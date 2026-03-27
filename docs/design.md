@@ -5550,58 +5550,139 @@ This is a recommended sequence of implementation work, ordered to
 maximize the ratio of "useful progress" to "infrastructure investment"
 at each step.
 
-### Step 1: Value model and heap (2-3 weeks)
+### Step 1: Value model (2-3 weeks)
 
-Build the `Arc<RwLock<T>>`-based value model, `Scalar`, `Value`,
-`PerlString`, and the mortal stack.  Implement the per-variable
-task-local mechanism for `local` (§3.3).  Write extensive unit tests
-for value coercion, reference creation, and dynamic scope
-save/restore.  This is the foundation everything else stands on.
+**This is the foundation everything else stands on.**
+
+Build the `perl-string` and `perl-value` crates first.  Every other
+crate depends on them, and design mistakes here are the most
+expensive to fix later.
+
+**Week 1: `perl-string` and core value types**
+
+1. `PerlString` — `Vec<u8>` + `is_utf8: bool`.  Methods: `as_str()`,
+   `from_str()`, `as_bytes()`, `into_bytes()`, concatenation,
+   comparison, `substr`, `length` (byte and character).  Extensive
+   tests for UTF-8 flag invariant maintenance.
+
+2. `SmallString` — 22-byte inline string.  Construction, conversion
+   to/from `PerlString`, boundary behavior at exactly 22 bytes.
+
+3. `SvFlags` — bitflags struct with IOK, NOK, POK, ROK, READONLY,
+   UTF8, MAGICAL, TAINT, WEAK.
+
+4. `PerlStringSlot` — the `None`/`Inline`/`Heap` enum.
+
+**Week 2: `Scalar`, `Value`, and coercion**
+
+5. `Scalar` — full struct with `iv`, `nv`, `pv`, `rv`, `magic`,
+   `stash`.  Coercion methods: `get_iv()`, `get_nv()`, `get_pv()`,
+   `set_iv()`, `set_str()`, `set_ref()`.  Each respects flag
+   discipline — reads check the validity flag first, writes
+   invalidate other caches.
+
+6. `Value` — the enum with compact variants (`Undef`, `Int`,
+   `Float`, `SmallStr`, `Str`, `Ref`) and `Scalar(Sv)`.
+   Upgrade logic: triggers for multi-rep, reference-taking,
+   magic attachment.  Once upgraded, never downgrade.
+
+7. `Sv`, `Av`, `Hv` type aliases — `Arc<RwLock<Scalar>>`, etc.
+   Basic operations: clone (Arc refcount bump), read through
+   RwLock, write through RwLock.
+
+**Week 3: References, cycle collection, mortal stack**
+
+8. Reference creation — `\$x` upgrades compact Value to
+   `Scalar(Sv)`, returns `Ref(Sv)` pointing to the same Arc.
+   Dereference in both directions.
+
+9. Cycle collection scaffolding — candidate set, `weaken` support,
+   Bacon-Rajan trial deletion.  Can be a stub initially, but the
+   hooks for tracking candidates should be in place.
+
+10. Mortal stack — `Vec<Value>` per interpreter, scope-entry marks,
+    scope-exit drops.
+
+11. Task-local `local` mechanism — `Option<Box<LocalStack>>` with
+    `WasInactive`/`WasActive` save stack.  Test with simulated
+    scope entry/exit.
+
+Each of these is independently testable with `#[test]` functions.
+No lexer, no parser, no interpreter — just data structures and
+their operations:
+
+```rust
+#[test]
+fn string_coercion() {
+    let mut sv = Scalar::from_str("42");
+    assert!(sv.flags.contains(SvFlags::POK));
+    assert_eq!(sv.get_iv(), 42);
+    assert!(sv.flags.contains(SvFlags::IOK));
+}
+
+#[test]
+fn compact_value_upgrade() {
+    let val = Value::Int(42);
+    let sv = val.to_scalar();  // upgrade
+    assert!(matches!(sv, Value::Scalar(_)));
+}
+
+#[test]
+fn reference_identity() {
+    let val = Value::SmallStr(SmallString::from("hello"));
+    let (val, ref1) = val.take_ref();  // upgrades, returns Ref
+    let (_, ref2) = val.take_ref();    // same Arc, refcount 3
+    // ref1 and ref2 point to the same Scalar
+}
+```
 
 ### Step 2: Lexer with sublexing (3-4 weeks)
 
-Build the lexer with the full context stack, sublexing, heredoc handling,
-and expectation-based tokenization.  Target passing `t/base/lex.t`.
-This is the hardest front-end component and should be done thoroughly.
+Build the lexer with the full context stack, sublexing, heredoc
+handling, and expectation-based tokenization.  Target passing
+`t/base/lex.t`.  This is the hardest front-end component and should
+be done thoroughly.
 
 ### Step 3: Parser and AST (2-3 weeks)
 
 Build the Pratt parser producing a syntax-oriented AST.  Wire up the
-parser–lexer feedback loop.  Target parsing (not necessarily executing)
-the `t/base/` test files.
+parser-lexer feedback loop.  Target parsing (not necessarily
+executing) the `t/base/` test files.
 
 ### Step 4: Minimal interpreter via AST walking (1-2 weeks)
 
 Build a quick-and-dirty AST-walking interpreter — just enough to run
-`print`, basic arithmetic, string operations, conditionals, and loops.
-This is throwaway scaffolding to get rapid feedback from the test suite.
+`print`, basic arithmetic, string operations, conditionals, and
+loops.  This is throwaway scaffolding to get rapid feedback from the
+test suite.
 
 ### Step 5: Compile-time execution (`BEGIN`, `use`) (1-2 weeks)
 
-Implement the compilation/execution interleaving so that `use strict`,
-`use warnings`, `use constant`, and simple `BEGIN` blocks work.  This
-unblocks virtually all real Perl code.
+Implement the compilation/execution interleaving so that
+`use strict`, `use warnings`, `use constant`, and simple `BEGIN`
+blocks work.  This unblocks virtually all real Perl code.
 
 ### Step 6: Lowering and IR (2-3 weeks)
 
-Build the HIR lowering and IR code generation.  Migrate the interpreter
-from AST walking to IR execution.  The AST walker can remain as a
-fallback during transition.
+Build the HIR lowering and IR code generation.  Migrate the
+interpreter from AST walking to IR execution.  The AST walker can
+remain as a fallback during transition.
 
 ### Step 7: Regex engine (3-4 weeks)
 
-Build the backtracking regex engine.  Target passing `t/base/pat.t` and
-then `t/op/re_tests`.
+Build the backtracking regex engine.  Target passing `t/base/pat.t`
+and then `t/op/re_tests`.
 
 ### Step 8: Subroutines, closures, and packages (2-3 weeks)
 
-Implement lexical pads, closures, package declarations, method dispatch,
-and `@ISA`-based inheritance.
+Implement closure captures as `Vec<Value>` (not Perl 5-style pads),
+package declarations, method dispatch, and `@ISA`-based inheritance.
 
 ### Step 9: Module loading (1-2 weeks)
 
 Implement `require`, `use`, `do`, `@INC` search, and the standard
-import/export mechanisms.
+import/export mechanisms.  Module registry for concurrent `require`
+(§13.11).
 
 ### Step 10: Core builtins (ongoing)
 
@@ -5610,10 +5691,25 @@ closest to passing.
 
 ### Step 11: Concurrency (when core is stable)
 
-Implement per-value synchronization, closure shareability detection,
-and async integration.  The shared heap architecture (§3.1) should
-be in place from the start; this step adds the multi-threaded
-execution paths.
+Implement per-value synchronization, `spawn`/`spawn blocking`/
+`spawn thread`, and Tokio integration.  The `Arc<RwLock<T>>` value
+model is concurrent from day one; this step adds the multi-task
+execution paths, the Tokio event loop, and the cardinal invariant
+enforcement (§13.11).
+
+### Step 12: Typed layer (incremental, alongside other steps)
+
+`let`/`fn` keyword registration and parsing can begin as soon as
+the parser exists (Step 3).  Type checking and typed IR generation
+build on Step 6.  `struct`/`enum`/`impl`/`trait` follow.  `extern fn`
+and AOT Rust codegen can proceed independently once the IR is stable.
+
+### Step 13: REPL (when interpreter is usable)
+
+Build the `perl-repl` crate on `reedline` once the interpreter can
+execute basic code (after Step 4 or 5).  Start with simple
+expression evaluation and `dd()` output, then add introspection
+commands, tab completion, and syntax highlighting incrementally.
 
 ---
 
