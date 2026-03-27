@@ -1,0 +1,36 @@
+//! Perl value types — the core data model.
+//!
+//! This crate provides the fundamental value representation:
+//!
+//! - [`Value`] — the top-level enum with compact variants for common cases
+//!   (integers, floats, small strings) and `Arc`-wrapped variants for shared
+//!   values (full scalars, arrays, hashes, code, regex).
+//!
+//! - [`Scalar`] — the full Perl SV: parallel iv/nv/pv caches with flag-driven
+//!   validity, magic chain, stash for blessed objects.
+//!
+//! - [`SvFlags`] — bitflags for cache validity (IOK, NOK, POK, ROK) and
+//!   metadata (READONLY, UTF8, TAINT, MAGICAL, WEAK).
+//!
+//! - Type aliases: `Sv`, `Av`, `Hv` for `Arc<RwLock<T>>` wrapped types.
+//!
+//! # Design Principles
+//!
+//! - **Compact by default.**  `Value::Int(42)` is 8 bytes, no heap allocation.
+//!   Only values that need shared identity, multi-representation caching, or
+//!   magic are upgraded to a full `Scalar` behind `Arc<RwLock<>>`.
+//!
+//! - **Upgrade, never downgrade.**  Once a value becomes `Value::Scalar(Sv)`,
+//!   it stays that way.  Identity via `Arc` address must be preserved.
+//!
+//! - **Flag-driven coercion.**  The `Scalar` struct uses `SvFlags` to track
+//!   which representation slots are valid.  The coercion engine checks flags
+//!   for the fast path and caches new representations lazily.
+
+pub mod flags;
+pub mod scalar;
+pub mod value;
+
+pub use flags::SvFlags;
+pub use scalar::Scalar;
+pub use value::{Av, Hv, Sv, Value};
