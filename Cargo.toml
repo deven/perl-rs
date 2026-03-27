@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/perl-string",
+    "crates/perl-value",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
