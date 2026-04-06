@@ -1,17 +1,18 @@
 //! Scalar value flags — cache validity and metadata bits.
 //!
 //! These flags follow Perl 5's SV flag model:
-//! - **Validity flags** (IOK, NOK, POK, ROK): which cached representations
-//!   are current.
+//! - **Validity flags** (INT_VALID, NUM_VALID, STR_VALID, REF_VALID): which
+//!   cached representations are current.
 //! - **Metadata flags** (READONLY, UTF8, TAINT, MAGICAL, WEAK): orthogonal
 //!   properties of the value.
 
 /// Flags for a `Scalar` value.
 ///
 /// Validity flags indicate which representation slots contain current data.
-/// The coercion engine reads these to determine the fast path (e.g., IOK
-/// set means `int` is valid — return it directly) and sets them when caching
-/// a new representation (e.g., parsing a string as an integer sets IOK).
+/// The coercion engine reads these to determine the fast path (e.g., INT_VALID
+/// set means the integer representation is valid — return it directly) and
+/// sets them when caching a new representation (e.g., parsing a string as an
+/// integer sets INT_VALID).
 ///
 /// Metadata flags describe orthogonal properties that don't affect which
 /// representation is current.
@@ -21,17 +22,17 @@ pub struct SvFlags(u16);
 impl SvFlags {
     // ── Validity flags ────────────────────────────────────────────
 
-    /// Integer value (`int`) is valid.
-    pub const IOK: SvFlags = SvFlags(1 << 0);
+    /// Integer representation is valid.
+    pub const INT_VALID: SvFlags = SvFlags(1 << 0);
 
-    /// Numeric value (`num`) is valid.
-    pub const NOK: SvFlags = SvFlags(1 << 1);
+    /// Numeric representation is valid.
+    pub const NUM_VALID: SvFlags = SvFlags(1 << 1);
 
-    /// String value (`pv`) is valid.
-    pub const POK: SvFlags = SvFlags(1 << 2);
+    /// String representation is valid.
+    pub const STR_VALID: SvFlags = SvFlags(1 << 2);
 
-    /// Reference value (`rv`) is valid — this scalar IS a reference.
-    pub const ROK: SvFlags = SvFlags(1 << 3);
+    /// Reference is valid — this scalar IS a reference.
+    pub const REF_VALID: SvFlags = SvFlags(1 << 3);
 
     // ── Metadata flags ────────────────────────────────────────────
 
@@ -39,7 +40,7 @@ impl SvFlags {
     pub const READONLY: SvFlags = SvFlags(1 << 4);
 
     /// String value is valid UTF-8 (redundant with PerlStringSlot's
-    /// own flag, but kept for fast checking without unpacking pv).
+    /// own flag, but kept for fast checking without unpacking the string slot).
     pub const UTF8: SvFlags = SvFlags(1 << 5);
 
     /// Value is tainted (taint mode).
@@ -54,13 +55,13 @@ impl SvFlags {
     // ── Compound masks ────────────────────────────────────────────
 
     /// Any numeric representation is valid.
-    pub const ANY_NUM: SvFlags = SvFlags(Self::IOK.0 | Self::NOK.0);
+    pub const ANY_NUM: SvFlags = SvFlags(Self::INT_VALID.0 | Self::NUM_VALID.0);
 
     /// Any value representation is valid.
-    pub const ANY_VAL: SvFlags = SvFlags(Self::IOK.0 | Self::NOK.0 | Self::POK.0);
+    pub const ANY_VAL: SvFlags = SvFlags(Self::INT_VALID.0 | Self::NUM_VALID.0 | Self::STR_VALID.0);
 
     /// All validity flags.
-    pub const ALL_VALIDITY: SvFlags = SvFlags(Self::IOK.0 | Self::NOK.0 | Self::POK.0 | Self::ROK.0);
+    pub const ALL_VALID: SvFlags = SvFlags(Self::INT_VALID.0 | Self::NUM_VALID.0 | Self::STR_VALID.0 | Self::REF_VALID.0);
 
     // ── Empty ─────────────────────────────────────────────────────
 
@@ -161,66 +162,66 @@ mod tests {
     fn default_is_empty() {
         let f = SvFlags::default();
         assert!(f.is_empty());
-        assert!(!f.contains(SvFlags::IOK));
+        assert!(!f.contains(SvFlags::INT_VALID));
     }
 
     #[test]
     fn set_and_check() {
         let mut f = SvFlags::EMPTY;
-        f.insert(SvFlags::IOK);
-        assert!(f.contains(SvFlags::IOK));
-        assert!(!f.contains(SvFlags::NOK));
+        f.insert(SvFlags::INT_VALID);
+        assert!(f.contains(SvFlags::INT_VALID));
+        assert!(!f.contains(SvFlags::NUM_VALID));
     }
 
     #[test]
     fn insert_multiple() {
         let mut f = SvFlags::EMPTY;
-        f.insert(SvFlags::IOK);
-        f.insert(SvFlags::POK);
-        assert!(f.contains(SvFlags::IOK));
-        assert!(f.contains(SvFlags::POK));
-        assert!(!f.contains(SvFlags::NOK));
+        f.insert(SvFlags::INT_VALID);
+        f.insert(SvFlags::STR_VALID);
+        assert!(f.contains(SvFlags::INT_VALID));
+        assert!(f.contains(SvFlags::STR_VALID));
+        assert!(!f.contains(SvFlags::NUM_VALID));
     }
 
     #[test]
     fn remove() {
-        let mut f = SvFlags::IOK | SvFlags::POK;
-        f.remove(SvFlags::IOK);
-        assert!(!f.contains(SvFlags::IOK));
-        assert!(f.contains(SvFlags::POK));
+        let mut f = SvFlags::INT_VALID | SvFlags::STR_VALID;
+        f.remove(SvFlags::INT_VALID);
+        assert!(!f.contains(SvFlags::INT_VALID));
+        assert!(f.contains(SvFlags::STR_VALID));
     }
 
     #[test]
     fn intersects() {
-        let f = SvFlags::IOK | SvFlags::POK;
-        assert!(f.intersects(SvFlags::IOK));
+        let f = SvFlags::INT_VALID | SvFlags::STR_VALID;
+        assert!(f.intersects(SvFlags::INT_VALID));
         assert!(f.intersects(SvFlags::ANY_NUM));
-        assert!(!f.intersects(SvFlags::NOK));
+        assert!(!f.intersects(SvFlags::NUM_VALID));
     }
 
     #[test]
     fn contains_compound() {
-        let f = SvFlags::IOK | SvFlags::NOK;
+        let f = SvFlags::INT_VALID | SvFlags::NUM_VALID;
         assert!(f.contains(SvFlags::ANY_NUM));
 
-        let g = SvFlags::IOK;
-        assert!(!g.contains(SvFlags::ANY_NUM)); // missing NOK
+        let g = SvFlags::INT_VALID;
+        assert!(!g.contains(SvFlags::ANY_NUM)); // missing NUM_VALID
     }
 
     #[test]
     fn clear_validity() {
-        let mut f = SvFlags::IOK | SvFlags::POK | SvFlags::READONLY;
-        f.remove(SvFlags::ALL_VALIDITY);
-        assert!(!f.contains(SvFlags::IOK));
-        assert!(!f.contains(SvFlags::POK));
+        let mut f = SvFlags::INT_VALID | SvFlags::STR_VALID | SvFlags::READONLY;
+        f.remove(SvFlags::ALL_VALID);
+        assert!(!f.contains(SvFlags::INT_VALID));
+        assert!(!f.contains(SvFlags::STR_VALID));
         assert!(f.contains(SvFlags::READONLY)); // metadata preserved
     }
 
     #[test]
     fn bitor_syntax() {
-        let f = SvFlags::IOK | SvFlags::NOK | SvFlags::READONLY;
-        assert!(f.contains(SvFlags::IOK));
+        let f = SvFlags::INT_VALID | SvFlags::NUM_VALID | SvFlags::READONLY;
+        assert!(f.contains(SvFlags::INT_VALID));
         assert!(f.contains(SvFlags::READONLY));
-        assert!(!f.contains(SvFlags::POK));
+        assert!(!f.contains(SvFlags::STR_VALID));
     }
 }

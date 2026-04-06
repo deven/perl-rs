@@ -477,9 +477,9 @@ mod tests {
         let sv = v.upgrade_to_scalar();
         assert!(matches!(v, Value::Scalar(_)));
 
-        // The Scalar should have iv=42 with IOK set
+        // The Scalar should have int=42 with INT_VALID set
         let guard = sv.read().unwrap();
-        assert!(guard.flags().contains(crate::flags::SvFlags::IOK));
+        assert!(guard.flags().contains(crate::flags::SvFlags::INT_VALID));
     }
 
     #[test]
@@ -489,7 +489,7 @@ mod tests {
         assert!(matches!(v, Value::Scalar(_)));
 
         let guard = sv.read().unwrap();
-        assert!(guard.flags().contains(crate::flags::SvFlags::POK));
+        assert!(guard.flags().contains(crate::flags::SvFlags::STR_VALID));
     }
 
     #[test]
