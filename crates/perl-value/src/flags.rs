@@ -10,7 +10,7 @@
 ///
 /// Validity flags indicate which representation slots contain current data.
 /// The coercion engine reads these to determine the fast path (e.g., IOK
-/// set means `iv` is valid — return it directly) and sets them when caching
+/// set means `int` is valid — return it directly) and sets them when caching
 /// a new representation (e.g., parsing a string as an integer sets IOK).
 ///
 /// Metadata flags describe orthogonal properties that don't affect which
@@ -21,10 +21,10 @@ pub struct SvFlags(u16);
 impl SvFlags {
     // ── Validity flags ────────────────────────────────────────────
 
-    /// Integer value (`iv`) is valid.
+    /// Integer value (`int`) is valid.
     pub const IOK: SvFlags = SvFlags(1 << 0);
 
-    /// Float value (`nv`) is valid.
+    /// Numeric value (`num`) is valid.
     pub const NOK: SvFlags = SvFlags(1 << 1);
 
     /// String value (`pv`) is valid.
