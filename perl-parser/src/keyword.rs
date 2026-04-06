@@ -186,11 +186,9 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Wantarray
             | Keyword::Exit
             | Keyword::Tied
-            | Keyword::Eval
             | Keyword::Die
             | Keyword::Warn
             | Keyword::Undef
-            | Keyword::Return
     )
 }
 

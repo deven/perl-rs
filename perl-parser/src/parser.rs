@@ -206,7 +206,11 @@ impl<'src> Parser<'src> {
             Token::Keyword(Keyword::Our) => self.parse_our_decl()?,
             Token::Keyword(Keyword::Local) => self.parse_local_decl()?,
             Token::Keyword(Keyword::State) => self.parse_state_decl()?,
-            Token::Keyword(Keyword::Sub) => self.parse_sub_decl()?,
+            Token::Keyword(Keyword::Sub) => {
+                // Named sub declaration if an identifier follows.
+                // Otherwise fall through to expression (anonymous sub).
+                if self.is_named_sub_ahead() { self.parse_sub_decl()? } else { self.parse_expr_statement()? }
+            }
             Token::Keyword(Keyword::If) => self.parse_if_stmt()?,
             Token::Keyword(Keyword::Unless) => self.parse_unless_stmt()?,
             Token::Keyword(Keyword::While) => self.parse_while_stmt()?,
@@ -214,21 +218,29 @@ impl<'src> Parser<'src> {
             Token::Keyword(Keyword::For) | Token::Keyword(Keyword::Foreach) => self.parse_for_stmt()?,
             Token::Keyword(Keyword::Package) => self.parse_package_decl()?,
             Token::Keyword(Keyword::Use) | Token::Keyword(Keyword::No) => self.parse_use_decl()?,
+
+            // Phaser blocks
+            Token::Keyword(Keyword::BEGIN) => self.parse_phaser(PhaserKind::Begin)?,
+            Token::Keyword(Keyword::END) => self.parse_phaser(PhaserKind::End)?,
+            Token::Keyword(Keyword::INIT) => self.parse_phaser(PhaserKind::Init)?,
+            Token::Keyword(Keyword::CHECK) => self.parse_phaser(PhaserKind::Check)?,
+            Token::Keyword(Keyword::UNITCHECK) => self.parse_phaser(PhaserKind::Unitcheck)?,
+
             Token::LBrace => {
                 let block = self.parse_block()?;
                 StmtKind::Block(block)
             }
-            _ => {
-                // Expression statement
-                self.expect.base = BaseExpect::Term;
-                let expr = self.parse_expr(PREC_LOW)?;
 
-                // Check for postfix control flow
-                let kind = self.maybe_postfix_control(expr)?;
-
-                self.eat(&Token::Semi);
-                kind
+            // Check for label: IDENT followed by ':'
+            Token::Ident(_) => {
+                if self.is_label_ahead() {
+                    self.parse_labeled_stmt()?
+                } else {
+                    self.parse_expr_statement()?
+                }
             }
+
+            _ => self.parse_expr_statement()?,
         };
 
         let end = self.peek_span();
@@ -373,6 +385,28 @@ impl<'src> Parser<'src> {
         Ok(StmtKind::SubDecl(SubDecl { name, prototype, attributes: Vec::new(), params: None, body, span: start.merge(self.peek_span()) }))
     }
 
+    /// Parse an anonymous sub expression: `sub { ... }` or `sub ($x) { ... }`.
+    fn parse_anon_sub(&mut self, span: Span) -> Result<Expr, ParseError> {
+        // Optional prototype
+        let prototype = if self.at(&Token::LParen) {
+            self.advance();
+            let mut proto = String::new();
+            while !self.at(&Token::RParen) && !self.at_eof() {
+                let t = self.advance();
+                proto.push_str(&format!("{}", t.token));
+            }
+            self.expect_token(&Token::RParen)?;
+            Some(proto)
+        } else {
+            None
+        };
+
+        self.expect.brace = BraceDisposition::BlockExpr;
+        let body = self.parse_block()?;
+
+        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonSub(prototype, None, body) })
+    }
+
     // ── Control flow statements ───────────────────────────────
 
     fn parse_if_stmt(&mut self) -> Result<StmtKind, ParseError> {
@@ -515,6 +549,74 @@ impl<'src> Parser<'src> {
         Ok(StmtKind::UseDecl(UseDecl { is_no, module, version, imports, span: start.merge(self.peek_span()) }))
     }
 
+    // ── Phaser blocks ─────────────────────────────────────────
+
+    fn parse_phaser(&mut self, kind: PhaserKind) -> Result<StmtKind, ParseError> {
+        self.advance(); // eat the phaser keyword
+        self.expect.brace = BraceDisposition::Block;
+        let block = self.parse_block()?;
+        Ok(StmtKind::Phaser(kind, block))
+    }
+
+    // ── Labels ────────────────────────────────────────────────
+
+    /// Check if we're looking at `IDENT :` (a label).
+    fn is_label_ahead(&mut self) -> bool {
+        let cp = self.lexer.checkpoint();
+        let saved_expect = self.expect;
+        let saved_current = self.current.take();
+
+        // Lexer is already past the Ident (it was cached).
+        // Lex the next token and check if it's a colon.
+        self.ensure_current();
+        let is_colon = matches!(self.peek(), Token::Colon);
+
+        self.current = saved_current;
+        self.expect = saved_expect;
+        self.lexer.restore(cp);
+        is_colon
+    }
+
+    /// Check if `sub` is followed by an identifier (named sub decl).
+    fn is_named_sub_ahead(&mut self) -> bool {
+        let cp = self.lexer.checkpoint();
+        let saved_expect = self.expect;
+        let saved_current = self.current.take();
+
+        // Lexer is already past `sub` (it was cached).
+        // Lex the next token and check if it's an identifier.
+        self.ensure_current();
+        let is_ident = matches!(self.peek(), Token::Ident(_));
+
+        self.current = saved_current;
+        self.expect = saved_expect;
+        self.lexer.restore(cp);
+        is_ident
+    }
+
+    fn parse_labeled_stmt(&mut self) -> Result<StmtKind, ParseError> {
+        let label = match self.advance().token {
+            Token::Ident(name) => name,
+            _ => unreachable!(),
+        };
+        self.expect_token(&Token::Colon)?; // eat ':'
+        let stmt = self.parse_statement()?;
+        Ok(StmtKind::Labeled(label, Box::new(stmt)))
+    }
+
+    // ── Expression statements ─────────────────────────────────
+
+    fn parse_expr_statement(&mut self) -> Result<StmtKind, ParseError> {
+        self.expect.base = BaseExpect::Term;
+        let expr = self.parse_expr(PREC_LOW)?;
+
+        // Check for postfix control flow
+        let kind = self.maybe_postfix_control(expr)?;
+
+        self.eat(&Token::Semi);
+        Ok(kind)
+    }
+
     // ── Block parsing ─────────────────────────────────────────
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
@@ -636,6 +738,58 @@ impl<'src> Parser<'src> {
                 self.expect.base = BaseExpect::Term;
                 let operand = self.parse_expr(PREC_INC)?;
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::PreDec, Box::new(operand)) })
+            }
+
+            // Anonymous sub: sub { ... } or sub ($x) { ... }
+            Token::Keyword(Keyword::Sub) => self.parse_anon_sub(span),
+
+            // eval BLOCK vs eval EXPR
+            Token::Keyword(Keyword::Eval) => {
+                self.expect.base = BaseExpect::Term;
+                if self.at(&Token::LBrace) {
+                    self.expect.brace = BraceDisposition::BlockExpr;
+                    let block = self.parse_block()?;
+                    Ok(Expr { span: span.merge(block.span), kind: ExprKind::EvalBlock(block) })
+                } else {
+                    let arg = self.parse_expr(PREC_COMMA)?;
+                    let end = span.merge(arg.span);
+                    Ok(Expr { kind: ExprKind::EvalExpr(Box::new(arg)), span: end })
+                }
+            }
+
+            // return with optional value
+            Token::Keyword(Keyword::Return) => {
+                self.expect.base = BaseExpect::Term;
+                if self.at(&Token::Semi) || self.at(&Token::RBrace) || self.at_eof() {
+                    Ok(Expr { kind: ExprKind::FuncCall("return".into(), vec![]), span })
+                } else {
+                    let val = self.parse_expr(PREC_COMMA)?;
+                    let end = span.merge(val.span);
+                    Ok(Expr { kind: ExprKind::FuncCall("return".into(), vec![val]), span: end })
+                }
+            }
+
+            // last/next/redo with optional label
+            Token::Keyword(Keyword::Last) | Token::Keyword(Keyword::Next) | Token::Keyword(Keyword::Redo) => {
+                let name = match spanned.token {
+                    Token::Keyword(Keyword::Last) => "last",
+                    Token::Keyword(Keyword::Next) => "next",
+                    Token::Keyword(Keyword::Redo) => "redo",
+                    _ => unreachable!(),
+                };
+                self.expect.base = BaseExpect::Term;
+                // Optional label argument
+                if let Token::Ident(_) = self.peek() {
+                    let label_span = self.peek_span();
+                    let label = match self.advance().token {
+                        Token::Ident(s) => s,
+                        _ => unreachable!(),
+                    };
+                    let end = span.merge(label_span);
+                    Ok(Expr { kind: ExprKind::FuncCall(name.into(), vec![Expr { kind: ExprKind::StringLit(label), span: label_span }]), span: end })
+                } else {
+                    Ok(Expr { kind: ExprKind::FuncCall(name.into(), vec![]), span })
+                }
             }
 
             // Named unary keywords
@@ -817,25 +971,26 @@ impl<'src> Parser<'src> {
         Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end_span) })
     }
 
-    fn maybe_postfix_subscript(&mut self, expr: Expr) -> Result<Expr, ParseError> {
-        // Check for $x[idx] or $x{key} immediately after a scalar var
-        if self.at(&Token::LBracket) {
-            self.advance();
-            self.expect.base = BaseExpect::Term;
-            let idx = self.parse_expr(PREC_LOW)?;
-            let end = self.peek_span();
-            self.expect_token(&Token::RBracket)?;
-            return Ok(Expr { span: expr.span.merge(end), kind: ExprKind::ArrayElem(Box::new(expr), Box::new(idx)) });
-        }
-        if self.at(&Token::LBrace) {
-            // Could be hash subscript — we need better heuristics here
-            // For now, in operator position after a scalar, { starts a hash subscript
-            self.advance();
-            self.expect.base = BaseExpect::Term;
-            let key = self.parse_expr(PREC_LOW)?;
-            let end = self.peek_span();
-            self.expect_token(&Token::RBrace)?;
-            return Ok(Expr { span: expr.span.merge(end), kind: ExprKind::HashElem(Box::new(expr), Box::new(key)) });
+    fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
+        // Handle chained subscripts: $x[0][1], $x{a}{b}, $x[0]{key}
+        loop {
+            if self.at(&Token::LBracket) {
+                self.advance();
+                self.expect.base = BaseExpect::Term;
+                let idx = self.parse_expr(PREC_LOW)?;
+                let end = self.peek_span();
+                self.expect_token(&Token::RBracket)?;
+                expr = Expr { span: expr.span.merge(end), kind: ExprKind::ArrayElem(Box::new(expr), Box::new(idx)) };
+            } else if self.at(&Token::LBrace) {
+                self.advance();
+                self.expect.base = BaseExpect::Term;
+                let key = self.parse_expr(PREC_LOW)?;
+                let end = self.peek_span();
+                self.expect_token(&Token::RBrace)?;
+                expr = Expr { span: expr.span.merge(end), kind: ExprKind::HashElem(Box::new(expr), Box::new(key)) };
+            } else {
+                break;
+            }
         }
         Ok(expr)
     }
@@ -1036,7 +1191,9 @@ impl<'src> Parser<'src> {
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RBracket)?;
-                Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArrayElem(Box::new(idx))) })
+                let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArrayElem(Box::new(idx))) };
+                // Handle chained subscripts: $ref->[0][1], $ref->[0]{key}
+                self.maybe_postfix_subscript(expr)
             }
             Token::LBrace => {
                 self.advance();
@@ -1044,7 +1201,9 @@ impl<'src> Parser<'src> {
                 let key = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RBrace)?;
-                Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::HashElem(Box::new(key))) })
+                let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::HashElem(Box::new(key))) };
+                // Handle chained subscripts: $ref->{a}{b}, $ref->{a}[0]
+                self.maybe_postfix_subscript(expr)
             }
             Token::LParen => {
                 // ->(...) — coderef call
@@ -1522,5 +1681,164 @@ mod tests {
         let src = "print <<END;\nhello\nEND\nmy $x = 1;\n";
         let prog = parse(src);
         assert_eq!(prog.statements.len(), 2);
+    }
+
+    // ── Anonymous sub tests ───────────────────────────────────
+
+    #[test]
+    fn parse_anon_sub() {
+        let e = parse_expr_str("sub { 42; };");
+        assert!(matches!(e.kind, ExprKind::AnonSub(_, _, _)));
+    }
+
+    #[test]
+    fn parse_anon_sub_with_proto() {
+        let e = parse_expr_str("sub ($x) { $x + 1; };");
+        match &e.kind {
+            ExprKind::AnonSub(proto, _, _) => {
+                assert!(proto.is_some());
+            }
+            other => panic!("expected AnonSub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_anon_sub_as_arg() {
+        let prog = parse("my $f = sub { 1; };");
+        match &prog.statements[0].kind {
+            StmtKind::My(_, Some(init)) => {
+                assert!(matches!(init.kind, ExprKind::AnonSub(_, _, _)));
+            }
+            other => panic!("expected My with AnonSub, got {other:?}"),
+        }
+    }
+
+    // ── Phaser block tests ────────────────────────────────────
+
+    #[test]
+    fn parse_begin_block() {
+        let prog = parse("BEGIN { 1; }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Phaser(PhaserKind::Begin, _)));
+    }
+
+    #[test]
+    fn parse_end_block() {
+        let prog = parse("END { 1; }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Phaser(PhaserKind::End, _)));
+    }
+
+    // ── Eval tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_eval_block() {
+        let e = parse_expr_str("eval { die; };");
+        assert!(matches!(e.kind, ExprKind::EvalBlock(_)));
+    }
+
+    #[test]
+    fn parse_eval_expr() {
+        let e = parse_expr_str("eval $code;");
+        assert!(matches!(e.kind, ExprKind::EvalExpr(_)));
+    }
+
+    // ── Return / loop control tests ───────────────────────────
+
+    #[test]
+    fn parse_return_value() {
+        let e = parse_expr_str("return 42;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "return");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected return call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_return_bare() {
+        let e = parse_expr_str("return;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "return");
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected bare return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_last_with_label() {
+        let e = parse_expr_str("last OUTER;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "last");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected last with label, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_next_bare() {
+        let e = parse_expr_str("next;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "next");
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected bare next, got {other:?}"),
+        }
+    }
+
+    // ── Label tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_labeled_loop() {
+        let prog = parse("OUTER: for my $i (@list) { next OUTER; }");
+        match &prog.statements[0].kind {
+            StmtKind::Labeled(label, inner) => {
+                assert_eq!(label, "OUTER");
+                assert!(matches!(inner.kind, StmtKind::ForEach(_)));
+            }
+            other => panic!("expected Labeled, got {other:?}"),
+        }
+    }
+
+    // ── Chained subscript tests ───────────────────────────────
+
+    #[test]
+    fn parse_chained_array_subscripts() {
+        // $aoa[0][1] — implicit arrow between adjacent subscripts
+        let e = parse_expr_str("$aoa[0][1];");
+        match &e.kind {
+            ExprKind::ArrayElem(inner, _) => {
+                assert!(matches!(inner.kind, ExprKind::ArrayElem(_, _)));
+            }
+            other => panic!("expected nested ArrayElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chained_hash_subscripts() {
+        let e = parse_expr_str("$h{a}{b};");
+        match &e.kind {
+            ExprKind::HashElem(inner, _) => {
+                assert!(matches!(inner.kind, ExprKind::HashElem(_, _)));
+            }
+            other => panic!("expected nested HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arrow_then_implicit_subscript() {
+        // $ref->[0][1] — arrow for first, implicit for second
+        let e = parse_expr_str("$ref->[0][1];");
+        match &e.kind {
+            ExprKind::ArrayElem(inner, _) => {
+                assert!(matches!(inner.kind, ExprKind::ArrowDeref(_, _)));
+            }
+            other => panic!("expected ArrayElem wrapping ArrowDeref, got {other:?}"),
+        }
     }
 }
