@@ -516,6 +516,11 @@ impl<'src> Lexer<'src> {
             "q" if self.at_quote_delimiter() => return self.lex_q_string(),
             "qq" if self.at_quote_delimiter() => return self.lex_qq_string(),
             "qw" if self.at_quote_delimiter() => return self.lex_qw(),
+            "qr" if self.at_quote_delimiter() => return self.lex_qr(),
+            "m" if self.at_quote_delimiter() => return self.lex_m(),
+            "s" if self.at_quote_delimiter() => return self.lex_s(),
+            "tr" if self.at_quote_delimiter() => return self.lex_tr(),
+            "y" if self.at_quote_delimiter() => return self.lex_tr(),
             _ => {}
         }
 
@@ -797,6 +802,54 @@ impl<'src> Lexer<'src> {
         Ok(Token::QwList(words))
     }
 
+    // ── Regex and friends ─────────────────────────────────────
+
+    /// `m/pattern/flags` or `m{pattern}flags`
+    fn lex_m(&mut self) -> Result<Token, ParseError> {
+        let (open, close) = self.read_quote_delimiters()?;
+        let pattern = self.scan_balanced_string(open, close)?;
+        let flags = self.scan_regex_flags();
+        Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
+    }
+
+    /// `qr/pattern/flags` or `qr{pattern}flags`
+    fn lex_qr(&mut self) -> Result<Token, ParseError> {
+        let (open, close) = self.read_quote_delimiters()?;
+        let pattern = self.scan_balanced_string(open, close)?;
+        let flags = self.scan_regex_flags();
+        Ok(Token::RegexLit(RegexKind::Qr, pattern, flags))
+    }
+
+    /// `s/pattern/replacement/flags` or `s{pattern}{replacement}flags`
+    fn lex_s(&mut self) -> Result<Token, ParseError> {
+        let (open, close) = self.read_quote_delimiters()?;
+        let pattern = self.scan_balanced_string(open, close)?;
+        // For paired delimiters like s{pat}{repl}, read a new pair.
+        // For same-char delimiters like s/pat/repl/, reuse the same delimiter.
+        let replacement = if open != close {
+            let (_open2, close2) = self.read_quote_delimiters()?;
+            self.scan_balanced_string(_open2, close2)?
+        } else {
+            self.scan_balanced_string(open, close)?
+        };
+        let flags = self.scan_regex_flags();
+        Ok(Token::SubstLit(pattern, replacement, flags))
+    }
+
+    /// `tr/from/to/flags` or `y/from/to/flags`
+    fn lex_tr(&mut self) -> Result<Token, ParseError> {
+        let (open, close) = self.read_quote_delimiters()?;
+        let from = self.scan_balanced_string(open, close)?;
+        let to = if open != close {
+            let (_open2, close2) = self.read_quote_delimiters()?;
+            self.scan_balanced_string(_open2, close2)?
+        } else {
+            self.scan_balanced_string(open, close)?
+        };
+        let flags = self.scan_regex_flags();
+        Ok(Token::TranslitLit(from, to, flags))
+    }
+
     fn read_quote_delimiters(&mut self) -> Result<(u8, u8), ParseError> {
         let open = self.advance_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.pos as u32, self.pos as u32)))?;
         let close = matching_delimiter(open);
@@ -901,13 +954,11 @@ impl<'src> Lexer<'src> {
 
     fn lex_slash(&mut self, expect: &Expect) -> Result<Token, ParseError> {
         if expect.slash_is_regex() {
-            // Regex: scan to closing /
+            // Regex: /pattern/flags
             self.pos += 1; // skip opening /
             let pattern = self.scan_to_delimiter(b'/')?;
             let flags = self.scan_regex_flags();
-            // Bootstrap: emit pattern and flags as a single token.
-            // Full implementation will use sub-tokens (§5.4).
-            Ok(Token::RegexBody(format!("/{pattern}/{flags}")))
+            Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
         } else {
             self.pos += 1;
             match self.peek_byte() {
@@ -1131,7 +1182,10 @@ mod tests {
                 | Token::MinusMinus
                 | Token::SpecialVar(_)
                 | Token::ArrayLen(_)
-                | Token::QuoteEnd => {
+                | Token::QuoteEnd
+                | Token::RegexLit(_, _, _)
+                | Token::SubstLit(_, _, _)
+                | Token::TranslitLit(_, _, _) => {
                     expect.base = BaseExpect::Operator;
                 }
                 Token::Semi | Token::LBrace => {
@@ -1387,5 +1441,75 @@ mod tests {
         // Verify expect state is correct after a string (operator position).
         let tokens = lex_all(r#""hello" . "world""#);
         assert!(tokens.contains(&Token::Dot));
+    }
+
+    // ── Regex / substitution / transliteration tests ──────────
+
+    #[test]
+    fn lex_bare_regex() {
+        let tokens = lex_all("/foo/i");
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), "i".into()),]);
+    }
+
+    #[test]
+    fn lex_bare_regex_no_flags() {
+        let tokens = lex_all("/hello world/");
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "hello world".into(), "".into()),]);
+    }
+
+    #[test]
+    fn lex_m_regex() {
+        let tokens = lex_all("m{foo}i");
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), "i".into()),]);
+    }
+
+    #[test]
+    fn lex_m_regex_slash() {
+        let tokens = lex_all("m/bar/gx");
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "bar".into(), "gx".into()),]);
+    }
+
+    #[test]
+    fn lex_qr_regex() {
+        let tokens = lex_all("qr/\\d+/");
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Qr, "\\d+".into(), "".into()),]);
+    }
+
+    #[test]
+    fn lex_substitution() {
+        let tokens = lex_all("s/foo/bar/g");
+        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), "g".into()),]);
+    }
+
+    #[test]
+    fn lex_substitution_braces() {
+        let tokens = lex_all("s{foo}{bar}g");
+        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), "g".into()),]);
+    }
+
+    #[test]
+    fn lex_transliteration() {
+        let tokens = lex_all("tr/a-z/A-Z/");
+        assert_eq!(tokens, vec![Token::TranslitLit("a-z".into(), "A-Z".into(), "".into()),]);
+    }
+
+    #[test]
+    fn lex_y_transliteration() {
+        let tokens = lex_all("y/abc/def/");
+        assert_eq!(tokens, vec![Token::TranslitLit("abc".into(), "def".into(), "".into()),]);
+    }
+
+    #[test]
+    fn lex_regex_in_expression() {
+        // After $x =~ the / should be a regex, not division.
+        let tokens = lex_all("$x =~ /foo/");
+        assert_eq!(tokens, vec![Token::ScalarVar("x".into()), Token::Binding, Token::RegexLit(RegexKind::Match, "foo".into(), "".into()),]);
+    }
+
+    #[test]
+    fn lex_division_not_regex() {
+        // After a variable, / is division.
+        let tokens = lex_all("$x / $y");
+        assert_eq!(tokens, vec![Token::ScalarVar("x".into()), Token::Slash, Token::ScalarVar("y".into()),]);
     }
 }

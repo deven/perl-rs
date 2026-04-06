@@ -694,6 +694,11 @@ impl<'src> Parser<'src> {
 
             Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
 
+            // Regex, substitution, transliteration
+            Token::RegexLit(_kind, pattern, flags) => Ok(Expr { kind: ExprKind::Regex(pattern, flags), span }),
+            Token::SubstLit(pattern, replacement, flags) => Ok(Expr { kind: ExprKind::Subst(pattern, SubstReplacement::Literal(replacement), flags), span }),
+            Token::TranslitLit(from, to, flags) => Ok(Expr { kind: ExprKind::Translit(from, to, flags), span }),
+
             Token::Keyword(Keyword::Do) => {
                 if self.at(&Token::LBrace) {
                     let block = self.parse_block()?;
@@ -1409,5 +1414,65 @@ mod tests {
     fn parse_print_interp_string() {
         let prog = parse(r#"print "Hello, $name!\n";"#);
         assert_eq!(prog.statements.len(), 1);
+    }
+
+    // ── Regex / substitution / transliteration tests ──────────
+
+    #[test]
+    fn parse_bare_regex() {
+        let e = parse_expr_str("/foo/i;");
+        match &e.kind {
+            ExprKind::Regex(pat, flags) => {
+                assert_eq!(pat, "foo");
+                assert_eq!(flags, "i");
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_regex_binding() {
+        let e = parse_expr_str("$x =~ /foo/;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Binding, _, right) => {
+                assert!(matches!(&right.kind, ExprKind::Regex(_, _)));
+            }
+            other => panic!("expected Binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_substitution() {
+        let e = parse_expr_str("s/foo/bar/g;");
+        match &e.kind {
+            ExprKind::Subst(pat, _, flags) => {
+                assert_eq!(pat, "foo");
+                assert_eq!(flags, "g");
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_transliteration() {
+        let e = parse_expr_str("tr/a-z/A-Z/;");
+        match &e.kind {
+            ExprKind::Translit(from, to, _) => {
+                assert_eq!(from, "a-z");
+                assert_eq!(to, "A-Z");
+            }
+            other => panic!("expected Translit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_subst_binding() {
+        let e = parse_expr_str("$x =~ s/old/new/g;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Binding, _, right) => {
+                assert!(matches!(&right.kind, ExprKind::Subst(_, _, _)));
+            }
+            other => panic!("expected Binding with Subst, got {other:?}"),
+        }
     }
 }

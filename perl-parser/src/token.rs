@@ -370,6 +370,14 @@ pub enum Token {
     /// Substitution replacement (between second and third delimiters).
     SubstReplacement(String),
 
+    // ── Compound regex tokens (bootstrap, pre-interpolation) ──
+    /// Complete regex: `/pattern/flags`, `m/pattern/flags`, `qr/pattern/flags`.
+    RegexLit(RegexKind, String, String),
+    /// Complete substitution: `s/pattern/replacement/flags`.
+    SubstLit(String, String, String),
+    /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
+    TranslitLit(String, String, String),
+
     // ── Heredoc ───────────────────────────────────────────────
     /// `<<TAG`, `<<"TAG"`, `<<'TAG'`.
     HeredocBegin(HeredocKind, String),
@@ -453,6 +461,9 @@ impl Token {
                 | Token::QuoteBegin(_, _)
                 | Token::RegexBegin(_, _)
                 | Token::HeredocBegin(_, _)
+                | Token::RegexLit(_, _, _)
+                | Token::SubstLit(_, _, _)
+                | Token::TranslitLit(_, _, _)
                 | Token::QwList(_)
                 | Token::Dollar
                 | Token::At
