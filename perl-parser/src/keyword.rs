@@ -191,6 +191,7 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Warn
             | Keyword::Undef
             | Keyword::Scalar
+            | Keyword::Require
     )
 }
 

@@ -968,6 +968,86 @@ impl<'src> Parser<'src> {
                 }
             }
 
+            // Prefix hash dereference: %$ref, %{expr}
+            Token::Percent => {
+                self.expect.base = BaseExpect::Term;
+                if self.at(&Token::LBrace) {
+                    self.advance();
+                    let inner = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RBrace)?;
+                    Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Hash, Box::new(inner)) })
+                } else {
+                    let operand = self.parse_deref_operand()?;
+                    Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Hash, Box::new(operand)) })
+                }
+            }
+
+            // Ampersand prefix: &foo, &foo(args), &$coderef(args), &{expr}(args)
+            Token::BitAnd => {
+                self.expect.base = BaseExpect::Term;
+                if self.at(&Token::LBrace) {
+                    // &{expr}
+                    self.advance();
+                    let inner = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RBrace)?;
+                    let deref = Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Code, Box::new(inner)) };
+                    self.maybe_call_args(deref)
+                } else if let Token::Ident(_) = self.peek() {
+                    // &foo or &foo(args)
+                    let name_span = self.peek_span();
+                    let name = match self.advance().token {
+                        Token::Ident(s) => s,
+                        _ => unreachable!(),
+                    };
+                    if self.at(&Token::LParen) {
+                        self.advance();
+                        self.expect.base = BaseExpect::Term;
+                        let mut args = Vec::new();
+                        while !self.at(&Token::RParen) && !self.at_eof() {
+                            args.push(self.parse_expr(PREC_COMMA + 1)?);
+                            if !self.eat(&Token::Comma) {
+                                break;
+                            }
+                        }
+                        let end = self.peek_span();
+                        self.expect_token(&Token::RParen)?;
+                        Ok(Expr { kind: ExprKind::FuncCall(name, args), span: span.merge(end) })
+                    } else {
+                        // &foo with no parens — call with current @_
+                        Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span: span.merge(name_span) })
+                    }
+                } else {
+                    // &$coderef or &$coderef(args)
+                    let operand = self.parse_deref_operand()?;
+                    let deref = Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Code, Box::new(operand)) };
+                    self.maybe_call_args(deref)
+                }
+            }
+
+            // Typeglob: *foo, *$ref, *{expr}
+            Token::Star => {
+                self.expect.base = BaseExpect::Term;
+                if self.at(&Token::LBrace) {
+                    self.advance();
+                    let inner = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RBrace)?;
+                    Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Glob, Box::new(inner)) })
+                } else if let Token::Ident(_) = self.peek() {
+                    let name_span = self.peek_span();
+                    let name = match self.advance().token {
+                        Token::Ident(s) => s,
+                        _ => unreachable!(),
+                    };
+                    Ok(Expr { kind: ExprKind::GlobVar(name), span: span.merge(name_span) })
+                } else {
+                    let operand = self.parse_deref_operand()?;
+                    Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Glob, Box::new(operand)) })
+                }
+            }
+
             Token::Ident(name) => self.parse_ident_term(name, span),
 
             Token::Keyword(Keyword::Undef) => Ok(Expr { kind: ExprKind::Undef, span }),
@@ -1418,6 +1498,26 @@ impl<'src> Parser<'src> {
                 Ok(Expr { span: span.merge(inner.span), kind: ExprKind::Deref(Sigil::Scalar, Box::new(inner)) })
             }
             other => Err(ParseError::new(format!("expected variable after dereference sigil, got {other:?}"), span)),
+        }
+    }
+
+    /// If `(` follows, parse arguments for a coderef call: `&$ref(args)`.
+    fn maybe_call_args(&mut self, callee: Expr) -> Result<Expr, ParseError> {
+        if self.at(&Token::LParen) {
+            self.advance();
+            self.expect.base = BaseExpect::Term;
+            let mut args = Vec::new();
+            while !self.at(&Token::RParen) && !self.at_eof() {
+                args.push(self.parse_expr(PREC_COMMA + 1)?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            let end = self.peek_span();
+            self.expect_token(&Token::RParen)?;
+            Ok(Expr { span: callee.span.merge(end), kind: ExprKind::MethodCall(Box::new(callee), String::new(), args) })
+        } else {
+            Ok(callee)
         }
     }
 
@@ -2750,6 +2850,126 @@ mod tests {
                 assert!(u.continue_block.is_some());
             }
             other => panic!("expected Until, got {other:?}"),
+        }
+    }
+
+    // ── Fat comma autoquoting test ────────────────────────────
+
+    #[test]
+    fn parse_fat_comma_autoquote() {
+        // key => value — key should be a StringLit, not a FuncCall
+        let e = parse_expr_str("key => 42;");
+        match &e.kind {
+            ExprKind::List(items) => {
+                assert!(matches!(items[0].kind, ExprKind::StringLit(_)));
+            }
+            other => panic!("expected List with StringLit first, got {other:?}"),
+        }
+    }
+
+    // ── Ampersand prefix call tests ───────────────────────────
+
+    #[test]
+    fn parse_ampersand_call() {
+        let e = parse_expr_str("&foo(1, 2);");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ampersand_coderef() {
+        let e = parse_expr_str("&$coderef(1);");
+        assert!(matches!(e.kind, ExprKind::MethodCall(_, _, _)));
+    }
+
+    #[test]
+    fn parse_ampersand_bare() {
+        // &foo with no parens — call with current @_
+        let e = parse_expr_str("&foo;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── Hash dereference tests ────────────────────────────────
+
+    #[test]
+    fn parse_hash_deref() {
+        let e = parse_expr_str("%$ref;");
+        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Hash, _)));
+    }
+
+    #[test]
+    fn parse_hash_deref_block() {
+        let e = parse_expr_str("%{$ref};");
+        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Hash, _)));
+    }
+
+    // ── Glob / typeglob tests ─────────────────────────────────
+
+    #[test]
+    fn parse_glob_var() {
+        let e = parse_expr_str("*foo;");
+        assert!(matches!(e.kind, ExprKind::GlobVar(_)));
+    }
+
+    #[test]
+    fn parse_glob_deref() {
+        let e = parse_expr_str("*$ref;");
+        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Glob, _)));
+    }
+
+    // ── Chained arrow calls test ──────────────────────────────
+
+    #[test]
+    fn parse_chained_arrow_calls() {
+        let e = parse_expr_str("$obj->foo->bar->baz;");
+        // Should be deeply nested MethodCall(MethodCall(MethodCall(...)))
+        match &e.kind {
+            ExprKind::MethodCall(inner, name, _) => {
+                assert_eq!(name, "baz");
+                assert!(matches!(inner.kind, ExprKind::MethodCall(_, _, _)));
+            }
+            other => panic!("expected chained MethodCall, got {other:?}"),
+        }
+    }
+
+    // ── Octal literal test ────────────────────────────────────
+
+    #[test]
+    fn lex_legacy_octal() {
+        let prog = parse("my $x = 0777;");
+        match &prog.statements[0].kind {
+            StmtKind::My(_, Some(init)) => {
+                match &init.kind {
+                    ExprKind::IntLit(n) => assert_eq!(*n, 0o777), // 511 decimal
+                    other => panic!("expected IntLit, got {other:?}"),
+                }
+            }
+            other => panic!("expected My, got {other:?}"),
+        }
+    }
+
+    // ── require test ──────────────────────────────────────────
+
+    #[test]
+    fn parse_require() {
+        let e = parse_expr_str("require Foo::Bar;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "require");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected require call, got {other:?}"),
         }
     }
 }
