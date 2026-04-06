@@ -80,11 +80,9 @@ pub struct Parser<'src> {
     lexer: Lexer<'src>,
     /// Cached current token with the lexer state that produced it.
     /// `None` means no token is cached — the next peek/advance will lex.
-    /// The `usize` is the lexer byte position *before* this token was
-    /// lexed, and the `Expect` is the expect state used to lex it.
-    /// If the current `self.expect` differs from the stored expect,
-    /// the token is stale and must be re-lexed.
-    current: Option<(Spanned, usize, Expect)>,
+    /// Fields: (token, pre_lex_pos, pre_lex_context_depth, expect_used).
+    /// On rewind, both position and context stack are restored.
+    current: Option<(Spanned, usize, usize, Expect)>,
     expect: Expect,
     errors: Vec<ParseError>,
     depth: ParseDepth,
@@ -102,27 +100,27 @@ impl<'src> Parser<'src> {
 
     /// Ensure `self.current` holds a token lexed under the current
     /// expect state.  If the cached token was lexed under a different
-    /// expect, rewind the lexer and re-lex.
+    /// expect, rewind the lexer (position + context stack) and re-lex.
     fn ensure_current(&mut self) {
         match &self.current {
-            Some((_, _, cached_expect)) if *cached_expect == self.expect => {
-                // Cache is valid — lexed under the same expect state.
+            Some((_, _, _, cached_expect)) if *cached_expect == self.expect => {
                 return;
             }
-            Some((_, pre_lex_pos, _)) => {
-                // Cache is stale — expect has changed since we lexed.
-                // Rewind the lexer to before this token and re-lex.
+            Some((_, pre_lex_pos, pre_lex_ctx_depth, _)) => {
                 let pos = *pre_lex_pos;
+                let ctx_depth = *pre_lex_ctx_depth;
                 self.lexer.set_pos(pos);
+                self.lexer.restore_context_depth(ctx_depth);
                 self.current = None;
             }
             None => {}
         }
 
         let pre_lex_pos = self.lexer.pos();
+        let pre_lex_ctx_depth = self.lexer.context_depth();
         let spanned =
             self.lexer.next_token(&self.expect).unwrap_or(Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) });
-        self.current = Some((spanned, pre_lex_pos, self.expect));
+        self.current = Some((spanned, pre_lex_pos, pre_lex_ctx_depth, self.expect));
     }
 
     fn peek(&mut self) -> &Token {
@@ -583,6 +581,9 @@ impl<'src> Parser<'src> {
             Token::FloatLit(n) => Ok(Expr { kind: ExprKind::FloatLit(n), span }),
             Token::StrLit(s) => Ok(Expr { kind: ExprKind::StringLit(s), span }),
 
+            // Interpolating string: collect sub-tokens into AST.
+            Token::QuoteBegin(_, _) => self.parse_interpolated_string(span),
+
             Token::ScalarVar(name) => {
                 let expr = Expr { kind: ExprKind::ScalarVar(name), span };
                 self.maybe_postfix_subscript(expr)
@@ -825,6 +826,61 @@ impl<'src> Parser<'src> {
         Ok(expr)
     }
 
+    // ── Interpolated string assembly ──────────────────────────
+
+    /// Collect sub-tokens after a `QuoteBegin` into an AST node.
+    /// Produces `StringLit` if no interpolation, `InterpolatedString` otherwise.
+    fn parse_interpolated_string(&mut self, start_span: Span) -> Result<Expr, ParseError> {
+        let mut parts: Vec<StringPart> = Vec::new();
+        let mut has_interp = false;
+
+        loop {
+            match self.peek().clone() {
+                Token::QuoteEnd => {
+                    let end = self.peek_span();
+                    self.advance();
+                    let span = start_span.merge(end);
+
+                    // Optimize: if no interpolation, collapse to a plain string.
+                    if !has_interp {
+                        let s: String = parts
+                            .into_iter()
+                            .map(|p| match p {
+                                StringPart::Const(s) => s,
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        return Ok(Expr { kind: ExprKind::StringLit(s), span });
+                    }
+
+                    // Merge adjacent Const segments.
+                    let merged = merge_string_parts(parts);
+                    return Ok(Expr { kind: ExprKind::InterpolatedString(merged), span });
+                }
+                Token::ConstSegment(s) => {
+                    self.advance();
+                    parts.push(StringPart::Const(s));
+                }
+                Token::InterpScalar(name) => {
+                    self.advance();
+                    has_interp = true;
+                    parts.push(StringPart::ScalarInterp(name));
+                }
+                Token::InterpArray(name) => {
+                    self.advance();
+                    has_interp = true;
+                    parts.push(StringPart::ArrayInterp(name));
+                }
+                Token::Eof => {
+                    return Err(ParseError::new("unterminated interpolated string", self.peek_span()));
+                }
+                other => {
+                    return Err(ParseError::new(format!("unexpected token in string: {other:?}"), self.peek_span()));
+                }
+            }
+        }
+    }
+
     // ── Operator parsing ──────────────────────────────────────
 
     fn peek_op_info(&mut self) -> Option<OpInfo> {
@@ -1034,6 +1090,21 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::Keyword(Keyword::Or) => Ok(BinOp::LowOr),
         other => Err(ParseError::new(format!("not a binary operator: {other:?}"), Span::DUMMY)),
     }
+}
+
+/// Merge adjacent `Const` segments in an interpolated string.
+fn merge_string_parts(parts: Vec<StringPart>) -> Vec<StringPart> {
+    let mut merged: Vec<StringPart> = Vec::new();
+    for part in parts {
+        if let StringPart::Const(s) = &part {
+            if let Some(StringPart::Const(prev)) = merged.last_mut() {
+                prev.push_str(s);
+                continue;
+            }
+        }
+        merged.push(part);
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -1262,5 +1333,81 @@ mod tests {
     fn parse_ref_and_deref() {
         let e = parse_expr_str("\\$x;");
         assert!(matches!(e.kind, ExprKind::Ref(_)));
+    }
+
+    // ── Interpolation tests ───────────────────────────────────
+
+    #[test]
+    fn parse_plain_double_string() {
+        // No interpolation — collapses to StringLit.
+        let e = parse_expr_str(r#""hello world";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "hello world"),
+            other => panic!("expected StringLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_interp_string() {
+        let e = parse_expr_str(r#""Hello, $name!";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert_eq!(parts.len(), 3);
+                assert!(matches!(&parts[0], StringPart::Const(s) if s == "Hello, "));
+                assert!(matches!(&parts[1], StringPart::ScalarInterp(s) if s == "name"));
+                assert!(matches!(&parts[2], StringPart::Const(s) if s == "!"));
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_interp_multiple_vars() {
+        let e = parse_expr_str(r#""$x and $y";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert_eq!(parts.len(), 3);
+                assert!(matches!(&parts[0], StringPart::ScalarInterp(s) if s == "x"));
+                assert!(matches!(&parts[1], StringPart::Const(s) if s == " and "));
+                assert!(matches!(&parts[2], StringPart::ScalarInterp(s) if s == "y"));
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_interp_array() {
+        let e = parse_expr_str(r#""items: @list""#);
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], StringPart::Const(s) if s == "items: "));
+                assert!(matches!(&parts[1], StringPart::ArrayInterp(s) if s == "list"));
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_string_concat_interp() {
+        // Interpolated string in a concat expression.
+        let e = parse_expr_str(r#""Hello, $name!" . " Bye!""#);
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Concat, _, _)));
+    }
+
+    #[test]
+    fn parse_escaped_no_interp() {
+        // \$ suppresses interpolation — should be plain StringLit.
+        let e = parse_expr_str(r#""price: \$100";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "price: $100"),
+            other => panic!("expected StringLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_interp_string() {
+        let prog = parse(r#"print "Hello, $name!\n";"#);
+        assert_eq!(prog.statements.len(), 1);
     }
 }
