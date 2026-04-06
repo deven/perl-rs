@@ -355,9 +355,12 @@ impl<'src> Lexer<'src> {
             // Integer
             let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
             let s = s.replace('_', "");
-            // Legacy octal: 0NNN where all digits are 0-7.
-            // Perl 5 treats leading-zero integers as octal.
-            if s.len() > 1 && s.starts_with('0') && s.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            // Leading zero means octal in Perl 5.
+            if s.len() > 1 && s.starts_with('0') {
+                // Check for illegal octal digits (8, 9).
+                if let Some(bad) = s.bytes().skip(1).find(|b| *b == b'8' || *b == b'9') {
+                    return Err(ParseError::new(format!("Illegal octal digit '{}'", bad as char), Span::new(start as u32, self.pos as u32)));
+                }
                 let n = i64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", Span::new(start as u32, self.pos as u32)))?;
                 Ok(Token::IntLit(n))
             } else {
@@ -414,6 +417,12 @@ impl<'src> Lexer<'src> {
                 break;
             }
         }
+        // Check for illegal binary digits (2-9)
+        if let Some(b) = self.peek_byte() {
+            if b.is_ascii_digit() {
+                return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), Span::new(start as u32, self.pos as u32 + 1)));
+            }
+        }
         let s = std::str::from_utf8(&self.src[bin_start..self.pos]).unwrap().replace('_', "");
         let n = i64::from_str_radix(&s, 2).map_err(|_| ParseError::new("invalid binary literal", Span::new(start as u32, self.pos as u32)))?;
         Ok(Token::IntLit(n))
@@ -428,6 +437,12 @@ impl<'src> Lexer<'src> {
                 self.pos += 1;
             } else {
                 break;
+            }
+        }
+        // Check for illegal octal digits (8, 9)
+        if let Some(b) = self.peek_byte() {
+            if b == b'8' || b == b'9' {
+                return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), Span::new(start as u32, self.pos as u32 + 1)));
             }
         }
         let s = std::str::from_utf8(&self.src[oct_start..self.pos]).unwrap().replace('_', "");
@@ -1927,5 +1942,55 @@ mod tests {
             }
             other => panic!("expected StrLit for q{{}}, got {other:?}"),
         }
+    }
+
+    // ── Octal literal tests ───────────────────────────────────
+
+    #[test]
+    fn lex_legacy_octal() {
+        let tokens = lex_all("0777");
+        assert_eq!(tokens, vec![Token::IntLit(0o777)]);
+    }
+
+    #[test]
+    fn lex_zero_alone() {
+        let tokens = lex_all("0");
+        assert_eq!(tokens, vec![Token::IntLit(0)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Illegal octal digit '8'")]
+    fn lex_illegal_octal_digit() {
+        lex_all("08");
+    }
+
+    #[test]
+    #[should_panic(expected = "Illegal octal digit '9'")]
+    fn lex_illegal_octal_digit_9() {
+        lex_all("09");
+    }
+
+    #[test]
+    #[should_panic(expected = "Illegal octal digit '8'")]
+    fn lex_illegal_explicit_octal_digit() {
+        lex_all("0o78");
+    }
+
+    #[test]
+    #[should_panic(expected = "Illegal binary digit '2'")]
+    fn lex_illegal_binary_digit() {
+        lex_all("0b12");
+    }
+
+    #[test]
+    fn lex_valid_binary() {
+        let tokens = lex_all("0b1010");
+        assert_eq!(tokens, vec![Token::IntLit(0b1010)]);
+    }
+
+    #[test]
+    fn lex_valid_explicit_octal() {
+        let tokens = lex_all("0o77");
+        assert_eq!(tokens, vec![Token::IntLit(0o77)]);
     }
 }
