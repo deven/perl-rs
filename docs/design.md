@@ -706,28 +706,123 @@ make fundamental tokenization decisions:
 
 The lexer and parser are therefore not independent.  They share state
 through an explicit expectation mechanism, analogous to `PL_expect` and
-`PL_lex_state` in `toke.c`.
+`PL_lex_state` in `toke.c`.  Both live in the `perl-parser` crate as
+`pub(crate)` modules — the crate boundary is at the AST level.
 
 ### 5.2 Expectation-Based Tokenization
 
-The lexer should carry an explicit `Expect` state set by the parser after
-consuming each token:
+The parser maintains an `Expect` state, updated after consuming
+each token and consulted by the lexer before tokenizing the next
+one.  This is the mechanism that resolves `/` as regex-vs-division,
+`{` as block-vs-hash, and barewords as various different token types.
+
+Perl 5's `PL_expect` is a flat enum with 11 states.  Analysis of
+how those states are actually used in `toke.c` reveals that they
+encode three orthogonal concerns in one value:
+
+1. **Base lexical mode.**  How does `/` tokenize?  Is a bareword
+   a potential label?  Is `->` being processed?
+
+2. **Brace disposition.**  When `{` is encountered, is it a statement
+   block, a block-expression, a block argument, or a hash?  What
+   should follow the matching `}`?
+
+3. **Attribute flag.**  Are `:attributes` allowed before the next
+   block?
+
+Rather than reproducing Perl 5's flat enum, we decompose these:
 
 ```rust
-enum Expect {
-    Operator,     // next token is an operator or statement terminator
-    Operand,      // next token is a term (variable, literal, prefix op)
-    BlockOrHash,  // next '{' could be a block or hashref
-    SubName,      // next token is a subroutine name
-    Label,        // next token might be a label
-    // ... other states as needed
+/// What kind of token the lexer should produce next.
+enum BaseExpect {
+    /// Expecting a value, prefix operator, keyword.
+    /// `/` starts a regex.
+    Term,
+
+    /// Expecting an infix/postfix operator.
+    /// `/` is division.
+    Operator,
+
+    /// Start of a statement.  Like Term, but labels are allowed
+    /// and statement-level declarations (format, sub) are valid.
+    Statement,
+
+    /// After `->`.  The next token is a method name, subscript
+    /// key, or sigil for postfix deref.
+    Ref,
+
+    /// After `->` for postfix dereference syntax (`$ref->@*`).
+    Postderef,
+}
+
+/// How to handle `{` when it's encountered.
+enum BraceDisposition {
+    /// Use parser position and local token context to determine
+    /// whether `{` is a block or hash.  This is the default when
+    /// no explicit brace disposition has been set.  The decision
+    /// uses only the current parser position (term vs operator)
+    /// and immediate token context — not arbitrary lookbehind or
+    /// semantic analysis.
+    Infer,
+
+    /// `{` is a statement block.  After `}`, expect a statement.
+    /// Used after `if (expr)`, `while (expr)`, etc.
+    Block,
+
+    /// `{` is a block-expression.  After `}`, expect an operator.
+    /// Used for `do { }`, anonymous subs, etc.
+    BlockExpr,
+
+    /// `{` is a block argument.  After `}`, expect a term.
+    /// Used after `->method` where the block is an argument.
+    BlockArg,
+
+    /// `{` is a hash constructor.
+    /// Used after filetest operators (the XTERMORDORDOR case).
+    Hash,
+}
+
+/// Combined expectation state.
+struct Expect {
+    base: BaseExpect,
+    brace: BraceDisposition,
+    allow_attributes: bool,
 }
 ```
 
-The parser updates this after every shift/reduce.  The lexer reads it
-before tokenizing the next token.  This is the mechanism that resolves
-`/` as regex-vs-division, `{` as block-vs-hashref, and barewords as
-various different token types.
+This maps to Perl 5's states as follows:
+
+| Perl 5 state | `base` | `brace` | `allow_attributes` |
+|---|---|---|---|
+| XOPERATOR | Operator | Infer | false |
+| XTERM | Term | Infer | false |
+| XSTATE | Statement | Infer | false |
+| XBLOCK | Term | Block | false |
+| XREF | Ref | Infer | false |
+| XPOSTDEREF | Postderef | Infer | false |
+| XATTRBLOCK | Term | Block | true |
+| XATTRTERM | Term | BlockExpr | true |
+| XTERMBLOCK | Term | BlockExpr | false |
+| XBLOCKTERM | Term | BlockArg | false |
+| XTERMORDORDOR | Operator | Hash | false |
+
+XTERMORDORDOR (Perl 5's self-described "evil hack" for filetest
+operators) is the one state that doesn't decompose cleanly.  It's
+operator-like for `/` (recognizes `//` as defined-or) but term-like
+for some other purposes.  The `Operator` base with `Hash` brace
+disposition captures its main observable behavior: after `-f $file`,
+a following `//` is the defined-or operator (not a regex), and a
+following `{` is a hash constructor.  If testing against Perl 5
+reveals additional edge semantics, they should be modeled as a
+targeted special case rather than expanding the core expectation
+model.
+
+The benefit of this decomposition: the lexer consults
+`expect.base` for the `/` decision and `expect.brace` for the
+`{` decision, rather than switching on 11 states in both places.
+Adding a new combination (like "term-like with attributes but
+block-as-argument disposition") is a different combination of
+existing values, not a new enum variant.
 
 ### 5.3 Symbol Table Feedback
 
@@ -738,6 +833,10 @@ resolve:
 - Whether a name refers to a constant sub (to inline the value)
 - Whether a name has been imported into the current package
 - Whether a `CONSTANT` pragma or `use overload` is active
+
+Prototype knowledge in particular affects not just lexical
+classification but also how the parser subsequently handles the
+argument list (see §6.3).
 
 This should be implemented as a callback or shared reference from the
 lexer to the symbol table, not by embedding the symbol table inside the
@@ -818,19 +917,23 @@ The lexer should:
 For multiple heredocs on one line (`<<A . <<B`), they are queued in order
 and collected sequentially.
 
+Literal heredocs (`<<'TAG'`) emit the body as a single string token.
+Interpolating heredocs (`<<"TAG"` or `<<TAG`) emit the body as a
+stream of quote/interpolation sub-tokens (§5.4), using the same
+mechanism as double-quoted strings.
+
 For heredocs inside interpolating contexts (the `s///` heredoc-in-
 substitution case), the heredoc context must be able to walk up the context
 stack to find the right source buffer for body collection — mirroring
 Perl 5's `LEXSHARED` walk in `scan_heredoc()`.
 
-### 5.6 Raw Token Layer
+### 5.6 Token Categories
 
-The lexer should emit raw tokens that are close to `toke.c`'s output
-categories, not simplified parser-convenience tokens.  A separate adapter
-can map raw tokens to parser tokens during the bootstrapping period when
-the parser is still evolving.
+The lexer emits tokens that already reflect context-sensitive
+disambiguation (§5.2).  The parser consumes these directly — there
+is no separate adapter or token-mapping layer.
 
-Core raw token categories:
+Core token categories:
 
 - Identifiers (barewords, with package qualification info)
 - Variables (`$`, `@`, `%`, `*` sigils, with name)
@@ -847,38 +950,287 @@ Core raw token categories:
 
 ## 6. Parser Architecture
 
-### 6.1 Pratt Parsing with Precedence Climbing
+### 6.1 Expression Parsing Algorithm
 
-Perl's grammar as described in `perly.y` is an operator-precedence grammar
-with many special forms.  A **Pratt parser** (top-down operator
-precedence) is an excellent fit for Rust because:
+Pratt parsing is used for expression assembly only.  Statement
+lists, declarations, blocks, and other top-level grammatical forms
+are handled by ordinary recursive descent that invokes `parse_expr`
+where an expression sub-grammar is needed.
 
-- It handles precedence and associativity naturally without a grammar file.
-- It is easy to extend with new operators or syntax.
-- It handles prefix, infix, and postfix operators cleanly.
-- It gives excellent error messages with minimal effort.
-- It can be written as straightforward recursive Rust functions.
+Expression parsing uses precedence climbing (the Pratt algorithm)
+with clear naming that avoids the original paper's cryptic
+terminology.
 
-The parser should be structured as:
+**Three core components on `Parser`:**
 
-1. A `parse_expr(min_precedence)` core using Pratt precedence climbing.
-2. Statement-level parsing functions for declarations, control flow, etc.
-3. Special-form parsers for `sub`, `my`/`our`/`local`, `use`/`no`, etc.
-4. A `parse_block()` that handles brace-delimited statement lists.
+`parse_term` — called when the parser expects the start of an
+expression.  Dispatches on the current token via a match: literals
+return AST nodes directly, prefix operators recurse into
+`parse_expr`, keywords like `if` and `sub` call dedicated helper
+methods.  Complex arms call out to helpers (`parse_if`,
+`parse_while`, `parse_sub_decl`, etc.) for readability.
+
+`parse_operator` — called when the parser has a left-hand expression
+and the next token is an infix/postfix operator that binds tightly
+enough.  Dispatches on the operator token: binary operators recurse
+into `parse_expr` for the right operand, postfix operators like `++`
+wrap the left operand, ternary `?:` parses the middle and right
+branches, `->` dispatches to method call or dereference parsing.
+
+`peek_op_info` — inspects the lookahead token in operator position and
+returns `Option<OpInfo>`.  `None` means the token is not valid in
+operator position (the expression ends here).  `Some(info)` provides
+the precedence and associativity for the precedence comparison.
+Operator lookup includes both built-in operators and those registered
+via plugins (§6.4).
+
+Parser position (term vs operator) is determined independently of
+plugin behavior.  Plugins only affect how tokens are interpreted
+within a given position — they cannot override the position itself.
+
+**The expression loop:**
+
+```rust
+type Precedence = u8;
+type ParseDepth = u16;  // compact; allows configurable limit up to 65535
+
+fn parse_expr(
+    &mut self,
+    min_prec: Precedence,
+    depth: ParseDepth,
+) -> Result<Ast, ParseError> {
+    let depth = self.descend(depth)?;
+    let token = self.advance();
+    let mut left = self.parse_term(token, depth)?;
+
+    while let Some(info) = self.peek_op_info()
+        && info.left_prec() >= min_prec
+    {
+        let token = self.advance();
+        left = self.parse_operator(token, left, depth)?;
+    }
+
+    Ok(left)
+}
+```
+
+This is recursive.  Each recursive call adds one stack frame for
+the right operand of an operator or a sub-expression inside a
+prefix construct.  Left-associative operator chains (`$a + $b + $c`)
+are handled by the loop, not by recursion — they add zero stack
+depth regardless of chain length.
+
+`parse_operator` always parses the right-hand side using
+`right_prec()` from the operator's `OpInfo`, regardless of whether
+the operator is built-in or provided by a plugin.  It must never
+use a fixed precedence (e.g., `parse_expr(0)`) for the RHS — doing
+so would silently break associativity.  This invariant ensures that
+precedence and associativity are enforced uniformly across all
+operators.
+
+**Nesting depth control:**
+
+Every parser entry point that descends into a new nested syntactic
+region calls `descend` exactly once on that entry.  This includes
+parser entry points such as `parse_expr`, `parse_block`, and
+`parse_statement` when they enter a new nested syntactic region.
+Helper methods that operate within an already-accounted-for region,
+including `parse_term` when called from `parse_expr`, do not call
+`descend` independently — the nesting was already accounted for by
+`parse_expr`.
+
+```rust
+fn descend(
+    &self,
+    depth: ParseDepth,
+) -> Result<ParseDepth, ParseError> {
+    if depth >= self.max_depth {
+        Err(self.error("nesting too deep"))
+    } else {
+        Ok(depth + 1)
+    }
+}
+```
+
+The default `max_depth` is set high enough to exceed Perl 5's
+actual limits (which are bounded by YYMAXDEPTH = 10,000 and the C
+call stack).  A configurable limit allows hardening against
+adversarial input without penalizing real code.
+
+**Precedence and associativity table:**
+
+Each infix operator has a single precedence number and an explicit
+associativity.  The left and right precedence values used by the
+algorithm are derived mechanically:
+
+```rust
+enum Assoc {
+    Left,    // right_prec = prec + 1
+    Right,   // right_prec = prec
+    Non,     // right_prec = prec + 1, error if chained
+}
+
+struct OpInfo {
+    prec: Precedence,
+    assoc: Assoc,
+}
+
+impl OpInfo {
+    fn left_prec(&self) -> Precedence {
+        self.prec
+    }
+
+    fn right_prec(&self) -> Precedence {
+        match self.assoc {
+            Assoc::Left | Assoc::Non => self.prec + 1,
+            Assoc::Right => self.prec,
+        }
+    }
+}
+```
+
+Left-associative: the right operand must bind strictly tighter,
+so same-precedence operators break out of recursion and are handled
+by the loop (attaching to the left).
+
+Right-associative: the right operand binds at the same level, so
+same-precedence operators are consumed by recursion (attaching to
+the right).
+
+Non-associative: same mechanics as left-associative, but
+`parse_operator` detects chaining by inspecting the left operand's
+top-level operator node (ignoring transparent grouping such as
+parentheses) — if it is the same non-associative operator, the
+parser reports a syntax error (e.g., `$a == $b == $c` is rejected).
+
+The precedence table is a match expression in `peek_op_info`,
+returning `OpInfo` with one number and one keyword per operator:
+
+```rust
+fn peek_op_info(&self) -> Option<OpInfo> {
+    match self.peek() {
+        Token::Or         => Some(OpInfo { prec: 2,  assoc: Assoc::Left }),
+        Token::And        => Some(OpInfo { prec: 4,  assoc: Assoc::Left }),
+        Token::Comma      => Some(OpInfo { prec: 6,  assoc: Assoc::Left }),
+        Token::Assign     => Some(OpInfo { prec: 8,  assoc: Assoc::Right }),
+        Token::Question   => Some(OpInfo { prec: 10, assoc: Assoc::Right }),
+        Token::DotDot     => Some(OpInfo { prec: 12, assoc: Assoc::Non }),
+        Token::LogOr      => Some(OpInfo { prec: 14, assoc: Assoc::Left }),
+        Token::LogAnd     => Some(OpInfo { prec: 16, assoc: Assoc::Left }),
+        Token::BitOr      => Some(OpInfo { prec: 18, assoc: Assoc::Left }),
+        Token::BitAnd     => Some(OpInfo { prec: 20, assoc: Assoc::Left }),
+        Token::NumEq      => Some(OpInfo { prec: 22, assoc: Assoc::Non }),
+        Token::StrEq      => Some(OpInfo { prec: 22, assoc: Assoc::Non }),
+        Token::NumLt      => Some(OpInfo { prec: 24, assoc: Assoc::Non }),
+        Token::StrLt      => Some(OpInfo { prec: 24, assoc: Assoc::Non }),
+        Token::Shift      => Some(OpInfo { prec: 26, assoc: Assoc::Left }),
+        Token::Plus       => Some(OpInfo { prec: 28, assoc: Assoc::Left }),
+        Token::Minus      => Some(OpInfo { prec: 28, assoc: Assoc::Left }),
+        Token::Star       => Some(OpInfo { prec: 30, assoc: Assoc::Left }),
+        Token::Slash      => Some(OpInfo { prec: 30, assoc: Assoc::Left }),
+        Token::Percent    => Some(OpInfo { prec: 30, assoc: Assoc::Left }),
+        Token::Match      => Some(OpInfo { prec: 32, assoc: Assoc::Left }),
+        Token::Pow        => Some(OpInfo { prec: 36, assoc: Assoc::Right }),
+        Token::Arrow      => Some(OpInfo { prec: 40, assoc: Assoc::Left }),
+        // ...
+        _ => None,
+    }
+}
+```
+
+Prefix operators do not have associativity — they have only a right
+precedence that controls how tightly they bind to their operand.
+This is a separate lookup used inside `parse_term`, not part of the
+infix precedence table.
+
+**Plugin integration:**
+
+Standard tokens are dispatched via match arms in `parse_term`,
+`parse_operator`, and `peek_op_info`.  User-defined syntax
+extensions (keyword plugins, infix plugins from §6.4) are handled
+as a fallthrough at the end of the match:
+
+```rust
+fn parse_term(&mut self, token: Token, depth: ParseDepth) -> Result<Ast, ParseError> {
+    match token {
+        Token::IntLit(n) => Ok(Ast::Int(n, self.span())),
+        Token::If => self.parse_if_expr(depth),
+        // ... all standard tokens ...
+
+        // Plugin fallthrough
+        Token::Bareword(name) => {
+            if let Some(plugin) = self.keyword_plugin(&name) {
+                plugin.parse(self.as_parser_context(), depth)
+            } else {
+                // ... standard bareword handling ...
+            }
+        }
+        _ => Err(self.error("expected expression")),
+    }
+}
+```
+
+Plugins use trait objects for dynamic dispatch (`Box<dyn
+KeywordPlugin>`).  Standard tokens use static match arms.  The
+overhead of trait object dispatch applies only to plugin-defined
+syntax, not to the core language.
+
+**Layer separation:**
+
+The parser operates on three cleanly separated layers:
+
+1. **Tokenization** resolves context-sensitive lexical ambiguities
+   (regex vs division, block vs hash, bareword vs keyword) using the
+   `Expect` state.  The result is a token stream whose variants
+   already encode those decisions.
+
+2. **Parser position** (term vs operator) determines which parse
+   method is called.  `parse_term` handles tokens at the start of
+   an expression.  `parse_operator` handles tokens after a left-hand
+   expression.  `peek_op_info` determines whether an operator
+   binds in the current context.
+
+3. **Construct-specific parsing** handles the interior of each
+   syntactic form.  `parse_if`, `parse_while`, `parse_sub_decl`,
+   and similar helpers are plain recursive descent, called from
+   `parse_term` arms.  They call `parse_expr` for sub-expressions,
+   completing the mutual recursion.
+
+Lexical context determines which token variant is produced.
+Parser position determines which parse method is called.
+A parse method does not inspect lexer expectation state.
+
+Although the parser is Pratt-style and token-directed in structure,
+parse dispatch is parser-owned.  Token variants encode lexical
+disambiguation; `Parser` methods interpret those variants by match
+dispatch in `parse_term`, `parse_operator`, and `peek_op_info`.
 
 ### 6.2 Parser–Lexer Feedback
 
-After consuming each token, the parser must update the lexer's `Expect`
-state.  This is not optional.  Examples:
+After consuming each token or completing a syntactic construct, the
+parser must update the `Expect` state (§5.2).  This is not optional.
+Examples:
 
-- After consuming `print`: set `Expect::Operand` (the next thing is
-  an argument list, so `/` is a regex, not division).
-- After consuming a closing `)` of a sub call: set `Expect::Operator`.
-- After consuming `sub`: set `Expect::SubName`.
-- After consuming `{` as a block opener: set `Expect::Operand`.
+- After consuming a token classified as a named unary or list
+  operator (e.g., `print`, `die`, `chomp`): set base to `Term`
+  (the next thing is an argument list, so `/` is a regex, not
+  division).
+- After completing a term or postfix expression: set base to
+  `Operator`.
+- After parsing a construct that requires a following block
+  (e.g., `if (expr)`, `while (expr)`, `for ...`): set base to
+  `Term`, brace to `Block`.
+- After parsing `sub name` (where a prototype, attributes, and body
+  may follow): set base to `Term`, brace to `Block`,
+  `allow_attributes` to `true`.
+- After consuming `->`: set base to `Ref`.
+- After consuming a filetest operator (`-f`): set base to
+  `Operator`, brace to `Hash` (the XTERMORDORDOR case).
 
-This is implemented by having the parser call `lexer.set_expect(...)` at
-the appropriate points.
+Since the lexer and parser share the `Parser` struct, this is a
+field assignment (e.g., `self.expect.base = BaseExpect::Term`) at
+the appropriate points in `parse_term`, `parse_operator`, and their
+helpers.  No cross-object communication is needed.
 
 ### 6.3 Prototype-Guided Parsing
 
@@ -954,25 +1306,26 @@ fn init(&self, compiler: &mut Compiler) {
 
 ```rust
 trait InfixPlugin: Send + Sync {
-    /// Precedence level for this operator.
-    fn precedence(&self) -> Precedence;
-
-    /// Build the op tree for `lhs OP rhs`.
+    /// Build the AST node for `lhs OP rhs`.
+    ///
+    /// The core parser has already parsed both operands using the
+    /// registered `OpInfo` to determine precedence and associativity.
+    /// The plugin only builds the resulting AST node — it does not
+    /// participate in precedence mechanics.
     fn build_op(
         &self,
-        parser: &mut ParserContext,
         lhs: AstNode,
         rhs: AstNode,
     ) -> AstNode;
 
-    /// If true and the lexer is in term position, this symbol
+    /// If true and the parser is in term position, this symbol
     /// produces a term (closure, prefix construct) instead of
     /// being an infix operator.  This fixes the Perl 5 limitation
     /// that prevents bare |args| closures.
     fn term_in_term_position(&self) -> bool { false }
 
-    /// Build the term op when in term position.
-    /// Only called when term_in_term_position() returns true
+    /// Build the term AST when in term position.
+    /// Only called when `term_in_term_position()` returns true
     /// and the parser is expecting a term.
     fn build_term(
         &self,
@@ -981,22 +1334,48 @@ trait InfixPlugin: Send + Sync {
 }
 ```
 
+The core parser drives plugin operators identically to built-in
+operators: look up the registered `OpInfo`, compute `right_prec()`
+from the precedence and associativity, parse both operands, and
+call the plugin's `build_op` with the results.  The plugin never
+touches precedence mechanics — the Pratt contract is enforced
+entirely by the core parser.  This makes it impossible for a plugin
+to accidentally break precedence or associativity.
+
+When a token has both built-in and plugin-defined behavior, the
+plugin takes precedence.  This allows plugins to override built-in
+operators (e.g., replacing `|` with a dual-mode version).  When
+multiple plugins register the same symbol, they are consulted in
+registration order; the first registered plugin for the symbol is
+used.
+
+`peek_op_info` consults both the built-in operator table and
+registered plugin operators, so plugin operators participate in
+precedence comparison on equal footing with built-ins.
+
 The `term_in_term_position` method is the key improvement over Perl 5.
 It lets a single symbol like `|` act as an infix operator in operator
 position and as a term-producing prefix in term position — exactly the
 `/` (division vs regex) pattern that Perl's own lexer already uses
 internally but does not expose to plugins.
 
-Extensions register operators at load time:
+Note: the `|` closure example is an extension capability
+demonstration, not a claim about Perl core syntax.
+
+Precedence and associativity are provided at registration time, not
+as a trait method — this makes operator metadata explicit at the
+registration point and decouples it from parse behavior:
 
 ```rust
 compiler.register_infix_operator(
     "\\\\",    // the \\ symbol from ExistsOr
+    OpInfo { prec: 16, assoc: Assoc::Left },
     Box::new(ExistsOrPlugin),
 );
 
 compiler.register_infix_operator(
     "|",      // dual-mode: bitwise-or in op position, closure in term position
+    OpInfo { prec: 18, assoc: Assoc::Left },
     Box::new(ClosureOrBitOrPlugin),
 );
 ```
@@ -1004,7 +1383,12 @@ compiler.register_infix_operator(
 **Parser context API:**
 
 The `ParserContext` passed to plugins provides the recursive descent
-API that plugins need to parse sub-expressions:
+API that plugins need to parse sub-expressions.  `ParserContext`
+manages `ParseDepth` internally — it calls `descend` on each
+recursive entry point, so plugins participate in the same nesting
+limit as the core parser without threading depth explicitly.
+`ParserContext` is a thin mutable façade over the active `Parser`,
+not a separate parser instance:
 
 ```rust
 impl ParserContext {
@@ -1030,7 +1414,7 @@ impl ParserContext {
     fn advance(&mut self) -> Token;
 
     /// Expect and consume a specific token, or error.
-    fn expect(&mut self, kind: TokenKind) -> Result<Token>;
+    fn expect_token(&mut self, kind: TokenKind) -> Result<Token>;
 
     /// Check whether the parser is in term or operator position.
     fn expecting_term(&self) -> bool;
@@ -1046,28 +1430,42 @@ impl ParserContext {
 
 **Precedence levels matching Perl 5:**
 
+Precedence levels are `u8` values with gaps for future insertion.
+Plugin operators register at a specific level from this table:
+
 ```rust
-enum Precedence {
-    Low,                 // PLUGIN_LOW_OP
-    LogicalOrLow,        // or
-    LogicalAndLow,       // and
-    Assign,              // = += etc.
-    Ternary,             // ?:
-    Range,               // ..
-    LogicalOr,           // || //
-    LogicalAnd,          // &&
-    BitwiseOr,           // |
-    BitwiseAnd,          // &
-    Equality,            // == eq
-    Relational,          // < gt
-    Shift,               // << >>
-    Additive,            // + -
-    Multiplicative,      // * / %
-    Matching,            // =~
-    Unary,               // ! ~ - (prefix)
-    Power,               // **
-    High,                // PLUGIN_HIGH_OP
-}
+// Approximate mapping (illustrative, not final):
+//  2  or
+//  4  and
+//  6  not (prefix)
+//  8  comma, =>
+// 10  assignment (=, +=, etc.)
+// 12  ternary (?:)
+// 14  range (..)
+// 16  || //
+// 18  &&
+// 20  | (bitwise)
+// 22  & (bitwise)
+// 24  == != eq ne <=> cmp
+// 26  < > <= >= lt gt le ge
+// 28  << >>
+// 30  + -
+// 32  * / % x
+// 34  =~ !~
+// 36  ! ~ \ (prefix unary)
+// 38  **
+// 40  ++ -- (pre/postfix)
+// 42  -> (arrow)
+```
+
+Plugin slots for custom operators at specific levels:
+
+```rust
+compiler.register_infix_operator(
+    "\\\\",    // ExistsOr
+    OpInfo { prec: 16, assoc: Assoc::Left },  // same level as ||
+    Box::new(ExistsOrPlugin),
+);
 ```
 
 **Advantages over Perl 5's mechanism:**
@@ -5636,60 +6034,66 @@ fn reference_identity() {
 }
 ```
 
-### Step 2: Lexer with sublexing (3-4 weeks)
+### Step 2: Lexer, parser, and AST (5-7 weeks)
 
-Build the lexer with the full context stack, sublexing, heredoc
-handling, and expectation-based tokenization.  Target passing
-`t/base/lex.t`.  This is the hardest front-end component and should
-be done thoroughly.
+Build the lexer and parser together in the `perl-parser` crate.
+The lexer and parser are inseparable — the lexer requires parser
+feedback (expectation state) to tokenize correctly, and the parser
+calls into the lexer with explicit expectations.  Build them
+incrementally in lockstep:
 
-### Step 3: Parser and AST (2-3 weeks)
+- Expectation state enum and token types
+- Main tokenizer loop dispatching on current character
+- Pratt parser with precedence climbing
+- Sublexing for quote-like constructs (`q//`, `qq//`, heredocs)
+- Keyword table and keyword-specific parsing
+- AST node types
 
-Build the Pratt parser producing a syntax-oriented AST.  Wire up the
-parser-lexer feedback loop.  Target parsing (not necessarily
-executing) the `t/base/` test files.
+Target passing `t/base/lex.t` and parsing the `t/base/` test files.
+This is the hardest front-end component and should be done
+thoroughly.
 
-### Step 4: Minimal interpreter via AST walking (1-2 weeks)
+### Step 3: Minimal interpreter via AST walking (1-2 weeks)
 
 Build a quick-and-dirty AST-walking interpreter — just enough to run
 `print`, basic arithmetic, string operations, conditionals, and
 loops.  This is throwaway scaffolding to get rapid feedback from the
 test suite.
 
-### Step 5: Compile-time execution (`BEGIN`, `use`) (1-2 weeks)
+### Step 4: Compile-time execution (`BEGIN`, `use`) (1-2 weeks)
 
 Implement the compilation/execution interleaving so that
 `use strict`, `use warnings`, `use constant`, and simple `BEGIN`
 blocks work.  This unblocks virtually all real Perl code.
 
-### Step 6: Lowering and IR (2-3 weeks)
+### Step 5: Lowering and IR (2-3 weeks)
 
 Build the HIR lowering and IR code generation.  Migrate the
 interpreter from AST walking to IR execution.  The AST walker can
 remain as a fallback during transition.
 
-### Step 7: Regex engine (3-4 weeks)
+### Step 6: Regex engine (3-4 weeks)
 
 Build the backtracking regex engine.  Target passing `t/base/pat.t`
 and then `t/op/re_tests`.
 
-### Step 8: Subroutines, closures, and packages (2-3 weeks)
+### Step 7: Subroutines, closures, and packages (2-3 weeks)
 
 Implement closure captures as `Vec<Value>` (not Perl 5-style pads),
 package declarations, method dispatch, and `@ISA`-based inheritance.
 
-### Step 9: Module loading (1-2 weeks)
+### Step 8: Module loading (1-2 weeks)
 
 Implement `require`, `use`, `do`, `@INC` search, and the standard
 import/export mechanisms.  Module registry for concurrent `require`
 (§13.11).
 
-### Step 10: Core builtins (ongoing)
+### Step 9: Core builtins (ongoing)
 
 Implement builtins incrementally, guided by which upstream tests are
 closest to passing.
 
-### Step 11: Concurrency (when core is stable)
+### Step 10: Concurrency (when core is stable)
 
 Implement per-value synchronization, `spawn`/`spawn blocking`/
 `spawn thread`, and Tokio integration.  The `Arc<RwLock<T>>` value
@@ -5697,17 +6101,17 @@ model is concurrent from day one; this step adds the multi-task
 execution paths, the Tokio event loop, and the cardinal invariant
 enforcement (§13.11).
 
-### Step 12: Typed layer (incremental, alongside other steps)
+### Step 11: Typed layer (incremental, alongside other steps)
 
 `let`/`fn` keyword registration and parsing can begin as soon as
-the parser exists (Step 3).  Type checking and typed IR generation
-build on Step 6.  `struct`/`enum`/`impl`/`trait` follow.  `extern fn`
+the parser exists (Step 2).  Type checking and typed IR generation
+build on Step 5.  `struct`/`enum`/`impl`/`trait` follow.  `extern fn`
 and AOT Rust codegen can proceed independently once the IR is stable.
 
-### Step 13: REPL (when interpreter is usable)
+### Step 12: REPL (when interpreter is usable)
 
 Build the `perl-repl` crate on `reedline` once the interpreter can
-execute basic code (after Step 4 or 5).  Start with simple
+execute basic code (after Step 3 or 4).  Start with simple
 expression evaluation and `dd()` output, then add introspection
 commands, tab completion, and syntax highlighting incrementally.
 
@@ -5720,13 +6124,12 @@ crates/
     perl-value/          # Value, Scalar, Arc-based types, magic
     perl-string/         # PerlString (octet + UTF-8 flag)
     perl-types/          # Typed value support, TypedVal trait
-    perl-lexer/          # Lexer with sublexing and context stack
-    perl-parser/         # Pratt parser, AST, match/closure syntax
+    perl-parser/         # Lexer + Pratt parser + AST (inseparable)
     perl-hir/            # HIR and lowering from AST
     perl-ir/             # IR definition and codegen from HIR
     perl-runtime/        # Interpreter, call frames, symbol tables
     perl-regex/          # Standalone regex engine (see §11)
-    perl-compiler/       # Orchestrates lex → parse → lower → codegen
+    perl-compiler/       # Orchestrates parse → lower → codegen
     perl-cli/            # Binary entry point, CLI arg handling
     perl-repl/           # Interactive REPL (reedline-based)
     perl-debug/          # DAP server, profiling, task inspection
@@ -5734,7 +6137,6 @@ crates/
 
 docs/
     design.md            # This document
-    lexer-notes.md       # Detailed lexer design notes
     compat-log.md        # Tracking compatibility decisions and divergences
 
 tests/
@@ -5743,10 +6145,34 @@ tests/
     integration/         # End-to-end Perl source tests
 ```
 
-Using a Cargo workspace with separate crates enforces clean boundaries:
-`perl-lexer` cannot accidentally depend on `perl-runtime` internals,
-the regex engine is independently testable and publishable, and the
-value model can be used by all layers without circular dependencies.
+The lexer and parser live in the same crate (`perl-parser`) because
+they are not separable — the lexer requires parser feedback
+(expectation state) to determine what a token is, and the parser
+calls into the lexer with explicit expectations.  Internally,
+`perl-parser` is organized as modules:
+
+```text
+perl-parser/
+    src/
+        lib.rs           # Public API: "give me source, get an AST"
+        token.rs         # Token enum, spans
+        lexer.rs         # Tokenizer, sublexing, heredocs
+        parser.rs        # Pratt parser, AST construction
+        ast.rs           # AST node types
+        keyword.rs       # Keyword table
+        expect.rs        # Expectation state enum
+```
+
+The lexer and parser are `pub(crate)` internals.  They share the
+`Expect` state on the `Parser` struct — the parser sets it, the
+lexer reads it when tokenizing the next token.  The crate boundary
+is at the AST level — downstream crates see only the AST.
+
+Using a Cargo workspace with separate crates enforces clean
+boundaries: `perl-parser` cannot accidentally depend on
+`perl-runtime` internals, the regex engine is independently
+testable and publishable, and the value model can be used by all
+layers without circular dependencies.
 
 `perl-regex` in particular is designed as an independently publishable
 crate with no dependency on the rest of the workspace (see §11).  It
