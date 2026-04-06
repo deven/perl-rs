@@ -173,8 +173,8 @@ impl Value {
             _ => {
                 let scalar = match std::mem::replace(self, Value::Undef) {
                     Value::Undef => Scalar::new_undef(),
-                    Value::Int(n) => Scalar::from_iv(n),
-                    Value::Float(n) => Scalar::from_nv(n),
+                    Value::Int(n) => Scalar::from_int(n),
+                    Value::Float(n) => Scalar::from_num(n),
                     Value::SmallStr(ss) => Scalar::from_perl_string(ss.to_perl_string()),
                     Value::Str(ps) => Scalar::from_perl_string(ps),
                     Value::Ref(target_sv) => Scalar::from_ref(Value::Scalar(target_sv)),
@@ -202,7 +202,7 @@ impl Value {
 
     /// Try to read as i64 without upgrading.
     /// Returns `None` for non-numeric compact types.
-    pub fn as_iv(&self) -> Option<i64> {
+    pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Int(n) => Some(*n),
             Value::Float(n) => Some(*n as i64),
@@ -211,7 +211,7 @@ impl Value {
     }
 
     /// Try to read as f64 without upgrading.
-    pub fn as_nv(&self) -> Option<f64> {
+    pub fn as_num(&self) -> Option<f64> {
         match self {
             Value::Int(n) => Some(*n as f64),
             Value::Float(n) => Some(*n),
@@ -336,16 +336,16 @@ mod tests {
     fn int_value() {
         let v = Value::from(42i64);
         assert!(v.is_defined());
-        assert_eq!(v.as_iv(), Some(42));
-        assert!((v.as_nv().unwrap() - 42.0).abs() < 1e-10);
+        assert_eq!(v.as_int(), Some(42));
+        assert!((v.as_num().unwrap() - 42.0).abs() < 1e-10);
     }
 
     #[test]
     fn float_value() {
         let v = Value::from(3.14f64);
         assert!(v.is_defined());
-        assert!((v.as_nv().unwrap() - 3.14).abs() < 1e-10);
-        assert_eq!(v.as_iv(), Some(3)); // truncation
+        assert!((v.as_num().unwrap() - 3.14).abs() < 1e-10);
+        assert_eq!(v.as_int(), Some(3)); // truncation
     }
 
     #[test]
@@ -365,8 +365,8 @@ mod tests {
 
     #[test]
     fn from_bool() {
-        assert_eq!(Value::from(true).as_iv(), Some(1));
-        assert_eq!(Value::from(false).as_iv(), Some(0));
+        assert_eq!(Value::from(true).as_int(), Some(1));
+        assert_eq!(Value::from(false).as_int(), Some(0));
     }
 
     #[test]
@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn reference_always_true() {
         // A reference is always true, even to a false value.
-        let sv = Arc::new(RwLock::new(Scalar::from_iv(0)));
+        let sv = Arc::new(RwLock::new(Scalar::from_int(0)));
         assert!(Value::Ref(sv).is_true());
     }
 

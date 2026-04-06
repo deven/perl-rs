@@ -38,12 +38,12 @@ pub struct Stash {
 ///
 /// Parallel representation slots with flag-driven validity, following
 /// Perl 5's SV model.  `$x = "42"` sets POK; `$x + 0` sets IOK and
-/// caches 42 in `iv` without clearing the string.
+/// caches 42 in `int` without clearing the string.
 ///
 /// # Flag Discipline
 ///
-/// - `iv` is meaningful only when `flags.contains(SvFlags::IOK)`.
-/// - `nv` is meaningful only when `flags.contains(SvFlags::NOK)`.
+/// - `int` is meaningful only when `flags.contains(SvFlags::IOK)`.
+/// - `num` is meaningful only when `flags.contains(SvFlags::NOK)`.
 /// - `pv` content is meaningful only when `flags.contains(SvFlags::POK)`.
 /// - `rv` is meaningful only when `flags.contains(SvFlags::ROK)`.
 ///
@@ -52,16 +52,16 @@ pub struct Stash {
 /// - Setting an integer: set IOK, clear POK and NOK (unless caching).
 ///
 /// Reading a missing representation triggers lazy coercion:
-/// - Reading iv when only POK is set: parse the string, cache in iv, set IOK.
+/// - Reading iv when only POK is set: parse the string, cache in int, set IOK.
 pub struct Scalar {
     /// Which representations are valid + metadata.
     pub(crate) flags: SvFlags,
 
     /// Integer representation.  Valid when IOK is set.
-    pub(crate) iv: i64,
+    pub(crate) int: i64,
 
     /// Float representation.  Valid when NOK is set.
-    pub(crate) nv: f64,
+    pub(crate) num: f64,
 
     /// String representation.  Valid when POK is set.
     /// Uses small-string optimization internally.
@@ -83,35 +83,35 @@ impl Scalar {
 
     /// Create an undef scalar (no flags set, no valid representations).
     pub fn new_undef() -> Self {
-        Scalar { flags: SvFlags::EMPTY, iv: 0, nv: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::EMPTY, int: 0, num: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from an integer.  IOK is set.
-    pub fn from_iv(n: i64) -> Self {
-        Scalar { flags: SvFlags::IOK, iv: n, nv: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+    pub fn from_int(n: i64) -> Self {
+        Scalar { flags: SvFlags::IOK, int: n, num: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from a float.  NOK is set.
-    pub fn from_nv(n: f64) -> Self {
-        Scalar { flags: SvFlags::NOK, iv: 0, nv: n, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+    pub fn from_num(n: f64) -> Self {
+        Scalar { flags: SvFlags::NOK, int: 0, num: n, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from a string.  POK is set.
     pub fn from_str(s: &str) -> Self {
         let mut pv = PerlStringSlot::None;
         pv.set_str(s);
-        Scalar { flags: SvFlags::POK | SvFlags::UTF8, iv: 0, nv: 0.0, pv, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::POK | SvFlags::UTF8, int: 0, num: 0.0, pv, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from a `PerlString`.  POK is set.
     pub fn from_perl_string(ps: PerlString) -> Self {
         let flags = if ps.is_utf8() { SvFlags::POK | SvFlags::UTF8 } else { SvFlags::POK };
-        Scalar { flags, iv: 0, nv: 0.0, pv: PerlStringSlot::Heap(ps), rv: None, magic: None, stash: None }
+        Scalar { flags, int: 0, num: 0.0, pv: PerlStringSlot::Heap(ps), rv: None, magic: None, stash: None }
     }
 
     /// Create a reference scalar.  ROK is set.
     pub fn from_ref(target: Value) -> Self {
-        Scalar { flags: SvFlags::ROK, iv: 0, nv: 0.0, pv: PerlStringSlot::None, rv: Some(target), magic: None, stash: None }
+        Scalar { flags: SvFlags::ROK, int: 0, num: 0.0, pv: PerlStringSlot::None, rv: Some(target), magic: None, stash: None }
     }
 
     // ── Flag accessors ────────────────────────────────────────────
@@ -167,12 +167,12 @@ impl Scalar {
 
         // Integer representation — check for zero.
         if self.flags.contains(SvFlags::IOK) {
-            return self.iv != 0;
+            return self.int != 0;
         }
 
         // Float representation — check for zero.
         if self.flags.contains(SvFlags::NOK) {
-            return self.nv != 0.0;
+            return self.num != 0.0;
         }
 
         // String representation — check for "" and "0".
@@ -188,27 +188,27 @@ impl Scalar {
 
     /// Get the integer value, coercing from other representations if needed.
     /// Caches the result by setting IOK.
-    pub fn get_iv(&mut self) -> i64 {
+    pub fn get_int(&mut self) -> i64 {
         if self.flags.contains(SvFlags::IOK) {
-            return self.iv;
+            return self.int;
         }
 
         // Try to coerce from float
         if self.flags.contains(SvFlags::NOK) {
-            self.iv = self.nv as i64;
+            self.int = self.num as i64;
             self.flags.insert(SvFlags::IOK);
-            return self.iv;
+            return self.int;
         }
 
         // Try to coerce from string
         if self.flags.contains(SvFlags::POK) {
             if let Some(ps) = self.pv.to_perl_string() {
-                self.iv = ps.parse_iv();
+                self.int = ps.parse_iv();
             } else {
-                self.iv = 0;
+                self.int = 0;
             }
             self.flags.insert(SvFlags::IOK);
-            return self.iv;
+            return self.int;
         }
 
         // Undef → 0
@@ -216,8 +216,8 @@ impl Scalar {
     }
 
     /// Set the integer value.  Sets IOK, clears NOK and POK.
-    pub fn set_iv(&mut self, n: i64) {
-        self.iv = n;
+    pub fn set_int(&mut self, n: i64) {
+        self.int = n;
         self.flags.insert(SvFlags::IOK);
         self.flags.remove(SvFlags::NOK | SvFlags::POK | SvFlags::UTF8);
         self.pv.clear();
@@ -227,33 +227,33 @@ impl Scalar {
 
     /// Get the float value, coercing from other representations if needed.
     /// Caches the result by setting NOK.
-    pub fn get_nv(&mut self) -> f64 {
+    pub fn get_num(&mut self) -> f64 {
         if self.flags.contains(SvFlags::NOK) {
-            return self.nv;
+            return self.num;
         }
 
         if self.flags.contains(SvFlags::IOK) {
-            self.nv = self.iv as f64;
+            self.num = self.int as f64;
             self.flags.insert(SvFlags::NOK);
-            return self.nv;
+            return self.num;
         }
 
         if self.flags.contains(SvFlags::POK) {
             if let Some(ps) = self.pv.to_perl_string() {
-                self.nv = ps.parse_nv();
+                self.num = ps.parse_nv();
             } else {
-                self.nv = 0.0;
+                self.num = 0.0;
             }
             self.flags.insert(SvFlags::NOK);
-            return self.nv;
+            return self.num;
         }
 
         0.0
     }
 
     /// Set the float value.  Sets NOK, clears IOK and POK.
-    pub fn set_nv(&mut self, n: f64) {
-        self.nv = n;
+    pub fn set_num(&mut self, n: f64) {
+        self.num = n;
         self.flags.insert(SvFlags::NOK);
         self.flags.remove(SvFlags::IOK | SvFlags::POK | SvFlags::UTF8);
         self.pv.clear();
@@ -264,20 +264,20 @@ impl Scalar {
     /// Get a string view, coercing from other representations if needed.
     /// Caches the result by setting POK.
     /// Returns `None` only for undef.
-    pub fn get_pv(&mut self) -> Option<&[u8]> {
+    pub fn get_bytes(&mut self) -> Option<&[u8]> {
         if self.flags.contains(SvFlags::POK) {
             return self.pv.as_bytes();
         }
 
         if self.flags.contains(SvFlags::IOK) {
-            let s = self.iv.to_string();
+            let s = self.int.to_string();
             self.pv.set_str(&s);
             self.flags.insert(SvFlags::POK | SvFlags::UTF8);
             return self.pv.as_bytes();
         }
 
         if self.flags.contains(SvFlags::NOK) {
-            let s = format_nv(self.nv);
+            let s = format_nv(self.num);
             self.pv.set_str(&s);
             self.flags.insert(SvFlags::POK | SvFlags::UTF8);
             return self.pv.as_bytes();
@@ -291,7 +291,7 @@ impl Scalar {
     /// Coerces if needed (numeric → string is always UTF-8).
     pub fn get_str(&mut self) -> Option<&str> {
         // Ensure pv is populated
-        self.get_pv()?;
+        self.get_bytes()?;
         self.pv.as_str()
     }
 
@@ -321,8 +321,8 @@ impl Scalar {
     pub fn set_rv(&mut self, target: Value) {
         self.rv = Some(target);
         self.flags = SvFlags::ROK;
-        self.iv = 0;
-        self.nv = 0.0;
+        self.int = 0;
+        self.num = 0.0;
         self.pv.clear();
     }
 
@@ -388,10 +388,10 @@ impl fmt::Debug for Scalar {
         let mut d = f.debug_struct("Scalar");
         d.field("flags", &self.flags);
         if self.flags.contains(SvFlags::IOK) {
-            d.field("iv", &self.iv);
+            d.field("int", &self.int);
         }
         if self.flags.contains(SvFlags::NOK) {
-            d.field("nv", &self.nv);
+            d.field("num", &self.num);
         }
         if self.flags.contains(SvFlags::POK) {
             d.field("pv", &self.pv);
@@ -423,18 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn from_iv() {
-        let mut sv = Scalar::from_iv(42);
+    fn from_int() {
+        let mut sv = Scalar::from_int(42);
         assert!(sv.flags().contains(SvFlags::IOK));
-        assert_eq!(sv.get_iv(), 42);
+        assert_eq!(sv.get_int(), 42);
         assert!(sv.is_defined());
     }
 
     #[test]
-    fn from_nv() {
-        let mut sv = Scalar::from_nv(3.14);
+    fn from_num() {
+        let mut sv = Scalar::from_num(3.14);
         assert!(sv.flags().contains(SvFlags::NOK));
-        assert!((sv.get_nv() - 3.14).abs() < 1e-10);
+        assert!((sv.get_num() - 3.14).abs() < 1e-10);
     }
 
     #[test]
@@ -447,16 +447,16 @@ mod tests {
 
     #[test]
     fn iv_to_nv_coercion() {
-        let mut sv = Scalar::from_iv(42);
+        let mut sv = Scalar::from_int(42);
         assert!(!sv.flags().contains(SvFlags::NOK));
-        let nv = sv.get_nv();
-        assert!((nv - 42.0).abs() < 1e-10);
+        let n = sv.get_num();
+        assert!((n - 42.0).abs() < 1e-10);
         assert!(sv.flags().contains(SvFlags::NOK)); // now cached
     }
 
     #[test]
     fn iv_to_str_coercion() {
-        let mut sv = Scalar::from_iv(42);
+        let mut sv = Scalar::from_int(42);
         assert!(!sv.flags().contains(SvFlags::POK));
         let s = sv.get_str();
         assert_eq!(s, Some("42"));
@@ -468,24 +468,24 @@ mod tests {
     fn str_to_iv_coercion() {
         let mut sv = Scalar::from_str("42abc");
         assert!(!sv.flags().contains(SvFlags::IOK));
-        let iv = sv.get_iv();
-        assert_eq!(iv, 42); // Perl-style: parse leading digits
+        let n = sv.get_int();
+        assert_eq!(n, 42); // Perl-style: parse leading digits
         assert!(sv.flags().contains(SvFlags::IOK)); // now cached
         assert!(sv.flags().contains(SvFlags::POK)); // still valid
     }
 
     #[test]
-    fn set_iv_clears_string() {
+    fn set_int_clears_string() {
         let mut sv = Scalar::from_str("hello");
         assert!(sv.flags().contains(SvFlags::POK));
-        sv.set_iv(99);
+        sv.set_int(99);
         assert!(sv.flags().contains(SvFlags::IOK));
         assert!(!sv.flags().contains(SvFlags::POK));
     }
 
     #[test]
     fn set_str_clears_numeric() {
-        let mut sv = Scalar::from_iv(42);
+        let mut sv = Scalar::from_int(42);
         assert!(sv.flags().contains(SvFlags::IOK));
         sv.set_str("hello");
         assert!(sv.flags().contains(SvFlags::POK));
@@ -502,8 +502,8 @@ mod tests {
         assert!(!sv.flags().contains(SvFlags::IOK));
 
         // Reading as integer triggers coercion and caching
-        let iv = sv.get_iv();
-        assert_eq!(iv, 42);
+        let n = sv.get_int();
+        assert_eq!(n, 42);
         assert!(sv.flags().contains(SvFlags::IOK)); // cached
         assert!(sv.flags().contains(SvFlags::POK)); // still valid
     }
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn readonly() {
-        let mut sv = Scalar::from_iv(42);
+        let mut sv = Scalar::from_int(42);
         assert!(!sv.is_readonly());
         sv.set_readonly();
         assert!(sv.is_readonly());
@@ -531,14 +531,14 @@ mod tests {
     #[test]
     fn undef_coerces_to_zero() {
         let mut sv = Scalar::new_undef();
-        assert_eq!(sv.get_iv(), 0);
-        assert!((sv.get_nv()).abs() < 1e-10);
+        assert_eq!(sv.get_int(), 0);
+        assert!((sv.get_num()).abs() < 1e-10);
     }
 
     #[test]
     fn undef_coerces_to_no_string() {
         let mut sv = Scalar::new_undef();
-        assert_eq!(sv.get_pv(), None);
+        assert_eq!(sv.get_bytes(), None);
         assert_eq!(sv.get_str(), None);
     }
 
@@ -552,38 +552,38 @@ mod tests {
 
     #[test]
     fn zero_int_is_false() {
-        let sv = Scalar::from_iv(0);
+        let sv = Scalar::from_int(0);
         assert!(!sv.is_true());
     }
 
     #[test]
     fn nonzero_int_is_true() {
-        let sv = Scalar::from_iv(42);
+        let sv = Scalar::from_int(42);
         assert!(sv.is_true());
 
-        let sv = Scalar::from_iv(-1);
+        let sv = Scalar::from_int(-1);
         assert!(sv.is_true());
     }
 
     #[test]
     fn zero_float_is_false() {
-        let sv = Scalar::from_nv(0.0);
+        let sv = Scalar::from_num(0.0);
         assert!(!sv.is_true());
     }
 
     #[test]
     fn nonzero_float_is_true() {
-        let sv = Scalar::from_nv(3.14);
+        let sv = Scalar::from_num(3.14);
         assert!(sv.is_true());
 
-        let sv = Scalar::from_nv(-0.001);
+        let sv = Scalar::from_num(-0.001);
         assert!(sv.is_true());
     }
 
     #[test]
     fn nan_is_true() {
         // In Perl, NaN is true (it's not zero).
-        let sv = Scalar::from_nv(f64::NAN);
+        let sv = Scalar::from_num(f64::NAN);
         assert!(sv.is_true());
     }
 

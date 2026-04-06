@@ -6,8 +6,8 @@
 //!   (integers, floats, small strings) and `Arc`-wrapped variants for shared
 //!   values (full scalars, arrays, hashes, code, regex).
 //!
-//! - [`Scalar`] — the full Perl SV: parallel iv/nv/pv caches with flag-driven
-//!   validity, magic chain, stash for blessed objects.
+//! - [`Scalar`] — the full Perl SV: parallel int/num/string caches with
+//!   flag-driven validity, magic chain, stash for blessed objects.
 //!
 //! - [`SvFlags`] — bitflags for cache validity (IOK, NOK, POK, ROK) and
 //!   metadata (READONLY, UTF8, TAINT, MAGICAL, WEAK).
