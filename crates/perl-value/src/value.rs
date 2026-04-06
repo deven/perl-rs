@@ -129,6 +129,34 @@ impl Value {
         matches!(self, Value::Code(_))
     }
 
+    // ── Truthiness ────────────────────────────────────────────
+
+    /// Perl truthiness.
+    ///
+    /// False values: `undef`, `0`, `0.0`, `""`, `"0"`, empty arrays,
+    /// empty hashes.
+    /// True values: nonzero numbers, non-false strings, references,
+    /// non-empty arrays, non-empty hashes, code refs, regexes.
+    pub fn is_true(&self) -> bool {
+        match self {
+            Value::Undef => false,
+            Value::Int(n) => *n != 0,
+            Value::Float(n) => *n != 0.0,
+            Value::SmallStr(ss) => !bytes_are_false(ss.as_bytes()),
+            Value::Str(ps) => !bytes_are_false(ps.as_bytes()),
+            Value::Ref(_) => true,
+            Value::Scalar(sv) => sv.read().map(|s| s.is_true()).unwrap_or(false),
+            Value::Array(av) => av.read().map(|a| !a.is_empty()).unwrap_or(false),
+            Value::Hash(hv) => hv.read().map(|h| !h.is_empty()).unwrap_or(false),
+            Value::Code(_) | Value::Regex(_) => true,
+        }
+    }
+
+    /// The logical inverse of `is_true`.
+    pub fn is_false(&self) -> bool {
+        !self.is_true()
+    }
+
     // ── Upgrade to full Scalar ────────────────────────────────
 
     /// Upgrade this value to a full `Scalar` behind `Arc<RwLock<>>`.
@@ -208,6 +236,15 @@ impl Value {
             _ => None,
         }
     }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+/// Perl string falseness check on raw bytes.
+/// Empty (`b""`) and the string `"0"` (`b"0"`) are false.
+#[inline]
+fn bytes_are_false(bytes: &[u8]) -> bool {
+    bytes.is_empty() || bytes == b"0"
 }
 
 // ── Trait impls ──────────────────────────────────────────────────
@@ -382,5 +419,110 @@ mod tests {
     fn debug_formatting() {
         assert_eq!(format!("{:?}", Value::Undef), "Undef");
         assert_eq!(format!("{:?}", Value::from(42i64)), "Int(42)");
+    }
+
+    // ── Truthiness tests ──────────────────────────────────────
+
+    #[test]
+    fn undef_is_false() {
+        assert!(Value::Undef.is_false());
+        assert!(!Value::Undef.is_true());
+    }
+
+    #[test]
+    fn int_truthiness() {
+        assert!(Value::Int(0).is_false());
+        assert!(Value::Int(1).is_true());
+        assert!(Value::Int(-1).is_true());
+        assert!(Value::Int(42).is_true());
+    }
+
+    #[test]
+    fn float_truthiness() {
+        assert!(Value::Float(0.0).is_false());
+        assert!(Value::Float(1.0).is_true());
+        assert!(Value::Float(-0.5).is_true());
+        assert!(Value::Float(f64::NAN).is_true());
+        assert!(Value::Float(f64::INFINITY).is_true());
+    }
+
+    #[test]
+    fn string_truthiness() {
+        // False strings
+        assert!(Value::from("").is_false());
+        assert!(Value::from("0").is_false());
+
+        // True strings
+        assert!(Value::from("1").is_true());
+        assert!(Value::from("hello").is_true());
+        assert!(Value::from("00").is_true());
+        assert!(Value::from("0.0").is_true());
+        assert!(Value::from(" ").is_true());
+        assert!(Value::from("0E0").is_true());
+    }
+
+    #[test]
+    fn long_string_truthiness() {
+        // Same rules apply to heap-allocated strings
+        let long_true = "a".repeat(30);
+        assert!(Value::from(long_true.as_str()).is_true());
+
+        // PerlString empty
+        assert!(Value::Str(PerlString::from_str("")).is_false());
+        assert!(Value::Str(PerlString::from_str("0")).is_false());
+        assert!(Value::Str(PerlString::from_str("hello")).is_true());
+    }
+
+    #[test]
+    fn reference_always_true() {
+        // A reference is always true, even to a false value.
+        let sv = Arc::new(RwLock::new(Scalar::from_iv(0)));
+        assert!(Value::Ref(sv).is_true());
+    }
+
+    #[test]
+    fn empty_containers_are_false() {
+        let av = Arc::new(RwLock::new(Vec::new()));
+        assert!(Value::Array(av).is_false());
+
+        let hv = Arc::new(RwLock::new(HashMap::new()));
+        assert!(Value::Hash(hv).is_false());
+    }
+
+    #[test]
+    fn nonempty_containers_are_true() {
+        let av = Arc::new(RwLock::new(vec![Value::Int(1)]));
+        assert!(Value::Array(av).is_true());
+
+        let mut map = HashMap::new();
+        map.insert(PerlString::from_str("key"), Value::Int(1));
+        let hv = Arc::new(RwLock::new(map));
+        assert!(Value::Hash(hv).is_true());
+    }
+
+    #[test]
+    fn upgraded_scalar_truthiness() {
+        // Upgrade an int to Scalar, truthiness should still work.
+        let mut v = Value::from(0i64);
+        v.upgrade_to_scalar();
+        assert!(v.is_false());
+
+        let mut v = Value::from(42i64);
+        v.upgrade_to_scalar();
+        assert!(v.is_true());
+
+        let mut v = Value::from("");
+        v.upgrade_to_scalar();
+        assert!(v.is_false());
+
+        let mut v = Value::from("hello");
+        v.upgrade_to_scalar();
+        assert!(v.is_true());
+    }
+
+    #[test]
+    fn from_bool_truthiness() {
+        assert!(Value::from(true).is_true());
+        assert!(Value::from(false).is_false());
     }
 }

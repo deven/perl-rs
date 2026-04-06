@@ -146,6 +146,44 @@ impl Scalar {
         self.flags.intersects(SvFlags::ANY_VAL | SvFlags::ROK)
     }
 
+    /// Perl truthiness.
+    ///
+    /// A scalar is false if it is:
+    /// - undef (no valid representations)
+    /// - integer zero (`iv == 0` when IOK)
+    /// - float zero (`nv == 0.0` when NOK)
+    /// - empty string (`""` when POK)
+    /// - the string `"0"` (when POK)
+    ///
+    /// References are always true.  Everything else is true.
+    ///
+    /// When multiple representations are valid, numeric is checked
+    /// first (faster than string comparison).
+    pub fn is_true(&self) -> bool {
+        // References are always true.
+        if self.flags.contains(SvFlags::ROK) {
+            return true;
+        }
+
+        // Integer representation — check for zero.
+        if self.flags.contains(SvFlags::IOK) {
+            return self.iv != 0;
+        }
+
+        // Float representation — check for zero.
+        if self.flags.contains(SvFlags::NOK) {
+            return self.nv != 0.0;
+        }
+
+        // String representation — check for "" and "0".
+        if self.flags.contains(SvFlags::POK) {
+            return !string_is_false(&self.pv);
+        }
+
+        // No valid representation → undef → false.
+        false
+    }
+
     // ── Integer access (with lazy coercion) ───────────────────────
 
     /// Get the integer value, coercing from other representations if needed.
@@ -332,6 +370,17 @@ fn format_nv(n: f64) -> String {
     format!("{}", n)
 }
 
+/// Perl string falseness: `""` (empty) and `"0"` are false.
+/// Everything else is true.
+fn string_is_false(pv: &PerlStringSlot) -> bool {
+    match pv.as_bytes() {
+        None => true,       // no string → false (shouldn't happen if POK is set)
+        Some(b"") => true,  // empty string
+        Some(b"0") => true, // the string "0"
+        Some(_) => false,   // anything else
+    }
+}
+
 // ── Trait impls ──────────────────────────────────────────────────
 
 impl fmt::Debug for Scalar {
@@ -491,5 +540,94 @@ mod tests {
         let mut sv = Scalar::new_undef();
         assert_eq!(sv.get_pv(), None);
         assert_eq!(sv.get_str(), None);
+    }
+
+    // ── Truthiness tests ──────────────────────────────────────
+
+    #[test]
+    fn undef_is_false() {
+        let sv = Scalar::new_undef();
+        assert!(!sv.is_true());
+    }
+
+    #[test]
+    fn zero_int_is_false() {
+        let sv = Scalar::from_iv(0);
+        assert!(!sv.is_true());
+    }
+
+    #[test]
+    fn nonzero_int_is_true() {
+        let sv = Scalar::from_iv(42);
+        assert!(sv.is_true());
+
+        let sv = Scalar::from_iv(-1);
+        assert!(sv.is_true());
+    }
+
+    #[test]
+    fn zero_float_is_false() {
+        let sv = Scalar::from_nv(0.0);
+        assert!(!sv.is_true());
+    }
+
+    #[test]
+    fn nonzero_float_is_true() {
+        let sv = Scalar::from_nv(3.14);
+        assert!(sv.is_true());
+
+        let sv = Scalar::from_nv(-0.001);
+        assert!(sv.is_true());
+    }
+
+    #[test]
+    fn nan_is_true() {
+        // In Perl, NaN is true (it's not zero).
+        let sv = Scalar::from_nv(f64::NAN);
+        assert!(sv.is_true());
+    }
+
+    #[test]
+    fn empty_string_is_false() {
+        let sv = Scalar::from_str("");
+        assert!(!sv.is_true());
+    }
+
+    #[test]
+    fn string_zero_is_false() {
+        let sv = Scalar::from_str("0");
+        assert!(!sv.is_true());
+    }
+
+    #[test]
+    fn nonempty_string_is_true() {
+        let sv = Scalar::from_str("hello");
+        assert!(sv.is_true());
+
+        // "00" is true — only exactly "0" is false
+        let sv = Scalar::from_str("00");
+        assert!(sv.is_true());
+
+        // "0.0" is true — only exactly "0" is false
+        let sv = Scalar::from_str("0.0");
+        assert!(sv.is_true());
+
+        // " " (space) is true
+        let sv = Scalar::from_str(" ");
+        assert!(sv.is_true());
+
+        // "0E0" is true — Perl's "zero but true"
+        let sv = Scalar::from_str("0E0");
+        assert!(sv.is_true());
+    }
+
+    #[test]
+    fn reference_is_true() {
+        let sv = Scalar::from_ref(Value::Int(0));
+        assert!(sv.is_true());
+
+        // Even a reference to undef is true
+        let sv = Scalar::from_ref(Value::Undef);
+        assert!(sv.is_true());
     }
 }
