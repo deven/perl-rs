@@ -141,7 +141,44 @@ impl<'src> Lexer<'src> {
                         break;
                     }
                 }
-            } else {
+                continue;
+            }
+            // Skip pod: =word ... =cut at start of line
+            if self.peek_byte() == Some(b'=')
+                && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphabetic())
+                && (self.pos == 0 || self.src.get(self.pos - 1) == Some(&b'\n'))
+            {
+                self.skip_pod();
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Skip a pod block: everything from `=word` to `=cut\n`.
+    /// Matches Perl 5's behavior: `=cut` must be at start of line,
+    /// followed by a non-alphabetic character (or EOF).
+    fn skip_pod(&mut self) {
+        loop {
+            // Advance to next line
+            while let Some(b) = self.advance_byte() {
+                if b == b'\n' {
+                    break;
+                }
+            }
+            if self.at_end() {
+                break;
+            }
+            // Check for =cut at start of line, followed by non-alpha or EOF.
+            // Perl uses !isALPHA(s[4]): =cut\n, =cut , =cut123 all match;
+            // =cutting does not.
+            if self.remaining().starts_with(b"=cut") && !self.remaining().get(4).is_some_and(|b| b.is_ascii_alphabetic()) {
+                // Skip the =cut line
+                while let Some(b) = self.advance_byte() {
+                    if b == b'\n' {
+                        break;
+                    }
+                }
                 break;
             }
         }
@@ -565,6 +602,17 @@ impl<'src> Lexer<'src> {
             "s" if self.at_quote_delimiter() => return self.lex_s(),
             "tr" if self.at_quote_delimiter() => return self.lex_tr(),
             "y" if self.at_quote_delimiter() => return self.lex_tr(),
+            _ => {}
+        }
+
+        // Special tokens
+        match name.as_str() {
+            "__FILE__" | "__LINE__" | "__PACKAGE__" | "__SUB__" => {
+                return Ok(Token::Ident(name));
+            }
+            "__END__" | "__DATA__" => {
+                return Ok(Token::DataEnd);
+            }
             _ => {}
         }
 
@@ -1116,7 +1164,33 @@ impl<'src> Lexer<'src> {
                     Ok(Token::NumLe)
                 }
             }
-            _ => Ok(Token::NumLt),
+            _ => {
+                // In term position, < could be readline/glob: <STDIN>, <>, <$fh>, <*.txt>
+                if expect.expecting_term() {
+                    // Try to scan a readline: <...> where ... is the content
+                    let start_pos = self.pos; // just after <
+                    let mut content = String::new();
+                    let mut found_close = false;
+                    while let Some(b) = self.peek_byte() {
+                        if b == b'>' {
+                            self.pos += 1;
+                            found_close = true;
+                            break;
+                        }
+                        if b == b'\n' {
+                            break;
+                        } // no multiline
+                        self.pos += 1;
+                        content.push(b as char);
+                    }
+                    if found_close {
+                        return Ok(Token::Readline(content));
+                    }
+                    // Not a readline — rewind
+                    self.pos = start_pos;
+                }
+                Ok(Token::NumLt)
+            }
         }
     }
 
@@ -1404,7 +1478,8 @@ mod tests {
                 | Token::RegexLit(_, _, _)
                 | Token::SubstLit(_, _, _)
                 | Token::TranslitLit(_, _, _)
-                | Token::HeredocLit(_, _, _) => {
+                | Token::HeredocLit(_, _, _)
+                | Token::Readline(_) => {
                     expect.base = BaseExpect::Operator;
                 }
                 Token::Semi | Token::LBrace => {

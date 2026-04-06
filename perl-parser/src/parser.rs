@@ -183,7 +183,11 @@ impl<'src> Parser<'src> {
 
         while !self.at_eof() {
             let stmt = self.parse_statement()?;
+            let is_data_end = matches!(stmt.kind, StmtKind::DataEnd);
             statements.push(stmt);
+            if is_data_end {
+                break; // __END__ / __DATA__ — everything after is not code
+            }
         }
 
         let end = self.peek_span();
@@ -225,6 +229,31 @@ impl<'src> Parser<'src> {
             Token::Keyword(Keyword::INIT) => self.parse_phaser(PhaserKind::Init)?,
             Token::Keyword(Keyword::CHECK) => self.parse_phaser(PhaserKind::Check)?,
             Token::Keyword(Keyword::UNITCHECK) => self.parse_phaser(PhaserKind::Unitcheck)?,
+
+            // given/when/default
+            Token::Keyword(Keyword::Given) => self.parse_given()?,
+            Token::Keyword(Keyword::When) => self.parse_when()?,
+            Token::Keyword(Keyword::Default) => {
+                self.advance();
+                self.expect.brace = BraceDisposition::Block;
+                let block = self.parse_block()?;
+                StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: start }, block)
+            }
+
+            // try/catch/finally/defer
+            Token::Keyword(Keyword::Try) => self.parse_try()?,
+            Token::Keyword(Keyword::Defer) => {
+                self.advance();
+                self.expect.brace = BraceDisposition::Block;
+                let block = self.parse_block()?;
+                StmtKind::Defer(block)
+            }
+
+            // __END__ / __DATA__ — stop parsing
+            Token::DataEnd => {
+                self.advance();
+                StmtKind::DataEnd
+            }
 
             Token::LBrace => {
                 let block = self.parse_block()?;
@@ -556,6 +585,57 @@ impl<'src> Parser<'src> {
         self.expect.brace = BraceDisposition::Block;
         let block = self.parse_block()?;
         Ok(StmtKind::Phaser(kind, block))
+    }
+
+    // ── given/when ────────────────────────────────────────────
+
+    fn parse_given(&mut self) -> Result<StmtKind, ParseError> {
+        self.advance(); // eat 'given'
+        let expr = self.parse_paren_expr()?;
+        self.expect.brace = BraceDisposition::Block;
+        let block = self.parse_block()?;
+        Ok(StmtKind::Given(expr, block))
+    }
+
+    fn parse_when(&mut self) -> Result<StmtKind, ParseError> {
+        self.advance(); // eat 'when'
+        let expr = self.parse_paren_expr()?;
+        self.expect.brace = BraceDisposition::Block;
+        let block = self.parse_block()?;
+        Ok(StmtKind::When(expr, block))
+    }
+
+    // ── try/catch/finally ─────────────────────────────────────
+
+    fn parse_try(&mut self) -> Result<StmtKind, ParseError> {
+        self.advance(); // eat 'try'
+        self.expect.brace = BraceDisposition::Block;
+        let body = self.parse_block()?;
+
+        let (catch_var, catch_block) = if self.eat(&Token::Keyword(Keyword::Catch)) {
+            let var = if self.at(&Token::LParen) {
+                self.advance();
+                let decl = self.parse_single_var_decl()?;
+                self.expect_token(&Token::RParen)?;
+                Some(decl)
+            } else {
+                None
+            };
+            self.expect.brace = BraceDisposition::Block;
+            let block = self.parse_block()?;
+            (var, Some(block))
+        } else {
+            (None, None)
+        };
+
+        let finally_block = if self.eat(&Token::Keyword(Keyword::Finally)) {
+            self.expect.brace = BraceDisposition::Block;
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
+
+        Ok(StmtKind::Try(TryStmt { body, catch_var, catch_block, finally_block }))
     }
 
     // ── Labels ────────────────────────────────────────────────
@@ -946,6 +1026,20 @@ impl<'src> Parser<'src> {
 
             // __END__ / __DATA__
             Token::DataEnd => Ok(Expr { kind: ExprKind::Todo("__END__".into()), span }),
+
+            // Readline / diamond: <STDIN>, <>, <$fh>, <*.txt>
+            Token::Readline(content) => {
+                if content.is_empty() {
+                    // <> — diamond operator, reads from ARGV
+                    Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![]), span })
+                } else if content.contains('*') || content.contains('?') {
+                    // <*.txt> — glob
+                    Ok(Expr { kind: ExprKind::FuncCall("glob".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+                } else {
+                    // <STDIN>, <$fh> — readline
+                    Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+                }
+            }
 
             Token::Keyword(Keyword::Do) => {
                 if self.at(&Token::LBrace) {
@@ -2248,5 +2342,98 @@ mod tests {
             ExprKind::FuncCall(name, _) => assert_eq!(name, "goto"),
             other => panic!("expected goto, got {other:?}"),
         }
+    }
+
+    // ── Readline / diamond tests ──────────────────────────────
+
+    #[test]
+    fn parse_diamond() {
+        let e = parse_expr_str("<>;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "readline");
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected readline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_readline_stdin() {
+        let e = parse_expr_str("<STDIN>;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "readline");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected readline, got {other:?}"),
+        }
+    }
+
+    // ── given/when tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_given_when() {
+        let prog = parse("given ($x) { when (1) { 1; } default { 0; } }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Given(_, _)));
+    }
+
+    // ── try/catch tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_try_catch() {
+        let prog = parse("try { die; } catch ($e) { warn $e; }");
+        match &prog.statements[0].kind {
+            StmtKind::Try(t) => {
+                assert!(t.catch_block.is_some());
+                assert!(t.catch_var.is_some());
+            }
+            other => panic!("expected Try, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_try_catch_finally() {
+        let prog = parse("try { 1; } catch ($e) { 2; } finally { 3; }");
+        match &prog.statements[0].kind {
+            StmtKind::Try(t) => {
+                assert!(t.catch_block.is_some());
+                assert!(t.finally_block.is_some());
+            }
+            other => panic!("expected Try, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_defer() {
+        let prog = parse("defer { cleanup(); }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Defer(_)));
+    }
+
+    // ── __END__ test ──────────────────────────────────────────
+
+    #[test]
+    fn parse_end_stops_parsing() {
+        let prog = parse("my $x = 1;\n__END__\nThis is not code.\n");
+        // Should have 2 statements: my decl and DataEnd
+        assert_eq!(prog.statements.len(), 2);
+        assert!(matches!(prog.statements[1].kind, StmtKind::DataEnd));
+    }
+
+    #[test]
+    fn parse_data_stops_parsing() {
+        let prog = parse("my $x = 1;\n__DATA__\nraw data here\n");
+        assert_eq!(prog.statements.len(), 2);
+        assert!(matches!(prog.statements[1].kind, StmtKind::DataEnd));
+    }
+
+    // ── Pod skipping test ─────────────────────────────────────
+
+    #[test]
+    fn parse_pod_skipped() {
+        let prog = parse("my $x = 1;\n\n=pod\n\nThis is pod.\n\n=cut\n\nmy $y = 2;\n");
+        // Should see both my declarations, pod is invisible
+        let my_count = prog.statements.iter().filter(|s| matches!(s.kind, StmtKind::My(_, _))).count();
+        assert_eq!(my_count, 2);
     }
 }

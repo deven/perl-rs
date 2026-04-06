@@ -65,6 +65,16 @@ pub enum StmtKind {
     /// `BEGIN { ... }`, `END { ... }`, etc.
     Phaser(PhaserKind, Block),
 
+    /// `given (EXPR) { when ... }`.
+    Given(Expr, Block),
+    /// `when (EXPR) { ... }` (inside given).
+    When(Expr, Block),
+
+    /// `try { ... } catch ($e) { ... } finally { ... }`.
+    Try(TryStmt),
+    /// `defer { ... }`.
+    Defer(Block),
+
     /// Empty statement (bare `;`).
     Empty,
 
@@ -429,4 +439,13 @@ pub struct ForEachStmt {
     pub list: Expr,
     pub body: Block,
     pub continue_block: Option<Block>,
+}
+
+/// `try { ... } catch ($e) { ... } finally { ... }`.
+#[derive(Clone, Debug)]
+pub struct TryStmt {
+    pub body: Block,
+    pub catch_var: Option<VarDecl>,
+    pub catch_block: Option<Block>,
+    pub finally_block: Option<Block>,
 }

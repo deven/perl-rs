@@ -394,6 +394,8 @@ pub enum Token {
     DataEnd,
     /// Yada yada yada (`...` as a statement).
     YadaYada,
+    /// `<STDIN>`, `<>`, `<$fh>`, `<*.txt>` — readline or glob.
+    Readline(String),
 
     /// A token we don't yet handle — placeholder for incremental development.
     Todo(String),
@@ -468,6 +470,7 @@ impl Token {
                 | Token::SubstLit(_, _, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
+                | Token::Readline(_)
                 | Token::QwList(_)
                 | Token::Dollar
                 | Token::At
