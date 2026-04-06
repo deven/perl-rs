@@ -687,11 +687,76 @@ impl<'src> Parser<'src> {
                 let expr = Expr { kind: ExprKind::ScalarVar(name), span };
                 self.maybe_postfix_subscript(expr)
             }
-            Token::ArrayVar(name) => Ok(Expr { kind: ExprKind::ArrayVar(name), span }),
+            Token::ArrayVar(name) => {
+                // @array[0,1] → array slice; @array{qw(a b)} → hash slice
+                if self.at(&Token::LBracket) {
+                    self.advance();
+                    self.expect.base = BaseExpect::Term;
+                    let mut indices = Vec::new();
+                    while !self.at(&Token::RBracket) && !self.at_eof() {
+                        indices.push(self.parse_expr(PREC_COMMA + 1)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RBracket)?;
+                    Ok(Expr { span: span.merge(end), kind: ExprKind::ArraySlice(Box::new(Expr { kind: ExprKind::ArrayVar(name), span }), indices) })
+                } else if self.at(&Token::LBrace) {
+                    self.advance();
+                    self.expect.base = BaseExpect::Term;
+                    let mut keys = Vec::new();
+                    while !self.at(&Token::RBrace) && !self.at_eof() {
+                        keys.push(self.parse_expr(PREC_COMMA + 1)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RBrace)?;
+                    Ok(Expr { span: span.merge(end), kind: ExprKind::HashSlice(Box::new(Expr { kind: ExprKind::ArrayVar(name), span }), keys) })
+                } else {
+                    Ok(Expr { kind: ExprKind::ArrayVar(name), span })
+                }
+            }
             Token::HashVar(name) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
             Token::GlobVar(name) => Ok(Expr { kind: ExprKind::GlobVar(name), span }),
             Token::ArrayLen(name) => Ok(Expr { kind: ExprKind::ArrayLen(name), span }),
             Token::SpecialVar(name) => Ok(Expr { kind: ExprKind::SpecialVar(name), span }),
+
+            // Prefix dereference: $$ref, @$ref, %$ref, ${expr}, @{expr}
+            Token::Dollar => {
+                self.expect.base = BaseExpect::Term;
+                if self.at(&Token::LBrace) {
+                    // ${expr} — dereference block
+                    self.advance();
+                    let inner = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RBrace)?;
+                    let expr = Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Scalar, Box::new(inner)) };
+                    self.maybe_postfix_subscript(expr)
+                } else {
+                    // $$ref — consume just the variable, subscripts apply to deref result.
+                    // Recursive: $$$ref → Deref(Scalar, Deref(Scalar, ScalarVar("ref")))
+                    let operand = self.parse_deref_operand()?;
+                    let expr = Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Scalar, Box::new(operand)) };
+                    self.maybe_postfix_subscript(expr)
+                }
+            }
+            Token::At => {
+                self.expect.base = BaseExpect::Term;
+                if self.at(&Token::LBrace) {
+                    // @{expr} — array dereference block
+                    self.advance();
+                    let inner = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RBrace)?;
+                    Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Array, Box::new(inner)) })
+                } else {
+                    let operand = self.parse_deref_operand()?;
+                    Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Array, Box::new(operand)) })
+                }
+            }
 
             Token::Ident(name) => self.parse_ident_term(name, span),
 
@@ -862,6 +927,26 @@ impl<'src> Parser<'src> {
                 }
             }
 
+            // sort/map/grep with optional block
+            Token::Keyword(kw) if keyword::is_block_list_op(kw) => self.parse_block_list_op(kw, span),
+
+            // print/say with optional filehandle
+            Token::Keyword(kw) if keyword::is_print_op(kw) => self.parse_print_op(kw, span),
+
+            // goto LABEL, goto &sub, goto EXPR
+            Token::Keyword(Keyword::Goto) => {
+                self.expect.base = BaseExpect::Term;
+                let arg = self.parse_expr(PREC_COMMA)?;
+                let end = span.merge(arg.span);
+                Ok(Expr { kind: ExprKind::FuncCall("goto".into(), vec![arg]), span: end })
+            }
+
+            // Yada yada yada (...)
+            Token::DotDotDot => Ok(Expr { kind: ExprKind::Todo("...".into()), span }),
+
+            // __END__ / __DATA__
+            Token::DataEnd => Ok(Expr { kind: ExprKind::Todo("__END__".into()), span }),
+
             Token::Keyword(Keyword::Do) => {
                 if self.at(&Token::LBrace) {
                     let block = self.parse_block()?;
@@ -969,6 +1054,135 @@ impl<'src> Parser<'src> {
 
         let end_span = args.last().map(|a| a.span).unwrap_or(span);
         Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end_span) })
+    }
+
+    /// Parse sort/map/grep with optional block as first argument.
+    /// `sort { $a <=> $b } @list`, `map { ... } @list`, `grep { ... } @list`
+    fn parse_block_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
+        let name = format!("{kw:?}").to_lowercase();
+        self.expect.base = BaseExpect::Term;
+
+        // Check for parens: sort(...), map(...), grep(...)
+        if self.at(&Token::LParen) {
+            self.advance();
+            let mut args = Vec::new();
+            // Check for block as first arg inside parens
+            if self.at(&Token::LBrace) {
+                self.expect.brace = BraceDisposition::BlockExpr;
+                let block = self.parse_block()?;
+                args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
+                self.eat(&Token::Comma);
+            }
+            while !self.at(&Token::RParen) && !self.at_eof() {
+                args.push(self.parse_expr(PREC_COMMA + 1)?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            let end = self.peek_span();
+            self.expect_token(&Token::RParen)?;
+            return Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end) });
+        }
+
+        let mut args = Vec::new();
+
+        // Check for block or sub name as first arg
+        if self.at(&Token::LBrace) {
+            self.expect.brace = BraceDisposition::BlockExpr;
+            let block = self.parse_block()?;
+            args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
+        } else if kw == Keyword::Sort {
+            // sort can also take a sub name: sort subname @list
+            if let Token::Ident(_) = self.peek() {
+                let ident_span = self.peek_span();
+                let ident = match self.advance().token {
+                    Token::Ident(s) => s,
+                    _ => unreachable!(),
+                };
+                args.push(Expr { kind: ExprKind::FuncCall(ident, vec![]), span: ident_span });
+            }
+        }
+
+        // Rest of arguments
+        while !self.at(&Token::Semi) && !self.at_eof() && !self.at(&Token::RBrace) && !self.at(&Token::RParen) {
+            if matches!(
+                self.peek(),
+                Token::Keyword(Keyword::If)
+                    | Token::Keyword(Keyword::Unless)
+                    | Token::Keyword(Keyword::While)
+                    | Token::Keyword(Keyword::Until)
+                    | Token::Keyword(Keyword::For)
+                    | Token::Keyword(Keyword::Foreach)
+            ) {
+                break;
+            }
+            args.push(self.parse_expr(PREC_COMMA + 1)?);
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+
+        let end_span = args.last().map(|a| a.span).unwrap_or(span);
+        Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end_span) })
+    }
+
+    /// Parse print/say with optional filehandle as first argument.
+    /// `print STDERR "error"`, `print "hello"`, `say $fh "data"`
+    fn parse_print_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
+        let name = format!("{kw:?}").to_lowercase();
+        self.expect.base = BaseExpect::Term;
+
+        // Check for parens
+        if self.at(&Token::LParen) {
+            return self.parse_list_op(kw, span);
+        }
+
+        // No parens — check for bare filehandle (uppercase identifier not followed by comma)
+        // This is a heuristic: `print STDERR "hello"` vs `print $x, $y`
+        // Perl uses the rule: bareword followed by non-comma term is a filehandle.
+        let mut args = Vec::new();
+
+        // Collect args as list
+        while !self.at(&Token::Semi) && !self.at_eof() && !self.at(&Token::RBrace) {
+            if matches!(
+                self.peek(),
+                Token::Keyword(Keyword::If)
+                    | Token::Keyword(Keyword::Unless)
+                    | Token::Keyword(Keyword::While)
+                    | Token::Keyword(Keyword::Until)
+                    | Token::Keyword(Keyword::For)
+                    | Token::Keyword(Keyword::Foreach)
+            ) {
+                break;
+            }
+            args.push(self.parse_expr(PREC_COMMA + 1)?);
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+
+        let end_span = args.last().map(|a| a.span).unwrap_or(span);
+        Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end_span) })
+    }
+
+    /// Parse the operand of a prefix dereference ($$ref, @$ref, etc.).
+    /// Consumes just the variable — subscripts are NOT included.
+    /// This ensures $$ref[0] parses as ($$ref)[0], not $(${ref}[0]).
+    fn parse_deref_operand(&mut self) -> Result<Expr, ParseError> {
+        let spanned = self.advance();
+        let span = spanned.span;
+        match spanned.token {
+            Token::ScalarVar(name) => Ok(Expr { kind: ExprKind::ScalarVar(name), span }),
+            Token::ArrayVar(name) => Ok(Expr { kind: ExprKind::ArrayVar(name), span }),
+            Token::HashVar(name) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
+            Token::SpecialVar(name) => Ok(Expr { kind: ExprKind::SpecialVar(name), span }),
+            // Recursive: $$$ref
+            Token::Dollar => {
+                let inner = self.parse_deref_operand()?;
+                Ok(Expr { span: span.merge(inner.span), kind: ExprKind::Deref(Sigil::Scalar, Box::new(inner)) })
+            }
+            other => Err(ParseError::new(format!("expected variable after dereference sigil, got {other:?}"), span)),
+        }
     }
 
     fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
@@ -1219,6 +1433,31 @@ impl<'src> Parser<'src> {
                 let end = self.peek_span();
                 self.expect_token(&Token::RParen)?;
                 Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), String::new(), args) })
+            }
+            // Postfix dereference: ->@*, ->%*, ->$*, ->@[...], ->@{...}
+            Token::At => {
+                self.advance();
+                if self.eat(&Token::Star) {
+                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefArray) })
+                } else {
+                    Err(ParseError::new("expected * after ->@", self.peek_span()))
+                }
+            }
+            Token::Dollar => {
+                self.advance();
+                if self.eat(&Token::Star) {
+                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefScalar) })
+                } else {
+                    Err(ParseError::new("expected * after ->$", self.peek_span()))
+                }
+            }
+            Token::Percent => {
+                self.advance();
+                if self.eat(&Token::Star) {
+                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefHash) })
+                } else {
+                    Err(ParseError::new("expected * after ->%", self.peek_span()))
+                }
             }
             other => Err(ParseError::new(format!("expected method name or subscript after ->, got {other:?}"), self.peek_span())),
         }
@@ -1839,6 +2078,175 @@ mod tests {
                 assert!(matches!(inner.kind, ExprKind::ArrowDeref(_, _)));
             }
             other => panic!("expected ArrayElem wrapping ArrowDeref, got {other:?}"),
+        }
+    }
+
+    // ── sort/map/grep block tests ─────────────────────────────
+
+    #[test]
+    fn parse_sort_block() {
+        let e = parse_expr_str("sort { $a <=> $b } @list;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "sort");
+                assert!(args.len() >= 2); // block + @list
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+            }
+            other => panic!("expected sort ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_map_block() {
+        let e = parse_expr_str("map { $_ * 2 } @nums;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "map");
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+            }
+            other => panic!("expected map ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_grep_block() {
+        let e = parse_expr_str("grep { $_ > 0 } @nums;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "grep");
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+            }
+            other => panic!("expected grep ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sort_no_block() {
+        let e = parse_expr_str("sort @list;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "sort");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected sort ListOp, got {other:?}"),
+        }
+    }
+
+    // ── print tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_print_simple() {
+        let prog = parse(r#"print "hello";"#);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::ListOp(name, _), .. }) => {
+                assert_eq!(name, "print");
+            }
+            other => panic!("expected print ListOp, got {other:?}"),
+        }
+    }
+
+    // ── Prefix dereference tests ──────────────────────────────
+
+    #[test]
+    fn parse_scalar_deref() {
+        let e = parse_expr_str("$$ref;");
+        match &e.kind {
+            ExprKind::Deref(Sigil::Scalar, inner) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected scalar Deref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_deref() {
+        let e = parse_expr_str("@$ref;");
+        match &e.kind {
+            ExprKind::Deref(Sigil::Array, inner) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected array Deref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_deref_block() {
+        let e = parse_expr_str("${$ref};");
+        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Scalar, _)));
+    }
+
+    #[test]
+    fn parse_array_deref_block() {
+        let e = parse_expr_str("@{$ref};");
+        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Array, _)));
+    }
+
+    #[test]
+    fn parse_deref_subscript() {
+        // $$ref[0] — deref then subscript
+        let e = parse_expr_str("$$ref[0];");
+        assert!(matches!(e.kind, ExprKind::ArrayElem(_, _)));
+    }
+
+    // ── Slice tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_array_slice() {
+        let e = parse_expr_str("@arr[0, 1, 2];");
+        match &e.kind {
+            ExprKind::ArraySlice(_, indices) => {
+                assert_eq!(indices.len(), 3);
+            }
+            other => panic!("expected ArraySlice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hash_slice() {
+        let e = parse_expr_str("@hash{qw(a b c)};");
+        match &e.kind {
+            ExprKind::HashSlice(_, keys) => {
+                assert_eq!(keys.len(), 1); // qw() is one expr
+            }
+            other => panic!("expected HashSlice, got {other:?}"),
+        }
+    }
+
+    // ── Postfix deref tests ───────────────────────────────────
+
+    #[test]
+    fn parse_postfix_deref_array() {
+        let e = parse_expr_str("$ref->@*;");
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefArray)));
+    }
+
+    #[test]
+    fn parse_postfix_deref_hash() {
+        let e = parse_expr_str("$ref->%*;");
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefHash)));
+    }
+
+    // ── Yada yada test ────────────────────────────────────────
+
+    #[test]
+    fn parse_yada_yada() {
+        let prog = parse("sub foo { ... }");
+        match &prog.statements[0].kind {
+            StmtKind::SubDecl(sub) => {
+                assert_eq!(sub.body.statements.len(), 1);
+            }
+            other => panic!("expected SubDecl, got {other:?}"),
+        }
+    }
+
+    // ── goto test ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_goto() {
+        let e = parse_expr_str("goto LABEL;");
+        match &e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "goto"),
+            other => panic!("expected goto, got {other:?}"),
         }
     }
 }
