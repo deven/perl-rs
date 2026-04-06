@@ -10,9 +10,8 @@
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-use perl_string::{PerlString, SmallString};
-
 use crate::scalar::Scalar;
+use crate::{PerlString, SMALL_STRING_MAX, SmallString};
 
 // ── Type aliases ─────────────────────────────────────────────────
 
@@ -677,7 +676,7 @@ impl From<&str> for Value {
 
 impl From<String> for Value {
     fn from(s: String) -> Self {
-        if s.len() <= perl_string::SMALL_STRING_MAX {
+        if s.len() <= SMALL_STRING_MAX {
             // Safe because String is always valid UTF-8
             Value::SmallStr(SmallString::from_str(&s).unwrap())
         } else {

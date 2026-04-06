@@ -12,10 +12,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use perl_string::{PerlString, PerlStringSlot};
-
 use crate::flags::SvFlags;
 use crate::value::Value;
+use crate::{PerlString, PerlStringSlot};
 
 // Placeholder types — will be fleshed out as the runtime develops.
 // Using empty structs for now so the code compiles and the shape is right.
