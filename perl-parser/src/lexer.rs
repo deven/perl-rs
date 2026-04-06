@@ -26,6 +26,16 @@ enum LexContext {
     },
 }
 
+/// Saved lexer state for checkpoint/restore (used by the parser's
+/// re-lex mechanism to undo a speculatively-lexed token).
+#[derive(Clone, Debug)]
+pub(crate) struct LexerCheckpoint {
+    pub pos: usize,
+    pub context_depth: usize,
+    pub redirect_idx: usize,
+    pub redirect_len: usize,
+}
+
 /// Lexer state, embedded in the `Parser` struct (not standalone).
 ///
 /// The lexer operates on a byte slice and maintains a position cursor.
@@ -36,11 +46,21 @@ pub(crate) struct Lexer<'src> {
     src: &'src [u8],
     pos: usize,
     context_stack: Vec<LexContext>,
+    /// When a heredoc tag is encountered, the body is collected eagerly
+    /// from subsequent lines.  The lexer then rewinds to continue scanning
+    /// the current line.  When skip_ws_and_comments later hits the newline
+    /// at the end of that line, it jumps to the position after the heredoc
+    /// terminator instead of the next source line.
+    heredoc_line_redirects: Vec<usize>,
+    /// Index into heredoc_line_redirects: how many have been consumed.
+    /// Using an index instead of removing from the vec allows checkpoint/
+    /// restore to undo redirect consumption by resetting the index.
+    heredoc_redirect_idx: usize,
 }
 
 impl<'src> Lexer<'src> {
     pub fn new(src: &'src [u8]) -> Self {
-        Lexer { src, pos: 0, context_stack: Vec::new() }
+        Lexer { src, pos: 0, context_stack: Vec::new(), heredoc_line_redirects: Vec::new(), heredoc_redirect_idx: 0 }
     }
 
     pub fn pos(&self) -> usize {
@@ -51,15 +71,23 @@ impl<'src> Lexer<'src> {
         self.pos = pos;
     }
 
-    /// Save the context stack depth for checkpoint/restore.
-    pub fn context_depth(&self) -> usize {
-        self.context_stack.len()
+    /// Save a checkpoint for the parser's re-lex mechanism.
+    pub fn checkpoint(&self) -> LexerCheckpoint {
+        LexerCheckpoint {
+            pos: self.pos,
+            context_depth: self.context_stack.len(),
+            redirect_idx: self.heredoc_redirect_idx,
+            redirect_len: self.heredoc_line_redirects.len(),
+        }
     }
 
-    /// Restore context stack to a saved depth (truncating any
-    /// contexts pushed since the checkpoint).
-    pub fn restore_context_depth(&mut self, depth: usize) {
-        self.context_stack.truncate(depth);
+    /// Restore to a saved checkpoint, undoing any state changes
+    /// (context pushes, redirect consumption/addition) since the checkpoint.
+    pub fn restore(&mut self, cp: LexerCheckpoint) {
+        self.pos = cp.pos;
+        self.context_stack.truncate(cp.context_depth);
+        self.heredoc_redirect_idx = cp.redirect_idx;
+        self.heredoc_line_redirects.truncate(cp.redirect_len);
     }
 
     // ── Character access ──────────────────────────────────────
@@ -75,6 +103,14 @@ impl<'src> Lexer<'src> {
     fn advance_byte(&mut self) -> Option<u8> {
         let b = self.src.get(self.pos).copied()?;
         self.pos += 1;
+        // When crossing a newline, fire any pending heredoc redirect.
+        // This makes heredoc body skipping transparent to all byte-level
+        // scanners (scan_balanced_string, lex_single_quoted_string, etc.),
+        // so constructs that span across a heredoc splice work correctly.
+        if b == b'\n' && self.heredoc_redirect_idx < self.heredoc_line_redirects.len() {
+            self.pos = self.heredoc_line_redirects[self.heredoc_redirect_idx];
+            self.heredoc_redirect_idx += 1;
+        }
         Some(b)
     }
 
@@ -90,18 +126,17 @@ impl<'src> Lexer<'src> {
 
     fn skip_ws_and_comments(&mut self) {
         loop {
-            // Skip whitespace
+            // Skip whitespace (advance_byte handles heredoc redirects on newlines)
             while let Some(b) = self.peek_byte() {
                 if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                    self.pos += 1;
+                    self.advance_byte();
                 } else {
                     break;
                 }
             }
             // Skip line comments
             if self.peek_byte() == Some(b'#') {
-                while let Some(b) = self.peek_byte() {
-                    self.pos += 1;
+                while let Some(b) = self.advance_byte() {
                     if b == b'\n' {
                         break;
                     }
@@ -1012,18 +1047,55 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn lex_less_than(&mut self, _expect: &Expect) -> Result<Token, ParseError> {
-        self.pos += 1;
+    fn lex_less_than(&mut self, expect: &Expect) -> Result<Token, ParseError> {
+        self.pos += 1; // consume first <
         match self.peek_byte() {
             Some(b'<') => {
-                self.pos += 1;
-                if self.peek_byte() == Some(b'=') {
-                    self.pos += 1;
-                    Ok(Token::Assign(AssignOp::ShiftLEq))
+                // Could be heredoc (in term position) or left shift.
+                if expect.expecting_term() {
+                    // Check for heredoc tag after <<
+                    let saved = self.pos; // position of second <
+                    self.pos += 1; // skip second <
+
+                    // <<~ for indented heredocs
+                    let indented = self.peek_byte() == Some(b'~');
+                    if indented {
+                        self.pos += 1;
+                    }
+
+                    // Skip optional whitespace between << and tag
+                    while self.peek_byte() == Some(b' ') || self.peek_byte() == Some(b'\t') {
+                        self.pos += 1;
+                    }
+
+                    match self.peek_byte() {
+                        // Quoted tags: <<"TAG" or <<'TAG'
+                        Some(b'"') | Some(b'\'') => {
+                            return self.lex_heredoc(indented);
+                        }
+                        // Bare tag: <<IDENT or <<~IDENT
+                        Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
+                            return self.lex_heredoc(indented);
+                        }
+                        _ => {
+                            // Not a heredoc — rewind to after first <, re-parse as <<
+                            self.pos = saved + 1;
+                            if self.peek_byte() == Some(b'=') {
+                                self.pos += 1;
+                                return Ok(Token::Assign(AssignOp::ShiftLEq));
+                            }
+                            return Ok(Token::ShiftL);
+                        }
+                    }
                 } else {
-                    // Could be heredoc <<TAG in term position
-                    // For now, emit as shift
-                    Ok(Token::ShiftL)
+                    // Operator position: left shift
+                    self.pos += 1;
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1;
+                        Ok(Token::Assign(AssignOp::ShiftLEq))
+                    } else {
+                        Ok(Token::ShiftL)
+                    }
                 }
             }
             Some(b'=') => {
@@ -1037,6 +1109,130 @@ impl<'src> Lexer<'src> {
             }
             _ => Ok(Token::NumLt),
         }
+    }
+
+    /// Lex a heredoc tag and eagerly collect the body.
+    /// Position is after `<<` (and optional `~`), at the tag start.
+    fn lex_heredoc(&mut self, indented: bool) -> Result<Token, ParseError> {
+        let start = self.pos;
+
+        // Determine quoting style and extract tag.
+        let (kind, tag) = match self.peek_byte() {
+            Some(b'\'') => {
+                // <<'TAG' — literal
+                self.pos += 1;
+                let tag = self.scan_heredoc_tag(b'\'')?;
+                let k = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
+                (k, tag)
+            }
+            Some(b'"') => {
+                // <<"TAG" — interpolating (explicit)
+                self.pos += 1;
+                let tag = self.scan_heredoc_tag(b'"')?;
+                let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
+                (k, tag)
+            }
+            _ => {
+                // Bare identifier — interpolating
+                let tag_start = self.pos;
+                while self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
+                    self.pos += 1;
+                }
+                let tag = String::from_utf8_lossy(&self.src[tag_start..self.pos]).into_owned();
+                let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
+                (k, tag)
+            }
+        };
+
+        if tag.is_empty() {
+            return Err(ParseError::new("empty heredoc tag", Span::new(start as u32, self.pos as u32)));
+        }
+
+        // Save position — the rest of the current line continues from here.
+        let rest_of_line_pos = self.pos;
+
+        // Find the end of the current line.
+        while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+            self.pos += 1;
+        }
+        if self.pos < self.src.len() {
+            self.pos += 1; // skip the \n
+        }
+
+        // Now collect body lines until the terminator.
+        let body_start = self.pos;
+        let mut body = String::new();
+        let mut found_terminator = false;
+
+        while self.pos < self.src.len() {
+            let line_start = self.pos;
+            // Read to end of line
+            while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+                self.pos += 1;
+            }
+            let line_end = self.pos;
+            if self.pos < self.src.len() {
+                self.pos += 1; // skip \n
+            }
+
+            let line = &self.src[line_start..line_end];
+
+            // Check if this line is the terminator.
+            let trimmed = if indented {
+                // For <<~, strip leading whitespace before comparing.
+                let mut i = 0;
+                while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+                    i += 1;
+                }
+                &line[i..]
+            } else {
+                line
+            };
+
+            if trimmed == tag.as_bytes() {
+                found_terminator = true;
+                break;
+            }
+
+            // Add line to body (including the newline).
+            body.push_str(&String::from_utf8_lossy(line));
+            body.push('\n');
+        }
+
+        if !found_terminator {
+            return Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(body_start as u32, self.pos as u32)));
+        }
+
+        // For indented heredocs, strip common leading whitespace from body.
+        if indented && !body.is_empty() {
+            body = strip_heredoc_indent(&body);
+        }
+
+        // Save the position after the terminator — this is where scanning
+        // resumes after the current line is finished.
+        let after_terminator = self.pos;
+
+        // Rewind to the rest of the current line.
+        self.pos = rest_of_line_pos;
+
+        // Register the redirect: when skip_ws_and_comments hits the
+        // newline at the end of the current line, jump to after_terminator.
+        self.heredoc_line_redirects.push(after_terminator);
+
+        Ok(Token::HeredocLit(kind, tag, body))
+    }
+
+    /// Scan a quoted heredoc tag (between matching quotes).
+    fn scan_heredoc_tag(&mut self, close: u8) -> Result<String, ParseError> {
+        let start = self.pos;
+        while self.pos < self.src.len() && self.src[self.pos] != close {
+            self.pos += 1;
+        }
+        let tag = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
+        if self.pos < self.src.len() {
+            self.pos += 1; // skip closing quote
+        }
+        Ok(tag)
     }
 
     fn lex_greater_than(&mut self) -> Token {
@@ -1153,6 +1349,19 @@ fn hex_digit(b: u8) -> u8 {
     }
 }
 
+/// Strip the common leading whitespace from an indented heredoc body (<<~).
+fn strip_heredoc_indent(body: &str) -> String {
+    // Find the minimum indentation (ignoring empty lines).
+    let min_indent = body.lines().filter(|line| !line.trim().is_empty()).map(|line| line.len() - line.trim_start().len()).min().unwrap_or(0);
+
+    if min_indent == 0 {
+        return body.to_string();
+    }
+
+    body.lines().map(|line| if line.len() >= min_indent { &line[min_indent..] } else { line }).collect::<Vec<_>>().join("\n")
+        + if body.ends_with('\n') { "\n" } else { "" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,7 +1394,8 @@ mod tests {
                 | Token::QuoteEnd
                 | Token::RegexLit(_, _, _)
                 | Token::SubstLit(_, _, _)
-                | Token::TranslitLit(_, _, _) => {
+                | Token::TranslitLit(_, _, _)
+                | Token::HeredocLit(_, _, _) => {
                     expect.base = BaseExpect::Operator;
                 }
                 Token::Semi | Token::LBrace => {
@@ -1511,5 +1721,109 @@ mod tests {
         // After a variable, / is division.
         let tokens = lex_all("$x / $y");
         assert_eq!(tokens, vec![Token::ScalarVar("x".into()), Token::Slash, Token::ScalarVar("y".into()),]);
+    }
+
+    // ── Heredoc tests ─────────────────────────────────────────
+
+    #[test]
+    fn lex_heredoc_bare_tag() {
+        let src = "<<END;\nHello, world!\nEND\n";
+        let tokens = lex_all(src);
+        assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "Hello, world!\n".into()), Token::Semi,]);
+    }
+
+    #[test]
+    fn lex_heredoc_double_quoted() {
+        let src = "<<\"END\";\nHello!\nEND\n";
+        let tokens = lex_all(src);
+        assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "Hello!\n".into()), Token::Semi,]);
+    }
+
+    #[test]
+    fn lex_heredoc_single_quoted() {
+        let src = "<<'END';\nNo $interpolation here.\nEND\n";
+        let tokens = lex_all(src);
+        assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Literal, "END".into(), "No $interpolation here.\n".into()), Token::Semi,]);
+    }
+
+    #[test]
+    fn lex_heredoc_multiline_body() {
+        let src = "<<END;\nline 1\nline 2\nline 3\nEND\n";
+        let tokens = lex_all(src);
+        match &tokens[0] {
+            Token::HeredocLit(_, _, body) => {
+                assert_eq!(body, "line 1\nline 2\nline 3\n");
+            }
+            other => panic!("expected HeredocLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_heredoc_with_rest_of_line() {
+        // The `. " suffix"` should be tokenized from the current line.
+        let src = "<<END . \" suffix\";\nbody\nEND\n";
+        let tokens = lex_all(src);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "body\n".into()),
+                Token::Dot,
+                Token::QuoteBegin(QuoteKind::Double, b'"'),
+                Token::ConstSegment(" suffix".into()),
+                Token::QuoteEnd,
+                Token::Semi,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_heredoc_indented() {
+        let src = "<<~END;\n    hello\n    world\n    END\n";
+        let tokens = lex_all(src);
+        match &tokens[0] {
+            Token::HeredocLit(HeredocKind::Indented, _, body) => {
+                assert_eq!(body, "hello\nworld\n");
+            }
+            other => panic!("expected indented HeredocLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_heredoc_then_code() {
+        // Code after the heredoc terminator should be lexed normally.
+        let src = "my $x = <<END;\nhello\nEND\nmy $y = 1;\n";
+        let tokens = lex_all(src);
+        // Should contain: my $x = <<END ; my $y = 1 ;
+        assert!(tokens.contains(&Token::Keyword(Keyword::My)));
+        assert_eq!(tokens.iter().filter(|t| matches!(t, Token::Keyword(Keyword::My))).count(), 2);
+    }
+
+    #[test]
+    fn lex_heredoc_spliced_inside_q_string() {
+        // A q{} string that spans across a heredoc body.
+        // The heredoc body is invisible to the q{} scanner.
+        // Perl: <<EOF returns "body\n", q{before\nafter\n} returns "before\nafter\n"
+        let src = "<<EOF, q{before\nbody\nEOF\nafter\n};\n";
+        let tokens = lex_all(src);
+
+        // First token: heredoc with body "body\n"
+        match &tokens[0] {
+            Token::HeredocLit(HeredocKind::Interpolating, tag, body) => {
+                assert_eq!(tag, "EOF");
+                assert_eq!(body, "body\n");
+            }
+            other => panic!("expected HeredocLit, got {other:?}"),
+        }
+
+        // Then comma
+        assert_eq!(tokens[1], Token::Comma);
+
+        // Then q{} string: "before\nafter\n" — the heredoc body is skipped
+        match &tokens[2] {
+            Token::StrLit(s) => {
+                assert_eq!(s, "before\nafter\n");
+            }
+            other => panic!("expected StrLit for q{{}}, got {other:?}"),
+        }
     }
 }

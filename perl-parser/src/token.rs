@@ -383,6 +383,9 @@ pub enum Token {
     HeredocBegin(HeredocKind, String),
     /// Body of a heredoc (sub-tokens if interpolating).
     HeredocEnd,
+    /// Complete heredoc with body already collected (bootstrap).
+    /// Fields: kind, tag, body.
+    HeredocLit(HeredocKind, String, String),
 
     // ── Special ───────────────────────────────────────────────
     /// `qw/.../` — list of words.
@@ -464,6 +467,7 @@ impl Token {
                 | Token::RegexLit(_, _, _)
                 | Token::SubstLit(_, _, _)
                 | Token::TranslitLit(_, _, _)
+                | Token::HeredocLit(_, _, _)
                 | Token::QwList(_)
                 | Token::Dollar
                 | Token::At

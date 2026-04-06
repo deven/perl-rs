@@ -8,7 +8,7 @@ use crate::ast::*;
 use crate::error::ParseError;
 use crate::expect::{BaseExpect, BraceDisposition, Expect};
 use crate::keyword;
-use crate::lexer::Lexer;
+use crate::lexer::{Lexer, LexerCheckpoint};
 use crate::span::Span;
 use crate::token::Keyword;
 use crate::token::*;
@@ -78,11 +78,11 @@ impl OpInfo {
 /// The combined parser/lexer.
 pub struct Parser<'src> {
     lexer: Lexer<'src>,
-    /// Cached current token with the lexer state that produced it.
+    /// Cached current token with the lexer checkpoint that produced it.
     /// `None` means no token is cached — the next peek/advance will lex.
-    /// Fields: (token, pre_lex_pos, pre_lex_context_depth, expect_used).
-    /// On rewind, both position and context stack are restored.
-    current: Option<(Spanned, usize, usize, Expect)>,
+    /// On rewind, the full lexer state (position, context stack,
+    /// heredoc redirects) is restored via the checkpoint.
+    current: Option<(Spanned, LexerCheckpoint, Expect)>,
     expect: Expect,
     errors: Vec<ParseError>,
     depth: ParseDepth,
@@ -100,27 +100,24 @@ impl<'src> Parser<'src> {
 
     /// Ensure `self.current` holds a token lexed under the current
     /// expect state.  If the cached token was lexed under a different
-    /// expect, rewind the lexer (position + context stack) and re-lex.
+    /// expect, restore the full lexer checkpoint and re-lex.
     fn ensure_current(&mut self) {
         match &self.current {
-            Some((_, _, _, cached_expect)) if *cached_expect == self.expect => {
+            Some((_, _, cached_expect)) if *cached_expect == self.expect => {
                 return;
             }
-            Some((_, pre_lex_pos, pre_lex_ctx_depth, _)) => {
-                let pos = *pre_lex_pos;
-                let ctx_depth = *pre_lex_ctx_depth;
-                self.lexer.set_pos(pos);
-                self.lexer.restore_context_depth(ctx_depth);
+            Some((_, checkpoint, _)) => {
+                let cp = checkpoint.clone();
+                self.lexer.restore(cp);
                 self.current = None;
             }
             None => {}
         }
 
-        let pre_lex_pos = self.lexer.pos();
-        let pre_lex_ctx_depth = self.lexer.context_depth();
+        let checkpoint = self.lexer.checkpoint();
         let spanned =
             self.lexer.next_token(&self.expect).unwrap_or(Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) });
-        self.current = Some((spanned, pre_lex_pos, pre_lex_ctx_depth, self.expect));
+        self.current = Some((spanned, checkpoint, self.expect));
     }
 
     fn peek(&mut self) -> &Token {
@@ -698,6 +695,18 @@ impl<'src> Parser<'src> {
             Token::RegexLit(_kind, pattern, flags) => Ok(Expr { kind: ExprKind::Regex(pattern, flags), span }),
             Token::SubstLit(pattern, replacement, flags) => Ok(Expr { kind: ExprKind::Subst(pattern, SubstReplacement::Literal(replacement), flags), span }),
             Token::TranslitLit(from, to, flags) => Ok(Expr { kind: ExprKind::Translit(from, to, flags), span }),
+
+            // Heredoc (body already collected by lexer).
+            Token::HeredocLit(kind, _tag, body) => {
+                match kind {
+                    HeredocKind::Literal | HeredocKind::IndentedLiteral => Ok(Expr { kind: ExprKind::StringLit(body), span }),
+                    HeredocKind::Interpolating | HeredocKind::Indented => {
+                        // TODO: process interpolation in body.
+                        // For now, treat as plain string.
+                        Ok(Expr { kind: ExprKind::StringLit(body), span })
+                    }
+                }
+            }
 
             Token::Keyword(Keyword::Do) => {
                 if self.at(&Token::LBrace) {
@@ -1474,5 +1483,44 @@ mod tests {
             }
             other => panic!("expected Binding with Subst, got {other:?}"),
         }
+    }
+
+    // ── Heredoc tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_heredoc_basic() {
+        let src = "my $x = <<END;\nhello world\nEND\n";
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 1);
+        match &prog.statements[0].kind {
+            StmtKind::My(vars, Some(init)) => {
+                assert_eq!(vars[0].name, "x");
+                match &init.kind {
+                    ExprKind::StringLit(s) => assert_eq!(s, "hello world\n"),
+                    other => panic!("expected StringLit, got {other:?}"),
+                }
+            }
+            other => panic!("expected My, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_concat() {
+        // <<END . " suffix" should parse as concatenation.
+        let src = "<<END . \" suffix\";\nbody\nEND\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => {
+                assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Concat, _, _)));
+            }
+            other => panic!("expected Expr with Concat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_then_statement() {
+        let src = "print <<END;\nhello\nEND\nmy $x = 1;\n";
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 2);
     }
 }
