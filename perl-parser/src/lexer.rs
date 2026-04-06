@@ -355,10 +355,15 @@ impl<'src> Lexer<'src> {
             // Integer
             let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
             let s = s.replace('_', "");
-            // Handle leading zeros as octal? No — Perl 5 treats `09` as decimal.
-            // Only `0NNN` without 8 or 9 is octal.  For now, parse as decimal.
-            let n: i64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", Span::new(start as u32, self.pos as u32)))?;
-            Ok(Token::IntLit(n))
+            // Legacy octal: 0NNN where all digits are 0-7.
+            // Perl 5 treats leading-zero integers as octal.
+            if s.len() > 1 && s.starts_with('0') && s.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+                let n = i64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", Span::new(start as u32, self.pos as u32)))?;
+                Ok(Token::IntLit(n))
+            } else {
+                let n: i64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", Span::new(start as u32, self.pos as u32)))?;
+                Ok(Token::IntLit(n))
+            }
         }
     }
 
