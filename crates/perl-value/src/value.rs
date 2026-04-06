@@ -237,6 +237,285 @@ impl Value {
         }
     }
 
+    // ── Coercing numeric access ───────────────────────────────
+    // These follow Perl's coercion rules: strings are parsed as
+    // numbers, undef becomes 0, references are their address.
+    // Unlike `as_int`/`as_num`, these always return a value.
+
+    /// Coerce to i64 following Perl's numeric conversion rules.
+    ///
+    /// - `Undef` → 0
+    /// - `Int(n)` → n
+    /// - `Float(n)` → n as i64 (truncation)
+    /// - `SmallStr`/`Str` → parse leading digits, 0 if non-numeric
+    /// - `Ref` → address as i64 (Perl behavior)
+    /// - `Scalar` → delegates through lock
+    /// - `Array` → element count
+    /// - `Hash` → element count
+    /// - `Code`/`Regex` → address
+    pub fn coerce_to_int(&self) -> i64 {
+        match self {
+            Value::Undef => 0,
+            Value::Int(n) => *n,
+            Value::Float(n) => *n as i64,
+            Value::SmallStr(ss) => ss.parse_iv(),
+            Value::Str(ps) => ps.parse_iv(),
+            Value::Ref(sv) => Arc::as_ptr(sv) as i64,
+            Value::Scalar(sv) => sv.write().expect("Scalar lock poisoned").get_int(),
+            Value::Array(av) => av.read().map(|a| a.len() as i64).unwrap_or(0),
+            Value::Hash(hv) => hv.read().map(|h| h.len() as i64).unwrap_or(0),
+            Value::Code(c) => Arc::as_ptr(c) as i64,
+            Value::Regex(r) => Arc::as_ptr(r) as i64,
+        }
+    }
+
+    /// Coerce to f64 following Perl's numeric conversion rules.
+    ///
+    /// Same coercion logic as `coerce_to_int` but returns f64.
+    pub fn coerce_to_num(&self) -> f64 {
+        match self {
+            Value::Undef => 0.0,
+            Value::Int(n) => *n as f64,
+            Value::Float(n) => *n,
+            Value::SmallStr(ss) => ss.parse_nv(),
+            Value::Str(ps) => ps.parse_nv(),
+            Value::Ref(sv) => Arc::as_ptr(sv) as usize as f64,
+            Value::Scalar(sv) => sv.write().expect("Scalar lock poisoned").get_num(),
+            Value::Array(av) => av.read().map(|a| a.len() as f64).unwrap_or(0.0),
+            Value::Hash(hv) => hv.read().map(|h| h.len() as f64).unwrap_or(0.0),
+            Value::Code(c) => Arc::as_ptr(c) as usize as f64,
+            Value::Regex(r) => Arc::as_ptr(r) as usize as f64,
+        }
+    }
+
+    // ── Arithmetic ────────────────────────────────────────────
+    // Perl's arithmetic coerces operands to numeric.  If both
+    // operands are integers and the result fits in i64, the result
+    // is integer.  Otherwise float.
+
+    /// Addition (`$a + $b`).
+    pub fn add(&self, other: &Value) -> Value {
+        // Fast path: both integers
+        if let (Value::Int(a), Value::Int(b)) = (self, other) {
+            return match a.checked_add(*b) {
+                Some(n) => Value::Int(n),
+                None => Value::Float(*a as f64 + *b as f64),
+            };
+        }
+        Value::Float(self.coerce_to_num() + other.coerce_to_num())
+    }
+
+    /// Subtraction (`$a - $b`).
+    pub fn sub(&self, other: &Value) -> Value {
+        if let (Value::Int(a), Value::Int(b)) = (self, other) {
+            return match a.checked_sub(*b) {
+                Some(n) => Value::Int(n),
+                None => Value::Float(*a as f64 - *b as f64),
+            };
+        }
+        Value::Float(self.coerce_to_num() - other.coerce_to_num())
+    }
+
+    /// Multiplication (`$a * $b`).
+    pub fn mul(&self, other: &Value) -> Value {
+        if let (Value::Int(a), Value::Int(b)) = (self, other) {
+            return match a.checked_mul(*b) {
+                Some(n) => Value::Int(n),
+                None => Value::Float(*a as f64 * *b as f64),
+            };
+        }
+        Value::Float(self.coerce_to_num() * other.coerce_to_num())
+    }
+
+    /// Division (`$a / $b`).
+    ///
+    /// Perl's `/` returns a float unless both operands are integers
+    /// and the result is exact.  Division by zero is a fatal error
+    /// in Perl; here we return `Inf` or `NaN` as Rust does.
+    pub fn div(&self, other: &Value) -> Value {
+        if let (Value::Int(a), Value::Int(b)) = (self, other) {
+            if *b != 0 && *a % *b == 0 {
+                return Value::Int(*a / *b);
+            }
+        }
+        Value::Float(self.coerce_to_num() / other.coerce_to_num())
+    }
+
+    /// Modulo (`$a % $b`).
+    ///
+    /// Perl's `%` operates on integers (truncating floats first).
+    pub fn modulo(&self, other: &Value) -> Value {
+        let a = self.coerce_to_int();
+        let b = other.coerce_to_int();
+        if b == 0 {
+            // Perl dies on modulo by zero; for now return 0.
+            // The runtime will handle the error.
+            return Value::Int(0);
+        }
+        Value::Int(a % b)
+    }
+
+    /// Unary negation (`-$a`).
+    pub fn negate(&self) -> Value {
+        match self {
+            Value::Int(n) => match n.checked_neg() {
+                Some(neg) => Value::Int(neg),
+                None => Value::Float(-(*n as f64)),
+            },
+            Value::Float(n) => Value::Float(-n),
+            _ => {
+                // Perl also handles string negation: -"foo" → "-foo"
+                // For now, coerce to numeric and negate.
+                let n = self.coerce_to_num();
+                Value::Float(-n)
+            }
+        }
+    }
+
+    // ── String concatenation ──────────────────────────────────
+
+    /// Concatenation (`$a . $b`).
+    ///
+    /// Coerces both sides to their string representation and
+    /// concatenates.
+    pub fn concat(&self, other: &Value) -> Value {
+        // Fast path: both are already strings
+        if let (Some(a), Some(b)) = (self.as_bytes(), other.as_bytes()) {
+            let mut buf = Vec::with_capacity(a.len() + b.len());
+            buf.extend_from_slice(a);
+            buf.extend_from_slice(b);
+            // UTF-8 if both inputs are UTF-8 strings
+            let both_utf8 = self.as_str().is_some() && other.as_str().is_some();
+            if both_utf8 {
+                // SAFETY: both sides are valid UTF-8
+                return Value::from(unsafe { String::from_utf8_unchecked(buf) });
+            }
+            return Value::Str(PerlString::from_bytes(buf));
+        }
+        // General case: stringify both sides
+        let a = self.stringify();
+        let b = other.stringify();
+        let mut result = a;
+        result.push_perl_string(&b);
+        Value::Str(result)
+    }
+
+    /// String repetition (`$a x $b`).
+    ///
+    /// Repeats the string form of `$a` by `$b` times.
+    pub fn repeat(&self, count: &Value) -> Value {
+        let n = count.coerce_to_int();
+        if n <= 0 {
+            return Value::from("");
+        }
+        let n = n as usize;
+        let s = self.stringify();
+        let bytes = s.as_bytes();
+        let mut buf = Vec::with_capacity(bytes.len() * n);
+        for _ in 0..n {
+            buf.extend_from_slice(bytes);
+        }
+        if s.is_utf8() {
+            // SAFETY: repeating valid UTF-8 produces valid UTF-8
+            Value::from(unsafe { String::from_utf8_unchecked(buf) })
+        } else {
+            Value::Str(PerlString::from_bytes(buf))
+        }
+    }
+
+    // ── Comparison ────────────────────────────────────────────
+
+    /// Numeric comparison (`$a <=> $b`).
+    /// Returns -1, 0, or 1 as a Value::Int.
+    pub fn num_cmp(&self, other: &Value) -> Value {
+        let a = self.coerce_to_num();
+        let b = other.coerce_to_num();
+        Value::Int(if a < b {
+            -1
+        } else if a > b {
+            1
+        } else {
+            0
+        })
+    }
+
+    /// Numeric equality (`$a == $b`).
+    pub fn num_eq(&self, other: &Value) -> bool {
+        self.coerce_to_num() == other.coerce_to_num()
+    }
+
+    /// Numeric inequality (`$a != $b`).
+    pub fn num_ne(&self, other: &Value) -> bool {
+        self.coerce_to_num() != other.coerce_to_num()
+    }
+
+    /// Numeric less-than (`$a < $b`).
+    pub fn num_lt(&self, other: &Value) -> bool {
+        self.coerce_to_num() < other.coerce_to_num()
+    }
+
+    /// Numeric greater-than (`$a > $b`).
+    pub fn num_gt(&self, other: &Value) -> bool {
+        self.coerce_to_num() > other.coerce_to_num()
+    }
+
+    /// Numeric less-or-equal (`$a <= $b`).
+    pub fn num_le(&self, other: &Value) -> bool {
+        self.coerce_to_num() <= other.coerce_to_num()
+    }
+
+    /// Numeric greater-or-equal (`$a >= $b`).
+    pub fn num_ge(&self, other: &Value) -> bool {
+        self.coerce_to_num() >= other.coerce_to_num()
+    }
+
+    /// String comparison (`$a cmp $b`).
+    /// Returns -1, 0, or 1 as a Value::Int.
+    pub fn str_cmp(&self, other: &Value) -> Value {
+        let a = self.stringify();
+        let b = other.stringify();
+        let ord = a.as_bytes().cmp(b.as_bytes());
+        Value::Int(match ord {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        })
+    }
+
+    /// String equality (`$a eq $b`).
+    pub fn str_eq(&self, other: &Value) -> bool {
+        // Fast path: both are byte slices already
+        if let (Some(a), Some(b)) = (self.as_bytes(), other.as_bytes()) {
+            return a == b;
+        }
+        self.stringify().as_bytes() == other.stringify().as_bytes()
+    }
+
+    /// String inequality (`$a ne $b`).
+    pub fn str_ne(&self, other: &Value) -> bool {
+        !self.str_eq(other)
+    }
+
+    /// String less-than (`$a lt $b`).
+    pub fn str_lt(&self, other: &Value) -> bool {
+        self.stringify().as_bytes() < other.stringify().as_bytes()
+    }
+
+    /// String greater-than (`$a gt $b`).
+    pub fn str_gt(&self, other: &Value) -> bool {
+        self.stringify().as_bytes() > other.stringify().as_bytes()
+    }
+
+    /// String less-or-equal (`$a le $b`).
+    pub fn str_le(&self, other: &Value) -> bool {
+        self.stringify().as_bytes() <= other.stringify().as_bytes()
+    }
+
+    /// String greater-or-equal (`$a ge $b`).
+    pub fn str_ge(&self, other: &Value) -> bool {
+        self.stringify().as_bytes() >= other.stringify().as_bytes()
+    }
+
     // ── Stringification ───────────────────────────────────────
 
     /// Convert this value to its Perl string representation.
@@ -730,5 +1009,225 @@ mod tests {
         buf.clear();
         Value::Float(3.14).write_bytes_to(&mut buf);
         assert_eq!(&buf, b"3.14");
+    }
+
+    // ── Coercion tests ────────────────────────────────────────
+
+    #[test]
+    fn coerce_undef_to_numeric() {
+        assert_eq!(Value::Undef.coerce_to_int(), 0);
+        assert_eq!(Value::Undef.coerce_to_num(), 0.0);
+    }
+
+    #[test]
+    fn coerce_string_to_numeric() {
+        assert_eq!(Value::from("42").coerce_to_int(), 42);
+        assert_eq!(Value::from("42abc").coerce_to_int(), 42);
+        assert_eq!(Value::from("abc").coerce_to_int(), 0);
+        assert!((Value::from("3.14").coerce_to_num() - 3.14).abs() < 1e-10);
+    }
+
+    #[test]
+    fn coerce_array_to_numeric() {
+        let av = Arc::new(RwLock::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
+        assert_eq!(Value::Array(av).coerce_to_int(), 3);
+    }
+
+    // ── Arithmetic tests ──────────────────────────────────────
+
+    #[test]
+    fn add_integers() {
+        let r = Value::Int(2).add(&Value::Int(3));
+        assert_eq!(r.as_int(), Some(5));
+    }
+
+    #[test]
+    fn add_integer_overflow() {
+        let r = Value::Int(i64::MAX).add(&Value::Int(1));
+        // Should overflow to float, not wrap
+        assert!(matches!(r, Value::Float(_)));
+    }
+
+    #[test]
+    fn add_floats() {
+        let r = Value::Float(1.5).add(&Value::Float(2.5));
+        assert!((r.as_num().unwrap() - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn add_int_float() {
+        let r = Value::Int(1).add(&Value::Float(2.5));
+        assert!((r.as_num().unwrap() - 3.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn add_string_coercion() {
+        let r = Value::from("10").add(&Value::from("20"));
+        assert!((r.coerce_to_num() - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn add_undef_is_zero() {
+        let r = Value::Int(5).add(&Value::Undef);
+        assert!((r.coerce_to_num() - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn sub_integers() {
+        let r = Value::Int(10).sub(&Value::Int(3));
+        assert_eq!(r.as_int(), Some(7));
+    }
+
+    #[test]
+    fn mul_integers() {
+        let r = Value::Int(6).mul(&Value::Int(7));
+        assert_eq!(r.as_int(), Some(42));
+    }
+
+    #[test]
+    fn mul_overflow() {
+        let r = Value::Int(i64::MAX).mul(&Value::Int(2));
+        assert!(matches!(r, Value::Float(_)));
+    }
+
+    #[test]
+    fn div_exact() {
+        let r = Value::Int(10).div(&Value::Int(2));
+        assert_eq!(r.as_int(), Some(5));
+    }
+
+    #[test]
+    fn div_inexact() {
+        let r = Value::Int(10).div(&Value::Int(3));
+        assert!(matches!(r, Value::Float(_)));
+        assert!((r.as_num().unwrap() - 10.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn div_by_zero() {
+        let r = Value::Int(1).div(&Value::Int(0));
+        // Returns Inf, not panic
+        assert!(r.as_num().unwrap().is_infinite());
+    }
+
+    #[test]
+    fn modulo_basic() {
+        let r = Value::Int(10).modulo(&Value::Int(3));
+        assert_eq!(r.as_int(), Some(1));
+    }
+
+    #[test]
+    fn negate_int() {
+        assert_eq!(Value::Int(42).negate().as_int(), Some(-42));
+        assert_eq!(Value::Int(-7).negate().as_int(), Some(7));
+        assert_eq!(Value::Int(0).negate().as_int(), Some(0));
+    }
+
+    #[test]
+    fn negate_float() {
+        assert!((Value::Float(3.14).negate().as_num().unwrap() + 3.14).abs() < 1e-10);
+    }
+
+    #[test]
+    fn negate_string() {
+        let r = Value::from("5").negate();
+        assert!((r.coerce_to_num() + 5.0).abs() < 1e-10);
+    }
+
+    // ── Concatenation tests ───────────────────────────────────
+
+    #[test]
+    fn concat_strings() {
+        let r = Value::from("hello").concat(&Value::from(" world"));
+        assert_eq!(r.as_str(), Some("hello world"));
+    }
+
+    #[test]
+    fn concat_int_and_string() {
+        let r = Value::Int(42).concat(&Value::from(" things"));
+        assert_eq!(format!("{}", r), "42 things");
+    }
+
+    #[test]
+    fn concat_undef() {
+        let r = Value::Undef.concat(&Value::from("hello"));
+        assert_eq!(format!("{}", r), "hello");
+    }
+
+    #[test]
+    fn repeat_string() {
+        let r = Value::from("ab").repeat(&Value::Int(3));
+        assert_eq!(r.as_str(), Some("ababab"));
+    }
+
+    #[test]
+    fn repeat_zero_times() {
+        let r = Value::from("hello").repeat(&Value::Int(0));
+        assert_eq!(r.as_str(), Some(""));
+    }
+
+    #[test]
+    fn repeat_negative() {
+        let r = Value::from("hello").repeat(&Value::Int(-1));
+        assert_eq!(r.as_str(), Some(""));
+    }
+
+    // ── Comparison tests ──────────────────────────────────────
+
+    #[test]
+    fn num_eq_basic() {
+        assert!(Value::Int(42).num_eq(&Value::Int(42)));
+        assert!(Value::Int(42).num_eq(&Value::Float(42.0)));
+        assert!(Value::from("42").num_eq(&Value::Int(42)));
+        assert!(!Value::Int(1).num_eq(&Value::Int(2)));
+    }
+
+    #[test]
+    fn num_cmp_basic() {
+        assert_eq!(Value::Int(1).num_cmp(&Value::Int(2)).as_int(), Some(-1));
+        assert_eq!(Value::Int(2).num_cmp(&Value::Int(2)).as_int(), Some(0));
+        assert_eq!(Value::Int(3).num_cmp(&Value::Int(2)).as_int(), Some(1));
+    }
+
+    #[test]
+    fn num_relational() {
+        assert!(Value::Int(1).num_lt(&Value::Int(2)));
+        assert!(!Value::Int(2).num_lt(&Value::Int(2)));
+        assert!(Value::Int(2).num_le(&Value::Int(2)));
+        assert!(Value::Int(3).num_gt(&Value::Int(2)));
+        assert!(Value::Int(2).num_ge(&Value::Int(2)));
+    }
+
+    #[test]
+    fn str_eq_basic() {
+        assert!(Value::from("hello").str_eq(&Value::from("hello")));
+        assert!(!Value::from("hello").str_eq(&Value::from("world")));
+        // "42" eq "42" even though 42 == 42.0
+        assert!(Value::from("42").str_eq(&Value::from("42")));
+        // Int stringifies: 42 eq "42"
+        assert!(Value::Int(42).str_eq(&Value::from("42")));
+    }
+
+    #[test]
+    fn str_cmp_basic() {
+        assert_eq!(Value::from("a").str_cmp(&Value::from("b")).as_int(), Some(-1));
+        assert_eq!(Value::from("b").str_cmp(&Value::from("b")).as_int(), Some(0));
+        assert_eq!(Value::from("c").str_cmp(&Value::from("b")).as_int(), Some(1));
+    }
+
+    #[test]
+    fn str_relational() {
+        assert!(Value::from("abc").str_lt(&Value::from("abd")));
+        assert!(Value::from("abc").str_le(&Value::from("abc")));
+        assert!(Value::from("abd").str_gt(&Value::from("abc")));
+        assert!(Value::from("abc").str_ge(&Value::from("abc")));
+    }
+
+    #[test]
+    fn mixed_num_str_comparison() {
+        // Numeric: "10" > "9" (10 > 9)
+        assert!(Value::from("10").num_gt(&Value::from("9")));
+        // String: "10" lt "9" (lexicographic: "1" < "9")
+        assert!(Value::from("10").str_lt(&Value::from("9")));
     }
 }
