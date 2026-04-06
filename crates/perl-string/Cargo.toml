@@ -1,8 +1,0 @@
-[package]
-name = "perl-string"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Perl string type: octet vector with UTF-8 flag"
-
-[dependencies]

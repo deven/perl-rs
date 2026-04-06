@@ -1,7 +1,11 @@
 [workspace]
 members = [
-    "crates/perl-string",
-    "crates/perl-value",
+#    "perl",
+#    "perl-compiler",
+    "perl-core",
+#    "perl-parser",
+#    "perl-regex",
+#    "perl-runtime",
 ]
 resolver = "2"
 
