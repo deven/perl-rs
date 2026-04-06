@@ -83,6 +83,7 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "rand" => Some(Keyword::Rand),
         "srand" => Some(Keyword::Srand),
         "wantarray" => Some(Keyword::Wantarray),
+        "scalar" => Some(Keyword::Scalar),
         "caller" => Some(Keyword::Caller),
         "exit" => Some(Keyword::Exit),
         "chdir" => Some(Keyword::Chdir),
@@ -189,6 +190,7 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Die
             | Keyword::Warn
             | Keyword::Undef
+            | Keyword::Scalar
     )
 }
 

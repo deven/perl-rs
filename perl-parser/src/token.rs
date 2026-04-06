@@ -134,6 +134,7 @@ pub enum Keyword {
     Rand,
     Srand,
     Wantarray,
+    Scalar,
     Caller,
     Die_,
     Exit,

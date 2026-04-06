@@ -111,6 +111,10 @@ pub enum ExprKind {
     ArrayLen(String),
     SpecialVar(String),
 
+    /// `my $x`, `our ($a, $b)`, `local @arr` etc. in expression context.
+    /// The Pratt parser handles `= expr` as normal assignment wrapping this.
+    Decl(DeclScope, Vec<VarDecl>),
+
     // ── Binary operations ─────────────────────────────────────
     BinOp(BinOp, Box<Expr>, Box<Expr>),
 
@@ -298,6 +302,15 @@ pub enum ArrowTarget {
 }
 
 /// Sigil for dereference operations.
+/// Scope of a variable declaration in expression context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclScope {
+    My,
+    Our,
+    Local,
+    State,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sigil {
     Scalar, // $
@@ -404,6 +417,7 @@ pub struct IfStmt {
 pub struct UnlessStmt {
     pub condition: Expr,
     pub then_block: Block,
+    pub elsif_clauses: Vec<(Expr, Block)>,
     pub else_block: Option<Block>,
 }
 
