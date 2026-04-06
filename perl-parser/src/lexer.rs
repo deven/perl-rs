@@ -13,18 +13,34 @@ use crate::keyword;
 use crate::span::Span;
 use crate::token::*;
 
+/// Sublexing context — tracks what mode the lexer is in.
+#[derive(Clone, Debug)]
+enum LexContext {
+    /// Inside an interpolating string ("...", qq//, `...`).
+    Interpolating {
+        close: u8,
+        /// For paired delimiters like qq{...}, the open delimiter
+        /// for nesting depth tracking.  None for non-paired (qq//).
+        open: Option<u8>,
+        depth: u32,
+    },
+}
+
 /// Lexer state, embedded in the `Parser` struct (not standalone).
 ///
 /// The lexer operates on a byte slice and maintains a position cursor.
 /// It reads the `expect` field to resolve context-sensitive ambiguities.
+/// The context stack tracks sublexing modes (interpolating strings,
+/// regex patterns, heredocs).
 pub(crate) struct Lexer<'src> {
     src: &'src [u8],
     pos: usize,
+    context_stack: Vec<LexContext>,
 }
 
 impl<'src> Lexer<'src> {
     pub fn new(src: &'src [u8]) -> Self {
-        Lexer { src, pos: 0 }
+        Lexer { src, pos: 0, context_stack: Vec::new() }
     }
 
     pub fn pos(&self) -> usize {
@@ -33,6 +49,17 @@ impl<'src> Lexer<'src> {
 
     pub fn set_pos(&mut self, pos: usize) {
         self.pos = pos;
+    }
+
+    /// Save the context stack depth for checkpoint/restore.
+    pub fn context_depth(&self) -> usize {
+        self.context_stack.len()
+    }
+
+    /// Restore context stack to a saved depth (truncating any
+    /// contexts pushed since the checkpoint).
+    pub fn restore_context_depth(&mut self, depth: usize) {
+        self.context_stack.truncate(depth);
     }
 
     // ── Character access ──────────────────────────────────────
@@ -88,7 +115,21 @@ impl<'src> Lexer<'src> {
     // ── Main tokenization entry point ─────────────────────────
 
     /// Lex the next token.  Uses `expect` to resolve ambiguities.
+    /// When inside a sublexing context (interpolating string, etc.),
+    /// dispatches to the appropriate sub-lexer instead.
     pub fn next_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
+        // If inside a sublexing context, dispatch there.
+        if let Some(ctx) = self.context_stack.last().cloned() {
+            return match ctx {
+                LexContext::Interpolating { close, open, depth } => self.lex_interp_token(close, open, depth),
+            };
+        }
+
+        self.lex_normal_token(expect)
+    }
+
+    /// Lex a token in normal (code) mode.
+    fn lex_normal_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
         self.skip_ws_and_comments();
 
         let start = self.pos as u32;
@@ -113,12 +154,15 @@ impl<'src> Lexer<'src> {
 
             // ── Strings ───────────────────────────────────────
             b'\'' => self.lex_single_quoted_string()?,
-            b'"' => self.lex_double_quoted_string()?,
+            b'"' => {
+                self.pos += 1; // skip opening "
+                self.context_stack.push(LexContext::Interpolating { close: b'"', open: None, depth: 0 });
+                Token::QuoteBegin(QuoteKind::Double, b'"')
+            }
             b'`' => {
-                // backtick — for now, treat like double-quoted
-                self.pos += 1;
-                let s = self.scan_to_delimiter(b'`')?;
-                Token::StrLit(s)
+                self.pos += 1; // skip opening `
+                self.context_stack.push(LexContext::Interpolating { close: b'`', open: None, depth: 0 });
+                Token::QuoteBegin(QuoteKind::Backtick, b'`')
             }
 
             // ── Operators and punctuation ─────────────────────
@@ -517,74 +561,202 @@ impl<'src> Lexer<'src> {
         Ok(Token::StrLit(s))
     }
 
-    fn lex_double_quoted_string(&mut self) -> Result<Token, ParseError> {
-        // For now: simple double-quoted string without interpolation.
-        // Full interpolation (§5.4) will emit sub-tokens; this is the
-        // bootstrap version.
-        self.pos += 1; // skip opening "
+    // ── Interpolating string sublexer (§5.4) ────────────────────
+
+    /// Lex one sub-token from inside an interpolating string.
+    /// Called when the context stack top is `Interpolating`.
+    fn lex_interp_token(&mut self, close: u8, open: Option<u8>, depth: u32) -> Result<Spanned, ParseError> {
+        let start = self.pos as u32;
+
+        if self.at_end() {
+            return Err(ParseError::new("unterminated string", Span::new(start, start)));
+        }
+
+        let b = self.peek_byte().unwrap();
+
+        // Check for closing delimiter.
+        if b == close && depth == 0 {
+            self.pos += 1;
+            self.context_stack.pop();
+            return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.pos as u32) });
+        }
+
+        // Check for interpolation.
+        if b == b'$' {
+            return self.lex_interp_scalar(start);
+        }
+        if b == b'@' {
+            return self.lex_interp_array(start);
+        }
+
+        // Otherwise, scan a ConstSegment: everything until we hit
+        // $, @, the closing delimiter, or end of input.
         let mut s = String::new();
+        let mut current_depth = depth;
+
         loop {
-            match self.advance_byte() {
-                None => return Err(ParseError::new("unterminated string", Span::new(self.pos as u32, self.pos as u32))),
+            match self.peek_byte() {
+                None => break,
+                Some(b) if b == close && current_depth == 0 => break,
+                Some(b'$') | Some(b'@') => break,
                 Some(b'\\') => {
-                    match self.peek_byte() {
-                        Some(b'n') => {
-                            self.pos += 1;
-                            s.push('\n');
-                        }
-                        Some(b't') => {
-                            self.pos += 1;
-                            s.push('\t');
-                        }
-                        Some(b'r') => {
-                            self.pos += 1;
-                            s.push('\r');
-                        }
-                        Some(b'\\') => {
-                            self.pos += 1;
-                            s.push('\\');
-                        }
-                        Some(b'"') => {
-                            self.pos += 1;
-                            s.push('"');
-                        }
-                        Some(b'$') => {
-                            self.pos += 1;
-                            s.push('$');
-                        }
-                        Some(b'@') => {
-                            self.pos += 1;
-                            s.push('@');
-                        }
-                        Some(b'0') => {
-                            self.pos += 1;
-                            s.push('\0');
-                        }
-                        Some(b'x') => {
-                            self.pos += 1;
-                            // \xHH
-                            let mut val = 0u8;
-                            for _ in 0..2 {
-                                if let Some(b) = self.peek_byte() {
-                                    if b.is_ascii_hexdigit() {
-                                        self.pos += 1;
-                                        val = val * 16 + hex_digit(b);
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            s.push(val as char);
-                        }
-                        _ => s.push('\\'),
-                    }
+                    self.pos += 1;
+                    self.process_escape(&mut s, close);
                 }
-                Some(b'"') => break,
-                // TODO: interpolation ($var, @var, ${expr})
-                Some(b) => s.push(b as char),
+                Some(b) if Some(b) == open => {
+                    current_depth += 1;
+                    self.pos += 1;
+                    s.push(b as char);
+                }
+                Some(b) if b == close && current_depth > 0 => {
+                    current_depth -= 1;
+                    self.pos += 1;
+                    s.push(b as char);
+                }
+                Some(b) => {
+                    self.pos += 1;
+                    s.push(b as char);
+                }
             }
         }
-        Ok(Token::StrLit(s))
+
+        // Update depth in context stack.
+        if let Some(LexContext::Interpolating { depth: d, .. }) = self.context_stack.last_mut() {
+            *d = current_depth;
+        }
+
+        Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.pos as u32) })
+    }
+
+    /// Process a backslash escape inside a double-quoted string.
+    /// The backslash has already been consumed.
+    fn process_escape(&mut self, s: &mut String, close: u8) {
+        match self.peek_byte() {
+            Some(b'n') => {
+                self.pos += 1;
+                s.push('\n');
+            }
+            Some(b't') => {
+                self.pos += 1;
+                s.push('\t');
+            }
+            Some(b'r') => {
+                self.pos += 1;
+                s.push('\r');
+            }
+            Some(b'\\') => {
+                self.pos += 1;
+                s.push('\\');
+            }
+            Some(b'$') => {
+                self.pos += 1;
+                s.push('$');
+            }
+            Some(b'@') => {
+                self.pos += 1;
+                s.push('@');
+            }
+            Some(b'0') => {
+                self.pos += 1;
+                s.push('\0');
+            }
+            Some(b'a') => {
+                self.pos += 1;
+                s.push('\x07');
+            }
+            Some(b'b') => {
+                self.pos += 1;
+                s.push('\x08');
+            }
+            Some(b'f') => {
+                self.pos += 1;
+                s.push('\x0C');
+            }
+            Some(b'e') => {
+                self.pos += 1;
+                s.push('\x1B');
+            }
+            Some(b) if b == close => {
+                self.pos += 1;
+                s.push(b as char);
+            }
+            Some(b'x') => {
+                self.pos += 1;
+                let mut val = 0u8;
+                if self.peek_byte() == Some(b'{') {
+                    // \x{HH...} — Unicode escape
+                    self.pos += 1;
+                    let mut n = 0u32;
+                    while let Some(b) = self.peek_byte() {
+                        if b == b'}' {
+                            self.pos += 1;
+                            break;
+                        }
+                        if b.is_ascii_hexdigit() {
+                            self.pos += 1;
+                            n = n * 16 + hex_digit(b) as u32;
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(c) = char::from_u32(n) {
+                        s.push(c);
+                    }
+                } else {
+                    // \xHH
+                    for _ in 0..2 {
+                        if let Some(b) = self.peek_byte() {
+                            if b.is_ascii_hexdigit() {
+                                self.pos += 1;
+                                val = val * 16 + hex_digit(b);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    s.push(val as char);
+                }
+            }
+            _ => s.push('\\'),
+        }
+    }
+
+    /// Lex `$name` or `${name}` interpolation inside a string.
+    fn lex_interp_scalar(&mut self, start: u32) -> Result<Spanned, ParseError> {
+        self.pos += 1; // skip $
+
+        // ${name} form
+        if self.peek_byte() == Some(b'{') {
+            self.pos += 1;
+            let name = self.scan_ident();
+            if self.peek_byte() == Some(b'}') {
+                self.pos += 1;
+            }
+            return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.pos as u32) });
+        }
+
+        // $name form — must start with alpha or _
+        if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+            let name = self.scan_ident();
+            return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.pos as u32) });
+        }
+
+        // Bare $ not followed by a name — treat as literal
+        // (Will become a ConstSegment "$")
+        Ok(Spanned { token: Token::ConstSegment("$".into()), span: Span::new(start, self.pos as u32) })
+    }
+
+    /// Lex `@name` interpolation inside a string.
+    fn lex_interp_array(&mut self, start: u32) -> Result<Spanned, ParseError> {
+        self.pos += 1; // skip @
+
+        if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+            let name = self.scan_ident();
+            return Ok(Spanned { token: Token::InterpArray(name), span: Span::new(start, self.pos as u32) });
+        }
+
+        // Bare @ not followed by a name — treat as literal
+        Ok(Spanned { token: Token::ConstSegment("@".into()), span: Span::new(start, self.pos as u32) })
     }
 
     fn scan_to_delimiter(&mut self, delim: u8) -> Result<String, ParseError> {
@@ -613,9 +785,9 @@ impl<'src> Lexer<'src> {
 
     fn lex_qq_string(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
-        // For now, no interpolation — bootstrap version
-        let s = self.scan_balanced_string(open, close)?;
-        Ok(Token::StrLit(s))
+        let paired_open = if open != close { Some(open) } else { None };
+        self.context_stack.push(LexContext::Interpolating { close, open: paired_open, depth: 0 });
+        Ok(Token::QuoteBegin(QuoteKind::Double, open))
     }
 
     fn lex_qw(&mut self) -> Result<Token, ParseError> {
@@ -958,12 +1130,15 @@ mod tests {
                 | Token::PlusPlus
                 | Token::MinusMinus
                 | Token::SpecialVar(_)
-                | Token::ArrayLen(_) => {
+                | Token::ArrayLen(_)
+                | Token::QuoteEnd => {
                     expect.base = BaseExpect::Operator;
                 }
                 Token::Semi | Token::LBrace => {
                     expect = Expect::XSTATE;
                 }
+                // Sub-tokens inside strings don't affect expect.
+                Token::QuoteBegin(_, _) | Token::ConstSegment(_) | Token::InterpScalar(_) | Token::InterpArray(_) => {}
                 _ => {
                     expect.base = BaseExpect::Term;
                 }
@@ -987,8 +1162,13 @@ mod tests {
 
     #[test]
     fn lex_string_literals() {
-        let tokens = lex_all(r#"'hello' "world\n""#);
-        assert_eq!(tokens, vec![Token::StrLit("hello".into()), Token::StrLit("world\n".into()),]);
+        // Single-quoted: still emits StrLit (no interpolation).
+        let tokens = lex_all("'hello'");
+        assert_eq!(tokens, vec![Token::StrLit("hello".into())]);
+
+        // Double-quoted: emits sub-token stream.
+        let tokens = lex_all(r#""world\n""#);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("world\n".into()), Token::QuoteEnd,]);
     }
 
     #[test]
@@ -1071,7 +1251,16 @@ mod tests {
     #[test]
     fn lex_print_hello() {
         let tokens = lex_all(r#"print "Hello, world!\n";"#);
-        assert_eq!(tokens, vec![Token::Keyword(Keyword::Print), Token::StrLit("Hello, world!\n".into()), Token::Semi,]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Keyword(Keyword::Print),
+                Token::QuoteBegin(QuoteKind::Double, b'"'),
+                Token::ConstSegment("Hello, world!\n".into()),
+                Token::QuoteEnd,
+                Token::Semi,
+            ]
+        );
     }
 
     #[test]
@@ -1101,5 +1290,102 @@ mod tests {
         assert_eq!(tokens[1], Token::SpecialVar("0".into()));
         assert_eq!(tokens[2], Token::SpecialVar("!".into()));
         assert_eq!(tokens[3], Token::SpecialVar("@".into()));
+    }
+
+    // ── Interpolation tests ───────────────────────────────────
+
+    #[test]
+    fn lex_interp_scalar() {
+        let tokens = lex_all(r#""Hello, $name!""#);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::QuoteBegin(QuoteKind::Double, b'"'),
+                Token::ConstSegment("Hello, ".into()),
+                Token::InterpScalar("name".into()),
+                Token::ConstSegment("!".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_interp_braced() {
+        let tokens = lex_all(r#""${name}bar""#);
+        assert_eq!(
+            tokens,
+            vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::InterpScalar("name".into()), Token::ConstSegment("bar".into()), Token::QuoteEnd,]
+        );
+    }
+
+    #[test]
+    fn lex_interp_array() {
+        let tokens = lex_all(r#""items: @list.""#);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::QuoteBegin(QuoteKind::Double, b'"'),
+                Token::ConstSegment("items: ".into()),
+                Token::InterpArray("list".into()),
+                Token::ConstSegment(".".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_interp_escaped_sigil() {
+        let tokens = lex_all(r#""price: \$100""#);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("price: $100".into()), Token::QuoteEnd,]);
+    }
+
+    #[test]
+    fn lex_interp_no_interpolation() {
+        // A double-quoted string with no variables is still sub-tokens.
+        let tokens = lex_all(r#""plain text""#);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("plain text".into()), Token::QuoteEnd,]);
+    }
+
+    #[test]
+    fn lex_interp_multiple_vars() {
+        let tokens = lex_all(r#""$x + $y""#);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::QuoteBegin(QuoteKind::Double, b'"'),
+                Token::InterpScalar("x".into()),
+                Token::ConstSegment(" + ".into()),
+                Token::InterpScalar("y".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_qq_interp() {
+        let tokens = lex_all(r#"qq{Hello, $name!}"#);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::QuoteBegin(QuoteKind::Double, b'{'),
+                Token::ConstSegment("Hello, ".into()),
+                Token::InterpScalar("name".into()),
+                Token::ConstSegment("!".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_empty_string() {
+        let tokens = lex_all(r#""""#);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::QuoteEnd,]);
+    }
+
+    #[test]
+    fn lex_interp_after_string() {
+        // Verify expect state is correct after a string (operator position).
+        let tokens = lex_all(r#""hello" . "world""#);
+        assert!(tokens.contains(&Token::Dot));
     }
 }
