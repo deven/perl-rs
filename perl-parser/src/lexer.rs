@@ -122,6 +122,11 @@ impl<'src> Lexer<'src> {
         self.pos >= self.src.len()
     }
 
+    /// Skip to end of source — used after __END__/__DATA__.
+    pub fn skip_to_end(&mut self) {
+        self.pos = self.src.len();
+    }
+
     // ── Skip whitespace and comments ──────────────────────────
 
     fn skip_ws_and_comments(&mut self) {
@@ -602,6 +607,7 @@ impl<'src> Lexer<'src> {
             "s" if self.at_quote_delimiter() => return self.lex_s(),
             "tr" if self.at_quote_delimiter() => return self.lex_tr(),
             "y" if self.at_quote_delimiter() => return self.lex_tr(),
+            "qx" if self.at_quote_delimiter() => return self.lex_qx(),
             _ => {}
         }
 
@@ -885,6 +891,13 @@ impl<'src> Lexer<'src> {
         let paired_open = if open != close { Some(open) } else { None };
         self.context_stack.push(LexContext::Interpolating { close, open: paired_open, depth: 0 });
         Ok(Token::QuoteBegin(QuoteKind::Double, open))
+    }
+
+    fn lex_qx(&mut self) -> Result<Token, ParseError> {
+        let (open, close) = self.read_quote_delimiters()?;
+        let paired_open = if open != close { Some(open) } else { None };
+        self.context_stack.push(LexContext::Interpolating { close, open: paired_open, depth: 0 });
+        Ok(Token::QuoteBegin(QuoteKind::Backtick, open))
     }
 
     fn lex_qw(&mut self) -> Result<Token, ParseError> {

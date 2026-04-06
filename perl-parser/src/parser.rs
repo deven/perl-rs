@@ -205,6 +205,14 @@ impl<'src> Parser<'src> {
             return Ok(Statement { kind: StmtKind::Empty, span: start });
         }
 
+        // __END__ / __DATA__ — stop parsing immediately
+        if matches!(self.peek(), Token::DataEnd) {
+            self.advance();
+            // Skip all remaining source — everything after is not code.
+            self.lexer.skip_to_end();
+            return Ok(Statement { kind: StmtKind::DataEnd, span: start.merge(self.peek_span()) });
+        }
+
         let kind = match self.peek().clone() {
             Token::Keyword(Keyword::My) => self.parse_my_decl()?,
             Token::Keyword(Keyword::Our) => self.parse_our_decl()?,
@@ -247,12 +255,6 @@ impl<'src> Parser<'src> {
                 self.expect.brace = BraceDisposition::Block;
                 let block = self.parse_block()?;
                 StmtKind::Defer(block)
-            }
-
-            // __END__ / __DATA__ — stop parsing
-            Token::DataEnd => {
-                self.advance();
-                StmtKind::DataEnd
             }
 
             Token::LBrace => {
@@ -414,6 +416,32 @@ impl<'src> Parser<'src> {
         Ok(StmtKind::SubDecl(SubDecl { name, prototype, attributes: Vec::new(), params: None, body, span: start.merge(self.peek_span()) }))
     }
 
+    /// Parse a declaration in expression context: `my $x`, `our ($a, @b)`, etc.
+    /// Returns a Decl expression; the Pratt parser handles `= expr` as assignment.
+    fn parse_decl_expr(&mut self, scope: DeclScope, span: Span) -> Result<Expr, ParseError> {
+        let mut vars = Vec::new();
+
+        if self.at(&Token::LParen) {
+            // List form: my ($x, @y, %z)
+            self.advance();
+            while !self.at(&Token::RParen) && !self.at_eof() {
+                vars.push(self.parse_single_var_decl()?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            let end = self.peek_span();
+            self.expect_token(&Token::RParen)?;
+            Ok(Expr { kind: ExprKind::Decl(scope, vars), span: span.merge(end) })
+        } else {
+            // Single variable: my $x, my @arr, my %hash
+            let var = self.parse_single_var_decl()?;
+            let end = var.span;
+            vars.push(var);
+            Ok(Expr { kind: ExprKind::Decl(scope, vars), span: span.merge(end) })
+        }
+    }
+
     /// Parse an anonymous sub expression: `sub { ... }` or `sub ($x) { ... }`.
     fn parse_anon_sub(&mut self, span: Span) -> Result<Expr, ParseError> {
         // Optional prototype
@@ -467,8 +495,22 @@ impl<'src> Parser<'src> {
         let condition = self.parse_paren_expr()?;
         self.expect.brace = BraceDisposition::Block;
         let then_block = self.parse_block()?;
-        let else_block = if self.eat(&Token::Keyword(Keyword::Else)) { Some(self.parse_block()?) } else { None };
-        Ok(StmtKind::Unless(UnlessStmt { condition, then_block, else_block }))
+
+        let mut elsif_clauses = Vec::new();
+        while self.eat(&Token::Keyword(Keyword::Elsif)) {
+            let cond = self.parse_paren_expr()?;
+            self.expect.brace = BraceDisposition::Block;
+            let block = self.parse_block()?;
+            elsif_clauses.push((cond, block));
+        }
+
+        let else_block = if self.eat(&Token::Keyword(Keyword::Else)) {
+            self.expect.brace = BraceDisposition::Block;
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
+        Ok(StmtKind::Unless(UnlessStmt { condition, then_block, elsif_clauses, else_block }))
     }
 
     fn parse_while_stmt(&mut self) -> Result<StmtKind, ParseError> {
@@ -492,24 +534,106 @@ impl<'src> Parser<'src> {
     fn parse_for_stmt(&mut self) -> Result<StmtKind, ParseError> {
         self.advance(); // eat for/foreach
 
-        // Determine: C-style for or foreach-style
-        // foreach $var (LIST) { }
-        // for (init; cond; step) { }
-        // for $var (LIST) { }
-
-        // If next token is a variable or 'my', it's foreach-style
+        // If next is a variable or 'my', it's foreach-style
         if matches!(self.peek(), Token::Keyword(Keyword::My) | Token::ScalarVar(_)) {
             return self.parse_foreach_body();
         }
 
-        // If next is '(' we need to peek further to distinguish
-        // for ($i=0; ...) vs for (@list)
-        // For now, assume foreach-style if '(' follows
+        // If next is '(' we need to distinguish C-style from foreach.
+        // C-style: for (init; cond; step) { ... }
+        // Foreach: for (LIST) { ... }
+        // Heuristic: scan inside parens for a semicolon at depth 0.
+        if self.at(&Token::LParen) {
+            if self.is_c_style_for() {
+                return self.parse_c_style_for();
+            }
+        }
+
+        // Foreach-style with bare list
         let list = self.parse_paren_expr()?;
         self.expect.brace = BraceDisposition::Block;
         let body = self.parse_block()?;
+        let continue_block = if self.eat(&Token::Keyword(Keyword::Continue)) {
+            self.expect.brace = BraceDisposition::Block;
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
 
-        Ok(StmtKind::ForEach(ForEachStmt { var: None, list, body, continue_block: None }))
+        Ok(StmtKind::ForEach(ForEachStmt { var: None, list, body, continue_block }))
+    }
+
+    /// Lookahead: is this `for (init; cond; step)` (C-style)?
+    /// Scans inside parens looking for a semicolon at paren depth 0.
+    fn is_c_style_for(&mut self) -> bool {
+        let cp = self.lexer.checkpoint();
+        let saved_expect = self.expect;
+        let saved_current = self.current.take();
+
+        // We're looking at '('. Skip it.
+        self.ensure_current();
+        let _ = self.current.take();
+
+        let mut depth = 1u32;
+        let mut found_semi = false;
+        loop {
+            self.ensure_current();
+            match self.peek() {
+                Token::LParen => {
+                    depth += 1;
+                }
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Token::Semi => {
+                    if depth == 1 {
+                        found_semi = true;
+                        break;
+                    }
+                }
+                Token::Eof => break,
+                _ => {}
+            }
+            let _ = self.current.take();
+        }
+
+        self.current = saved_current;
+        self.expect = saved_expect;
+        self.lexer.restore(cp);
+        found_semi
+    }
+
+    /// Parse C-style: `for (init; cond; step) { ... }`
+    fn parse_c_style_for(&mut self) -> Result<StmtKind, ParseError> {
+        self.expect_token(&Token::LParen)?;
+        self.expect.base = BaseExpect::Term;
+
+        // init (may be empty)
+        let init = if self.at(&Token::Semi) {
+            None
+        } else {
+            self.expect.base = BaseExpect::Term;
+            Some(self.parse_expr(PREC_LOW)?)
+        };
+        self.expect_token(&Token::Semi)?;
+
+        // condition (may be empty)
+        self.expect.base = BaseExpect::Term;
+        let condition = if self.at(&Token::Semi) { None } else { Some(self.parse_expr(PREC_LOW)?) };
+        self.expect_token(&Token::Semi)?;
+
+        // step (may be empty)
+        self.expect.base = BaseExpect::Term;
+        let step = if self.at(&Token::RParen) { None } else { Some(self.parse_expr(PREC_LOW)?) };
+        self.expect_token(&Token::RParen)?;
+
+        self.expect.brace = BraceDisposition::Block;
+        let body = self.parse_block()?;
+
+        Ok(StmtKind::For(ForStmt { init, condition, step, body }))
     }
 
     fn parse_foreach_body(&mut self) -> Result<StmtKind, ParseError> {
@@ -529,8 +653,14 @@ impl<'src> Parser<'src> {
         let list = self.parse_paren_expr()?;
         self.expect.brace = BraceDisposition::Block;
         let body = self.parse_block()?;
+        let continue_block = if self.eat(&Token::Keyword(Keyword::Continue)) {
+            self.expect.brace = BraceDisposition::Block;
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
 
-        Ok(StmtKind::ForEach(ForEachStmt { var, list, body, continue_block: None }))
+        Ok(StmtKind::ForEach(ForEachStmt { var, list, body, continue_block }))
     }
 
     // ── Package and use ───────────────────────────────────────
@@ -869,7 +999,7 @@ impl<'src> Parser<'src> {
                 let operand = self.parse_expr(PREC_UNARY)?;
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Ref(Box::new(operand)) })
             }
-            Token::Not => {
+            Token::Not | Token::Keyword(Keyword::Not) => {
                 self.expect.base = BaseExpect::Term;
                 let operand = self.parse_expr(PREC_NOT_LOW)?;
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Not, Box::new(operand)) })
@@ -883,6 +1013,18 @@ impl<'src> Parser<'src> {
                 self.expect.base = BaseExpect::Term;
                 let operand = self.parse_expr(PREC_INC)?;
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::PreDec, Box::new(operand)) })
+            }
+
+            // Declaration in expression context: my $x, our ($a, $b), etc.
+            Token::Keyword(Keyword::My) | Token::Keyword(Keyword::Our) | Token::Keyword(Keyword::Local) | Token::Keyword(Keyword::State) => {
+                let scope = match spanned.token {
+                    Token::Keyword(Keyword::My) => DeclScope::My,
+                    Token::Keyword(Keyword::Our) => DeclScope::Our,
+                    Token::Keyword(Keyword::Local) => DeclScope::Local,
+                    Token::Keyword(Keyword::State) => DeclScope::State,
+                    _ => unreachable!(),
+                };
+                self.parse_decl_expr(scope, span)
             }
 
             // Anonymous sub: sub { ... } or sub ($x) { ... }
@@ -2435,5 +2577,179 @@ mod tests {
         // Should see both my declarations, pod is invisible
         let my_count = prog.statements.iter().filter(|s| matches!(s.kind, StmtKind::My(_, _))).count();
         assert_eq!(my_count, 2);
+    }
+
+    // ── C-style for loop tests ────────────────────────────────
+
+    #[test]
+    fn parse_c_style_for() {
+        let prog = parse("for (my $i = 0; $i < 10; $i++) { print $i; }");
+        match &prog.statements[0].kind {
+            StmtKind::For(f) => {
+                // init should be an assignment wrapping a Decl(My)
+                match &f.init {
+                    Some(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
+                        assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::My, _)));
+                    }
+                    other => panic!("expected Assign(Decl(My), ...), got {other:?}"),
+                }
+            }
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_c_style_for_empty_parts() {
+        let prog = parse("for (;;) { last; }");
+        match &prog.statements[0].kind {
+            StmtKind::For(f) => {
+                assert!(f.init.is_none());
+                assert!(f.condition.is_none());
+                assert!(f.step.is_none());
+            }
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_c_style_for_list_decl() {
+        let prog = parse("for (my ($i, $j) = (0, 0); $i < 10; $i++) { 1; }");
+        match &prog.statements[0].kind {
+            StmtKind::For(f) => match &f.init {
+                Some(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => match &lhs.kind {
+                    ExprKind::Decl(DeclScope::My, vars) => {
+                        assert_eq!(vars.len(), 2);
+                    }
+                    other => panic!("expected Decl(My, 2 vars), got {other:?}"),
+                },
+                other => panic!("expected Assign(Decl(My), ...), got {other:?}"),
+            },
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_foreach_still_works() {
+        // Ensure for (@list) still parses as foreach
+        let prog = parse("for (@list) { 1; }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::ForEach(_)));
+    }
+
+    #[test]
+    fn parse_foreach_continue() {
+        let prog = parse("foreach my $x (@list) { 1; } continue { 2; }");
+        match &prog.statements[0].kind {
+            StmtKind::ForEach(f) => {
+                assert!(f.continue_block.is_some());
+            }
+            other => panic!("expected ForEach, got {other:?}"),
+        }
+    }
+
+    // ── scalar keyword test ───────────────────────────────────
+
+    #[test]
+    fn parse_scalar_keyword() {
+        let e = parse_expr_str("scalar @array;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "scalar");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected scalar call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unless_elsif_else() {
+        let prog = parse("unless (0) { 1; } elsif (1) { 2; } else { 3; }");
+        match &prog.statements[0].kind {
+            StmtKind::Unless(u) => {
+                assert_eq!(u.elsif_clauses.len(), 1);
+                assert!(u.else_block.is_some());
+            }
+            other => panic!("expected Unless, got {other:?}"),
+        }
+    }
+
+    // ── Decl-as-expression test ───────────────────────────────
+
+    #[test]
+    fn parse_decl_in_expr_context() {
+        // my $x = 5 in statement context still works
+        let prog = parse("my $x = 5;");
+        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
+    }
+
+    // ── qx// test ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_qx_string() {
+        let e = parse_expr_str("qx{ls -la};");
+        // qx produces an interpolated string (backtick kind)
+        assert!(matches!(e.kind, ExprKind::InterpolatedString(_) | ExprKind::StringLit(_)));
+    }
+
+    // ── C-style for with plain expression init ────────────────
+
+    #[test]
+    fn parse_c_style_for_plain_init() {
+        // No 'my' — just a plain assignment
+        let prog = parse("for ($i = 0; $i < 10; $i++) { 1; }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::For(_)));
+    }
+
+    // ── local/our/state in for-init ───────────────────────────
+
+    #[test]
+    fn parse_c_style_for_local() {
+        let prog = parse("for (local $i = 0; $i < 10; $i++) { 1; }");
+        match &prog.statements[0].kind {
+            StmtKind::For(f) => match &f.init {
+                Some(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
+                    assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::Local, _)));
+                }
+                other => panic!("expected Assign(Decl(Local), ...), got {other:?}"),
+            },
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    // ── my with array/hash ────────────────────────────────────
+
+    #[test]
+    fn parse_my_array_decl() {
+        let prog = parse("my @arr = (1, 2, 3);");
+        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
+    }
+
+    #[test]
+    fn parse_my_hash_decl() {
+        let prog = parse("my %hash = (a => 1);");
+        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
+    }
+
+    // ── while continue block ──────────────────────────────────
+
+    #[test]
+    fn parse_while_continue() {
+        let prog = parse("while (1) { 1; } continue { 2; }");
+        match &prog.statements[0].kind {
+            StmtKind::While(w) => {
+                assert!(w.continue_block.is_some());
+            }
+            other => panic!("expected While, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_until_continue() {
+        let prog = parse("until (0) { 1; } continue { 2; }");
+        match &prog.statements[0].kind {
+            StmtKind::Until(u) => {
+                assert!(u.continue_block.is_some());
+            }
+            other => panic!("expected Until, got {other:?}"),
+        }
     }
 }
