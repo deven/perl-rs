@@ -5952,11 +5952,10 @@ at each step.
 
 **This is the foundation everything else stands on.**
 
-Build the `perl-string` and `perl-value` crates first.  Every other
-crate depends on them, and design mistakes here are the most
-expensive to fix later.
+Build the `perl-core` crate first.  Every other crate depends on
+it, and design mistakes here are the most expensive to fix later.
 
-**Week 1: `perl-string` and core value types**
+**Week 1: Strings and core value types**
 
 1. `PerlString` — `Vec<u8>` + `is_utf8: bool`.  Methods: `as_str()`,
    `from_str()`, `as_bytes()`, `into_bytes()`, concatenation,
@@ -5966,18 +5965,18 @@ expensive to fix later.
 2. `SmallString` — 22-byte inline string.  Construction, conversion
    to/from `PerlString`, boundary behavior at exactly 22 bytes.
 
-3. `SvFlags` — bitflags struct with IOK, NOK, POK, ROK, READONLY,
-   UTF8, MAGICAL, TAINT, WEAK.
+3. `SvFlags` — bitflags struct with INT_VALID, NUM_VALID, STR_VALID,
+   REF_VALID, READONLY, UTF8, MAGICAL, TAINT, WEAK.
 
 4. `PerlStringSlot` — the `None`/`Inline`/`Heap` enum.
 
 **Week 2: `Scalar`, `Value`, and coercion**
 
-5. `Scalar` — full struct with `iv`, `nv`, `pv`, `rv`, `magic`,
-   `stash`.  Coercion methods: `get_iv()`, `get_nv()`, `get_pv()`,
-   `set_iv()`, `set_str()`, `set_ref()`.  Each respects flag
-   discipline — reads check the validity flag first, writes
-   invalidate other caches.
+5. `Scalar` — full struct with `int`, `num`, `bytes`, `rv`, `magic`,
+   `stash`.  Coercion methods: `get_int()`, `get_num()`,
+   `get_bytes()`, `get_str()`, `set_int()`, `set_str()`, `set_ref()`.
+   Each respects flag discipline — reads check the validity flag
+   first, writes invalidate other caches.
 
 6. `Value` — the enum with compact variants (`Undef`, `Int`,
    `Float`, `SmallStr`, `Str`, `Ref`) and `Scalar(Sv)`.
@@ -6055,22 +6054,23 @@ thoroughly.
 
 ### Step 3: Minimal interpreter via AST walking (1-2 weeks)
 
-Build a quick-and-dirty AST-walking interpreter — just enough to run
-`print`, basic arithmetic, string operations, conditionals, and
-loops.  This is throwaway scaffolding to get rapid feedback from the
-test suite.
+Build a quick-and-dirty AST-walking interpreter in `perl-runtime` —
+just enough to run `print`, basic arithmetic, string operations,
+conditionals, and loops.  This is throwaway scaffolding to get rapid
+feedback from the test suite.
 
 ### Step 4: Compile-time execution (`BEGIN`, `use`) (1-2 weeks)
 
-Implement the compilation/execution interleaving so that
-`use strict`, `use warnings`, `use constant`, and simple `BEGIN`
-blocks work.  This unblocks virtually all real Perl code.
+Implement the `Executor` trait (§22.1) and the
+compilation/execution interleaving so that `use strict`,
+`use warnings`, `use constant`, and simple `BEGIN` blocks work.
+This unblocks virtually all real Perl code.
 
 ### Step 5: Lowering and IR (2-3 weeks)
 
-Build the HIR lowering and IR code generation.  Migrate the
-interpreter from AST walking to IR execution.  The AST walker can
-remain as a fallback during transition.
+Build the HIR lowering and IR code generation in `perl-compiler`.
+Migrate the interpreter from AST walking to IR execution.  The AST
+walker can remain as a fallback during transition.
 
 ### Step 6: Regex engine (3-4 weeks)
 
@@ -6110,46 +6110,149 @@ and AOT Rust codegen can proceed independently once the IR is stable.
 
 ### Step 12: REPL (when interpreter is usable)
 
-Build the `perl-repl` crate on `reedline` once the interpreter can
-execute basic code (after Step 3 or 4).  Start with simple
-expression evaluation and `dd()` output, then add introspection
-commands, tab completion, and syntax highlighting incrementally.
+Build the REPL module in `perl-runtime` (behind the `repl` feature
+flag) on `reedline` once the interpreter can execute basic code
+(after Step 3 or 4).  Start with simple expression evaluation and
+`dd()` output, then add introspection commands, tab completion, and
+syntax highlighting incrementally.
 
 ---
 
 ## 22. Project Structure
 
+### 22.1 Crate Architecture
+
+The workspace consists of five library crates and one binary, with
+three independent leaf crates that have no internal dependencies:
+
 ```text
-crates/
-    perl-value/          # Value, Scalar, Arc-based types, magic
-    perl-string/         # PerlString (octet + UTF-8 flag)
-    perl-types/          # Typed value support, TypedVal trait
-    perl-parser/         # Lexer + Pratt parser + AST (inseparable)
-    perl-hir/            # HIR and lowering from AST
-    perl-ir/             # IR definition and codegen from HIR
-    perl-runtime/        # Interpreter, call frames, symbol tables
-    perl-regex/          # Standalone regex engine (see §11)
-    perl-compiler/       # Orchestrates parse → lower → codegen
-    perl-cli/            # Binary entry point, CLI arg handling
-    perl-repl/           # Interactive REPL (reedline-based)
-    perl-debug/          # DAP server, profiling, task inspection
-    perl-extensions/     # Native extension API, FFI support
-
-docs/
-    design.md            # This document
-    compat-log.md        # Tracking compatibility decisions and divergences
-
-tests/
-    upstream/            # Symlink or copy of Perl 5 t/ directory
-    unit/                # Rust unit tests
-    integration/         # End-to-end Perl source tests
+                    ┌───────────┐
+                    │   perl    │  (bin: fn main())
+                    └─────┬─────┘
+                          │
+                  ┌───────▼────────┐
+                  │  perl-runtime  │  (lib: interpreter,
+                  │                │   builtins, CLI/REPL)
+                  └┬────┬─────────┘
+                   │    │
+        ┌──────────▼┐   │   ┌────────────┐
+        │perl-regex │   │   │perl-compiler│
+        │           │   │   │(lib: HIR,   │
+        │(lib:      │   │   │ IR, lower,  │
+        │ standalone│   │   │ optimize)   │
+        │ regex     │   │   └──┬──────┬───┘
+        │ engine)   │   │      │      │
+        └───────────┘   │  ┌───▼──┐ ┌─▼──────────┐
+                        │  │perl- │ │perl-parser  │
+                        │  │core  │ │(lib: lexer  │
+                        │  │(lib: │ │ + parser    │
+                        │  │values│ │ + AST)      │
+                        │  │etc.) │ │             │
+                        │  └──────┘ └─────────────┘
+                        │      ▲         ▲
+                        └──────┴─────────┘
 ```
 
-The lexer and parser live in the same crate (`perl-parser`) because
-they are not separable — the lexer requires parser feedback
-(expectation state) to determine what a token is, and the parser
-calls into the lexer with explicit expectations.  Internally,
-`perl-parser` is organized as modules:
+| Crate | Type | Dependencies | Contents |
+|---|---|---|---|
+| `perl-core` | lib | none | Strings, values, scalars, flags, typed value trait, extension API |
+| `perl-parser` | lib | none | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters |
+| `perl-regex` | lib | none | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11) |
+| `perl-compiler` | lib | `perl-core`, `perl-parser` | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
+| `perl-runtime` | lib | `perl-compiler`, `perl-core`, `perl-regex` | Interpreter loop, `Executor` impl, call frames, symbol tables, builtins, magic, concurrency, bytecode save/load, CLI, REPL, debug |
+| `perl` | bin | `perl-runtime` | Thin entry point: parses `std::env::args`, calls `perl_runtime::run`, exits |
+
+**Design rationale:**
+
+Three leaf crates (`perl-core`, `perl-parser`, `perl-regex`) have no
+cross-dependencies.  Each is independently useful as a library:
+`perl-parser` for tools that need to parse Perl without executing it,
+`perl-regex` for Rust programs that want Perl-compatible regex, and
+`perl-core` for extensions that need the value types.
+
+`perl-compiler` contains the compilation pipeline: AST → HIR → IR →
+optimize.  It depends on `perl-parser` (for AST input) and
+`perl-core` (for value types referenced during lowering).  It does
+*not* depend on `perl-runtime` — this layering is deliberate.
+
+`perl-runtime` depends on `perl-compiler` and implements the
+`Executor` trait that the compiler uses for `BEGIN`/`use`/`eval
+STRING` execution.  The mutual recursion between compiler and
+interpreter is broken cleanly by dependency inversion:
+
+```rust
+/// Defined in perl-compiler.  The compiler doesn't know about the
+/// interpreter — only that something can execute compiled IR.
+trait Executor {
+    fn execute(
+        &mut self,
+        ir: &CompiledUnit,
+    ) -> Result<Value, PerlException>;
+}
+```
+
+The compiler calls `executor.execute(begin_block)` when it hits a
+`BEGIN`.  The runtime implements `Executor` and passes itself to the
+compiler.  No circular dependency — just an inversion-of-control
+callback.
+
+This layering has a concrete benefit: a future AOT tool that emits
+Rust source code (§14.14) can depend on `perl-compiler` without
+pulling in the interpreter:
+
+```text
+perl-aot (future bin)
+  └─ perl-compiler
+       ├─ perl-core
+       └─ perl-parser
+```
+
+No interpreter, no builtins, no Tokio runtime — just parse Perl,
+compile to IR, emit Rust source.
+
+**Bytecode serialization** lives in `perl-runtime`, not
+`perl-compiler`.  The IR types are defined in `perl-compiler`, but
+the bytecode format is optimized for fast loading into the
+interpreter loop — it's a runtime concern.  The flow:
+
+- First run: `perl-compiler` produces IR → `perl-runtime` executes
+  it and optionally saves bytecode to a `.plc` file.
+- Subsequent runs: `perl-runtime` finds the `.plc`, checks the
+  timestamp, loads bytecode directly, skips compilation.
+
+Same pattern as Python's `.pyc` files.
+
+**Internal module structure of `perl-compiler`:**
+
+```text
+perl-compiler/
+    src/
+        lib.rs
+        hir/             # HIR types and lowering from AST
+        ir/              # IR types and codegen from HIR
+        optimize/        # Optimization passes
+        executor.rs      # Executor trait definition
+```
+
+**Internal module structure of `perl-runtime`:**
+
+```text
+perl-runtime/
+    src/
+        lib.rs
+        interp/          # Interpreter loop, call frames
+        builtins/        # print, chomp, push, sort, etc.
+        symbols/         # Symbol tables, stashes, globs
+        scope/           # local, my, our — dynamic/lexical scope
+        magic/           # Tied variables, special vars
+        concurrency/     # spawn, channels, task management
+        bytecode/        # IR serialization/deserialization
+        cli/             # Argument parsing, -e/-p/-n/-w flags
+        repl/            # Interactive REPL (behind feature flag)
+        debug/           # DAP server, profiling (behind feature flag)
+```
+
+**Internal module structure of `perl-parser`:**
 
 ```text
 perl-parser/
@@ -6160,7 +6263,7 @@ perl-parser/
         parser.rs        # Pratt parser, AST construction
         ast.rs           # AST node types
         keyword.rs       # Keyword table
-        expect.rs        # Expectation state enum
+        expect.rs        # Expectation state
 ```
 
 The lexer and parser are `pub(crate)` internals.  They share the
@@ -6168,16 +6271,49 @@ The lexer and parser are `pub(crate)` internals.  They share the
 lexer reads it when tokenizing the next token.  The crate boundary
 is at the AST level — downstream crates see only the AST.
 
-Using a Cargo workspace with separate crates enforces clean
-boundaries: `perl-parser` cannot accidentally depend on
-`perl-runtime` internals, the regex engine is independently
-testable and publishable, and the value model can be used by all
-layers without circular dependencies.
+**Feature flags on `perl-runtime`:**
 
-`perl-regex` in particular is designed as an independently publishable
-crate with no dependency on the rest of the workspace (see §11).  It
-should have its own README, examples, and documentation suitable for
-Rust programmers who have no interest in Perl.
+```toml
+[features]
+default = []
+repl = ["dep:reedline"]
+debug = ["dep:dap"]
+```
+
+The REPL and debug server have their own dependencies that most
+users don't need.  Feature flags keep them out of the default build
+without requiring separate crates.  A future JIT backend would
+follow the same pattern on `perl-compiler`:
+
+```toml
+# perl-compiler Cargo.toml
+[features]
+default = []
+jit = ["dep:cranelift-codegen", "dep:cranelift-frontend"]
+```
+
+**The binary crate (`perl`) is minimal** — all logic lives in
+`perl-runtime` as testable library code.  This makes the runtime
+embeddable: a Rust application can depend on `perl-runtime` and
+invoke Perl without going through the CLI.
+
+**Published crate names** may differ from workspace names if the
+`perl-*` namespace on crates.io is unavailable.  Fallback names
+follow the pattern `perl5-core`, `perl5-parser`, `perl5-regex`, etc.
+Local workspace names remain `perl-*` regardless.
+
+### 22.2 Supporting Files
+
+```text
+docs/
+    design.md            # This document
+    compat-log.md        # Tracking compatibility decisions and divergences
+
+tests/
+    upstream/            # Symlink or copy of Perl 5 t/ directory
+    unit/                # Rust unit tests
+    integration/         # End-to-end Perl source tests
+```
 
 ---
 
@@ -6265,8 +6401,16 @@ The key architectural decisions in this design:
 7. **Value model first in implementation order**, because everything
    depends on it — not lexer first.
 
-8. **Cargo workspace crate structure** enforces dependency boundaries
-   at the build system level, not just by convention.
+8. **Six crates plus one binary** — three independent leaf crates
+   (`perl-core`, `perl-parser`, `perl-regex`) with no
+   cross-dependencies, a `perl-compiler` library (HIR, IR, lowering,
+   optimization, `Executor` trait), a `perl-runtime` library
+   (interpreter, builtins, bytecode save/load), and a thin `perl`
+   binary.  The compiler–interpreter mutual recursion
+   (`BEGIN`/`use`/`eval STRING`) is broken by dependency inversion:
+   `perl-compiler` defines the `Executor` trait, `perl-runtime`
+   implements it.  Cargo workspace enforces dependency boundaries at
+   the build system level.
 
 9. **`let`/`fn` as the typed layer.**  Native Rust types with Rust
    syntax (`name: Type`), type inference, immutable-by-default
