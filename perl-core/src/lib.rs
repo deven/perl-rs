@@ -1,4 +1,4 @@
-//! Perl value types — the core data model.
+//! Perl core types.
 //!
 //! This crate provides the fundamental value representation:
 //!
@@ -29,9 +29,15 @@
 //!   for the fast path and caches new representations lazily.
 
 pub mod flags;
+pub mod perl_string;
 pub mod scalar;
+pub mod small_string;
+pub mod string_slot;
 pub mod value;
 
 pub use flags::SvFlags;
+pub use perl_string::PerlString;
 pub use scalar::Scalar;
+pub use small_string::{SMALL_STRING_MAX, SmallString};
+pub use string_slot::{PerlStringSlot, SLOT_INLINE_MAX};
 pub use value::{Av, Hv, Sv, Value};
