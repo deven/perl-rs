@@ -37,37 +37,39 @@ pub struct Stash {
 /// The full Perl scalar.
 ///
 /// Parallel representation slots with flag-driven validity, following
-/// Perl 5's SV model.  `$x = "42"` sets POK; `$x + 0` sets IOK and
+/// Perl 5's SV model.  `$x = "42"` sets STR_VALID; `$x + 0` sets INT_VALID and
 /// caches 42 in `int` without clearing the string.
 ///
 /// # Flag Discipline
 ///
-/// - `int` is meaningful only when `flags.contains(SvFlags::IOK)`.
-/// - `num` is meaningful only when `flags.contains(SvFlags::NOK)`.
-/// - `pv` content is meaningful only when `flags.contains(SvFlags::POK)`.
-/// - `rv` is meaningful only when `flags.contains(SvFlags::ROK)`.
+/// - `int` is meaningful only when `flags.contains(SvFlags::INT_VALID)`.
+/// - `num` is meaningful only when `flags.contains(SvFlags::NUM_VALID)`.
+/// - `pv` content is meaningful only when `flags.contains(SvFlags::STR_VALID)`.
+/// - `rv` is meaningful only when `flags.contains(SvFlags::REF_VALID)`.
 ///
 /// Writing a new representation typically invalidates the others:
-/// - Setting a string: set POK, clear IOK and NOK.
-/// - Setting an integer: set IOK, clear POK and NOK (unless caching).
+/// - Setting a string: set STR_VALID, clear INT_VALID and NUM_VALID.
+/// - Setting an integer: set INT_VALID, clear STR_VALID and NUM_VALID (unless
+///   caching).
 ///
 /// Reading a missing representation triggers lazy coercion:
-/// - Reading iv when only POK is set: parse the string, cache in int, set IOK.
+/// - Reading iv when only STR_VALID is set: parse the string, cache in int,
+///   set INT_VALID.
 pub struct Scalar {
     /// Which representations are valid + metadata.
     pub(crate) flags: SvFlags,
 
-    /// Integer representation.  Valid when IOK is set.
+    /// Integer representation.  Valid when INT_VALID is set.
     pub(crate) int: i64,
 
-    /// Float representation.  Valid when NOK is set.
+    /// Float representation.  Valid when NUM_VALID is set.
     pub(crate) num: f64,
 
-    /// String representation.  Valid when POK is set.
+    /// String representation.  Valid when STR_VALID is set.
     /// Uses small-string optimization internally.
     pub(crate) pv: PerlStringSlot,
 
-    /// Reference target.  Valid when ROK is set.
+    /// Reference target.  Valid when REF_VALID is set.
     /// When set, this scalar IS a reference (like Perl's RV).
     pub(crate) rv: Option<Value>,
 
@@ -86,32 +88,32 @@ impl Scalar {
         Scalar { flags: SvFlags::EMPTY, int: 0, num: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
-    /// Create a scalar from an integer.  IOK is set.
+    /// Create a scalar from an integer.  INT_VALID is set.
     pub fn from_int(n: i64) -> Self {
-        Scalar { flags: SvFlags::IOK, int: n, num: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::INT_VALID, int: n, num: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
-    /// Create a scalar from a float.  NOK is set.
+    /// Create a scalar from a float.  NUM_VALID is set.
     pub fn from_num(n: f64) -> Self {
-        Scalar { flags: SvFlags::NOK, int: 0, num: n, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::NUM_VALID, int: 0, num: n, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
-    /// Create a scalar from a string.  POK is set.
+    /// Create a scalar from a string.  STR_VALID is set.
     pub fn from_str(s: &str) -> Self {
         let mut pv = PerlStringSlot::None;
         pv.set_str(s);
-        Scalar { flags: SvFlags::POK | SvFlags::UTF8, int: 0, num: 0.0, pv, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::STR_VALID | SvFlags::UTF8, int: 0, num: 0.0, pv, rv: None, magic: None, stash: None }
     }
 
-    /// Create a scalar from a `PerlString`.  POK is set.
+    /// Create a scalar from a `PerlString`.  STR_VALID is set.
     pub fn from_perl_string(ps: PerlString) -> Self {
-        let flags = if ps.is_utf8() { SvFlags::POK | SvFlags::UTF8 } else { SvFlags::POK };
+        let flags = if ps.is_utf8() { SvFlags::STR_VALID | SvFlags::UTF8 } else { SvFlags::STR_VALID };
         Scalar { flags, int: 0, num: 0.0, pv: PerlStringSlot::Heap(ps), rv: None, magic: None, stash: None }
     }
 
-    /// Create a reference scalar.  ROK is set.
+    /// Create a reference scalar.  REF_VALID is set.
     pub fn from_ref(target: Value) -> Self {
-        Scalar { flags: SvFlags::ROK, int: 0, num: 0.0, pv: PerlStringSlot::None, rv: Some(target), magic: None, stash: None }
+        Scalar { flags: SvFlags::REF_VALID, int: 0, num: 0.0, pv: PerlStringSlot::None, rv: Some(target), magic: None, stash: None }
     }
 
     // ── Flag accessors ────────────────────────────────────────────
@@ -123,7 +125,7 @@ impl Scalar {
 
     /// Whether this scalar is a reference.
     pub fn is_ref(&self) -> bool {
-        self.flags.contains(SvFlags::ROK)
+        self.flags.contains(SvFlags::REF_VALID)
     }
 
     /// Whether this scalar is read-only.
@@ -143,17 +145,17 @@ impl Scalar {
 
     /// Whether any value representation is valid (not undef).
     pub fn is_defined(&self) -> bool {
-        self.flags.intersects(SvFlags::ANY_VAL | SvFlags::ROK)
+        self.flags.intersects(SvFlags::ANY_VAL | SvFlags::REF_VALID)
     }
 
     /// Perl truthiness.
     ///
     /// A scalar is false if it is:
     /// - undef (no valid representations)
-    /// - integer zero (`iv == 0` when IOK)
-    /// - float zero (`nv == 0.0` when NOK)
-    /// - empty string (`""` when POK)
-    /// - the string `"0"` (when POK)
+    /// - integer zero (`int == 0` when INT_VALID)
+    /// - float zero (`num == 0.0` when NUM_VALID)
+    /// - empty string (`""` when STR_VALID)
+    /// - the string `"0"` (when STR_VALID)
     ///
     /// References are always true.  Everything else is true.
     ///
@@ -161,22 +163,22 @@ impl Scalar {
     /// first (faster than string comparison).
     pub fn is_true(&self) -> bool {
         // References are always true.
-        if self.flags.contains(SvFlags::ROK) {
+        if self.flags.contains(SvFlags::REF_VALID) {
             return true;
         }
 
         // Integer representation — check for zero.
-        if self.flags.contains(SvFlags::IOK) {
+        if self.flags.contains(SvFlags::INT_VALID) {
             return self.int != 0;
         }
 
         // Float representation — check for zero.
-        if self.flags.contains(SvFlags::NOK) {
+        if self.flags.contains(SvFlags::NUM_VALID) {
             return self.num != 0.0;
         }
 
         // String representation — check for "" and "0".
-        if self.flags.contains(SvFlags::POK) {
+        if self.flags.contains(SvFlags::STR_VALID) {
             return !string_is_false(&self.pv);
         }
 
@@ -187,27 +189,27 @@ impl Scalar {
     // ── Integer access (with lazy coercion) ───────────────────────
 
     /// Get the integer value, coercing from other representations if needed.
-    /// Caches the result by setting IOK.
+    /// Caches the result by setting INT_VALID.
     pub fn get_int(&mut self) -> i64 {
-        if self.flags.contains(SvFlags::IOK) {
+        if self.flags.contains(SvFlags::INT_VALID) {
             return self.int;
         }
 
         // Try to coerce from float
-        if self.flags.contains(SvFlags::NOK) {
+        if self.flags.contains(SvFlags::NUM_VALID) {
             self.int = self.num as i64;
-            self.flags.insert(SvFlags::IOK);
+            self.flags.insert(SvFlags::INT_VALID);
             return self.int;
         }
 
         // Try to coerce from string
-        if self.flags.contains(SvFlags::POK) {
+        if self.flags.contains(SvFlags::STR_VALID) {
             if let Some(ps) = self.pv.to_perl_string() {
                 self.int = ps.parse_iv();
             } else {
                 self.int = 0;
             }
-            self.flags.insert(SvFlags::IOK);
+            self.flags.insert(SvFlags::INT_VALID);
             return self.int;
         }
 
@@ -215,71 +217,71 @@ impl Scalar {
         0
     }
 
-    /// Set the integer value.  Sets IOK, clears NOK and POK.
+    /// Set the integer value.  Sets INT_VALID, clears NUM_VALID and STR_VALID.
     pub fn set_int(&mut self, n: i64) {
         self.int = n;
-        self.flags.insert(SvFlags::IOK);
-        self.flags.remove(SvFlags::NOK | SvFlags::POK | SvFlags::UTF8);
+        self.flags.insert(SvFlags::INT_VALID);
+        self.flags.remove(SvFlags::NUM_VALID | SvFlags::STR_VALID | SvFlags::UTF8);
         self.pv.clear();
     }
 
     // ── Float access (with lazy coercion) ─────────────────────────
 
     /// Get the float value, coercing from other representations if needed.
-    /// Caches the result by setting NOK.
+    /// Caches the result by setting NUM_VALID.
     pub fn get_num(&mut self) -> f64 {
-        if self.flags.contains(SvFlags::NOK) {
+        if self.flags.contains(SvFlags::NUM_VALID) {
             return self.num;
         }
 
-        if self.flags.contains(SvFlags::IOK) {
+        if self.flags.contains(SvFlags::INT_VALID) {
             self.num = self.int as f64;
-            self.flags.insert(SvFlags::NOK);
+            self.flags.insert(SvFlags::NUM_VALID);
             return self.num;
         }
 
-        if self.flags.contains(SvFlags::POK) {
+        if self.flags.contains(SvFlags::STR_VALID) {
             if let Some(ps) = self.pv.to_perl_string() {
                 self.num = ps.parse_nv();
             } else {
                 self.num = 0.0;
             }
-            self.flags.insert(SvFlags::NOK);
+            self.flags.insert(SvFlags::NUM_VALID);
             return self.num;
         }
 
         0.0
     }
 
-    /// Set the float value.  Sets NOK, clears IOK and POK.
+    /// Set the float value.  Sets NUM_VALID, clears INT_VALID and STR_VALID.
     pub fn set_num(&mut self, n: f64) {
         self.num = n;
-        self.flags.insert(SvFlags::NOK);
-        self.flags.remove(SvFlags::IOK | SvFlags::POK | SvFlags::UTF8);
+        self.flags.insert(SvFlags::NUM_VALID);
+        self.flags.remove(SvFlags::INT_VALID | SvFlags::STR_VALID | SvFlags::UTF8);
         self.pv.clear();
     }
 
     // ── String access (with lazy coercion) ────────────────────────
 
     /// Get a string view, coercing from other representations if needed.
-    /// Caches the result by setting POK.
+    /// Caches the result by setting STR_VALID.
     /// Returns `None` only for undef.
     pub fn get_bytes(&mut self) -> Option<&[u8]> {
-        if self.flags.contains(SvFlags::POK) {
+        if self.flags.contains(SvFlags::STR_VALID) {
             return self.pv.as_bytes();
         }
 
-        if self.flags.contains(SvFlags::IOK) {
+        if self.flags.contains(SvFlags::INT_VALID) {
             let s = self.int.to_string();
             self.pv.set_str(&s);
-            self.flags.insert(SvFlags::POK | SvFlags::UTF8);
+            self.flags.insert(SvFlags::STR_VALID | SvFlags::UTF8);
             return self.pv.as_bytes();
         }
 
-        if self.flags.contains(SvFlags::NOK) {
+        if self.flags.contains(SvFlags::NUM_VALID) {
             let s = format_nv(self.num);
             self.pv.set_str(&s);
-            self.flags.insert(SvFlags::POK | SvFlags::UTF8);
+            self.flags.insert(SvFlags::STR_VALID | SvFlags::UTF8);
             return self.pv.as_bytes();
         }
 
@@ -290,30 +292,30 @@ impl Scalar {
     /// Get a `&str` view if the string representation is UTF-8.
     /// Coerces if needed (numeric → string is always UTF-8).
     pub fn get_str(&mut self) -> Option<&str> {
-        // Ensure pv is populated
+        // Ensure string is populated
         self.get_bytes()?;
         self.pv.as_str()
     }
 
-    /// Set the string value from a `&str`.  Sets POK + UTF8, clears IOK and NOK.
+    /// Set the string value from a `&str`.  Sets STR_VALID + UTF8, clears INT_VALID and NUM_VALID.
     pub fn set_str(&mut self, s: &str) {
         self.pv.set_str(s);
-        self.flags.insert(SvFlags::POK | SvFlags::UTF8);
-        self.flags.remove(SvFlags::IOK | SvFlags::NOK);
+        self.flags.insert(SvFlags::STR_VALID | SvFlags::UTF8);
+        self.flags.remove(SvFlags::INT_VALID | SvFlags::NUM_VALID);
     }
 
-    /// Set the string value from raw bytes.  Sets POK, clears UTF8 + IOK + NOK.
+    /// Set the string value from raw bytes.  Sets STR_VALID, clears UTF8 + INT_VALID + NUM_VALID.
     pub fn set_bytes(&mut self, bytes: &[u8]) {
         self.pv.set_bytes(bytes);
-        self.flags.insert(SvFlags::POK);
-        self.flags.remove(SvFlags::IOK | SvFlags::NOK | SvFlags::UTF8);
+        self.flags.insert(SvFlags::STR_VALID);
+        self.flags.remove(SvFlags::INT_VALID | SvFlags::NUM_VALID | SvFlags::UTF8);
     }
 
     /// Get the string representation as an owned `PerlString`.
-    /// Coerces if needed (populates the pv cache as a side effect).
+    /// Coerces if needed (populates the string cache as a side effect).
     /// Returns an empty string for undef.
     pub fn stringify(&mut self) -> PerlString {
-        // Ensure pv cache is populated (may coerce from int/num).
+        // Ensure string cache is populated (may coerce from int/num).
         if self.get_bytes().is_none() {
             return PerlString::new(); // undef → empty string
         }
@@ -331,14 +333,14 @@ impl Scalar {
 
     /// Get the reference target, if this is a reference.
     pub fn get_rv(&self) -> Option<&Value> {
-        if self.flags.contains(SvFlags::ROK) { self.rv.as_ref() } else { None }
+        if self.flags.contains(SvFlags::REF_VALID) { self.rv.as_ref() } else { None }
     }
 
     /// Set this scalar to be a reference to the given value.
     /// Clears all other representations.
     pub fn set_rv(&mut self, target: Value) {
         self.rv = Some(target);
-        self.flags = SvFlags::ROK;
+        self.flags = SvFlags::REF_VALID;
         self.int = 0;
         self.num = 0.0;
         self.pv.clear();
@@ -392,7 +394,7 @@ pub(crate) fn format_nv(n: f64) -> String {
 /// Everything else is true.
 fn string_is_false(pv: &PerlStringSlot) -> bool {
     match pv.as_bytes() {
-        None => true,       // no string → false (shouldn't happen if POK is set)
+        None => true,       // no string → false (shouldn't happen if STR_VALID is set)
         Some(b"") => true,  // empty string
         Some(b"0") => true, // the string "0"
         Some(_) => false,   // anything else
@@ -405,16 +407,16 @@ impl fmt::Debug for Scalar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("Scalar");
         d.field("flags", &self.flags);
-        if self.flags.contains(SvFlags::IOK) {
+        if self.flags.contains(SvFlags::INT_VALID) {
             d.field("int", &self.int);
         }
-        if self.flags.contains(SvFlags::NOK) {
+        if self.flags.contains(SvFlags::NUM_VALID) {
             d.field("num", &self.num);
         }
-        if self.flags.contains(SvFlags::POK) {
+        if self.flags.contains(SvFlags::STR_VALID) {
             d.field("pv", &self.pv);
         }
-        if self.flags.contains(SvFlags::ROK) {
+        if self.flags.contains(SvFlags::REF_VALID) {
             d.field("rv", &self.rv);
         }
         if self.magic.is_some() {
@@ -443,7 +445,7 @@ mod tests {
     #[test]
     fn from_int() {
         let mut sv = Scalar::from_int(42);
-        assert!(sv.flags().contains(SvFlags::IOK));
+        assert!(sv.flags().contains(SvFlags::INT_VALID));
         assert_eq!(sv.get_int(), 42);
         assert!(sv.is_defined());
     }
@@ -451,14 +453,14 @@ mod tests {
     #[test]
     fn from_num() {
         let mut sv = Scalar::from_num(3.14);
-        assert!(sv.flags().contains(SvFlags::NOK));
+        assert!(sv.flags().contains(SvFlags::NUM_VALID));
         assert!((sv.get_num() - 3.14).abs() < 1e-10);
     }
 
     #[test]
     fn from_str() {
         let mut sv = Scalar::from_str("hello");
-        assert!(sv.flags().contains(SvFlags::POK));
+        assert!(sv.flags().contains(SvFlags::STR_VALID));
         assert!(sv.flags().contains(SvFlags::UTF8));
         assert_eq!(sv.get_str(), Some("hello"));
     }
@@ -466,64 +468,64 @@ mod tests {
     #[test]
     fn iv_to_nv_coercion() {
         let mut sv = Scalar::from_int(42);
-        assert!(!sv.flags().contains(SvFlags::NOK));
+        assert!(!sv.flags().contains(SvFlags::NUM_VALID));
         let n = sv.get_num();
         assert!((n - 42.0).abs() < 1e-10);
-        assert!(sv.flags().contains(SvFlags::NOK)); // now cached
+        assert!(sv.flags().contains(SvFlags::NUM_VALID)); // now cached
     }
 
     #[test]
     fn iv_to_str_coercion() {
         let mut sv = Scalar::from_int(42);
-        assert!(!sv.flags().contains(SvFlags::POK));
+        assert!(!sv.flags().contains(SvFlags::STR_VALID));
         let s = sv.get_str();
         assert_eq!(s, Some("42"));
-        assert!(sv.flags().contains(SvFlags::POK)); // now cached
-        assert!(sv.flags().contains(SvFlags::IOK)); // still valid
+        assert!(sv.flags().contains(SvFlags::STR_VALID)); // now cached
+        assert!(sv.flags().contains(SvFlags::INT_VALID)); // still valid
     }
 
     #[test]
     fn str_to_iv_coercion() {
         let mut sv = Scalar::from_str("42abc");
-        assert!(!sv.flags().contains(SvFlags::IOK));
+        assert!(!sv.flags().contains(SvFlags::INT_VALID));
         let n = sv.get_int();
         assert_eq!(n, 42); // Perl-style: parse leading digits
-        assert!(sv.flags().contains(SvFlags::IOK)); // now cached
-        assert!(sv.flags().contains(SvFlags::POK)); // still valid
+        assert!(sv.flags().contains(SvFlags::INT_VALID)); // now cached
+        assert!(sv.flags().contains(SvFlags::STR_VALID)); // still valid
     }
 
     #[test]
     fn set_int_clears_string() {
         let mut sv = Scalar::from_str("hello");
-        assert!(sv.flags().contains(SvFlags::POK));
+        assert!(sv.flags().contains(SvFlags::STR_VALID));
         sv.set_int(99);
-        assert!(sv.flags().contains(SvFlags::IOK));
-        assert!(!sv.flags().contains(SvFlags::POK));
+        assert!(sv.flags().contains(SvFlags::INT_VALID));
+        assert!(!sv.flags().contains(SvFlags::STR_VALID));
     }
 
     #[test]
     fn set_str_clears_numeric() {
         let mut sv = Scalar::from_int(42);
-        assert!(sv.flags().contains(SvFlags::IOK));
+        assert!(sv.flags().contains(SvFlags::INT_VALID));
         sv.set_str("hello");
-        assert!(sv.flags().contains(SvFlags::POK));
-        assert!(!sv.flags().contains(SvFlags::IOK));
-        assert!(!sv.flags().contains(SvFlags::NOK));
+        assert!(sv.flags().contains(SvFlags::STR_VALID));
+        assert!(!sv.flags().contains(SvFlags::INT_VALID));
+        assert!(!sv.flags().contains(SvFlags::NUM_VALID));
     }
 
     #[test]
     fn multi_rep_caching() {
         // Simulate: $x = "42"; $x + 0;
-        // After the addition, both POK and IOK should be set.
+        // After the addition, both STR_VALID and INT_VALID should be set.
         let mut sv = Scalar::from_str("42");
-        assert!(sv.flags().contains(SvFlags::POK));
-        assert!(!sv.flags().contains(SvFlags::IOK));
+        assert!(sv.flags().contains(SvFlags::STR_VALID));
+        assert!(!sv.flags().contains(SvFlags::INT_VALID));
 
         // Reading as integer triggers coercion and caching
         let n = sv.get_int();
         assert_eq!(n, 42);
-        assert!(sv.flags().contains(SvFlags::IOK)); // cached
-        assert!(sv.flags().contains(SvFlags::POK)); // still valid
+        assert!(sv.flags().contains(SvFlags::INT_VALID)); // cached
+        assert!(sv.flags().contains(SvFlags::STR_VALID)); // still valid
     }
 
     #[test]
@@ -664,9 +666,9 @@ mod tests {
         let ps = sv.stringify();
         assert_eq!(ps.as_str(), Some("42"));
         assert!(ps.is_utf8());
-        // Should have cached the string (POK now set)
-        assert!(sv.flags().contains(SvFlags::POK));
-        assert!(sv.flags().contains(SvFlags::IOK)); // still valid
+        // Should have cached the string (STR_VALID now set)
+        assert!(sv.flags().contains(SvFlags::STR_VALID));
+        assert!(sv.flags().contains(SvFlags::INT_VALID)); // still valid
     }
 
     #[test]
@@ -685,11 +687,11 @@ mod tests {
 
     #[test]
     fn stringify_caches_string() {
-        // Start with integer, stringify, check both IOK and POK are set.
+        // Start with integer, stringify, check both INT_VALID and STR_VALID are set.
         let mut sv = Scalar::from_int(99);
-        assert!(!sv.flags().contains(SvFlags::POK));
+        assert!(!sv.flags().contains(SvFlags::STR_VALID));
         let _ = sv.stringify();
-        assert!(sv.flags().contains(SvFlags::POK));
-        assert!(sv.flags().contains(SvFlags::IOK));
+        assert!(sv.flags().contains(SvFlags::STR_VALID));
+        assert!(sv.flags().contains(SvFlags::INT_VALID));
     }
 }
