@@ -44,7 +44,7 @@ pub struct Stash {
 ///
 /// - `int` is meaningful only when `flags.contains(SvFlags::INT_VALID)`.
 /// - `num` is meaningful only when `flags.contains(SvFlags::NUM_VALID)`.
-/// - `pv` content is meaningful only when `flags.contains(SvFlags::STR_VALID)`.
+/// - `bytes` content is meaningful only when `flags.contains(SvFlags::STR_VALID)`.
 /// - `rv` is meaningful only when `flags.contains(SvFlags::REF_VALID)`.
 ///
 /// Writing a new representation typically invalidates the others:
@@ -67,7 +67,7 @@ pub struct Scalar {
 
     /// String representation.  Valid when STR_VALID is set.
     /// Uses small-string optimization internally.
-    pub(crate) pv: PerlStringSlot,
+    pub(crate) bytes: PerlStringSlot,
 
     /// Reference target.  Valid when REF_VALID is set.
     /// When set, this scalar IS a reference (like Perl's RV).
@@ -85,35 +85,35 @@ impl Scalar {
 
     /// Create an undef scalar (no flags set, no valid representations).
     pub fn new_undef() -> Self {
-        Scalar { flags: SvFlags::EMPTY, int: 0, num: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::EMPTY, int: 0, num: 0.0, bytes: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from an integer.  INT_VALID is set.
     pub fn from_int(n: i64) -> Self {
-        Scalar { flags: SvFlags::INT_VALID, int: n, num: 0.0, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::INT_VALID, int: n, num: 0.0, bytes: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from a float.  NUM_VALID is set.
     pub fn from_num(n: f64) -> Self {
-        Scalar { flags: SvFlags::NUM_VALID, int: 0, num: n, pv: PerlStringSlot::None, rv: None, magic: None, stash: None }
+        Scalar { flags: SvFlags::NUM_VALID, int: 0, num: n, bytes: PerlStringSlot::None, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from a string.  STR_VALID is set.
     pub fn from_str(s: &str) -> Self {
-        let mut pv = PerlStringSlot::None;
-        pv.set_str(s);
-        Scalar { flags: SvFlags::STR_VALID | SvFlags::UTF8, int: 0, num: 0.0, pv, rv: None, magic: None, stash: None }
+        let mut bytes = PerlStringSlot::None;
+        bytes.set_str(s);
+        Scalar { flags: SvFlags::STR_VALID | SvFlags::UTF8, int: 0, num: 0.0, bytes, rv: None, magic: None, stash: None }
     }
 
     /// Create a scalar from a `PerlString`.  STR_VALID is set.
     pub fn from_perl_string(ps: PerlString) -> Self {
         let flags = if ps.is_utf8() { SvFlags::STR_VALID | SvFlags::UTF8 } else { SvFlags::STR_VALID };
-        Scalar { flags, int: 0, num: 0.0, pv: PerlStringSlot::Heap(ps), rv: None, magic: None, stash: None }
+        Scalar { flags, int: 0, num: 0.0, bytes: PerlStringSlot::Heap(ps), rv: None, magic: None, stash: None }
     }
 
     /// Create a reference scalar.  REF_VALID is set.
     pub fn from_ref(target: Value) -> Self {
-        Scalar { flags: SvFlags::REF_VALID, int: 0, num: 0.0, pv: PerlStringSlot::None, rv: Some(target), magic: None, stash: None }
+        Scalar { flags: SvFlags::REF_VALID, int: 0, num: 0.0, bytes: PerlStringSlot::None, rv: Some(target), magic: None, stash: None }
     }
 
     // ── Flag accessors ────────────────────────────────────────────
@@ -179,7 +179,7 @@ impl Scalar {
 
         // String representation — check for "" and "0".
         if self.flags.contains(SvFlags::STR_VALID) {
-            return !string_is_false(&self.pv);
+            return !string_is_false(&self.bytes);
         }
 
         // No valid representation → undef → false.
@@ -204,7 +204,7 @@ impl Scalar {
 
         // Try to coerce from string
         if self.flags.contains(SvFlags::STR_VALID) {
-            if let Some(ps) = self.pv.to_perl_string() {
+            if let Some(ps) = self.bytes.to_perl_string() {
                 self.int = ps.parse_iv();
             } else {
                 self.int = 0;
@@ -222,7 +222,7 @@ impl Scalar {
         self.int = n;
         self.flags.insert(SvFlags::INT_VALID);
         self.flags.remove(SvFlags::NUM_VALID | SvFlags::STR_VALID | SvFlags::UTF8);
-        self.pv.clear();
+        self.bytes.clear();
     }
 
     // ── Float access (with lazy coercion) ─────────────────────────
@@ -241,7 +241,7 @@ impl Scalar {
         }
 
         if self.flags.contains(SvFlags::STR_VALID) {
-            if let Some(ps) = self.pv.to_perl_string() {
+            if let Some(ps) = self.bytes.to_perl_string() {
                 self.num = ps.parse_nv();
             } else {
                 self.num = 0.0;
@@ -258,7 +258,7 @@ impl Scalar {
         self.num = n;
         self.flags.insert(SvFlags::NUM_VALID);
         self.flags.remove(SvFlags::INT_VALID | SvFlags::STR_VALID | SvFlags::UTF8);
-        self.pv.clear();
+        self.bytes.clear();
     }
 
     // ── String access (with lazy coercion) ────────────────────────
@@ -268,21 +268,21 @@ impl Scalar {
     /// Returns `None` only for undef.
     pub fn get_bytes(&mut self) -> Option<&[u8]> {
         if self.flags.contains(SvFlags::STR_VALID) {
-            return self.pv.as_bytes();
+            return self.bytes.as_bytes();
         }
 
         if self.flags.contains(SvFlags::INT_VALID) {
             let s = self.int.to_string();
-            self.pv.set_str(&s);
+            self.bytes.set_str(&s);
             self.flags.insert(SvFlags::STR_VALID | SvFlags::UTF8);
-            return self.pv.as_bytes();
+            return self.bytes.as_bytes();
         }
 
         if self.flags.contains(SvFlags::NUM_VALID) {
             let s = format_nv(self.num);
-            self.pv.set_str(&s);
+            self.bytes.set_str(&s);
             self.flags.insert(SvFlags::STR_VALID | SvFlags::UTF8);
-            return self.pv.as_bytes();
+            return self.bytes.as_bytes();
         }
 
         // Undef
@@ -294,19 +294,19 @@ impl Scalar {
     pub fn get_str(&mut self) -> Option<&str> {
         // Ensure string is populated
         self.get_bytes()?;
-        self.pv.as_str()
+        self.bytes.as_str()
     }
 
     /// Set the string value from a `&str`.  Sets STR_VALID + UTF8, clears INT_VALID and NUM_VALID.
     pub fn set_str(&mut self, s: &str) {
-        self.pv.set_str(s);
+        self.bytes.set_str(s);
         self.flags.insert(SvFlags::STR_VALID | SvFlags::UTF8);
         self.flags.remove(SvFlags::INT_VALID | SvFlags::NUM_VALID);
     }
 
     /// Set the string value from raw bytes.  Sets STR_VALID, clears UTF8 + INT_VALID + NUM_VALID.
     pub fn set_bytes(&mut self, bytes: &[u8]) {
-        self.pv.set_bytes(bytes);
+        self.bytes.set_bytes(bytes);
         self.flags.insert(SvFlags::STR_VALID);
         self.flags.remove(SvFlags::INT_VALID | SvFlags::NUM_VALID | SvFlags::UTF8);
     }
@@ -319,9 +319,9 @@ impl Scalar {
         if self.get_bytes().is_none() {
             return PerlString::new(); // undef → empty string
         }
-        // Now pv is guaranteed to be populated.  Read it.
+        // Now bytes is guaranteed to be populated.  Read it.
         let is_utf8 = self.flags.contains(SvFlags::UTF8);
-        if let Some(bytes) = self.pv.as_bytes() {
+        if let Some(bytes) = self.bytes.as_bytes() {
             // SAFETY: if UTF8 flag is set, get_bytes ensured valid UTF-8.
             unsafe { PerlString::from_bytes_utf8_unchecked(bytes.to_vec(), is_utf8) }
         } else {
@@ -343,7 +343,7 @@ impl Scalar {
         self.flags = SvFlags::REF_VALID;
         self.int = 0;
         self.num = 0.0;
-        self.pv.clear();
+        self.bytes.clear();
     }
 
     // ── Magic ─────────────────────────────────────────────────────
@@ -392,8 +392,8 @@ pub(crate) fn format_nv(n: f64) -> String {
 
 /// Perl string falseness: `""` (empty) and `"0"` are false.
 /// Everything else is true.
-fn string_is_false(pv: &PerlStringSlot) -> bool {
-    match pv.as_bytes() {
+fn string_is_false(slot: &PerlStringSlot) -> bool {
+    match slot.as_bytes() {
         None => true,       // no string → false (shouldn't happen if STR_VALID is set)
         Some(b"") => true,  // empty string
         Some(b"0") => true, // the string "0"
@@ -414,7 +414,7 @@ impl fmt::Debug for Scalar {
             d.field("num", &self.num);
         }
         if self.flags.contains(SvFlags::STR_VALID) {
-            d.field("pv", &self.pv);
+            d.field("bytes", &self.bytes);
         }
         if self.flags.contains(SvFlags::REF_VALID) {
             d.field("rv", &self.rv);
