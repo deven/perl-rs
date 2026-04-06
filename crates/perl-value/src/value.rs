@@ -236,6 +236,87 @@ impl Value {
             _ => None,
         }
     }
+
+    // ── Stringification ───────────────────────────────────────
+
+    /// Convert this value to its Perl string representation.
+    ///
+    /// This is the operation that happens when a value is used in
+    /// string context: `print`, `.` concatenation, `"$x"` interpolation,
+    /// `eq`/`ne` comparison.
+    ///
+    /// Rules:
+    /// - `Undef` → `""` (empty string; in practice Perl warns)
+    /// - `Int(n)` → decimal representation
+    /// - `Float(n)` → Perl-style float formatting
+    /// - `SmallStr`/`Str` → the string itself (clone)
+    /// - `Ref(sv)` → `"SCALAR(0xADDR)"`
+    /// - `Scalar(sv)` → delegates through lock, coerces if needed
+    /// - `Array(av)` → element count (Perl's `@arr` in string context)
+    /// - `Hash(hv)` → `"N/M"` buckets string (Perl 5 behavior)
+    /// - `Code` → `"CODE(0xADDR)"`
+    /// - `Regex` → `"Regex(0xADDR)"` (placeholder)
+    pub fn stringify(&self) -> PerlString {
+        match self {
+            Value::Undef => PerlString::new(),
+            Value::Int(n) => PerlString::from_str(&n.to_string()),
+            Value::Float(n) => PerlString::from_str(&crate::scalar::format_nv(*n)),
+            Value::SmallStr(ss) => ss.to_perl_string(),
+            Value::Str(ps) => ps.clone(),
+            Value::Ref(sv) => {
+                let addr = Arc::as_ptr(sv) as usize;
+                PerlString::from_str(&format!("SCALAR(0x{:x})", addr))
+            }
+            Value::Scalar(sv) => {
+                let mut guard = sv.write().expect("Scalar lock poisoned");
+                guard.stringify()
+            }
+            Value::Array(av) => {
+                let len = av.read().map(|a| a.len()).unwrap_or(0);
+                PerlString::from_str(&len.to_string())
+            }
+            Value::Hash(hv) => {
+                // Perl 5 stringifies a hash as "N/M" where N = used buckets,
+                // M = total buckets.  We approximate with "N/N" (key count).
+                let len = hv.read().map(|h| h.len()).unwrap_or(0);
+                if len == 0 { PerlString::from_str("0") } else { PerlString::from_str(&format!("{}/{}", len, len)) }
+            }
+            Value::Code(c) => {
+                let addr = Arc::as_ptr(c) as usize;
+                PerlString::from_str(&format!("CODE(0x{:x})", addr))
+            }
+            Value::Regex(r) => {
+                let addr = Arc::as_ptr(r) as usize;
+                PerlString::from_str(&format!("Regex(0x{:x})", addr))
+            }
+        }
+    }
+
+    /// Write the string representation to a byte buffer.
+    ///
+    /// More efficient than `stringify()` when you just need to
+    /// append to output — avoids allocating a PerlString for types
+    /// that are already byte slices.
+    pub fn write_bytes_to(&self, buf: &mut Vec<u8>) {
+        match self {
+            Value::Undef => {} // empty string — no bytes
+            Value::Int(n) => {
+                use std::io::Write;
+                let _ = write!(buf, "{}", n);
+            }
+            Value::Float(n) => {
+                buf.extend_from_slice(crate::scalar::format_nv(*n).as_bytes());
+            }
+            Value::SmallStr(ss) => buf.extend_from_slice(ss.as_bytes()),
+            Value::Str(ps) => buf.extend_from_slice(ps.as_bytes()),
+            _ => {
+                // For ref/scalar/array/hash/code/regex, fall back to
+                // stringify() — these are less common in hot output paths.
+                let ps = self.stringify();
+                buf.extend_from_slice(ps.as_bytes());
+            }
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -263,6 +344,25 @@ impl fmt::Debug for Value {
             Value::Hash(hv) => write!(f, "Hash(<{} keys>)", { hv.read().map(|h| h.len()).unwrap_or(0) }),
             Value::Code(_) => write!(f, "Code(...)"),
             Value::Regex(_) => write!(f, "Regex(...)"),
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    /// Perl stringification — what `print $value` produces.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Undef => Ok(()), // empty string
+            Value::Int(n) => write!(f, "{}", n),
+            Value::Float(n) => write!(f, "{}", crate::scalar::format_nv(*n)),
+            Value::SmallStr(ss) => fmt::Display::fmt(ss, f),
+            Value::Str(ps) => fmt::Display::fmt(ps, f),
+            _ => {
+                // References, scalars, containers, code, regex —
+                // convert via stringify to avoid duplicating logic.
+                let ps = self.stringify();
+                fmt::Display::fmt(&ps, f)
+            }
         }
     }
 }
@@ -524,5 +624,111 @@ mod tests {
     fn from_bool_truthiness() {
         assert!(Value::from(true).is_true());
         assert!(Value::from(false).is_false());
+    }
+
+    // ── Stringification tests ─────────────────────────────────
+
+    #[test]
+    fn stringify_undef() {
+        let v = Value::Undef;
+        assert_eq!(format!("{}", v), "");
+        assert!(v.stringify().is_empty());
+    }
+
+    #[test]
+    fn stringify_int() {
+        assert_eq!(format!("{}", Value::Int(42)), "42");
+        assert_eq!(format!("{}", Value::Int(0)), "0");
+        assert_eq!(format!("{}", Value::Int(-7)), "-7");
+
+        let ps = Value::Int(42).stringify();
+        assert_eq!(ps.as_str(), Some("42"));
+        assert!(ps.is_utf8());
+    }
+
+    #[test]
+    fn stringify_float() {
+        assert_eq!(format!("{}", Value::Float(3.14)), "3.14");
+        assert_eq!(format!("{}", Value::Float(0.0)), "0");
+        assert_eq!(format!("{}", Value::Float(-2.5)), "-2.5");
+        assert_eq!(format!("{}", Value::Float(1000.0)), "1000");
+    }
+
+    #[test]
+    fn stringify_small_str() {
+        let v = Value::from("hello");
+        assert_eq!(format!("{}", v), "hello");
+        assert_eq!(v.stringify().as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn stringify_long_str() {
+        let long = "a".repeat(30);
+        let v = Value::from(long.as_str());
+        assert_eq!(format!("{}", v), long);
+    }
+
+    #[test]
+    fn stringify_reference() {
+        let sv = Arc::new(RwLock::new(Scalar::from_int(42)));
+        let v = Value::Ref(sv);
+        let s = format!("{}", v);
+        assert!(s.starts_with("SCALAR(0x"));
+        assert!(s.ends_with(')'));
+    }
+
+    #[test]
+    fn stringify_upgraded_scalar() {
+        let mut v = Value::from(42i64);
+        v.upgrade_to_scalar();
+        assert_eq!(format!("{}", v), "42");
+
+        let mut v = Value::from("hello");
+        v.upgrade_to_scalar();
+        assert_eq!(format!("{}", v), "hello");
+    }
+
+    #[test]
+    fn stringify_array() {
+        // Empty array → "0"
+        let av = Arc::new(RwLock::new(Vec::new()));
+        assert_eq!(format!("{}", Value::Array(av)), "0");
+
+        // 3-element array → "3"
+        let av = Arc::new(RwLock::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
+        assert_eq!(format!("{}", Value::Array(av)), "3");
+    }
+
+    #[test]
+    fn stringify_hash() {
+        // Empty hash → "0"
+        let hv = Arc::new(RwLock::new(HashMap::new()));
+        assert_eq!(format!("{}", Value::Hash(hv)), "0");
+
+        // Non-empty hash → "N/N"
+        let mut map = HashMap::new();
+        map.insert(PerlString::from_str("a"), Value::Int(1));
+        map.insert(PerlString::from_str("b"), Value::Int(2));
+        let hv = Arc::new(RwLock::new(map));
+        assert_eq!(format!("{}", Value::Hash(hv)), "2/2");
+    }
+
+    #[test]
+    fn write_bytes_to_buffer() {
+        let mut buf = Vec::new();
+        Value::Int(42).write_bytes_to(&mut buf);
+        assert_eq!(&buf, b"42");
+
+        buf.clear();
+        Value::from("hello").write_bytes_to(&mut buf);
+        assert_eq!(&buf, b"hello");
+
+        buf.clear();
+        Value::Undef.write_bytes_to(&mut buf);
+        assert!(buf.is_empty());
+
+        buf.clear();
+        Value::Float(3.14).write_bytes_to(&mut buf);
+        assert_eq!(&buf, b"3.14");
     }
 }

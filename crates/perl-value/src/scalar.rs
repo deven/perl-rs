@@ -309,6 +309,24 @@ impl Scalar {
         self.flags.remove(SvFlags::IOK | SvFlags::NOK | SvFlags::UTF8);
     }
 
+    /// Get the string representation as an owned `PerlString`.
+    /// Coerces if needed (populates the pv cache as a side effect).
+    /// Returns an empty string for undef.
+    pub fn stringify(&mut self) -> PerlString {
+        // Ensure pv cache is populated (may coerce from int/num).
+        if self.get_bytes().is_none() {
+            return PerlString::new(); // undef → empty string
+        }
+        // Now pv is guaranteed to be populated.  Read it.
+        let is_utf8 = self.flags.contains(SvFlags::UTF8);
+        if let Some(bytes) = self.pv.as_bytes() {
+            // SAFETY: if UTF8 flag is set, get_bytes ensured valid UTF-8.
+            unsafe { PerlString::from_bytes_utf8_unchecked(bytes.to_vec(), is_utf8) }
+        } else {
+            PerlString::new()
+        }
+    }
+
     // ── Reference access ──────────────────────────────────────────
 
     /// Get the reference target, if this is a reference.
@@ -361,7 +379,7 @@ impl Scalar {
 /// round-trips.  Rust doesn't have %g, so we approximate:
 /// use Display (which gives shortest round-trip representation),
 /// falling back to LowerExp for very large/small values.
-fn format_nv(n: f64) -> String {
+pub(crate) fn format_nv(n: f64) -> String {
     if n == 0.0 {
         return "0".to_string();
     }
@@ -629,5 +647,49 @@ mod tests {
         // Even a reference to undef is true
         let sv = Scalar::from_ref(Value::Undef);
         assert!(sv.is_true());
+    }
+
+    // ── Stringification tests ─────────────────────────────────
+
+    #[test]
+    fn stringify_undef() {
+        let mut sv = Scalar::new_undef();
+        let ps = sv.stringify();
+        assert!(ps.is_empty());
+    }
+
+    #[test]
+    fn stringify_iv() {
+        let mut sv = Scalar::from_int(42);
+        let ps = sv.stringify();
+        assert_eq!(ps.as_str(), Some("42"));
+        assert!(ps.is_utf8());
+        // Should have cached the string (POK now set)
+        assert!(sv.flags().contains(SvFlags::POK));
+        assert!(sv.flags().contains(SvFlags::IOK)); // still valid
+    }
+
+    #[test]
+    fn stringify_nv() {
+        let mut sv = Scalar::from_num(3.14);
+        let ps = sv.stringify();
+        assert_eq!(ps.as_str(), Some("3.14"));
+    }
+
+    #[test]
+    fn stringify_str_passthrough() {
+        let mut sv = Scalar::from_str("hello");
+        let ps = sv.stringify();
+        assert_eq!(ps.as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn stringify_caches_string() {
+        // Start with integer, stringify, check both IOK and POK are set.
+        let mut sv = Scalar::from_int(99);
+        assert!(!sv.flags().contains(SvFlags::POK));
+        let _ = sv.stringify();
+        assert!(sv.flags().contains(SvFlags::POK));
+        assert!(sv.flags().contains(SvFlags::IOK));
     }
 }
