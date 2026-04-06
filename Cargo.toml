@@ -3,7 +3,7 @@ members = [
 #    "perl",
 #    "perl-compiler",
     "perl-core",
-#    "perl-parser",
+    "perl-parser",
 #    "perl-regex",
 #    "perl-runtime",
 ]
