@@ -197,18 +197,13 @@ pub fn is_named_unary(kw: Keyword) -> bool {
 pub fn is_list_op(kw: Keyword) -> bool {
     matches!(
         kw,
-        Keyword::Print
-            | Keyword::Say
-            | Keyword::Push
+        Keyword::Push
             | Keyword::Unshift
             | Keyword::Splice
             | Keyword::Keys
             | Keyword::Values
             | Keyword::Each
             | Keyword::Reverse
-            | Keyword::Sort
-            | Keyword::Map
-            | Keyword::Grep
             | Keyword::Join
             | Keyword::Split
             | Keyword::Sprintf
@@ -235,4 +230,16 @@ pub fn is_list_op(kw: Keyword) -> bool {
             | Keyword::Bless
             | Keyword::Mkdir
     )
+}
+
+/// Is this keyword a block-list operator (sort/map/grep)?
+/// These take an optional block as the first argument.
+pub fn is_block_list_op(kw: Keyword) -> bool {
+    matches!(kw, Keyword::Sort | Keyword::Map | Keyword::Grep)
+}
+
+/// Is this keyword a print-like operator?
+/// These take an optional filehandle as the first argument.
+pub fn is_print_op(kw: Keyword) -> bool {
+    matches!(kw, Keyword::Print | Keyword::Say)
 }

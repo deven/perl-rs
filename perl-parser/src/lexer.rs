@@ -418,15 +418,24 @@ impl<'src> Lexer<'src> {
                 return Ok(Token::ScalarVar(name));
             }
             Some(b'{') => {
-                // ${name} — deref or variable
-                self.pos += 1; // skip {
-                let name = self.scan_ident();
-                if self.peek_byte() == Some(b'}') {
-                    self.pos += 1;
+                // ${name} — variable with brace disambiguation
+                // ${$ref} or ${expr} — dereference block (return Dollar, let parser handle {})
+                if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+                    self.pos += 1; // skip {
+                    let name = self.scan_ident();
+                    if self.peek_byte() == Some(b'}') {
+                        self.pos += 1;
+                    }
+                    return Ok(Token::ScalarVar(name));
                 }
-                return Ok(Token::ScalarVar(name));
+                // Not a simple identifier — deref block
+                return Ok(Token::Dollar);
             }
             Some(b'$') => {
+                // $$name is scalar dereference; $$ alone is PID
+                if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || b == b'{') {
+                    return Ok(Token::Dollar);
+                }
                 self.pos += 1;
                 return Ok(Token::SpecialVar("$".into()));
             }
