@@ -214,6 +214,8 @@ pub enum ExprKind {
     // ── Placeholder for incremental development ───────────────
     /// `...` — yada yada yada (unimplemented placeholder).
     YadaYada,
+    /// `-e $file`, `-d "/tmp"`, `-f _` — filetest operator.
+    Filetest(char, Box<Expr>),
 }
 
 /// Part of an interpolated string (§7.3).
