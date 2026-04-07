@@ -175,8 +175,6 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Srand
             | Keyword::Caller
             | Keyword::Eof
-            | Keyword::Stat
-            | Keyword::Lstat
             | Keyword::Rmdir
             | Keyword::Chdir
             | Keyword::Close

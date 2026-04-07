@@ -1344,6 +1344,10 @@ impl<'src> Parser<'src> {
                 }
             }
 
+            // stat / lstat — dedicated AST nodes with StatTarget
+            Token::Keyword(Keyword::Stat) => self.parse_stat_op(false, span),
+            Token::Keyword(Keyword::Lstat) => self.parse_stat_op(true, span),
+
             // Named unary keywords
             Token::Keyword(kw) if keyword::is_named_unary(kw) => self.parse_named_unary(kw, span),
 
@@ -1437,13 +1441,8 @@ impl<'src> Parser<'src> {
                 if matches!(self.peek(), Token::FatComma | Token::RBrace) {
                     return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
                 }
-                self.expect.base = BaseExpect::Term;
-                let operand = if self.at(&Token::Semi) || self.at(&Token::RBrace) || self.at(&Token::RParen) || self.at_eof() {
-                    Expr { kind: ExprKind::ScalarVar("_".into()), span }
-                } else {
-                    self.parse_expr(PREC_UNARY)?
-                };
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Filetest(test_char, Box::new(operand)) })
+                let (target, end) = self.parse_stat_target(span)?;
+                Ok(Expr { span: span.merge(end), kind: ExprKind::Filetest(test_char, target) })
             }
 
             // Yada yada yada (...)
@@ -1582,6 +1581,52 @@ impl<'src> Parser<'src> {
         let arg = self.parse_expr(PREC_COMMA)?;
         let end = span.merge(arg.span);
         Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: end })
+    }
+
+    /// Parse the target of a stat-family operation (filetest, stat, lstat).
+    ///
+    /// Handles three cases:
+    /// - Bare `_` → `StatTarget::StatCache`
+    /// - No operand (`;`, `}`, `)`, EOF) → `StatTarget::Default`
+    /// - Expression → `StatTarget::Expr(Box::new(expr))`
+    ///
+    /// Also handles the parenthesized form: `stat(_)`, `stat($file)`.
+    /// Returns `(target, end_span)`.
+    fn parse_stat_target(&mut self, start: Span) -> Result<(StatTarget, Span), ParseError> {
+        self.expect.base = BaseExpect::Term;
+
+        // Parenthesized form: stat($file), stat(_)
+        if self.at(&Token::LParen) {
+            self.advance();
+            let (target, _) = self.parse_stat_target_inner(start)?;
+            let end = self.peek_span();
+            self.expect_token(&Token::RParen)?;
+            return Ok((target, end));
+        }
+
+        self.parse_stat_target_inner(start)
+    }
+
+    /// Inner helper: parse the stat target without handling parens.
+    fn parse_stat_target_inner(&mut self, start: Span) -> Result<(StatTarget, Span), ParseError> {
+        if self.at(&Token::Semi) || self.at(&Token::RBrace) || self.at(&Token::RParen) || self.at_eof() {
+            Ok((StatTarget::Default, start))
+        } else if matches!(self.peek(), Token::Ident(name) if name == "_") {
+            let end = self.peek_span();
+            self.advance();
+            Ok((StatTarget::StatCache, end))
+        } else {
+            let expr = self.parse_expr(PREC_UNARY)?;
+            let end = expr.span;
+            Ok((StatTarget::Expr(Box::new(expr)), end))
+        }
+    }
+
+    /// Parse `stat TARGET` or `lstat TARGET`.
+    fn parse_stat_op(&mut self, is_lstat: bool, span: Span) -> Result<Expr, ParseError> {
+        let (target, end) = self.parse_stat_target(span)?;
+        let kind = if is_lstat { ExprKind::Lstat(target) } else { ExprKind::Stat(target) };
+        Ok(Expr { span: span.merge(end), kind })
     }
 
     fn parse_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
@@ -2390,7 +2435,15 @@ mod tests {
     #[test]
     fn parse_if_stmt() {
         let prog = parse("if ($x > 0) { print 1; }");
-        assert!(matches!(prog.statements[0].kind, StmtKind::If(_)));
+        match &prog.statements[0].kind {
+            StmtKind::If(if_stmt) => {
+                assert!(matches!(if_stmt.condition.kind, ExprKind::BinOp(BinOp::NumGt, _, _)));
+                assert_eq!(if_stmt.then_block.statements.len(), 1);
+                assert!(if_stmt.elsif_clauses.is_empty());
+                assert!(if_stmt.else_block.is_none());
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2408,13 +2461,27 @@ mod tests {
     #[test]
     fn parse_while_loop() {
         let prog = parse("while ($x > 0) { $x--; }");
-        assert!(matches!(prog.statements[0].kind, StmtKind::While(_)));
+        match &prog.statements[0].kind {
+            StmtKind::While(w) => {
+                assert!(matches!(w.condition.kind, ExprKind::BinOp(BinOp::NumGt, _, _)));
+                assert_eq!(w.body.statements.len(), 1);
+            }
+            other => panic!("expected While, got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_foreach_loop() {
         let prog = parse("for my $item (@list) { print $item; }");
-        assert!(matches!(prog.statements[0].kind, StmtKind::ForEach(_)));
+        match &prog.statements[0].kind {
+            StmtKind::ForEach(f) => {
+                let var = f.var.as_ref().expect("expected loop variable");
+                assert_eq!(var.name, "item");
+                assert_eq!(var.sigil, Sigil::Scalar);
+                assert_eq!(f.body.statements.len(), 1);
+            }
+            other => panic!("expected ForEach, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2432,13 +2499,26 @@ mod tests {
     #[test]
     fn parse_arrow_method_call() {
         let e = parse_expr_str("$obj->method(1, 2);");
-        assert!(matches!(e.kind, ExprKind::MethodCall(_, _, _)));
+        match &e.kind {
+            ExprKind::MethodCall(invocant, name, args) => {
+                assert!(matches!(invocant.kind, ExprKind::ScalarVar(ref n) if n == "obj"));
+                assert_eq!(name, "method");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_arrow_deref() {
         let e = parse_expr_str("$ref->{key};");
-        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))));
+        match &e.kind {
+            ExprKind::ArrowDeref(base, ArrowTarget::HashElem(key)) => {
+                assert!(matches!(base.kind, ExprKind::ScalarVar(ref n) if n == "ref"));
+                assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "key"));
+            }
+            other => panic!("expected ArrowDeref HashElem, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2505,6 +2585,12 @@ mod tests {
     fn parse_multiple_statements() {
         let prog = parse("my $x = 1; my $y = 2; $x + $y;");
         assert_eq!(prog.statements.len(), 3);
+        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
+        assert!(matches!(prog.statements[1].kind, StmtKind::My(_, _)));
+        match &prog.statements[2].kind {
+            StmtKind::Expr(e) => assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Add, _, _))),
+            other => panic!("expected Expr(Add), got {other:?}"),
+        }
     }
 
     #[test]
@@ -2595,7 +2681,13 @@ mod tests {
     fn parse_string_concat_interp() {
         // Interpolated string in a concat expression.
         let e = parse_expr_str(r#""Hello, $name!" . " Bye!""#);
-        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Concat, _, _)));
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Concat, left, right) => {
+                assert!(matches!(left.kind, ExprKind::InterpolatedString(_)));
+                assert!(matches!(right.kind, ExprKind::StringLit(ref s) if s == " Bye!"));
+            }
+            other => panic!("expected Concat(InterpolatedString, StringLit), got {other:?}"),
+        }
     }
 
     #[test]
@@ -2612,6 +2704,14 @@ mod tests {
     fn parse_print_interp_string() {
         let prog = parse(r#"print "Hello, $name!\n";"#);
         assert_eq!(prog.statements.len(), 1);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::ListOp(name, args), .. }) => {
+                assert_eq!(name, "print");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::InterpolatedString(_)));
+            }
+            other => panic!("expected print with InterpolatedString arg, got {other:?}"),
+        }
     }
 
     // ── Regex / substitution / transliteration tests ──────────
@@ -2711,6 +2811,14 @@ mod tests {
         let src = "print <<END;\nhello\nEND\nmy $x = 1;\n";
         let prog = parse(src);
         assert_eq!(prog.statements.len(), 2);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::ListOp(name, _), .. }) => assert_eq!(name, "print"),
+            other => panic!("expected print ListOp, got {other:?}"),
+        }
+        match &prog.statements[1].kind {
+            StmtKind::My(vars, Some(_)) => assert_eq!(vars[0].name, "x"),
+            other => panic!("expected My, got {other:?}"),
+        }
     }
 
     // ── Anonymous sub tests ───────────────────────────────────
@@ -2718,7 +2826,13 @@ mod tests {
     #[test]
     fn parse_anon_sub() {
         let e = parse_expr_str("sub { 42; };");
-        assert!(matches!(e.kind, ExprKind::AnonSub(_, _, _)));
+        match &e.kind {
+            ExprKind::AnonSub(proto, _, body) => {
+                assert!(proto.is_none());
+                assert_eq!(body.statements.len(), 1);
+            }
+            other => panic!("expected AnonSub, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2963,20 +3077,36 @@ mod tests {
     #[test]
     fn parse_deref_block() {
         let e = parse_expr_str("${$ref};");
-        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Scalar, _)));
+        match &e.kind {
+            ExprKind::Deref(Sigil::Scalar, inner) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(ref n) if n == "ref"));
+            }
+            other => panic!("expected Deref(Scalar, ScalarVar), got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_array_deref_block() {
         let e = parse_expr_str("@{$ref};");
-        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Array, _)));
+        match &e.kind {
+            ExprKind::Deref(Sigil::Array, inner) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(ref n) if n == "ref"));
+            }
+            other => panic!("expected Deref(Array, ScalarVar), got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_deref_subscript() {
-        // $$ref[0] — deref then subscript
+        // $$ref[0] → ArrayElem(Deref(Scalar, ScalarVar("ref")), 0)
         let e = parse_expr_str("$$ref[0];");
-        assert!(matches!(e.kind, ExprKind::ArrayElem(_, _)));
+        match &e.kind {
+            ExprKind::ArrayElem(base, idx) => {
+                assert!(matches!(base.kind, ExprKind::Deref(Sigil::Scalar, _)));
+                assert!(matches!(idx.kind, ExprKind::IntLit(0)));
+            }
+            other => panic!("expected ArrayElem(Deref, 0), got {other:?}"),
+        }
     }
 
     // ── Slice tests ───────────────────────────────────────────
@@ -3076,7 +3206,14 @@ mod tests {
     #[test]
     fn parse_given_when() {
         let prog = parse("given ($x) { when (1) { 1; } default { 0; } }");
-        assert!(matches!(prog.statements[0].kind, StmtKind::Given(_, _)));
+        match &prog.statements[0].kind {
+            StmtKind::Given(expr, block) => {
+                assert!(matches!(expr.kind, ExprKind::ScalarVar(ref n) if n == "x"));
+                assert!(block.statements.len() >= 2);
+                assert!(matches!(block.statements[0].kind, StmtKind::When(_, _)));
+            }
+            other => panic!("expected Given, got {other:?}"),
+        }
     }
 
     // ── try/catch tests ───────────────────────────────────────
@@ -3108,7 +3245,12 @@ mod tests {
     #[test]
     fn parse_defer() {
         let prog = parse("defer { cleanup(); }");
-        assert!(matches!(prog.statements[0].kind, StmtKind::Defer(_)));
+        match &prog.statements[0].kind {
+            StmtKind::Defer(block) => {
+                assert_eq!(block.statements.len(), 1);
+            }
+            other => panic!("expected Defer with 1-stmt block, got {other:?}"),
+        }
     }
 
     // ── __END__ test ──────────────────────────────────────────
@@ -3279,13 +3421,27 @@ mod tests {
     #[test]
     fn parse_my_array_decl() {
         let prog = parse("my @arr = (1, 2, 3);");
-        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
+        match &prog.statements[0].kind {
+            StmtKind::My(vars, Some(_)) => {
+                assert_eq!(vars.len(), 1);
+                assert_eq!(vars[0].sigil, Sigil::Array);
+                assert_eq!(vars[0].name, "arr");
+            }
+            other => panic!("expected My with Array sigil, got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_my_hash_decl() {
         let prog = parse("my %hash = (a => 1);");
-        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
+        match &prog.statements[0].kind {
+            StmtKind::My(vars, Some(_)) => {
+                assert_eq!(vars.len(), 1);
+                assert_eq!(vars[0].sigil, Sigil::Hash);
+                assert_eq!(vars[0].name, "hash");
+            }
+            other => panic!("expected My with Hash sigil, got {other:?}"),
+        }
     }
 
     // ── while continue block ──────────────────────────────────
@@ -3343,7 +3499,14 @@ mod tests {
     #[test]
     fn parse_ampersand_coderef() {
         let e = parse_expr_str("&$coderef(1);");
-        assert!(matches!(e.kind, ExprKind::MethodCall(_, _, _)));
+        match &e.kind {
+            ExprKind::MethodCall(_, name, args) => {
+                assert!(name.is_empty()); // coderef call uses empty method name
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::IntLit(1)));
+            }
+            other => panic!("expected MethodCall for coderef, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3364,13 +3527,23 @@ mod tests {
     #[test]
     fn parse_hash_deref() {
         let e = parse_expr_str("%$ref;");
-        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Hash, _)));
+        match &e.kind {
+            ExprKind::Deref(Sigil::Hash, inner) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(ref n) if n == "ref"));
+            }
+            other => panic!("expected Deref(Hash, ScalarVar), got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_hash_deref_block() {
         let e = parse_expr_str("%{$ref};");
-        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Hash, _)));
+        match &e.kind {
+            ExprKind::Deref(Sigil::Hash, inner) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(ref n) if n == "ref"));
+            }
+            other => panic!("expected Deref(Hash, ScalarVar), got {other:?}"),
+        }
     }
 
     // ── Glob / typeglob tests ─────────────────────────────────
@@ -3378,13 +3551,21 @@ mod tests {
     #[test]
     fn parse_glob_var() {
         let e = parse_expr_str("*foo;");
-        assert!(matches!(e.kind, ExprKind::GlobVar(_)));
+        match &e.kind {
+            ExprKind::GlobVar(name) => assert_eq!(name, "foo"),
+            other => panic!("expected GlobVar('foo'), got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_glob_deref() {
         let e = parse_expr_str("*$ref;");
-        assert!(matches!(e.kind, ExprKind::Deref(Sigil::Glob, _)));
+        match &e.kind {
+            ExprKind::Deref(Sigil::Glob, inner) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(ref n) if n == "ref"));
+            }
+            other => panic!("expected Deref(Glob, ScalarVar), got {other:?}"),
+        }
     }
 
     // ── Chained arrow calls test ──────────────────────────────
@@ -3844,11 +4025,11 @@ mod tests {
     fn parse_filetest_e() {
         let e = parse_expr_str("-e $file;");
         match &e.kind {
-            ExprKind::Filetest(c, operand) => {
+            ExprKind::Filetest(c, StatTarget::Expr(operand)) => {
                 assert_eq!(*c, 'e');
-                assert!(matches!(operand.kind, ExprKind::ScalarVar(_)));
+                assert!(matches!(operand.kind, ExprKind::ScalarVar(ref n) if n == "file"));
             }
-            other => panic!("expected Filetest('e'), got {other:?}"),
+            other => panic!("expected Filetest('e', Expr(ScalarVar)), got {other:?}"),
         }
     }
 
@@ -3856,45 +4037,52 @@ mod tests {
     fn parse_filetest_d_string() {
         let e = parse_expr_str(r#"-d "/tmp";"#);
         match &e.kind {
-            ExprKind::Filetest(c, _) => assert_eq!(*c, 'd'),
-            other => panic!("expected Filetest('d'), got {other:?}"),
+            ExprKind::Filetest(c, StatTarget::Expr(operand)) => {
+                assert_eq!(*c, 'd');
+                assert!(matches!(operand.kind, ExprKind::StringLit(ref s) if s == "/tmp"));
+            }
+            other => panic!("expected Filetest('d', Expr(StringLit)), got {other:?}"),
         }
     }
 
     #[test]
     fn parse_filetest_f_underscore() {
-        // -f _ uses the cached stat buffer
+        // -f _ uses the cached stat buffer — dedicated AST variant.
         let e = parse_expr_str("-f _;");
         match &e.kind {
-            ExprKind::Filetest(c, _) => assert_eq!(*c, 'f'),
-            other => panic!("expected Filetest('f'), got {other:?}"),
+            ExprKind::Filetest(c, StatTarget::StatCache) => {
+                assert_eq!(*c, 'f');
+            }
+            other => panic!("expected Filetest('f', StatCache), got {other:?}"),
         }
     }
 
     #[test]
     fn parse_filetest_no_operand() {
-        // -e alone defaults to $_
+        // -e alone defaults to $_ — dedicated AST variant.
         let e = parse_expr_str("-e;");
         match &e.kind {
-            ExprKind::Filetest(c, operand) => {
+            ExprKind::Filetest(c, StatTarget::Default) => {
                 assert_eq!(*c, 'e');
-                match &operand.kind {
-                    ExprKind::ScalarVar(name) => assert_eq!(name, "_"),
-                    other => panic!("expected default $_, got {other:?}"),
-                }
             }
-            other => panic!("expected Filetest('e'), got {other:?}"),
+            other => panic!("expected Filetest('e', Default), got {other:?}"),
         }
     }
 
     #[test]
     fn parse_stacked_filetests() {
-        // -f -r $file → Filetest('f', Filetest('r', $file))
+        // -f -r $file → Filetest('f', Expr(Filetest('r', Expr($file))))
         let e = parse_expr_str("-f -r $file;");
         match &e.kind {
-            ExprKind::Filetest(c, inner) => {
+            ExprKind::Filetest(c, StatTarget::Expr(inner)) => {
                 assert_eq!(*c, 'f');
-                assert!(matches!(inner.kind, ExprKind::Filetest('r', _)));
+                match &inner.kind {
+                    ExprKind::Filetest(c2, StatTarget::Expr(innermost)) => {
+                        assert_eq!(*c2, 'r');
+                        assert!(matches!(innermost.kind, ExprKind::ScalarVar(ref n) if n == "file"));
+                    }
+                    other => panic!("expected inner Filetest('r', Expr(ScalarVar)), got {other:?}"),
+                }
             }
             other => panic!("expected stacked Filetest, got {other:?}"),
         }
@@ -3934,5 +4122,900 @@ mod tests {
             },
             other => panic!("expected HashElem, got {other:?}"),
         }
+    }
+
+    // ── stat / lstat tests ────────────────────────────────────
+
+    #[test]
+    fn parse_stat_expr() {
+        let e = parse_expr_str("stat $file;");
+        match &e.kind {
+            ExprKind::Stat(StatTarget::Expr(operand)) => {
+                assert!(matches!(operand.kind, ExprKind::ScalarVar(ref n) if n == "file"));
+            }
+            other => panic!("expected Stat(Expr(ScalarVar)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_stat_underscore() {
+        let e = parse_expr_str("stat _;");
+        assert!(matches!(e.kind, ExprKind::Stat(StatTarget::StatCache)));
+    }
+
+    #[test]
+    fn parse_stat_default() {
+        let e = parse_expr_str("stat;");
+        assert!(matches!(e.kind, ExprKind::Stat(StatTarget::Default)));
+    }
+
+    #[test]
+    fn parse_stat_parens() {
+        let e = parse_expr_str("stat($file);");
+        match &e.kind {
+            ExprKind::Stat(StatTarget::Expr(operand)) => {
+                assert!(matches!(operand.kind, ExprKind::ScalarVar(ref n) if n == "file"));
+            }
+            other => panic!("expected Stat(Expr(ScalarVar)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_stat_parens_underscore() {
+        let e = parse_expr_str("stat(_);");
+        assert!(matches!(e.kind, ExprKind::Stat(StatTarget::StatCache)));
+    }
+
+    #[test]
+    fn parse_lstat_expr() {
+        let e = parse_expr_str("lstat $file;");
+        match &e.kind {
+            ExprKind::Lstat(StatTarget::Expr(operand)) => {
+                assert!(matches!(operand.kind, ExprKind::ScalarVar(ref n) if n == "file"));
+            }
+            other => panic!("expected Lstat(Expr(ScalarVar)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lstat_underscore() {
+        let e = parse_expr_str("lstat _;");
+        assert!(matches!(e.kind, ExprKind::Lstat(StatTarget::StatCache)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — compound assignment operators
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_assign_sub() {
+        let e = parse_expr_str("$x -= 1;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::SubEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_mul() {
+        let e = parse_expr_str("$x *= 2;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::MulEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_div() {
+        let e = parse_expr_str("$x /= 2;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::DivEq, _, _)));
+    }
+
+    #[test]
+    #[ignore = "lexer gap: %= not yet implemented"]
+    fn parse_assign_mod() {
+        let e = parse_expr_str("$x %= 3;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ModEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_pow() {
+        let e = parse_expr_str("$x **= 2;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::PowEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_concat() {
+        let e = parse_expr_str("$x .= 'a';");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ConcatEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_and() {
+        let e = parse_expr_str("$x &&= 1;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::AndEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_or() {
+        let e = parse_expr_str("$x ||= 1;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::OrEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_dor() {
+        let e = parse_expr_str("$x //= 1;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::DorEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_bit_and() {
+        let e = parse_expr_str("$x &= 0xFF;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::BitAndEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_bit_or() {
+        let e = parse_expr_str("$x |= 0xFF;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::BitOrEq, _, _)));
+    }
+
+    #[test]
+    #[ignore = "lexer gap: ^= not yet implemented"]
+    fn parse_assign_bit_xor() {
+        let e = parse_expr_str("$x ^= 0xFF;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::BitXorEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_shift_l() {
+        let e = parse_expr_str("$x <<= 2;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ShiftLEq, _, _)));
+    }
+
+    #[test]
+    fn parse_assign_shift_r() {
+        let e = parse_expr_str("$x >>= 2;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ShiftREq, _, _)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — precedence verification
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn prec_and_binds_tighter_than_or() {
+        let e = parse_expr_str("$a && $b || $c;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Or, left, _) => {
+                assert!(matches!(left.kind, ExprKind::BinOp(BinOp::And, _, _)));
+            }
+            other => panic!("expected Or(And(..), ..), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prec_assign_right_assoc() {
+        let e = parse_expr_str("$a = $b = 1;");
+        match &e.kind {
+            ExprKind::Assign(AssignOp::Eq, _, right) => {
+                assert!(matches!(right.kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+            }
+            other => panic!("expected chained assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prec_ternary_nested() {
+        // $a ? $b ? 1 : 2 : 3 — right-assoc: $a ? ($b ? 1 : 2) : 3
+        let e = parse_expr_str("$a ? $b ? 1 : 2 : 3;");
+        match &e.kind {
+            ExprKind::Ternary(_, middle, _) => {
+                assert!(matches!(middle.kind, ExprKind::Ternary(_, _, _)));
+            }
+            other => panic!("expected nested Ternary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prec_binding_tighter_than_concat() {
+        let e = parse_expr_str("$x =~ /foo/ . 'bar';");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Concat, left, _) => {
+                assert!(matches!(left.kind, ExprKind::BinOp(BinOp::Binding, _, _)));
+            }
+            other => panic!("expected Concat(Binding(..), ..), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prec_low_or_loosest() {
+        let e = parse_expr_str("$a = 1 or die;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::LowOr, left, _) => {
+                assert!(matches!(left.kind, ExprKind::Assign(_, _, _)));
+            }
+            other => panic!("expected LowOr(Assign(..), ..), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prec_not_low_vs_and_low() {
+        let e = parse_expr_str("not $a and $b;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::LowAnd, left, _) => {
+                assert!(matches!(left.kind, ExprKind::UnaryOp(UnaryOp::Not, _)));
+            }
+            other => panic!("expected LowAnd(Not(..), ..), got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — operators with AST verification
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_range() {
+        let e = parse_expr_str("1..10;");
+        assert!(matches!(e.kind, ExprKind::Range(_, _)));
+    }
+
+    #[test]
+    fn parse_not_binding() {
+        let e = parse_expr_str("$x !~ /foo/;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::NotBinding, _, right) => {
+                assert!(matches!(right.kind, ExprKind::Regex(_, _)));
+            }
+            other => panic!("expected NotBinding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pre_inc() {
+        let e = parse_expr_str("++$x;");
+        assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::PreInc, _)));
+    }
+
+    #[test]
+    fn parse_pre_dec() {
+        let e = parse_expr_str("--$x;");
+        assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::PreDec, _)));
+    }
+
+    #[test]
+    fn parse_post_inc() {
+        let e = parse_expr_str("$x++;");
+        assert!(matches!(e.kind, ExprKind::PostfixOp(PostfixOp::Inc, _)));
+    }
+
+    #[test]
+    fn parse_post_dec() {
+        let e = parse_expr_str("$x--;");
+        assert!(matches!(e.kind, ExprKind::PostfixOp(PostfixOp::Dec, _)));
+    }
+
+    #[test]
+    fn parse_bit_and() {
+        let e = parse_expr_str("$a & $b;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::BitAnd, _, _)));
+    }
+
+    #[test]
+    fn parse_bit_or() {
+        let e = parse_expr_str("$a | $b;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::BitOr, _, _)));
+    }
+
+    #[test]
+    fn parse_bit_xor() {
+        let e = parse_expr_str("$a ^ $b;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::BitXor, _, _)));
+    }
+
+    #[test]
+    fn parse_shift_l() {
+        let e = parse_expr_str("$a << 2;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::ShiftL, _, _)));
+    }
+
+    #[test]
+    fn parse_shift_r() {
+        let e = parse_expr_str("$a >> 2;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::ShiftR, _, _)));
+    }
+
+    #[test]
+    fn parse_bit_not() {
+        let e = parse_expr_str("~$x;");
+        assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::BitNot, _)));
+    }
+
+    #[test]
+    fn parse_spaceship() {
+        let e = parse_expr_str("$a <=> $b;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Spaceship, _, _)));
+    }
+
+    #[test]
+    fn parse_str_cmp() {
+        let e = parse_expr_str("$a cmp $b;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::StrCmp, _, _)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — arrow deref targets
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_arrow_coderef_call() {
+        let e = parse_expr_str("$ref->(1, 2);");
+        match &e.kind {
+            ExprKind::MethodCall(_, name, args) => {
+                assert!(name.is_empty());
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected coderef MethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arrow_array_elem() {
+        let e = parse_expr_str("$ref->[0];");
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::ArrayElem(_))));
+    }
+
+    #[test]
+    fn parse_chained_mixed_subscripts() {
+        let e = parse_expr_str("$ref->[0]{key}[1];");
+        match &e.kind {
+            ExprKind::ArrayElem(inner, _) => {
+                assert!(matches!(inner.kind, ExprKind::HashElem(_, _)));
+            }
+            other => panic!("expected ArrayElem(HashElem(..),..), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postfix_deref_scalar() {
+        let e = parse_expr_str("$ref->$*;");
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefScalar)));
+    }
+
+    #[test]
+    #[ignore = "$$ lexes as SpecialVar, not nested deref"]
+    fn parse_triple_deref() {
+        let e = parse_expr_str("$$$ref;");
+        match &e.kind {
+            ExprKind::Deref(Sigil::Scalar, inner) => {
+                assert!(matches!(inner.kind, ExprKind::Deref(Sigil::Scalar, _)));
+            }
+            other => panic!("expected Deref(Deref(..)), got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — postfix control flow variants
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_postfix_unless() {
+        let prog = parse("print 1 unless $x;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::Unless, _, _), .. }) => {}
+            other => panic!("expected PostfixControl Unless, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postfix_while() {
+        let prog = parse("$x++ while $x < 10;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::While, _, _), .. }) => {}
+            other => panic!("expected PostfixControl While, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postfix_until() {
+        let prog = parse("$x++ until $x >= 10;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::Until, _, _), .. }) => {}
+            other => panic!("expected PostfixControl Until, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postfix_for() {
+        let prog = parse("print $_ for @list;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::For, _, _), .. }) => {}
+            other => panic!("expected PostfixControl For, got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — declaration variants
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_our_decl() {
+        let prog = parse("our $VERSION = '1.0';");
+        match &prog.statements[0].kind {
+            StmtKind::Our(vars, Some(_)) => {
+                assert_eq!(vars[0].name, "VERSION");
+                assert_eq!(vars[0].sigil, Sigil::Scalar);
+            }
+            other => panic!("expected Our, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_state_decl() {
+        let prog = parse("state $counter = 0;");
+        match &prog.statements[0].kind {
+            StmtKind::State(vars, Some(_)) => {
+                assert_eq!(vars[0].name, "counter");
+            }
+            other => panic!("expected State, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_my_list_decl() {
+        let prog = parse("my ($a, $b, $c);");
+        match &prog.statements[0].kind {
+            StmtKind::My(vars, None) => {
+                assert_eq!(vars.len(), 3);
+                assert_eq!(vars[0].name, "a");
+                assert_eq!(vars[1].name, "b");
+                assert_eq!(vars[2].name, "c");
+            }
+            other => panic!("expected My with 3 vars, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_my_mixed_sigil_list() {
+        let prog = parse("my ($x, @y, %z);");
+        match &prog.statements[0].kind {
+            StmtKind::My(vars, None) => {
+                assert_eq!(vars[0].sigil, Sigil::Scalar);
+                assert_eq!(vars[1].sigil, Sigil::Array);
+                assert_eq!(vars[2].sigil, Sigil::Hash);
+            }
+            other => panic!("expected My with mixed sigils, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sub_with_prototype() {
+        let prog = parse("sub foo ($$) { }");
+        match &prog.statements[0].kind {
+            StmtKind::SubDecl(sub) => {
+                assert_eq!(sub.name, "foo");
+                assert!(sub.prototype.is_some());
+            }
+            other => panic!("expected SubDecl with prototype, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_package_block_form() {
+        let prog = parse("package Foo { }");
+        match &prog.statements[0].kind {
+            StmtKind::PackageDecl(p) => {
+                assert_eq!(p.name, "Foo");
+                assert!(p.block.is_some());
+            }
+            other => panic!("expected PackageDecl with block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_package_version() {
+        let prog = parse("package Foo 1.0;");
+        match &prog.statements[0].kind {
+            StmtKind::PackageDecl(p) => {
+                assert_eq!(p.name, "Foo");
+                assert!(p.version.is_some());
+            }
+            other => panic!("expected PackageDecl with version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_no_decl() {
+        let prog = parse("no warnings;");
+        match &prog.statements[0].kind {
+            StmtKind::UseDecl(u) => {
+                assert!(u.is_no);
+                assert_eq!(u.module, "warnings");
+            }
+            other => panic!("expected UseDecl(is_no=true), got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — builtins
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_defined() {
+        let e = parse_expr_str("defined $x;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "defined");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "x"));
+            }
+            other => panic!("expected FuncCall('defined', [ScalarVar]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chomp() {
+        let e = parse_expr_str("chomp $line;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "chomp");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected chomp FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_die_no_arg() {
+        let e = parse_expr_str("die;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "die");
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected bare die, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_push_list() {
+        let e = parse_expr_str("push @arr, 1, 2, 3;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "push");
+                assert_eq!(args.len(), 4);
+            }
+            other => panic!("expected push ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_join_list() {
+        let e = parse_expr_str("join ',', @arr;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "join");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected join ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_split_regex() {
+        let e = parse_expr_str("split /,/, $str;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "split");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::Regex(_, _)));
+            }
+            other => panic!("expected split ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sort_subname() {
+        let e = parse_expr_str("sort compare @list;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "sort");
+                assert!(args.len() >= 2);
+                assert!(matches!(args[0].kind, ExprKind::FuncCall(_, _)));
+            }
+            other => panic!("expected sort with sub name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_open_three_arg() {
+        let e = parse_expr_str("open my $fh, '<', 'file.txt';");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "open");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected open ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bless_two_arg() {
+        let e = parse_expr_str("bless $self, 'Foo';");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "bless");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected bless ListOp, got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — special forms
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_do_block() {
+        let e = parse_expr_str("do { 42; };");
+        assert!(matches!(e.kind, ExprKind::DoBlock(_)));
+    }
+
+    #[test]
+    fn parse_do_file() {
+        let e = parse_expr_str("do 'config.pl';");
+        assert!(matches!(e.kind, ExprKind::DoExpr(_)));
+    }
+
+    #[test]
+    fn parse_undef() {
+        let e = parse_expr_str("undef;");
+        assert!(matches!(e.kind, ExprKind::Undef));
+    }
+
+    #[test]
+    fn parse_glob_wildcard() {
+        let e = parse_expr_str("<*.txt>;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "glob");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected glob FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "brace disambiguation: {key => val} parsed as block, not anon hash"]
+    fn parse_anon_hash() {
+        let e = parse_expr_str("{key => 'val'};");
+        match &e.kind {
+            ExprKind::AnonHash(elems) => {
+                assert!(elems.len() >= 2);
+            }
+            other => panic!("expected AnonHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_nested_anon_constructors() {
+        let e = parse_expr_str("[{a => 1}, {b => 2}];");
+        match &e.kind {
+            ExprKind::AnonArray(elems) => {
+                assert_eq!(elems.len(), 2);
+                assert!(matches!(elems[0].kind, ExprKind::AnonHash(_)));
+                assert!(matches!(elems[1].kind, ExprKind::AnonHash(_)));
+            }
+            other => panic!("expected AnonArray of AnonHashes, got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — phaser blocks (INIT/CHECK/UNITCHECK)
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_init_block() {
+        let prog = parse("INIT { 1; }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Phaser(PhaserKind::Init, _)));
+    }
+
+    #[test]
+    fn parse_check_block() {
+        let prog = parse("CHECK { 1; }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Phaser(PhaserKind::Check, _)));
+    }
+
+    #[test]
+    fn parse_unitcheck_block() {
+        let prog = parse("UNITCHECK { 1; }");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Phaser(PhaserKind::Unitcheck, _)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — control flow variants
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_try_finally_only() {
+        let prog = parse("try { 1; } finally { 2; }");
+        match &prog.statements[0].kind {
+            StmtKind::Try(t) => {
+                assert!(t.catch_block.is_none());
+                assert!(t.finally_block.is_some());
+            }
+            other => panic!("expected Try with only finally, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_many_elsifs() {
+        let prog = parse("if ($a) { 1; } elsif ($b) { 2; } elsif ($c) { 3; } elsif ($d) { 4; } else { 5; }");
+        match &prog.statements[0].kind {
+            StmtKind::If(if_stmt) => {
+                assert_eq!(if_stmt.elsif_clauses.len(), 3);
+                assert!(if_stmt.else_block.is_some());
+            }
+            other => panic!("expected If with 3 elsifs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_statements() {
+        let prog = parse(";;;");
+        assert!(prog.statements.iter().all(|s| matches!(s.kind, StmtKind::Empty)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — regex flags
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_regex_with_many_flags() {
+        let e = parse_expr_str("/foo/imsxg;");
+        match &e.kind {
+            ExprKind::Regex(pat, flags) => {
+                assert_eq!(pat, "foo");
+                assert_eq!(flags, "imsxg");
+            }
+            other => panic!("expected Regex with flags, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_qr_regex() {
+        let e = parse_expr_str("qr/\\d+/;");
+        match &e.kind {
+            ExprKind::Regex(pat, _) => assert_eq!(pat, "\\d+"),
+            other => panic!("expected Regex (qr), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tr_with_flags() {
+        let e = parse_expr_str("tr/a-z/A-Z/cs;");
+        match &e.kind {
+            ExprKind::Translit(_, _, flags) => assert_eq!(flags, "cs"),
+            other => panic!("expected Translit with flags, got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — miscellaneous
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_scalar_context() {
+        let e = parse_expr_str("scalar @arr;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "scalar");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected scalar FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_package_method_call() {
+        let e = parse_expr_str("Foo::Bar->new();");
+        match &e.kind {
+            ExprKind::MethodCall(class, method, _) => {
+                assert_eq!(method, "new");
+                match &class.kind {
+                    ExprKind::FuncCall(name, _) => assert_eq!(name, "Foo::Bar"),
+                    other => panic!("expected class FuncCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_require_version() {
+        let e = parse_expr_str("require 5.010;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "require");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected require with version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_labeled_bare_block() {
+        let prog = parse("BLOCK: { last BLOCK; }");
+        match &prog.statements[0].kind {
+            StmtKind::Labeled(label, _) => assert_eq!(label, "BLOCK"),
+            other => panic!("expected Labeled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "keywords not autoquoted by fat comma"]
+    fn parse_fat_comma_with_keyword() {
+        let e = parse_expr_str("if => 1;");
+        match &e.kind {
+            ExprKind::List(items) => match &items[0].kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "if"),
+                other => panic!("expected StringLit('if'), got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — known gaps (ignored until implemented)
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    #[ignore = "C1: s///e replacement is code, not string"]
+    fn parse_subst_e_flag() {
+        let e = parse_expr_str("s/foo/uc($&)/e;");
+        match &e.kind {
+            ExprKind::Subst(_, SubstReplacement::Interpolated(_), _) => {}
+            other => panic!("expected Subst with Expr replacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "C2: complex string interpolation not implemented"]
+    fn parse_interp_backslash_ref() {
+        let e = parse_expr_str(r#""${\ $ref}";"#);
+        assert!(matches!(e.kind, ExprKind::InterpolatedString(_)));
+    }
+
+    #[test]
+    #[ignore = "C3: local assignment not handled"]
+    fn parse_local_special_var_assign() {
+        let prog = parse("local $/ = undef;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
+                assert!(matches!(lhs.kind, ExprKind::Local(_)));
+            }
+            other => panic!("expected local assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "C5: qx// not implemented"]
+    fn parse_qx_string_parens() {
+        let e = parse_expr_str("qx(ls -la);");
+        assert!(matches!(e.kind, ExprKind::InterpolatedString(_) | ExprKind::StringLit(_)));
+    }
+
+    #[test]
+    #[ignore = "C7: filehandle not separated from args"]
+    fn parse_print_filehandle() {
+        let e = parse_expr_str("print STDERR 'error';");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "print");
+                assert!(args.len() >= 2);
+            }
+            other => panic!("expected print with filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "M11: unless does not support elsif"]
+    fn parse_unless_elsif() {
+        let prog = parse("unless ($x) { 1; } elsif ($y) { 2; }");
+        assert_eq!(prog.statements.len(), 1);
     }
 }
