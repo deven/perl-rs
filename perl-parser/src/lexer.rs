@@ -580,9 +580,30 @@ impl<'src> Lexer<'src> {
                 return Ok(Token::Dollar);
             }
             Some(b'$') => {
-                // $$name is scalar dereference; $$ alone is PID
-                if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || b == b'{') {
-                    return Ok(Token::Dollar);
+                // $$name is scalar dereference; $$ alone is PID.
+                // Return Dollar (deref prefix) if the byte after the second $
+                // could start any variable expression ($name, ${expr}, $0,
+                // $$nested, $!, etc.).  Only return SpecialVar("$") (PID)
+                // when nothing variable-like follows.
+                if let Some(b) = self.peek_byte_at(1) {
+                    if b == b'_'
+                        || b.is_ascii_alphabetic()
+                        || b == b'{'
+                        || b == b'$'
+                        || b.is_ascii_digit()
+                        || b == b'!'
+                        || b == b'@'
+                        || b == b'/'
+                        || b == b'\\'
+                        || b == b';'
+                        || b == b','
+                        || b == b'^'
+                        || b == b'+'
+                        || b == b'-'
+                        || b == b'#'
+                    {
+                        return Ok(Token::Dollar);
+                    }
                 }
                 self.pos += 1;
                 return Ok(Token::SpecialVar("$".into()));
@@ -622,6 +643,14 @@ impl<'src> Lexer<'src> {
             Some(b',') => {
                 self.pos += 1;
                 return Ok(Token::SpecialVar(",".into()));
+            }
+            Some(b'+') => {
+                self.pos += 1;
+                return Ok(Token::SpecialVar("+".into()));
+            }
+            Some(b'-') => {
+                self.pos += 1;
+                return Ok(Token::SpecialVar("-".into()));
             }
             Some(b) if b.is_ascii_digit() => {
                 let start = self.pos;

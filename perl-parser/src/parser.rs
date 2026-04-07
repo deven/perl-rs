@@ -1142,7 +1142,10 @@ impl<'src> Parser<'src> {
             Token::HashVar(name) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
             Token::GlobVar(name) => Ok(Expr { kind: ExprKind::GlobVar(name), span }),
             Token::ArrayLen(name) => Ok(Expr { kind: ExprKind::ArrayLen(name), span }),
-            Token::SpecialVar(name) => Ok(Expr { kind: ExprKind::SpecialVar(name), span }),
+            Token::SpecialVar(name) => {
+                let expr = Expr { kind: ExprKind::SpecialVar(name), span };
+                self.maybe_postfix_subscript(expr)
+            }
             Token::SpecialArrayVar(name) => Ok(Expr { kind: ExprKind::SpecialArrayVar(name), span }),
             Token::SpecialHashVar(name) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
 
@@ -4427,7 +4430,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "$+ not yet recognized by lex_dollar"]
     fn parse_special_array_elem() {
         // $+[0] — element access on special array @+.
         let e = parse_expr_str("$+[0];");
@@ -4459,7 +4461,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "brace after SpecialVar not parsed as hash subscript"]
     fn parse_special_hash_elem() {
         // $!{ENOENT} — element access on special hash %!.
         let e = parse_expr_str("$!{ENOENT};");
@@ -4782,7 +4783,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "$$ lexes as SpecialVar, not nested deref"]
     fn parse_triple_deref() {
         let e = parse_expr_str("$$$ref;");
         match &e.kind {
