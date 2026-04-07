@@ -783,6 +783,22 @@ impl<'src> Lexer<'src> {
                         || b == b'+'
                         || b == b'-'
                         || b == b'#'
+                        || b == b'&'
+                        || b == b'"'
+                        || b == b'.'
+                        || b == b'|'
+                        || b == b'?'
+                        || b == b'`'
+                        || b == b'\''
+                        || b == b'('
+                        || b == b')'
+                        || b == b'<'
+                        || b == b'>'
+                        || b == b']'
+                        || b == b'%'
+                        || b == b':'
+                        || b == b'='
+                        || b == b'~'
                     {
                         return Ok(Token::Dollar);
                     }
@@ -833,6 +849,86 @@ impl<'src> Lexer<'src> {
             Some(b'-') => {
                 self.pos += 1;
                 return Ok(Token::SpecialVar("-".into()));
+            }
+            Some(b'&') => {
+                self.pos += 1;
+                return Ok(Token::SpecialVar("&".into()));
+            }
+            // ── perlvar: remaining punctuation special variables ──
+            Some(b'"') => {
+                // $" — list separator for array interpolation
+                self.pos += 1;
+                return Ok(Token::SpecialVar("\"".into()));
+            }
+            Some(b'.') => {
+                // $. — current line number
+                self.pos += 1;
+                return Ok(Token::SpecialVar(".".into()));
+            }
+            Some(b'|') => {
+                // $| — output autoflush
+                self.pos += 1;
+                return Ok(Token::SpecialVar("|".into()));
+            }
+            Some(b'?') => {
+                // $? — child process status
+                self.pos += 1;
+                return Ok(Token::SpecialVar("?".into()));
+            }
+            Some(b'`') => {
+                // $` — prematch string
+                self.pos += 1;
+                return Ok(Token::SpecialVar("`".into()));
+            }
+            Some(b'\'') => {
+                // $' — postmatch string
+                self.pos += 1;
+                return Ok(Token::SpecialVar("'".into()));
+            }
+            Some(b'(') => {
+                // $( — real GID
+                self.pos += 1;
+                return Ok(Token::SpecialVar("(".into()));
+            }
+            Some(b')') => {
+                // $) — effective GID
+                self.pos += 1;
+                return Ok(Token::SpecialVar(")".into()));
+            }
+            Some(b'<') => {
+                // $< — real UID
+                self.pos += 1;
+                return Ok(Token::SpecialVar("<".into()));
+            }
+            Some(b'>') => {
+                // $> — effective UID
+                self.pos += 1;
+                return Ok(Token::SpecialVar(">".into()));
+            }
+            Some(b']') => {
+                // $] — Perl version
+                self.pos += 1;
+                return Ok(Token::SpecialVar("]".into()));
+            }
+            Some(b'%') => {
+                // $% — page number (format)
+                self.pos += 1;
+                return Ok(Token::SpecialVar("%".into()));
+            }
+            Some(b':') => {
+                // $: — format break characters
+                self.pos += 1;
+                return Ok(Token::SpecialVar(":".into()));
+            }
+            Some(b'=') => {
+                // $= — page length (format)
+                self.pos += 1;
+                return Ok(Token::SpecialVar("=".into()));
+            }
+            Some(b'~') => {
+                // $~ — format name
+                self.pos += 1;
+                return Ok(Token::SpecialVar("~".into()));
             }
             Some(b) if b.is_ascii_digit() => {
                 let start = self.pos;
@@ -2669,6 +2765,119 @@ mod tests {
     fn lex_dollar_comma() {
         let tokens = lex_all("$,");
         assert_eq!(tokens, vec![Token::SpecialVar(",".into())]);
+    }
+
+    // ── perlvar punctuation special variables ─────────────────
+
+    #[test]
+    fn lex_dollar_ampersand() {
+        let tokens = lex_all("$&");
+        assert_eq!(tokens, vec![Token::SpecialVar("&".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_double_quote() {
+        // $" — list separator
+        let tokens = lex_all("$\"");
+        assert_eq!(tokens, vec![Token::SpecialVar("\"".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_dot() {
+        // $. — line number
+        let tokens = lex_all("$.");
+        assert_eq!(tokens, vec![Token::SpecialVar(".".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_pipe() {
+        // $| — autoflush
+        let tokens = lex_all("$|");
+        assert_eq!(tokens, vec![Token::SpecialVar("|".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_question() {
+        // $? — child status
+        let tokens = lex_all("$?");
+        assert_eq!(tokens, vec![Token::SpecialVar("?".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_backtick() {
+        // $` — prematch
+        let tokens = lex_all("$`");
+        assert_eq!(tokens, vec![Token::SpecialVar("`".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_single_quote() {
+        // $' — postmatch
+        let tokens = lex_all("$'");
+        assert_eq!(tokens, vec![Token::SpecialVar("'".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_open_paren() {
+        // $( — real GID
+        let tokens = lex_all("$(");
+        assert_eq!(tokens, vec![Token::SpecialVar("(".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_close_paren() {
+        // $) — effective GID
+        let tokens = lex_all("$)");
+        assert_eq!(tokens, vec![Token::SpecialVar(")".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_less_than() {
+        // $< — real UID
+        let tokens = lex_all("$<");
+        assert_eq!(tokens, vec![Token::SpecialVar("<".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_greater_than() {
+        // $> — effective UID
+        let tokens = lex_all("$>");
+        assert_eq!(tokens, vec![Token::SpecialVar(">".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_close_bracket() {
+        // $] — Perl version
+        let tokens = lex_all("$]");
+        assert_eq!(tokens, vec![Token::SpecialVar("]".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_percent() {
+        // $% — page number
+        let tokens = lex_all("$%");
+        assert_eq!(tokens, vec![Token::SpecialVar("%".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_colon() {
+        // $: — format break chars
+        let tokens = lex_all("$:");
+        assert_eq!(tokens, vec![Token::SpecialVar(":".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_equals() {
+        // $= — page length
+        let tokens = lex_all("$=");
+        assert_eq!(tokens, vec![Token::SpecialVar("=".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_tilde() {
+        // $~ — format name
+        let tokens = lex_all("$~");
+        assert_eq!(tokens, vec![Token::SpecialVar("~".into())]);
     }
 
     #[test]

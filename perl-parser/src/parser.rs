@@ -1486,7 +1486,7 @@ impl<'src> Parser<'src> {
                     let repl_src = format!("{};", replacement);
                     let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
                     match prog.statements.into_iter().next() {
-                        Some(Stmt { kind: StmtKind::Expr(expr), .. }) => SubstReplacement::Expr(Box::new(expr)),
+                        Some(Statement { kind: StmtKind::Expr(expr), .. }) => SubstReplacement::Expr(Box::new(expr)),
                         _ => SubstReplacement::Literal(replacement),
                     }
                 } else {
