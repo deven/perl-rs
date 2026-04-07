@@ -331,8 +331,13 @@ pub enum Token {
     RParen,   // )
     LBracket, // [
     RBracket, // ]
-    LBrace,   // {
-    RBrace,   // }
+    LBrace,   // { (block, hash subscript)
+    /// `{` that opens an anonymous hash constructor.
+    /// Distinct from `LBrace` (which opens blocks and subscripts).
+    /// The lexer decides which to emit, matching toke.c's
+    /// `PERLY_BRACE_OPEN` vs `HASHBRACK` distinction.
+    HashBrace,
+    RBrace, // }
 
     // ── Punctuation ───────────────────────────────────────────
     Semi,     // ;
@@ -465,6 +470,7 @@ impl Token {
                 | Token::LParen
                 | Token::LBracket
                 | Token::LBrace
+                | Token::HashBrace
                 | Token::Minus
                 | Token::Plus
                 | Token::Bang
@@ -511,6 +517,7 @@ impl std::fmt::Display for Token {
             Token::LParen => write!(f, "("),
             Token::RParen => write!(f, ")"),
             Token::LBrace => write!(f, "{{"),
+            Token::HashBrace => write!(f, "{{"),
             Token::RBrace => write!(f, "}}"),
             Token::LBracket => write!(f, "["),
             Token::RBracket => write!(f, "]"),

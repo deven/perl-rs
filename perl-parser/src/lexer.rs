@@ -8,7 +8,7 @@
 //! heredocs, and regex scanning are handled by helper methods.
 
 use crate::error::ParseError;
-use crate::expect::{BaseExpect, Expect};
+use crate::expect::{BaseExpect, BraceDisposition, Expect};
 use crate::keyword;
 use crate::span::Span;
 use crate::token::*;
@@ -135,6 +135,162 @@ impl<'src> Lexer<'src> {
     /// Get a byte slice of the source.
     pub fn slice(&self, start: usize, end: usize) -> &[u8] {
         &self.src[start..end]
+    }
+
+    /// Byte-level lookahead to determine if content after `{` looks like
+    /// an anonymous hash rather than a block.  Faithfully reproduces the
+    /// heuristic from toke.c `yyl_leftcurly()` default case (lines 6400–6471).
+    ///
+    /// Called when the lexer position is right after `{`.
+    /// Does NOT advance the lexer — purely read-only scan on source bytes.
+    pub fn looks_like_hash_content(&self) -> bool {
+        let src = self.remaining();
+
+        // Skip whitespace and comments (toke.c: s = skipspace(s))
+        let i = skip_ws_bytes(src, 0);
+
+        // Empty {} → hash (toke.c line 6368)
+        if i >= src.len() || src[i] == b'}' {
+            return true;
+        }
+
+        let s = i; // start of first term (toke.c's `s`)
+        let mut t = i; // scanner position  (toke.c's `t`)
+
+        // ── Scan past the first term ────────────────────────────
+        // toke.c lines 6401–6463
+
+        if src[s] == b'\'' || src[s] == b'"' || src[s] == b'`' {
+            // String literal — scan to matching quote, handling escapes.
+            // toke.c lines 6401–6406
+            let quote = src[s];
+            t += 1;
+            while t < src.len() && src[t] != quote {
+                if src[t] == b'\\' {
+                    t += 1;
+                }
+                t += 1;
+            }
+            if t < src.len() {
+                t += 1;
+            } // past closing quote
+        } else if src[s] == b'q' {
+            // q//, qq//, qx// — or a plain word starting with 'q'.
+            // toke.c lines 6408–6455.
+            //
+            // The C code uses `++t` with side effects inside boolean
+            // short-circuit evaluation.  We replicate the same
+            // advancement sequence explicitly.
+            t += 1; // past 'q'
+
+            let is_q_quote = if t < src.len() {
+                if !is_word_char(src[t]) {
+                    // Non-word char right after 'q' → q// (e.g. q/, q{)
+                    true
+                } else if src[t] == b'q' || src[t] == b'x' {
+                    // Could be qq// or qx// — advance past second char
+                    t += 1;
+                    t < src.len() && !is_word_char(src[t])
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_q_quote {
+                // Skip whitespace before delimiter (toke.c line 6419)
+                while t < src.len() && is_space(src[t]) {
+                    t += 1;
+                }
+
+                // Check for `q =>` — bare 'q' as hash key (toke.c line 6422)
+                if t + 1 < src.len() && src[t] == b'=' && src[t + 1] == b'>' {
+                    return true;
+                }
+
+                // Scan past the q-quote's delimiters (toke.c lines 6425–6447)
+                if t < src.len() {
+                    let open = src[t];
+                    let close = match open {
+                        b'(' => b')',
+                        b'[' => b']',
+                        b'{' => b'}',
+                        b'<' => b'>',
+                        _ => open,
+                    };
+                    if open == close {
+                        // Same-char delimiter (q/.../)
+                        t += 1;
+                        while t < src.len() {
+                            if src[t] == b'\\' && t + 1 < src.len() && open != b'\\' {
+                                t += 1;
+                            } else if src[t] == open {
+                                break;
+                            }
+                            t += 1;
+                        }
+                    } else {
+                        // Paired delimiters (q{...}, q<...>)
+                        let mut brackets: i32 = 1;
+                        t += 1;
+                        while t < src.len() {
+                            if src[t] == b'\\' && t + 1 < src.len() {
+                                t += 1;
+                            } else if src[t] == close {
+                                brackets -= 1;
+                                if brackets <= 0 {
+                                    break;
+                                }
+                            } else if src[t] == open {
+                                brackets += 1;
+                            }
+                            t += 1;
+                        }
+                    }
+                    if t < src.len() {
+                        t += 1;
+                    } // past closing delimiter
+                }
+            } else {
+                // Plain word starting with 'q' (e.g. "query", "qw", "qr").
+                // t was already advanced past 'q' (and possibly 'qq'/'qx'
+                // whose second char turned out to be a word char); continue
+                // scanning the rest of the identifier.
+                // toke.c lines 6449–6455
+                while t < src.len() && is_word_char(src[t]) {
+                    t += 1;
+                }
+            }
+        } else if is_word_char(src[s]) {
+            // Bareword — scan past it.
+            // toke.c lines 6457–6463
+            t += 1;
+            while t < src.len() && is_word_char(src[t]) {
+                t += 1;
+            }
+        }
+
+        // Skip whitespace after first term (toke.c line 6465)
+        t = skip_ws_bytes(src, t);
+
+        // ── Key decision ────────────────────────────────────────
+        // "if comma follows first term, call it an anon hash"
+        // toke.c lines 6467–6471
+        if t < src.len() {
+            // => after first term → definitely hash
+            if src[t] == b'=' && t + 1 < src.len() && src[t + 1] == b'>' {
+                return true;
+            }
+            // , after first term → hash if first char is 'q' or non-lowercase
+            // (lowercase bareword + comma could be a function call in a block)
+            if src[t] == b',' && (src[s] == b'q' || !src[s].is_ascii_lowercase()) {
+                return true;
+            }
+        }
+
+        // Default: block
+        false
     }
 
     /// Skip a format body: everything until a line containing just `.`
@@ -358,7 +514,33 @@ impl<'src> Lexer<'src> {
             }
             b'{' => {
                 self.pos += 1;
-                Token::LBrace
+                // Brace disambiguation matching toke.c yyl_leftcurly().
+                //
+                // Explicit brace disposition (set by parser) takes priority,
+                // then base expect state, then the heuristic for the
+                // ambiguous statement-level case.
+                match expect.brace {
+                    // XBLOCK / XTERMBLOCK / XBLOCKTERM → always block.
+                    BraceDisposition::Block | BraceDisposition::BlockExpr | BraceDisposition::BlockArg => Token::LBrace,
+                    // Explicitly marked as hash.
+                    BraceDisposition::Hash => Token::HashBrace,
+                    BraceDisposition::Infer => match expect.base {
+                        // XTERM → always hash (toke.c lines 6313–6317).
+                        BaseExpect::Term => Token::HashBrace,
+                        // XOPERATOR → always block (toke.c lines 6318–6348).
+                        BaseExpect::Operator => Token::LBrace,
+                        // XREF → always block (toke.c lines 6379–6383).
+                        BaseExpect::Ref | BaseExpect::Postderef => Token::LBrace,
+                        // XSTATE / default → heuristic (toke.c lines 6360–6501).
+                        BaseExpect::Statement => {
+                            if self.looks_like_hash_content() {
+                                Token::HashBrace
+                            } else {
+                                Token::LBrace
+                            }
+                        }
+                    },
+                }
             }
             b'}' => {
                 self.pos += 1;
@@ -1687,6 +1869,36 @@ fn strip_heredoc_indent(body: &str) -> String {
         + if body.ends_with('\n') { "\n" } else { "" }
 }
 
+// ── Byte-level helpers for brace disambiguation ─────────────
+
+/// Equivalent to Perl's `isWORDCHAR`: `[a-zA-Z0-9_]`.
+fn is_word_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Equivalent to Perl's `isSPACE`.
+fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
+}
+
+/// Skip whitespace and `#`-comments in raw source bytes.
+/// Equivalent to toke.c's `skipspace()`.
+fn skip_ws_bytes(src: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < src.len() && is_space(src[i]) {
+            i += 1;
+        }
+        if i < src.len() && src[i] == b'#' {
+            while i < src.len() && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1725,11 +1937,20 @@ mod tests {
                 | Token::GlobVar(_)
                 | Token::QwList(_)
                 | Token::SpecialArrayVar(_)
-                | Token::SpecialHashVar(_) => {
+                | Token::SpecialHashVar(_)
+                | Token::Arrow => {
+                    // Arrow: toke.c's TOKEN(ARROW) doesn't change PL_expect,
+                    // so it inherits XOPERATOR from the preceding term.
                     expect.base = BaseExpect::Operator;
                 }
                 Token::Semi | Token::LBrace => {
                     expect = Expect::XSTATE;
+                }
+                // HASHBRACK in toke.c is returned via OPERATOR() which
+                // sets PL_expect = XTERM — the first thing in a hash
+                // literal is a term (key expression).
+                Token::HashBrace => {
+                    expect.base = BaseExpect::Term;
                 }
                 // Sub-tokens inside strings don't affect expect.
                 Token::QuoteBegin(_, _) | Token::ConstSegment(_) | Token::InterpScalar(_) | Token::InterpArray(_) => {}
@@ -2670,5 +2891,373 @@ mod tests {
     fn lex_ctrl_z_eof() {
         let tokens = lex_all("1;\x1amore stuff");
         assert!(tokens.contains(&Token::DataEnd(DataEndMarker::CtrlZ)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Brace disambiguation: Token::LBrace vs Token::HashBrace
+    //
+    // These tests verify that the lexer faithfully reproduces
+    // toke.c's yyl_leftcurly() decision for every code path.
+    //
+    // Each named Expect constant maps to a toke.c PL_expect state.
+    // The expected token matches what toke.c would return:
+    //   LBrace   = PERLY_BRACE_OPEN  (block / subscript)
+    //   HashBrace = HASHBRACK          (anonymous hash)
+    // ═══════════════════════════════════════════════════════════
+
+    /// Lex `{` (and whatever follows) under an explicit expect state.
+    fn lex_brace(src: &str, expect: Expect) -> Token {
+        let mut lexer = Lexer::new(src.as_bytes());
+        lexer.next_token(&expect).unwrap().token
+    }
+
+    // ── Named expect states from toke.c ───────────────────────
+    // Each test name includes the toke.c state for traceability.
+
+    #[test]
+    fn brace_xterm_always_hash() {
+        // toke.c case XTERM: → OPERATOR(HASHBRACK)  (line 6313)
+        assert_eq!(lex_brace("{}", Expect::XTERM), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_xterm_hash_even_with_block_content() {
+        // XTERM: { is ALWAYS hash, regardless of content.
+        assert_eq!(lex_brace("{my $x = 1; $x}", Expect::XTERM), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_xtermordordor_always_hash() {
+        // toke.c case XTERMORDORDOR: → OPERATOR(HASHBRACK)  (line 6314)
+        // Used after // (defined-or) operator.
+        assert_eq!(lex_brace("{}", Expect::XTERMORDORDOR), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_xtermordordor_hash_even_with_block_content() {
+        assert_eq!(lex_brace("{my $x = 1}", Expect::XTERMORDORDOR), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_xoperator_always_block() {
+        // toke.c case XOPERATOR: → falls through to PERLY_BRACE_OPEN  (line 6318)
+        // Used for hash subscripts: $hash{key}
+        assert_eq!(lex_brace("{key}", Expect::XOPERATOR), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xoperator_block_even_with_hash_content() {
+        assert_eq!(lex_brace("{key => val}", Expect::XOPERATOR), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xblock_always_block() {
+        // toke.c case XBLOCK: → TOKEN(PERLY_BRACE_OPEN)  (line 6350)
+        // Used after if/while/sub etc.
+        assert_eq!(lex_brace("{1}", Expect::XBLOCK), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xblock_block_even_with_hash_content() {
+        assert_eq!(lex_brace("{key => val}", Expect::XBLOCK), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xattrblock_always_block() {
+        // toke.c case XATTRBLOCK: → TOKEN(PERLY_BRACE_OPEN)  (line 6349)
+        // Used for sub body after attributes.
+        assert_eq!(lex_brace("{1}", Expect::XATTRBLOCK), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xtermblock_always_block() {
+        // toke.c case XTERMBLOCK: → TOKEN(PERLY_BRACE_OPEN)  (line 6344)
+        // Block that produces a value (e.g. eval).
+        assert_eq!(lex_brace("{1}", Expect::XTERMBLOCK), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xattrterm_always_block() {
+        // toke.c case XATTRTERM: → TOKEN(PERLY_BRACE_OPEN)  (line 6343)
+        assert_eq!(lex_brace("{1}", Expect::XATTRTERM), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xblockterm_always_block() {
+        // toke.c case XBLOCKTERM: → TOKEN(PERLY_BRACE_OPEN)  (line 6355)
+        assert_eq!(lex_brace("{1}", Expect::XBLOCKTERM), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xref_always_block() {
+        // toke.c default case, XREF check: → block_expectation  (line 6379)
+        // Used for ${...}, @{...} dereference blocks.
+        assert_eq!(lex_brace("{expr}", Expect::XREF), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xref_block_even_with_hash_content() {
+        // XREF is always block, even if content looks like a hash.
+        assert_eq!(lex_brace("{key => val}", Expect::XREF), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_xpostderef_always_block() {
+        // Postfix dereference context → block.
+        assert_eq!(lex_brace("{key}", Expect::XPOSTDEREF), Token::LBrace);
+    }
+
+    // ── Explicit BraceDisposition overrides ───────────────────
+
+    #[test]
+    fn brace_explicit_block_overrides_term_base() {
+        // Even with Term base, explicit Block disposition → LBrace.
+        let mut e = Expect::XTERM;
+        e.brace = BraceDisposition::Block;
+        assert_eq!(lex_brace("{ 1 }", e), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_explicit_hash_overrides_operator_base() {
+        // Even with Operator base, explicit Hash disposition → HashBrace.
+        let mut e = Expect::XOPERATOR;
+        e.brace = BraceDisposition::Hash;
+        assert_eq!(lex_brace("{ 1 }", e), Token::HashBrace);
+    }
+
+    // ── Heuristic (XSTATE) — toke.c default case ─────────────
+    //
+    // When PL_expect is XSTATE (statement level, brace=Infer),
+    // toke.c scans the content after { to decide.  Lines 6400–6471.
+
+    #[test]
+    fn brace_heuristic_empty_is_hash() {
+        // {} → hash (toke.c line 6377)
+        assert_eq!(lex_brace("{}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_empty_with_space() {
+        assert_eq!(lex_brace("{  }", Expect::XSTATE), Token::HashBrace);
+    }
+
+    // ── Heuristic: bareword first term ────────────────────────
+
+    #[test]
+    fn brace_heuristic_bareword_fat_comma() {
+        // {key => ...} → hash (line 6470: '=' and '>')
+        assert_eq!(lex_brace("{key => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_uppercase_fat_comma() {
+        assert_eq!(lex_brace("{Foo => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_uppercase_comma_is_hash() {
+        // {Foo, 1} → hash: !isLOWER('F') (line 6469)
+        assert_eq!(lex_brace("{Foo, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_lowercase_comma_is_block() {
+        // {foo, 1} → block: isLOWER('f'), could be func call (line 6469)
+        assert_eq!(lex_brace("{foo, 1}", Expect::XSTATE), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_lowercase_fat_comma_is_hash() {
+        // {foo => 1} → hash: => always wins regardless of case
+        assert_eq!(lex_brace("{foo => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_no_comma_is_block() {
+        // {my $x = 1} → block: no comma/=> after first term
+        assert_eq!(lex_brace("{my $x = 1}", Expect::XSTATE), Token::LBrace);
+    }
+
+    // ── Heuristic: string first term (lines 6401–6406) ───────
+
+    #[test]
+    fn brace_heuristic_single_quoted_comma() {
+        // {'key', 1} → hash
+        assert_eq!(lex_brace("{'key', 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_single_quoted_fat_comma() {
+        assert_eq!(lex_brace("{'key' => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_double_quoted_comma() {
+        assert_eq!(lex_brace("{\"key\", 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_double_quoted_fat_comma() {
+        assert_eq!(lex_brace("{\"key\" => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_backtick_comma() {
+        assert_eq!(lex_brace("{`cmd`, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_string_no_comma_is_block() {
+        // {"key"; 1} → block: string but no comma/=> after
+        assert_eq!(lex_brace("{\"key\"; 1}", Expect::XSTATE), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_string_with_escapes() {
+        // {"he\"llo", 1} → hash: escaped quote inside string
+        assert_eq!(lex_brace("{\"he\\\"llo\", 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    // ── Heuristic: non-alpha first char (line 6469: !isLOWER) ─
+
+    #[test]
+    fn brace_heuristic_number_comma() {
+        // {1, 2} → hash: '1' is not isLOWER
+        assert_eq!(lex_brace("{1, 2}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_underscore_comma() {
+        // {_foo, 1} → hash: '_' is not isLOWER
+        assert_eq!(lex_brace("{_foo, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_dollar_is_block() {
+        // {$x + 1} → block: '$' doesn't start a word/quote
+        assert_eq!(lex_brace("{$x + 1}", Expect::XSTATE), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_at_is_block() {
+        // {@array} → block: '@' doesn't start a word/quote
+        assert_eq!(lex_brace("{@array}", Expect::XSTATE), Token::LBrace);
+    }
+
+    // ── Heuristic: q-quote constructs (lines 6408–6455) ──────
+
+    #[test]
+    fn brace_heuristic_q_slash_comma() {
+        // {q/hello/, 1} → hash
+        assert_eq!(lex_brace("{q/hello/, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_qq_slash_comma() {
+        assert_eq!(lex_brace("{qq/hello/, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_qx_slash_comma() {
+        assert_eq!(lex_brace("{qx/cmd/, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_q_braces_comma() {
+        // {q{hello}, 1} → hash: q{} with paired delimiters
+        assert_eq!(lex_brace("{q{hello}, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_q_nested_braces_comma() {
+        // {q{{nested}}, 1} → hash: q{} with nested braces
+        assert_eq!(lex_brace("{q{{nested}}, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_q_fat_comma() {
+        // {q/hello/ => 1} → hash
+        assert_eq!(lex_brace("{q/hello/ => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_q_with_escapes_comma() {
+        assert_eq!(lex_brace("{q/he\\'llo/, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_bare_q_fat_comma() {
+        // {q => 1} → hash: bare 'q' as key (toke.c line 6422)
+        assert_eq!(lex_brace("{q => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_bare_qq_fat_comma() {
+        // {qq => 1} → hash: 'qq' followed by space (non-word-char),
+        // enters q-quote branch, skips whitespace, finds =>
+        assert_eq!(lex_brace("{qq => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_qw_word_comma() {
+        // {qw, 1} → hash: 'qw' is a word starting with 'q',
+        // *s == 'q' satisfies the check (toke.c line 6469)
+        assert_eq!(lex_brace("{qw, 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_qr_word_no_comma_is_block() {
+        // {qr; 1} → block: 'qr' is a word, no comma/=> after
+        assert_eq!(lex_brace("{qr; 1}", Expect::XSTATE), Token::LBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_query_word_no_comma_is_block() {
+        assert_eq!(lex_brace("{query; 1}", Expect::XSTATE), Token::LBrace);
+    }
+
+    // ── Heuristic: comments (skipspace) ───────────────────────
+
+    #[test]
+    fn brace_heuristic_comment_then_hash() {
+        // { # comment\n key => 1} → hash
+        assert_eq!(lex_brace("{ # comment\nkey => 1}", Expect::XSTATE), Token::HashBrace);
+    }
+
+    #[test]
+    fn brace_heuristic_comment_then_block() {
+        assert_eq!(lex_brace("{ # comment\nmy $x = 1}", Expect::XSTATE), Token::LBrace);
+    }
+
+    // ── Integration: lex_all with natural context ─────────────
+
+    #[test]
+    fn brace_in_assignment_is_hash() {
+        // $x = {...} — after =, lex_all sets Term → HashBrace
+        let tokens = lex_all("$x = {key => 1}");
+        assert!(tokens.contains(&Token::HashBrace));
+        assert!(!tokens.iter().any(|t| *t == Token::LBrace));
+    }
+
+    #[test]
+    fn brace_after_semicolon_hash() {
+        // ; {key => 1} — after ;, XSTATE → heuristic → hash
+        let tokens = lex_all("1; {key => 1}");
+        assert!(tokens.contains(&Token::HashBrace));
+    }
+
+    #[test]
+    fn brace_after_semicolon_block() {
+        // ; {my $x} — after ;, XSTATE → heuristic → block
+        let tokens = lex_all("1; {my $x}");
+        assert!(tokens.contains(&Token::LBrace));
+    }
+
+    #[test]
+    fn brace_after_arrow_is_block() {
+        // $ref->{key} — after ->, XOPERATOR → LBrace (subscript)
+        let tokens = lex_all("$ref->{key}");
+        assert!(tokens.contains(&Token::LBrace));
+        assert!(!tokens.contains(&Token::HashBrace));
     }
 }
