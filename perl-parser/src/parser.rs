@@ -434,19 +434,7 @@ impl<'src> Parser<'src> {
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
         };
 
-        // Optional prototype
-        let prototype = if self.at(&Token::LParen) {
-            self.advance();
-            let mut proto = String::new();
-            while !self.at(&Token::RParen) && !self.at_eof() {
-                let t = self.advance();
-                proto.push_str(&format!("{}", t.token));
-            }
-            self.expect_token(&Token::RParen)?;
-            Some(proto)
-        } else {
-            None
-        };
+        let prototype = self.parse_prototype()?;
 
         let attributes = self.parse_attributes()?;
         let body = self.parse_block()?;
@@ -455,6 +443,19 @@ impl<'src> Parser<'src> {
     }
 
     /// Parse attributes: `:lvalue :method(args)` etc.
+    /// Parse an optional prototype: `($$)`, `(\@\%)`, etc.
+    /// Sets `BaseExpect::Proto` so the lexer scans `(...)` as a raw
+    /// string, matching toke.c's `scan_str()` call in `yyl_sub()`.
+    fn parse_prototype(&mut self) -> Result<Option<String>, ParseError> {
+        self.expect.base = BaseExpect::Proto;
+        if let Token::Prototype(proto) = self.peek().clone() {
+            self.advance();
+            Ok(Some(proto))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn parse_attributes(&mut self) -> Result<Vec<Attribute>, ParseError> {
         let mut attrs = Vec::new();
         while self.at(&Token::Colon) {
@@ -536,19 +537,7 @@ impl<'src> Parser<'src> {
 
     /// Parse an anonymous sub expression: `sub { ... }` or `sub ($x) { ... }`.
     fn parse_anon_sub(&mut self, span: Span) -> Result<Expr, ParseError> {
-        // Optional prototype
-        let prototype = if self.at(&Token::LParen) {
-            self.advance();
-            let mut proto = String::new();
-            while !self.at(&Token::RParen) && !self.at_eof() {
-                let t = self.advance();
-                proto.push_str(&format!("{}", t.token));
-            }
-            self.expect_token(&Token::RParen)?;
-            Some(proto)
-        } else {
-            None
-        };
+        let prototype = self.parse_prototype()?;
 
         self.expect.brace = BraceDisposition::BlockExpr;
         let body = self.parse_block()?;
@@ -939,18 +928,7 @@ impl<'src> Parser<'src> {
             other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
         };
 
-        let prototype = if self.at(&Token::LParen) {
-            self.advance();
-            let mut proto = String::new();
-            while !self.at(&Token::RParen) && !self.at_eof() {
-                let t = self.advance();
-                proto.push_str(&format!("{}", t.token));
-            }
-            self.expect_token(&Token::RParen)?;
-            Some(proto)
-        } else {
-            None
-        };
+        let prototype = self.parse_prototype()?;
 
         let attributes = self.parse_attributes()?;
         self.expect.brace = BraceDisposition::Block;

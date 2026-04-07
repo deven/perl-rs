@@ -345,6 +345,11 @@ pub enum Token {
     Dollar,   // $ (when not part of a variable)
     HashSign, // # (should not normally reach parser)
 
+    /// Subroutine prototype scanned as a raw string: `($$)` → `"$$"`.
+    /// The lexer produces this instead of `LParen` when `base = Proto`.
+    /// Matches toke.c's `scan_str` + `force_next(THING)` for prototypes.
+    Prototype(String),
+
     // ── Quote/interpolation sub-tokens (§5.4) ─────────────────
     /// Start of a quote-like construct.  Contains quote type and delimiter.
     QuoteBegin(QuoteKind, u8),
@@ -519,6 +524,7 @@ impl std::fmt::Display for Token {
             Token::LBrace => write!(f, "{{"),
             Token::HashBrace => write!(f, "{{"),
             Token::RBrace => write!(f, "}}"),
+            Token::Prototype(s) => write!(f, "({})", s),
             Token::LBracket => write!(f, "["),
             Token::RBracket => write!(f, "]"),
             Token::Comma => write!(f, ","),

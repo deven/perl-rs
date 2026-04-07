@@ -28,6 +28,11 @@ pub enum BaseExpect {
 
     /// After `->` for postfix dereference syntax (`$ref->@*`).
     Postderef,
+
+    /// After `sub name` — if `(` follows, scan it as a raw prototype
+    /// string (not tokenized).  Matches toke.c's `scan_str()` call
+    /// inside `yyl_sub()`.
+    Proto,
 }
 
 /// How to interpret `{` when encountered.
