@@ -397,9 +397,6 @@ pub enum Token {
     YadaYada,
     /// `<STDIN>`, `<>`, `<$fh>`, `<*.txt>` — readline or glob.
     Readline(String),
-
-    /// A token we don't yet handle — placeholder for incremental development.
-    Todo(String),
 }
 
 /// Kind of quote-like construct.
