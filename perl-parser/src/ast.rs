@@ -180,8 +180,14 @@ pub enum ExprKind {
     FuncCall(String, Vec<Expr>),
     /// Method call: `$obj->method(...)`.
     MethodCall(Box<Expr>, String, Vec<Expr>),
-    /// Indirect method call: `new Foo(...)`.
-    IndirectMethodCall(String, Box<Expr>, Vec<Expr>),
+    /// Indirect method call: `new Foo(...)` → invocant, method, args.
+    IndirectMethodCall(Box<Expr>, String, Vec<Expr>),
+
+    // ── Bareword ──────────────────────────────────────────────
+    /// A bare identifier not followed by `(` — class name, constant,
+    /// or bareword.  The parser doesn't resolve which; that's the
+    /// compiler's job.
+    Bareword(String),
 
     // ── List operators ────────────────────────────────────────
     /// `print EXPR, EXPR` — list operator with args.
