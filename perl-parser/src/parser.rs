@@ -257,6 +257,18 @@ impl<'src> Parser<'src> {
                 StmtKind::Defer(block)
             }
 
+            // format NAME = ... .
+            Token::Keyword(Keyword::Format) => self.parse_format()?,
+
+            // class Name :attrs { ... }
+            Token::Keyword(Keyword::Class) => self.parse_class()?,
+
+            // field $var :attrs = default;
+            Token::Keyword(Keyword::Field) => self.parse_field()?,
+
+            // method name(params) { ... }
+            Token::Keyword(Keyword::Method) => self.parse_method()?,
+
             Token::LBrace => {
                 let block = self.parse_block()?;
                 StmtKind::Block(block)
@@ -824,6 +836,101 @@ impl<'src> Parser<'src> {
         Ok(StmtKind::Try(TryStmt { body, catch_var, catch_block, finally_block }))
     }
 
+    // ── format ────────────────────────────────────────────────
+
+    fn parse_format(&mut self) -> Result<StmtKind, ParseError> {
+        let start = self.peek_span();
+        self.advance(); // eat 'format'
+
+        // Optional name (defaults to STDOUT)
+        let name = if let Token::Ident(_) = self.peek() {
+            match self.advance().token {
+                Token::Ident(s) => s,
+                _ => unreachable!(),
+            }
+        } else {
+            "STDOUT".to_string()
+        };
+
+        // Expect '='
+        self.expect_token(&Token::Assign(AssignOp::Eq))?;
+
+        // Consume body lines until a line containing just '.'
+        // We scan raw bytes since format bodies are not normal Perl code.
+        let body_start = self.lexer.current_pos();
+        self.lexer.skip_format_body();
+        let body_end = self.lexer.current_pos();
+        let body = String::from_utf8_lossy(self.lexer.slice(body_start, body_end)).into_owned();
+
+        Ok(StmtKind::FormatDecl(FormatDecl { name, body, span: start.merge(self.peek_span()) }))
+    }
+
+    // ── class / field / method (5.38+ Corinna) ────────────────
+
+    fn parse_class(&mut self) -> Result<StmtKind, ParseError> {
+        let start = self.peek_span();
+        self.advance(); // eat 'class'
+
+        let name = match self.advance().token {
+            Token::Ident(n) => n,
+            other => return Err(ParseError::new(format!("expected class name, got {other:?}"), start)),
+        };
+
+        let attributes = self.parse_attributes()?;
+        self.expect.brace = BraceDisposition::Block;
+        let body = self.parse_block()?;
+
+        Ok(StmtKind::ClassDecl(ClassDecl { name, attributes, body, span: start.merge(self.peek_span()) }))
+    }
+
+    fn parse_field(&mut self) -> Result<StmtKind, ParseError> {
+        let start = self.peek_span();
+        self.advance(); // eat 'field'
+
+        let var = self.parse_single_var_decl()?;
+        let attributes = self.parse_attributes()?;
+
+        let default = if self.eat(&Token::Assign(AssignOp::Eq)) {
+            self.expect.base = BaseExpect::Term;
+            Some(self.parse_expr(PREC_COMMA)?)
+        } else {
+            None
+        };
+
+        self.eat(&Token::Semi);
+
+        Ok(StmtKind::FieldDecl(FieldDecl { var, attributes, default, span: start.merge(self.peek_span()) }))
+    }
+
+    fn parse_method(&mut self) -> Result<StmtKind, ParseError> {
+        let start = self.peek_span();
+        self.advance(); // eat 'method'
+
+        let name = match self.advance().token {
+            Token::Ident(n) => n,
+            other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
+        };
+
+        let prototype = if self.at(&Token::LParen) {
+            self.advance();
+            let mut proto = String::new();
+            while !self.at(&Token::RParen) && !self.at_eof() {
+                let t = self.advance();
+                proto.push_str(&format!("{}", t.token));
+            }
+            self.expect_token(&Token::RParen)?;
+            Some(proto)
+        } else {
+            None
+        };
+
+        let attributes = self.parse_attributes()?;
+        self.expect.brace = BraceDisposition::Block;
+        let body = self.parse_block()?;
+
+        Ok(StmtKind::MethodDecl(SubDecl { name, prototype, attributes, params: None, body, span: start.merge(self.peek_span()) }))
+    }
+
     // ── Labels ────────────────────────────────────────────────
 
     /// Check if we're looking at `IDENT :` (a label).
@@ -1295,16 +1402,18 @@ impl<'src> Parser<'src> {
             Token::TranslitLit(from, to, flags) => Ok(Expr { kind: ExprKind::Translit(from, to, flags), span }),
 
             // Heredoc (body already collected by lexer).
-            Token::HeredocLit(kind, _tag, body) => {
-                match kind {
-                    HeredocKind::Literal | HeredocKind::IndentedLiteral => Ok(Expr { kind: ExprKind::StringLit(body), span }),
-                    HeredocKind::Interpolating | HeredocKind::Indented => {
-                        // TODO: process interpolation in body.
-                        // For now, treat as plain string.
-                        Ok(Expr { kind: ExprKind::StringLit(body), span })
+            Token::HeredocLit(kind, _tag, body) => match kind {
+                HeredocKind::Literal | HeredocKind::IndentedLiteral => Ok(Expr { kind: ExprKind::StringLit(body), span }),
+                HeredocKind::Interpolating | HeredocKind::Indented => {
+                    let parts = Self::interpolate_string_body(&body);
+                    if parts.len() == 1 {
+                        if let StringPart::Const(s) = &parts[0] {
+                            return Ok(Expr { kind: ExprKind::StringLit(s.clone()), span });
+                        }
                     }
+                    Ok(Expr { kind: ExprKind::InterpolatedString(parts), span })
                 }
-            }
+            },
 
             // sort/map/grep with optional block
             Token::Keyword(kw) if keyword::is_block_list_op(kw) => self.parse_block_list_op(kw, span),
@@ -1375,6 +1484,62 @@ impl<'src> Parser<'src> {
             let end = self.peek_span();
             self.expect_token(&Token::RParen)?;
             return Ok(Expr { kind: ExprKind::FuncCall(name, args), span: span.merge(end) });
+        }
+
+        // Indirect object syntax: METHOD CLASS ARGS
+        // e.g. new Foo(args), new Foo args
+        // Heuristic: bareword followed by a capitalized bareword or $var.
+        match self.peek() {
+            Token::Ident(class_name) if class_name.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                let class_name = class_name.clone();
+                let class_span = self.peek_span();
+                self.advance(); // eat class name
+                let class_expr = Expr { kind: ExprKind::FuncCall(class_name, vec![]), span: class_span };
+
+                // Optional args
+                let mut args = Vec::new();
+                if self.at(&Token::LParen) {
+                    self.advance();
+                    self.expect.base = BaseExpect::Term;
+                    while !self.at(&Token::RParen) && !self.at_eof() {
+                        args.push(self.parse_expr(PREC_COMMA + 1)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RParen)?;
+                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(class_expr), args), span: span.merge(end) });
+                }
+
+                return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(class_expr), args), span: span.merge(class_span) });
+            }
+            Token::ScalarVar(_) => {
+                let var_span = self.peek_span();
+                let var = match self.advance().token {
+                    Token::ScalarVar(n) => n,
+                    _ => unreachable!(),
+                };
+                let invocant = Expr { kind: ExprKind::ScalarVar(var), span: var_span };
+
+                let mut args = Vec::new();
+                if self.at(&Token::LParen) {
+                    self.advance();
+                    self.expect.base = BaseExpect::Term;
+                    while !self.at(&Token::RParen) && !self.at_eof() {
+                        args.push(self.parse_expr(PREC_COMMA + 1)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RParen)?;
+                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(invocant), args), span: span.merge(end) });
+                }
+
+                return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(invocant), args), span: span.merge(var_span) });
+            }
+            _ => {}
         }
 
         // Bare identifier
@@ -1606,6 +1771,172 @@ impl<'src> Parser<'src> {
         // -bareword autoquoting ($hash{-key}) handled by parse_term Minus handler.
         self.expect.base = BaseExpect::Term;
         self.parse_expr(PREC_LOW)
+    }
+
+    /// Scan a string body for interpolation: split into Const/ScalarInterp/ArrayInterp.
+    /// Handles $var, @var, and \escape sequences.
+    fn interpolate_string_body(body: &str) -> Vec<StringPart> {
+        let bytes = body.as_bytes();
+        let mut parts = Vec::new();
+        let mut buf = String::new();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if i + 1 < bytes.len() => {
+                    // Escape sequence
+                    i += 1;
+                    match bytes[i] {
+                        b'n' => {
+                            buf.push('\n');
+                            i += 1;
+                        }
+                        b't' => {
+                            buf.push('\t');
+                            i += 1;
+                        }
+                        b'r' => {
+                            buf.push('\r');
+                            i += 1;
+                        }
+                        b'\\' => {
+                            buf.push('\\');
+                            i += 1;
+                        }
+                        b'$' => {
+                            buf.push('$');
+                            i += 1;
+                        }
+                        b'@' => {
+                            buf.push('@');
+                            i += 1;
+                        }
+                        b'"' => {
+                            buf.push('"');
+                            i += 1;
+                        }
+                        b'0' => {
+                            buf.push('\0');
+                            i += 1;
+                        }
+                        b'a' => {
+                            buf.push('\x07');
+                            i += 1;
+                        }
+                        b'e' => {
+                            buf.push('\x1b');
+                            i += 1;
+                        }
+                        b'x' => {
+                            i += 1;
+                            // \xHH or \x{HHHH}
+                            if i < bytes.len() && bytes[i] == b'{' {
+                                i += 1;
+                                let start = i;
+                                while i < bytes.len() && bytes[i] != b'}' {
+                                    i += 1;
+                                }
+                                let hex = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+                                if i < bytes.len() {
+                                    i += 1;
+                                } // skip '}'
+                                if let Ok(n) = u32::from_str_radix(hex, 16) {
+                                    if let Some(c) = char::from_u32(n) {
+                                        buf.push(c);
+                                    }
+                                }
+                            } else {
+                                let start = i;
+                                while i < bytes.len() && i - start < 2 && bytes[i].is_ascii_hexdigit() {
+                                    i += 1;
+                                }
+                                let hex = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+                                if let Ok(n) = u32::from_str_radix(hex, 16) {
+                                    if let Some(c) = char::from_u32(n) {
+                                        buf.push(c);
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            buf.push('\\');
+                            buf.push(other as char);
+                            i += 1;
+                        }
+                    }
+                }
+                b'$' | b'@' => {
+                    let sigil = bytes[i];
+                    // Check for variable name
+                    if i + 1 < bytes.len() && (bytes[i + 1] == b'_' || bytes[i + 1].is_ascii_alphabetic()) {
+                        // Flush const buffer
+                        if !buf.is_empty() {
+                            parts.push(StringPart::Const(std::mem::take(&mut buf)));
+                        }
+                        i += 1; // skip sigil
+                        let start = i;
+                        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                            i += 1;
+                        }
+                        // Handle :: in package-qualified names
+                        while i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
+                            i += 2;
+                            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                                i += 1;
+                            }
+                        }
+                        let name = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+                        if sigil == b'$' {
+                            parts.push(StringPart::ScalarInterp(name));
+                        } else {
+                            parts.push(StringPart::ArrayInterp(name));
+                        }
+                    } else if sigil == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                        // ${expr} — store as scalar interp with braced name
+                        if !buf.is_empty() {
+                            parts.push(StringPart::Const(std::mem::take(&mut buf)));
+                        }
+                        i += 2; // skip ${
+                        let start = i;
+                        let mut depth = 1u32;
+                        while i < bytes.len() && depth > 0 {
+                            if bytes[i] == b'{' {
+                                depth += 1;
+                            }
+                            if bytes[i] == b'}' {
+                                depth -= 1;
+                            }
+                            if depth > 0 {
+                                i += 1;
+                            }
+                        }
+                        let name = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+                        if i < bytes.len() {
+                            i += 1;
+                        } // skip '}'
+                        parts.push(StringPart::ScalarInterp(name));
+                    } else {
+                        // Literal sigil — not followed by a valid var name
+                        buf.push(sigil as char);
+                        i += 1;
+                    }
+                }
+                other => {
+                    buf.push(other as char);
+                    i += 1;
+                }
+            }
+        }
+
+        if !buf.is_empty() {
+            parts.push(StringPart::Const(buf));
+        }
+
+        if parts.is_empty() {
+            parts.push(StringPart::Const(String::new()));
+        }
+
+        parts
     }
 
     fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
@@ -3194,6 +3525,169 @@ mod tests {
         match &e.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "v5"),
             other => panic!("expected StringLit(\"v5\"), got {other:?}"),
+        }
+    }
+
+    // ── format tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_format_decl() {
+        let prog = parse("format STDOUT =\n@<<<< @>>>>\n$name, $value\n.\n");
+        match &prog.statements[0].kind {
+            StmtKind::FormatDecl(f) => {
+                assert_eq!(f.name, "STDOUT");
+                assert!(f.body.contains("@<<<<"));
+            }
+            other => panic!("expected FormatDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_format_default_name() {
+        let prog = parse("format =\ntest\n.\n");
+        match &prog.statements[0].kind {
+            StmtKind::FormatDecl(f) => {
+                assert_eq!(f.name, "STDOUT");
+            }
+            other => panic!("expected FormatDecl, got {other:?}"),
+        }
+    }
+
+    // ── class/field/method tests ──────────────────────────────
+
+    #[test]
+    fn parse_class_decl() {
+        let prog = parse("class Foo { field $x; method greet { 1; } }");
+        match &prog.statements[0].kind {
+            StmtKind::ClassDecl(c) => {
+                assert_eq!(c.name, "Foo");
+                assert!(c.body.statements.len() >= 2);
+            }
+            other => panic!("expected ClassDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_class_with_isa() {
+        let prog = parse("class Bar :isa(Foo) { }");
+        match &prog.statements[0].kind {
+            StmtKind::ClassDecl(c) => {
+                assert_eq!(c.name, "Bar");
+                assert_eq!(c.attributes.len(), 1);
+                assert_eq!(c.attributes[0].name, "isa");
+            }
+            other => panic!("expected ClassDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_field_decl() {
+        let prog = parse("class Foo { field $x = 42; }");
+        match &prog.statements[0].kind {
+            StmtKind::ClassDecl(c) => match &c.body.statements[0].kind {
+                StmtKind::FieldDecl(f) => {
+                    assert_eq!(f.var.name, "x");
+                    assert!(f.default.is_some());
+                }
+                other => panic!("expected FieldDecl, got {other:?}"),
+            },
+            other => panic!("expected ClassDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_field_with_param() {
+        let prog = parse("class Foo { field $name :param; }");
+        match &prog.statements[0].kind {
+            StmtKind::ClassDecl(c) => match &c.body.statements[0].kind {
+                StmtKind::FieldDecl(f) => {
+                    assert_eq!(f.attributes.len(), 1);
+                    assert_eq!(f.attributes[0].name, "param");
+                }
+                other => panic!("expected FieldDecl, got {other:?}"),
+            },
+            other => panic!("expected ClassDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_method_decl() {
+        let prog = parse("class Foo { method greet() { 1; } }");
+        match &prog.statements[0].kind {
+            StmtKind::ClassDecl(c) => match &c.body.statements[0].kind {
+                StmtKind::MethodDecl(m) => {
+                    assert_eq!(m.name, "greet");
+                }
+                other => panic!("expected MethodDecl, got {other:?}"),
+            },
+            other => panic!("expected ClassDecl, got {other:?}"),
+        }
+    }
+
+    // ── Indirect object syntax tests ──────────────────────────
+
+    #[test]
+    fn parse_indirect_new() {
+        let e = parse_expr_str("new Foo(1, 2);");
+        match &e.kind {
+            ExprKind::IndirectMethodCall(method, class, args) => {
+                assert_eq!(method, "new");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(class.kind, ExprKind::FuncCall(_, _)));
+            }
+            other => panic!("expected IndirectMethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_indirect_new_no_args() {
+        let e = parse_expr_str("new Foo;");
+        match &e.kind {
+            ExprKind::IndirectMethodCall(method, _, args) => {
+                assert_eq!(method, "new");
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected IndirectMethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_indirect_with_var() {
+        let e = parse_expr_str("new $class;");
+        match &e.kind {
+            ExprKind::IndirectMethodCall(method, invocant, _) => {
+                assert_eq!(method, "new");
+                assert!(matches!(invocant.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected IndirectMethodCall, got {other:?}"),
+        }
+    }
+
+    // ── Heredoc interpolation tests ───────────────────────────
+
+    #[test]
+    fn parse_heredoc_interpolation() {
+        let src = "<<END;\nHello $name!\nEND\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::InterpolatedString(parts), .. }) => {
+                assert!(parts.len() >= 3); // "Hello ", $name, "!\n"
+                assert!(matches!(parts[0], StringPart::Const(_)));
+                assert!(matches!(parts[1], StringPart::ScalarInterp(_)));
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_no_interp_stays_stringlit() {
+        let src = "<<END;\nNo variables here.\nEND\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::StringLit(s), .. }) => {
+                assert_eq!(s, "No variables here.\n");
+            }
+            other => panic!("expected StringLit, got {other:?}"),
         }
     }
 }

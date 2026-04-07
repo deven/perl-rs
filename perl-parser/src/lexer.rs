@@ -127,6 +127,59 @@ impl<'src> Lexer<'src> {
         self.pos = self.src.len();
     }
 
+    /// Current byte position in source.
+    pub fn current_pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Get a byte slice of the source.
+    pub fn slice(&self, start: usize, end: usize) -> &[u8] {
+        &self.src[start..end]
+    }
+
+    /// Skip a format body: everything until a line containing just `.`
+    /// (optionally followed by whitespace).
+    pub fn skip_format_body(&mut self) {
+        loop {
+            // Check for terminator: '.' at start of line (optionally with trailing ws)
+            if self.peek_byte() == Some(b'.') {
+                let saved = self.pos;
+                self.pos += 1;
+                // Check rest of line is whitespace or newline/EOF
+                let mut is_term = true;
+                while let Some(b) = self.peek_byte() {
+                    if b == b'\n' {
+                        self.pos += 1;
+                        break;
+                    }
+                    if b == b' ' || b == b'\t' || b == b'\r' {
+                        self.pos += 1;
+                        continue;
+                    }
+                    is_term = false;
+                    break;
+                }
+                if is_term {
+                    return; // consumed the terminator line
+                }
+                self.pos = saved; // not a terminator, rewind
+            }
+            // Skip to next line
+            loop {
+                match self.peek_byte() {
+                    None => return, // EOF
+                    Some(b'\n') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => {
+                        self.pos += 1;
+                    }
+                }
+            }
+        }
+    }
+
     // ── Skip whitespace and comments ──────────────────────────
 
     fn skip_ws_and_comments(&mut self) {

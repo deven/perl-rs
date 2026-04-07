@@ -80,6 +80,16 @@ pub enum StmtKind {
 
     /// `__END__` or `__DATA__`.
     DataEnd,
+
+    /// `format NAME = ... .`
+    FormatDecl(FormatDecl),
+
+    /// `class Name :attrs { ... }` (5.38+ Corinna).
+    ClassDecl(ClassDecl),
+    /// `field $var :attrs = default;` (inside class).
+    FieldDecl(FieldDecl),
+    /// `method name(params) { ... }` (inside class).
+    MethodDecl(SubDecl),
 }
 
 /// An expression.
@@ -462,4 +472,30 @@ pub struct TryStmt {
     pub catch_var: Option<VarDecl>,
     pub catch_block: Option<Block>,
     pub finally_block: Option<Block>,
+}
+
+/// `format NAME = ... .`
+#[derive(Clone, Debug)]
+pub struct FormatDecl {
+    pub name: String,
+    pub body: String,
+    pub span: Span,
+}
+
+/// `class Name :attrs { ... }` (5.38+ Corinna).
+#[derive(Clone, Debug)]
+pub struct ClassDecl {
+    pub name: String,
+    pub attributes: Vec<Attribute>,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// `field $var :attrs = default;` (inside class).
+#[derive(Clone, Debug)]
+pub struct FieldDecl {
+    pub var: VarDecl,
+    pub attributes: Vec<Attribute>,
+    pub default: Option<Expr>,
+    pub span: Span,
 }
