@@ -309,7 +309,12 @@ impl<'src> Lexer<'src> {
             b'|' => self.lex_pipe(),
             b'^' => {
                 self.pos += 1;
-                Token::BitXor
+                if self.peek_byte() == Some(b'=') {
+                    self.pos += 1;
+                    Token::Assign(AssignOp::BitXorEq)
+                } else {
+                    Token::BitXor
+                }
             }
             b'~' => {
                 self.pos += 1;
@@ -712,7 +717,12 @@ impl<'src> Lexer<'src> {
             }
         } else {
             self.pos += 1;
-            Ok(Token::Percent)
+            if self.peek_byte() == Some(b'=') {
+                self.pos += 1;
+                Ok(Token::Assign(AssignOp::ModEq))
+            } else {
+                Ok(Token::Percent)
+            }
         }
     }
 
@@ -2306,7 +2316,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "lexer gap: %= not yet implemented"]
     fn lex_mod_eq() {
         let tokens = lex_all("$x %= 3");
         assert!(tokens.contains(&Token::Assign(AssignOp::ModEq)));
@@ -2355,7 +2364,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "lexer gap: ^= not yet implemented"]
     fn lex_bit_xor_eq() {
         let tokens = lex_all("$x ^= 0xFF");
         assert!(tokens.contains(&Token::Assign(AssignOp::BitXorEq)));

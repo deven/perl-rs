@@ -233,6 +233,15 @@ impl<'src> Parser<'src> {
             return Ok(Statement { kind: StmtKind::DataEnd(marker, data_offset), span: start.merge(self.peek_span()) });
         }
 
+        // Fat comma autoquotes keywords at statement level too:
+        // `if => 1` should not trigger the if-statement parser.
+        if let Token::Keyword(_) = self.peek() {
+            if self.is_fat_comma_after_keyword() {
+                let kind = self.parse_expr_statement()?;
+                return Ok(Statement { kind, span: start.merge(self.peek_span()) });
+            }
+        }
+
         let kind = match self.peek().clone() {
             Token::Keyword(Keyword::My) => self.parse_my_decl()?,
             Token::Keyword(Keyword::Our) => self.parse_our_decl()?,
@@ -452,7 +461,7 @@ impl<'src> Parser<'src> {
             // Attribute names can be identifiers or keywords (e.g. :method, :lvalue)
             let name = match self.peek().clone() {
                 Token::Ident(s) => Some(s),
-                Token::Keyword(kw) => Some(format!("{kw:?}").to_lowercase()),
+                Token::Keyword(kw) => Some((<&str>::from(kw)).to_string()),
                 _ => None,
             };
             if let Some(name) = name {
@@ -981,6 +990,22 @@ impl<'src> Parser<'src> {
         is_ident
     }
 
+    /// Speculative lookahead: is the token after the current keyword a fat comma?
+    /// Used to detect `if => 1` (autoquoting) vs `if ($cond) { ... }`.
+    fn is_fat_comma_after_keyword(&mut self) -> bool {
+        let cp = self.lexer.checkpoint();
+        let saved_expect = self.expect;
+        let saved_current = self.current.take();
+
+        self.ensure_current();
+        let is_fat_comma = matches!(self.peek(), Token::FatComma);
+
+        self.current = saved_current;
+        self.expect = saved_expect;
+        self.lexer.restore(cp);
+        is_fat_comma
+    }
+
     fn parse_labeled_stmt(&mut self) -> Result<StmtKind, ParseError> {
         let label = match self.advance().token {
             Token::Ident(name) => name,
@@ -1061,6 +1086,14 @@ impl<'src> Parser<'src> {
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
         let spanned = self.advance();
         let span = spanned.span;
+
+        // Fat comma autoquotes keywords: `if => 1` produces StringLit("if").
+        if let Token::Keyword(kw) = &spanned.token {
+            if matches!(self.peek(), Token::FatComma) {
+                let name: &str = (*kw).into();
+                return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
+            }
+        }
 
         match spanned.token {
             Token::IntLit(n) => Ok(Expr { kind: ExprKind::IntLit(n), span }),
@@ -1588,7 +1621,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = format!("{kw:?}").to_lowercase();
+        let name = (<&str>::from(kw)).to_string();
         self.expect.base = BaseExpect::Term;
 
         // Named unary with optional arg
@@ -1658,7 +1691,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = format!("{kw:?}").to_lowercase();
+        let name = (<&str>::from(kw)).to_string();
         self.expect.base = BaseExpect::Term;
 
         // Check for parens
@@ -1704,7 +1737,7 @@ impl<'src> Parser<'src> {
     /// Parse sort/map/grep with optional block as first argument.
     /// `sort { $a <=> $b } @list`, `map { ... } @list`, `grep { ... } @list`
     fn parse_block_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = format!("{kw:?}").to_lowercase();
+        let name = (<&str>::from(kw)).to_string();
         self.expect.base = BaseExpect::Term;
 
         // Check for parens: sort(...), map(...), grep(...)
@@ -1774,7 +1807,7 @@ impl<'src> Parser<'src> {
     /// Parse print/say with optional filehandle as first argument.
     /// `print STDERR "error"`, `print "hello"`, `say $fh "data"`
     fn parse_print_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = format!("{kw:?}").to_lowercase();
+        let name = (<&str>::from(kw)).to_string();
         self.expect.base = BaseExpect::Term;
 
         // Handle optional parens — print(...) form
@@ -4480,7 +4513,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "lexer gap: %= not yet implemented"]
     fn parse_assign_mod() {
         let e = parse_expr_str("$x %= 3;");
         assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ModEq, _, _)));
@@ -4529,7 +4561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "lexer gap: ^= not yet implemented"]
     fn parse_assign_bit_xor() {
         let e = parse_expr_str("$x ^= 0xFF;");
         assert!(matches!(e.kind, ExprKind::Assign(AssignOp::BitXorEq, _, _)));
@@ -5221,7 +5252,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "keywords not autoquoted by fat comma"]
     fn parse_fat_comma_with_keyword() {
         let e = parse_expr_str("if => 1;");
         match &e.kind {
@@ -5255,7 +5285,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "C3: local assignment not handled"]
     fn parse_local_special_var_assign() {
         let prog = parse("local $/ = undef;");
         match &prog.statements[0].kind {
@@ -5674,7 +5703,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M11: unless does not support elsif"]
     fn parse_unless_elsif() {
         let prog = parse("unless ($x) { 1; } elsif ($y) { 2; }");
         assert_eq!(prog.statements.len(), 1);
