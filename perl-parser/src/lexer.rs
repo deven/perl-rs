@@ -1560,8 +1560,11 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_slash(&mut self, expect: &Expect) -> Result<Token, ParseError> {
-        // // is always defined-or; empty regex requires m//.
-        // This eliminates the need for XTERMORDORDOR.
+        // The lexer always returns Token::DefinedOr for //.  The parser
+        // converts it to an empty regex in term position (and consumes
+        // any trailing flags like //gi → DefinedOr + Ident("gi")).
+        // Only m// produces Token::RegexLit with an empty pattern directly
+        // from the lexer.  This eliminates the need for XTERMORDORDOR.
         if self.peek_byte_at(1) == Some(b'/') {
             self.pos += 2;
             if self.peek_byte() == Some(b'=') {
