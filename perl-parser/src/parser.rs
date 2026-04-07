@@ -1479,7 +1479,21 @@ impl<'src> Parser<'src> {
 
             // Regex, substitution, transliteration
             Token::RegexLit(_kind, pattern, flags) => Ok(Expr { kind: ExprKind::Regex(pattern, flags), span }),
-            Token::SubstLit(pattern, replacement, flags) => Ok(Expr { kind: ExprKind::Subst(pattern, SubstReplacement::Literal(replacement), flags), span }),
+            Token::SubstLit(pattern, replacement, flags) => {
+                let repl = if flags.contains('e') {
+                    // With /e flag, the replacement is Perl code.
+                    // Parse it as an expression using a sub-parser.
+                    let repl_src = format!("{};", replacement);
+                    let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
+                    match prog.statements.into_iter().next() {
+                        Some(Stmt { kind: StmtKind::Expr(expr), .. }) => SubstReplacement::Expr(Box::new(expr)),
+                        _ => SubstReplacement::Literal(replacement),
+                    }
+                } else {
+                    SubstReplacement::Literal(replacement)
+                };
+                Ok(Expr { kind: ExprKind::Subst(pattern, repl, flags), span })
+            }
             Token::TranslitLit(from, to, flags) => Ok(Expr { kind: ExprKind::Translit(from, to, flags), span }),
 
             // Heredoc (body already collected by lexer).
@@ -5351,17 +5365,15 @@ mod tests {
     // ═══════════════════════════════════════════════════════════
 
     #[test]
-    #[ignore = "C1: s///e replacement is code, not string"]
     fn parse_subst_e_flag() {
         let e = parse_expr_str("s/foo/uc($&)/e;");
         match &e.kind {
-            ExprKind::Subst(_, SubstReplacement::Interpolated(_), _) => {}
+            ExprKind::Subst(_, SubstReplacement::Expr(_), _) => {}
             other => panic!("expected Subst with Expr replacement, got {other:?}"),
         }
     }
 
     #[test]
-    #[ignore = "C2: complex string interpolation not implemented"]
     fn parse_interp_backslash_ref() {
         let e = parse_expr_str(r#""${\ $ref}";"#);
         assert!(matches!(e.kind, ExprKind::InterpolatedString(_)));
@@ -5379,7 +5391,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "C5: qx// not implemented"]
     fn parse_qx_string_parens() {
         let e = parse_expr_str("qx(ls -la);");
         assert!(matches!(e.kind, ExprKind::InterpolatedString(_) | ExprKind::StringLit(_)));

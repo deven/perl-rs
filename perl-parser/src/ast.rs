@@ -270,6 +270,8 @@ pub enum StringPart {
 pub enum SubstReplacement {
     Literal(String),
     Interpolated(Vec<StringPart>),
+    /// With `/e` flag: replacement is Perl code parsed as an expression.
+    Expr(Box<Expr>),
 }
 
 /// Binary operators.
