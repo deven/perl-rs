@@ -298,10 +298,12 @@ impl<'src> Parser<'src> {
             // method name(params) { ... }
             Token::Keyword(Keyword::Method) => self.parse_method()?,
 
+            // The lexer already decided: LBrace = block, HashBrace = hash.
             Token::LBrace => {
                 let block = self.parse_block()?;
                 StmtKind::Block(block)
             }
+            Token::HashBrace => self.parse_expr_statement()?,
 
             // Check for label: IDENT followed by ':'
             Token::Ident(_) => {
@@ -767,7 +769,10 @@ impl<'src> Parser<'src> {
         let version =
             if matches!(self.peek(), Token::IntLit(_) | Token::FloatLit(_) | Token::VersionLit(_)) { Some(format!("{}", self.advance().token)) } else { None };
 
-        let block = if self.at(&Token::LBrace) {
+        let block = if {
+            self.expect.brace = BraceDisposition::Block;
+            self.at(&Token::LBrace)
+        } {
             Some(self.parse_block()?)
         } else {
             self.eat(&Token::Semi);
@@ -1006,6 +1011,9 @@ impl<'src> Parser<'src> {
         is_fat_comma
     }
 
+    /// Determine if `{` at statement level starts an anon hash or a block.
+    /// The lexer has already advanced past `{` (it's the cached current token),
+    /// so `lexer.remaining()` gives us the bytes after `{`.
     fn parse_labeled_stmt(&mut self) -> Result<StmtKind, ParseError> {
         let label = match self.advance().token {
             Token::Ident(name) => name,
@@ -1034,6 +1042,7 @@ impl<'src> Parser<'src> {
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         self.descend()?;
         let start = self.peek_span();
+        self.expect.brace = BraceDisposition::Block;
         self.expect_token(&Token::LBrace)?;
         self.expect = Expect::XSTATE;
 
@@ -1109,6 +1118,7 @@ impl<'src> Parser<'src> {
             }
             Token::ArrayVar(name) => {
                 // @array[0,1] → array slice; @array{qw(a b)} → hash slice
+                self.expect.base = BaseExpect::Operator;
                 if self.at(&Token::LBracket) {
                     self.advance();
                     self.expect.base = BaseExpect::Term;
@@ -1151,7 +1161,7 @@ impl<'src> Parser<'src> {
 
             // Prefix dereference: $$ref, @$ref, %$ref, ${expr}, @{expr}
             Token::Dollar => {
-                self.expect.base = BaseExpect::Term;
+                self.expect.base = BaseExpect::Ref;
                 if self.at(&Token::LBrace) {
                     // ${expr} — dereference block
                     self.advance();
@@ -1169,7 +1179,7 @@ impl<'src> Parser<'src> {
                 }
             }
             Token::At => {
-                self.expect.base = BaseExpect::Term;
+                self.expect.base = BaseExpect::Ref;
                 if self.at(&Token::LBrace) {
                     // @{expr} — array dereference block
                     self.advance();
@@ -1185,7 +1195,7 @@ impl<'src> Parser<'src> {
 
             // Prefix hash dereference: %$ref, %{expr}
             Token::Percent => {
-                self.expect.base = BaseExpect::Term;
+                self.expect.base = BaseExpect::Ref;
                 if self.at(&Token::LBrace) {
                     self.advance();
                     let inner = self.parse_expr(PREC_LOW)?;
@@ -1200,7 +1210,7 @@ impl<'src> Parser<'src> {
 
             // Ampersand prefix: &foo, &foo(args), &$coderef(args), &{expr}(args)
             Token::BitAnd => {
-                self.expect.base = BaseExpect::Term;
+                self.expect.base = BaseExpect::Ref;
                 if self.at(&Token::LBrace) {
                     // &{expr}
                     self.advance();
@@ -1362,8 +1372,8 @@ impl<'src> Parser<'src> {
             // eval BLOCK vs eval EXPR
             Token::Keyword(Keyword::Eval) => {
                 self.expect.base = BaseExpect::Term;
+                self.expect.brace = BraceDisposition::BlockExpr;
                 if self.at(&Token::LBrace) {
-                    self.expect.brace = BraceDisposition::BlockExpr;
                     let block = self.parse_block()?;
                     Ok(Expr { span: span.merge(block.span), kind: ExprKind::EvalBlock(block) })
                 } else {
@@ -1448,8 +1458,10 @@ impl<'src> Parser<'src> {
             }
 
             // Anonymous hash ref or block — depends on context
-            // For now, treat as hash in expression context
-            Token::LBrace => {
+            // Anonymous hash constructor: {key => val, ...}
+            // The lexer emits HashBrace for anon hashes (matching toke.c HASHBRACK).
+            // LBrace is kept as a fallback for robustness.
+            Token::HashBrace | Token::LBrace => {
                 self.expect.base = BaseExpect::Term;
                 let mut elems = Vec::new();
                 while !self.at(&Token::RBrace) && !self.at_eof() {
@@ -1527,6 +1539,7 @@ impl<'src> Parser<'src> {
             }
 
             Token::Keyword(Keyword::Do) => {
+                self.expect.brace = BraceDisposition::BlockExpr;
                 if self.at(&Token::LBrace) {
                     let block = self.parse_block()?;
                     Ok(Expr { span: span.merge(block.span), kind: ExprKind::DoBlock(block) })
@@ -1748,8 +1761,8 @@ impl<'src> Parser<'src> {
             self.advance();
             let mut args = Vec::new();
             // Check for block as first arg inside parens
+            self.expect.brace = BraceDisposition::BlockExpr;
             if self.at(&Token::LBrace) {
-                self.expect.brace = BraceDisposition::BlockExpr;
                 let block = self.parse_block()?;
                 args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
                 self.eat(&Token::Comma);
@@ -1768,8 +1781,8 @@ impl<'src> Parser<'src> {
         let mut args = Vec::new();
 
         // Check for block or sub name as first arg
+        self.expect.brace = BraceDisposition::BlockExpr;
         if self.at(&Token::LBrace) {
-            self.expect.brace = BraceDisposition::BlockExpr;
             let block = self.parse_block()?;
             args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
         } else if kw == Keyword::Sort {
@@ -2153,6 +2166,9 @@ impl<'src> Parser<'src> {
     fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         // Handle chained subscripts: $x[0][1], $x{a}{b}, $x[0]{key}
         loop {
+            // After a term, we're in operator position — ensures {
+            // is lexed as LBrace (subscript), not HashBrace.
+            self.expect.base = BaseExpect::Operator;
             if self.at(&Token::LBracket) {
                 self.advance();
                 self.expect.base = BaseExpect::Term;
@@ -5085,7 +5101,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "brace disambiguation: {key => val} parsed as block, not anon hash"]
     fn parse_anon_hash() {
         let e = parse_expr_str("{key => 'val'};");
         match &e.kind {
@@ -5093,6 +5108,74 @@ mod tests {
                 assert!(elems.len() >= 2);
             }
             other => panic!("expected AnonHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_anon_hash_at_stmt_level() {
+        // {key => 'val'} at statement level — the heuristic should
+        // detect => after bareword and route to AnonHash.
+        let prog = parse("{key => 'val'};");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::AnonHash(elems), .. }) => {
+                assert_eq!(elems.len(), 2);
+            }
+            other => panic!("expected AnonHash at stmt level, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_hash_at_stmt_level() {
+        // {} at statement level — empty braces are a hash.
+        let prog = parse("{};");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::AnonHash(elems), .. }) => {
+                assert_eq!(elems.len(), 0);
+            }
+            other => panic!("expected empty AnonHash at stmt level, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_string_key_hash_at_stmt_level() {
+        // {'key', 'val'} — string followed by comma → hash.
+        let prog = parse("{'key', 'val'};");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::AnonHash(_), .. }) => {}
+            other => panic!("expected AnonHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_uppercase_comma_hash_at_stmt_level() {
+        // {Foo, 1} — uppercase bareword followed by comma → hash.
+        let prog = parse("{Foo, 1};");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::AnonHash(_), .. }) => {}
+            other => panic!("expected AnonHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lowercase_comma_block_at_stmt_level() {
+        // {foo, 1} — lowercase bareword followed by comma → block
+        // (could be a function call: foo(), 1).
+        let prog = parse("{foo(1)};");
+        match &prog.statements[0].kind {
+            StmtKind::Block(_) => {}
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_block_at_stmt_level() {
+        // {my $x = 1; $x} — clearly a block (no comma/=> after first term).
+        let prog = parse("{my $x = 1; $x};");
+        match &prog.statements[0].kind {
+            StmtKind::Block(block) => {
+                assert!(block.statements.len() >= 1);
+            }
+            other => panic!("expected Block, got {other:?}"),
         }
     }
 
