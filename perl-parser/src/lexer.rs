@@ -642,6 +642,26 @@ impl<'src> Lexer<'src> {
             _ => {}
         }
 
+        // v-strings: v5, v5.26, v5.26.0 etc.
+        if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|b| b.is_ascii_digit()) {
+            let mut vstr = name.clone();
+            while self.peek_byte() == Some(b'.') {
+                // Check that a digit follows the dot
+                if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+                    vstr.push('.');
+                    self.pos += 1; // skip '.'
+                    let start = self.pos;
+                    while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
+                        self.pos += 1;
+                    }
+                    vstr.push_str(std::str::from_utf8(&self.src[start..self.pos]).unwrap());
+                } else {
+                    break;
+                }
+            }
+            return Ok(Token::StrLit(vstr));
+        }
+
         // Keywords
         if let Some(kw) = keyword::lookup_keyword(&name) {
             return Ok(Token::Keyword(kw));

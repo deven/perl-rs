@@ -411,9 +411,64 @@ impl<'src> Parser<'src> {
             None
         };
 
+        let attributes = self.parse_attributes()?;
         let body = self.parse_block()?;
 
-        Ok(StmtKind::SubDecl(SubDecl { name, prototype, attributes: Vec::new(), params: None, body, span: start.merge(self.peek_span()) }))
+        Ok(StmtKind::SubDecl(SubDecl { name, prototype, attributes, params: None, body, span: start.merge(self.peek_span()) }))
+    }
+
+    /// Parse attributes: `:lvalue :method(args)` etc.
+    fn parse_attributes(&mut self) -> Result<Vec<Attribute>, ParseError> {
+        let mut attrs = Vec::new();
+        while self.at(&Token::Colon) {
+            let attr_start = self.peek_span();
+            self.advance(); // eat ':'
+            // Attribute names can be identifiers or keywords (e.g. :method, :lvalue)
+            let name = match self.peek().clone() {
+                Token::Ident(s) => Some(s),
+                Token::Keyword(kw) => Some(format!("{kw:?}").to_lowercase()),
+                _ => None,
+            };
+            if let Some(name) = name {
+                let name_span = self.peek_span();
+                self.advance(); // eat the name
+                // Optional parenthesized args
+                let value = if self.at(&Token::LParen) {
+                    self.advance();
+                    let mut args = String::new();
+                    let mut depth = 1u32;
+                    loop {
+                        match self.peek().clone() {
+                            Token::LParen => {
+                                depth += 1;
+                                args.push('(');
+                                self.advance();
+                            }
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    self.advance();
+                                    break;
+                                }
+                                args.push(')');
+                                self.advance();
+                            }
+                            Token::Eof => break,
+                            _ => {
+                                args.push_str(&format!("{}", self.advance().token));
+                            }
+                        }
+                    }
+                    Some(args)
+                } else {
+                    None
+                };
+                attrs.push(Attribute { name, value, span: attr_start.merge(name_span) });
+            } else {
+                break;
+            }
+        }
+        Ok(attrs)
     }
 
     /// Parse a declaration in expression context: `my $x`, `our ($a, @b)`, etc.
@@ -694,6 +749,7 @@ impl<'src> Parser<'src> {
 
         let module = match self.advance().token {
             Token::Ident(n) => n,
+            Token::StrLit(n) => n, // v-strings: use v5.26.0
             Token::IntLit(n) => format!("{n}"),
             Token::FloatLit(n) => format!("{n}"),
             other => return Err(ParseError::new(format!("expected module name, got {other:?}"), start)),
@@ -1055,6 +1111,27 @@ impl<'src> Parser<'src> {
 
             // Prefix unary operators
             Token::Minus => {
+                // -bareword (not followed by parens) → StringLit("-bareword")
+                // Perl: unary minus on an identifier always returns "-identifier".
+                if let Token::Ident(name) = self.peek().clone() {
+                    let cp = self.lexer.checkpoint();
+                    let saved_expect = self.expect;
+                    let saved_current = self.current.take();
+
+                    // Peek past the Ident to check what follows.
+                    self.ensure_current();
+                    let next_is_paren = matches!(self.peek(), Token::LParen);
+
+                    self.current = saved_current;
+                    self.expect = saved_expect;
+                    self.lexer.restore(cp);
+
+                    if !next_is_paren {
+                        let end = self.peek_span();
+                        self.advance(); // eat the ident
+                        return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(end) });
+                    }
+                }
                 self.expect.base = BaseExpect::Term;
                 let operand = self.parse_expr(PREC_UNARY)?;
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(operand)) })
@@ -1279,8 +1356,8 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_ident_term(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
-        // Check if followed by `=>` — fat comma autoquoting
-        if matches!(self.peek(), Token::FatComma) {
+        // Autoquote: bareword followed by `=>` (fat comma) or `}` (hash subscript)
+        if matches!(self.peek(), Token::FatComma | Token::RBrace) {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
 
@@ -1521,6 +1598,16 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Parse the key expression inside `{ }` hash subscripts.
+    /// Handles bareword autoquoting: `$hash{key}` → StringLit("key"),
+    /// `$hash{-key}` → StringLit("-key").
+    fn parse_hash_subscript_key(&mut self) -> Result<Expr, ParseError> {
+        // Bareword autoquoting ($hash{key}) handled by parse_ident_term (RBrace check).
+        // -bareword autoquoting ($hash{-key}) handled by parse_term Minus handler.
+        self.expect.base = BaseExpect::Term;
+        self.parse_expr(PREC_LOW)
+    }
+
     fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         // Handle chained subscripts: $x[0][1], $x{a}{b}, $x[0]{key}
         loop {
@@ -1533,8 +1620,7 @@ impl<'src> Parser<'src> {
                 expr = Expr { span: expr.span.merge(end), kind: ExprKind::ArrayElem(Box::new(expr), Box::new(idx)) };
             } else if self.at(&Token::LBrace) {
                 self.advance();
-                self.expect.base = BaseExpect::Term;
-                let key = self.parse_expr(PREC_LOW)?;
+                let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RBrace)?;
                 expr = Expr { span: expr.span.merge(end), kind: ExprKind::HashElem(Box::new(expr), Box::new(key)) };
@@ -1747,8 +1833,7 @@ impl<'src> Parser<'src> {
             }
             Token::LBrace => {
                 self.advance();
-                self.expect.base = BaseExpect::Term;
-                let key = self.parse_expr(PREC_LOW)?;
+                let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RBrace)?;
                 let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::HashElem(Box::new(key))) };
@@ -2970,6 +3055,145 @@ mod tests {
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected require call, got {other:?}"),
+        }
+    }
+
+    // ── Hash subscript autoquoting tests ──────────────────────
+
+    #[test]
+    fn parse_hash_bareword_autoquote() {
+        let e = parse_expr_str("$hash{key};");
+        match &e.kind {
+            ExprKind::HashElem(_, key) => {
+                assert!(matches!(key.kind, ExprKind::StringLit(_)));
+            }
+            other => panic!("expected HashElem with StringLit key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hash_neg_bareword_autoquote() {
+        let e = parse_expr_str("$hash{-key};");
+        match &e.kind {
+            ExprKind::HashElem(_, key) => match &key.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "-key"),
+                other => panic!("expected StringLit('-key'), got {other:?}"),
+            },
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arrow_hash_autoquote() {
+        let e = parse_expr_str("$ref->{key};");
+        match &e.kind {
+            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(key)) => {
+                assert!(matches!(key.kind, ExprKind::StringLit(_)));
+            }
+            other => panic!("expected ArrowDeref with StringLit key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hash_expr_not_autoquoted() {
+        // $hash{$key} should NOT autoquote
+        let e = parse_expr_str("$hash{$key};");
+        match &e.kind {
+            ExprKind::HashElem(_, key) => {
+                assert!(matches!(key.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected HashElem with ScalarVar key, got {other:?}"),
+        }
+    }
+
+    // ── -bareword fat comma autoquoting ───────────────────────
+
+    #[test]
+    fn parse_neg_bareword_fat_comma() {
+        // -key => 42 should produce StringLit("-key")
+        let e = parse_expr_str("-key => 42;");
+        match &e.kind {
+            ExprKind::List(items) => match &items[0].kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "-key"),
+                other => panic!("expected StringLit('-key'), got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_neg_bareword_alone() {
+        // -key alone → StringLit("-key")
+        let e = parse_expr_str("-key;");
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "-key"),
+            other => panic!("expected StringLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_neg_func_call_not_quoted() {
+        // -func() → negate the function call, NOT autoquote
+        let e = parse_expr_str("-func();");
+        assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::Negate, _)));
+    }
+
+    // ── Attribute tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_sub_with_attribute() {
+        let prog = parse("sub foo :lvalue { 1; }");
+        match &prog.statements[0].kind {
+            StmtKind::SubDecl(sub) => {
+                assert_eq!(sub.attributes.len(), 1);
+                assert_eq!(sub.attributes[0].name, "lvalue");
+                assert!(sub.attributes[0].value.is_none());
+            }
+            other => panic!("expected SubDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sub_multiple_attributes() {
+        let prog = parse("sub foo :lvalue :method { 1; }");
+        match &prog.statements[0].kind {
+            StmtKind::SubDecl(sub) => {
+                assert_eq!(sub.attributes.len(), 2);
+                assert_eq!(sub.attributes[0].name, "lvalue");
+                assert_eq!(sub.attributes[1].name, "method");
+            }
+            other => panic!("expected SubDecl, got {other:?}"),
+        }
+    }
+
+    // ── v-string tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_vstring() {
+        let prog = parse("use v5.26.0;");
+        match &prog.statements[0].kind {
+            StmtKind::UseDecl(u) => {
+                assert_eq!(u.module, "v5.26.0");
+            }
+            other => panic!("expected UseDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vstring_as_expr() {
+        let e = parse_expr_str("v5.26;");
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "v5.26"),
+            other => panic!("expected StringLit(\"v5.26\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vstring_no_dots() {
+        let e = parse_expr_str("v5;");
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "v5"),
+            other => panic!("expected StringLit(\"v5\"), got {other:?}"),
         }
     }
 }
