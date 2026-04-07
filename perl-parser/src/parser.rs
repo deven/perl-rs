@@ -49,7 +49,7 @@ const PREC_POW: Precedence = 40; // **
 const PREC_INC: Precedence = 42; // ++ -- (postfix)
 const PREC_ARROW: Precedence = 44; // ->
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Assoc {
     Left,
     Right,
@@ -1287,11 +1287,17 @@ impl<'src> Parser<'src> {
             Token::PlusPlus => {
                 self.expect.base = BaseExpect::Term;
                 let operand = self.parse_expr(PREC_INC)?;
+                if !Self::is_valid_lvalue(&operand) {
+                    return Err(ParseError::new("invalid operand for prefix ++", operand.span));
+                }
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::PreInc, Box::new(operand)) })
             }
             Token::MinusMinus => {
                 self.expect.base = BaseExpect::Term;
                 let operand = self.parse_expr(PREC_INC)?;
+                if !Self::is_valid_lvalue(&operand) {
+                    return Err(ParseError::new("invalid operand for prefix --", operand.span));
+                }
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::PreDec, Box::new(operand)) })
             }
 
@@ -2223,14 +2229,43 @@ impl<'src> Parser<'src> {
         }
     }
 
+    // ── Semantic validation helpers ──────────────────────────────
+
+    /// Check whether an expression is a valid assignment target (lvalue).
+    fn is_valid_lvalue(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::ScalarVar(_) | ExprKind::ArrayVar(_) | ExprKind::HashVar(_) => true,
+            ExprKind::SpecialVar(_) | ExprKind::GlobVar(_) | ExprKind::ArrayLen(_) => true,
+            ExprKind::ArrayElem(_, _) | ExprKind::HashElem(_, _) => true,
+            ExprKind::ArraySlice(_, _) | ExprKind::HashSlice(_, _) => true,
+            ExprKind::Deref(_, _) | ExprKind::ArrowDeref(_, _) => true,
+            ExprKind::Local(_) => true,
+            ExprKind::Decl(_, _) => true,
+            ExprKind::Paren(inner) => Self::is_valid_lvalue(inner),
+            ExprKind::List(items) => items.iter().all(|e| Self::is_valid_lvalue(e)),
+            ExprKind::Undef => true, // (undef, $x) = (1, 2)
+            _ => false,
+        }
+    }
+
     fn parse_operator(&mut self, left: Expr, info: OpInfo) -> Result<Expr, ParseError> {
         let op_spanned = self.advance();
         let right_prec = info.right_prec();
 
         match op_spanned.token {
             // Postfix increment/decrement
-            Token::PlusPlus => Ok(Expr { span: left.span.merge(op_spanned.span), kind: ExprKind::PostfixOp(PostfixOp::Inc, Box::new(left)) }),
-            Token::MinusMinus => Ok(Expr { span: left.span.merge(op_spanned.span), kind: ExprKind::PostfixOp(PostfixOp::Dec, Box::new(left)) }),
+            Token::PlusPlus => {
+                if !Self::is_valid_lvalue(&left) {
+                    return Err(ParseError::new("invalid operand for postfix ++", left.span));
+                }
+                Ok(Expr { span: left.span.merge(op_spanned.span), kind: ExprKind::PostfixOp(PostfixOp::Inc, Box::new(left)) })
+            }
+            Token::MinusMinus => {
+                if !Self::is_valid_lvalue(&left) {
+                    return Err(ParseError::new("invalid operand for postfix --", left.span));
+                }
+                Ok(Expr { span: left.span.merge(op_spanned.span), kind: ExprKind::PostfixOp(PostfixOp::Dec, Box::new(left)) })
+            }
 
             // Ternary
             Token::Question => {
@@ -2250,6 +2285,9 @@ impl<'src> Parser<'src> {
 
             // Assignment
             Token::Assign(op) => {
+                if !Self::is_valid_lvalue(&left) {
+                    return Err(ParseError::new("invalid assignment target", left.span));
+                }
                 self.expect.base = BaseExpect::Term;
                 let right = self.parse_expr(right_prec)?;
                 Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::Assign(op, Box::new(left), Box::new(right)) })
@@ -5496,6 +5534,143 @@ mod tests {
             }
             other => panic!("expected PostfixControl(If, PrintOp), got {other:?}"),
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Semantic validation tests
+    // ═══════════════════════════════════════════════════════════
+
+    fn parse_expr_fails(src: &str) -> bool {
+        // A quick way to check that parsing an expression fails.
+        std::panic::catch_unwind(|| parse_expr_str(src)).is_err()
+    }
+
+    // ── Chained comparisons (Perl 5.32+) ───────────────────
+
+    #[test]
+    fn allow_chained_lt() {
+        // $a < $b < $c — chained comparison, valid since 5.32.
+        let e = parse_expr_str("$a < $b < $c;");
+        // Parses as ($a < $b) < $c (left-assoc); desugaring to
+        // $a < $b && $b < $c is a compiler concern.
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::NumLt, _, _)));
+    }
+
+    #[test]
+    fn allow_chained_eq() {
+        let e = parse_expr_str("$a == $b == $c;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::NumEq, _, _)));
+    }
+
+    #[test]
+    fn allow_chained_str_cmp() {
+        let e = parse_expr_str("$a eq $b eq $c;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::StrEq, _, _)));
+    }
+
+    #[test]
+    fn allow_mixed_prec_comparisons() {
+        // $a < $b && $b < $c — different precedence levels, OK.
+        let _e = parse_expr_str("$a < $b && $b < $c;");
+    }
+
+    #[test]
+    fn allow_comparison_in_ternary() {
+        let _e = parse_expr_str("$a == $b ? 1 : 0;");
+    }
+
+    #[test]
+    fn allow_eq_after_lt() {
+        // $a < $b == $c — different non-assoc prec groups, OK.
+        let _e = parse_expr_str("$a < $b == $c;");
+    }
+
+    // ── Lvalue validation ─────────────────────────────────────
+
+    #[test]
+    fn reject_assign_to_literal() {
+        assert!(parse_expr_fails("42 = $x;"));
+    }
+
+    #[test]
+    fn reject_assign_to_string() {
+        assert!(parse_expr_fails("'hello' = $x;"));
+    }
+
+    #[test]
+    fn reject_assign_to_binop() {
+        assert!(parse_expr_fails("$a + $b = 1;"));
+    }
+
+    #[test]
+    fn reject_compound_assign_to_literal() {
+        assert!(parse_expr_fails("42 += 1;"));
+    }
+
+    #[test]
+    fn reject_prefix_inc_literal() {
+        assert!(parse_expr_fails("++42;"));
+    }
+
+    #[test]
+    fn reject_postfix_inc_literal() {
+        assert!(parse_expr_fails("42++;"));
+    }
+
+    #[test]
+    fn reject_prefix_dec_string() {
+        assert!(parse_expr_fails("--'hello';"));
+    }
+
+    #[test]
+    fn allow_assign_to_var() {
+        let _e = parse_expr_str("$x = 1;");
+    }
+
+    #[test]
+    fn allow_assign_to_array_elem() {
+        let _e = parse_expr_str("$a[0] = 1;");
+    }
+
+    #[test]
+    fn allow_assign_to_hash_elem() {
+        let _e = parse_expr_str("$h{key} = 1;");
+    }
+
+    #[test]
+    fn allow_assign_to_deref() {
+        let _e = parse_expr_str("$$ref = 1;");
+    }
+
+    #[test]
+    fn allow_assign_to_arrow_deref() {
+        let _e = parse_expr_str("$ref->[0] = 1;");
+    }
+
+    #[test]
+    fn allow_assign_to_my_decl() {
+        let _e = parse_expr_str("my $x = 1;");
+    }
+
+    #[test]
+    fn allow_assign_to_local() {
+        let _e = parse_expr_str("local $/ = undef;");
+    }
+
+    #[test]
+    fn allow_list_assign() {
+        let prog = parse("my ($a, $b) = (1, 2);");
+        assert_eq!(prog.statements.len(), 1);
+    }
+
+    #[test]
+    fn allow_inc_var() {
+        let _e = parse_expr_str("++$x;");
+    }
+
+    #[test]
+    fn allow_postfix_inc_var() {
+        let _e = parse_expr_str("$x++;");
     }
 
     #[test]
