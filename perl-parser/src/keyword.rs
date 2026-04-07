@@ -98,15 +98,20 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "seek" => Some(Keyword::Seek),
         "tell" => Some(Keyword::Tell),
         "eof" => Some(Keyword::Eof),
+        "getc" => Some(Keyword::Getc),
+        "readline" => Some(Keyword::Readline),
+        "readlink" => Some(Keyword::Readlink),
         "binmode" => Some(Keyword::Binmode),
         "stat" => Some(Keyword::Stat),
         "lstat" => Some(Keyword::Lstat),
         "chmod" => Some(Keyword::Chmod),
         "chown" => Some(Keyword::Chown),
+        "umask" => Some(Keyword::Umask),
         "glob" => Some(Keyword::Glob),
         "opendir" => Some(Keyword::Opendir),
         "readdir" => Some(Keyword::Readdir),
         "closedir" => Some(Keyword::Closedir),
+        "pos" => Some(Keyword::Pos),
         "system" => Some(Keyword::System),
         "exec" => Some(Keyword::Exec),
         "qw" => Some(Keyword::Qw),
@@ -242,15 +247,20 @@ impl From<Keyword> for &'static str {
             Keyword::Seek => "seek",
             Keyword::Tell => "tell",
             Keyword::Eof => "eof",
+            Keyword::Getc => "getc",
+            Keyword::Readline => "readline",
+            Keyword::Readlink => "readlink",
             Keyword::Binmode => "binmode",
             Keyword::Stat => "stat",
             Keyword::Lstat => "lstat",
             Keyword::Chmod => "chmod",
             Keyword::Chown => "chown",
+            Keyword::Umask => "umask",
             Keyword::Glob => "glob",
             Keyword::Opendir => "opendir",
             Keyword::Readdir => "readdir",
             Keyword::Closedir => "closedir",
+            Keyword::Pos => "pos",
             Keyword::System => "system",
             Keyword::Exec => "exec",
             Keyword::Qw => "qw",
@@ -319,6 +329,9 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Srand
             | Keyword::Caller
             | Keyword::Eof
+            | Keyword::Getc
+            | Keyword::Readline
+            | Keyword::Readlink
             | Keyword::Rmdir
             | Keyword::Chdir
             | Keyword::Close
@@ -326,6 +339,8 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Readdir
             | Keyword::Pop
             | Keyword::Shift
+            | Keyword::Pos
+            | Keyword::Umask
             | Keyword::Wantarray
             | Keyword::Exit
             | Keyword::Tied
@@ -335,6 +350,15 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Scalar
             | Keyword::Require
     )
+}
+
+/// Does this operator prefer `//` as defined-or over an empty regex argument?
+///
+/// Matches toke.c's `UNIDOR` macro: shift, pop, getc, pos, readline,
+/// readlink, undef, umask.  After these operators, `shift // 0` is
+/// parsed as `shift() // 0`, not `shift(m//)`.
+pub fn prefers_defined_or(kw: Keyword) -> bool {
+    matches!(kw, Keyword::Shift | Keyword::Pop | Keyword::Getc | Keyword::Pos | Keyword::Readline | Keyword::Readlink | Keyword::Undef | Keyword::Umask)
 }
 
 /// Is this keyword a list operator?

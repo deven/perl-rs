@@ -1699,6 +1699,13 @@ impl<'src> Parser<'src> {
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
         }
 
+        // Operators that prefer defined-or: // after shift/pop/undef/etc.
+        // is defined-or, not an empty regex argument.  Matches toke.c's
+        // XTERMORDORDOR.
+        if keyword::prefers_defined_or(kw) && matches!(self.peek(), Token::DefinedOr) {
+            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
+        }
+
         if self.at(&Token::LParen)? {
             self.advance()?;
             let arg = self.parse_expr(PREC_LOW)?;
@@ -1739,7 +1746,9 @@ impl<'src> Parser<'src> {
 
     /// Inner helper: parse the stat target without handling parens.
     fn parse_stat_target_inner(&mut self, start: Span) -> Result<(StatTarget, Span), ParseError> {
-        if self.at(&Token::Semi)? || self.at(&Token::RBrace)? || self.at(&Token::RParen)? || self.at_eof()? {
+        // No argument: ;, }, ), EOF, or // (defined-or, not empty regex —
+        // matches toke.c's FTST macro setting XTERMORDORDOR).
+        if self.at(&Token::Semi)? || self.at(&Token::RBrace)? || self.at(&Token::RParen)? || self.at_eof()? || matches!(self.peek(), Token::DefinedOr) {
             Ok((StatTarget::Default, start))
         } else if matches!(self.peek(), Token::Ident(name) if name == "_") {
             let end = self.peek_span();
@@ -3050,6 +3059,109 @@ mod tests {
             }
             other => panic!("expected empty Regex with flags, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_empty_regex_in_condition() {
+        // if (//) { } — empty regex as condition.
+        let prog = parse("if (//) { 1; }");
+        assert_eq!(prog.statements.len(), 1);
+        match &prog.statements[0].kind {
+            StmtKind::If(if_stmt) => {
+                assert!(matches!(if_stmt.condition.kind, ExprKind::Regex(_, _)));
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_regex_as_print_arg() {
+        // print //; — empty regex as print argument.
+        let prog = parse("print //;");
+        assert_eq!(prog.statements.len(), 1);
+    }
+
+    #[test]
+    fn parse_empty_regex_in_split() {
+        // split //, $s — empty regex as split pattern.
+        let prog = parse("split //, $s;");
+        assert_eq!(prog.statements.len(), 1);
+    }
+
+    #[test]
+    fn parse_empty_regex_in_ternary() {
+        // $x = // ? 1 : 0 — empty regex match, then ternary.
+        let e = parse_expr_str("$x = // ? 1 : 0;");
+        assert!(matches!(e.kind, ExprKind::Assign(_, _, _)));
+    }
+
+    // ── prefers_defined_or: UNIDOR operators ────────────────
+    //
+    // After these operators, // is defined-or, not an empty regex.
+    // Matches toke.c's UNIDOR macro and XTERMORDORDOR behavior.
+
+    #[test]
+    fn parse_shift_prefers_defined_or() {
+        let e = parse_expr_str("shift // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_pop_prefers_defined_or() {
+        let e = parse_expr_str("pop // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_getc_prefers_defined_or() {
+        let e = parse_expr_str("getc // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_pos_prefers_defined_or() {
+        let e = parse_expr_str("pos // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_readline_prefers_defined_or() {
+        let e = parse_expr_str("readline // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_readlink_prefers_defined_or() {
+        let e = parse_expr_str("readlink // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_undef_prefers_defined_or() {
+        let e = parse_expr_str("undef // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_umask_prefers_defined_or() {
+        let e = parse_expr_str("umask // 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_filetest_prefers_defined_or() {
+        // -f // "default" — file test with no operand, then defined-or.
+        let e = parse_expr_str("-f // \"default\";");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_shift_defined_or_bareword() {
+        // shift //i 0 — in Perl this is a syntax error because i is not
+        // predeclared.  Our parser is more permissive: it parses as
+        // shift() // i(0) since any bareword can be a function call.
+        let e = parse_expr_str("shift //i 0;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
     }
 
     #[test]
