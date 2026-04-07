@@ -121,9 +121,11 @@ pub enum ExprKind {
     ArrayLen(String),
     SpecialVar(String),
 
-    /// `my $x`, `our ($a, $b)`, `local @arr` etc. in expression context.
+    /// `my $x`, `our ($a, $b)`, `state $x` in expression context.
     /// The Pratt parser handles `= expr` as normal assignment wrapping this.
     Decl(DeclScope, Vec<VarDecl>),
+    /// `local LVALUE` — localize any lvalue (hash elem, glob, etc.).
+    Local(Box<Expr>),
 
     // ── Binary operations ─────────────────────────────────────
     BinOp(BinOp, Box<Expr>, Box<Expr>),
@@ -310,6 +312,8 @@ pub enum ArrowTarget {
     DerefHash,
     /// `$ref->$*` postfix deref.
     DerefScalar,
+    /// `$obj->$method(args)` dynamic method dispatch.
+    DynMethod(Box<Expr>, Vec<Expr>),
 }
 
 /// Sigil for dereference operations.
@@ -318,7 +322,6 @@ pub enum ArrowTarget {
 pub enum DeclScope {
     My,
     Our,
-    Local,
     State,
 }
 

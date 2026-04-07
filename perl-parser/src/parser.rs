@@ -216,7 +216,7 @@ impl<'src> Parser<'src> {
         let kind = match self.peek().clone() {
             Token::Keyword(Keyword::My) => self.parse_my_decl()?,
             Token::Keyword(Keyword::Our) => self.parse_our_decl()?,
-            Token::Keyword(Keyword::Local) => self.parse_local_decl()?,
+            Token::Keyword(Keyword::Local) => self.parse_expr_statement()?,
             Token::Keyword(Keyword::State) => self.parse_state_decl()?,
             Token::Keyword(Keyword::Sub) => {
                 // Named sub declaration if an identifier follows.
@@ -1279,16 +1279,23 @@ impl<'src> Parser<'src> {
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::PreDec, Box::new(operand)) })
             }
 
-            // Declaration in expression context: my $x, our ($a, $b), etc.
-            Token::Keyword(Keyword::My) | Token::Keyword(Keyword::Our) | Token::Keyword(Keyword::Local) | Token::Keyword(Keyword::State) => {
+            // Declaration in expression context: my $x, our ($a, $b), state $x
+            Token::Keyword(Keyword::My) | Token::Keyword(Keyword::Our) | Token::Keyword(Keyword::State) => {
                 let scope = match spanned.token {
                     Token::Keyword(Keyword::My) => DeclScope::My,
                     Token::Keyword(Keyword::Our) => DeclScope::Our,
-                    Token::Keyword(Keyword::Local) => DeclScope::Local,
                     Token::Keyword(Keyword::State) => DeclScope::State,
                     _ => unreachable!(),
                 };
                 self.parse_decl_expr(scope, span)
+            }
+
+            // local is different — it dynamically scopes any lvalue,
+            // not just bare variables: local $hash{key}, local $/, local *GLOB
+            Token::Keyword(Keyword::Local) => {
+                self.expect.base = BaseExpect::Term;
+                let operand = self.parse_expr(PREC_UNARY)?;
+                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Local(Box::new(operand)) })
             }
 
             // Anonymous sub: sub { ... } or sub ($x) { ... }
@@ -2182,6 +2189,31 @@ impl<'src> Parser<'src> {
                 let end = self.peek_span();
                 self.expect_token(&Token::RParen)?;
                 Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), String::new(), args) })
+            }
+            // Dynamic method dispatch: ->$method or ->$method(args)
+            Token::ScalarVar(var_name) => {
+                let var_span = self.peek_span();
+                self.advance();
+                let method_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
+                if self.at(&Token::LParen) {
+                    self.advance();
+                    self.expect.base = BaseExpect::Term;
+                    let mut args = Vec::new();
+                    while !self.at(&Token::RParen) && !self.at_eof() {
+                        args.push(self.parse_expr(PREC_COMMA + 1)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RParen)?;
+                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DynMethod(Box::new(method_expr), args)) })
+                } else {
+                    Ok(Expr {
+                        span: left.span.merge(var_span),
+                        kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DynMethod(Box::new(method_expr), vec![])),
+                    })
+                }
             }
             // Postfix dereference: ->@*, ->%*, ->$*, ->@[...], ->@{...}
             Token::At => {
@@ -3224,9 +3256,9 @@ mod tests {
         match &prog.statements[0].kind {
             StmtKind::For(f) => match &f.init {
                 Some(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
-                    assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::Local, _)));
+                    assert!(matches!(lhs.kind, ExprKind::Local(_)));
                 }
-                other => panic!("expected Assign(Decl(Local), ...), got {other:?}"),
+                other => panic!("expected Assign(Local(...), ...), got {other:?}"),
             },
             other => panic!("expected For, got {other:?}"),
         }
@@ -3702,6 +3734,97 @@ mod tests {
                 assert_eq!(s, "Hello $name!\n");
             }
             other => panic!("expected StringLit with literal $name, got {other:?}"),
+        }
+    }
+
+    // ── Dynamic method dispatch tests ─────────────────────────
+
+    #[test]
+    fn parse_dynamic_method() {
+        // $obj->$method
+        let e = parse_expr_str("$obj->$method;");
+        match &e.kind {
+            ExprKind::ArrowDeref(_, ArrowTarget::DynMethod(method_expr, args)) => {
+                assert!(matches!(method_expr.kind, ExprKind::ScalarVar(_)));
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected DynMethod, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dynamic_method_with_args() {
+        // $obj->$method(1, 2)
+        let e = parse_expr_str("$obj->$method(1, 2);");
+        match &e.kind {
+            ExprKind::ArrowDeref(_, ArrowTarget::DynMethod(_, args)) => {
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected DynMethod with args, got {other:?}"),
+        }
+    }
+
+    // ── Complex local lvalue tests ────────────────────────────
+
+    #[test]
+    fn parse_local_hash_elem() {
+        let prog = parse("local $hash{key} = 42;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => match &lhs.kind {
+                ExprKind::Local(inner) => {
+                    assert!(matches!(inner.kind, ExprKind::HashElem(_, _)));
+                }
+                other => panic!("expected Local(HashElem), got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_local_glob() {
+        let prog = parse("local *STDOUT;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Local(inner), .. }) => {
+                assert!(matches!(inner.kind, ExprKind::GlobVar(_)));
+            }
+            other => panic!("expected Local(GlobVar), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_local_simple_var() {
+        // local $x = 5 still works
+        let prog = parse("local $x = 5;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
+                assert!(matches!(lhs.kind, ExprKind::Local(_)));
+            }
+            other => panic!("expected Assign(Local), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_local_hash_elem() {
+        // delete local $hash{key}
+        let e = parse_expr_str("delete local $hash{key};");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "delete");
+                assert!(matches!(args[0].kind, ExprKind::Local(_)));
+            }
+            other => panic!("expected delete(Local(...)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_local_special_var() {
+        // local $/ — localize input record separator
+        let e = parse_expr_str("local $/;");
+        match &e.kind {
+            ExprKind::Local(inner) => {
+                assert!(matches!(inner.kind, ExprKind::SpecialVar(_)));
+            }
+            other => panic!("expected Local(SpecialVar), got {other:?}"),
         }
     }
 }
