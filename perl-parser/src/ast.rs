@@ -213,7 +213,28 @@ pub enum ExprKind {
     /// `...` — yada yada yada (unimplemented placeholder).
     YadaYada,
     /// `-e $file`, `-d "/tmp"`, `-f _` — filetest operator.
-    Filetest(char, Box<Expr>),
+    Filetest(char, StatTarget),
+    /// `stat $file`, `stat _`, `stat` — stat call.
+    Stat(StatTarget),
+    /// `lstat $file`, `lstat _`, `lstat` — lstat call.
+    Lstat(StatTarget),
+}
+
+/// The operand of a stat-family operation: filetest operators (`-e`, `-f`,
+/// `-d`, etc.), `stat`, and `lstat`.
+///
+/// All three share the Perl convention that a bare `_` means "reuse the
+/// cached stat buffer from the most recent `stat`, `lstat`, or filetest."
+#[derive(Clone, Debug)]
+pub enum StatTarget {
+    /// An expression: `-f $file`, `-d "/tmp"`, `stat $fh`, or stacked
+    /// filetests like `-f -r $file`.
+    Expr(Box<Expr>),
+    /// The bare `_` filehandle — reuse the cached stat buffer from the
+    /// most recent `stat`, `lstat`, or filetest call.
+    StatCache,
+    /// Implicit `$_` — when no operand is given (`-e;`).
+    Default,
 }
 
 /// Part of an interpolated string (§7.3).

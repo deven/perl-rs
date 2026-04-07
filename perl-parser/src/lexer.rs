@@ -1585,7 +1585,9 @@ mod tests {
                 | Token::SubstLit(_, _, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
-                | Token::Readline(_) => {
+                | Token::Readline(_)
+                | Token::GlobVar(_)
+                | Token::QwList(_) => {
                     expect.base = BaseExpect::Operator;
                 }
                 Token::Semi | Token::LBrace => {
@@ -1628,19 +1630,39 @@ mod tests {
     #[test]
     fn lex_comparison_ops() {
         let tokens = lex_all("$a == $b != $c <= $d >= $e <=> $f");
-        assert!(tokens.contains(&Token::NumEq));
-        assert!(tokens.contains(&Token::NumNe));
-        assert!(tokens.contains(&Token::NumLe));
-        assert!(tokens.contains(&Token::NumGe));
-        assert!(tokens.contains(&Token::Spaceship));
+        assert_eq!(
+            tokens,
+            vec![
+                Token::ScalarVar("a".into()),
+                Token::NumEq,
+                Token::ScalarVar("b".into()),
+                Token::NumNe,
+                Token::ScalarVar("c".into()),
+                Token::NumLe,
+                Token::ScalarVar("d".into()),
+                Token::NumGe,
+                Token::ScalarVar("e".into()),
+                Token::Spaceship,
+                Token::ScalarVar("f".into()),
+            ]
+        );
     }
 
     #[test]
     fn lex_string_cmp_ops() {
         let tokens = lex_all("$a eq $b ne $c lt $d");
-        assert!(tokens.contains(&Token::StrEq));
-        assert!(tokens.contains(&Token::StrNe));
-        assert!(tokens.contains(&Token::StrLt));
+        assert_eq!(
+            tokens,
+            vec![
+                Token::ScalarVar("a".into()),
+                Token::StrEq,
+                Token::ScalarVar("b".into()),
+                Token::StrNe,
+                Token::ScalarVar("c".into()),
+                Token::StrLt,
+                Token::ScalarVar("d".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1653,12 +1675,6 @@ mod tests {
     fn lex_hex_literal() {
         let tokens = lex_all("0xFF");
         assert_eq!(tokens, vec![Token::IntLit(255)]);
-    }
-
-    #[test]
-    fn lex_binary_literal() {
-        let tokens = lex_all("0b1010");
-        assert_eq!(tokens, vec![Token::IntLit(10)]);
     }
 
     #[test]
@@ -1697,9 +1713,18 @@ mod tests {
     #[test]
     fn lex_logical_ops() {
         let tokens = lex_all("$a && $b || $c // $d");
-        assert!(tokens.contains(&Token::AndAnd));
-        assert!(tokens.contains(&Token::OrOr));
-        assert!(tokens.contains(&Token::DorDor));
+        assert_eq!(
+            tokens,
+            vec![
+                Token::ScalarVar("a".into()),
+                Token::AndAnd,
+                Token::ScalarVar("b".into()),
+                Token::OrOr,
+                Token::ScalarVar("c".into()),
+                Token::DorDor,
+                Token::ScalarVar("d".into()),
+            ]
+        );
     }
 
     #[test]
@@ -2065,5 +2090,320 @@ mod tests {
     fn lex_valid_explicit_octal() {
         let tokens = lex_all("0o77");
         assert_eq!(tokens, vec![Token::IntLit(0o77)]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NEW TESTS — numeric edge cases
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn lex_hex_underscored() {
+        let tokens = lex_all("0xFF_FF");
+        assert_eq!(tokens, vec![Token::IntLit(0xFFFF)]);
+    }
+
+    #[test]
+    fn lex_binary_underscored() {
+        let tokens = lex_all("0b1010_0101");
+        assert_eq!(tokens, vec![Token::IntLit(0b1010_0101)]);
+    }
+
+    #[test]
+    fn lex_scientific_neg_exponent() {
+        let tokens = lex_all("1.5e-3");
+        assert_eq!(tokens.len(), 1);
+        assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 1.5e-3).abs() < 1e-15));
+    }
+
+    #[test]
+    fn lex_scientific_pos_exponent() {
+        let tokens = lex_all("2e+5");
+        assert_eq!(tokens.len(), 1);
+        assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 2e5).abs() < 1.0));
+    }
+
+    // ── String / quote edge cases ─────────────────────────────
+
+    #[test]
+    fn lex_single_quoted_escape_backslash() {
+        let tokens = lex_all("'a\\\\b'");
+        assert_eq!(tokens, vec![Token::StrLit("a\\b".into())]);
+    }
+
+    #[test]
+    fn lex_single_quoted_escape_quote() {
+        let tokens = lex_all("'it\\'s'");
+        assert_eq!(tokens, vec![Token::StrLit("it's".into())]);
+    }
+
+    #[test]
+    fn lex_double_quoted_tab_escape() {
+        let tokens = lex_all(r#""\t""#);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("\t".into()), Token::QuoteEnd]);
+    }
+
+    #[test]
+    fn lex_q_bang_delimiter() {
+        let tokens = lex_all("q!hello!");
+        assert_eq!(tokens, vec![Token::StrLit("hello".into())]);
+    }
+
+    #[test]
+    fn lex_qq_pipe_delimiter() {
+        let tokens = lex_all("qq|hello $name|");
+        assert_eq!(
+            tokens,
+            vec![Token::QuoteBegin(QuoteKind::Double, b'|'), Token::ConstSegment("hello ".into()), Token::InterpScalar("name".into()), Token::QuoteEnd,]
+        );
+    }
+
+    #[test]
+    fn lex_qw_braces_delimiter() {
+        let tokens = lex_all("qw{foo bar baz}");
+        assert_eq!(tokens, vec![Token::QwList(vec!["foo".into(), "bar".into(), "baz".into()])]);
+    }
+
+    #[test]
+    fn lex_qw_slash_delimiter() {
+        let tokens = lex_all("qw/foo bar baz/");
+        assert_eq!(tokens, vec![Token::QwList(vec!["foo".into(), "bar".into(), "baz".into()])]);
+    }
+
+    #[test]
+    fn lex_backtick_string() {
+        let tokens = lex_all("`ls -la`");
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Backtick, b'`'), Token::ConstSegment("ls -la".into()), Token::QuoteEnd]);
+    }
+
+    #[test]
+    fn lex_heredoc_empty_body() {
+        let src = "<<END;\nEND\n";
+        let tokens = lex_all(src);
+        assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "".into()), Token::Semi]);
+    }
+
+    #[test]
+    fn lex_heredoc_indented_literal() {
+        let src = "<<~'END';\n    hello\n    END\n";
+        let tokens = lex_all(src);
+        match &tokens[0] {
+            Token::HeredocLit(HeredocKind::IndentedLiteral, tag, body) => {
+                assert_eq!(tag, "END");
+                assert_eq!(body, "hello\n");
+            }
+            other => panic!("expected IndentedLiteral HeredocLit, got {other:?}"),
+        }
+    }
+
+    // ── Assignment operator tokens ────────────────────────────
+
+    #[test]
+    fn lex_all_assignment_ops() {
+        let tokens = lex_all("$a += $b -= $c *= $d /= $e");
+        assert!(tokens.contains(&Token::Assign(AssignOp::AddEq)));
+        assert!(tokens.contains(&Token::Assign(AssignOp::SubEq)));
+        assert!(tokens.contains(&Token::Assign(AssignOp::MulEq)));
+        assert!(tokens.contains(&Token::Assign(AssignOp::DivEq)));
+    }
+
+    #[test]
+    #[ignore = "lexer gap: %= not yet implemented"]
+    fn lex_mod_eq() {
+        let tokens = lex_all("$x %= 3");
+        assert!(tokens.contains(&Token::Assign(AssignOp::ModEq)));
+    }
+
+    #[test]
+    fn lex_pow_eq() {
+        let tokens = lex_all("$x **= 2");
+        assert!(tokens.contains(&Token::Assign(AssignOp::PowEq)));
+    }
+
+    #[test]
+    fn lex_concat_eq() {
+        let tokens = lex_all("$x .= 'a'");
+        assert!(tokens.contains(&Token::Assign(AssignOp::ConcatEq)));
+    }
+
+    #[test]
+    fn lex_and_eq() {
+        let tokens = lex_all("$x &&= 1");
+        assert!(tokens.contains(&Token::Assign(AssignOp::AndEq)));
+    }
+
+    #[test]
+    fn lex_or_eq() {
+        let tokens = lex_all("$x ||= 1");
+        assert!(tokens.contains(&Token::Assign(AssignOp::OrEq)));
+    }
+
+    #[test]
+    fn lex_dor_eq() {
+        let tokens = lex_all("$x //= 1");
+        assert!(tokens.contains(&Token::Assign(AssignOp::DorEq)));
+    }
+
+    #[test]
+    fn lex_bit_and_eq() {
+        let tokens = lex_all("$x &= 0xFF");
+        assert!(tokens.contains(&Token::Assign(AssignOp::BitAndEq)));
+    }
+
+    #[test]
+    fn lex_bit_or_eq() {
+        let tokens = lex_all("$x |= 0xFF");
+        assert!(tokens.contains(&Token::Assign(AssignOp::BitOrEq)));
+    }
+
+    #[test]
+    #[ignore = "lexer gap: ^= not yet implemented"]
+    fn lex_bit_xor_eq() {
+        let tokens = lex_all("$x ^= 0xFF");
+        assert!(tokens.contains(&Token::Assign(AssignOp::BitXorEq)));
+    }
+
+    #[test]
+    fn lex_shift_l_eq() {
+        let tokens = lex_all("$x <<= 2");
+        assert!(tokens.contains(&Token::Assign(AssignOp::ShiftLEq)));
+    }
+
+    #[test]
+    fn lex_shift_r_eq() {
+        let tokens = lex_all("$x >>= 2");
+        assert!(tokens.contains(&Token::Assign(AssignOp::ShiftREq)));
+    }
+
+    // ── Operator edge cases ───────────────────────────────────
+
+    #[test]
+    fn lex_not_binding() {
+        let tokens = lex_all("$x !~ /foo/");
+        assert!(tokens.contains(&Token::NotBinding));
+    }
+
+    #[test]
+    fn lex_dotdot() {
+        let tokens = lex_all("1..10");
+        assert!(tokens.contains(&Token::DotDot));
+    }
+
+    #[test]
+    fn lex_dotdotdot_as_yada() {
+        let tokens = lex_all("...");
+        assert_eq!(tokens, vec![Token::DotDotDot]);
+    }
+
+    // ── Variable edge cases ───────────────────────────────────
+
+    #[test]
+    fn lex_dollar_slash() {
+        let tokens = lex_all("$/");
+        assert_eq!(tokens, vec![Token::SpecialVar("/".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_backslash() {
+        let tokens = lex_all("$\\");
+        assert_eq!(tokens, vec![Token::SpecialVar("\\".into())]);
+    }
+
+    #[test]
+    fn lex_dollar_comma() {
+        let tokens = lex_all("$,");
+        assert_eq!(tokens, vec![Token::SpecialVar(",".into())]);
+    }
+
+    #[test]
+    fn lex_array_len() {
+        let tokens = lex_all("$#arr");
+        assert_eq!(tokens, vec![Token::ArrayLen("arr".into())]);
+    }
+
+    #[test]
+    fn lex_glob_var() {
+        // * lexes as Star; the parser combines Star + Ident into GlobVar
+        let tokens = lex_all("*foo");
+        assert_eq!(tokens, vec![Token::Star, Token::Ident("foo".into())]);
+    }
+
+    #[test]
+    fn lex_multi_digit_capture() {
+        let tokens = lex_all("$12");
+        assert_eq!(tokens, vec![Token::SpecialVar("12".into())]);
+    }
+
+    // ── Regex edge cases ──────────────────────────────────────
+
+    #[test]
+    fn lex_regex_many_flags() {
+        let tokens = lex_all("/foo/imsxg");
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), "imsxg".into())]);
+    }
+
+    #[test]
+    fn lex_substitution_global() {
+        let tokens = lex_all("s/old/new/g");
+        assert_eq!(tokens, vec![Token::SubstLit("old".into(), "new".into(), "g".into())]);
+    }
+
+    #[test]
+    fn lex_transliteration_flags() {
+        let tokens = lex_all("tr/a-z/A-Z/cs");
+        assert_eq!(tokens, vec![Token::TranslitLit("a-z".into(), "A-Z".into(), "cs".into())]);
+    }
+
+    #[test]
+    fn lex_regex_after_keyword_term() {
+        let tokens = lex_all("print /foo/");
+        assert!(tokens.contains(&Token::RegexLit(RegexKind::Match, "foo".into(), "".into())));
+    }
+
+    // ── Filetest tokens ───────────────────────────────────────
+
+    #[test]
+    fn lex_filetest_f() {
+        let tokens = lex_all("-f $file");
+        assert_eq!(tokens, vec![Token::Filetest(b'f'), Token::ScalarVar("file".into())]);
+    }
+
+    #[test]
+    fn lex_filetest_d() {
+        let tokens = lex_all("-d $dir");
+        assert_eq!(tokens, vec![Token::Filetest(b'd'), Token::ScalarVar("dir".into())]);
+    }
+
+    // ── Readline / glob tokens ────────────────────────────────
+
+    #[test]
+    fn lex_readline_stdin() {
+        let tokens = lex_all("<STDIN>");
+        assert_eq!(tokens, vec![Token::Readline("STDIN".into())]);
+    }
+
+    #[test]
+    fn lex_readline_diamond() {
+        let tokens = lex_all("<>");
+        assert_eq!(tokens, vec![Token::Readline("".into())]);
+    }
+
+    #[test]
+    fn lex_glob_wildcard() {
+        let tokens = lex_all("<*.txt>");
+        assert_eq!(tokens, vec![Token::Readline("*.txt".into())]);
+    }
+
+    // ── DataEnd tokens ────────────────────────────────────────
+
+    #[test]
+    fn lex_end_token() {
+        let tokens = lex_all("1;\n__END__\nstuff");
+        assert!(tokens.contains(&Token::DataEnd));
+    }
+
+    #[test]
+    fn lex_data_token() {
+        let tokens = lex_all("1;\n__DATA__\nstuff");
+        assert!(tokens.contains(&Token::DataEnd));
     }
 }
