@@ -387,12 +387,6 @@ impl<'src> Parser<'src> {
         Ok(StmtKind::Our(vars, init))
     }
 
-    fn parse_local_decl(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance();
-        let (vars, init) = self.parse_var_list()?;
-        Ok(StmtKind::Local(vars, init))
-    }
-
     fn parse_state_decl(&mut self) -> Result<StmtKind, ParseError> {
         self.advance();
         let (vars, init) = self.parse_var_list()?;
@@ -2259,40 +2253,6 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::new(format!("expected method name or subscript after ->, got {other:?}"), self.peek_span())),
         }
     }
-}
-
-/// Is this byte a valid filetest operator letter?
-/// -r -w -x -o -R -W -X -O -e -z -s -f -d -l -p -S -b -c -t -u -g -k -T -B -M -A -C
-fn is_filetest_char(b: u8) -> bool {
-    matches!(
-        b,
-        b'r' | b'w'
-            | b'x'
-            | b'o'
-            | b'R'
-            | b'W'
-            | b'X'
-            | b'O'
-            | b'e'
-            | b'z'
-            | b's'
-            | b'f'
-            | b'd'
-            | b'l'
-            | b'p'
-            | b'S'
-            | b'b'
-            | b'c'
-            | b't'
-            | b'u'
-            | b'g'
-            | b'k'
-            | b'T'
-            | b'B'
-            | b'M'
-            | b'A'
-            | b'C'
-    )
 }
 
 fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {

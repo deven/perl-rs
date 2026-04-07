@@ -29,7 +29,6 @@ pub enum Keyword {
     Until,
     For,
     Foreach,
-    Loop,
     Given,
     When,
     Default,
@@ -68,13 +67,7 @@ pub enum Keyword {
     Gt,
     Le,
     Ge,
-    Cmp,      // string comparison
-    If_,      // postfix if (same keyword, different parse)
-    Unless_,  // postfix unless
-    While_,   // postfix while
-    Until_,   // postfix until
-    For_,     // postfix for
-    Foreach_, // postfix foreach
+    Cmp, // string comparison
 
     // ── Loop control ──────────────────────────────────────────
     Last,

@@ -29,8 +29,6 @@ pub enum StmtKind {
     My(Vec<VarDecl>, Option<Expr>),
     /// `our $x`.
     Our(Vec<VarDecl>, Option<Expr>),
-    /// `local $x`.
-    Local(Vec<VarDecl>, Option<Expr>),
     /// `state $x`.
     State(Vec<VarDecl>, Option<Expr>),
 
