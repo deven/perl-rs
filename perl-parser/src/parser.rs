@@ -1436,6 +1436,22 @@ impl<'src> Parser<'src> {
                 Ok(Expr { kind: ExprKind::FuncCall("goto".into(), vec![arg]), span: end })
             }
 
+            // Filetest operators: -e, -f, -d, etc. (lexed as single token)
+            Token::Filetest(test_byte) => {
+                let test_char = test_byte as char;
+                // In autoquoting contexts (=> or }), treat as StringLit("-x")
+                if matches!(self.peek(), Token::FatComma | Token::RBrace) {
+                    return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
+                }
+                self.expect.base = BaseExpect::Term;
+                let operand = if self.at(&Token::Semi) || self.at(&Token::RBrace) || self.at(&Token::RParen) || self.at_eof() {
+                    Expr { kind: ExprKind::ScalarVar("_".into()), span }
+                } else {
+                    self.parse_expr(PREC_UNARY)?
+                };
+                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Filetest(test_char, Box::new(operand)) })
+            }
+
             // Yada yada yada (...)
             Token::DotDotDot => Ok(Expr { kind: ExprKind::YadaYada, span }),
 
@@ -2243,6 +2259,40 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::new(format!("expected method name or subscript after ->, got {other:?}"), self.peek_span())),
         }
     }
+}
+
+/// Is this byte a valid filetest operator letter?
+/// -r -w -x -o -R -W -X -O -e -z -s -f -d -l -p -S -b -c -t -u -g -k -T -B -M -A -C
+fn is_filetest_char(b: u8) -> bool {
+    matches!(
+        b,
+        b'r' | b'w'
+            | b'x'
+            | b'o'
+            | b'R'
+            | b'W'
+            | b'X'
+            | b'O'
+            | b'e'
+            | b'z'
+            | b's'
+            | b'f'
+            | b'd'
+            | b'l'
+            | b'p'
+            | b'S'
+            | b'b'
+            | b'c'
+            | b't'
+            | b'u'
+            | b'g'
+            | b'k'
+            | b'T'
+            | b'B'
+            | b'M'
+            | b'A'
+            | b'C'
+    )
 }
 
 fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
@@ -3825,6 +3875,104 @@ mod tests {
                 assert!(matches!(inner.kind, ExprKind::SpecialVar(_)));
             }
             other => panic!("expected Local(SpecialVar), got {other:?}"),
+        }
+    }
+
+    // ── Filetest operator tests ───────────────────────────────
+
+    #[test]
+    fn parse_filetest_e() {
+        let e = parse_expr_str("-e $file;");
+        match &e.kind {
+            ExprKind::Filetest(c, operand) => {
+                assert_eq!(*c, 'e');
+                assert!(matches!(operand.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected Filetest('e'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_filetest_d_string() {
+        let e = parse_expr_str(r#"-d "/tmp";"#);
+        match &e.kind {
+            ExprKind::Filetest(c, _) => assert_eq!(*c, 'd'),
+            other => panic!("expected Filetest('d'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_filetest_f_underscore() {
+        // -f _ uses the cached stat buffer
+        let e = parse_expr_str("-f _;");
+        match &e.kind {
+            ExprKind::Filetest(c, _) => assert_eq!(*c, 'f'),
+            other => panic!("expected Filetest('f'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_filetest_no_operand() {
+        // -e alone defaults to $_
+        let e = parse_expr_str("-e;");
+        match &e.kind {
+            ExprKind::Filetest(c, operand) => {
+                assert_eq!(*c, 'e');
+                match &operand.kind {
+                    ExprKind::ScalarVar(name) => assert_eq!(name, "_"),
+                    other => panic!("expected default $_, got {other:?}"),
+                }
+            }
+            other => panic!("expected Filetest('e'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_stacked_filetests() {
+        // -f -r $file → Filetest('f', Filetest('r', $file))
+        let e = parse_expr_str("-f -r $file;");
+        match &e.kind {
+            ExprKind::Filetest(c, inner) => {
+                assert_eq!(*c, 'f');
+                assert!(matches!(inner.kind, ExprKind::Filetest('r', _)));
+            }
+            other => panic!("expected stacked Filetest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_minus_non_filetest_still_quotes() {
+        // -key is NOT a filetest — 'k' is filetest but "key" is multi-char
+        let e = parse_expr_str("-key;");
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "-key"),
+            other => panic!("expected StringLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_filetest_letter_fat_comma_autoquotes() {
+        // -f => value — NOT a filetest, autoquotes as StringLit("-f")
+        let e = parse_expr_str("-f => 1;");
+        match &e.kind {
+            ExprKind::List(items) => match &items[0].kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "-f"),
+                other => panic!("expected StringLit('-f'), got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_filetest_letter_hash_subscript_autoquotes() {
+        // $hash{-f} — NOT a filetest, autoquotes as StringLit("-f")
+        let e = parse_expr_str("$hash{-f};");
+        match &e.kind {
+            ExprKind::HashElem(_, key) => match &key.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "-f"),
+                other => panic!("expected StringLit('-f'), got {other:?}"),
+            },
+            other => panic!("expected HashElem, got {other:?}"),
         }
     }
 }
