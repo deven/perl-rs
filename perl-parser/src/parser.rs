@@ -1529,7 +1529,7 @@ impl<'src> Parser<'src> {
                 let class_name = class_name.clone();
                 let class_span = self.peek_span();
                 self.advance(); // eat class name
-                let class_expr = Expr { kind: ExprKind::FuncCall(class_name, vec![]), span: class_span };
+                let class_expr = Expr { kind: ExprKind::Bareword(class_name), span: class_span };
 
                 // Optional args
                 let mut args = Vec::new();
@@ -1544,10 +1544,10 @@ impl<'src> Parser<'src> {
                     }
                     let end = self.peek_span();
                     self.expect_token(&Token::RParen)?;
-                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(class_expr), args), span: span.merge(end) });
+                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(end) });
                 }
 
-                return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(class_expr), args), span: span.merge(class_span) });
+                return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(class_span) });
             }
             Token::ScalarVar(_) => {
                 let var_span = self.peek_span();
@@ -1569,16 +1569,16 @@ impl<'src> Parser<'src> {
                     }
                     let end = self.peek_span();
                     self.expect_token(&Token::RParen)?;
-                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(invocant), args), span: span.merge(end) });
+                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(end) });
                 }
 
-                return Ok(Expr { kind: ExprKind::IndirectMethodCall(name, Box::new(invocant), args), span: span.merge(var_span) });
+                return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(var_span) });
             }
             _ => {}
         }
 
-        // Bare identifier
-        Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span })
+        // Bare identifier — not followed by ( or indirect object context.
+        Ok(Expr { kind: ExprKind::Bareword(name), span })
     }
 
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
@@ -1738,7 +1738,7 @@ impl<'src> Parser<'src> {
                     Token::Ident(s) => s,
                     _ => unreachable!(),
                 };
-                args.push(Expr { kind: ExprKind::FuncCall(ident, vec![]), span: ident_span });
+                args.push(Expr { kind: ExprKind::Bareword(ident), span: ident_span });
             }
         }
 
@@ -3916,10 +3916,10 @@ mod tests {
     fn parse_indirect_new() {
         let e = parse_expr_str("new Foo(1, 2);");
         match &e.kind {
-            ExprKind::IndirectMethodCall(method, class, args) => {
+            ExprKind::IndirectMethodCall(class, method, args) => {
+                assert!(matches!(class.kind, ExprKind::Bareword(ref n) if n == "Foo"));
                 assert_eq!(method, "new");
                 assert_eq!(args.len(), 2);
-                assert!(matches!(class.kind, ExprKind::FuncCall(_, _)));
             }
             other => panic!("expected IndirectMethodCall, got {other:?}"),
         }
@@ -3929,7 +3929,8 @@ mod tests {
     fn parse_indirect_new_no_args() {
         let e = parse_expr_str("new Foo;");
         match &e.kind {
-            ExprKind::IndirectMethodCall(method, _, args) => {
+            ExprKind::IndirectMethodCall(class, method, args) => {
+                assert!(matches!(class.kind, ExprKind::Bareword(ref n) if n == "Foo"));
                 assert_eq!(method, "new");
                 assert_eq!(args.len(), 0);
             }
@@ -3941,7 +3942,7 @@ mod tests {
     fn parse_indirect_with_var() {
         let e = parse_expr_str("new $class;");
         match &e.kind {
-            ExprKind::IndirectMethodCall(method, invocant, _) => {
+            ExprKind::IndirectMethodCall(invocant, method, _) => {
                 assert_eq!(method, "new");
                 assert!(matches!(invocant.kind, ExprKind::ScalarVar(_)));
             }
@@ -4861,7 +4862,7 @@ mod tests {
             ExprKind::ListOp(name, args) => {
                 assert_eq!(name, "sort");
                 assert!(args.len() >= 2);
-                assert!(matches!(args[0].kind, ExprKind::FuncCall(_, _)));
+                assert!(matches!(args[0].kind, ExprKind::Bareword(_)));
             }
             other => panic!("expected sort with sub name, got {other:?}"),
         }
@@ -5063,8 +5064,8 @@ mod tests {
             ExprKind::MethodCall(class, method, _) => {
                 assert_eq!(method, "new");
                 match &class.kind {
-                    ExprKind::FuncCall(name, _) => assert_eq!(name, "Foo::Bar"),
-                    other => panic!("expected class FuncCall, got {other:?}"),
+                    ExprKind::Bareword(name) => assert_eq!(name, "Foo::Bar"),
+                    other => panic!("expected Bareword, got {other:?}"),
                 }
             }
             other => panic!("expected MethodCall, got {other:?}"),
