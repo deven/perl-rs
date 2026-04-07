@@ -208,7 +208,6 @@ pub fn is_list_op(kw: Keyword) -> bool {
             | Keyword::Join
             | Keyword::Split
             | Keyword::Sprintf
-            | Keyword::Printf
             | Keyword::Substr
             | Keyword::Index
             | Keyword::Rindex
@@ -242,5 +241,5 @@ pub fn is_block_list_op(kw: Keyword) -> bool {
 /// Is this keyword a print-like operator?
 /// These take an optional filehandle as the first argument.
 pub fn is_print_op(kw: Keyword) -> bool {
-    matches!(kw, Keyword::Print | Keyword::Say)
+    matches!(kw, Keyword::Print | Keyword::Say | Keyword::Printf)
 }

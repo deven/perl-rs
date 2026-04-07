@@ -1771,37 +1771,123 @@ impl<'src> Parser<'src> {
         let name = format!("{kw:?}").to_lowercase();
         self.expect.base = BaseExpect::Term;
 
-        // Check for parens
-        if self.at(&Token::LParen) {
-            return self.parse_list_op(kw, span);
-        }
+        // Handle optional parens — print(...) form
+        let in_parens = self.eat(&Token::LParen);
 
-        // No parens — check for bare filehandle (uppercase identifier not followed by comma)
-        // This is a heuristic: `print STDERR "hello"` vs `print $x, $y`
-        // Perl uses the rule: bareword followed by non-comma term is a filehandle.
+        // Try to detect filehandle before argument list.
+        let filehandle = self.try_parse_print_filehandle()?;
+
+        // Collect args as comma-separated list.
         let mut args = Vec::new();
-
-        // Collect args as list
-        while !self.at(&Token::Semi) && !self.at_eof() && !self.at(&Token::RBrace) {
-            if matches!(
-                self.peek(),
-                Token::Keyword(Keyword::If)
-                    | Token::Keyword(Keyword::Unless)
-                    | Token::Keyword(Keyword::While)
-                    | Token::Keyword(Keyword::Until)
-                    | Token::Keyword(Keyword::For)
-                    | Token::Keyword(Keyword::Foreach)
-            ) {
-                break;
-            }
+        while !self.at_print_end(in_parens) {
             args.push(self.parse_expr(PREC_COMMA + 1)?);
             if !self.eat(&Token::Comma) {
                 break;
             }
         }
 
+        if in_parens {
+            self.expect_token(&Token::RParen)?;
+        }
+
         let end_span = args.last().map(|a| a.span).unwrap_or(span);
-        Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end_span) })
+        Ok(Expr { kind: ExprKind::PrintOp(name, filehandle, args), span: span.merge(end_span) })
+    }
+
+    /// Check whether we're at the end of a print argument list.
+    fn at_print_end(&mut self, in_parens: bool) -> bool {
+        if self.at(&Token::Semi) || self.at_eof() || self.at(&Token::RBrace) {
+            return true;
+        }
+        if in_parens && self.at(&Token::RParen) {
+            return true;
+        }
+        matches!(
+            self.peek(),
+            Token::Keyword(Keyword::If)
+                | Token::Keyword(Keyword::Unless)
+                | Token::Keyword(Keyword::While)
+                | Token::Keyword(Keyword::Until)
+                | Token::Keyword(Keyword::For)
+                | Token::Keyword(Keyword::Foreach)
+        )
+    }
+
+    /// Speculative lookahead: detect a filehandle after print/say/printf.
+    ///
+    /// Perl's rule: a bareword not followed by comma is a filehandle.
+    /// A scalar variable followed by a clearly term-starting token (not
+    /// an operator or comma) is a filehandle.
+    fn try_parse_print_filehandle(&mut self) -> Result<Option<Box<Expr>>, ParseError> {
+        let is_bareword = matches!(self.peek(), Token::Ident(_));
+        let is_scalar = matches!(self.peek(), Token::ScalarVar(_));
+
+        if !is_bareword && !is_scalar {
+            return Ok(None);
+        }
+
+        // Save state for speculative lookahead.
+        let cp = self.lexer.checkpoint();
+        let saved_expect = self.expect;
+        let saved_current = self.current.take();
+
+        // Peek at what follows the candidate token.
+        // (Taking saved_current already moved past it in the lexer.)
+        self.ensure_current();
+        let next = self.peek().clone();
+
+        // Restore parser state.
+        self.current = saved_current;
+        self.expect = saved_expect;
+        self.lexer.restore(cp);
+
+        // Decision:
+        // Bareword: filehandle if NOT followed by comma.
+        //   `print STDERR "hello"` → fh.  `print STDERR;` → fh.
+        //   `print STDERR, "hello"` → not fh.
+        // ScalarVar: filehandle if followed by an unambiguous term start
+        //   (string, variable, paren, keyword).  Not if followed by
+        //   comma, operator, semicolon, or EOF.
+        //   `print $fh "hello"` → fh.  `print $fh;` → not fh.
+        //   `print $x + 1;` → not fh.
+        let is_filehandle = if is_bareword {
+            !matches!(next, Token::Comma)
+        } else {
+            // ScalarVar — conservative: only if next is clearly a new term.
+            matches!(
+                next,
+                Token::QuoteBegin(_, _)
+                    | Token::StrLit(_)
+                    | Token::IntLit(_)
+                    | Token::FloatLit(_)
+                    | Token::ScalarVar(_)
+                    | Token::ArrayVar(_)
+                    | Token::HashVar(_)
+                    | Token::SpecialVar(_)
+                    | Token::SpecialArrayVar(_)
+                    | Token::SpecialHashVar(_)
+                    | Token::Ident(_)
+                    | Token::LParen
+                    | Token::LBracket
+                    | Token::RegexLit(_, _, _)
+                    | Token::SubstLit(_, _, _)
+                    | Token::HeredocLit(_, _, _)
+                    | Token::QwList(_)
+                    | Token::Backslash
+            )
+        };
+
+        if is_filehandle {
+            let fh_span = self.peek_span();
+            let fh = match self.advance().token {
+                Token::Ident(n) => Expr { kind: ExprKind::Bareword(n), span: fh_span },
+                Token::ScalarVar(n) => Expr { kind: ExprKind::ScalarVar(n), span: fh_span },
+                _ => unreachable!(),
+            };
+            Ok(Some(Box::new(fh)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Parse the operand of a prefix dereference ($$ref, @$ref, etc.).
@@ -2558,11 +2644,12 @@ mod tests {
     fn parse_print_list() {
         let prog = parse(r#"print "hello", " ", "world";"#);
         match &prog.statements[0].kind {
-            StmtKind::Expr(Expr { kind: ExprKind::ListOp(name, args), .. }) => {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, fh, args), .. }) => {
                 assert_eq!(name, "print");
+                assert!(fh.is_none());
                 assert_eq!(args.len(), 3);
             }
-            other => panic!("expected ListOp, got {other:?}"),
+            other => panic!("expected PrintOp, got {other:?}"),
         }
     }
 
@@ -2729,8 +2816,9 @@ mod tests {
         let prog = parse(r#"print "Hello, $name!\n";"#);
         assert_eq!(prog.statements.len(), 1);
         match &prog.statements[0].kind {
-            StmtKind::Expr(Expr { kind: ExprKind::ListOp(name, args), .. }) => {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, fh, args), .. }) => {
                 assert_eq!(name, "print");
+                assert!(fh.is_none());
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0].kind, ExprKind::InterpolatedString(_)));
             }
@@ -2836,8 +2924,8 @@ mod tests {
         let prog = parse(src);
         assert_eq!(prog.statements.len(), 2);
         match &prog.statements[0].kind {
-            StmtKind::Expr(Expr { kind: ExprKind::ListOp(name, _), .. }) => assert_eq!(name, "print"),
-            other => panic!("expected print ListOp, got {other:?}"),
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _, _), .. }) => assert_eq!(name, "print"),
+            other => panic!("expected print PrintOp, got {other:?}"),
         }
         match &prog.statements[1].kind {
             StmtKind::My(vars, Some(_)) => assert_eq!(vars[0].name, "x"),
@@ -3067,10 +3155,11 @@ mod tests {
     fn parse_print_simple() {
         let prog = parse(r#"print "hello";"#);
         match &prog.statements[0].kind {
-            StmtKind::Expr(Expr { kind: ExprKind::ListOp(name, _), .. }) => {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, fh, _), .. }) => {
                 assert_eq!(name, "print");
+                assert!(fh.is_none());
             }
-            other => panic!("expected print ListOp, got {other:?}"),
+            other => panic!("expected print PrintOp, got {other:?}"),
         }
     }
 
@@ -3917,7 +4006,7 @@ mod tests {
         let e = parse_expr_str("new Foo(1, 2);");
         match &e.kind {
             ExprKind::IndirectMethodCall(class, method, args) => {
-                assert!(matches!(class.kind, ExprKind::Bareword(ref n) if n == "Foo"));
+                assert!(matches!(&class.kind, ExprKind::Bareword(n) if n == "Foo"));
                 assert_eq!(method, "new");
                 assert_eq!(args.len(), 2);
             }
@@ -3930,7 +4019,7 @@ mod tests {
         let e = parse_expr_str("new Foo;");
         match &e.kind {
             ExprKind::IndirectMethodCall(class, method, args) => {
-                assert!(matches!(class.kind, ExprKind::Bareword(ref n) if n == "Foo"));
+                assert!(matches!(&class.kind, ExprKind::Bareword(n) if n == "Foo"));
                 assert_eq!(method, "new");
                 assert_eq!(args.len(), 0);
             }
@@ -5147,15 +5236,265 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "C7: filehandle not separated from args"]
     fn parse_print_filehandle() {
         let e = parse_expr_str("print STDERR 'error';");
         match &e.kind {
-            ExprKind::ListOp(name, args) => {
+            ExprKind::PrintOp(name, fh, args) => {
                 assert_eq!(name, "print");
-                assert!(args.len() >= 2);
+                match fh.as_deref() {
+                    Some(Expr { kind: ExprKind::Bareword(n), .. }) => assert_eq!(n, "STDERR"),
+                    other => panic!("expected filehandle Bareword('STDERR'), got {other:?}"),
+                }
+                assert_eq!(args.len(), 1);
             }
-            other => panic!("expected print with filehandle, got {other:?}"),
+            other => panic!("expected PrintOp with filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_filehandle_parens() {
+        // print(STDERR "testing\n") — parenthesized form.
+        let e = parse_expr_str(r#"print(STDERR "testing\n");"#);
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected PrintOp with filehandle (parens), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_comma_not_filehandle() {
+        // print STDERR, "hello" — comma means STDERR is an arg, not filehandle.
+        let e = parse_expr_str("print STDERR, 'hello';");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected PrintOp with no filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_scalar_filehandle() {
+        // print $fh "hello" — $fh is filehandle.
+        let e = parse_expr_str("print $fh 'hello';");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::ScalarVar(n), .. }) if n == "fh"));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected PrintOp with scalar filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_bare_no_args() {
+        // print STDERR; — filehandle with no args (prints $_ to STDERR).
+        let e = parse_expr_str("print STDERR;");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected PrintOp with filehandle, no args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_say_filehandle() {
+        let e = parse_expr_str("say STDERR 'error';");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "say");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected say PrintOp with filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_printf_filehandle() {
+        let e = parse_expr_str("printf STDERR '%s', $msg;");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "printf");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected printf PrintOp with filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_no_args() {
+        // print; — prints $_ to default output.
+        let e = parse_expr_str("print;");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected PrintOp with no args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_parens_no_args() {
+        // print() — prints $_ to default output (paren form).
+        let e = parse_expr_str("print();");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected PrintOp() with no args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_parens_fh_no_args() {
+        // print(STDERR); — bareword filehandle in parens, no args (prints $_).
+        let e = parse_expr_str("print(STDERR);");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
+                assert_eq!(args.len(), 0);
+            }
+            other => panic!("expected PrintOp(STDERR) with no args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_parens_scalar_fh() {
+        // print($fh $_); — $fh is filehandle (followed by $_, a term).
+        let e = parse_expr_str("print($fh $_);");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::ScalarVar(n), .. }) if n == "fh"));
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "_"));
+            }
+            other => panic!("expected PrintOp($fh, [$_]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_parens_scalar_not_fh() {
+        // print($f); — $f NOT a filehandle (followed by ), not a term).
+        // Prints value of $f to STDOUT.
+        let e = parse_expr_str("print($f);");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "f"));
+            }
+            other => panic!("expected PrintOp(None, [$f]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_scalar_not_fh() {
+        // print $f; — $f NOT a filehandle (followed by ;, not a term).
+        let e = parse_expr_str("print $f;");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "f"));
+            }
+            other => panic!("expected PrintOp(None, [$f]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_say_no_filehandle() {
+        let e = parse_expr_str("say 'hello';");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "say");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected say PrintOp with no filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_say_parens_filehandle() {
+        let e = parse_expr_str("say(STDERR 'hello');");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "say");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected say PrintOp with filehandle (parens), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_printf_no_filehandle() {
+        let e = parse_expr_str("printf '%s', $msg;");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "printf");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected printf PrintOp with no filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_printf_parens_filehandle() {
+        let e = parse_expr_str("printf(STDERR '%s', $msg);");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "printf");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected printf PrintOp with filehandle (parens), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_stdout_filehandle() {
+        let e = parse_expr_str("print STDOUT 'hello';");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDOUT"));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected print STDOUT filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_print_postfix_if() {
+        // print "hello" if $cond; — postfix control should work with PrintOp.
+        let prog = parse("print 'hello' if $cond;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::If, body, _), .. }) => {
+                assert!(matches!(body.kind, ExprKind::PrintOp(_, _, _)));
+            }
+            other => panic!("expected PostfixControl(If, PrintOp), got {other:?}"),
         }
     }
 

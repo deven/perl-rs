@@ -190,8 +190,14 @@ pub enum ExprKind {
     Bareword(String),
 
     // ── List operators ────────────────────────────────────────
-    /// `print EXPR, EXPR` — list operator with args.
+    /// List operator with args: `push @arr, 1`, `join ',', @arr`, etc.
     ListOp(String, Vec<Expr>),
+
+    // ── Print operators ───────────────────────────────────────
+    /// `print`, `say`, `printf` — with optional filehandle.
+    /// `print STDERR "hello"` → filehandle = Some(Bareword("STDERR")).
+    /// `print "hello"` → filehandle = None.
+    PrintOp(String, Option<Box<Expr>>, Vec<Expr>),
 
     // ── Regex operations ──────────────────────────────────────
     /// `s/pattern/replacement/flags`.
