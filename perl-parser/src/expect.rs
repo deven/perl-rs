@@ -1,111 +1,95 @@
-//! Lexer–parser expectation state (§5.2).
+//! Lexer expectation state.
 //!
-//! The `Expect` struct tells the lexer how to resolve context-sensitive
-//! tokens like `/` (regex vs division) and `{` (block vs hash).  The
-//! parser updates this after consuming each token or construct.
+//! The `Expect` enum tells the lexer how to resolve context-sensitive
+//! tokens: `/` (regex vs division), `{` (block vs hash), and `(`
+//! (prototype vs grouping).  The parser sets this before each peek
+//! to communicate syntactic context to the lexer.
 //!
-//! This decomposes Perl 5's 11 `PL_expect` states into orthogonal fields.
+//! Maps to Perl 5's `PL_expect` states.  `XTERMORDORDOR` is folded
+//! into `Term` (we always lex `//` as defined-or), and the five block
+//! variants are collapsed into `Block(ExpectNext)`, where `ExpectNext`
+//! carries the state to restore after `}` — the equivalent of Perl's
+//! bracket stack.  `Prototype` has no `PL_expect` equivalent.
 
-/// What the lexer should expect next: a term or an operator?
+/// Lexer expectation state.
+///
+/// Set by the parser before each peek to tell the lexer how to resolve
+/// context-sensitive tokens (`/`, `{`, `(`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BaseExpect {
-    /// Expecting a value, prefix operator, or keyword.
-    /// `/` starts a regex.
+pub enum Expect {
+    /// Expecting a term (value, prefix operator, or keyword).
+    /// `/` starts a regex; `{` is a hash constructor.
     #[default]
-    Term,
+    Term, // XTERM | XTERMORDORDOR
 
-    /// Expecting an infix/postfix operator.
-    /// `/` is division.
-    Operator,
+    /// Expecting an infix or postfix operator.
+    /// `/` is division; `{` is a block brace.
+    Operator, // XOPERATOR
 
     /// Start of a statement.  Like Term, but labels are allowed
     /// and statement-level declarations (format, sub) are valid.
+    /// `/` starts a regex; `{` uses the byte-level heuristic.
+    Statement, // XSTATE
+
+    /// Expecting `{` to open a block.
+    /// After the matching `}`, the parser restores the given state.
+    Block(ExpectNext), // XBLOCK | XATTRBLOCK | XATTRTERM | XTERMBLOCK | XBLOCKTERM
+
+    /// After a sigil (`$`, `@`, `%`, `&`) for dereference.
+    /// `{` is a deref block, not a hash constructor.
+    Deref, // XREF
+
+    /// After `->` for postfix dereference (`->@*`, `->$*`, `->%*`).
+    Postderef, // XPOSTDEREF
+
+    /// After `sub name` (without `use feature 'signatures'`).
+    /// `(` scans a raw prototype string instead of tokenizing.
+    Prototype,
+}
+
+/// What to expect after a block's closing `}`.
+///
+/// Equivalent to the value Perl pushes onto `PL_lex_brackstack` when
+/// `{` is encountered, and restores when the matching `}` is reached.
+/// In our recursive-descent parser, this is carried in the `Block`
+/// variant rather than an explicit stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectNext {
+    /// Block is a statement body (`if`/`while`/`for`/`sub`).
+    /// After `}`, expect a new statement.
     Statement,
 
-    /// After `->`.  The next token is a method name, subscript
-    /// key, or sigil for postfix deref.
-    Ref,
+    /// Block produces a value (`eval`/`do`/anonymous sub).
+    /// After `}`, expect an operator.
+    Operator,
 
-    /// After `->` for postfix dereference syntax (`$ref->@*`).
-    Postderef,
-
-    /// After `sub name` — if `(` follows, scan it as a raw prototype
-    /// string (not tokenized).  Matches toke.c's `scan_str()` call
-    /// inside `yyl_sub()`.
-    Proto,
-}
-
-/// How to interpret `{` when encountered.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BraceDisposition {
-    /// Use parser position and local token context to determine
-    /// whether `{` is a block or hash.
-    #[default]
-    Infer,
-
-    /// `{` is a statement block.  After `}`, expect a statement.
-    /// Used after `if (expr)`, `while (expr)`, etc.
-    Block,
-
-    /// `{` is a block-expression.  After `}`, expect an operator.
-    /// Used for `do { }`, anonymous subs, etc.
-    BlockExpr,
-
-    /// `{` is a block argument.  After `}`, expect a term.
-    /// Used after `->method` where the block is an argument.
-    BlockArg,
-
-    /// `{` is a hash constructor.
-    /// Used after filetest operators (the XTERMORDORDOR case).
-    Hash,
-}
-
-/// Combined expectation state.
-///
-/// Maps to Perl 5's states:
-///
-/// | Perl 5 state   | base      | brace     | allow_attributes |
-/// |----------------|-----------|-----------|------------------|
-/// | XOPERATOR      | Operator  | Infer     | false            |
-/// | XTERM          | Term      | Infer     | false            |
-/// | XSTATE         | Statement | Infer     | false            |
-/// | XBLOCK         | Term      | Block     | false            |
-/// | XREF           | Ref       | Infer     | false            |
-/// | XPOSTDEREF     | Postderef | Infer     | false            |
-/// | XATTRBLOCK     | Term      | Block     | true             |
-/// | XATTRTERM      | Term      | BlockExpr | true             |
-/// | XTERMBLOCK     | Term      | BlockExpr | false            |
-/// | XBLOCKTERM     | Term      | BlockArg  | false            |
-/// | XTERMORDORDOR  | Operator  | Hash      | false            |
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Expect {
-    pub base: BaseExpect,
-    pub brace: BraceDisposition,
-    pub allow_attributes: bool,
+    /// Block is a leading argument (`sort`/`map`/`grep`).
+    /// After `}`, expect a term (the list to operate on).
+    Term,
 }
 
 impl Expect {
     // ── Named presets matching Perl 5's states ────────────────
 
-    pub const XOPERATOR: Expect = Expect { base: BaseExpect::Operator, brace: BraceDisposition::Infer, allow_attributes: false };
-    pub const XTERM: Expect = Expect { base: BaseExpect::Term, brace: BraceDisposition::Infer, allow_attributes: false };
-    pub const XSTATE: Expect = Expect { base: BaseExpect::Statement, brace: BraceDisposition::Infer, allow_attributes: false };
-    pub const XBLOCK: Expect = Expect { base: BaseExpect::Term, brace: BraceDisposition::Block, allow_attributes: false };
-    pub const XREF: Expect = Expect { base: BaseExpect::Ref, brace: BraceDisposition::Infer, allow_attributes: false };
-    pub const XPOSTDEREF: Expect = Expect { base: BaseExpect::Postderef, brace: BraceDisposition::Infer, allow_attributes: false };
-    pub const XATTRBLOCK: Expect = Expect { base: BaseExpect::Term, brace: BraceDisposition::Block, allow_attributes: true };
-    pub const XATTRTERM: Expect = Expect { base: BaseExpect::Term, brace: BraceDisposition::BlockExpr, allow_attributes: true };
-    pub const XTERMBLOCK: Expect = Expect { base: BaseExpect::Term, brace: BraceDisposition::BlockExpr, allow_attributes: false };
-    pub const XBLOCKTERM: Expect = Expect { base: BaseExpect::Term, brace: BraceDisposition::BlockArg, allow_attributes: false };
-    pub const XTERMORDORDOR: Expect = Expect { base: BaseExpect::Operator, brace: BraceDisposition::Hash, allow_attributes: false };
+    pub const XOPERATOR: Expect = Expect::Operator;
+    pub const XTERM: Expect = Expect::Term;
+    pub const XSTATE: Expect = Expect::Statement;
+    pub const XBLOCK: Expect = Expect::Block(ExpectNext::Statement);
+    pub const XREF: Expect = Expect::Deref;
+    pub const XPOSTDEREF: Expect = Expect::Postderef;
+    pub const XATTRBLOCK: Expect = Expect::Block(ExpectNext::Statement);
+    pub const XATTRTERM: Expect = Expect::Block(ExpectNext::Operator);
+    pub const XTERMBLOCK: Expect = Expect::Block(ExpectNext::Operator);
+    pub const XBLOCKTERM: Expect = Expect::Block(ExpectNext::Term);
+    pub const XTERMORDORDOR: Expect = Expect::Term;
 
     /// Are we in a position where `/` should be a regex?
     pub fn slash_is_regex(&self) -> bool {
-        matches!(self.base, BaseExpect::Term | BaseExpect::Statement)
+        matches!(self, Expect::Term | Expect::Statement | Expect::Deref)
     }
 
     /// Are we expecting a term (value, prefix, keyword)?
     pub fn expecting_term(&self) -> bool {
-        matches!(self.base, BaseExpect::Term | BaseExpect::Statement)
+        matches!(self, Expect::Term | Expect::Statement | Expect::Deref)
     }
 }

@@ -8,7 +8,7 @@
 //! heredocs, and regex scanning are handled by helper methods.
 
 use crate::error::ParseError;
-use crate::expect::{BaseExpect, BraceDisposition, Expect};
+use crate::expect::Expect;
 use crate::keyword;
 use crate::span::Span;
 use crate::token::*;
@@ -498,7 +498,7 @@ impl<'src> Lexer<'src> {
             }
             b'(' => {
                 self.pos += 1;
-                if expect.base == BaseExpect::Proto {
+                if *expect == Expect::Prototype {
                     // Prototype scanning: read raw bytes until matching ).
                     // Matches toke.c's scan_str() call in yyl_sub().
                     let content = self.scan_balanced_string(b'(', b')')?;
@@ -522,33 +522,19 @@ impl<'src> Lexer<'src> {
             b'{' => {
                 self.pos += 1;
                 // Brace disambiguation matching toke.c yyl_leftcurly().
-                //
-                // Explicit brace disposition (set by parser) takes priority,
-                // then base expect state, then the heuristic for the
-                // ambiguous statement-level case.
-                match expect.brace {
-                    // XBLOCK / XTERMBLOCK / XBLOCKTERM → always block.
-                    BraceDisposition::Block | BraceDisposition::BlockExpr | BraceDisposition::BlockArg => Token::LBrace,
-                    // Explicitly marked as hash.
-                    BraceDisposition::Hash => Token::HashBrace,
-                    BraceDisposition::Infer => match expect.base {
-                        // XTERM → always hash (toke.c lines 6313–6317).
-                        BaseExpect::Term => Token::HashBrace,
-                        // XOPERATOR → always block (toke.c lines 6318–6348).
-                        BaseExpect::Operator => Token::LBrace,
-                        // XREF → always block (toke.c lines 6379–6383).
-                        BaseExpect::Ref | BaseExpect::Postderef => Token::LBrace,
-                        // Proto: no prototype found, { is the sub body block.
-                        BaseExpect::Proto => Token::LBrace,
-                        // XSTATE / default → heuristic (toke.c lines 6360–6501).
-                        BaseExpect::Statement => {
-                            if self.looks_like_hash_content() {
-                                Token::HashBrace
-                            } else {
-                                Token::LBrace
-                            }
+                match expect {
+                    // XTERM → always hash (toke.c lines 6313–6317).
+                    Expect::Term => Token::HashBrace,
+                    // XSTATE → heuristic (toke.c lines 6360–6501).
+                    Expect::Statement => {
+                        if self.looks_like_hash_content() {
+                            Token::HashBrace
+                        } else {
+                            Token::LBrace
                         }
-                    },
+                    }
+                    // Everything else → block brace.
+                    _ => Token::LBrace,
                 }
             }
             b'}' => {
@@ -1065,7 +1051,7 @@ impl<'src> Lexer<'src> {
         // After -> (Ref position), all words are identifiers — no keyword
         // lookup.  `$obj->method`, `$obj->keys`, `$obj->print` are all
         // method calls, not keywords.
-        if expect.base == BaseExpect::Ref {
+        if *expect == Expect::Deref {
             return Ok(Token::Ident(name));
         }
 
@@ -2010,7 +1996,7 @@ mod tests {
 
     fn lex_all(src: &str) -> Vec<Token> {
         let mut lexer = Lexer::new(src.as_bytes());
-        let mut expect = Expect::XSTATE;
+        let mut expect = Expect::Statement;
         let mut tokens = Vec::new();
         loop {
             let spanned = lexer.next_token(&expect).unwrap();
@@ -2046,21 +2032,21 @@ mod tests {
                 | Token::Arrow => {
                     // Arrow: toke.c's TOKEN(ARROW) doesn't change PL_expect,
                     // so it inherits XOPERATOR from the preceding term.
-                    expect.base = BaseExpect::Operator;
+                    expect = Expect::Operator;
                 }
                 Token::Semi | Token::LBrace => {
-                    expect = Expect::XSTATE;
+                    expect = Expect::Statement;
                 }
                 // HASHBRACK in toke.c is returned via OPERATOR() which
                 // sets PL_expect = XTERM — the first thing in a hash
                 // literal is a term (key expression).
                 Token::HashBrace => {
-                    expect.base = BaseExpect::Term;
+                    expect = Expect::Term;
                 }
                 // Sub-tokens inside strings don't affect expect.
                 Token::QuoteBegin(_, _) | Token::ConstSegment(_) | Token::InterpScalar(_) | Token::InterpArray(_) => {}
                 _ => {
-                    expect.base = BaseExpect::Term;
+                    expect = Expect::Term;
                 }
             }
             tokens.push(spanned.token);
@@ -3225,28 +3211,10 @@ mod tests {
         assert_eq!(lex_brace("{key}", Expect::XPOSTDEREF), Token::LBrace);
     }
 
-    // ── Explicit BraceDisposition overrides ───────────────────
-
-    #[test]
-    fn brace_explicit_block_overrides_term_base() {
-        // Even with Term base, explicit Block disposition → LBrace.
-        let mut e = Expect::XTERM;
-        e.brace = BraceDisposition::Block;
-        assert_eq!(lex_brace("{ 1 }", e), Token::LBrace);
-    }
-
-    #[test]
-    fn brace_explicit_hash_overrides_operator_base() {
-        // Even with Operator base, explicit Hash disposition → HashBrace.
-        let mut e = Expect::XOPERATOR;
-        e.brace = BraceDisposition::Hash;
-        assert_eq!(lex_brace("{ 1 }", e), Token::HashBrace);
-    }
-
-    // ── Heuristic (XSTATE) — toke.c default case ─────────────
+    // ── Heuristic (XSTATE / Statement) — toke.c default case ─
     //
-    // When PL_expect is XSTATE (statement level, brace=Infer),
-    // toke.c scans the content after { to decide.  Lines 6400–6471.
+    // When PL_expect is XSTATE (statement level), toke.c scans the
+    // content after { to decide block vs hash.  Lines 6400–6471.
 
     #[test]
     fn brace_heuristic_empty_is_hash() {
