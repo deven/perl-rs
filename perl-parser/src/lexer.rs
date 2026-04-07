@@ -114,7 +114,7 @@ impl<'src> Lexer<'src> {
         Some(b)
     }
 
-    fn remaining(&self) -> &'src [u8] {
+    pub fn remaining(&self) -> &'src [u8] {
         &self.src[self.pos..]
     }
 
@@ -358,6 +358,16 @@ impl<'src> Lexer<'src> {
             b'}' => {
                 self.pos += 1;
                 Token::RBrace
+            }
+
+            // ^D (0x04) and ^Z (0x1a) — logical end of script.
+            b'\x04' => {
+                self.pos += 1;
+                Token::DataEnd(DataEndMarker::CtrlD)
+            }
+            b'\x1a' => {
+                self.pos += 1;
+                Token::DataEnd(DataEndMarker::CtrlZ)
             }
 
             other => {
@@ -776,7 +786,8 @@ impl<'src> Lexer<'src> {
                 return Ok(Token::Ident(name));
             }
             "__END__" | "__DATA__" => {
-                return Ok(Token::DataEnd);
+                let marker = if name == "__END__" { DataEndMarker::End } else { DataEndMarker::Data };
+                return Ok(Token::DataEnd(marker));
             }
             _ => {}
         }
@@ -2603,12 +2614,24 @@ mod tests {
     #[test]
     fn lex_end_token() {
         let tokens = lex_all("1;\n__END__\nstuff");
-        assert!(tokens.contains(&Token::DataEnd));
+        assert!(tokens.contains(&Token::DataEnd(DataEndMarker::End)));
     }
 
     #[test]
     fn lex_data_token() {
         let tokens = lex_all("1;\n__DATA__\nstuff");
-        assert!(tokens.contains(&Token::DataEnd));
+        assert!(tokens.contains(&Token::DataEnd(DataEndMarker::Data)));
+    }
+
+    #[test]
+    fn lex_ctrl_d_eof() {
+        let tokens = lex_all("1;\x04more stuff");
+        assert!(tokens.contains(&Token::DataEnd(DataEndMarker::CtrlD)));
+    }
+
+    #[test]
+    fn lex_ctrl_z_eof() {
+        let tokens = lex_all("1;\x1amore stuff");
+        assert!(tokens.contains(&Token::DataEnd(DataEndMarker::CtrlZ)));
     }
 }

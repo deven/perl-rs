@@ -183,7 +183,7 @@ impl<'src> Parser<'src> {
 
         while !self.at_eof() {
             let stmt = self.parse_statement()?;
-            let is_data_end = matches!(stmt.kind, StmtKind::DataEnd);
+            let is_data_end = matches!(stmt.kind, StmtKind::DataEnd(_, _));
             statements.push(stmt);
             if is_data_end {
                 break; // __END__ / __DATA__ — everything after is not code
@@ -205,12 +205,32 @@ impl<'src> Parser<'src> {
             return Ok(Statement { kind: StmtKind::Empty, span: start });
         }
 
-        // __END__ / __DATA__ — stop parsing immediately
-        if matches!(self.peek(), Token::DataEnd) {
+        // __END__ / __DATA__ / ^D / ^Z — stop parsing immediately
+        if let Token::DataEnd(marker) = self.peek() {
+            let marker = *marker;
             self.advance();
+            // Compute the byte offset where trailing data begins.
+            let data_offset = match marker {
+                // ^D / ^Z: data starts immediately after the control char.
+                DataEndMarker::CtrlD | DataEndMarker::CtrlZ => self.lexer.current_pos() as u32,
+                // __END__ / __DATA__: data starts after the rest of the current line.
+                DataEndMarker::End | DataEndMarker::Data => {
+                    let pos = self.lexer.current_pos();
+                    let src = self.lexer.remaining();
+                    // Skip to end of line.
+                    let mut i = 0;
+                    while i < src.len() && src[i] != b'\n' {
+                        i += 1;
+                    }
+                    if i < src.len() {
+                        i += 1; // skip the newline
+                    }
+                    (pos + i) as u32
+                }
+            };
             // Skip all remaining source — everything after is not code.
             self.lexer.skip_to_end();
-            return Ok(Statement { kind: StmtKind::DataEnd, span: start.merge(self.peek_span()) });
+            return Ok(Statement { kind: StmtKind::DataEnd(marker, data_offset), span: start.merge(self.peek_span()) });
         }
 
         let kind = match self.peek().clone() {
@@ -3261,17 +3281,55 @@ mod tests {
 
     #[test]
     fn parse_end_stops_parsing() {
-        let prog = parse("my $x = 1;\n__END__\nThis is not code.\n");
+        let src = "my $x = 1;\n__END__\nThis is not code.\n";
+        let prog = parse(src);
         // Should have 2 statements: my decl and DataEnd
         assert_eq!(prog.statements.len(), 2);
-        assert!(matches!(prog.statements[1].kind, StmtKind::DataEnd));
+        match &prog.statements[1].kind {
+            StmtKind::DataEnd(DataEndMarker::End, offset) => {
+                assert_eq!(&src.as_bytes()[*offset as usize..], b"This is not code.\n");
+            }
+            other => panic!("expected DataEnd(End), got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_data_stops_parsing() {
-        let prog = parse("my $x = 1;\n__DATA__\nraw data here\n");
+        let src = "my $x = 1;\n__DATA__\nraw data here\n";
+        let prog = parse(src);
         assert_eq!(prog.statements.len(), 2);
-        assert!(matches!(prog.statements[1].kind, StmtKind::DataEnd));
+        match &prog.statements[1].kind {
+            StmtKind::DataEnd(DataEndMarker::Data, offset) => {
+                assert_eq!(&src.as_bytes()[*offset as usize..], b"raw data here\n");
+            }
+            other => panic!("expected DataEnd(Data), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ctrl_d_stops_parsing() {
+        let src = "my $x = 1;\x04ignored code\n";
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 2);
+        match &prog.statements[1].kind {
+            StmtKind::DataEnd(DataEndMarker::CtrlD, offset) => {
+                assert_eq!(&src.as_bytes()[*offset as usize..], b"ignored code\n");
+            }
+            other => panic!("expected DataEnd(CtrlD), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ctrl_z_stops_parsing() {
+        let src = "my $x = 1;\x1aignored code\n";
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 2);
+        match &prog.statements[1].kind {
+            StmtKind::DataEnd(DataEndMarker::CtrlZ, offset) => {
+                assert_eq!(&src.as_bytes()[*offset as usize..], b"ignored code\n");
+            }
+            other => panic!("expected DataEnd(CtrlZ), got {other:?}"),
+        }
     }
 
     // ── Pod skipping test ─────────────────────────────────────
