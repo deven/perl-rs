@@ -498,7 +498,14 @@ impl<'src> Lexer<'src> {
             }
             b'(' => {
                 self.pos += 1;
-                Token::LParen
+                if expect.base == BaseExpect::Proto {
+                    // Prototype scanning: read raw bytes until matching ).
+                    // Matches toke.c's scan_str() call in yyl_sub().
+                    let content = self.scan_balanced_string(b'(', b')')?;
+                    Token::Prototype(content)
+                } else {
+                    Token::LParen
+                }
             }
             b')' => {
                 self.pos += 1;
@@ -531,6 +538,8 @@ impl<'src> Lexer<'src> {
                         BaseExpect::Operator => Token::LBrace,
                         // XREF → always block (toke.c lines 6379–6383).
                         BaseExpect::Ref | BaseExpect::Postderef => Token::LBrace,
+                        // Proto: no prototype found, { is the sub body block.
+                        BaseExpect::Proto => Token::LBrace,
                         // XSTATE / default → heuristic (toke.c lines 6360–6501).
                         BaseExpect::Statement => {
                             if self.looks_like_hash_content() {
