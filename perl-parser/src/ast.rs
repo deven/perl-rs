@@ -117,7 +117,12 @@ pub enum ExprKind {
     HashVar(String),
     GlobVar(String),
     ArrayLen(String),
+    /// `$!`, `$^W`, `${^MATCH}`, `$/`, etc.
     SpecialVar(String),
+    /// `@+`, `@-`, `@{^CAPTURE}`, etc.
+    SpecialArrayVar(String),
+    /// `%!`, `%+`, `%-`, `%{^CAPTURE}`, etc.
+    SpecialHashVar(String),
 
     /// `my $x`, `our ($a, $b)`, `state $x` in expression context.
     /// The Pratt parser handles `= expr` as normal assignment wrapping this.

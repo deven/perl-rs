@@ -533,6 +533,24 @@ impl<'src> Lexer<'src> {
                 return Ok(Token::ScalarVar(name));
             }
             Some(b'{') => {
+                // ${^Foo} — demarcated caret variable
+                if self.peek_byte_at(1) == Some(b'^') {
+                    self.pos += 2; // skip { and ^
+                    let ident_start = self.pos;
+                    while let Some(b) = self.peek_byte() {
+                        if b.is_ascii_alphanumeric() || b == b'_' {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let ident = std::str::from_utf8(&self.src[ident_start..self.pos]).unwrap();
+                    let name = format!("^{ident}");
+                    if self.peek_byte() == Some(b'}') {
+                        self.pos += 1;
+                    }
+                    return Ok(Token::SpecialVar(name));
+                }
                 // ${name} — variable with brace disambiguation
                 // ${$ref} or ${expr} — dereference block (return Dollar, let parser handle {})
                 if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
@@ -553,6 +571,18 @@ impl<'src> Lexer<'src> {
                 }
                 self.pos += 1;
                 return Ok(Token::SpecialVar("$".into()));
+            }
+            Some(b'^') => {
+                // $^X — caret variable (single character after ^)
+                if let Some(next) = self.peek_byte_at(1) {
+                    if next.is_ascii_alphabetic() || next == b'[' || next == b']' {
+                        self.pos += 2; // skip ^ and the character
+                        let name = format!("^{}", next as char);
+                        return Ok(Token::SpecialVar(name));
+                    }
+                }
+                // Bare $^ — not a caret variable
+                return Ok(Token::Dollar);
             }
             Some(b'!') => {
                 self.pos += 1;
@@ -595,6 +625,32 @@ impl<'src> Lexer<'src> {
     fn lex_at(&mut self) -> Result<Token, ParseError> {
         self.pos += 1; // skip @
         match self.peek_byte() {
+            Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
+                // @{^CAPTURE} etc.
+                self.pos += 2; // skip { and ^
+                let ident_start = self.pos;
+                while let Some(b) = self.peek_byte() {
+                    if b.is_ascii_alphanumeric() || b == b'_' {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let ident = std::str::from_utf8(&self.src[ident_start..self.pos]).unwrap();
+                let name = format!("^{ident}");
+                if self.peek_byte() == Some(b'}') {
+                    self.pos += 1;
+                }
+                Ok(Token::SpecialArrayVar(name))
+            }
+            Some(b'+') => {
+                self.pos += 1;
+                Ok(Token::SpecialArrayVar("+".into()))
+            }
+            Some(b'-') => {
+                self.pos += 1;
+                Ok(Token::SpecialArrayVar("-".into()))
+            }
             Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
                 let name = self.scan_ident();
                 Ok(Token::ArrayVar(name))
@@ -608,6 +664,36 @@ impl<'src> Lexer<'src> {
         if expect.expecting_term() {
             self.pos += 1;
             match self.peek_byte() {
+                Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
+                    // %{^CAPTURE} etc.
+                    self.pos += 2; // skip { and ^
+                    let ident_start = self.pos;
+                    while let Some(b) = self.peek_byte() {
+                        if b.is_ascii_alphanumeric() || b == b'_' {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let ident = std::str::from_utf8(&self.src[ident_start..self.pos]).unwrap();
+                    let name = format!("^{ident}");
+                    if self.peek_byte() == Some(b'}') {
+                        self.pos += 1;
+                    }
+                    Ok(Token::SpecialHashVar(name))
+                }
+                Some(b'!') => {
+                    self.pos += 1;
+                    Ok(Token::SpecialHashVar("!".into()))
+                }
+                Some(b'+') => {
+                    self.pos += 1;
+                    Ok(Token::SpecialHashVar("+".into()))
+                }
+                Some(b'-') => {
+                    self.pos += 1;
+                    Ok(Token::SpecialHashVar("-".into()))
+                }
                 Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
                     let name = self.scan_ident();
                     Ok(Token::HashVar(name))
@@ -1587,7 +1673,9 @@ mod tests {
                 | Token::HeredocLit(_, _, _)
                 | Token::Readline(_)
                 | Token::GlobVar(_)
-                | Token::QwList(_) => {
+                | Token::QwList(_)
+                | Token::SpecialArrayVar(_)
+                | Token::SpecialHashVar(_) => {
                     expect.base = BaseExpect::Operator;
                 }
                 Token::Semi | Token::LBrace => {
@@ -2331,6 +2419,123 @@ mod tests {
     fn lex_multi_digit_capture() {
         let tokens = lex_all("$12");
         assert_eq!(tokens, vec![Token::SpecialVar("12".into())]);
+    }
+
+    // ── Caret variable tests ──────────────────────────────────
+
+    #[test]
+    fn lex_caret_w() {
+        let tokens = lex_all("$^W");
+        assert_eq!(tokens, vec![Token::SpecialVar("^W".into())]);
+    }
+
+    #[test]
+    fn lex_caret_o() {
+        let tokens = lex_all("$^O");
+        assert_eq!(tokens, vec![Token::SpecialVar("^O".into())]);
+    }
+
+    #[test]
+    fn lex_caret_x() {
+        let tokens = lex_all("$^X");
+        assert_eq!(tokens, vec![Token::SpecialVar("^X".into())]);
+    }
+
+    #[test]
+    fn lex_caret_bracket() {
+        // $^[ is the $COMPILING variable.
+        let tokens = lex_all("$^[");
+        assert_eq!(tokens, vec![Token::SpecialVar("^[".into())]);
+    }
+
+    #[test]
+    fn lex_demarcated_caret_match() {
+        let tokens = lex_all("${^MATCH}");
+        assert_eq!(tokens, vec![Token::SpecialVar("^MATCH".into())]);
+    }
+
+    #[test]
+    fn lex_demarcated_caret_postmatch() {
+        let tokens = lex_all("${^POSTMATCH}");
+        assert_eq!(tokens, vec![Token::SpecialVar("^POSTMATCH".into())]);
+    }
+
+    #[test]
+    fn lex_demarcated_caret_utf8locale() {
+        let tokens = lex_all("${^UTF8LOCALE}");
+        assert_eq!(tokens, vec![Token::SpecialVar("^UTF8LOCALE".into())]);
+    }
+
+    #[test]
+    fn lex_demarcated_caret_warning_bits() {
+        let tokens = lex_all("${^WARNING_BITS}");
+        assert_eq!(tokens, vec![Token::SpecialVar("^WARNING_BITS".into())]);
+    }
+
+    // ── Special array variable tests ──────────────────────────
+
+    #[test]
+    fn lex_special_array_plus() {
+        let tokens = lex_all("@+");
+        assert_eq!(tokens, vec![Token::SpecialArrayVar("+".into())]);
+    }
+
+    #[test]
+    fn lex_special_array_minus() {
+        let tokens = lex_all("@-");
+        assert_eq!(tokens, vec![Token::SpecialArrayVar("-".into())]);
+    }
+
+    #[test]
+    fn lex_special_array_caret_capture() {
+        let tokens = lex_all("@{^CAPTURE}");
+        assert_eq!(tokens, vec![Token::SpecialArrayVar("^CAPTURE".into())]);
+    }
+
+    #[test]
+    fn lex_regular_array_not_special() {
+        // @foo is a regular array, not special.
+        let tokens = lex_all("@foo");
+        assert_eq!(tokens, vec![Token::ArrayVar("foo".into())]);
+    }
+
+    // ── Special hash variable tests ───────────────────────────
+
+    #[test]
+    fn lex_special_hash_bang() {
+        let tokens = lex_all("%!");
+        assert_eq!(tokens, vec![Token::SpecialHashVar("!".into())]);
+    }
+
+    #[test]
+    fn lex_special_hash_plus() {
+        let tokens = lex_all("%+");
+        assert_eq!(tokens, vec![Token::SpecialHashVar("+".into())]);
+    }
+
+    #[test]
+    fn lex_special_hash_minus() {
+        let tokens = lex_all("%-");
+        assert_eq!(tokens, vec![Token::SpecialHashVar("-".into())]);
+    }
+
+    #[test]
+    fn lex_special_hash_caret_capture() {
+        let tokens = lex_all("%{^CAPTURE}");
+        assert_eq!(tokens, vec![Token::SpecialHashVar("^CAPTURE".into())]);
+    }
+
+    #[test]
+    fn lex_special_hash_caret_capture_all() {
+        let tokens = lex_all("%{^CAPTURE_ALL}");
+        assert_eq!(tokens, vec![Token::SpecialHashVar("^CAPTURE_ALL".into())]);
+    }
+
+    #[test]
+    fn lex_regular_hash_not_special() {
+        // %foo is a regular hash, not special.
+        let tokens = lex_all("%foo");
+        assert_eq!(tokens, vec![Token::HashVar("foo".into())]);
     }
 
     // ── Regex edge cases ──────────────────────────────────────

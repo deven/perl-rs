@@ -242,8 +242,12 @@ pub enum Token {
     GlobVar(String),
     /// `$#name` — array last index.
     ArrayLen(String),
-    /// `$$`, `$!`, `$@`, `$_`, `$0`, `$/`, `$\`, etc.
+    /// `$$`, `$!`, `$@`, `$_`, `$0`, `$/`, `$\`, `$^W`, `${^MATCH}`, etc.
     SpecialVar(String),
+    /// `@+`, `@-`, `@{^CAPTURE}`, etc.
+    SpecialArrayVar(String),
+    /// `%!`, `%+`, `%-`, `%{^CAPTURE}`, etc.
+    SpecialHashVar(String),
 
     // ── Keywords ──────────────────────────────────────────────
     Keyword(Keyword),
@@ -443,6 +447,8 @@ impl Token {
                 | Token::HashVar(_)
                 | Token::GlobVar(_)
                 | Token::SpecialVar(_)
+                | Token::SpecialArrayVar(_)
+                | Token::SpecialHashVar(_)
                 | Token::LParen
                 | Token::LBracket
                 | Token::LBrace
@@ -480,6 +486,9 @@ impl std::fmt::Display for Token {
             Token::ScalarVar(s) => write!(f, "${s}"),
             Token::ArrayVar(s) => write!(f, "@{s}"),
             Token::HashVar(s) => write!(f, "%{s}"),
+            Token::SpecialVar(s) => write!(f, "${s}"),
+            Token::SpecialArrayVar(s) => write!(f, "@{s}"),
+            Token::SpecialHashVar(s) => write!(f, "%{s}"),
             Token::Semi => write!(f, ";"),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),

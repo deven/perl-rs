@@ -1090,6 +1090,8 @@ impl<'src> Parser<'src> {
             Token::GlobVar(name) => Ok(Expr { kind: ExprKind::GlobVar(name), span }),
             Token::ArrayLen(name) => Ok(Expr { kind: ExprKind::ArrayLen(name), span }),
             Token::SpecialVar(name) => Ok(Expr { kind: ExprKind::SpecialVar(name), span }),
+            Token::SpecialArrayVar(name) => Ok(Expr { kind: ExprKind::SpecialArrayVar(name), span }),
+            Token::SpecialHashVar(name) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
 
             // Prefix dereference: $$ref, @$ref, %$ref, ${expr}, @{expr}
             Token::Dollar => {
@@ -1793,6 +1795,8 @@ impl<'src> Parser<'src> {
             Token::ArrayVar(name) => Ok(Expr { kind: ExprKind::ArrayVar(name), span }),
             Token::HashVar(name) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
             Token::SpecialVar(name) => Ok(Expr { kind: ExprKind::SpecialVar(name), span }),
+            Token::SpecialArrayVar(name) => Ok(Expr { kind: ExprKind::SpecialArrayVar(name), span }),
+            Token::SpecialHashVar(name) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
             // Recursive: $$$ref
             Token::Dollar => {
                 let inner = self.parse_deref_operand()?;
@@ -4181,6 +4185,90 @@ mod tests {
     fn parse_lstat_underscore() {
         let e = parse_expr_str("lstat _;");
         assert!(matches!(e.kind, ExprKind::Lstat(StatTarget::StatCache)));
+    }
+
+    // ── Special array / hash variable tests ───────────────────
+
+    #[test]
+    fn parse_special_array_plus() {
+        let e = parse_expr_str("@+;");
+        match &e.kind {
+            ExprKind::SpecialArrayVar(name) => assert_eq!(name, "+"),
+            other => panic!("expected SpecialArrayVar('+'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_special_array_minus() {
+        let e = parse_expr_str("@-;");
+        match &e.kind {
+            ExprKind::SpecialArrayVar(name) => assert_eq!(name, "-"),
+            other => panic!("expected SpecialArrayVar('-'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "$+ not yet recognized by lex_dollar"]
+    fn parse_special_array_elem() {
+        // $+[0] — element access on special array @+.
+        let e = parse_expr_str("$+[0];");
+        match &e.kind {
+            ExprKind::ArrayElem(base, idx) => {
+                assert!(matches!(base.kind, ExprKind::SpecialVar(ref n) if n == "+"));
+                assert!(matches!(idx.kind, ExprKind::IntLit(0)));
+            }
+            other => panic!("expected ArrayElem(SpecialVar('+'), 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_special_hash_bang() {
+        let e = parse_expr_str("%!;");
+        match &e.kind {
+            ExprKind::SpecialHashVar(name) => assert_eq!(name, "!"),
+            other => panic!("expected SpecialHashVar('!'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_special_hash_plus() {
+        let e = parse_expr_str("%+;");
+        match &e.kind {
+            ExprKind::SpecialHashVar(name) => assert_eq!(name, "+"),
+            other => panic!("expected SpecialHashVar('+'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "brace after SpecialVar not parsed as hash subscript"]
+    fn parse_special_hash_elem() {
+        // $!{ENOENT} — element access on special hash %!.
+        let e = parse_expr_str("$!{ENOENT};");
+        match &e.kind {
+            ExprKind::HashElem(base, key) => {
+                assert!(matches!(base.kind, ExprKind::SpecialVar(ref n) if n == "!"));
+                assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "ENOENT"));
+            }
+            other => panic!("expected HashElem(SpecialVar('!'), 'ENOENT'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_special_array_caret_capture() {
+        let e = parse_expr_str("@{^CAPTURE};");
+        match &e.kind {
+            ExprKind::SpecialArrayVar(name) => assert_eq!(name, "^CAPTURE"),
+            other => panic!("expected SpecialArrayVar('^CAPTURE'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_special_hash_caret_capture_all() {
+        let e = parse_expr_str("%{^CAPTURE_ALL};");
+        match &e.kind {
+            ExprKind::SpecialHashVar(name) => assert_eq!(name, "^CAPTURE_ALL"),
+            other => panic!("expected SpecialHashVar('^CAPTURE_ALL'), got {other:?}"),
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
