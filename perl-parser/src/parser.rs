@@ -1430,10 +1430,7 @@ impl<'src> Parser<'src> {
             }
 
             // Yada yada yada (...)
-            Token::DotDotDot => Ok(Expr { kind: ExprKind::Todo("...".into()), span }),
-
-            // __END__ / __DATA__
-            Token::DataEnd => Ok(Expr { kind: ExprKind::Todo("__END__".into()), span }),
+            Token::DotDotDot => Ok(Expr { kind: ExprKind::YadaYada, span }),
 
             // Readline / diamond: <STDIN>, <>, <$fh>, <*.txt>
             Token::Readline(content) => {
@@ -2986,6 +2983,10 @@ mod tests {
         match &prog.statements[0].kind {
             StmtKind::SubDecl(sub) => {
                 assert_eq!(sub.body.statements.len(), 1);
+                match &sub.body.statements[0].kind {
+                    StmtKind::Expr(Expr { kind: ExprKind::YadaYada, .. }) => {}
+                    other => panic!("expected YadaYada, got {other:?}"),
+                }
             }
             other => panic!("expected SubDecl, got {other:?}"),
         }
@@ -3688,6 +3689,19 @@ mod tests {
                 assert_eq!(s, "No variables here.\n");
             }
             other => panic!("expected StringLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_single_quoted_no_interp() {
+        // <<'END' should NOT interpolate — $name stays literal
+        let src = "<<'END';\nHello $name!\nEND\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::StringLit(s), .. }) => {
+                assert_eq!(s, "Hello $name!\n");
+            }
+            other => panic!("expected StringLit with literal $name, got {other:?}"),
         }
     }
 }

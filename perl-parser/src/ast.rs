@@ -210,7 +210,8 @@ pub enum ExprKind {
     Wantarray,
 
     // ── Placeholder for incremental development ───────────────
-    Todo(String),
+    /// `...` — yada yada yada (unimplemented placeholder).
+    YadaYada,
 }
 
 /// Part of an interpolated string (§7.3).
