@@ -184,26 +184,26 @@ pub enum Keyword {
 /// Assignment operator variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignOp {
-    Eq,       // =
-    AddEq,    // +=
-    SubEq,    // -=
-    MulEq,    // *=
-    DivEq,    // /=
-    ModEq,    // %=
-    PowEq,    // **=
-    ConcatEq, // .=
-    AndEq,    // &&=
-    OrEq,     // ||=
-    DorEq,    // //=
-    BitAndEq, // &=
-    BitOrEq,  // |=
-    BitXorEq, // ^=
-    ShiftLEq, // <<=
-    ShiftREq, // >>=
-    RepeatEq, // x=
-    BandEq,   // &.=   (string bitand)
-    BorEq,    // |.=   (string bitor)
-    BxorEq,   // ^.=   (string bitxor)
+    Eq,          // =
+    AddEq,       // +=
+    SubEq,       // -=
+    MulEq,       // *=
+    DivEq,       // /=
+    ModEq,       // %=
+    PowEq,       // **=
+    ConcatEq,    // .=
+    AndEq,       // &&=
+    OrEq,        // ||=
+    DefinedOrEq, // //=
+    BitAndEq,    // &=
+    BitOrEq,     // |=
+    BitXorEq,    // ^=
+    ShiftLEq,    // <<=
+    ShiftREq,    // >>=
+    RepeatEq,    // x=
+    BandEq,      // &.=   (string bitand)
+    BorEq,       // |.=   (string bitor)
+    BxorEq,      // ^.=   (string bitxor)
 }
 
 /// Tokens emitted by the lexer.
@@ -281,11 +281,11 @@ pub enum Token {
     StrCmp,    // cmp
 
     // ── Operators — logical ───────────────────────────────────
-    AndAnd, // &&
-    OrOr,   // ||
-    DorDor, // //  (defined-or)
-    Bang,   // !
-    Not,    // not (low precedence, also keyword)
+    AndAnd,    // &&
+    OrOr,      // ||
+    DefinedOr, // //  (defined-or)
+    Bang,      // !
+    Not,       // not (low precedence, also keyword)
 
     // ── Operators — bitwise ───────────────────────────────────
     BitAnd, // &

@@ -69,20 +69,6 @@ pub enum ExpectNext {
 }
 
 impl Expect {
-    // ── Named presets matching Perl 5's states ────────────────
-
-    pub const XOPERATOR: Expect = Expect::Operator;
-    pub const XTERM: Expect = Expect::Term;
-    pub const XSTATE: Expect = Expect::Statement;
-    pub const XBLOCK: Expect = Expect::Block(ExpectNext::Statement);
-    pub const XREF: Expect = Expect::Deref;
-    pub const XPOSTDEREF: Expect = Expect::Postderef;
-    pub const XATTRBLOCK: Expect = Expect::Block(ExpectNext::Statement);
-    pub const XATTRTERM: Expect = Expect::Block(ExpectNext::Operator);
-    pub const XTERMBLOCK: Expect = Expect::Block(ExpectNext::Operator);
-    pub const XBLOCKTERM: Expect = Expect::Block(ExpectNext::Term);
-    pub const XTERMORDORDOR: Expect = Expect::Term;
-
     /// Are we in a position where `/` should be a regex?
     pub fn slash_is_regex(&self) -> bool {
         matches!(self, Expect::Term | Expect::Statement | Expect::Deref)

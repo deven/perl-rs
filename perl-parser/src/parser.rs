@@ -1477,6 +1477,20 @@ impl<'src> Parser<'src> {
 
             // Regex, substitution, transliteration
             Token::RegexLit(_kind, pattern, flags) => Ok(Expr { kind: ExprKind::Regex(pattern, flags), span }),
+            // // in term position is an empty regex, not defined-or.
+            // The lexer always returns DefinedOr for //; we convert here.
+            // Optional flags follow as an Ident (e.g. //i → DefinedOr + Ident("i")).
+            Token::DefinedOr => {
+                let flags = match self.peek() {
+                    Token::Ident(s) if s.chars().all(|c| "msixpgcadlun".contains(c)) => {
+                        let f = s.clone();
+                        self.advance();
+                        f
+                    }
+                    _ => String::new(),
+                };
+                Ok(Expr { kind: ExprKind::Regex(String::new(), flags), span })
+            }
             Token::SubstLit(pattern, replacement, flags) => {
                 let repl = if flags.contains('e') {
                     // With /e flag, the replacement is Perl code.
@@ -2261,7 +2275,7 @@ impl<'src> Parser<'src> {
     fn peek_op_info(&mut self) -> Option<OpInfo> {
         match self.peek() {
             Token::OrOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
-            Token::DorDor => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
+            Token::DefinedOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::AndAnd => Some(OpInfo { prec: PREC_AND, assoc: Assoc::Left }),
             Token::BitOr => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
             Token::BitXor => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
@@ -2343,7 +2357,7 @@ impl<'src> Parser<'src> {
 
             // Arrow
             Token::Arrow => {
-                self.expect = Expect::XREF;
+                self.expect = Expect::Deref;
                 self.parse_arrow_rhs(left)
             }
 
@@ -2538,7 +2552,7 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::StrCmp => Ok(BinOp::StrCmp),
         Token::AndAnd => Ok(BinOp::And),
         Token::OrOr => Ok(BinOp::Or),
-        Token::DorDor => Ok(BinOp::Dor),
+        Token::DefinedOr => Ok(BinOp::DefinedOr),
         Token::BitAnd => Ok(BinOp::BitAnd),
         Token::BitOr => Ok(BinOp::BitOr),
         Token::BitXor => Ok(BinOp::BitXor),
@@ -2822,7 +2836,7 @@ mod tests {
     #[test]
     fn parse_defined_or() {
         let e = parse_expr_str("$x // $default;");
-        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Dor, _, _)));
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
     }
 
     #[test]
@@ -2950,6 +2964,64 @@ mod tests {
                 assert!(matches!(&right.kind, ExprKind::Regex(_, _)));
             }
             other => panic!("expected Binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_regex() {
+        // // in term position is an empty regex, not defined-or.
+        let e = parse_expr_str("$x =~ //;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
+                ExprKind::Regex(pat, flags) => {
+                    assert_eq!(pat, "");
+                    assert_eq!(flags, "");
+                }
+                other => panic!("expected empty Regex, got {other:?}"),
+            },
+            other => panic!("expected Binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_regex_bare() {
+        // // at statement level is an empty regex match against $_.
+        let e = parse_expr_str("//;");
+        match &e.kind {
+            ExprKind::Regex(pat, flags) => {
+                assert_eq!(pat, "");
+                assert_eq!(flags, "");
+            }
+            other => panic!("expected empty Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_regex_with_flags() {
+        // //gi in term position is an empty regex with flags.
+        let e = parse_expr_str("$x =~ //gi;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
+                ExprKind::Regex(pat, flags) => {
+                    assert_eq!(pat, "");
+                    assert_eq!(flags, "gi");
+                }
+                other => panic!("expected empty Regex with flags, got {other:?}"),
+            },
+            other => panic!("expected Binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_regex_bare_with_flags() {
+        // //gi at statement level is an empty regex with flags.
+        let e = parse_expr_str("//gi;");
+        match &e.kind {
+            ExprKind::Regex(pat, flags) => {
+                assert_eq!(pat, "");
+                assert_eq!(flags, "gi");
+            }
+            other => panic!("expected empty Regex with flags, got {other:?}"),
         }
     }
 
@@ -4572,9 +4644,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_assign_dor() {
+    fn parse_assign_defined_or() {
         let e = parse_expr_str("$x //= 1;");
-        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::DorEq, _, _)));
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::DefinedOrEq, _, _)));
     }
 
     #[test]

@@ -306,7 +306,7 @@ pub enum BinOp {
     // Logical
     And,
     Or,
-    Dor,
+    DefinedOr,
     LowAnd,
     LowOr,
     // Bitwise
