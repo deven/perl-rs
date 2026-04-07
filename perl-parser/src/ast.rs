@@ -4,7 +4,7 @@
 //! lowering, and tooling.  It is the public output of `perl-parser`.
 
 use crate::span::Span;
-use crate::token::AssignOp;
+use crate::token::{AssignOp, DataEndMarker};
 
 /// A complete Perl program.
 #[derive(Clone, Debug)]
@@ -76,8 +76,10 @@ pub enum StmtKind {
     /// Empty statement (bare `;`).
     Empty,
 
-    /// `__END__` or `__DATA__`.
-    DataEnd,
+    /// Logical end of script: `__END__`, `__DATA__`, `^D`, or `^Z`.
+    /// The `u32` is the byte offset where trailing data begins
+    /// (after the marker line's newline).
+    DataEnd(DataEndMarker, u32),
 
     /// `format NAME = ... .`
     FormatDecl(FormatDecl),
