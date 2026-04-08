@@ -154,6 +154,28 @@ impl LexerSource {
         self.cursor
     }
 
+    /// Current line number (1-based).
+    pub fn line_number(&self) -> usize {
+        self.line_number
+    }
+
+    /// Rewind the source cursor for checkpoint/restore.
+    /// Also truncates the heredoc stack if it grew since the checkpoint.
+    pub fn set_cursor(&mut self, cursor: usize, line_number: usize, heredoc_depth: usize) {
+        self.cursor = cursor;
+        self.line_number = line_number;
+        // If heredoc stack shrank, clear stale state from undone heredocs.
+        if heredoc_depth < self.heredoc_stack.len() {
+            self.heredoc_stack.truncate(heredoc_depth);
+            self.queued_line = None;
+        }
+    }
+
+    /// Current heredoc stack depth (for checkpoint/restore).
+    pub fn heredoc_depth(&self) -> usize {
+        self.heredoc_stack.len()
+    }
+
     /// Total length of the source buffer.
     pub fn src_len(&self) -> usize {
         self.src.len()

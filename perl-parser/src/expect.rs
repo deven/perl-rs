@@ -78,4 +78,16 @@ impl Expect {
     pub fn expecting_term(&self) -> bool {
         matches!(self, Expect::Term | Expect::Statement | Expect::Deref)
     }
+
+    /// Whether two expects produce identical lexer behavior.
+    /// Statement and Term are equivalent for the lexer: both expect
+    /// a term, both treat `/` as regex, both treat `<<` as heredoc.
+    /// The only difference (`{` heuristic vs always-hash) is handled
+    /// at the parser level before any expect transition.
+    pub fn lexer_equivalent(&self, other: &Expect) -> bool {
+        if self == other {
+            return true;
+        }
+        matches!((self, other), (Expect::Statement, Expect::Term) | (Expect::Term, Expect::Statement))
+    }
 }

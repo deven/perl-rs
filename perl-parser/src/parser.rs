@@ -76,12 +76,12 @@ impl OpInfo {
 }
 
 /// The combined parser/lexer.
-pub struct Parser<'src> {
-    lexer: Lexer<'src>,
+pub struct Parser {
+    lexer: Lexer,
     /// Cached current token with the lexer checkpoint that produced it.
     /// `None` means no token is cached — the next peek/advance will lex.
-    /// On rewind, the full lexer state (position, context stack,
-    /// heredoc redirects) is restored via the checkpoint.
+    /// On rewind, the full lexer state (position, context stack)
+    /// is restored via the checkpoint.
     current: Option<(Spanned, LexerCheckpoint, Expect)>,
     expect: Expect,
     /// Stored lexer error — surfaced by advance() or checked by parse_program().
@@ -89,10 +89,10 @@ pub struct Parser<'src> {
     depth: ParseDepth,
 }
 
-impl<'src> Parser<'src> {
+impl Parser {
     // ── Construction ──────────────────────────────────────────
 
-    pub fn new(src: &'src [u8]) -> Result<Self, ParseError> {
+    pub fn new(src: &[u8]) -> Result<Self, ParseError> {
         let lexer = Lexer::new(src);
         Ok(Parser { lexer, current: None, expect: Expect::Statement, lexer_error: None, depth: 0 })
     }
@@ -104,10 +104,10 @@ impl<'src> Parser<'src> {
     /// expect, restore the full lexer checkpoint and re-lex.
     fn ensure_current(&mut self) {
         match &self.current {
-            Some((_, _, cached_expect)) if *cached_expect == self.expect => {
+            Some((spanned, _, cached_expect)) if cached_expect.lexer_equivalent(&self.expect) => {
                 return;
             }
-            Some((_, checkpoint, _)) => {
+            Some((_, checkpoint, cached_expect)) => {
                 let cp = checkpoint.clone();
                 self.lexer.restore(cp);
                 self.current = None;
@@ -240,19 +240,16 @@ impl<'src> Parser<'src> {
             let data_offset = match marker {
                 // ^D / ^Z: data starts immediately after the control char.
                 DataEndMarker::CtrlD | DataEndMarker::CtrlZ => self.lexer.current_pos() as u32,
-                // __END__ / __DATA__: data starts after the rest of the current line.
+                // __END__ / __DATA__: data starts after the current line.
                 DataEndMarker::End | DataEndMarker::Data => {
-                    let pos = self.lexer.current_pos();
-                    let src = self.lexer.remaining();
-                    // Skip to end of line.
-                    let mut i = 0;
-                    while i < src.len() && src[i] != b'\n' {
-                        i += 1;
+                    // Skip rest of current line.  Data starts on the next line.
+                    let remaining_len = self.lexer.remaining().len();
+                    let mut offset = self.lexer.current_pos() + remaining_len;
+                    // Account for the line terminator (\n) which is not in remaining().
+                    if self.lexer.line_is_terminated() {
+                        offset += 1;
                     }
-                    if i < src.len() {
-                        i += 1; // skip the newline
-                    }
-                    (pos + i) as u32
+                    offset as u32
                 }
             };
             // Skip all remaining source — everything after is not code.
