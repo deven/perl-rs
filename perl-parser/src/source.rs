@@ -217,14 +217,14 @@ impl LexerSource {
         let stripped = self.strip_indent(raw)?;
 
         // 4. If inside a heredoc, check for terminator.
-        if let Some(ctx) = self.heredoc_stack.last() {
-            if stripped.line.as_ref() == ctx.tag.as_ref() {
-                // Terminator found.
-                let ctx = self.heredoc_stack.pop().unwrap();
+        let is_terminator = self.heredoc_stack.last().is_some_and(|ctx| stripped.line.as_ref() == ctx.tag.as_ref());
+        if is_terminator {
+            // last() returned Some, so pop() is guaranteed to succeed.
+            if let Some(ctx) = self.heredoc_stack.pop() {
                 self.required_indent = ctx.prev_indent;
                 self.queued_line = Some(ctx.saved_line);
-                return Ok(None);
             }
+            return Ok(None);
         }
 
         Ok(Some(stripped))

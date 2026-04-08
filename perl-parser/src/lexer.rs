@@ -188,24 +188,36 @@ impl Lexer {
     /// Build a `Span` from a line-local start position to the current
     /// cursor position.  Both positions are on the current line.
     fn span_from(&self, local_start: usize) -> Span {
-        let line = self.current_line.as_ref().unwrap();
-        Span::new((line.offset + local_start) as u32, line.global_pos())
+        match &self.current_line {
+            Some(line) => Span::new((line.offset + local_start) as u32, line.global_pos()),
+            None => {
+                let pos = self.source.cursor() as u32;
+                Span::new(pos, pos)
+            }
+        }
     }
 
     /// Advance the cursor by `n` bytes within the current line.
     fn skip(&mut self, n: usize) {
-        self.current_line.as_mut().unwrap().pos += n;
+        if let Some(line) = self.current_line.as_mut() {
+            line.pos += n;
+        }
     }
 
     /// Byte slice from line-local `start` to current cursor position.
     fn line_slice(&self, start: usize) -> &[u8] {
-        let line = self.current_line.as_ref().unwrap();
-        &line.line[start..line.pos]
+        match &self.current_line {
+            Some(line) => &line.line[start..line.pos],
+            None => &[],
+        }
     }
 
-    /// Like `line_slice` but returns `&str` (panics if not valid UTF-8).
-    fn line_slice_str(&self, start: usize) -> &str {
-        std::str::from_utf8(self.line_slice(start)).unwrap()
+    /// Like `line_slice` but returns `&str`.  Returns an error for
+    /// non-UTF-8 source bytes (identifiers and numbers are always
+    /// ASCII, so this only fails for truly malformed input).
+    fn line_slice_str(&self, start: usize) -> Result<&str, ParseError> {
+        let bytes = self.line_slice(start);
+        std::str::from_utf8(bytes).map_err(|_| ParseError::new("invalid UTF-8 in source", self.span_from(start)))
     }
 
     /// Whether the current line was terminated by a newline in the source.
@@ -454,8 +466,11 @@ impl Lexer {
                 break; // EOF inside pod — not an error per Perl
             }
             let is_cut = {
-                let line = self.current_line.as_ref().unwrap();
-                line.line.starts_with(b"=cut") && !line.line.get(4).is_some_and(|b| b.is_ascii_alphabetic())
+                if let Some(line) = &self.current_line {
+                    line.line.starts_with(b"=cut") && !line.line.get(4).is_some_and(|b| b.is_ascii_alphabetic())
+                } else {
+                    false
+                }
             };
             self.current_line = None; // skip this line
             if is_cut {
@@ -518,7 +533,13 @@ impl Lexer {
 
         let start = self.span_pos();
 
-        let b = self.peek_byte().unwrap();
+        let b = match self.peek_byte() {
+            Some(b) => b,
+            None => {
+                let start = self.span_pos();
+                return Ok(Spanned { token: Token::Eof, span: Span::new(start, start) });
+            }
+        };
 
         let token = match b {
             // ── Digits → numeric literal ──────────────────────
@@ -679,20 +700,20 @@ impl Lexer {
             self.skip(1); // skip '.'
             self.scan_digits();
             self.scan_exponent();
-            let s = self.line_slice_str(start);
+            let s = self.line_slice_str(start)?;
             let s = s.replace('_', "");
             let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
             Ok(Token::FloatLit(n))
         } else if self.peek_byte() == Some(b'e') || self.peek_byte() == Some(b'E') {
             // Float with exponent
             self.scan_exponent();
-            let s = self.line_slice_str(start);
+            let s = self.line_slice_str(start)?;
             let s = s.replace('_', "");
             let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
             Ok(Token::FloatLit(n))
         } else {
             // Integer
-            let s = self.line_slice_str(start);
+            let s = self.line_slice_str(start)?;
             let s = s.replace('_', "");
             // Leading zero means octal in Perl 5.
             if s.len() > 1 && s.starts_with('0') {
@@ -740,7 +761,7 @@ impl Lexer {
                 break;
             }
         }
-        let s = self.line_slice_str(hex_start).replace('_', "");
+        let s = self.line_slice_str(hex_start)?.replace('_', "");
         let n = i64::from_str_radix(&s, 16).map_err(|_| ParseError::new("invalid hex literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
@@ -762,7 +783,7 @@ impl Lexer {
                 return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), self.span_from(start)));
             }
         }
-        let s = self.line_slice_str(bin_start).replace('_', "");
+        let s = self.line_slice_str(bin_start)?.replace('_', "");
         let n = i64::from_str_radix(&s, 2).map_err(|_| ParseError::new("invalid binary literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
@@ -784,7 +805,7 @@ impl Lexer {
                 return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), self.span_from(start)));
             }
         }
-        let s = self.line_slice_str(oct_start).replace('_', "");
+        let s = self.line_slice_str(oct_start)?.replace('_', "");
         let n = i64::from_str_radix(&s, 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
@@ -830,7 +851,7 @@ impl Lexer {
                             break;
                         }
                     }
-                    let ident = self.line_slice_str(ident_start);
+                    let ident = self.line_slice_str(ident_start)?;
                     let name = format!("^{ident}");
                     if self.peek_byte() == Some(b'}') {
                         self.skip(1);
@@ -1024,7 +1045,7 @@ impl Lexer {
                 while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
                     self.skip(1);
                 }
-                let name = self.line_slice_str(start);
+                let name = self.line_slice_str(start)?;
                 return Ok(Token::SpecialVar(name.into()));
             }
             _ => {}
@@ -1047,7 +1068,7 @@ impl Lexer {
                         break;
                     }
                 }
-                let ident = self.line_slice_str(ident_start);
+                let ident = self.line_slice_str(ident_start)?;
                 let name = format!("^{ident}");
                 if self.peek_byte() == Some(b'}') {
                     self.skip(1);
@@ -1086,7 +1107,7 @@ impl Lexer {
                             break;
                         }
                     }
-                    let ident = self.line_slice_str(ident_start);
+                    let ident = self.line_slice_str(ident_start)?;
                     let name = format!("^{ident}");
                     if self.peek_byte() == Some(b'}') {
                         self.skip(1);
@@ -1210,7 +1231,7 @@ impl Lexer {
                     while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
                         self.skip(1);
                     }
-                    vstr.push_str(self.line_slice_str(start));
+                    vstr.push_str(self.line_slice_str(start)?);
                 } else {
                     break;
                 }
@@ -1480,7 +1501,9 @@ impl Lexer {
                     return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
                 }
                 // Not a simple ${name} — backtrack and scan as expression
-                self.current_line.as_mut().unwrap().pos = saved_pos;
+                if let Some(line) = self.current_line.as_mut() {
+                    line.pos = saved_pos;
+                }
             }
             // Expression interpolation: ${\ expr}, ${$ref}, etc.
             // Push ExprInString — next tokens are normal code until }.
@@ -1809,7 +1832,9 @@ impl Lexer {
                         }
                         _ => {
                             // Not a heredoc — rewind to after first <, re-parse as <<
-                            self.current_line.as_mut().unwrap().pos = saved + 1;
+                            if let Some(line) = self.current_line.as_mut() {
+                                line.pos = saved + 1;
+                            }
                             if self.peek_byte() == Some(b'=') {
                                 self.skip(1);
                                 return Ok(Token::Assign(AssignOp::ShiftLEq));
@@ -1860,7 +1885,9 @@ impl Lexer {
                         return Ok(Token::Readline(content));
                     }
                     // Not a readline — rewind
-                    self.current_line.as_mut().unwrap().pos = start_pos;
+                    if let Some(line) = self.current_line.as_mut() {
+                        line.pos = start_pos;
+                    }
                 }
                 Ok(Token::NumLt)
             }

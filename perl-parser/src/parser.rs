@@ -128,12 +128,20 @@ impl Parser {
 
     fn peek(&mut self) -> &Token {
         self.ensure_current();
-        &self.current.as_ref().unwrap().0.token
+        match &self.current {
+            Some((spanned, _, _)) => &spanned.token,
+            // ensure_current always populates self.current; this is
+            // unreachable but avoids a panicking unwrap.
+            None => &Token::Eof,
+        }
     }
 
     fn peek_span(&mut self) -> Span {
         self.ensure_current();
-        self.current.as_ref().unwrap().0.span
+        match &self.current {
+            Some((spanned, _, _)) => spanned.span,
+            None => Span::new(0, 0),
+        }
     }
 
     fn advance(&mut self) -> Result<Spanned, ParseError> {
@@ -141,7 +149,10 @@ impl Parser {
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        Ok(self.current.take().unwrap().0)
+        match self.current.take() {
+            Some((spanned, _, _)) => Ok(spanned),
+            None => Err(ParseError::new("internal: no current token", Span::new(0, 0))),
+        }
     }
 
     fn expect_token(&mut self, expected: &Token) -> Result<Spanned, ParseError> {
@@ -172,7 +183,10 @@ impl Parser {
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        Ok(self.current.as_ref().unwrap().0.token == *token)
+        match &self.current {
+            Some((spanned, _, _)) => Ok(spanned.token == *token),
+            None => Ok(false),
+        }
     }
 
     fn at_eof(&mut self) -> Result<bool, ParseError> {
@@ -180,7 +194,10 @@ impl Parser {
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        Ok(matches!(self.current.as_ref().unwrap().0.token, Token::Eof))
+        match &self.current {
+            Some((spanned, _, _)) => Ok(matches!(spanned.token, Token::Eof)),
+            None => Ok(true),
+        }
     }
 
     // ── Depth control ─────────────────────────────────────────
@@ -2257,7 +2274,10 @@ impl Parser {
                     ExprKind::List(more) => items.extend(more),
                     _ => items.push(right),
                 };
-                let span = items.first().unwrap().span.merge(items.last().unwrap().span);
+                let span = match (items.first(), items.last()) {
+                    (Some(f), Some(l)) => f.span.merge(l.span),
+                    _ => Span::new(0, 0),
+                };
                 Ok(Expr { kind: ExprKind::List(items), span })
             }
 
