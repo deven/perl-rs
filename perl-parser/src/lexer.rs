@@ -7,18 +7,22 @@
 //! This module implements the core tokenization loop.  Quote-like sublexing,
 //! heredocs, and regex scanning are handled by helper methods.
 
+use bytes::Bytes;
+
 use crate::error::ParseError;
 use crate::expect::Expect;
 use crate::keyword;
+use crate::source::{LexerLine, LexerSource};
 use crate::span::Span;
 use crate::token::*;
 
 /// Sublexing context — tracks what mode the lexer is in.
 #[derive(Clone, Debug)]
 enum LexContext {
-    /// Inside an interpolating string ("...", qq//, `...`).
+    /// Inside an interpolating string ("...", qq//, `...`, heredoc body).
+    /// `close` is `None` for heredocs (end signaled by LexerSource).
     Interpolating {
-        close: u8,
+        close: Option<u8>,
         /// For paired delimiters like qq{...}, the open delimiter
         /// for nesting depth tracking.  None for non-paired (qq//).
         open: Option<u8>,
@@ -27,148 +31,204 @@ enum LexContext {
     /// Inside `${expr}` or `@{expr}` — normal code lexing, but
     /// when `}` is reached at depth 0, pop back to Interpolating.
     ExprInString { depth: u32 },
-    /// Inside an interpolating heredoc body — produces ConstSegment,
-    /// InterpScalar, etc. until the terminator line is found.
-    HeredocBody {
-        tag: String,
-        rest_of_line_pos: usize,
-        at_line_start: bool,
-        /// Exact whitespace prefix from the terminator line (for `<<~`).
-        /// Empty for non-indented heredocs.
-        indent: Vec<u8>,
-    },
 }
 
 /// Saved lexer state for checkpoint/restore (used by the parser's
 /// re-lex mechanism to undo a speculatively-lexed token).
 #[derive(Clone, Debug)]
 pub(crate) struct LexerCheckpoint {
-    pub pos: usize,
+    pub line: Option<LexerLine>,
     pub context_depth: usize,
-    pub redirect_idx: usize,
-    pub redirect_len: usize,
+    pub source_cursor: usize,
+    pub source_line_number: usize,
+    pub heredoc_depth: usize,
 }
 
 /// Lexer state, embedded in the `Parser` struct (not standalone).
 ///
-/// The lexer operates on a byte slice and maintains a position cursor.
-/// It reads the `expect` field to resolve context-sensitive ambiguities.
+/// The lexer operates on lines delivered by `LexerSource`.  It reads
+/// the `expect` field to resolve context-sensitive ambiguities.
 /// The context stack tracks sublexing modes (interpolating strings,
 /// regex patterns, heredocs).
 ///
-/// CR normalization: if the source contains `\r`, the buffer is
-/// normalized at construction (`\r\n` → `\n`).  Standalone `\r` is
-/// NOT a newline and stays as a literal byte.  All internal code
-/// sees `\n`-only line endings.  When the source has no `\r` bytes
-/// (the common case), this is zero-copy.
-pub(crate) struct Lexer<'src> {
-    src: std::borrow::Cow<'src, [u8]>,
-    pos: usize,
+/// CRLF normalization is handled by `LexerSource` at the line level.
+pub(crate) struct Lexer {
+    source: LexerSource,
+    current_line: Option<LexerLine>,
     context_stack: Vec<LexContext>,
-    /// When a heredoc tag is encountered on a line, the body starts
-    /// on the following lines.  The lexer processes the body, then
-    /// rewinds to continue the current line.  When advance_byte later
-    /// crosses the newline at the end of the current line, it jumps
-    /// to the position after the heredoc terminator.
-    heredoc_line_redirects: Vec<usize>,
-    /// Index into heredoc_line_redirects: how many have been consumed.
-    /// Using an index instead of removing from the vec allows checkpoint/
-    /// restore to undo redirect consumption by resetting the index.
-    heredoc_redirect_idx: usize,
 }
 
-/// Normalize `\r\n` → `\n`.  Standalone `\r` is NOT a newline and
-/// stays as a literal byte in the content.
-fn normalize_crlf(src: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(src.len());
-    let mut i = 0;
-    while i < src.len() {
-        if src[i] == b'\r' && i + 1 < src.len() && src[i + 1] == b'\n' {
-            // \r\n → \n: skip the \r, the \n will be pushed next iteration.
-            i += 1;
-        } else {
-            out.push(src[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-impl<'src> Lexer<'src> {
-    pub fn new(src: &'src [u8]) -> Self {
-        let src = if src.contains(&b'\r') { std::borrow::Cow::Owned(normalize_crlf(src)) } else { std::borrow::Cow::Borrowed(src) };
-        Lexer { src, pos: 0, context_stack: Vec::new(), heredoc_line_redirects: Vec::new(), heredoc_redirect_idx: 0 }
+impl Lexer {
+    pub fn new(src: &[u8]) -> Self {
+        Lexer { source: LexerSource::new(src), current_line: None, context_stack: Vec::new() }
     }
 
+    /// Global byte position in the original source.
     pub fn pos(&self) -> usize {
-        self.pos
-    }
-
-    pub fn set_pos(&mut self, pos: usize) {
-        self.pos = pos;
+        match &self.current_line {
+            Some(line) => line.offset + line.pos,
+            None => self.source.cursor(),
+        }
     }
 
     /// Save a checkpoint for the parser's re-lex mechanism.
     pub fn checkpoint(&self) -> LexerCheckpoint {
         LexerCheckpoint {
-            pos: self.pos,
+            line: self.current_line.clone(),
             context_depth: self.context_stack.len(),
-            redirect_idx: self.heredoc_redirect_idx,
-            redirect_len: self.heredoc_line_redirects.len(),
+            source_cursor: self.source.cursor(),
+            source_line_number: self.source.line_number(),
+            heredoc_depth: self.source.heredoc_depth(),
         }
     }
 
     /// Restore to a saved checkpoint, undoing any state changes
-    /// (context pushes, redirect consumption/addition) since the checkpoint.
+    /// (context pushes, line transitions, heredoc starts) since the checkpoint.
     pub fn restore(&mut self, cp: LexerCheckpoint) {
-        self.pos = cp.pos;
+        self.current_line = cp.line;
         self.context_stack.truncate(cp.context_depth);
-        self.heredoc_redirect_idx = cp.redirect_idx;
-        self.heredoc_line_redirects.truncate(cp.redirect_len);
+        self.source.set_cursor(cp.source_cursor, cp.source_line_number, cp.heredoc_depth);
+    }
+
+    // ── Line management ───────────────────────────────────────
+
+    /// Ensure a line is loaded.  Returns true if a line is available,
+    /// false if EOF or heredoc finished (current_line stays None).
+    fn ensure_line(&mut self) -> Result<bool, ParseError> {
+        if let Some(line) = &self.current_line {
+            if line.pos < line.line.len() {
+                return Ok(true); // has content
+            }
+            // Exhausted — drop it.
+            self.current_line = None;
+        }
+        match self.source.next_line()? {
+            Some(line) => {
+                self.current_line = Some(line);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     // ── Character access ──────────────────────────────────────
 
+    /// Peek at the current byte without advancing.
+    /// Returns `None` at end of line or when no line is loaded.
     fn peek_byte(&self) -> Option<u8> {
-        self.src.get(self.pos).copied()
+        self.current_line.as_ref()?.peek_byte()
     }
 
+    /// Peek at a byte at an offset from the current position.
+    /// Only valid within the current line content.
     fn peek_byte_at(&self, offset: usize) -> Option<u8> {
-        self.src.get(self.pos + offset).copied()
+        self.current_line.as_ref()?.peek_byte_at(offset)
     }
 
+    /// Consume the current byte and advance.
+    /// Returns `None` at end of line content (line is NOT dropped;
+    /// caller can check `line.terminated` before dropping).
     fn advance_byte(&mut self) -> Option<u8> {
-        let b = self.src.get(self.pos).copied()?;
-        self.pos += 1;
-        // When crossing a newline, fire any pending heredoc redirect.
-        if b == b'\n' && self.heredoc_redirect_idx < self.heredoc_line_redirects.len() {
-            self.pos = self.heredoc_line_redirects[self.heredoc_redirect_idx];
-            self.heredoc_redirect_idx += 1;
+        self.current_line.as_mut()?.advance_byte()
+    }
+
+    /// Advance to the next content byte, crossing line boundaries.
+    /// When the current line is exhausted and terminated, pushes
+    /// `'\n'` to `content`, drops the line, and fetches the next.
+    /// Returns `None` only at true EOF (unterminated line or source
+    /// exhausted).
+    fn advance_byte_in_string(&mut self, content: &mut String) -> Result<Option<u8>, ParseError> {
+        loop {
+            if let Some(b) = self.advance_byte() {
+                return Ok(Some(b));
+            }
+            // End of line content.  If terminated, the line boundary
+            // is a newline in the source — add it and fetch next line.
+            if self.current_line.as_ref().is_some_and(|l| l.terminated) {
+                content.push('\n');
+                self.current_line = None;
+                if !self.ensure_line()? {
+                    return Ok(None); // EOF after newline
+                }
+            } else {
+                return Ok(None); // unterminated — true EOF
+            }
         }
-        Some(b)
     }
 
+    /// Remaining bytes in the current line (not including synthetic \n).
     pub fn remaining(&self) -> &[u8] {
-        &self.src[self.pos..]
+        match &self.current_line {
+            Some(line) => line.remaining(),
+            None => &[],
+        }
     }
 
+    /// Whether the source is fully exhausted (no current line, no
+    /// more lines in source, not inside a heredoc).
     fn at_end(&self) -> bool {
-        self.pos >= self.src.len()
+        self.current_line.is_none() && self.source.cursor() >= self.source.src_len()
+    }
+
+    // ── Position and span helpers ─────────────────────────────
+
+    /// Current position within the current line (line-local).
+    fn line_pos(&self) -> usize {
+        self.current_line.as_ref().map_or(0, |l| l.pos)
+    }
+
+    /// Global position as u32 for span construction.
+    fn span_pos(&self) -> u32 {
+        match &self.current_line {
+            Some(line) => line.global_pos(),
+            None => self.source.cursor() as u32,
+        }
+    }
+
+    /// Build a `Span` from a line-local start position to the current
+    /// cursor position.  Both positions are on the current line.
+    fn span_from(&self, local_start: usize) -> Span {
+        let line = self.current_line.as_ref().unwrap();
+        Span::new((line.offset + local_start) as u32, line.global_pos())
+    }
+
+    /// Advance the cursor by `n` bytes within the current line.
+    fn skip(&mut self, n: usize) {
+        self.current_line.as_mut().unwrap().pos += n;
+    }
+
+    /// Byte slice from line-local `start` to current cursor position.
+    fn line_slice(&self, start: usize) -> &[u8] {
+        let line = self.current_line.as_ref().unwrap();
+        &line.line[start..line.pos]
+    }
+
+    /// Like `line_slice` but returns `&str` (panics if not valid UTF-8).
+    fn line_slice_str(&self, start: usize) -> &str {
+        std::str::from_utf8(self.line_slice(start)).unwrap()
+    }
+
+    /// Whether the current line was terminated by a newline in the source.
+    pub fn line_is_terminated(&self) -> bool {
+        self.current_line.as_ref().is_some_and(|l| l.terminated)
     }
 
     /// Skip to end of source — used after __END__/__DATA__.
     pub fn skip_to_end(&mut self) {
-        self.pos = self.src.len();
+        self.current_line = None;
+        // Drain the source.
+        while let Ok(Some(_)) = self.source.next_line() {}
     }
 
-    /// Current byte position in source.
+    /// Current byte position in source (global).
     pub fn current_pos(&self) -> usize {
-        self.pos
+        self.pos()
     }
 
-    /// Get a byte slice of the source.
+    /// Raw slice of the source buffer.  For rare operations that
+    /// need global byte access (e.g. format body extraction).
     pub fn slice(&self, start: usize, end: usize) -> &[u8] {
-        &self.src[start..end]
+        self.source.src_slice(start, end)
     }
 
     /// Byte-level lookahead to determine if content after `{` looks like
@@ -178,7 +238,14 @@ impl<'src> Lexer<'src> {
     /// Called when the lexer position is right after `{`.
     /// Does NOT advance the lexer — purely read-only scan on source bytes.
     pub fn looks_like_hash_content(&self) -> bool {
-        let src = self.remaining();
+        // Use raw source from current position — the heuristic needs to
+        // see past comments and line boundaries to determine block vs hash.
+        let pos = self.pos();
+        let len = self.source.src_len();
+        if pos >= len {
+            return true;
+        }
+        let src = self.source.src_slice(pos, len);
 
         // Skip whitespace and comments (toke.c: s = skipspace(s))
         let i = skip_ws_bytes(src, 0);
@@ -330,106 +397,72 @@ impl<'src> Lexer<'src> {
     /// Skip a format body: everything until a line containing just `.`
     /// (optionally followed by whitespace).
     pub fn skip_format_body(&mut self) {
+        // Skip the rest of the current line (after `=`).
+        self.current_line = None;
         loop {
-            // Check for terminator: '.' at start of line (optionally with trailing ws)
-            if self.peek_byte() == Some(b'.') {
-                let saved = self.pos;
-                self.pos += 1;
-                // Check rest of line is whitespace or newline/EOF
-                let mut is_term = true;
-                while let Some(b) = self.peek_byte() {
-                    if b == b'\n' {
-                        self.pos += 1;
-                        break;
-                    }
-                    if b == b' ' || b == b'\t' || b == b'\r' {
-                        self.pos += 1;
-                        continue;
-                    }
-                    is_term = false;
-                    break;
-                }
-                if is_term {
-                    return; // consumed the terminator line
-                }
-                self.pos = saved; // not a terminator, rewind
-            }
-            // Skip to next line
-            loop {
-                match self.peek_byte() {
-                    None => return, // EOF
-                    Some(b'\n') => {
-                        self.pos += 1;
-                        break;
-                    }
-                    _ => {
-                        self.pos += 1;
+            match self.source.next_line() {
+                Ok(Some(line)) => {
+                    // Terminator: '.' at start of line, optionally followed by ws.
+                    if line.line.first() == Some(&b'.') && line.line[1..].iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r') {
+                        return;
                     }
                 }
+                _ => return, // EOF
             }
         }
     }
 
     // ── Skip whitespace and comments ──────────────────────────
 
-    fn skip_ws_and_comments(&mut self) {
+    fn skip_ws_and_comments(&mut self) -> Result<(), ParseError> {
         loop {
-            // Skip whitespace (advance_byte handles heredoc redirects on newlines)
-            while let Some(b) = self.peek_byte() {
-                if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                    self.advance_byte();
-                } else {
-                    break;
-                }
+            if !self.ensure_line()? {
+                break; // EOF
             }
-            // Skip line comments
+            // Skip spaces and tabs within the line.
+            while self.peek_byte().is_some_and(|b| b == b' ' || b == b'\t') {
+                self.skip(1);
+            }
+            // End of line content — ensure_line will drop and fetch next.
+            if self.peek_byte().is_none() {
+                continue;
+            }
+            // Comment — rest of line is comment, drop it.
             if self.peek_byte() == Some(b'#') {
-                while let Some(b) = self.advance_byte() {
-                    if b == b'\n' {
-                        break;
-                    }
-                }
+                self.current_line = None;
                 continue;
             }
             // Skip pod: =word ... =cut at start of line
-            if self.peek_byte() == Some(b'=')
-                && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphabetic())
-                && (self.pos == 0 || self.src.get(self.pos - 1) == Some(&b'\n'))
-            {
-                self.skip_pod();
+            if self.peek_byte() == Some(b'=') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphabetic()) && self.line_pos() == 0 {
+                self.skip_pod()?;
                 continue;
             }
             break;
         }
+        Ok(())
     }
 
     /// Skip a pod block: everything from `=word` to `=cut\n`.
     /// Matches Perl 5's behavior: `=cut` must be at start of line,
     /// followed by a non-alphabetic character (or EOF).
-    fn skip_pod(&mut self) {
+    fn skip_pod(&mut self) -> Result<(), ParseError> {
+        // Skip the current =word line.
+        self.current_line = None;
+        // Read lines until =cut at start of line.
         loop {
-            // Advance to next line
-            while let Some(b) = self.advance_byte() {
-                if b == b'\n' {
-                    break;
-                }
+            if !self.ensure_line()? {
+                break; // EOF inside pod — not an error per Perl
             }
-            if self.at_end() {
-                break;
-            }
-            // Check for =cut at start of line, followed by non-alpha or EOF.
-            // Perl uses !isALPHA(s[4]): =cut\n, =cut , =cut123 all match;
-            // =cutting does not.
-            if self.remaining().starts_with(b"=cut") && !self.remaining().get(4).is_some_and(|b| b.is_ascii_alphabetic()) {
-                // Skip the =cut line
-                while let Some(b) = self.advance_byte() {
-                    if b == b'\n' {
-                        break;
-                    }
-                }
+            let is_cut = {
+                let line = self.current_line.as_ref().unwrap();
+                line.line.starts_with(b"=cut") && !line.line.get(4).is_some_and(|b| b.is_ascii_alphabetic())
+            };
+            self.current_line = None; // skip this line
+            if is_cut {
                 break;
             }
         }
+        Ok(())
     }
 
     // ── Main tokenization entry point ─────────────────────────
@@ -467,9 +500,6 @@ impl<'src> Lexer<'src> {
                 }
                 return Ok(result);
             }
-            Some(LexContext::HeredocBody { .. }) => {
-                return self.lex_heredoc_body_token();
-            }
             None => {}
         }
 
@@ -478,13 +508,15 @@ impl<'src> Lexer<'src> {
 
     /// Lex a token in normal (code) mode.
     fn lex_normal_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
-        self.skip_ws_and_comments();
+        self.skip_ws_and_comments()?;
 
-        let start = self.pos as u32;
-
-        if self.at_end() {
+        // Ensure a line is available after skipping whitespace.
+        if !self.ensure_line()? {
+            let start = self.span_pos();
             return Ok(Spanned { token: Token::Eof, span: Span::new(start, start) });
         }
+
+        let start = self.span_pos();
 
         let b = self.peek_byte().unwrap();
 
@@ -503,13 +535,13 @@ impl<'src> Lexer<'src> {
             // ── Strings ───────────────────────────────────────
             b'\'' => self.lex_single_quoted_string()?,
             b'"' => {
-                self.pos += 1; // skip opening "
-                self.context_stack.push(LexContext::Interpolating { close: b'"', open: None, depth: 0 });
+                self.skip(1); // skip opening "
+                self.context_stack.push(LexContext::Interpolating { close: Some(b'"'), open: None, depth: 0 });
                 Token::QuoteBegin(QuoteKind::Double, b'"')
             }
             b'`' => {
-                self.pos += 1; // skip opening `
-                self.context_stack.push(LexContext::Interpolating { close: b'`', open: None, depth: 0 });
+                self.skip(1); // skip opening `
+                self.context_stack.push(LexContext::Interpolating { close: Some(b'`'), open: None, depth: 0 });
                 Token::QuoteBegin(QuoteKind::Backtick, b'`')
             }
 
@@ -526,40 +558,40 @@ impl<'src> Lexer<'src> {
             b'&' => self.lex_ampersand(),
             b'|' => self.lex_pipe(),
             b'^' => {
-                self.pos += 1;
+                self.skip(1);
                 if self.peek_byte() == Some(b'=') {
-                    self.pos += 1;
+                    self.skip(1);
                     Token::Assign(AssignOp::BitXorEq)
                 } else {
                     Token::BitXor
                 }
             }
             b'~' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Tilde
             }
             b'\\' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Backslash
             }
             b'?' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Question
             }
             b':' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Colon
             }
             b',' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Comma
             }
             b';' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Semi
             }
             b'(' => {
-                self.pos += 1;
+                self.skip(1);
                 if *expect == Expect::Prototype {
                     // Prototype scanning: read raw bytes until matching ).
                     // Matches toke.c's scan_str() call in yyl_sub().
@@ -570,19 +602,19 @@ impl<'src> Lexer<'src> {
                 }
             }
             b')' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::RParen
             }
             b'[' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::LBracket
             }
             b']' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::RBracket
             }
             b'{' => {
-                self.pos += 1;
+                self.skip(1);
                 // Brace disambiguation matching toke.c yyl_leftcurly().
                 match expect {
                     // XTERM → always hash (toke.c lines 6313–6317).
@@ -600,34 +632,34 @@ impl<'src> Lexer<'src> {
                 }
             }
             b'}' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::RBrace
             }
 
             // ^D (0x04) and ^Z (0x1a) — logical end of script.
             b'\x04' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::DataEnd(DataEndMarker::CtrlD)
             }
             b'\x1a' => {
-                self.pos += 1;
+                self.skip(1);
                 Token::DataEnd(DataEndMarker::CtrlZ)
             }
 
             other => {
-                self.pos += 1;
-                return Err(ParseError::new(format!("unexpected byte 0x{:02x} ('{}')", other, other as char), Span::new(start, self.pos as u32)));
+                self.skip(1);
+                return Err(ParseError::new(format!("unexpected byte 0x{:02x} ('{}')", other, other as char), Span::new(start, self.span_pos())));
             }
         };
 
-        let end = self.pos as u32;
+        let end = self.span_pos();
         Ok(Spanned { token, span: Span::new(start, end) })
     }
 
     // ── Number literals ───────────────────────────────────────
 
     fn lex_number(&mut self) -> Result<Token, ParseError> {
-        let start = self.pos;
+        let start = self.line_pos();
 
         // Check for 0x, 0b, 0o prefixes
         if self.peek_byte() == Some(b'0') {
@@ -644,34 +676,34 @@ impl<'src> Lexer<'src> {
 
         if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
             // Float
-            self.pos += 1; // skip '.'
+            self.skip(1); // skip '.'
             self.scan_digits();
             self.scan_exponent();
-            let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+            let s = self.line_slice_str(start);
             let s = s.replace('_', "");
-            let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", Span::new(start as u32, self.pos as u32)))?;
+            let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
             Ok(Token::FloatLit(n))
         } else if self.peek_byte() == Some(b'e') || self.peek_byte() == Some(b'E') {
             // Float with exponent
             self.scan_exponent();
-            let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+            let s = self.line_slice_str(start);
             let s = s.replace('_', "");
-            let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", Span::new(start as u32, self.pos as u32)))?;
+            let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
             Ok(Token::FloatLit(n))
         } else {
             // Integer
-            let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+            let s = self.line_slice_str(start);
             let s = s.replace('_', "");
             // Leading zero means octal in Perl 5.
             if s.len() > 1 && s.starts_with('0') {
                 // Check for illegal octal digits (8, 9).
                 if let Some(bad) = s.bytes().skip(1).find(|b| *b == b'8' || *b == b'9') {
-                    return Err(ParseError::new(format!("Illegal octal digit '{}'", bad as char), Span::new(start as u32, self.pos as u32)));
+                    return Err(ParseError::new(format!("Illegal octal digit '{}'", bad as char), self.span_from(start)));
                 }
-                let n = i64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", Span::new(start as u32, self.pos as u32)))?;
+                let n = i64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
                 Ok(Token::IntLit(n))
             } else {
-                let n: i64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", Span::new(start as u32, self.pos as u32)))?;
+                let n: i64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", self.span_from(start)))?;
                 Ok(Token::IntLit(n))
             }
         }
@@ -680,7 +712,7 @@ impl<'src> Lexer<'src> {
     fn scan_digits(&mut self) {
         while let Some(b) = self.peek_byte() {
             if b.is_ascii_digit() || b == b'_' {
-                self.pos += 1;
+                self.skip(1);
             } else {
                 break;
             }
@@ -689,37 +721,37 @@ impl<'src> Lexer<'src> {
 
     fn scan_exponent(&mut self) {
         if self.peek_byte() == Some(b'e') || self.peek_byte() == Some(b'E') {
-            self.pos += 1;
+            self.skip(1);
             if self.peek_byte() == Some(b'+') || self.peek_byte() == Some(b'-') {
-                self.pos += 1;
+                self.skip(1);
             }
             self.scan_digits();
         }
     }
 
     fn lex_hex(&mut self) -> Result<Token, ParseError> {
-        let start = self.pos;
-        self.pos += 2; // skip 0x
-        let hex_start = self.pos;
+        let start = self.line_pos();
+        self.skip(2); // skip 0x
+        let hex_start = self.line_pos();
         while let Some(b) = self.peek_byte() {
             if b.is_ascii_hexdigit() || b == b'_' {
-                self.pos += 1;
+                self.skip(1);
             } else {
                 break;
             }
         }
-        let s = std::str::from_utf8(&self.src[hex_start..self.pos]).unwrap().replace('_', "");
-        let n = i64::from_str_radix(&s, 16).map_err(|_| ParseError::new("invalid hex literal", Span::new(start as u32, self.pos as u32)))?;
+        let s = self.line_slice_str(hex_start).replace('_', "");
+        let n = i64::from_str_radix(&s, 16).map_err(|_| ParseError::new("invalid hex literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
 
     fn lex_binary(&mut self) -> Result<Token, ParseError> {
-        let start = self.pos;
-        self.pos += 2; // skip 0b
-        let bin_start = self.pos;
+        let start = self.line_pos();
+        self.skip(2); // skip 0b
+        let bin_start = self.line_pos();
         while let Some(b) = self.peek_byte() {
             if b == b'0' || b == b'1' || b == b'_' {
-                self.pos += 1;
+                self.skip(1);
             } else {
                 break;
             }
@@ -727,21 +759,21 @@ impl<'src> Lexer<'src> {
         // Check for illegal binary digits (2-9)
         if let Some(b) = self.peek_byte() {
             if b.is_ascii_digit() {
-                return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), Span::new(start as u32, self.pos as u32 + 1)));
+                return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), self.span_from(start)));
             }
         }
-        let s = std::str::from_utf8(&self.src[bin_start..self.pos]).unwrap().replace('_', "");
-        let n = i64::from_str_radix(&s, 2).map_err(|_| ParseError::new("invalid binary literal", Span::new(start as u32, self.pos as u32)))?;
+        let s = self.line_slice_str(bin_start).replace('_', "");
+        let n = i64::from_str_radix(&s, 2).map_err(|_| ParseError::new("invalid binary literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
 
     fn lex_octal_explicit(&mut self) -> Result<Token, ParseError> {
-        let start = self.pos;
-        self.pos += 2; // skip 0o
-        let oct_start = self.pos;
+        let start = self.line_pos();
+        self.skip(2); // skip 0o
+        let oct_start = self.line_pos();
         while let Some(b) = self.peek_byte() {
             if (b'0'..=b'7').contains(&b) || b == b'_' {
-                self.pos += 1;
+                self.skip(1);
             } else {
                 break;
             }
@@ -749,23 +781,23 @@ impl<'src> Lexer<'src> {
         // Check for illegal octal digits (8, 9)
         if let Some(b) = self.peek_byte() {
             if b == b'8' || b == b'9' {
-                return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), Span::new(start as u32, self.pos as u32 + 1)));
+                return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), self.span_from(start)));
             }
         }
-        let s = std::str::from_utf8(&self.src[oct_start..self.pos]).unwrap().replace('_', "");
-        let n = i64::from_str_radix(&s, 8).map_err(|_| ParseError::new("invalid octal literal", Span::new(start as u32, self.pos as u32)))?;
+        let s = self.line_slice_str(oct_start).replace('_', "");
+        let n = i64::from_str_radix(&s, 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
 
     // ── Variables ($, @, %) ───────────────────────────────────
 
     fn lex_dollar(&mut self, _expect: &Expect) -> Result<Token, ParseError> {
-        self.pos += 1; // skip $
+        self.skip(1); // skip $
 
         // $# — array length
         if self.peek_byte() == Some(b'#') {
             if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
-                self.pos += 1; // skip #
+                self.skip(1); // skip #
                 let name = self.scan_ident();
                 return Ok(Token::ArrayLen(name));
             }
@@ -779,7 +811,7 @@ impl<'src> Lexer<'src> {
                     let name = self.scan_ident();
                     return Ok(Token::ScalarVar(name));
                 }
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::ScalarVar("_".into()));
             }
             Some(b) if b.is_ascii_alphabetic() => {
@@ -789,29 +821,29 @@ impl<'src> Lexer<'src> {
             Some(b'{') => {
                 // ${^Foo} — demarcated caret variable
                 if self.peek_byte_at(1) == Some(b'^') {
-                    self.pos += 2; // skip { and ^
-                    let ident_start = self.pos;
+                    self.skip(2); // skip { and ^
+                    let ident_start = self.line_pos();
                     while let Some(b) = self.peek_byte() {
                         if b.is_ascii_alphanumeric() || b == b'_' {
-                            self.pos += 1;
+                            self.skip(1);
                         } else {
                             break;
                         }
                     }
-                    let ident = std::str::from_utf8(&self.src[ident_start..self.pos]).unwrap();
+                    let ident = self.line_slice_str(ident_start);
                     let name = format!("^{ident}");
                     if self.peek_byte() == Some(b'}') {
-                        self.pos += 1;
+                        self.skip(1);
                     }
                     return Ok(Token::SpecialVar(name));
                 }
                 // ${name} — variable with brace disambiguation
                 // ${$ref} or ${expr} — dereference block (return Dollar, let parser handle {})
                 if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
-                    self.pos += 1; // skip {
+                    self.skip(1); // skip {
                     let name = self.scan_ident();
                     if self.peek_byte() == Some(b'}') {
-                        self.pos += 1;
+                        self.skip(1);
                     }
                     return Ok(Token::ScalarVar(name));
                 }
@@ -860,14 +892,14 @@ impl<'src> Lexer<'src> {
                         return Ok(Token::Dollar);
                     }
                 }
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("$".into()));
             }
             Some(b'^') => {
                 // $^X — caret variable (single character after ^)
                 if let Some(next) = self.peek_byte_at(1) {
                     if next.is_ascii_alphabetic() || next == b'[' || next == b']' {
-                        self.pos += 2; // skip ^ and the character
+                        self.skip(2); // skip ^ and the character
                         let name = format!("^{}", next as char);
                         return Ok(Token::SpecialVar(name));
                     }
@@ -876,123 +908,123 @@ impl<'src> Lexer<'src> {
                 return Ok(Token::Dollar);
             }
             Some(b'!') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("!".into()));
             }
             Some(b'@') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("@".into()));
             }
             Some(b'/') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("/".into()));
             }
             Some(b'\\') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("\\".into()));
             }
             Some(b';') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar(";".into()));
             }
             Some(b',') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar(",".into()));
             }
             Some(b'+') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("+".into()));
             }
             Some(b'-') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("-".into()));
             }
             Some(b'&') => {
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("&".into()));
             }
             // ── perlvar: remaining punctuation special variables ──
             Some(b'"') => {
                 // $" — list separator for array interpolation
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("\"".into()));
             }
             Some(b'.') => {
                 // $. — current line number
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar(".".into()));
             }
             Some(b'|') => {
                 // $| — output autoflush
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("|".into()));
             }
             Some(b'?') => {
                 // $? — child process status
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("?".into()));
             }
             Some(b'`') => {
                 // $` — prematch string
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("`".into()));
             }
             Some(b'\'') => {
                 // $' — postmatch string
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("'".into()));
             }
             Some(b'(') => {
                 // $( — real GID
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("(".into()));
             }
             Some(b')') => {
                 // $) — effective GID
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar(")".into()));
             }
             Some(b'<') => {
                 // $< — real UID
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("<".into()));
             }
             Some(b'>') => {
                 // $> — effective UID
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar(">".into()));
             }
             Some(b']') => {
                 // $] — Perl version
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("]".into()));
             }
             Some(b'%') => {
                 // $% — page number (format)
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("%".into()));
             }
             Some(b':') => {
                 // $: — format break characters
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar(":".into()));
             }
             Some(b'=') => {
                 // $= — page length (format)
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("=".into()));
             }
             Some(b'~') => {
                 // $~ — format name
-                self.pos += 1;
+                self.skip(1);
                 return Ok(Token::SpecialVar("~".into()));
             }
             Some(b) if b.is_ascii_digit() => {
-                let start = self.pos;
+                let start = self.line_pos();
                 while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
-                    self.pos += 1;
+                    self.skip(1);
                 }
-                let name = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+                let name = self.line_slice_str(start);
                 return Ok(Token::SpecialVar(name.into()));
             }
             _ => {}
@@ -1002,32 +1034,32 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_at(&mut self) -> Result<Token, ParseError> {
-        self.pos += 1; // skip @
+        self.skip(1); // skip @
         match self.peek_byte() {
             Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
                 // @{^CAPTURE} etc.
-                self.pos += 2; // skip { and ^
-                let ident_start = self.pos;
+                self.skip(2); // skip { and ^
+                let ident_start = self.line_pos();
                 while let Some(b) = self.peek_byte() {
                     if b.is_ascii_alphanumeric() || b == b'_' {
-                        self.pos += 1;
+                        self.skip(1);
                     } else {
                         break;
                     }
                 }
-                let ident = std::str::from_utf8(&self.src[ident_start..self.pos]).unwrap();
+                let ident = self.line_slice_str(ident_start);
                 let name = format!("^{ident}");
                 if self.peek_byte() == Some(b'}') {
-                    self.pos += 1;
+                    self.skip(1);
                 }
                 Ok(Token::SpecialArrayVar(name))
             }
             Some(b'+') => {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::SpecialArrayVar("+".into()))
             }
             Some(b'-') => {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::SpecialArrayVar("-".into()))
             }
             Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
@@ -1041,36 +1073,36 @@ impl<'src> Lexer<'src> {
     fn lex_percent(&mut self, expect: &Expect) -> Result<Token, ParseError> {
         // % can be modulo or hash sigil
         if expect.expecting_term() {
-            self.pos += 1;
+            self.skip(1);
             match self.peek_byte() {
                 Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
                     // %{^CAPTURE} etc.
-                    self.pos += 2; // skip { and ^
-                    let ident_start = self.pos;
+                    self.skip(2); // skip { and ^
+                    let ident_start = self.line_pos();
                     while let Some(b) = self.peek_byte() {
                         if b.is_ascii_alphanumeric() || b == b'_' {
-                            self.pos += 1;
+                            self.skip(1);
                         } else {
                             break;
                         }
                     }
-                    let ident = std::str::from_utf8(&self.src[ident_start..self.pos]).unwrap();
+                    let ident = self.line_slice_str(ident_start);
                     let name = format!("^{ident}");
                     if self.peek_byte() == Some(b'}') {
-                        self.pos += 1;
+                        self.skip(1);
                     }
                     Ok(Token::SpecialHashVar(name))
                 }
                 Some(b'!') => {
-                    self.pos += 1;
+                    self.skip(1);
                     Ok(Token::SpecialHashVar("!".into()))
                 }
                 Some(b'+') => {
-                    self.pos += 1;
+                    self.skip(1);
                     Ok(Token::SpecialHashVar("+".into()))
                 }
                 Some(b'-') => {
-                    self.pos += 1;
+                    self.skip(1);
                     Ok(Token::SpecialHashVar("-".into()))
                 }
                 Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
@@ -1080,9 +1112,9 @@ impl<'src> Lexer<'src> {
                 _ => Ok(Token::Percent),
             }
         } else {
-            self.pos += 1;
+            self.skip(1);
             if self.peek_byte() == Some(b'=') {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::Assign(AssignOp::ModEq))
             } else {
                 Ok(Token::Percent)
@@ -1093,18 +1125,18 @@ impl<'src> Lexer<'src> {
     // ── Identifiers ───────────────────────────────────────────
 
     fn scan_ident(&mut self) -> String {
-        let start = self.pos;
+        let start = self.line_pos();
         while let Some(b) = self.peek_byte() {
             if b.is_ascii_alphanumeric() || b == b'_' {
-                self.pos += 1;
+                self.skip(1);
             } else if b == b':' && self.peek_byte_at(1) == Some(b':') {
                 // Package separator Foo::Bar
-                self.pos += 2;
+                self.skip(2);
             } else {
                 break;
             }
         }
-        String::from_utf8_lossy(&self.src[start..self.pos]).into_owned()
+        String::from_utf8_lossy(self.line_slice(start)).into_owned()
     }
 
     fn lex_word(&mut self, expect: &Expect) -> Result<Token, ParseError> {
@@ -1173,12 +1205,12 @@ impl<'src> Lexer<'src> {
                 // Check that a digit follows the dot
                 if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
                     vstr.push('.');
-                    self.pos += 1; // skip '.'
-                    let start = self.pos;
+                    self.skip(1); // skip '.'
+                    let start = self.line_pos();
                     while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
-                        self.pos += 1;
+                        self.skip(1);
                     }
-                    vstr.push_str(std::str::from_utf8(&self.src[start..self.pos]).unwrap());
+                    vstr.push_str(self.line_slice_str(start));
                 } else {
                     break;
                 }
@@ -1205,18 +1237,18 @@ impl<'src> Lexer<'src> {
     // ── Strings ───────────────────────────────────────────────
 
     fn lex_single_quoted_string(&mut self) -> Result<Token, ParseError> {
-        self.pos += 1; // skip opening '
+        self.skip(1); // skip opening '
         let mut s = String::new();
         loop {
-            match self.advance_byte() {
-                None => return Err(ParseError::new("unterminated string", Span::new(self.pos as u32, self.pos as u32))),
+            match self.advance_byte_in_string(&mut s)? {
+                None => return Err(ParseError::new("unterminated string", Span::new(self.span_pos(), self.span_pos()))),
                 Some(b'\\') => match self.peek_byte() {
                     Some(b'\\') => {
-                        self.pos += 1;
+                        self.skip(1);
                         s.push('\\');
                     }
                     Some(b'\'') => {
-                        self.pos += 1;
+                        self.skip(1);
                         s.push('\'');
                     }
                     _ => s.push('\\'),
@@ -1232,20 +1264,39 @@ impl<'src> Lexer<'src> {
 
     /// Lex one sub-token from inside an interpolating string.
     /// Called when the context stack top is `Interpolating`.
-    fn lex_interp_token(&mut self, close: u8, open: Option<u8>, depth: u32) -> Result<Spanned, ParseError> {
-        let start = self.pos as u32;
+    /// `close` is `None` for heredocs (end signaled by LexerSource).
+    fn lex_interp_token(&mut self, close: Option<u8>, open: Option<u8>, depth: u32) -> Result<Spanned, ParseError> {
+        let start = self.span_pos();
 
-        if self.at_end() {
-            return Err(ParseError::new("unterminated string", Span::new(start, start)));
+        // For heredocs, ensure we have a line loaded.
+        if close.is_none() {
+            if !self.ensure_line()? {
+                // LexerSource returned None — heredoc finished.
+                self.context_stack.pop();
+                return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
+            }
         }
 
-        let b = self.peek_byte().unwrap();
+        let b = match self.peek_byte() {
+            Some(b) => b,
+            None if close.is_none() => {
+                // Empty heredoc line — return newline as ConstSegment.
+                if self.current_line.as_ref().is_some_and(|l| l.terminated) {
+                    self.current_line = None;
+                    return Ok(Spanned { token: Token::ConstSegment("\n".into()), span: Span::new(start, self.span_pos()) });
+                }
+                return Err(ParseError::new("unterminated string", Span::new(start, start)));
+            }
+            None => return Err(ParseError::new("unterminated string", Span::new(start, start))),
+        };
 
-        // Check for closing delimiter.
-        if b == close && depth == 0 {
-            self.pos += 1;
-            self.context_stack.pop();
-            return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.pos as u32) });
+        // Check for closing delimiter (not for heredocs — close is None).
+        if let Some(c) = close {
+            if b == c && depth == 0 {
+                self.skip(1);
+                self.context_stack.pop();
+                return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
+            }
         }
 
         // Check for interpolation.
@@ -1257,31 +1308,56 @@ impl<'src> Lexer<'src> {
         }
 
         // Otherwise, scan a ConstSegment: everything until we hit
-        // $, @, the closing delimiter, or end of input.
+        // $, @, the closing delimiter, or end of line.
         let mut s = String::new();
         let mut current_depth = depth;
 
         loop {
             match self.peek_byte() {
-                None => break,
-                Some(b) if b == close && current_depth == 0 => break,
+                None => {
+                    // End of line content.
+                    let terminated = self.current_line.as_ref().is_some_and(|l| l.terminated);
+                    if close.is_none() {
+                        // Heredoc: push newline, drop line, break.
+                        // Next call to lex_interp_token will ensure_line,
+                        // which either gets the next body line or detects
+                        // heredoc end (QuoteEnd).
+                        if terminated {
+                            s.push('\n');
+                        }
+                        self.current_line = None;
+                        break;
+                    } else {
+                        // Regular string: cross line boundary.
+                        if terminated {
+                            s.push('\n');
+                            self.current_line = None;
+                            if !self.ensure_line()? {
+                                break; // EOF inside string
+                            }
+                            continue;
+                        }
+                        break; // unterminated line — EOF
+                    }
+                }
+                Some(b) if Some(b) == close && current_depth == 0 => break,
                 Some(b'$') | Some(b'@') => break,
                 Some(b'\\') => {
-                    self.pos += 1;
+                    self.skip(1);
                     self.process_escape(&mut s, close);
                 }
                 Some(b) if Some(b) == open => {
                     current_depth += 1;
-                    self.pos += 1;
+                    self.skip(1);
                     s.push(b as char);
                 }
-                Some(b) if b == close && current_depth > 0 => {
+                Some(b) if Some(b) == close && current_depth > 0 => {
                     current_depth -= 1;
-                    self.pos += 1;
+                    self.skip(1);
                     s.push(b as char);
                 }
                 Some(b) => {
-                    self.pos += 1;
+                    self.skip(1);
                     s.push(b as char);
                 }
             }
@@ -1292,75 +1368,75 @@ impl<'src> Lexer<'src> {
             *d = current_depth;
         }
 
-        Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.pos as u32) })
+        Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.span_pos()) })
     }
 
     /// Process a backslash escape inside a double-quoted string.
     /// The backslash has already been consumed.
-    fn process_escape(&mut self, s: &mut String, close: u8) {
+    fn process_escape(&mut self, s: &mut String, close: Option<u8>) {
         match self.peek_byte() {
             Some(b'n') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\n');
             }
             Some(b't') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\t');
             }
             Some(b'r') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\r');
             }
             Some(b'\\') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\\');
             }
             Some(b'$') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('$');
             }
             Some(b'@') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('@');
             }
             Some(b'0') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\0');
             }
             Some(b'a') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\x07');
             }
             Some(b'b') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\x08');
             }
             Some(b'f') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\x0C');
             }
             Some(b'e') => {
-                self.pos += 1;
+                self.skip(1);
                 s.push('\x1B');
             }
-            Some(b) if b == close => {
-                self.pos += 1;
+            Some(b) if Some(b) == close => {
+                self.skip(1);
                 s.push(b as char);
             }
             Some(b'x') => {
-                self.pos += 1;
+                self.skip(1);
                 let mut val = 0u8;
                 if self.peek_byte() == Some(b'{') {
                     // \x{HH...} — Unicode escape
-                    self.pos += 1;
+                    self.skip(1);
                     let mut n = 0u32;
                     while let Some(b) = self.peek_byte() {
                         if b == b'}' {
-                            self.pos += 1;
+                            self.skip(1);
                             break;
                         }
                         if b.is_ascii_hexdigit() {
-                            self.pos += 1;
+                            self.skip(1);
                             n = n * 16 + hex_digit(b) as u32;
                         } else {
                             break;
@@ -1374,7 +1450,7 @@ impl<'src> Lexer<'src> {
                     for _ in 0..2 {
                         if let Some(b) = self.peek_byte() {
                             if b.is_ascii_hexdigit() {
-                                self.pos += 1;
+                                self.skip(1);
                                 val = val * 16 + hex_digit(b);
                             } else {
                                 break;
@@ -1390,66 +1466,66 @@ impl<'src> Lexer<'src> {
 
     /// Lex `$name`, `${name}`, or `${expr}` interpolation inside a string.
     fn lex_interp_scalar(&mut self, start: u32) -> Result<Spanned, ParseError> {
-        self.pos += 1; // skip $
+        self.skip(1); // skip $
 
         // ${...} form
         if self.peek_byte() == Some(b'{') {
-            self.pos += 1; // skip {
+            self.skip(1); // skip {
             // Simple identifier: ${name}
             if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
-                let saved_pos = self.pos;
+                let saved_pos = self.line_pos();
                 let name = self.scan_ident();
                 if self.peek_byte() == Some(b'}') {
-                    self.pos += 1;
-                    return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.pos as u32) });
+                    self.skip(1);
+                    return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
                 }
                 // Not a simple ${name} — backtrack and scan as expression
-                self.pos = saved_pos;
+                self.current_line.as_mut().unwrap().pos = saved_pos;
             }
             // Expression interpolation: ${\ expr}, ${$ref}, etc.
             // Push ExprInString — next tokens are normal code until }.
             self.context_stack.push(LexContext::ExprInString { depth: 0 });
-            return Ok(Spanned { token: Token::InterpScalarExprStart, span: Span::new(start, self.pos as u32) });
+            return Ok(Spanned { token: Token::InterpScalarExprStart, span: Span::new(start, self.span_pos()) });
         }
 
         // $name form — must start with alpha or _
         if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
             let name = self.scan_ident();
-            return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.pos as u32) });
+            return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
         }
 
         // Bare $ not followed by a name — treat as literal
-        Ok(Spanned { token: Token::ConstSegment("$".into()), span: Span::new(start, self.pos as u32) })
+        Ok(Spanned { token: Token::ConstSegment("$".into()), span: Span::new(start, self.span_pos()) })
     }
 
     /// Lex `@name` or `@{expr}` interpolation inside a string.
     fn lex_interp_array(&mut self, start: u32) -> Result<Spanned, ParseError> {
-        self.pos += 1; // skip @
+        self.skip(1); // skip @
 
         // @{...} form — expression interpolation: @{[ expr ]}
         if self.peek_byte() == Some(b'{') {
-            self.pos += 1; // skip {
+            self.skip(1); // skip {
             self.context_stack.push(LexContext::ExprInString { depth: 0 });
-            return Ok(Spanned { token: Token::InterpArrayExprStart, span: Span::new(start, self.pos as u32) });
+            return Ok(Spanned { token: Token::InterpArrayExprStart, span: Span::new(start, self.span_pos()) });
         }
 
         // @name form
         if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
             let name = self.scan_ident();
-            return Ok(Spanned { token: Token::InterpArray(name), span: Span::new(start, self.pos as u32) });
+            return Ok(Spanned { token: Token::InterpArray(name), span: Span::new(start, self.span_pos()) });
         }
 
         // Bare @ not followed by a name — treat as literal
-        Ok(Spanned { token: Token::ConstSegment("@".into()), span: Span::new(start, self.pos as u32) })
+        Ok(Spanned { token: Token::ConstSegment("@".into()), span: Span::new(start, self.span_pos()) })
     }
 
     fn scan_to_delimiter(&mut self, delim: u8) -> Result<String, ParseError> {
         let mut s = String::new();
         loop {
-            match self.advance_byte() {
-                None => return Err(ParseError::new("unterminated string", Span::new(self.pos as u32, self.pos as u32))),
+            match self.advance_byte_in_string(&mut s)? {
+                None => return Err(ParseError::new("unterminated string", Span::new(self.span_pos(), self.span_pos()))),
                 Some(b'\\') if self.peek_byte() == Some(delim) => {
-                    self.pos += 1;
+                    self.skip(1);
                     s.push(delim as char);
                 }
                 Some(b) if b == delim => break,
@@ -1470,14 +1546,14 @@ impl<'src> Lexer<'src> {
     fn lex_qq_string(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
         let paired_open = if open != close { Some(open) } else { None };
-        self.context_stack.push(LexContext::Interpolating { close, open: paired_open, depth: 0 });
+        self.context_stack.push(LexContext::Interpolating { close: Some(close), open: paired_open, depth: 0 });
         Ok(Token::QuoteBegin(QuoteKind::Double, open))
     }
 
     fn lex_qx(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
         let paired_open = if open != close { Some(open) } else { None };
-        self.context_stack.push(LexContext::Interpolating { close, open: paired_open, depth: 0 });
+        self.context_stack.push(LexContext::Interpolating { close: Some(close), open: paired_open, depth: 0 });
         Ok(Token::QuoteBegin(QuoteKind::Backtick, open))
     }
 
@@ -1537,7 +1613,7 @@ impl<'src> Lexer<'src> {
     }
 
     fn read_quote_delimiters(&mut self) -> Result<(u8, u8), ParseError> {
-        let open = self.advance_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.pos as u32, self.pos as u32)))?;
+        let open = self.advance_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))?;
         let close = matching_delimiter(open);
         Ok((open, close))
     }
@@ -1548,12 +1624,12 @@ impl<'src> Lexer<'src> {
         let paired = open != close; // e.g. {}, [], (), <>
 
         loop {
-            match self.advance_byte() {
-                None => return Err(ParseError::new("unterminated string", Span::new(self.pos as u32, self.pos as u32))),
+            match self.advance_byte_in_string(&mut s)? {
+                None => return Err(ParseError::new("unterminated string", Span::new(self.span_pos(), self.span_pos()))),
                 Some(b'\\') => {
                     if let Some(next) = self.peek_byte() {
                         if next == close || next == open {
-                            self.pos += 1;
+                            self.skip(1);
                             s.push(next as char);
                             continue;
                         }
@@ -1580,14 +1656,14 @@ impl<'src> Lexer<'src> {
     // ── Operators ─────────────────────────────────────────────
 
     fn lex_plus(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'+') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::PlusPlus
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Assign(AssignOp::AddEq)
             }
             _ => Token::Plus,
@@ -1595,23 +1671,23 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_minus(&mut self, expect: &Expect) -> Result<Token, ParseError> {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'-') => {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::MinusMinus)
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::Assign(AssignOp::SubEq))
             }
             Some(b'>') => {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::Arrow)
             }
             Some(b) if expect.expecting_term() && b.is_ascii_alphabetic() && !self.peek_byte_at(1).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') => {
                 // Filetest: -f, -d, -r, etc.
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::Filetest(b))
             }
             _ => Ok(Token::Minus),
@@ -1619,19 +1695,19 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_star(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'*') => {
-                self.pos += 1;
+                self.skip(1);
                 if self.peek_byte() == Some(b'=') {
-                    self.pos += 1;
+                    self.skip(1);
                     Token::Assign(AssignOp::PowEq)
                 } else {
                     Token::Power
                 }
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Assign(AssignOp::MulEq)
             }
             _ => Token::Star,
@@ -1645,23 +1721,23 @@ impl<'src> Lexer<'src> {
         // Only m// produces Token::RegexLit with an empty pattern directly
         // from the lexer.  This eliminates the need for XTERMORDORDOR.
         if self.peek_byte_at(1) == Some(b'/') {
-            self.pos += 2;
+            self.skip(2);
             if self.peek_byte() == Some(b'=') {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::Assign(AssignOp::DefinedOrEq))
             } else {
                 Ok(Token::DefinedOr)
             }
         } else if expect.slash_is_regex() {
             // Single / in term context: regex.
-            self.pos += 1; // skip opening /
+            self.skip(1); // skip opening /
             let pattern = self.scan_to_delimiter(b'/')?;
             let flags = self.scan_regex_flags();
             Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
         } else {
-            self.pos += 1;
+            self.skip(1);
             if self.peek_byte() == Some(b'=') {
-                self.pos += 1;
+                self.skip(1);
                 Ok(Token::Assign(AssignOp::DivEq))
             } else {
                 Ok(Token::Slash)
@@ -1670,31 +1746,31 @@ impl<'src> Lexer<'src> {
     }
 
     fn scan_regex_flags(&mut self) -> String {
-        let start = self.pos;
+        let start = self.line_pos();
         while let Some(b) = self.peek_byte() {
             if b.is_ascii_alphabetic() {
-                self.pos += 1;
+                self.skip(1);
             } else {
                 break;
             }
         }
-        String::from_utf8_lossy(&self.src[start..self.pos]).into_owned()
+        String::from_utf8_lossy(self.line_slice(start)).into_owned()
     }
 
     fn lex_dot(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'.') => {
-                self.pos += 1;
+                self.skip(1);
                 if self.peek_byte() == Some(b'.') {
-                    self.pos += 1;
+                    self.skip(1);
                     Token::DotDotDot
                 } else {
                     Token::DotDot
                 }
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Assign(AssignOp::ConcatEq)
             }
             _ => Token::Dot,
@@ -1702,24 +1778,24 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_less_than(&mut self, expect: &Expect) -> Result<Token, ParseError> {
-        self.pos += 1; // consume first <
+        self.skip(1); // consume first <
         match self.peek_byte() {
             Some(b'<') => {
                 // Could be heredoc (in term position) or left shift.
                 if expect.expecting_term() {
                     // Check for heredoc tag after <<
-                    let saved = self.pos; // position of second <
-                    self.pos += 1; // skip second <
+                    let saved = self.line_pos(); // position of second <
+                    self.skip(1); // skip second <
 
                     // <<~ for indented heredocs
                     let indented = self.peek_byte() == Some(b'~');
                     if indented {
-                        self.pos += 1;
+                        self.skip(1);
                     }
 
                     // Skip optional whitespace between << and tag
                     while self.peek_byte() == Some(b' ') || self.peek_byte() == Some(b'\t') {
-                        self.pos += 1;
+                        self.skip(1);
                     }
 
                     match self.peek_byte() {
@@ -1733,9 +1809,9 @@ impl<'src> Lexer<'src> {
                         }
                         _ => {
                             // Not a heredoc — rewind to after first <, re-parse as <<
-                            self.pos = saved + 1;
+                            self.current_line.as_mut().unwrap().pos = saved + 1;
                             if self.peek_byte() == Some(b'=') {
-                                self.pos += 1;
+                                self.skip(1);
                                 return Ok(Token::Assign(AssignOp::ShiftLEq));
                             }
                             return Ok(Token::ShiftL);
@@ -1743,9 +1819,9 @@ impl<'src> Lexer<'src> {
                     }
                 } else {
                     // Operator position: left shift
-                    self.pos += 1;
+                    self.skip(1);
                     if self.peek_byte() == Some(b'=') {
-                        self.pos += 1;
+                        self.skip(1);
                         Ok(Token::Assign(AssignOp::ShiftLEq))
                     } else {
                         Ok(Token::ShiftL)
@@ -1753,9 +1829,9 @@ impl<'src> Lexer<'src> {
                 }
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 if self.peek_byte() == Some(b'>') {
-                    self.pos += 1;
+                    self.skip(1);
                     Ok(Token::Spaceship)
                 } else {
                     Ok(Token::NumLe)
@@ -1765,335 +1841,140 @@ impl<'src> Lexer<'src> {
                 // In term position, < could be readline/glob: <STDIN>, <>, <$fh>, <*.txt>
                 if expect.expecting_term() {
                     // Try to scan a readline: <...> where ... is the content
-                    let start_pos = self.pos; // just after <
+                    let start_pos = self.line_pos(); // just after <
                     let mut content = String::new();
                     let mut found_close = false;
                     while let Some(b) = self.peek_byte() {
                         if b == b'>' {
-                            self.pos += 1;
+                            self.skip(1);
                             found_close = true;
                             break;
                         }
                         if b == b'\n' {
                             break;
                         } // no multiline
-                        self.pos += 1;
+                        self.skip(1);
                         content.push(b as char);
                     }
                     if found_close {
                         return Ok(Token::Readline(content));
                     }
                     // Not a readline — rewind
-                    self.pos = start_pos;
+                    self.current_line.as_mut().unwrap().pos = start_pos;
                 }
                 Ok(Token::NumLt)
             }
         }
     }
 
-    /// Lex a heredoc tag and eagerly collect the body.
+    /// Lex a heredoc tag and start body processing via LexerSource.
     /// Position is after `<<` (and optional `~`), at the tag start.
     fn lex_heredoc(&mut self, indented: bool) -> Result<Token, ParseError> {
-        let start = self.pos;
+        let start = self.line_pos();
 
         // Determine quoting style and extract tag.
         let (kind, tag) = match self.peek_byte() {
             Some(b'\'') => {
                 // <<'TAG' — literal
-                self.pos += 1;
+                self.skip(1);
                 let tag = self.scan_heredoc_tag(b'\'')?;
                 let k = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
                 (k, tag)
             }
             Some(b'"') => {
                 // <<"TAG" — interpolating (explicit)
-                self.pos += 1;
+                self.skip(1);
                 let tag = self.scan_heredoc_tag(b'"')?;
                 let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
                 (k, tag)
             }
             _ => {
                 // Bare identifier — interpolating
-                let tag_start = self.pos;
+                let tag_start = self.line_pos();
                 while self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
-                    self.pos += 1;
+                    self.skip(1);
                 }
-                let tag = String::from_utf8_lossy(&self.src[tag_start..self.pos]).into_owned();
+                let tag = String::from_utf8_lossy(self.line_slice(tag_start)).into_owned();
                 let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
                 (k, tag)
             }
         };
 
         if tag.is_empty() {
-            return Err(ParseError::new("empty heredoc tag", Span::new(start as u32, self.pos as u32)));
+            return Err(ParseError::new("empty heredoc tag", self.span_from(start)));
         }
 
-        // Save position — the rest of the current line continues from here.
-        let rest_of_line_pos = self.pos;
+        let tag_bytes = Bytes::from(tag.as_bytes().to_vec());
 
-        // Find the end of the current line.
-        while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
-            self.pos += 1;
-        }
-        if self.pos < self.src.len() {
-            self.pos += 1; // skip the \n
-        }
-
-        // pos is now at the start of the heredoc body.
-        let body_start = self.pos;
-
+        // Tell LexerSource to start the heredoc.  This takes the current
+        // line (with cursor at the rest-of-line position) and begins
+        // serving heredoc body lines on subsequent next_line() calls.
         match kind {
             HeredocKind::Interpolating => {
-                // Non-indented interpolating: process on the fly.
-                self.context_stack.push(LexContext::HeredocBody { tag, rest_of_line_pos, at_line_start: true, indent: Vec::new() });
+                self.source.start_heredoc(tag_bytes, &mut self.current_line);
+                self.context_stack.push(LexContext::Interpolating { close: None, open: None, depth: 0 });
                 Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
             }
             HeredocKind::Indented => {
-                // Indented interpolating: scan ahead to find the terminator
-                // and extract its exact whitespace prefix, then rewind.
-                let indent = self.scan_heredoc_terminator_indent(&tag, body_start)?;
-                self.pos = body_start;
-                self.context_stack.push(LexContext::HeredocBody { tag, rest_of_line_pos, at_line_start: true, indent });
+                self.source.start_indented_heredoc(tag_bytes, &mut self.current_line)?;
+                self.context_stack.push(LexContext::Interpolating { close: None, open: None, depth: 0 });
                 Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
             }
-            HeredocKind::Literal | HeredocKind::IndentedLiteral => {
-                // Literal heredocs: collect body as raw string.
-                self.collect_heredoc_literal(&tag, indented, body_start, rest_of_line_pos)
+            HeredocKind::Literal => {
+                self.source.start_heredoc(tag_bytes, &mut self.current_line);
+                self.collect_heredoc_literal(&tag, false)
+            }
+            HeredocKind::IndentedLiteral => {
+                self.source.start_indented_heredoc(tag_bytes, &mut self.current_line)?;
+                self.collect_heredoc_literal(&tag, true)
             }
         }
-    }
-
-    /// Scan ahead from `body_start` to find the indented heredoc terminator.
-    /// Returns the exact whitespace prefix from the terminator line.
-    /// Leaves `self.pos` after the terminator line.
-    fn scan_heredoc_terminator_indent(&mut self, tag: &str, body_start: usize) -> Result<Vec<u8>, ParseError> {
-        self.pos = body_start;
-        while self.pos < self.src.len() {
-            let line_start = self.pos;
-            // Scan leading whitespace.
-            while self.pos < self.src.len() && (self.src[self.pos] == b' ' || self.src[self.pos] == b'\t') {
-                self.pos += 1;
-            }
-            let indent_end = self.pos;
-            // Scan rest of line.
-            while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
-                self.pos += 1;
-            }
-            let line_end = self.pos;
-            if self.pos < self.src.len() {
-                self.pos += 1; // skip \n
-            }
-            // Check if the non-whitespace part matches the tag.
-            if &self.src[indent_end..line_end] == tag.as_bytes() {
-                return Ok(self.src[line_start..indent_end].to_vec());
-            }
-        }
-        Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(body_start as u32, self.pos as u32)))
     }
 
     /// Collect a literal heredoc body as a raw string.
-    /// Used for `<<'TAG'` and `<<~'TAG'`.
-    fn collect_heredoc_literal(&mut self, tag: &str, indented: bool, body_start: usize, rest_of_line_pos: usize) -> Result<Token, ParseError> {
+    /// LexerSource handles terminator detection and indent stripping.
+    fn collect_heredoc_literal(&mut self, tag: &str, indented: bool) -> Result<Token, ParseError> {
         let mut body = String::new();
-        let mut found_terminator = false;
-        let mut terminator_indent: Vec<u8> = Vec::new();
-
-        while self.pos < self.src.len() {
-            let line_start = self.pos;
-            while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
-                self.pos += 1;
-            }
-            let line_end = self.pos;
-            if self.pos < self.src.len() {
-                self.pos += 1; // skip \n
-            }
-
-            let line = &self.src[line_start..line_end];
-
-            // Check if this line is the terminator.
-            if indented {
-                let mut i = 0;
-                while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
-                    i += 1;
+        loop {
+            match self.source.next_line()? {
+                Some(line) => {
+                    body.push_str(&String::from_utf8_lossy(&line.line));
+                    body.push('\n');
                 }
-                if &line[i..] == tag.as_bytes() {
-                    terminator_indent = line[..i].to_vec();
-                    found_terminator = true;
-                    break;
-                }
-            } else if line == tag.as_bytes() {
-                found_terminator = true;
-                break;
+                None => break, // terminator found by LexerSource
             }
-
-            body.push_str(&String::from_utf8_lossy(line));
-            body.push('\n');
         }
-
-        if !found_terminator {
-            return Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(body_start as u32, self.pos as u32)));
-        }
-
-        // For indented literal heredocs, strip the terminator's exact
-        // indentation from each body line (matching toke.c behavior).
-        if indented && !terminator_indent.is_empty() {
-            body = strip_heredoc_indent_exact(&body, &terminator_indent);
-        }
-
-        let after_terminator = self.pos;
-        self.pos = rest_of_line_pos;
-        self.heredoc_line_redirects.push(after_terminator);
-
         let kind = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
         Ok(Token::HeredocLit(kind, tag.to_string(), body))
     }
 
-    /// Lex one sub-token from inside an interpolating heredoc body.
-    /// Called when the context stack top is `HeredocBody`.
-    fn lex_heredoc_body_token(&mut self) -> Result<Spanned, ParseError> {
-        let start = self.pos as u32;
-
-        // Extract context fields — clone tag and indent to avoid borrowing self.
-        let (tag, rest_of_line_pos, at_line_start, indent) = match self.context_stack.last() {
-            Some(LexContext::HeredocBody { tag, rest_of_line_pos, at_line_start, indent }) => (tag.clone(), *rest_of_line_pos, *at_line_start, indent.clone()),
-            _ => unreachable!(),
-        };
-
-        if self.at_end() {
-            return Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(start, start)));
-        }
-
-        // At line start, check for terminator.
-        if at_line_start {
-            let line_start = self.pos;
-            // For indented heredocs, check if line starts with indent + tag.
-            if !indent.is_empty() {
-                // Strip the indent prefix.
-                let after_indent = if self.src[self.pos..].starts_with(&indent) {
-                    self.pos + indent.len()
-                } else {
-                    // Check for empty line (just \n) — allowed without indent.
-                    if self.peek_byte() == Some(b'\n') {
-                        // Not a terminator, not an error — just an empty line.
-                        // Clear at_line_start after processing below.
-                        self.pos // don't skip indent
-                    } else {
-                        // Non-empty line without correct indentation.
-                        return Err(ParseError::new("indentation on line of here-doc doesn't match delimiter", Span::new(start, self.pos as u32)));
-                    }
-                };
-                // Check if the rest of the line after indent is the tag.
-                let mut tag_end = after_indent;
-                while tag_end < self.src.len() && self.src[tag_end] != b'\n' {
-                    tag_end += 1;
-                }
-                if &self.src[after_indent..tag_end] == tag.as_bytes() {
-                    // Found terminator.  Skip past it.
-                    self.pos = tag_end;
-                    if self.pos < self.src.len() {
-                        self.pos += 1; // skip \n
-                    }
-                    let after_terminator = self.pos;
-                    self.context_stack.pop();
-                    self.pos = rest_of_line_pos;
-                    self.heredoc_line_redirects.push(after_terminator);
-                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
-                }
-                // Not terminator — skip the indent bytes for content.
-                if self.src[self.pos..].starts_with(&indent) {
-                    self.pos += indent.len();
-                }
-            } else {
-                // Non-indented: check if full line matches tag.
-                let mut line_end = self.pos;
-                while line_end < self.src.len() && self.src[line_end] != b'\n' {
-                    line_end += 1;
-                }
-                if &self.src[line_start..line_end] == tag.as_bytes() {
-                    // Found terminator.
-                    self.pos = line_end;
-                    if self.pos < self.src.len() {
-                        self.pos += 1; // skip \n
-                    }
-                    let after_terminator = self.pos;
-                    self.context_stack.pop();
-                    self.pos = rest_of_line_pos;
-                    self.heredoc_line_redirects.push(after_terminator);
-                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
-                }
-            }
-
-            // Not a terminator line — clear the flag.
-            if let Some(LexContext::HeredocBody { at_line_start: a, .. }) = self.context_stack.last_mut() {
-                *a = false;
-            }
-        }
-
-        // Check for interpolation.
-        let b = self.peek_byte().unwrap();
-        if b == b'$' {
-            return self.lex_interp_scalar(start);
-        }
-        if b == b'@' {
-            return self.lex_interp_array(start);
-        }
-
-        // Scan a ConstSegment: everything until $, @, or newline.
-        let mut s = String::new();
-        loop {
-            match self.peek_byte() {
-                None => break,
-                Some(b'$') | Some(b'@') => break,
-                Some(b'\\') => {
-                    self.pos += 1;
-                    self.process_escape(&mut s, 0);
-                }
-                Some(b'\n') => {
-                    self.pos += 1;
-                    s.push('\n');
-                    // Mark next call as line start for terminator check.
-                    if let Some(LexContext::HeredocBody { at_line_start: a, .. }) = self.context_stack.last_mut() {
-                        *a = true;
-                    }
-                    break;
-                }
-                Some(b) => {
-                    self.pos += 1;
-                    s.push(b as char);
-                }
-            }
-        }
-
-        Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.pos as u32) })
-    }
-
     /// Scan a quoted heredoc tag (between matching quotes).
     fn scan_heredoc_tag(&mut self, close: u8) -> Result<String, ParseError> {
-        let start = self.pos;
-        while self.pos < self.src.len() && self.src[self.pos] != close {
-            self.pos += 1;
+        let start = self.line_pos();
+        while self.peek_byte().is_some_and(|b| b != close) {
+            self.skip(1);
         }
-        let tag = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
-        if self.pos < self.src.len() {
-            self.pos += 1; // skip closing quote
+        let tag = String::from_utf8_lossy(self.line_slice(start)).into_owned();
+        if self.peek_byte() == Some(close) {
+            self.skip(1); // skip closing quote
         }
         Ok(tag)
     }
 
     fn lex_greater_than(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'>') => {
-                self.pos += 1;
+                self.skip(1);
                 if self.peek_byte() == Some(b'=') {
-                    self.pos += 1;
+                    self.skip(1);
                     Token::Assign(AssignOp::ShiftREq)
                 } else {
                     Token::ShiftR
                 }
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::NumGe
             }
             _ => Token::NumGt,
@@ -2101,18 +1982,18 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_equals(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::NumEq
             }
             Some(b'~') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Binding
             }
             Some(b'>') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::FatComma
             }
             _ => Token::Assign(AssignOp::Eq),
@@ -2120,14 +2001,14 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_bang(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::NumNe
             }
             Some(b'~') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::NotBinding
             }
             _ => Token::Bang,
@@ -2135,19 +2016,19 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_ampersand(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'&') => {
-                self.pos += 1;
+                self.skip(1);
                 if self.peek_byte() == Some(b'=') {
-                    self.pos += 1;
+                    self.skip(1);
                     Token::Assign(AssignOp::AndEq)
                 } else {
                     Token::AndAnd
                 }
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Assign(AssignOp::BitAndEq)
             }
             _ => Token::BitAnd,
@@ -2155,19 +2036,19 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_pipe(&mut self) -> Token {
-        self.pos += 1;
+        self.skip(1);
         match self.peek_byte() {
             Some(b'|') => {
-                self.pos += 1;
+                self.skip(1);
                 if self.peek_byte() == Some(b'=') {
-                    self.pos += 1;
+                    self.skip(1);
                     Token::Assign(AssignOp::OrEq)
                 } else {
                     Token::OrOr
                 }
             }
             Some(b'=') => {
-                self.pos += 1;
+                self.skip(1);
                 Token::Assign(AssignOp::BitOrEq)
             }
             _ => Token::BitOr,
@@ -2192,32 +2073,6 @@ fn hex_digit(b: u8) -> u8 {
         b'A'..=b'F' => b - b'A' + 10,
         _ => 0,
     }
-}
-
-/// Strip the common leading whitespace from an indented heredoc body (<<~).
-/// Strip the terminator's exact whitespace prefix from each body line.
-/// Matches toke.c behavior: the indent is determined by the terminator
-/// line, not the minimum indent.  Empty lines (just "\n") are preserved.
-/// Panics if any non-empty line doesn't start with the exact indent.
-fn strip_heredoc_indent_exact(body: &str, indent: &[u8]) -> String {
-    let indent_str = std::str::from_utf8(indent).unwrap_or("");
-    let mut result = String::with_capacity(body.len());
-    for line in body.split_inclusive('\n') {
-        let trimmed = line.strip_suffix('\n').unwrap_or(line);
-        if trimmed.is_empty() {
-            // Empty line — preserve as-is.
-            result.push_str(line);
-        } else if trimmed.as_bytes().starts_with(indent) {
-            result.push_str(&trimmed[indent_str.len()..]);
-            if line.ends_with('\n') {
-                result.push('\n');
-            }
-        } else {
-            // Indentation mismatch — should have been caught earlier.
-            result.push_str(line);
-        }
-    }
-    result
 }
 
 // ── Byte-level helpers for brace disambiguation ─────────────
@@ -2321,28 +2176,8 @@ mod tests {
     }
 
     // ── CR normalization ────────────────────────────────────────
-
-    #[test]
-    fn normalize_crlf_strips_cr_before_lf() {
-        assert_eq!(normalize_crlf(b"a\r\nb\r\n"), b"a\nb\n");
-    }
-
-    #[test]
-    fn normalize_crlf_preserves_standalone_cr() {
-        // Standalone \r is NOT a newline — stays as literal byte.
-        assert_eq!(normalize_crlf(b"a\rb"), b"a\rb");
-    }
-
-    #[test]
-    fn normalize_crlf_preserves_lf_cr() {
-        // \n\r is NOT CRLF — the \r stays.
-        assert_eq!(normalize_crlf(b"a\n\rb"), b"a\n\rb");
-    }
-
-    #[test]
-    fn normalize_crlf_noop_on_lf_only() {
-        assert_eq!(normalize_crlf(b"a\nb\n"), b"a\nb\n");
-    }
+    // Note: normalize_crlf is now handled by LexerSource.
+    // Low-level tests are in source.rs; these test high-level behavior.
 
     #[test]
     fn lex_crlf_same_as_lf() {
