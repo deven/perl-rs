@@ -137,7 +137,7 @@ enum Value {
     Undef,
     Int(i64),                 // just an integer
     Float(f64),               // just a float
-    SmallStr(SmallString),    // short string, inline (≤22 bytes)
+    SmallStr(SmallString),    // short string, inline (≤38 bytes)
     Str(PerlString),          // longer string, heap-allocated
     Ref(Sv),                  // just a reference (points to a full Scalar)
 
@@ -160,19 +160,20 @@ enum Value {
 /// Avoids a heap allocation for one of the hottest scalar cases.
 struct SmallString {
     len: u8,
-    is_utf8: bool,
-    buf: [u8; 22],
+    flags: u8,        // see string flags below
+    buf: [u8; 38],
 }
 ```
 
-The threshold of 22 bytes is chosen to keep `SmallString` the same
-size as `PerlString` (which is `Vec<u8>` at 24 bytes + `is_utf8`),
-so the `Value` enum doesn't grow.  22 bytes covers the vast majority
+The threshold of 38 bytes is chosen to keep `SmallString` the same
+size as `PerlString` (which is `Bytes` at 32 bytes + `flags` at
+1 byte + 7 bytes padding = 40 bytes), so the `Value` enum doesn't
+grow.  38 bytes covers the vast majority
 of short strings: hash keys, field names, small literals, numeric
 stringifications like `"42"` or `"3.14159"`, single characters,
 and short identifiers.
 
-When a `SmallStr` grows past 22 bytes (via `.=`, `substr` assignment,
+When a `SmallStr` grows past 38 bytes (via `.=`, `substr` assignment,
 etc.), it promotes to `Str(PerlString)` — one heap allocation at the
 growth point.  This promotion is one-way; a `Str` that shrinks does
 not demote back to `SmallStr`.
@@ -233,26 +234,26 @@ trait TypedVal: Send + Sync + Any {
 When a value is upgraded from a compact `Value` variant to a full
 `Scalar` (see upgrade triggers in §2.2), it gains multi-representation
 caching with flag-driven validity.  This matches Perl 5's SV model
-where `$x = "42"` sets POK, then `$x + 0` sets IOK and caches 42 in
-`iv` without clearing the string.  Multiple representations coexist:
+where `$x = "42"` sets STR_VALID, then `$x + 0` sets INT_VALID and caches 42 in
+`int` without clearing the string.  Multiple representations coexist:
 
 ```rust
 struct Scalar {
-    flags: SvFlags,                    // validity + metadata bits
-    iv: i64,                           // integer cache
-    nv: f64,                           // float cache
-    pv: PerlStringSlot,               // string cache (with small-string optimization)
-    rv: Option<Value>,                 // reference target
+    flags: ScalarFlags,                    // validity + metadata bits
+    int: i64,                          // integer cache
+    num: f64,                          // float cache
+    bytes: PerlStringSlot,             // string cache (with small-string optimization)
+    reference: Option<Value>,          // reference target
     magic: Option<Box<MagicChain>>,
     stash: Option<Arc<Stash>>,         // blessed package (for objects)
 }
 
 /// Small-string optimization within the Scalar's string cache.
 /// Even after upgrading to a full Scalar, short strings avoid a
-/// heap allocation for the pv field.
+/// heap allocation for the bytes field.
 enum PerlStringSlot {
     None,
-    Inline { buf: [u8; 24], len: u8, is_utf8: bool },
+    Inline { buf: [u8; 24], len: u8, flags: u8 },
     Heap(PerlString),
 }
 ```
@@ -264,80 +265,243 @@ the string cache inside a full `Scalar` (already behind `Arc`).
 
 **Flag discipline:**
 
-`SvFlags` separates cache-validity bits from orthogonal metadata:
+`ScalarFlags` separates cache-validity bits from orthogonal metadata:
 
 ```rust
-bitflags! {
-    struct SvFlags: u32 {
-        // Cache validity — which representations are current
-        const IOK      = 1 << 0;   // iv is valid
-        const NOK      = 1 << 1;   // nv is valid
-        const POK      = 1 << 2;   // pv is valid
-        const ROK      = 1 << 3;   // rv is valid (this is a reference)
+struct ScalarFlags(u16);
 
-        // Metadata — orthogonal to cache validity
-        const UTF8     = 1 << 4;   // pv is valid UTF-8
-        const READONLY = 1 << 5;   // value is immutable
-        const TAINT    = 1 << 6;   // value is tainted
-        const MAGICAL  = 1 << 7;   // magic chain is attached
-        const WEAK     = 1 << 8;   // this is a weak reference
-    }
+impl ScalarFlags {
+    // Cache validity — which representations are current
+    const INT_VALID  = 1 << 0;   // int is valid
+    const NUM_VALID  = 1 << 1;   // num is valid
+    const STR_VALID  = 1 << 2;   // bytes is valid
+    const REF_VALID  = 1 << 3;   // ref is valid (this is a reference)
+
+    // Metadata — orthogonal to cache validity
+    const UTF8       = 1 << 4;   // bytes is valid UTF-8
+    const READONLY   = 1 << 5;   // value is immutable
+    const TAINT      = 1 << 6;   // value is tainted
+    const MAGICAL    = 1 << 7;   // magic chain is attached
+    const WEAK       = 1 << 8;   // this is a weak reference
 }
 ```
 
 The validity bits drive the lazy coercion engine: reading `$x` as a
-number checks IOK first (fast path — return `iv`), falls back to
-NOK, falls back to computing numeric value from `pv`, caches the
-result by setting IOK/NOK.  Writing invalidates the other caches
-(e.g., assigning a new string clears IOK and NOK, sets POK).
+number checks INT_VALID first (fast path — return `int`), falls back
+to NUM_VALID, falls back to computing numeric value from `bytes`,
+caches the result by setting INT_VALID/NUM_VALID.  Writing
+invalidates the other caches (e.g., assigning a new string clears
+INT_VALID and NUM_VALID, sets STR_VALID).
 
 `PerlString` is the heap-allocated string type used by the `Heap`
 variant of `PerlStringSlot` (and throughout the runtime for string
-keys, identifiers, etc.).  Perl strings are octet sequences with an
-optional UTF-8 flag, not Rust `String`.  A `PerlString` is
-essentially `Vec<u8>` plus a `bool is_utf8` flag, with operations
-that respect Perl's specific UTF-8 upgrade/downgrade semantics.
+keys, identifiers, etc.).  Perl strings are octet sequences with
+metadata flags, not Rust `String`.
 
-A `Vec<u8>` (not `bytes::Bytes`) is the right backing store because
-Perl strings are heavily mutated: `.=`, `chop`, `chomp`, `substr`
-assignment, `s///`, and `vec()` all modify in place.  `Bytes` is
-immutable and optimized for zero-copy slicing — a different use case.
-Async IO boundaries should convert to/from `Bytes`/`BytesMut` at the
-edge.
+`Bytes` / `BytesMut` from the `bytes` crate is the backing store,
+providing Perl 5's copy-on-write (COW) string semantics:
 
-When the UTF-8 flag is set, zero-cost conversion to `&str` is available:
+- **Shared / COW state (`Bytes`):** Multiple SVs can reference the
+  same underlying buffer.  Operations like `substr($x, 0, 5)` as an
+  rvalue produce a zero-copy `Bytes::slice()`.  `Bytes` is immutable
+  and reference-counted — cloning is a cheap refcount bump.
+
+- **Mutation (`BytesMut`):** When a string is mutated (`.=`, `chop`,
+  `chomp`, `substr` assignment, `s///`, `vec()`), the `Bytes` handle
+  is checked for unique ownership.  If uniquely held, it converts to
+  `BytesMut` in place (no copy).  If shared, copy-on-write triggers:
+  a new `BytesMut` is allocated, the content is copied, then mutated.
+
+This maps directly to Perl 5's `SvPV_COW` mechanism.
+
+**String flags:**
+
+A single `flags: u8` byte carries two independent concerns:
+
+```text
+bit 0:     Perl UTF-8 flag (SvUTF8) — Perl's semantic "treat as characters"
+bits 1-3:  Rust byte-content cache (3 bits, 5 used states):
+```
+
+| bits 1-3 | ASCII | valid UTF-8 | description |
+|---|---|---|---|
+| `000` | yes | yes | pure 7-bit ASCII |
+| `001` | no | yes | valid UTF-8 but non-ASCII |
+| `010` | no | no | invalid UTF-8 |
+| `011` | unknown | yes | valid UTF-8, possibly ASCII |
+| `100` | no | unknown | non-ASCII, UTF-8 unknown |
+| `111` | unknown | unknown | completely unknown |
+
+States `101` and `110` are unused (ASCII implies valid UTF-8).
+
+The Perl UTF-8 flag (bit 0) is independent of the Rust cache.
+Perl's "extended UTF-8" can represent code points above U+10FFFF
+and surrogates that Rust rejects, and `Encode::_utf8_on()` sets
+the Perl flag without validation.
+
+**State transitions — scans only narrow, never re-widen:**
+
+- `is_ascii()` scan: `111` → `000` or `100`; `011` → `000` or `001`
+- `as_str()` scan: `111` → `000` or `001` or `010`;
+  `100` → `001` or `010`
+
+Once a state is narrowed, no subsequent operation widens it unless
+the bytes are mutated.  Mutation rules for the Rust cache (bits
+1-3), preserving the Perl UTF-8 flag (bit 0) independently:
+
+- **Appending or prepending pure ASCII bytes**: no flag change.
+  Cannot affect UTF-8 validity or introduce non-ASCII content.
+
+- **Appending or prepending `&str`** to a valid UTF-8 string:
+  preserves `001` or `011`.  Valid UTF-8 concatenated with valid
+  UTF-8 is valid UTF-8.
+
+- **Inserting mid-string** into any string results in invalid
+  UTF-8 if the byte at the insertion point is a UTF-8 continuation
+  byte (`0x80..0xBF`), because this splits a multi-byte sequence
+  — transition to `010` (invalid).  This check can be skipped for
+  `000` (insertion point is guaranteed ASCII) and for `010`/`111`
+  (no validity claim to protect).
+
+- **Adding to an ASCII string** (`000`) inherits the flags of the
+  content being added.
+
+- **Adding valid UTF-8** (`&str`, `String`, or a string with known
+  `001`/`011` flags) to a valid UTF-8 string preserves UTF-8
+  validity.  ASCII status: `001` stays `001`; `000` transitions to
+  `001` if the added content is non-ASCII.
+
+- **Removing valid UTF-8 characters** from a valid UTF-8 string
+  (respecting character boundaries, not splitting a multi-byte
+  sequence): `001` resets to `011` (removing non-ASCII characters
+  might leave only ASCII).  `011` stays `011`.
+
+- **Removing non-ASCII bytes**: reset to `111` (remaining content
+  is unknown).
+
+- **Any other byte-level mutation** (raw writes, `vec()`, `s///`
+  with byte-level replacement): reset to `111`.
+
+These rules are optimizations, not requirements.  The blanket
+fallback — reset bits 1-3 to `111` on any mutation — is always
+correct.  The lazy scan recovers the information if needed later.
+Smart preservation avoids unnecessary re-scanning for common
+operations like string concatenation and `chomp`.
+
+**`flags == 0` fast path:**
+
+When all bits are zero (`flags == 0`), the string is pure ASCII with
+no Perl UTF-8 flag — the overwhelmingly common case for typical Perl
+code.  A single comparison handles it: safe for `as_str()`, no
+multi-byte characters, no special semantics.  This is also the
+natural zero-initialized state for strings built from known-ASCII
+source bytes.
+
+**Construction policy:**
+
+- `SmallString`: always scan for ASCII at construction (checking ≤38
+  bytes for a high bit is nearly free).  From raw bytes: `000` (ASCII)
+  or `100` (non-ASCII, UTF-8 unknown).  From Rust `&str`/`String`:
+  `000` (ASCII) or `001` (non-ASCII, valid UTF-8 from type).  This
+  is the only eager scan.
+- `PerlString` from Rust `&str` or `String`: set `011` (valid UTF-8
+  from type, ASCII status deferred).  `String` ownership transfer is
+  zero-copy via `Bytes::from()`.
+- `PerlString` from arbitrary bytes (I/O, XS, `Encode`, lexer
+  literals): set `111`, defer all scanning.
 
 ```rust
 struct PerlString {
-    buf: Vec<u8>,
-    is_utf8: bool,
+    buf: Bytes,
+    flags: u8,
 }
 
 impl PerlString {
-    /// Zero-cost &str view when the UTF-8 flag is set.
-    fn as_str(&self) -> Option<&str> {
-        if self.is_utf8 {
-            // SAFETY: we maintain the invariant that is_utf8 == true
-            // means self.buf contains valid UTF-8.
-            Some(unsafe { std::str::from_utf8_unchecked(&self.buf) })
-        } else {
-            None
+    const PERL_UTF8: u8   = 0b0001;
+    const ASCII: u8       = 0b0000;  // bits 1-3
+    const UTF8_NON_ASCII: u8 = 0b0010;
+    const INVALID_UTF8: u8 = 0b0100;
+    const UTF8_MAYBE_ASCII: u8 = 0b0110;
+    const NON_ASCII_UNKNOWN: u8 = 0b1000;
+    const UNKNOWN: u8     = 0b1110;
+    const CACHE_MASK: u8  = 0b1110;
+
+    /// Zero-cost &str view when Rust UTF-8 validity is known.
+    /// Triggers a validation scan if needed.
+    fn as_str(&mut self) -> Option<&str> {
+        match self.flags & Self::CACHE_MASK {
+            Self::ASCII | Self::UTF8_NON_ASCII | Self::UTF8_MAYBE_ASCII => {
+                // Known valid UTF-8 (all three states).
+                Some(unsafe { std::str::from_utf8_unchecked(&self.buf) })
+            }
+            Self::INVALID_UTF8 => None,
+            _ => {
+                // UNKNOWN or NON_ASCII_UNKNOWN — need UTF-8 scan.
+                match std::str::from_utf8(&self.buf) {
+                    Ok(s) => {
+                        let cache = if s.is_ascii() { Self::ASCII } else { Self::UTF8_NON_ASCII };
+                        self.flags = (self.flags & Self::PERL_UTF8) | cache;
+                        Some(unsafe { std::str::from_utf8_unchecked(&self.buf) })
+                    }
+                    Err(_) => {
+                        self.flags = (self.flags & Self::PERL_UTF8) | Self::INVALID_UTF8;
+                        None
+                    }
+                }
+            }
         }
     }
 
-    /// Zero-cost construction from a Rust &str.
-    fn from_str(s: &str) -> PerlString {
-        PerlString { buf: s.as_bytes().to_vec(), is_utf8: true }
+    /// Check whether the string is pure 7-bit ASCII.
+    /// Triggers an ASCII scan if needed.
+    fn is_ascii(&mut self) -> bool {
+        match self.flags & Self::CACHE_MASK {
+            Self::ASCII => true,
+            Self::UTF8_NON_ASCII | Self::INVALID_UTF8 | Self::NON_ASCII_UNKNOWN => false,
+            Self::UTF8_MAYBE_ASCII => {
+                // Valid UTF-8 but haven't checked ASCII.
+                if self.buf.iter().all(|&b| b < 128) {
+                    self.flags = (self.flags & Self::PERL_UTF8) | Self::ASCII;
+                    true
+                } else {
+                    self.flags = (self.flags & Self::PERL_UTF8) | Self::UTF8_NON_ASCII;
+                    false
+                }
+            }
+            _ => {
+                // UNKNOWN — full scan.
+                if self.buf.iter().all(|&b| b < 128) {
+                    self.flags = (self.flags & Self::PERL_UTF8) | Self::ASCII;
+                    true
+                } else {
+                    self.flags = (self.flags & Self::PERL_UTF8) | Self::NON_ASCII_UNKNOWN;
+                    false
+                }
+            }
+        }
     }
 
-    /// Always-available byte view.
+    /// Zero-copy construction from a Rust String.
+    fn from_string(s: String) -> PerlString {
+        PerlString {
+            buf: Bytes::from(s.into_bytes()),
+            flags: Self::UTF8_MAYBE_ASCII,  // valid from type, ASCII unknown
+        }
+    }
+
+    /// Construction from a Rust &str — known valid UTF-8, ASCII deferred.
+    fn from_str(s: &str) -> PerlString {
+        PerlString { buf: Bytes::from(s.as_bytes().to_vec()), flags: Self::UTF8_MAYBE_ASCII }
+    }
+
+    /// Always-available byte view (zero-cost — Bytes derefs to &[u8]).
     fn as_bytes(&self) -> &[u8] {
         &self.buf
     }
 
-    /// Freeze into Bytes for async IO boundaries.
-    fn into_bytes(self) -> bytes::Bytes {
-        self.buf.into()
+    /// Clone for COW — cheap refcount bump when shared.
+    fn clone_cow(&self) -> PerlString {
+        PerlString { buf: self.buf.clone(), flags: self.flags }
     }
 }
 ```
@@ -359,8 +523,8 @@ Neither `Arc` is ever the last to drop, so neither value is freed.
 Perl 5 has the same problem (it leaks cycles unless `weaken` is
 used).
 
-We do better: **reference counting + backup cycle collector**,
-matching CPython's approach.  The cycle collector uses the
+This implementation does better: **reference counting + backup cycle
+collector**, matching CPython's approach.  The cycle collector uses the
 Bacon–Rajan trial-deletion algorithm:
 
 1. **Candidate identification.**  When an `Arc`'s strong count
@@ -711,118 +875,92 @@ through an explicit expectation mechanism, analogous to `PL_expect` and
 
 ### 5.2 Expectation-Based Tokenization
 
-The parser maintains an `Expect` state, updated after consuming
-each token and consulted by the lexer before tokenizing the next
-one.  This is the mechanism that resolves `/` as regex-vs-division,
-`{` as block-vs-hash, and barewords as various different token types.
+The parser maintains an `Expect` state, analogous to Perl 5's
+`PL_expect`, providing context from the parser so the lexer knows
+what to expect and can return different tokens accordingly.
+`PL_expect` is a flat enum with 11 states that conflate multiple
+concerns.  Some are represented by the `Expect` enum; others are
+dropped because the parser design does not require the lexer to
+know the context:
 
-Perl 5's `PL_expect` is a flat enum with 11 states.  Analysis of
-how those states are actually used in `toke.c` reveals that they
-encode three orthogonal concerns in one value:
+- **How does `/` tokenize?**  As a regex delimiter or as division.
+  Determined by whether the parser is expecting a term (regex) or
+  an operator (division) — the `Term` vs `Operator` distinction.
 
-1. **Base lexical mode.**  How does `/` tokenize?  Is a bareword
-   a potential label?  Is `->` being processed?
+- **How does `{` tokenize?**  As a hash constructor, a statement
+  block, a block expression, or a block argument.  Determined by
+  the expect state: `Term` → hash, `Operator` → block,
+  `Statement` → byte-level heuristic, `Block(...)` → block.
 
-2. **Brace disposition.**  When `{` is encountered, is it a statement
-   block, a block-expression, a block argument, or a hash?  What
-   should follow the matching `}`?
+- **What should follow `}`?**  After a block's closing brace, the
+  parser needs to know whether to expect a statement (`if` block),
+  an operator (`do` block), or a term (`sort` block argument).
+  Perl 5 encodes this as separate `PL_expect` variants (`XBLOCK`,
+  `XTERMBLOCK`, `XBLOCKTERM`).  C enums can't carry data, so each
+  combination requires its own variant.  Rust enums can, so this
+  collapses into `Block(ExpectNext)` where `ExpectNext` is
+  `Statement`, `Operator`, or `Term`.
 
-3. **Attribute flag.**  Are `:attributes` allowed before the next
-   block?
+- **Are `:attributes` expected before this block?**  Perl 5 has
+  `XATTRBLOCK` and `XATTRTERM` as separate states.  Dropped — the
+  parser design does not require the lexer to identify attributes,
+  so `XATTRBLOCK` and `XBLOCK` are the same state.
 
-Rather than reproducing Perl 5's flat enum, we decompose these:
+- **Is `//` defined-or or empty regex?**  Perl 5's `XTERMORDORDOR`
+  state (its self-described "evil hack").  Eliminated entirely —
+  the lexer always produces `Token::DefinedOr` for `//`.  The
+  parser converts it to an empty regex in term position (with
+  optional flag consumption, e.g. `//gi`).  Operators that prefer
+  defined-or (`shift`, `pop`, `getc`, `pos`, `readline`, `readlink`,
+  `undef`, `umask`) are identified by `prefers_defined_or()` and
+  stop consuming arguments before `//`.  File test operators treat
+  `//` as no-operand.  This matches toke.c's UNIDOR/FTST behavior.
+
+- **Is this a prototype/signature context?**  After `sub name`,
+  a `(` should scan a raw prototype string rather than tokenize
+  normally.  This has no `PL_expect` equivalent — Perl 5 handles
+  it differently.  A `Prototype` variant handles this.
 
 ```rust
-/// What kind of token the lexer should produce next.
-enum BaseExpect {
-    /// Expecting a value, prefix operator, keyword.
-    /// `/` starts a regex.
-    Term,
+/// Lexer expectation state.
+enum Expect {
+    /// Expecting a term (value, prefix operator, keyword).
+    /// `/` starts a regex; `{` is a hash constructor.
+    Term,       // XTERM (XTERMORDORDOR folded in)
 
     /// Expecting an infix/postfix operator.
-    /// `/` is division.
-    Operator,
+    /// `/` is division; `{` is a block brace.
+    Operator,   // XOPERATOR
 
-    /// Start of a statement.  Like Term, but labels are allowed
-    /// and statement-level declarations (format, sub) are valid.
+    /// Start of a statement.  Like Term, but labels are allowed.
+    /// `/` starts a regex; `{` uses the byte-level heuristic.
+    Statement,  // XSTATE
+
+    /// Expecting `{` to open a block.
+    /// After `}`, the parser restores the given state.
+    Block(ExpectNext),  // XBLOCK | XATTRBLOCK | XATTRTERM | XTERMBLOCK | XBLOCKTERM
+
+    /// After a sigil for dereference.
+    /// `{` is a deref block, not a hash constructor.
+    Deref,      // XREF
+
+    /// After `->` for postfix dereference (`->@*`, `->$*`).
+    Postderef,  // XPOSTDEREF
+
+    /// After `sub name` — `(` scans a raw prototype string.
+    Prototype,  // no PL_expect equivalent
+}
+
+/// What to expect after a block's closing `}`.
+enum ExpectNext {
+    /// Block is a statement body (if/while/for/sub).
     Statement,
-
-    /// After `->`.  The next token is a method name, subscript
-    /// key, or sigil for postfix deref.
-    Ref,
-
-    /// After `->` for postfix dereference syntax (`$ref->@*`).
-    Postderef,
-}
-
-/// How to handle `{` when it's encountered.
-enum BraceDisposition {
-    /// Use parser position and local token context to determine
-    /// whether `{` is a block or hash.  This is the default when
-    /// no explicit brace disposition has been set.  The decision
-    /// uses only the current parser position (term vs operator)
-    /// and immediate token context — not arbitrary lookbehind or
-    /// semantic analysis.
-    Infer,
-
-    /// `{` is a statement block.  After `}`, expect a statement.
-    /// Used after `if (expr)`, `while (expr)`, etc.
-    Block,
-
-    /// `{` is a block-expression.  After `}`, expect an operator.
-    /// Used for `do { }`, anonymous subs, etc.
-    BlockExpr,
-
-    /// `{` is a block argument.  After `}`, expect a term.
-    /// Used after `->method` where the block is an argument.
-    BlockArg,
-
-    /// `{` is a hash constructor.
-    /// Used after filetest operators (the XTERMORDORDOR case).
-    Hash,
-}
-
-/// Combined expectation state.
-struct Expect {
-    base: BaseExpect,
-    brace: BraceDisposition,
-    allow_attributes: bool,
+    /// Block produces a value (eval/do/anonymous sub).
+    Operator,
+    /// Block is a leading argument (sort/map/grep).
+    Term,
 }
 ```
-
-This maps to Perl 5's states as follows:
-
-| Perl 5 state | `base` | `brace` | `allow_attributes` |
-|---|---|---|---|
-| XOPERATOR | Operator | Infer | false |
-| XTERM | Term | Infer | false |
-| XSTATE | Statement | Infer | false |
-| XBLOCK | Term | Block | false |
-| XREF | Ref | Infer | false |
-| XPOSTDEREF | Postderef | Infer | false |
-| XATTRBLOCK | Term | Block | true |
-| XATTRTERM | Term | BlockExpr | true |
-| XTERMBLOCK | Term | BlockExpr | false |
-| XBLOCKTERM | Term | BlockArg | false |
-| XTERMORDORDOR | Operator | Hash | false |
-
-XTERMORDORDOR (Perl 5's self-described "evil hack" for filetest
-operators) is the one state that doesn't decompose cleanly.  It's
-operator-like for `/` (recognizes `//` as defined-or) but term-like
-for some other purposes.  The `Operator` base with `Hash` brace
-disposition captures its main observable behavior: after `-f $file`,
-a following `//` is the defined-or operator (not a regex), and a
-following `{` is a hash constructor.  If testing against Perl 5
-reveals additional edge semantics, they should be modeled as a
-targeted special case rather than expanding the core expectation
-model.
-
-The benefit of this decomposition: the lexer consults
-`expect.base` for the `/` decision and `expect.brace` for the
-`{` decision, rather than switching on 11 states in both places.
-Adding a new combination (like "term-like with attributes but
-block-as-argument disposition") is a different combination of
-existing values, not a new enum variant.
 
 ### 5.3 Symbol Table Feedback
 
@@ -842,34 +980,268 @@ This should be implemented as a callback or shared reference from the
 lexer to the symbol table, not by embedding the symbol table inside the
 lexer.
 
-### 5.4 Sublexing and the Context Stack
+### 5.4 Source Layer (`LexerSource`)
 
-Sublexing is the core architectural requirement.  The implementation
-should use an explicit context stack:
+The lexer does not read source bytes directly.  A dedicated
+`LexerSource` type manages line-oriented source delivery, CRLF
+normalization, heredoc body sequencing, and indentation stripping.
+The lexer receives one line at a time and scans bytes within it,
+never dealing with line boundaries, newline encoding, or heredoc
+line reordering.
+
+**Why a source layer:**
+
+Without this abstraction, the lexer must juggle byte-level position
+pointers, CRLF normalization (either preprocessing via `Cow` or
+per-byte checks in every accessor), heredoc redirect tables, saved
+line positions for heredoc remainder restoration, indent
+save/restore stacks, and terminator detection interleaved with
+content scanning.  These are all line-level concerns forced into a
+byte-level API, resulting in significant accidental complexity.
+
+`LexerSource` is purpose-built for the lexer's needs — not a
+general-purpose abstraction.  A future general `Source` type for
+other uses (e.g. error reporting, IDE integration) could underlie
+`LexerSource` as a wrapper.
+
+**Dependencies:**
+
+`perl-parser` depends on the `bytes` crate.  `LexerSource` uses
+`Bytes` for zero-copy reference-counted slices of the source buffer.
+Line slicing, heredoc remainder saving, and indentation prefixes are
+all `Bytes` handles into the same underlying allocation — no copying.
+`perl-regex` remains dependency-free, operating on `&[u8]` and
+`&str` slices; the conversion from `Bytes` to `&[u8]` is free
+(`Bytes` derefs to `&[u8]`).
+
+**`LexerLine` — the lexer's working unit:**
+
+The lexer operates on a `LexerLine` that combines line metadata with
+a byte-scanning cursor.  All fields are `pub(crate)` — the lexer
+freely reads and writes `pos` for cursor control, and reads `number`
+and `offset` for span computation:
 
 ```rust
-struct LexerContext {
-    source: SourceBuffer,
-    position: usize,
-    mode: LexMode,
-    delimiters: Option<DelimiterInfo>,
-    subst_phase: Option<SubstPhase>,
-    parent: Option<usize>,  // index into context stack
+struct LexerLine {
+    /// 1-based line number in the original source.
+    number: usize,
+    /// Byte offset of the start of this line in the original source.
+    offset: usize,
+    /// Line content without line ending.  When inside an indented
+    /// heredoc, the required indentation prefix has been stripped.
+    line: Bytes,
+    /// Whether this line was terminated by a newline in the source.
+    terminated: bool,
+    /// Current scanning position within `line`.
+    pos: usize,
 }
 
-enum LexMode {
-    Normal,                 // regular code
-    QuoteInterpolating,     // inside "...", qq//, etc.
-    QuoteLiteral,           // inside '...', q//
+impl LexerLine {
+    fn peek_byte(&self) -> Option<u8>;
+    fn peek_byte_at(&self, offset: usize) -> Option<u8>;
+    fn advance_byte(&mut self) -> Option<u8>;
+    fn remaining(&self) -> &[u8];       // borrowed view for comparisons
+    fn at_end(&self) -> bool;
+    fn slice(&self, start: usize, end: usize) -> Bytes;  // zero-copy
+    fn slice_since(&self, start: usize) -> Bytes;         // slice(start..pos)
+}
+```
+
+The typical lexer scanning pattern:
+
+```rust
+let start = line.pos;
+while line.peek_byte().is_some_and(|b| b.is_ascii_alphanumeric()) {
+    line.advance_byte();
+}
+let name: Bytes = line.slice_since(start);
+```
+
+The resulting `Bytes` is a zero-copy reference-counted slice into
+the original source buffer — no allocation, no copy.  This `Bytes`
+handle flows through the token, the AST, and into the runtime
+`PerlString` as a cheap refcount bump at each stage.
+
+The lexer holds `Option<LexerLine>` as its current line.  When the
+line is exhausted (`at_end()`), the lexer sets it to `None`.  On
+the next token request, `None` triggers a call to
+`source.next_line()` to get the next line.
+
+Because `LexerLine` carries the scanning position, saving and
+restoring a line (e.g. for heredoc remainder) automatically preserves
+the cursor position within that line.  The lexer transparently
+resumes mid-line without any special-case logic.
+
+**`LexerSource` API:**
+
+```rust
+impl LexerSource {
+    /// Get the next line.  Returns `Ok(Some(line))` for content,
+    /// `Ok(None)` when a heredoc body is finished (the saved
+    /// remainder will be returned by the next call), or `Err` for
+    /// real errors (unterminated heredoc, indentation mismatch).
+    fn next_line(&mut self) -> Result<Option<LexerLine>, SourceError>;
+
+    /// Begin processing an indented heredoc body.  Scans ahead to
+    /// find the terminator, sets the required indentation from its
+    /// whitespace prefix.  The current line is taken from the Option
+    /// (setting it to None) and saved internally for restoration
+    /// when the terminator is found.
+    fn start_indented_heredoc(
+        &mut self,
+        tag: Bytes,
+        current_line: &mut Option<LexerLine>,
+    ) -> Result<(), SourceError>;
+
+    /// Begin processing a non-indented heredoc body.  The current
+    /// line is taken from the Option (setting it to None) and saved
+    /// internally for restoration when the terminator is found.
+    /// Does not change the required indentation.
+    fn start_heredoc(
+        &mut self,
+        tag: Bytes,
+        current_line: &mut Option<LexerLine>,
+    );
+}
+```
+
+**Internal state:**
+
+`LexerSource` maintains a heredoc context stack:
+
+```rust
+struct HeredocContext {
+    tag: Bytes,
+    saved_line: LexerLine,
+    prev_indent: Option<Bytes>,
+}
+```
+
+When `start_heredoc` or `start_indented_heredoc` is called:
+
+1. The current `LexerLine` (with its cursor position) is pushed onto
+   the stack along with the current `required_indent` and the tag.
+2. For indented heredocs, `LexerSource` scans ahead through upcoming
+   lines to find the terminator, extracts its full whitespace prefix,
+   and sets that as the new `required_indent`.  The scan validates
+   that the terminator starts with the current required indent (if
+   any) — this handles nested indented heredocs correctly.
+3. Subsequent `next_line()` calls serve body lines with the required
+   indent stripped.
+
+When `next_line()` encounters a line that matches the current
+heredoc tag (after indent stripping):
+
+1. It returns `Ok(None)` to signal "heredoc finished."
+2. Internally, it pops the context stack, restoring `required_indent`
+   to the saved value.
+3. The saved `LexerLine` is queued so that the next `next_line()`
+   call returns it — transparently resuming the declaration line.
+
+**CRLF normalization:**
+
+`LexerSource` strips `\r` immediately before `\n` when splitting
+lines.  The `line` field in `LexerLine` is a `Bytes` slice that ends
+before the `\r` (for CRLF) or before the `\n` (for LF).  Standalone
+`\r` not followed by `\n` is a literal byte in the content — not a
+line ending.  This matches Perl's behavior.  Because the stripping
+is done by adjusting slice boundaries rather than copying, it is
+zero-copy.
+
+**How this simplifies the lexer:**
+
+With `LexerSource`, the lexer's main loop is:
+
+```rust
+loop {
+    if self.current_line.is_none() {
+        match self.source.next_line()? {
+            Some(line) => self.current_line = Some(line),
+            None => {
+                // Heredoc body finished — emit QuoteEnd.
+                // Next iteration gets the saved remainder line.
+                return Ok(Token::QuoteEnd);
+            }
+        }
+    }
+    let line = self.current_line.as_mut().unwrap();
+    // ... scan bytes from line, produce tokens ...
+    if line.at_end() {
+        self.current_line = None;
+    }
+}
+```
+
+The lexer never manages heredoc line ordering, CRLF normalization,
+indent stripping, or position save/restore.  These are fully
+encapsulated in `LexerSource`.
+
+**Zero-copy flow from source to runtime:**
+
+Because both the parser and the runtime use `Bytes`, literal values
+flow from source to runtime without copying.  A string literal like
+`'hello world'` exists once in the source buffer.  The lexer
+produces a `Bytes` slice via `line.slice_since(start)`, which flows
+through the token and AST as a refcount bump at each stage, and
+ultimately initializes the runtime `PerlString` with the same
+underlying allocation.  This applies to all literals that need no
+escape processing: single-quoted strings, `qw()` words,
+`ConstSegment` parts of interpolated strings, heredoc body segments,
+and regex literal fragments.
+
+The same `Bytes` sharing works in reverse for `eval STRING` — the
+string being evaluated is already a `Bytes` (or trivially freezable
+to one), so `LexerSource` can lex directly from it with zero-copy
+line slicing.  No need to copy the string into a separate source
+buffer.
+
+### 5.5 Sublexing and the Context Stack
+
+Sublexing is the core architectural requirement.  The implementation
+uses an explicit context stack on the lexer.  This stack tracks the
+lexer's current mode within the line it is scanning — it does not
+manage source positioning or line sequencing (those are `LexerSource`
+concerns; see §5.4).
+
+```rust
+enum LexContext {
+    Interpolating {         // inside "...", qq//, heredoc body, etc.
+        open: Option<u8>,   // paired opener for depth tracking
+        close: Option<u8>,  // None for heredocs
+        depth: u32,         // nesting depth for paired delimiters
+        expr_depth: u32,    // >0 means inside ${expr} or @{expr}
+    },
+    Literal {               // inside '...', q//, literal heredoc body
+        open: Option<u8>,
+        close: Option<u8>,  // None for literal heredocs
+        depth: u32,
+    },
     QuoteWords,             // inside qw//
     RegexPattern,           // inside m//, qr//, or s///pattern
     SubstReplacement,       // inside s///replacement
     TranslitBody,           // inside tr/// or y///
-    HeredocBody,            // collecting heredoc lines
-    HeredocInterpolating,   // inside an interpolating heredoc
     Format,                 // inside format/write body
 }
 ```
+
+`Interpolating` and `Literal` each carry delimiter information.
+Heredoc bodies reuse these same variants with `close: None` — the
+byte scanning logic is identical to delimited strings.  The
+difference is how end-of-content is detected: for delimited strings,
+the scanner finds the closing delimiter; for heredocs,
+`source.next_line()` returns `None`, and the lexer handles this at
+the line-fetching level, outside the scanning mode.
+
+Expression interpolation (`${expr}` and `@{expr}`) is handled by
+the `expr_depth` field on `Interpolating`.  When `${` or `@{` is
+encountered, `expr_depth` is incremented.  While `expr_depth > 0`,
+the lexer produces normal code tokens (identifiers, operators, etc.)
+instead of string content — `{` increments and `}` decrements the
+depth.  When `}` decrements `expr_depth` to 0, the lexer resumes
+string scanning.  Nested strings inside expressions (e.g.
+`"${func("inner")}"`) push a new `Interpolating` context onto the
+stack, which pops back to the outer `Interpolating` (still with
+`expr_depth > 0`) when the inner string closes.
 
 Quote-like scanning produces a stream of sub-tokens:
 
@@ -878,25 +1250,29 @@ QuoteBegin(qq, delimiter='|')
 ConstSegment("Hello, ")
 InterpScalar(name)
 ConstSegment("! You have ")
-InterpExprBegin            # triggered by ${...} containing an expression
+InterpScalarExprStart       # triggered by ${expr} — increments expr_depth
   ... tokens for the expression ...
-InterpExprEnd
+RBrace                      # closing } decrements expr_depth to 0
 ConstSegment(" messages.\n")
 QuoteEnd
 ```
 
-Both `$name` and `${name}` produce `InterpScalar(name)`.  Only
-`${expr}` with operators or calls produces the `InterpExprBegin` /
-`InterpExprEnd` bracketed form.
+Both `$name` and `${name}` (with a simple identifier) produce
+`InterpScalar(name)`.  `${expr}` with operators or calls produces
+`InterpScalarExprStart`, followed by normal code tokens, followed by
+`RBrace`.  `@{expr}` uses `InterpArrayExprStart`.  The parser calls
+`parse_expr()` inline for expression interpolation — the same parser
+instance, with proper span tracking and error reporting.
 
-The parser reassembles these into string concatenation / interpolation
-AST nodes.
+### 5.6 Heredoc Handling
 
-### 5.5 Heredoc Handling
+Heredocs are handled by the cooperation of `LexerSource` (§5.4) and
+the lexer's token-production loop.  The source layer manages all line
+ordering, indentation, and save/restore.  The lexer's only heredoc
+awareness is recognizing `<<TAG` and framing the body as
+`QuoteBegin` / content tokens / `QuoteEnd`.
 
-Heredocs require special lexer context management because their body
-appears on subsequent lines, while the rest of the statement (after the
-`<<TAG`) continues on the *current* line:
+**Basic flow:**
 
 ```perl
 my $x = <<END . "suffix";
@@ -904,30 +1280,127 @@ body here
 END
 ```
 
-The lexer should:
+1. The lexer encounters `<<END` while scanning a line.  It emits
+   `QuoteBegin(Heredoc, 0)`, pushes `Interpolating` (with
+   `close: None`) onto the context stack, and calls
+   `source.start_heredoc(tag, &mut self.current_line)`.  The method
+   takes the `LexerLine` (with cursor pointing at ` . "suffix";`)
+   and sets the lexer's current line to `None` in one step.
 
-1. When `<<TAG` is seen: record the heredoc (tag, quoting style) in a
-   pending-heredoc queue on the current context.
-2. When the end of the logical line is reached (after scanning the rest
-   of the expression): push a new `HeredocBody` context that reads
-   subsequent lines until the terminator.
-3. When the terminator is found: pop the heredoc context and resume the
-   enclosing context at the next logical line.
+2. The lexer's main loop calls `source.next_line()`, which returns
+   the first body line.  In `Interpolating` mode, the lexer
+   scans it for interpolation and produces `ConstSegment`,
+   `InterpScalar`, etc. — the same token stream as `"..."` and
+   `qq{}`.
 
-For multiple heredocs on one line (`<<A . <<B`), they are queued in order
-and collected sequentially.
+3. When `source.next_line()` returns `Ok(None)`, the terminator has
+   been found.  The lexer pops `Interpolating` from the
+   context stack and emits `QuoteEnd`.
 
-Literal heredocs (`<<'TAG'`) emit the body as a single string token.
-Interpolating heredocs (`<<"TAG"` or `<<TAG`) emit the body as a
-stream of quote/interpolation sub-tokens (§5.4), using the same
-mechanism as double-quoted strings.
+4. On the next `source.next_line()` call, `LexerSource` returns the
+   saved `LexerLine` — the remainder ` . "suffix";`.  Because
+   `LexerLine` carries the cursor position, the lexer transparently
+   resumes scanning mid-line.
 
-For heredocs inside interpolating contexts (the `s///` heredoc-in-
-substitution case), the heredoc context must be able to walk up the context
-stack to find the right source buffer for body collection — mirroring
-Perl 5's `LEXSHARED` walk in `scan_heredoc()`.
+**Multiple heredocs on one line:**
 
-### 5.6 Token Categories
+```perl
+my ($a, $b) = (<<A, <<B);
+body A
+A
+body B
+B
+```
+
+This falls out naturally from the save/restore mechanism:
+
+1. `<<A` saves the remainder `, <<B);` and starts A's body.
+2. A's terminator found → `source.next_line()` returns `None`.
+   Lexer emits `QuoteEnd`.
+3. Next `source.next_line()` returns the saved `, <<B);`.
+4. Lexer scans `, `, encounters `<<B`, saves `);\n`, starts B's body.
+5. B's terminator found → `source.next_line()` returns `None`.
+   Lexer emits `QuoteEnd`.
+6. Next `source.next_line()` returns `);`.
+
+No special stacking logic in the lexer.  `LexerSource`'s internal
+heredoc context stack handles all the line sequencing.
+
+**Indented heredocs (`<<~`):**
+
+```perl
+my $x = <<~END;
+    Hello, $name!
+    END
+```
+
+The lexer calls `source.start_indented_heredoc(tag, current_line)`.
+`LexerSource` scans ahead to find the terminator line, extracts its
+full whitespace prefix (`"    "` in this example), and sets that as
+the required indentation.  Subsequent body lines are delivered with
+the prefix stripped.  When the terminator is found, the previous
+required indentation (if any) is restored.
+
+**Nested heredocs with indentation:**
+
+Expression interpolation in heredocs (`${...}`) increments
+`expr_depth`, switching the lexer to normal code mode.  If
+a nested heredoc appears inside the expression, `LexerSource`
+handles the nesting correctly:
+
+```perl
+my $x = <<~OUTER;
+    sum=${\(<<A + <<B)}
+    1
+    A
+    2
+    B
+    OUTER
+```
+
+- `<<~OUTER` sets required indent to `"    "` (from terminator).
+- Body lines are served with 4-space indent stripped.
+- Inside `${\(...)}`, the lexer encounters `<<A`.  `LexerSource`
+  saves the remainder and starts A's body.  A is non-indented, but
+  the required indent (`"    "`) is still active — A's body lines
+  `"    1\n"` have the prefix stripped, yielding `"1\n"`.  The
+  terminator `"    A\n"` is also stripped to `"A"`, matching the tag.
+- After A, the remainder is restored.  The lexer encounters `<<B`,
+  same process.  B's body `"    2\n"` yields `"2\n"`.
+- After B, the expression completes.  The lexer is back in OUTER's
+  body, continuing with the next body line.
+
+For nested indented heredocs (`<<~INNER` inside `<<~OUTER`),
+`LexerSource`'s terminator scan validates that the inner terminator
+starts with the current required indent and uses the full raw prefix
+as the new required indent.  On completion, the outer indent is
+restored from the context stack.
+
+**Literal heredocs:**
+
+Literal heredocs (`<<'TAG'`, `<<~'TAG'`) do not interpolate.
+`LexerSource` still manages the line sequencing and indentation, but
+the lexer collects the body lines into a single string token
+(`HeredocLit`) rather than producing a sub-token stream.
+
+**Token stream for interpolating heredocs:**
+
+Interpolating heredocs produce the same token stream as `"..."` and
+`qq{}` — unified under `parse_interpolated_string`:
+
+```text
+QuoteBegin(Heredoc, 0)
+ConstSegment("body line 1\nbody line 2\n")
+InterpScalar(name)
+ConstSegment(" more text\n")
+QuoteEnd
+```
+
+`ConstSegment` tokens span across line boundaries within the body —
+the lexer only breaks them for interpolation (`$`, `@`) or the
+terminator.
+
+### 5.7 Token Categories
 
 The lexer emits tokens that already reflect context-sensitive
 disambiguation (§5.2).  The parser consumes these directly — there
@@ -938,7 +1411,7 @@ Core token categories:
 - Identifiers (barewords, with package qualification info)
 - Variables (`$`, `@`, `%`, `*` sigils, with name)
 - Numeric literals (integer, float, hex, octal, binary, underscored)
-- String/quote sub-tokens (as described in §5.4)
+- String/quote sub-tokens (as described in §5.5)
 - Regex sub-tokens
 - Operators (arithmetic, string, logical, bitwise, comparison, binding)
 - Punctuation (delimiters, semicolons, arrows, fat comma)
@@ -981,8 +1454,6 @@ branches, `->` dispatches to method call or dereference parsing.
 returns `Option<OpInfo>`.  `None` means the token is not valid in
 operator position (the expression ends here).  `Some(info)` provides
 the precedence and associativity for the precedence comparison.
-Operator lookup includes both built-in operators and those registered
-via plugins (§6.4).
 
 Parser position (term vs operator) is determined independently of
 plugin behavior.  Plugins only affect how tokens are interpreted
@@ -992,22 +1463,17 @@ within a given position — they cannot override the position itself.
 
 ```rust
 type Precedence = u8;
-type ParseDepth = u16;  // compact; allows configurable limit up to 65535
 
 fn parse_expr(
     &mut self,
     min_prec: Precedence,
-    depth: ParseDepth,
-) -> Result<Ast, ParseError> {
-    let depth = self.descend(depth)?;
-    let token = self.advance();
-    let mut left = self.parse_term(token, depth)?;
+) -> Result<Expr, ParseError> {
+    let mut left = self.parse_term()?;
 
     while let Some(info) = self.peek_op_info()
         && info.left_prec() >= min_prec
     {
-        let token = self.advance();
-        left = self.parse_operator(token, left, depth)?;
+        left = self.parse_operator(left, info)?;
     }
 
     Ok(left)
@@ -1028,34 +1494,14 @@ so would silently break associativity.  This invariant ensures that
 precedence and associativity are enforced uniformly across all
 operators.
 
-**Nesting depth control:**
+**Nesting depth control (future):**
 
-Every parser entry point that descends into a new nested syntactic
-region calls `descend` exactly once on that entry.  This includes
-parser entry points such as `parse_expr`, `parse_block`, and
-`parse_statement` when they enter a new nested syntactic region.
-Helper methods that operate within an already-accounted-for region,
-including `parse_term` when called from `parse_expr`, do not call
-`descend` independently — the nesting was already accounted for by
-`parse_expr`.
-
-```rust
-fn descend(
-    &self,
-    depth: ParseDepth,
-) -> Result<ParseDepth, ParseError> {
-    if depth >= self.max_depth {
-        Err(self.error("nesting too deep"))
-    } else {
-        Ok(depth + 1)
-    }
-}
-```
-
-The default `max_depth` is set high enough to exceed Perl 5's
-actual limits (which are bounded by YYMAXDEPTH = 10,000 and the C
-call stack).  A configurable limit allows hardening against
-adversarial input without penalizing real code.
+A nesting depth limit will be added to guard against adversarial
+input (deeply nested expressions, blocks within blocks).  This is
+not yet implemented — the current parser relies on Rust's stack
+depth.  The planned approach is a `descend()` check at each
+recursive entry point, with a configurable `max_depth` high enough
+to exceed Perl 5's actual limits (YYMAXDEPTH = 10,000).
 
 **Precedence and associativity table:**
 
@@ -1104,35 +1550,61 @@ parentheses) — if it is the same non-associative operator, the
 parser reports a syntax error (e.g., `$a == $b == $c` is rejected).
 
 The precedence table is a match expression in `peek_op_info`,
-returning `OpInfo` with one number and one keyword per operator:
+returning `OpInfo` with one number and one keyword per operator.
+Precedence values use even numbers so that `right_prec` (which adds
+1 for left/non-associative) fits cleanly:
 
 ```rust
+const PREC_LOW: Precedence = 0;       // statement boundary
+const PREC_OR_LOW: Precedence = 2;    // or
+const PREC_AND_LOW: Precedence = 4;   // and
+const PREC_NOT_LOW: Precedence = 6;   // not (prefix)
+const PREC_LIST: Precedence = 8;      // list operators
+const PREC_COMMA: Precedence = 10;    // , =>
+const PREC_ASSIGN: Precedence = 12;   // = += -= etc.
+const PREC_TERNARY: Precedence = 14;  // ?:
+const PREC_RANGE: Precedence = 16;    // .. ...
+const PREC_OR: Precedence = 18;       // || //
+const PREC_AND: Precedence = 20;      // &&
+const PREC_BIT_OR: Precedence = 22;   // | ^
+const PREC_BIT_AND: Precedence = 24;  // &
+const PREC_EQ: Precedence = 26;       // == != eq ne <=> cmp
+const PREC_REL: Precedence = 28;      // < > <= >= lt gt le ge
+const PREC_SHIFT: Precedence = 30;    // << >>
+const PREC_ADD: Precedence = 32;      // + - .
+const PREC_MUL: Precedence = 34;      // * / % x
+const PREC_BINDING: Precedence = 36;  // =~ !~
+const PREC_UNARY: Precedence = 38;    // ! ~ \ - + (prefix)
+const PREC_POW: Precedence = 40;      // **
+const PREC_INC: Precedence = 42;      // ++ -- (postfix)
+const PREC_ARROW: Precedence = 44;    // ->
+
 fn peek_op_info(&self) -> Option<OpInfo> {
     match self.peek() {
-        Token::Or         => Some(OpInfo { prec: 2,  assoc: Assoc::Left }),
-        Token::And        => Some(OpInfo { prec: 4,  assoc: Assoc::Left }),
-        Token::Comma      => Some(OpInfo { prec: 6,  assoc: Assoc::Left }),
-        Token::Assign     => Some(OpInfo { prec: 8,  assoc: Assoc::Right }),
-        Token::Question   => Some(OpInfo { prec: 10, assoc: Assoc::Right }),
-        Token::DotDot     => Some(OpInfo { prec: 12, assoc: Assoc::Non }),
-        Token::LogOr      => Some(OpInfo { prec: 14, assoc: Assoc::Left }),
-        Token::LogAnd     => Some(OpInfo { prec: 16, assoc: Assoc::Left }),
-        Token::BitOr      => Some(OpInfo { prec: 18, assoc: Assoc::Left }),
-        Token::BitAnd     => Some(OpInfo { prec: 20, assoc: Assoc::Left }),
-        Token::NumEq      => Some(OpInfo { prec: 22, assoc: Assoc::Non }),
-        Token::StrEq      => Some(OpInfo { prec: 22, assoc: Assoc::Non }),
-        Token::NumLt      => Some(OpInfo { prec: 24, assoc: Assoc::Non }),
-        Token::StrLt      => Some(OpInfo { prec: 24, assoc: Assoc::Non }),
-        Token::Shift      => Some(OpInfo { prec: 26, assoc: Assoc::Left }),
-        Token::Plus       => Some(OpInfo { prec: 28, assoc: Assoc::Left }),
-        Token::Minus      => Some(OpInfo { prec: 28, assoc: Assoc::Left }),
-        Token::Star       => Some(OpInfo { prec: 30, assoc: Assoc::Left }),
-        Token::Slash      => Some(OpInfo { prec: 30, assoc: Assoc::Left }),
-        Token::Percent    => Some(OpInfo { prec: 30, assoc: Assoc::Left }),
-        Token::Match      => Some(OpInfo { prec: 32, assoc: Assoc::Left }),
-        Token::Pow        => Some(OpInfo { prec: 36, assoc: Assoc::Right }),
-        Token::Arrow      => Some(OpInfo { prec: 40, assoc: Assoc::Left }),
-        // ...
+        Token::Keyword(Keyword::Or) => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
+        Token::Keyword(Keyword::And) => Some(OpInfo { prec: PREC_AND_LOW, assoc: Assoc::Left }),
+        Token::Comma | Token::FatComma => Some(OpInfo { prec: PREC_COMMA, assoc: Assoc::Left }),
+        Token::Assign(_) => Some(OpInfo { prec: PREC_ASSIGN, assoc: Assoc::Right }),
+        Token::Question => Some(OpInfo { prec: PREC_TERNARY, assoc: Assoc::Right }),
+        Token::DotDot | Token::DotDotDot => Some(OpInfo { prec: PREC_RANGE, assoc: Assoc::Non }),
+        Token::OrOr | Token::DefinedOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
+        Token::AndAnd => Some(OpInfo { prec: PREC_AND, assoc: Assoc::Left }),
+        Token::BitOr | Token::BitXor => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
+        Token::BitAnd => Some(OpInfo { prec: PREC_BIT_AND, assoc: Assoc::Left }),
+        Token::NumEq | Token::NumNe | Token::Spaceship
+            | Token::StrEq | Token::StrNe | Token::StrCmp
+            => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
+        Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe
+            | Token::StrLt | Token::StrGt | Token::StrLe | Token::StrGe
+            => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non }),
+        Token::ShiftL | Token::ShiftR => Some(OpInfo { prec: PREC_SHIFT, assoc: Assoc::Left }),
+        Token::Plus | Token::Minus | Token::Dot => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
+        Token::Star | Token::Slash | Token::Percent | Token::X
+            => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
+        Token::Binding | Token::NotBinding => Some(OpInfo { prec: PREC_BINDING, assoc: Assoc::Left }),
+        Token::Power => Some(OpInfo { prec: PREC_POW, assoc: Assoc::Right }),
+        Token::PlusPlus | Token::MinusMinus => Some(OpInfo { prec: PREC_INC, assoc: Assoc::Non }),
+        Token::Arrow => Some(OpInfo { prec: PREC_ARROW, assoc: Assoc::Left }),
         _ => None,
     }
 }
@@ -1151,21 +1623,22 @@ extensions (keyword plugins, infix plugins from §6.4) are handled
 as a fallthrough at the end of the match:
 
 ```rust
-fn parse_term(&mut self, token: Token, depth: ParseDepth) -> Result<Ast, ParseError> {
-    match token {
-        Token::IntLit(n) => Ok(Ast::Int(n, self.span())),
-        Token::If => self.parse_if_expr(depth),
+fn parse_term(&mut self) -> Result<Expr, ParseError> {
+    let spanned = self.advance()?;
+    match spanned.token {
+        Token::IntLit(n) => Ok(Expr { kind: ExprKind::IntLit(n), span: spanned.span }),
+        Token::Keyword(Keyword::If) => self.parse_if_expr(spanned.span),
         // ... all standard tokens ...
 
         // Plugin fallthrough
-        Token::Bareword(name) => {
+        Token::Ident(name) => {
             if let Some(plugin) = self.keyword_plugin(&name) {
-                plugin.parse(self.as_parser_context(), depth)
+                plugin.parse(self.as_parser_context())
             } else {
                 // ... standard bareword handling ...
             }
         }
-        _ => Err(self.error("expected expression")),
+        _ => Err(ParseError::new("expected expression", spanned.span)),
     }
 }
 ```
@@ -1212,24 +1685,24 @@ parser must update the `Expect` state (§5.2).  This is not optional.
 Examples:
 
 - After consuming a token classified as a named unary or list
-  operator (e.g., `print`, `die`, `chomp`): set base to `Term`
+  operator (e.g., `print`, `die`, `chomp`): set to `Term`
   (the next thing is an argument list, so `/` is a regex, not
   division).
-- After completing a term or postfix expression: set base to
-  `Operator`.
+- After completing a term or postfix expression: set to `Operator`.
 - After parsing a construct that requires a following block
-  (e.g., `if (expr)`, `while (expr)`, `for ...`): set base to
-  `Term`, brace to `Block`.
-- After parsing `sub name` (where a prototype, attributes, and body
-  may follow): set base to `Term`, brace to `Block`,
-  `allow_attributes` to `true`.
-- After consuming `->`: set base to `Ref`.
-- After consuming a filetest operator (`-f`): set base to
-  `Operator`, brace to `Hash` (the XTERMORDORDOR case).
+  (e.g., `if (expr)`, `while (expr)`, `for ...`): set to
+  `Block(Statement)`.
+- After parsing `sub name` (where a body may follow): set to
+  `Block(Operator)`.  Attributes are handled by the parser's call
+  structure, not the expectation state.
+- After consuming a sigil for dereference: set to `Deref`.
+- After consuming a filetest operator (`-f`): keep as `Term`.
+  The defined-or preference is handled by
+  `prefers_defined_or()` — no special expect state needed.
 
 Since the lexer and parser share the `Parser` struct, this is a
-field assignment (e.g., `self.expect.base = BaseExpect::Term`) at
-the appropriate points in `parse_term`, `parse_operator`, and their
+field assignment (e.g., `self.expect = Expect::Term`) at the
+appropriate points in `parse_term`, `parse_operator`, and their
 helpers.  No cross-object communication is needed.
 
 ### 6.3 Prototype-Guided Parsing
@@ -1251,7 +1724,7 @@ co-resident compiler/runtime architecture.
 Perl 5 modules like `Syntax::Keyword::Try`, `Syntax::Keyword::Match`,
 `Object::Pad`, `Syntax::Operator::ExistsOr`, and
 `Syntax::Operator::Equ` extend the language by hooking into the lexer
-and parser at well-defined extension points.  Our Rust implementation
+and parser at well-defined extension points.  The Rust implementation
 must provide equivalent (and improved) extensibility so that the same
 kinds of syntax extensions are possible.
 
@@ -1272,7 +1745,7 @@ The Perl 5 C implementation provides three mechanisms:
    `parse_arithexpr`, etc.  These let plugins manipulate the lexer
    buffer and recursively invoke the parser to parse sub-expressions.
 
-Our Rust implementation should provide all three, redesigned as
+The Rust implementation should provide all three, redesigned as
 trait-based APIs rather than global function pointers.
 
 **Keyword extension trait:**
@@ -1574,7 +2047,7 @@ stringifications).
 
 The lowering pass transforms the syntax-oriented AST into a
 semantics-oriented High-level IR (HIR) where implicit Perl behaviors
-become explicit.  This is where we encode Perl's actual semantics rather
+become explicit.  The HIR encodes Perl's actual semantics rather
 than its surface syntax.
 
 ### 8.2 Key Lowering Transformations
@@ -2181,7 +2654,7 @@ This is a fundamental departure from Perl 5, where a closure
 captures a "lexical pad" — an AV allocated in the per-interpreter
 arena, making every closure interpreter-local.
 
-Our design does not use Perl 5-style pads.  A closure's captures are
+This design does not use Perl 5-style pads.  A closure's captures are
 a `Vec<Value>` where each value is `Arc`-refcounted:
 
 ```perl
@@ -2402,7 +2875,7 @@ differs.
 
 This is fundamentally different from Python's async split, where
 `async def` and `def` are different function "colors" that cannot
-freely call each other.  In our model there is one color.  Every
+freely call each other.  In this model there is one color.  Every
 function — `sub` or `fn` — is "potentially async" because the
 interpreter handles it transparently.
 
@@ -2660,7 +3133,7 @@ extern fn fetch_page(url: &str) -> Result<String, Error> {
 # A Rust program can call either version depending on its context.
 ```
 
-This means a library written in our language and compiled via AOT
+This means a library written in the language and compiled via AOT
 produces a Rust crate that is both sync and async, from one source,
 with no async runtime dependency for the sync variant.
 
@@ -3343,15 +3816,15 @@ solve.
 ### 14.1 Motivation
 
 The default Perl scalar is a `PerlString`-backed container with
-IV/NV/PV coercion flags, magic chains, and `Arc`-refcounted heap
+int/num/string coercion flags, magic chains, and `Arc`-refcounted heap
 allocation.
 This is necessary for Perl 5 compatibility, but it imposes costs:
 
 - Every crossing between Perl and Rust code requires coercion checks
   and potentially data conversion.
-- The dual-representation machinery (IOK/NOK/POK) runs on every
-  arithmetic and string operation even when the program never uses
-  the alternate representation.
+- The dual-representation machinery (INT_VALID/NUM_VALID/STR_VALID)
+  runs on every arithmetic and string operation even when the program
+  never uses the alternate representation.
 - Every variable is implicitly nullable (`undef`), and every operation
   can fail silently by returning `undef` instead of signaling an error.
 - All variables are mutable, so the compiler cannot reason about
@@ -4250,7 +4723,7 @@ let s: String = "hello";
 my $x = s;                 # $x becomes a PerlString with UTF-8 flag set
 
 let n: i64 = 42;
-my $y = n;                 # $y becomes a full scalar with IOK flag set
+my $y = n;                 # $y becomes a full scalar with INT_VALID flag set
 
 let o: Option<String> = undef;
 my $z = o;                 # $z becomes undef
@@ -4272,11 +4745,11 @@ The compiler should warn statically about potentially-failing coercions.
 
 | From | To | Cost |
 |------|----|------|
-| `String` → `PerlString` | Wrap bytes, set UTF-8 flag | Cheap (one alloc) |
-| `PerlString` (UTF-8 flag set) → `String` | Validate flag, take bytes | Cheap (flag check) |
-| `PerlString` (no UTF-8 flag) → `String` | Full UTF-8 validation | O(n), may fail |
-| `PerlString` → `Bytes` | Freeze `Vec<u8>` | Cheap |
-| `Bytes` → `PerlString` | Copy into `Vec<u8>` | O(n) |
+| `String` → `PerlString` | Wrap as Bytes, set flags | Cheap (refcount) |
+| `PerlString` (Rust-valid) → `String` | Take bytes, no validation | Cheap (flag check) |
+| `PerlString` (unknown) → `String` | Full UTF-8 validation | O(n), may fail |
+| `PerlString` → `Bytes` | Access inner `buf` | Zero-cost |
+| `Bytes` → `PerlString` | Wrap with flags | Cheap (refcount bump) |
 | `String` → `&str` | Pointer cast | Zero-cost |
 | `Arc<str>` → `&str` | Deref | Zero-cost |
 
@@ -5026,7 +5499,7 @@ let greet = move |name: &str| -> String { f"{prefix}, {name}!" };
 print prefix;              # fine — we still have our copy (clone-on-assign)
 ```
 
-Note that `move` in our model means "clone into the closure," not
+Note that `move` in this model means "clone into the closure," not
 "transfer ownership" as in Rust.  This is consistent with the
 clone-on-assign model (§14.9) — the outer variable remains accessible.
 
@@ -5064,8 +5537,8 @@ keyword API nor `PL_infix_plugin` can change how it parses.
 
 However, `move` and `async` are not Perl 5 keywords, so they can
 be registered via `PL_keyword_plugin`.  Once the parser hits `move`,
-our keyword hook takes over and can parse `|args| expr` however we
-want — the `|` is being interpreted by our custom parser at that
+the keyword hook takes over and can parse `|args| expr` freely
+— the `|` is being interpreted by the custom parser at that
 point, not by Perl's operator dispatch.  The standard parser never
 sees it.
 
@@ -5108,16 +5581,16 @@ in detail and proposes solutions.
 
 `move |args| expr` and `async |args| expr` work on standard Perl 5
 because `move` and `async` are registered via `PL_keyword_plugin`.
-When the lexer encounters the keyword, it calls our plugin, which
-takes over parsing entirely.  Our plugin can then parse `|args| expr`
-however we want — the standard parser never sees the `|`.
+When the lexer encounters the keyword, it calls the plugin, which
+takes over parsing entirely.  The plugin can then parse `|args| expr`
+freely — the standard parser never sees the `|`.
 
 **Why bare `|args|` is hard.**
 
 Without a keyword prefix, `|` hits the lexer's `yyl_verticalbar`
 function, which unconditionally emits a `BITOROP` token.  The parser
 then tries to parse it as an infix bitwise-or operator, expecting
-a left-hand operand that doesn't exist (we're in term position).
+a left-hand operand that doesn't exist (it's in term position).
 
 **The near-miss: `PL_infix_plugin`.**
 
@@ -5313,17 +5786,17 @@ The runtime behavior is Perl 5, but the compile-time checking is real.
 
 `Syntax::Keyword::Match` (by Paul Evans) already registers `match` as
 a keyword, with syntax `match($expr : op) { case(val) { ... } }`.
-Our `match` uses Rust-style arm syntax: `match $expr { val => arm }`.
+The `match` implementation uses Rust-style arm syntax: `match $expr { val => arm }`.
 The two syntaxes are distinguishable in parsing (the `: op` after the
 expression is unique to `Syntax::Keyword::Match`), but since both
 register the same keyword, they cannot be loaded simultaneously.
 
 Options include: coordinating with Paul Evans on a unified design,
-having our module subsume `Syntax::Keyword::Match`'s functionality as
-a subset (our `match` on untyped values could support the `: op`
-syntax), or accepting that `use Typed` and `use Syntax::Keyword::Match`
-are alternatives.  This should be resolved before the CPAN module is
-published.
+having the module subsume `Syntax::Keyword::Match`'s functionality as
+a subset (the `match` implementation on untyped values could support
+the `: op` syntax), or accepting that `use Typed` and
+`use Syntax::Keyword::Match` are alternatives.  This should be
+resolved before the CPAN module is published.
 
 **Rust-style `|args| expr` closures — partially portable:**
 
@@ -5334,8 +5807,8 @@ implemented on standard Perl 5.  A small proposed extension to Perl's
 
 However, `move |args| expr` and `async |args| expr` *are* portable
 today, because `move` and `async` are not Perl 5 keywords.  When
-registered via `PL_keyword_plugin`, they trigger our custom parser
-which then handles the `|...|` syntax entirely within our parsing
+registered via `PL_keyword_plugin`, they trigger the custom parser
+which then handles the `|...|` syntax entirely within the parsing
 hook — the standard Perl parser never sees the `|`.  This means the
 concurrency-critical closure forms are fully portable.  Anonymous
 `fn(args) { expr }` covers the remaining cases.
@@ -5423,7 +5896,7 @@ Internals::SvREADONLY($handler, 1);
 ```
 
 The `move` and `async` keywords are registered via `PL_keyword_plugin`.
-When triggered, our custom parser handles the `|...|` syntax — the
+When triggered, the custom parser handles the `|...|` syntax — the
 standard Perl parser never sees the `|`.  Bare `|args| expr` without
 a keyword prefix remains Rust-runtime-only.
 
@@ -5613,7 +6086,7 @@ standard debug protocol for IDE integration.  Introspecting a running
 program — "what's in this object? what methods does it have?" — is
 painful.
 
-Our architecture provides structural advantages that make better
+The architecture provides structural advantages that make better
 debugging possible.  This section identifies the opportunities and
 goals without prescribing detailed solutions — the debugging
 experience is expected to evolve significantly during implementation.
@@ -5630,9 +6103,9 @@ experience is expected to evolve significantly during implementation.
 - **Typed values are self-describing.**  A `struct User { name:
   String, age: i64 }` knows its own field names and types at
   runtime.  Pretty-printing it is trivial.
-- **Untyped values have observable state.**  `SvFlags` tells you
-  which representations are cached (IOK, POK, etc.), whether magic
-  is attached, whether the value is read-only.
+- **Untyped values have observable state.**  `ScalarFlags` tells you
+  which representations are cached (INT_VALID, STR_VALID, etc.),
+  whether magic is attached, whether the value is read-only.
 - **Async-aware.**  The runtime knows about all active Tokio tasks,
   their states, and their call stacks.
 
@@ -5761,7 +6234,7 @@ highlighting, no tab completion, no multiline input handling.  Third-
 party REPLs (`Reply`, `Devel::REPL`) exist but are not widely used
 and have rough edges.
 
-Our REPL should be a first-class tool, built on `reedline` (the Rust
+The REPL should be a first-class tool, built on `reedline` (the Rust
 line-editor library used by Nushell), providing:
 
 - **Line editing.**  Emacs and Vi keybinding modes, word-level
@@ -5814,7 +6287,7 @@ Foo: new, value, label, to_string
   ISA: Base: serialize, deserialize
 
 perl> :flags $obj
-SvFlags: POK | ROK | MAGICAL
+ScalarFlags: STR_VALID | REF_VALID | MAGICAL
   blessed into: Foo
   magic: TIEDSCALAR
 
@@ -5957,22 +6430,23 @@ it, and design mistakes here are the most expensive to fix later.
 
 **Week 1: Strings and core value types**
 
-1. `PerlString` — `Vec<u8>` + `is_utf8: bool`.  Methods: `as_str()`,
-   `from_str()`, `as_bytes()`, `into_bytes()`, concatenation,
-   comparison, `substr`, `length` (byte and character).  Extensive
-   tests for UTF-8 flag invariant maintenance.
+1. `PerlString` — `Bytes` + `flags: u8` (Perl UTF-8 flag, Rust
+   validity cache).  Methods: `as_str()`, `from_str()`, `as_bytes()`,
+   `clone_cow()`, concatenation, comparison, `substr`, `length`
+   (byte and character).  Extensive tests for flag maintenance across
+   mutation and COW transitions.
 
-2. `SmallString` — 22-byte inline string.  Construction, conversion
-   to/from `PerlString`, boundary behavior at exactly 22 bytes.
+2. `SmallString` — 38-byte inline string.  Construction, conversion
+   to/from `PerlString`, boundary behavior at exactly 38 bytes.
 
-3. `SvFlags` — bitflags struct with INT_VALID, NUM_VALID, STR_VALID,
+3. `ScalarFlags` — bitflags struct with INT_VALID, NUM_VALID, STR_VALID,
    REF_VALID, READONLY, UTF8, MAGICAL, TAINT, WEAK.
 
 4. `PerlStringSlot` — the `None`/`Inline`/`Heap` enum.
 
 **Week 2: `Scalar`, `Value`, and coercion**
 
-5. `Scalar` — full struct with `int`, `num`, `bytes`, `rv`, `magic`,
+5. `Scalar` — full struct with `int`, `num`, `bytes`, `reference`, `magic`,
    `stash`.  Coercion methods: `get_int()`, `get_num()`,
    `get_bytes()`, `get_str()`, `set_int()`, `set_str()`, `set_ref()`.
    Each respects flag discipline — reads check the validity flag
@@ -6012,9 +6486,9 @@ their operations:
 #[test]
 fn string_coercion() {
     let mut sv = Scalar::from_str("42");
-    assert!(sv.flags.contains(SvFlags::POK));
-    assert_eq!(sv.get_iv(), 42);
-    assert!(sv.flags.contains(SvFlags::IOK));
+    assert!(sv.flags.contains(ScalarFlags::STR_VALID));
+    assert_eq!(sv.get_int(), 42);
+    assert!(sv.flags.contains(ScalarFlags::INT_VALID));
 }
 
 #[test]
@@ -6123,7 +6597,7 @@ syntax highlighting incrementally.
 ### 22.1 Crate Architecture
 
 The workspace consists of five library crates and one binary, with
-three independent leaf crates that have no internal dependencies:
+three independent leaf crates that have no cross-dependencies:
 
 ```text
                     ┌───────────┐
@@ -6155,8 +6629,8 @@ three independent leaf crates that have no internal dependencies:
 
 | Crate | Type | Dependencies | Contents |
 |---|---|---|---|
-| `perl-core` | lib | none | Strings, values, scalars, flags, typed value trait, extension API |
-| `perl-parser` | lib | none | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters |
+| `perl-core` | lib | `bytes` | Strings, values, scalars, flags, typed value trait, extension API |
+| `perl-parser` | lib | `bytes` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters |
 | `perl-regex` | lib | none | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11) |
 | `perl-compiler` | lib | `perl-core`, `perl-parser` | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
 | `perl-runtime` | lib | `perl-compiler`, `perl-core`, `perl-regex` | Interpreter loop, `Executor` impl, call frames, symbol tables, builtins, magic, concurrency, bytecode save/load, CLI, REPL, debug |
@@ -6168,7 +6642,11 @@ Three leaf crates (`perl-core`, `perl-parser`, `perl-regex`) have no
 cross-dependencies.  Each is independently useful as a library:
 `perl-parser` for tools that need to parse Perl without executing it,
 `perl-regex` for Rust programs that want Perl-compatible regex, and
-`perl-core` for extensions that need the value types.
+`perl-core` for extensions that need the value types.  `perl-core` and
+`perl-parser` depend on the `bytes` crate for zero-copy
+reference-counted byte buffers (source slicing in the parser,
+copy-on-write semantics for Perl strings).  `perl-regex` remains
+dependency-free, operating on `&[u8]` and `&str` slices.
 
 `perl-compiler` contains the compilation pipeline: AST → HIR → IR →
 optimize.  It depends on `perl-parser` (for AST input) and
@@ -6258,8 +6736,9 @@ perl-runtime/
 perl-parser/
     src/
         lib.rs           # Public API: "give me source, get an AST"
+        source.rs        # LexerSource, LexerLine, CRLF normalization
         token.rs         # Token enum, spans
-        lexer.rs         # Tokenizer, sublexing, heredocs
+        lexer.rs         # Tokenizer, sublexing
         parser.rs        # Pratt parser, AST construction
         ast.rs           # AST node types
         keyword.rs       # Keyword table
@@ -6403,7 +6882,9 @@ The key architectural decisions in this design:
 
 8. **Six crates plus one binary** — three independent leaf crates
    (`perl-core`, `perl-parser`, `perl-regex`) with no
-   cross-dependencies, a `perl-compiler` library (HIR, IR, lowering,
+   cross-dependencies.  `perl-core` and `perl-parser` depend on the
+   `bytes` crate for zero-copy reference-counted buffers; `perl-regex`
+   is dependency-free.  A `perl-compiler` library (HIR, IR, lowering,
    optimization, `Executor` trait), a `perl-runtime` library
    (interpreter, builtins, bytecode save/load), and a thin `perl`
    binary.  The compiler–interpreter mutual recursion
