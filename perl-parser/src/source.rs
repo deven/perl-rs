@@ -84,6 +84,13 @@ impl LexerLine {
     pub fn slice_since(&self, start: usize) -> Bytes {
         self.line.slice(start..self.pos)
     }
+
+    /// Byte offset in the original source at the current cursor position.
+    /// Used for span construction.
+    #[inline]
+    pub fn global_pos(&self) -> u32 {
+        (self.offset + self.pos) as u32
+    }
 }
 
 // ── LexerSource ───────────────────────────────────────────────────
@@ -139,6 +146,23 @@ impl LexerSource {
     /// Zero-copy — just a refcount bump.
     pub fn from_bytes(src: Bytes) -> Self {
         LexerSource { src, cursor: 0, line_number: 1, heredoc_stack: Vec::new(), queued_line: None, required_indent: None }
+    }
+
+    /// Current byte position in the source buffer.
+    /// Used for global position when no current line is active.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Total length of the source buffer.
+    pub fn src_len(&self) -> usize {
+        self.src.len()
+    }
+
+    /// Raw slice of the source buffer.  For rare operations that need
+    /// access to the underlying bytes (e.g. format body extraction).
+    pub fn src_slice(&self, start: usize, end: usize) -> &[u8] {
+        &self.src[start..end]
     }
 
     /// Get the next line.
@@ -254,12 +278,12 @@ impl LexerSource {
     /// Returns the `LexerLine` with indent stripped and cursor at 0.
     /// Empty lines (zero content) are allowed without the indent prefix.
     fn strip_indent(&self, raw: RawLine) -> Result<LexerLine, ParseError> {
-        let content = if let Some(indent) = &self.required_indent {
+        let (content, indent_len) = if let Some(indent) = &self.required_indent {
             if raw.content.starts_with(indent.as_ref()) {
-                raw.content.slice(indent.len()..)
+                (raw.content.slice(indent.len()..), indent.len())
             } else if raw.content.is_empty() {
                 // Empty line — allowed without indent.
-                raw.content
+                (raw.content, 0)
             } else {
                 return Err(ParseError::new(
                     "indentation of here-doc doesn't match delimiter",
@@ -267,10 +291,10 @@ impl LexerSource {
                 ));
             }
         } else {
-            raw.content
+            (raw.content, 0)
         };
 
-        Ok(LexerLine { number: raw.number, offset: raw.offset, line: content, terminated: raw.terminated, pos: 0 })
+        Ok(LexerLine { number: raw.number, offset: raw.offset + indent_len, line: content, terminated: raw.terminated, pos: 0 })
     }
 
     /// Scan ahead from the current cursor to find an indented heredoc
@@ -620,10 +644,15 @@ mod tests {
         source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         // Body lines with indent stripped.
+        // Source: "<<~END;\n    hello\n    world\n    END\n"
+        //          0       8          18
+        // "    hello" at raw offset 8, 4-byte indent stripped → offset 12.
         let l1 = source.next_line().unwrap().unwrap();
         assert_eq!(&l1.line[..], b"hello");
+        assert_eq!(l1.offset, 12);
         let l2 = source.next_line().unwrap().unwrap();
         assert_eq!(&l2.line[..], b"world");
+        assert_eq!(l2.offset, 22);
 
         // Terminator → None.
         assert!(source.next_line().unwrap().is_none());
