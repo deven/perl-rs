@@ -434,6 +434,8 @@ pub enum QuoteKind {
     Double,
     /// Backtick or `qx//`
     Backtick,
+    /// Interpolating heredoc body (`<<TAG`, `<<"TAG"`)
+    Heredoc,
 }
 
 /// Kind of regex construct.
