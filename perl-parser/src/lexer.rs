@@ -24,6 +24,9 @@ enum LexContext {
         open: Option<u8>,
         depth: u32,
     },
+    /// Inside `${expr}` or `@{expr}` — normal code lexing, but
+    /// when `}` is reached at depth 0, pop back to Interpolating.
+    ExprInString { depth: u32 },
 }
 
 /// Saved lexer state for checkpoint/restore (used by the parser's
@@ -408,6 +411,30 @@ impl<'src> Lexer<'src> {
         if let Some(ctx) = self.context_stack.last().cloned() {
             return match ctx {
                 LexContext::Interpolating { close, open, depth } => self.lex_interp_token(close, open, depth),
+                LexContext::ExprInString { .. } => {
+                    // Normal code lexing inside ${expr} or @{expr}.
+                    let result = self.lex_normal_token(expect)?;
+                    // Track brace depth to find the closing }.
+                    match &result.token {
+                        Token::LBrace | Token::HashBrace => {
+                            if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
+                                *d += 1;
+                            }
+                        }
+                        Token::RBrace => {
+                            if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
+                                if *d == 0 {
+                                    // Closing } of the expression — pop back to Interpolating.
+                                    self.context_stack.pop();
+                                } else {
+                                    *d -= 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(result)
+                }
             };
         }
 
@@ -1326,18 +1353,28 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    /// Lex `$name` or `${name}` interpolation inside a string.
+    /// Lex `$name`, `${name}`, or `${expr}` interpolation inside a string.
     fn lex_interp_scalar(&mut self, start: u32) -> Result<Spanned, ParseError> {
         self.pos += 1; // skip $
 
-        // ${name} form
+        // ${...} form
         if self.peek_byte() == Some(b'{') {
-            self.pos += 1;
-            let name = self.scan_ident();
-            if self.peek_byte() == Some(b'}') {
-                self.pos += 1;
+            self.pos += 1; // skip {
+            // Simple identifier: ${name}
+            if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+                let saved_pos = self.pos;
+                let name = self.scan_ident();
+                if self.peek_byte() == Some(b'}') {
+                    self.pos += 1;
+                    return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.pos as u32) });
+                }
+                // Not a simple ${name} — backtrack and scan as expression
+                self.pos = saved_pos;
             }
-            return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.pos as u32) });
+            // Expression interpolation: ${\ expr}, ${$ref}, etc.
+            // Push ExprInString — next tokens are normal code until }.
+            self.context_stack.push(LexContext::ExprInString { depth: 0 });
+            return Ok(Spanned { token: Token::InterpScalarExprStart, span: Span::new(start, self.pos as u32) });
         }
 
         // $name form — must start with alpha or _
@@ -1347,14 +1384,21 @@ impl<'src> Lexer<'src> {
         }
 
         // Bare $ not followed by a name — treat as literal
-        // (Will become a ConstSegment "$")
         Ok(Spanned { token: Token::ConstSegment("$".into()), span: Span::new(start, self.pos as u32) })
     }
 
-    /// Lex `@name` interpolation inside a string.
+    /// Lex `@name` or `@{expr}` interpolation inside a string.
     fn lex_interp_array(&mut self, start: u32) -> Result<Spanned, ParseError> {
         self.pos += 1; // skip @
 
+        // @{...} form — expression interpolation: @{[ expr ]}
+        if self.peek_byte() == Some(b'{') {
+            self.pos += 1; // skip {
+            self.context_stack.push(LexContext::ExprInString { depth: 0 });
+            return Ok(Spanned { token: Token::InterpArrayExprStart, span: Span::new(start, self.pos as u32) });
+        }
+
+        // @name form
         if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
             let name = self.scan_ident();
             return Ok(Spanned { token: Token::InterpArray(name), span: Span::new(start, self.pos as u32) });
@@ -2048,7 +2092,12 @@ mod tests {
                     expect = Expect::Term;
                 }
                 // Sub-tokens inside strings don't affect expect.
-                Token::QuoteBegin(_, _) | Token::ConstSegment(_) | Token::InterpScalar(_) | Token::InterpArray(_) => {}
+                Token::QuoteBegin(_, _)
+                | Token::ConstSegment(_)
+                | Token::InterpScalar(_)
+                | Token::InterpArray(_)
+                | Token::InterpScalarExprStart
+                | Token::InterpArrayExprStart => {}
                 _ => {
                     expect = Expect::Term;
                 }
