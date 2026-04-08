@@ -27,6 +27,16 @@ enum LexContext {
     /// Inside `${expr}` or `@{expr}` — normal code lexing, but
     /// when `}` is reached at depth 0, pop back to Interpolating.
     ExprInString { depth: u32 },
+    /// Inside an interpolating heredoc body — produces ConstSegment,
+    /// InterpScalar, etc. until the terminator line is found.
+    HeredocBody {
+        tag: String,
+        rest_of_line_pos: usize,
+        at_line_start: bool,
+        /// Exact whitespace prefix from the terminator line (for `<<~`).
+        /// Empty for non-indented heredocs.
+        indent: Vec<u8>,
+    },
 }
 
 /// Saved lexer state for checkpoint/restore (used by the parser's
@@ -45,15 +55,21 @@ pub(crate) struct LexerCheckpoint {
 /// It reads the `expect` field to resolve context-sensitive ambiguities.
 /// The context stack tracks sublexing modes (interpolating strings,
 /// regex patterns, heredocs).
+///
+/// CR normalization: if the source contains `\r`, the buffer is
+/// normalized at construction (`\r\n` → `\n`).  Standalone `\r` is
+/// NOT a newline and stays as a literal byte.  All internal code
+/// sees `\n`-only line endings.  When the source has no `\r` bytes
+/// (the common case), this is zero-copy.
 pub(crate) struct Lexer<'src> {
-    src: &'src [u8],
+    src: std::borrow::Cow<'src, [u8]>,
     pos: usize,
     context_stack: Vec<LexContext>,
-    /// When a heredoc tag is encountered, the body is collected eagerly
-    /// from subsequent lines.  The lexer then rewinds to continue scanning
-    /// the current line.  When skip_ws_and_comments later hits the newline
-    /// at the end of that line, it jumps to the position after the heredoc
-    /// terminator instead of the next source line.
+    /// When a heredoc tag is encountered on a line, the body starts
+    /// on the following lines.  The lexer processes the body, then
+    /// rewinds to continue the current line.  When advance_byte later
+    /// crosses the newline at the end of the current line, it jumps
+    /// to the position after the heredoc terminator.
     heredoc_line_redirects: Vec<usize>,
     /// Index into heredoc_line_redirects: how many have been consumed.
     /// Using an index instead of removing from the vec allows checkpoint/
@@ -61,8 +77,26 @@ pub(crate) struct Lexer<'src> {
     heredoc_redirect_idx: usize,
 }
 
+/// Normalize `\r\n` → `\n`.  Standalone `\r` is NOT a newline and
+/// stays as a literal byte in the content.
+fn normalize_crlf(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'\r' && i + 1 < src.len() && src[i + 1] == b'\n' {
+            // \r\n → \n: skip the \r, the \n will be pushed next iteration.
+            i += 1;
+        } else {
+            out.push(src[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 impl<'src> Lexer<'src> {
     pub fn new(src: &'src [u8]) -> Self {
+        let src = if src.contains(&b'\r') { std::borrow::Cow::Owned(normalize_crlf(src)) } else { std::borrow::Cow::Borrowed(src) };
         Lexer { src, pos: 0, context_stack: Vec::new(), heredoc_line_redirects: Vec::new(), heredoc_redirect_idx: 0 }
     }
 
@@ -107,9 +141,6 @@ impl<'src> Lexer<'src> {
         let b = self.src.get(self.pos).copied()?;
         self.pos += 1;
         // When crossing a newline, fire any pending heredoc redirect.
-        // This makes heredoc body skipping transparent to all byte-level
-        // scanners (scan_balanced_string, lex_single_quoted_string, etc.),
-        // so constructs that span across a heredoc splice work correctly.
         if b == b'\n' && self.heredoc_redirect_idx < self.heredoc_line_redirects.len() {
             self.pos = self.heredoc_line_redirects[self.heredoc_redirect_idx];
             self.heredoc_redirect_idx += 1;
@@ -117,7 +148,7 @@ impl<'src> Lexer<'src> {
         Some(b)
     }
 
-    pub fn remaining(&self) -> &'src [u8] {
+    pub fn remaining(&self) -> &[u8] {
         &self.src[self.pos..]
     }
 
@@ -408,34 +439,38 @@ impl<'src> Lexer<'src> {
     /// dispatches to the appropriate sub-lexer instead.
     pub fn next_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
         // If inside a sublexing context, dispatch there.
-        if let Some(ctx) = self.context_stack.last().cloned() {
-            return match ctx {
-                LexContext::Interpolating { close, open, depth } => self.lex_interp_token(close, open, depth),
-                LexContext::ExprInString { .. } => {
-                    // Normal code lexing inside ${expr} or @{expr}.
-                    let result = self.lex_normal_token(expect)?;
-                    // Track brace depth to find the closing }.
-                    match &result.token {
-                        Token::LBrace | Token::HashBrace => {
-                            if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
-                                *d += 1;
-                            }
+        match self.context_stack.last() {
+            Some(LexContext::Interpolating { close, open, depth }) => {
+                let (close, open, depth) = (*close, *open, *depth);
+                return self.lex_interp_token(close, open, depth);
+            }
+            Some(LexContext::ExprInString { .. }) => {
+                // Normal code lexing inside ${expr} or @{expr}.
+                let result = self.lex_normal_token(expect)?;
+                // Track brace depth to find the closing }.
+                match &result.token {
+                    Token::LBrace | Token::HashBrace => {
+                        if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
+                            *d += 1;
                         }
-                        Token::RBrace => {
-                            if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
-                                if *d == 0 {
-                                    // Closing } of the expression — pop back to Interpolating.
-                                    self.context_stack.pop();
-                                } else {
-                                    *d -= 1;
-                                }
-                            }
-                        }
-                        _ => {}
                     }
-                    Ok(result)
+                    Token::RBrace => {
+                        if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
+                            if *d == 0 {
+                                self.context_stack.pop();
+                            } else {
+                                *d -= 1;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-            };
+                return Ok(result);
+            }
+            Some(LexContext::HeredocBody { .. }) => {
+                return self.lex_heredoc_body_token();
+            }
+            None => {}
         }
 
         self.lex_normal_token(expect)
@@ -1804,14 +1839,67 @@ impl<'src> Lexer<'src> {
             self.pos += 1; // skip the \n
         }
 
-        // Now collect body lines until the terminator.
+        // pos is now at the start of the heredoc body.
         let body_start = self.pos;
+
+        match kind {
+            HeredocKind::Interpolating => {
+                // Non-indented interpolating: process on the fly.
+                self.context_stack.push(LexContext::HeredocBody { tag, rest_of_line_pos, at_line_start: true, indent: Vec::new() });
+                Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
+            }
+            HeredocKind::Indented => {
+                // Indented interpolating: scan ahead to find the terminator
+                // and extract its exact whitespace prefix, then rewind.
+                let indent = self.scan_heredoc_terminator_indent(&tag, body_start)?;
+                self.pos = body_start;
+                self.context_stack.push(LexContext::HeredocBody { tag, rest_of_line_pos, at_line_start: true, indent });
+                Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
+            }
+            HeredocKind::Literal | HeredocKind::IndentedLiteral => {
+                // Literal heredocs: collect body as raw string.
+                self.collect_heredoc_literal(&tag, indented, body_start, rest_of_line_pos)
+            }
+        }
+    }
+
+    /// Scan ahead from `body_start` to find the indented heredoc terminator.
+    /// Returns the exact whitespace prefix from the terminator line.
+    /// Leaves `self.pos` after the terminator line.
+    fn scan_heredoc_terminator_indent(&mut self, tag: &str, body_start: usize) -> Result<Vec<u8>, ParseError> {
+        self.pos = body_start;
+        while self.pos < self.src.len() {
+            let line_start = self.pos;
+            // Scan leading whitespace.
+            while self.pos < self.src.len() && (self.src[self.pos] == b' ' || self.src[self.pos] == b'\t') {
+                self.pos += 1;
+            }
+            let indent_end = self.pos;
+            // Scan rest of line.
+            while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+                self.pos += 1;
+            }
+            let line_end = self.pos;
+            if self.pos < self.src.len() {
+                self.pos += 1; // skip \n
+            }
+            // Check if the non-whitespace part matches the tag.
+            if &self.src[indent_end..line_end] == tag.as_bytes() {
+                return Ok(self.src[line_start..indent_end].to_vec());
+            }
+        }
+        Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(body_start as u32, self.pos as u32)))
+    }
+
+    /// Collect a literal heredoc body as a raw string.
+    /// Used for `<<'TAG'` and `<<~'TAG'`.
+    fn collect_heredoc_literal(&mut self, tag: &str, indented: bool, body_start: usize, rest_of_line_pos: usize) -> Result<Token, ParseError> {
         let mut body = String::new();
         let mut found_terminator = false;
+        let mut terminator_indent: Vec<u8> = Vec::new();
 
         while self.pos < self.src.len() {
             let line_start = self.pos;
-            // Read to end of line
             while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
                 self.pos += 1;
             }
@@ -1823,23 +1911,21 @@ impl<'src> Lexer<'src> {
             let line = &self.src[line_start..line_end];
 
             // Check if this line is the terminator.
-            let trimmed = if indented {
-                // For <<~, strip leading whitespace before comparing.
+            if indented {
                 let mut i = 0;
                 while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
                     i += 1;
                 }
-                &line[i..]
-            } else {
-                line
-            };
-
-            if trimmed == tag.as_bytes() {
+                if &line[i..] == tag.as_bytes() {
+                    terminator_indent = line[..i].to_vec();
+                    found_terminator = true;
+                    break;
+                }
+            } else if line == tag.as_bytes() {
                 found_terminator = true;
                 break;
             }
 
-            // Add line to body (including the newline).
             body.push_str(&String::from_utf8_lossy(line));
             body.push('\n');
         }
@@ -1848,23 +1934,137 @@ impl<'src> Lexer<'src> {
             return Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(body_start as u32, self.pos as u32)));
         }
 
-        // For indented heredocs, strip common leading whitespace from body.
-        if indented && !body.is_empty() {
-            body = strip_heredoc_indent(&body);
+        // For indented literal heredocs, strip the terminator's exact
+        // indentation from each body line (matching toke.c behavior).
+        if indented && !terminator_indent.is_empty() {
+            body = strip_heredoc_indent_exact(&body, &terminator_indent);
         }
 
-        // Save the position after the terminator — this is where scanning
-        // resumes after the current line is finished.
         let after_terminator = self.pos;
-
-        // Rewind to the rest of the current line.
         self.pos = rest_of_line_pos;
-
-        // Register the redirect: when skip_ws_and_comments hits the
-        // newline at the end of the current line, jump to after_terminator.
         self.heredoc_line_redirects.push(after_terminator);
 
-        Ok(Token::HeredocLit(kind, tag, body))
+        let kind = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
+        Ok(Token::HeredocLit(kind, tag.to_string(), body))
+    }
+
+    /// Lex one sub-token from inside an interpolating heredoc body.
+    /// Called when the context stack top is `HeredocBody`.
+    fn lex_heredoc_body_token(&mut self) -> Result<Spanned, ParseError> {
+        let start = self.pos as u32;
+
+        // Extract context fields — clone tag and indent to avoid borrowing self.
+        let (tag, rest_of_line_pos, at_line_start, indent) = match self.context_stack.last() {
+            Some(LexContext::HeredocBody { tag, rest_of_line_pos, at_line_start, indent }) => (tag.clone(), *rest_of_line_pos, *at_line_start, indent.clone()),
+            _ => unreachable!(),
+        };
+
+        if self.at_end() {
+            return Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(start, start)));
+        }
+
+        // At line start, check for terminator.
+        if at_line_start {
+            let line_start = self.pos;
+            // For indented heredocs, check if line starts with indent + tag.
+            if !indent.is_empty() {
+                // Strip the indent prefix.
+                let after_indent = if self.src[self.pos..].starts_with(&indent) {
+                    self.pos + indent.len()
+                } else {
+                    // Check for empty line (just \n) — allowed without indent.
+                    if self.peek_byte() == Some(b'\n') {
+                        // Not a terminator, not an error — just an empty line.
+                        // Clear at_line_start after processing below.
+                        self.pos // don't skip indent
+                    } else {
+                        // Non-empty line without correct indentation.
+                        return Err(ParseError::new("indentation on line of here-doc doesn't match delimiter", Span::new(start, self.pos as u32)));
+                    }
+                };
+                // Check if the rest of the line after indent is the tag.
+                let mut tag_end = after_indent;
+                while tag_end < self.src.len() && self.src[tag_end] != b'\n' {
+                    tag_end += 1;
+                }
+                if &self.src[after_indent..tag_end] == tag.as_bytes() {
+                    // Found terminator.  Skip past it.
+                    self.pos = tag_end;
+                    if self.pos < self.src.len() {
+                        self.pos += 1; // skip \n
+                    }
+                    let after_terminator = self.pos;
+                    self.context_stack.pop();
+                    self.pos = rest_of_line_pos;
+                    self.heredoc_line_redirects.push(after_terminator);
+                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
+                }
+                // Not terminator — skip the indent bytes for content.
+                if self.src[self.pos..].starts_with(&indent) {
+                    self.pos += indent.len();
+                }
+            } else {
+                // Non-indented: check if full line matches tag.
+                let mut line_end = self.pos;
+                while line_end < self.src.len() && self.src[line_end] != b'\n' {
+                    line_end += 1;
+                }
+                if &self.src[line_start..line_end] == tag.as_bytes() {
+                    // Found terminator.
+                    self.pos = line_end;
+                    if self.pos < self.src.len() {
+                        self.pos += 1; // skip \n
+                    }
+                    let after_terminator = self.pos;
+                    self.context_stack.pop();
+                    self.pos = rest_of_line_pos;
+                    self.heredoc_line_redirects.push(after_terminator);
+                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
+                }
+            }
+
+            // Not a terminator line — clear the flag.
+            if let Some(LexContext::HeredocBody { at_line_start: a, .. }) = self.context_stack.last_mut() {
+                *a = false;
+            }
+        }
+
+        // Check for interpolation.
+        let b = self.peek_byte().unwrap();
+        if b == b'$' {
+            return self.lex_interp_scalar(start);
+        }
+        if b == b'@' {
+            return self.lex_interp_array(start);
+        }
+
+        // Scan a ConstSegment: everything until $, @, or newline.
+        let mut s = String::new();
+        loop {
+            match self.peek_byte() {
+                None => break,
+                Some(b'$') | Some(b'@') => break,
+                Some(b'\\') => {
+                    self.pos += 1;
+                    self.process_escape(&mut s, 0);
+                }
+                Some(b'\n') => {
+                    self.pos += 1;
+                    s.push('\n');
+                    // Mark next call as line start for terminator check.
+                    if let Some(LexContext::HeredocBody { at_line_start: a, .. }) = self.context_stack.last_mut() {
+                        *a = true;
+                    }
+                    break;
+                }
+                Some(b) => {
+                    self.pos += 1;
+                    s.push(b as char);
+                }
+            }
+        }
+
+        Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.pos as u32) })
     }
 
     /// Scan a quoted heredoc tag (between matching quotes).
@@ -1995,16 +2195,29 @@ fn hex_digit(b: u8) -> u8 {
 }
 
 /// Strip the common leading whitespace from an indented heredoc body (<<~).
-fn strip_heredoc_indent(body: &str) -> String {
-    // Find the minimum indentation (ignoring empty lines).
-    let min_indent = body.lines().filter(|line| !line.trim().is_empty()).map(|line| line.len() - line.trim_start().len()).min().unwrap_or(0);
-
-    if min_indent == 0 {
-        return body.to_string();
+/// Strip the terminator's exact whitespace prefix from each body line.
+/// Matches toke.c behavior: the indent is determined by the terminator
+/// line, not the minimum indent.  Empty lines (just "\n") are preserved.
+/// Panics if any non-empty line doesn't start with the exact indent.
+fn strip_heredoc_indent_exact(body: &str, indent: &[u8]) -> String {
+    let indent_str = std::str::from_utf8(indent).unwrap_or("");
+    let mut result = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        if trimmed.is_empty() {
+            // Empty line — preserve as-is.
+            result.push_str(line);
+        } else if trimmed.as_bytes().starts_with(indent) {
+            result.push_str(&trimmed[indent_str.len()..]);
+            if line.ends_with('\n') {
+                result.push('\n');
+            }
+        } else {
+            // Indentation mismatch — should have been caught earlier.
+            result.push_str(line);
+        }
     }
-
-    body.lines().map(|line| if line.len() >= min_indent { &line[min_indent..] } else { line }).collect::<Vec<_>>().join("\n")
-        + if body.ends_with('\n') { "\n" } else { "" }
+    result
 }
 
 // ── Byte-level helpers for brace disambiguation ─────────────
@@ -2106,6 +2319,125 @@ mod tests {
         }
         tokens
     }
+
+    // ── CR normalization ────────────────────────────────────────
+
+    #[test]
+    fn normalize_crlf_strips_cr_before_lf() {
+        assert_eq!(normalize_crlf(b"a\r\nb\r\n"), b"a\nb\n");
+    }
+
+    #[test]
+    fn normalize_crlf_preserves_standalone_cr() {
+        // Standalone \r is NOT a newline — stays as literal byte.
+        assert_eq!(normalize_crlf(b"a\rb"), b"a\rb");
+    }
+
+    #[test]
+    fn normalize_crlf_preserves_lf_cr() {
+        // \n\r is NOT CRLF — the \r stays.
+        assert_eq!(normalize_crlf(b"a\n\rb"), b"a\n\rb");
+    }
+
+    #[test]
+    fn normalize_crlf_noop_on_lf_only() {
+        assert_eq!(normalize_crlf(b"a\nb\n"), b"a\nb\n");
+    }
+
+    #[test]
+    fn lex_crlf_same_as_lf() {
+        // CRLF source should produce identical tokens to LF source.
+        let lf_tokens = lex_all("my $x = 1;\nmy $y = 2;\n");
+        let crlf_tokens = lex_all("my $x = 1;\r\nmy $y = 2;\r\n");
+        assert_eq!(lf_tokens, crlf_tokens);
+    }
+
+    #[test]
+    fn lex_crlf_heredoc() {
+        // Heredoc with CRLF line endings should work identically to LF.
+        let lf_tokens = lex_all("<<END;\nhello\nEND\n");
+        let crlf_tokens = lex_all("<<END;\r\nhello\r\nEND\r\n");
+        assert_eq!(lf_tokens, crlf_tokens);
+    }
+
+    #[test]
+    fn lex_cr_only_not_treated_as_newline() {
+        // Standalone \r is NOT a line ending.  This source has \r (not \r\n)
+        // before the terminator, so "END" is not at line start and the
+        // heredoc is unterminated — matching Perl's behavior.
+        let src = b"<<END;\nhello\rEND\n";
+        let mut lexer = Lexer::new(src);
+        let expect = Expect::Statement;
+        // Consume QuoteBegin.
+        let tok = lexer.next_token(&expect).unwrap();
+        assert_eq!(tok.token, Token::QuoteBegin(QuoteKind::Heredoc, 0));
+        // Consume body content — "hello\rEND\n" is a single non-terminator line.
+        let tok = lexer.next_token(&expect).unwrap();
+        assert!(matches!(tok.token, Token::ConstSegment(_)));
+        // Now at EOF with no terminator found — should error.
+        let result = lexer.next_token(&expect);
+        assert!(result.is_err(), "expected unterminated heredoc error");
+    }
+
+    // ── Indented heredoc indentation mismatch errors ──────────
+
+    #[test]
+    fn lex_indented_heredoc_mismatch_croaks() {
+        // Body line with wrong indentation should error.
+        let src = "<<~END;\n    hello\n  bad indent\n    END\n";
+        let mut lexer = Lexer::new(src.as_bytes());
+        let expect = Expect::Statement;
+        // Consume QuoteBegin.
+        lexer.next_token(&expect).unwrap();
+        // Consume tokens until we hit the error.
+        let mut got_error = false;
+        for _ in 0..20 {
+            match lexer.next_token(&expect) {
+                Err(e) => {
+                    assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
+                    got_error = true;
+                    break;
+                }
+                Ok(tok) if matches!(tok.token, Token::Eof) => break,
+                Ok(_) => continue,
+            }
+        }
+        assert!(got_error, "expected indentation mismatch error");
+    }
+
+    #[test]
+    fn lex_indented_heredoc_tabs_vs_spaces_croaks() {
+        // Terminator uses tab+spaces, body line uses only spaces — mismatch.
+        let src = "<<~END;\n\t  hello\n    wrong\n\t  END\n";
+        let mut lexer = Lexer::new(src.as_bytes());
+        let expect = Expect::Statement;
+        lexer.next_token(&expect).unwrap();
+        let mut got_error = false;
+        for _ in 0..20 {
+            match lexer.next_token(&expect) {
+                Err(e) => {
+                    assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
+                    got_error = true;
+                    break;
+                }
+                Ok(tok) if matches!(tok.token, Token::Eof) => break,
+                Ok(_) => continue,
+            }
+        }
+        assert!(got_error, "expected indentation mismatch error");
+    }
+
+    #[test]
+    fn lex_indented_heredoc_empty_line_ok() {
+        // Empty lines (just \n) are allowed without indentation.
+        let src = "<<~END;\n    hello\n\n    world\n    END\n";
+        let tokens = lex_all(src);
+        assert_eq!(tokens[0], Token::QuoteBegin(QuoteKind::Heredoc, 0));
+        let body: String = tokens.iter().filter_map(|t| if let Token::ConstSegment(s) = t { Some(s.as_str()) } else { None }).collect();
+        assert_eq!(body, "hello\n\nworld\n");
+    }
+
+    // ── Basic token tests ─────────────────────────────────────
 
     #[test]
     fn lex_simple_assignment() {
@@ -2447,14 +2779,14 @@ mod tests {
     fn lex_heredoc_bare_tag() {
         let src = "<<END;\nHello, world!\nEND\n";
         let tokens = lex_all(src);
-        assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "Hello, world!\n".into()), Token::Semi,]);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("Hello, world!\n".into()), Token::QuoteEnd, Token::Semi,]);
     }
 
     #[test]
     fn lex_heredoc_double_quoted() {
         let src = "<<\"END\";\nHello!\nEND\n";
         let tokens = lex_all(src);
-        assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "Hello!\n".into()), Token::Semi,]);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("Hello!\n".into()), Token::QuoteEnd, Token::Semi,]);
     }
 
     #[test]
@@ -2468,12 +2800,11 @@ mod tests {
     fn lex_heredoc_multiline_body() {
         let src = "<<END;\nline 1\nline 2\nline 3\nEND\n";
         let tokens = lex_all(src);
-        match &tokens[0] {
-            Token::HeredocLit(_, _, body) => {
-                assert_eq!(body, "line 1\nline 2\nline 3\n");
-            }
-            other => panic!("expected HeredocLit, got {other:?}"),
-        }
+        // Heredoc body is split into ConstSegments at line boundaries.
+        assert_eq!(tokens[0], Token::QuoteBegin(QuoteKind::Heredoc, 0));
+        // Collect all ConstSegment content.
+        let body: String = tokens.iter().filter_map(|t| if let Token::ConstSegment(s) = t { Some(s.as_str()) } else { None }).collect();
+        assert_eq!(body, "line 1\nline 2\nline 3\n");
     }
 
     #[test]
@@ -2484,7 +2815,9 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "body\n".into()),
+                Token::QuoteBegin(QuoteKind::Heredoc, 0),
+                Token::ConstSegment("body\n".into()),
+                Token::QuoteEnd,
                 Token::Dot,
                 Token::QuoteBegin(QuoteKind::Double, b'"'),
                 Token::ConstSegment(" suffix".into()),
@@ -2498,12 +2831,10 @@ mod tests {
     fn lex_heredoc_indented() {
         let src = "<<~END;\n    hello\n    world\n    END\n";
         let tokens = lex_all(src);
-        match &tokens[0] {
-            Token::HeredocLit(HeredocKind::Indented, _, body) => {
-                assert_eq!(body, "hello\nworld\n");
-            }
-            other => panic!("expected indented HeredocLit, got {other:?}"),
-        }
+        assert_eq!(tokens[0], Token::QuoteBegin(QuoteKind::Heredoc, 0));
+        // Indent (4 spaces) should be stripped from each line.
+        let body: String = tokens.iter().filter_map(|t| if let Token::ConstSegment(s) = t { Some(s.as_str()) } else { None }).collect();
+        assert_eq!(body, "hello\nworld\n");
     }
 
     #[test]
@@ -2524,20 +2855,27 @@ mod tests {
         let src = "<<EOF, q{before\nbody\nEOF\nafter\n};\n";
         let tokens = lex_all(src);
 
-        // First token: heredoc with body "body\n"
-        match &tokens[0] {
-            Token::HeredocLit(HeredocKind::Interpolating, tag, body) => {
-                assert_eq!(tag, "EOF");
-                assert_eq!(body, "body\n");
+        // First tokens: heredoc body
+        assert_eq!(tokens[0], Token::QuoteBegin(QuoteKind::Heredoc, 0));
+        // Collect heredoc body content.
+        let mut i = 1;
+        let mut body = String::new();
+        while i < tokens.len() && tokens[i] != Token::QuoteEnd {
+            if let Token::ConstSegment(s) = &tokens[i] {
+                body.push_str(s);
             }
-            other => panic!("expected HeredocLit, got {other:?}"),
+            i += 1;
         }
+        assert_eq!(body, "body\n");
+        assert_eq!(tokens[i], Token::QuoteEnd);
+        i += 1;
 
         // Then comma
-        assert_eq!(tokens[1], Token::Comma);
+        assert_eq!(tokens[i], Token::Comma);
+        i += 1;
 
         // Then q{} string: "before\nafter\n" — the heredoc body is skipped
-        match &tokens[2] {
+        match &tokens[i] {
             Token::StrLit(s) => {
                 assert_eq!(s, "before\nafter\n");
             }
@@ -2682,7 +3020,7 @@ mod tests {
     fn lex_heredoc_empty_body() {
         let src = "<<END;\nEND\n";
         let tokens = lex_all(src);
-        assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Interpolating, "END".into(), "".into()), Token::Semi]);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Heredoc, 0), Token::QuoteEnd, Token::Semi,]);
     }
 
     #[test]
