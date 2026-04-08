@@ -13,6 +13,7 @@ pub mod ast;
 pub mod error;
 pub mod expect;
 pub mod keyword;
+pub mod source;
 pub mod span;
 pub mod token;
 
