@@ -757,7 +757,7 @@ mod tests {
 
         // The Scalar should have int=42 with INT_VALID set
         let guard = sv.read().unwrap();
-        assert!(guard.flags().contains(crate::flags::SvFlags::INT_VALID));
+        assert!(guard.flags().contains(crate::flags::ScalarFlags::INT_VALID));
     }
 
     #[test]
@@ -767,7 +767,7 @@ mod tests {
         assert!(matches!(v, Value::Scalar(_)));
 
         let guard = sv.read().unwrap();
-        assert!(guard.flags().contains(crate::flags::SvFlags::STR_VALID));
+        assert!(guard.flags().contains(crate::flags::ScalarFlags::STR_VALID));
     }
 
     #[test]

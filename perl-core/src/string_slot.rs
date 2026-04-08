@@ -1,6 +1,6 @@
 //! String cache slot for the `Scalar` struct.
 //!
-//! This enum provides small-string optimization within the `pv` field
+//! This enum provides small-string optimization within the `bytes` field
 //! of a full `Scalar`.  Even after a value has been upgraded from a
 //! compact `Value` variant to a full `Scalar` (behind `Arc<RwLock<>>`),
 //! short strings in the cache avoid an additional heap allocation.
@@ -15,12 +15,12 @@ pub const SLOT_INLINE_MAX: usize = 24;
 
 /// The string cache inside a `Scalar`.
 ///
-/// - `None` — no string representation cached (POK is clear).
+/// - `None` — no string representation cached (STR_VALID is clear).
 /// - `Inline` — short string stored directly in the Scalar struct.
 /// - `Heap` — longer string on the heap via `PerlString`.
 ///
 /// Note that `None` means "no string cache", not "empty string".
-/// An empty string is `Inline { len: 0, .. }` with POK set.
+/// An empty string is `Inline { len: 0, .. }` with STR_VALID set.
 #[derive(Clone, PartialEq, Eq)]
 pub enum PerlStringSlot {
     /// No string representation cached.

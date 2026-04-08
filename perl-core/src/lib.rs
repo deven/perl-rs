@@ -9,7 +9,7 @@
 //! - [`Scalar`] — the full Perl SV: parallel int/num/string caches with
 //!   flag-driven validity, magic chain, stash for blessed objects.
 //!
-//! - [`SvFlags`] — bitflags for cache validity (INT_VALID, NUM_VALID,
+//! - [`ScalarFlags`] — bitflags for cache validity (INT_VALID, NUM_VALID,
 //!   STR_VALID, REF_VALID) and metadata (READONLY, UTF8, TAINT, MAGICAL,
 //!   WEAK).
 //!
@@ -24,7 +24,7 @@
 //! - **Upgrade, never downgrade.**  Once a value becomes `Value::Scalar(Sv)`,
 //!   it stays that way.  Identity via `Arc` address must be preserved.
 //!
-//! - **Flag-driven coercion.**  The `Scalar` struct uses `SvFlags` to track
+//! - **Flag-driven coercion.**  The `Scalar` struct uses `ScalarFlags` to track
 //!   which representation slots are valid.  The coercion engine checks flags
 //!   for the fast path and caches new representations lazily.
 
@@ -35,7 +35,7 @@ pub mod small_string;
 pub mod string_slot;
 pub mod value;
 
-pub use flags::SvFlags;
+pub use flags::ScalarFlags;
 pub use perl_string::PerlString;
 pub use scalar::Scalar;
 pub use small_string::{SMALL_STRING_MAX, SmallString};
