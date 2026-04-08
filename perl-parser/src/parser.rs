@@ -2178,7 +2178,7 @@ impl<'src> Parser<'src> {
                             parts.push(StringPart::ArrayInterp(name));
                         }
                     } else if sigil == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                        // ${expr} — store as scalar interp with braced name
+                        // ${...} — either ${name} or ${expr}
                         if !buf.is_empty() {
                             parts.push(StringPart::Const(std::mem::take(&mut buf)));
                         }
@@ -2196,11 +2196,58 @@ impl<'src> Parser<'src> {
                                 i += 1;
                             }
                         }
-                        let name = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+                        let content = String::from_utf8_lossy(&bytes[start..i]).into_owned();
                         if i < bytes.len() {
                             i += 1;
                         } // skip '}'
-                        parts.push(StringPart::ScalarInterp(name));
+                        // Simple identifier → ScalarInterp; otherwise sub-parse.
+                        if content.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') && !content.is_empty() {
+                            parts.push(StringPart::ScalarInterp(content));
+                        } else {
+                            let expr_src = format!("{content};");
+                            match crate::parse(expr_src.as_bytes()) {
+                                Ok(prog) => match prog.statements.into_iter().next() {
+                                    Some(Statement { kind: StmtKind::Expr(expr), .. }) => {
+                                        parts.push(StringPart::ExprInterp(Box::new(expr)));
+                                    }
+                                    _ => parts.push(StringPart::Const(format!("${{{content}}}"))),
+                                },
+                                _ => parts.push(StringPart::Const(format!("${{{content}}}"))),
+                            }
+                        }
+                    } else if sigil == b'@' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                        // @{expr} — expression interpolation (e.g. @{[ 1, 2, 3 ]})
+                        if !buf.is_empty() {
+                            parts.push(StringPart::Const(std::mem::take(&mut buf)));
+                        }
+                        i += 2; // skip @{
+                        let start = i;
+                        let mut depth = 1u32;
+                        while i < bytes.len() && depth > 0 {
+                            if bytes[i] == b'{' {
+                                depth += 1;
+                            }
+                            if bytes[i] == b'}' {
+                                depth -= 1;
+                            }
+                            if depth > 0 {
+                                i += 1;
+                            }
+                        }
+                        let content = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+                        if i < bytes.len() {
+                            i += 1;
+                        } // skip '}'
+                        let expr_src = format!("{content};");
+                        match crate::parse(expr_src.as_bytes()) {
+                            Ok(prog) => match prog.statements.into_iter().next() {
+                                Some(Statement { kind: StmtKind::Expr(expr), .. }) => {
+                                    parts.push(StringPart::ExprInterp(Box::new(expr)));
+                                }
+                                _ => parts.push(StringPart::Const(format!("@{{{content}}}"))),
+                            },
+                            _ => parts.push(StringPart::Const(format!("@{{{content}}}"))),
+                        }
                     } else {
                         // Literal sigil — not followed by a valid var name
                         buf.push(sigil as char);
@@ -2295,6 +2342,17 @@ impl<'src> Parser<'src> {
                     self.advance()?;
                     has_interp = true;
                     parts.push(StringPart::ArrayInterp(name));
+                }
+                Token::InterpScalarExprStart | Token::InterpArrayExprStart => {
+                    self.advance()?;
+                    has_interp = true;
+                    // The lexer pushed ExprInString context — normal code
+                    // lexing until the closing }.  Parse the expression,
+                    // then consume the } (which pops the context).
+                    self.expect = Expect::Term;
+                    let expr = self.parse_expr(PREC_LOW)?;
+                    self.expect_token(&Token::RBrace)?;
+                    parts.push(StringPart::ExprInterp(Box::new(expr)));
                 }
                 Token::Eof => {
                     return Err(ParseError::new("unterminated interpolated string", self.peek_span()));
@@ -5583,9 +5641,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_interp_backslash_ref() {
+    fn parse_interp_scalar_expr() {
+        // "${\ $ref}" — scalar expression interpolation.
         let e = parse_expr_str(r#""${\ $ref}";"#);
-        assert!(matches!(e.kind, ExprKind::InterpolatedString(_)));
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert!(parts.iter().any(|p| matches!(p, StringPart::ExprInterp(_))), "expected ExprInterp, got {parts:?}");
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_interp_scalar_expr_arithmetic() {
+        // "${\ $x + 1}" — expression with arithmetic.
+        let e = parse_expr_str(r#""val: ${\ $x + 1}";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], StringPart::Const(s) if s == "val: "));
+                assert!(matches!(&parts[1], StringPart::ExprInterp(_)));
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_interp_array_expr() {
+        // "@{[ 1, 2, 3 ]}" — array expression interpolation.
+        let e = parse_expr_str(r#""@{[ 1, 2, 3 ]}";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert!(parts.iter().any(|p| matches!(p, StringPart::ExprInterp(_))), "expected ExprInterp, got {parts:?}");
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_interp_expr_with_text() {
+        // Mixing expression interpolation with plain text and simple vars.
+        let e = parse_expr_str(r#""Hello ${\ uc($name)}, you have @{[ $n + 1 ]} items";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert!(parts.len() >= 4, "expected at least 4 parts, got {}", parts.len());
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_interp_simple_braced_var() {
+        // "${name}" — simple braced variable, NOT expression interpolation.
+        let e = parse_expr_str(r#""${name}s";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(parts) => {
+                assert!(matches!(&parts[0], StringPart::ScalarInterp(s) if s == "name"), "expected ScalarInterp(name), got {:?}", parts[0]);
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
     }
 
     #[test]

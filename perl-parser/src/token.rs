@@ -366,10 +366,11 @@ pub enum Token {
     InterpScalar(String),
     /// `@name` interpolation inside a quote (array in string).
     InterpArray(String),
-    /// Start of `${expr}` expression interpolation.
-    InterpExprBegin,
-    /// End of `${expr}` expression interpolation.
-    InterpExprEnd,
+    /// `${expr}` expression interpolation — lexer switches to normal code mode.
+    /// Parser calls parse_expr(), then expect_token(RBrace).
+    InterpScalarExprStart,
+    /// `@{expr}` expression interpolation — lexer switches to normal code mode.
+    InterpArrayExprStart,
 
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.
