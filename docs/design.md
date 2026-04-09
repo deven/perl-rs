@@ -873,6 +873,14 @@ through an explicit expectation mechanism, analogous to `PL_expect` and
 `PL_lex_state` in `toke.c`.  Both live in the `perl-parser` crate as
 `pub(crate)` modules — the crate boundary is at the AST level.
 
+**Note:** The coupling between lexer and parser is real, but the
+*mechanism* for communicating context can be much simpler than Perl 5's
+approach.  Perl 5 uses a shared mutable state (`PL_expect`) because
+its LALR(1) parser cannot influence the lexer mid-production.  The
+recursive descent parser can call explicit lexer methods based on its
+current production, eliminating the shared state entirely.  See §5.2
+(Planned), §6.5, and §6.6.
+
 ### 5.2 Expectation-Based Tokenization
 
 The parser maintains an `Expect` state, analogous to Perl 5's
@@ -961,6 +969,41 @@ enum ExpectNext {
     Term,
 }
 ```
+
+**Planned: Eliminating `Expect` and `ExpectNext`.**  The `Expect` enum
+exists because the lexer must pre-decide ambiguous tokens (`{`, `/`,
+`(`) before the parser sees them.  This is inherited from Perl 5's
+LALR(1) architecture, where the parser cannot backtrack and needs
+distinct token types for different syntactic roles.
+
+The recursive descent parser has no such constraint.  Each ambiguous
+token can be resolved by the parser's own control flow:
+
+- **`/` (regex vs division):** The Pratt parser already knows whether
+  it is in term position (just called `parse_term`) or operator
+  position (in the `peek_op_info` loop).  The lexer can expose two
+  methods — `lex_term_token()` and `lex_operator_token()` — called
+  explicitly by the parser.  No shared `Expect` state needed.
+
+- **`{` (block vs hash):** Eliminated entirely — see §6.5.  The
+  parser always parses `{` as a block and reclassifies afterward.
+  `HashBrace` is deleted.
+
+- **`(` (prototype vs normal):** After `sub name`, the parser calls
+  a dedicated `lex_prototype()` method on the lexer.  No `Prototype`
+  expect state needed.
+
+- **`ExpectNext`:** The recursive descent call stack implicitly
+  encodes what follows `}`.  `parse_if` calls `parse_block` and
+  regains control at statement level.  `parse_anon_sub` calls
+  `parse_block` and returns to the Pratt loop in operator position.
+  No explicit state needed.
+
+The target architecture is a lexer with explicit mode methods driven
+by the parser's control flow, rather than a shared expect state that
+the parser sets and the lexer reads.  This eliminates the re-lex
+mechanism, checkpoint/restore in `ensure_current`, and the
+`lexer_equivalent` workaround entirely.  See §6.6 for the full plan.
 
 ### 5.3 Symbol Table Feedback
 
@@ -1705,6 +1748,15 @@ field assignment (e.g., `self.expect = Expect::Term`) at the
 appropriate points in `parse_term`, `parse_operator`, and their
 helpers.  No cross-object communication is needed.
 
+**Planned: Replacing feedback with explicit mode calls.**  The
+`Expect`-based feedback loop is a vestige of Perl 5's LALR(1)
+architecture.  The planned forward-only parser design (§6.6)
+eliminates the shared `Expect` state entirely.  Instead of the parser
+setting `self.expect` and the lexer reading it, the parser calls the
+appropriate lexer method directly: `lex_term_token()` in term
+position, `lex_operator_token()` in operator position.  The call
+stack is the context.  See §5.2 (Planned) and §6.6 for details.
+
 ### 6.3 Prototype-Guided Parsing
 
 When the parser encounters a known subroutine name, it should check the
@@ -1967,6 +2019,198 @@ capabilities (keyword registration, infix operators, recursive
 parsing) with a cleaner interface.  A compatibility guide mapping
 Perl 5 plugin API calls to Rust trait methods would assist module
 authors in porting their extensions.
+
+### 6.5 Brace Disambiguation
+
+**The problem.** When the parser encounters `{` at statement level,
+it could be a block (`{ print 1; print 2 }`) or an anonymous hash
+constructor (`{ key => "value" }`).  In Perl 5, the LALR(1) parser
+requires a distinct token type before it can select a grammar
+production, so `toke.c` runs a ~170-line byte-level heuristic
+(`yyl_leftcurly`, lines 6400–6471) that scans ahead through the raw
+source, manually skipping whitespace, comments, string literals,
+q-quotes with paired/unpaired delimiters, and barewords.  It then
+checks whether the first term is followed by `,` or `=>` to guess
+hash vs block.  This heuristic is fragile, cannot see past the
+current line reliably, and disagrees with programmer intent in edge
+cases (e.g. `{@pairs}` at statement level is classified as a block
+even when a hash constructor was intended).
+
+**The current implementation** mirrors Perl's approach: the lexer
+emits `HashBrace` or `LBrace` based on the heuristic, and the parser
+dispatches on the token.  This requires the `Expect` state, the
+re-lex mechanism, checkpoint/restore with heredoc stack management,
+and a cross-line raw source slice for the heuristic.
+
+**The planned approach: parse as block, reclassify.**  The recursive
+descent parser is not constrained by LALR(1) token-driven dispatch.
+The key insight is that hash constructor content is always valid as
+block content — a block containing a single expression statement.
+The converse is not true: multi-statement or keyword-bearing content
+cannot be a hash.  This asymmetry enables a simple strategy:
+
+1. The lexer always emits `LBrace` for `{`.  `HashBrace` is deleted.
+
+2. In term position (`$x = {`, `foo({`, after `,`, after `=>`),
+   `parse_term` sees `LBrace` and calls hash constructor parsing
+   directly.  No heuristic needed — context is unambiguous.
+
+3. In block position (`if (...) {`, `sub name {`, `eval {`),
+   `parse_block` is called directly.  Also unambiguous.
+
+4. At statement level — the only ambiguous case — `parse_statement`
+   always calls `parse_block`.  After the block is parsed, the
+   result is inspected:
+
+   - Multiple statements → block.
+   - Any statement terminated by a semicolon → block.
+   - Any non-expression statement (`my`, `if`, `for`, labels, etc.)
+     → block.
+   - A single unterminated expression statement → candidate for
+     reclassification as a hash constructor.
+
+5. Reclassification of single-expression blocks uses token-level
+   heuristics on the parsed AST, which have strictly more information
+   than Perl's byte-level scan:
+
+   - Expression contains a top-level `=>` (fat comma) → hash.
+   - Expression is a comma-list where the first element is a string
+     literal, a q-quote, or a non-lowercase bareword → hash.
+   - Expression is a function call, complex expression, or lowercase
+     bareword followed by arguments → block.
+
+   These rules replicate Perl's behavior for all common cases.  Edge
+   cases where they differ are cases where Perl's byte heuristic was
+   guessing incorrectly and the token-level heuristic can be more
+   accurate.
+
+6. `parse_expr_statement` must track whether a semicolon was consumed,
+   since this is the primary signal distinguishing block from hash
+   content.  The terminated/unterminated distinction is recorded and
+   available to the reclassification logic.
+
+**The `+{...}` idiom.**  Perl programmers force hash constructor
+interpretation with `+{ ... }`, where the unary `+` is a no-op that
+places `{` in term position.  This works automatically in the
+architecture: `+` is a prefix operator, `parse_term` is called for
+its operand, sees `LBrace`, and parses as a hash constructor.  No
+special case needed.
+
+**Bug-for-bug compatibility.**  The reclassification heuristic is
+tuned to match Perl's behavior, not to be theoretically optimal.
+Cases like `{@pairs}` at statement level will be classified as a
+block, matching Perl, even though a human might intend a hash
+constructor.  The `+{@pairs}` workaround applies identically.
+
+This change eliminates `Token::HashBrace`, the `looks_like_hash_content`
+byte-level heuristic, the `skip_ws_bytes` helper, the cross-line raw
+source slice access, and the `{`-related re-lex path — the primary
+source of complexity in the checkpoint/restore mechanism.
+
+### 6.6 Forward-Only Parser Design
+
+**The problem.** The current parser uses speculative lookahead in
+several places: `ensure_current` re-lexes tokens when the `Expect`
+state changes, and helper methods like `is_fat_comma_after_keyword`,
+`is_label_ahead`, `is_named_sub_ahead`, `is_c_style_for`, and
+`try_parse_print_filehandle` use checkpoint/restore to peek at future
+tokens.  This requires saving and restoring the lexer's full state —
+current line position, source cursor, context stack depth, and
+heredoc stack depth.  The interaction between speculative lexing and
+heredoc state is particularly fragile: a speculative lex of `<<TAG`
+calls `start_heredoc` as a side effect, which must be undone on
+restore.
+
+**The target: consume then decide.**  Every speculative lookahead can
+be replaced by consuming the current token and branching on what
+follows.  The parser moves strictly forward.  No checkpoints, no
+restore, no re-lex.
+
+**Replacement for each current speculative lookahead:**
+
+1. **`ensure_current` re-lex (Expect mismatch).**  Eliminated
+   entirely by removing the `Expect` state.  The parser calls
+   explicit lexer methods (`lex_term_token`, `lex_operator_token`)
+   that always produce the correct token for the context.  No token
+   is ever lexed speculatively and discarded.
+
+2. **`is_fat_comma_after_keyword`.**  Currently the parser peeks the
+   keyword, speculatively lexes the next token, checks for `=>`, and
+   restores.  Replacement: consume the keyword in `parse_term`.  If
+   the next token is `FatComma`, autoquote the keyword as a string.
+   This already happens in `parse_term` — the statement-level check
+   in `parse_statement` can simply dispatch keywords through
+   `parse_expr_statement`, and `parse_term` handles the autoquoting.
+
+3. **`is_label_ahead`.**  Currently peeks the `Ident`, speculatively
+   lexes the next token, checks for `:`, and restores.  Replacement:
+   consume the `Ident`.  If the next token is `:`, it is a label —
+   parse the labeled statement.  If not, it is the start of an
+   expression — pass the already-consumed `Ident` into expression
+   parsing as the initial term.  This requires `parse_expr` to
+   accept an optional pre-consumed left-hand side.
+
+4. **`is_named_sub_ahead`.**  Currently peeks `sub`, speculatively
+   lexes the next token, checks for `Ident`, and restores.
+   Replacement: consume `sub`.  If the next token is an identifier,
+   it is a named sub declaration.  If it is `{` or `(`, it is an
+   anonymous sub.  Branch directly.
+
+5. **`try_parse_print_filehandle`.**  Currently peeks the first
+   argument token, speculatively lexes the second, checks whether
+   the combination looks like a filehandle, and restores.
+   Replacement: consume the first token.  If it is a bareword and
+   the next token is not `,`, treat it as a filehandle.  If it is
+   a scalar variable and the next token is a clear term-start
+   (string, variable, paren, keyword), treat it as a filehandle.
+   Otherwise, it is the first argument — pass it into expression
+   parsing as the initial term.
+
+6. **`is_c_style_for`.**  Currently lexes tokens inside `(...)`,
+   scanning for `;` at depth 0, then restores all of them.
+   Replacement: parse the first expression inside `(`.  If it is
+   followed by `;`, this is C-style `for`.  If followed by `)` or
+   `,`, it is list-style.  The first expression is kept — it
+   becomes the initializer (C-style) or the first element of the
+   iteration list.
+
+7. **Prototype re-lex for `(`.**  Currently the lexer re-lexes `(`
+   as a prototype scanner when `Expect` is `Prototype`.  Replacement:
+   after `sub name`, the parser calls `self.lexer.lex_prototype()`
+   explicitly.  The lexer provides a dedicated method rather than
+   using `Expect` to switch modes.
+
+**Common pattern.**  Every replacement follows the same principle:
+consume the token, look at what follows, and branch.  When the
+consumed token turns out to be the first element of an expression
+rather than a special syntactic marker (label, filehandle, keyword),
+it is passed into expression parsing as a pre-consumed initial term.
+This avoids rewinding and re-lexing.
+
+**Lexer API simplification.**  With `Expect` eliminated, the lexer
+exposes a small set of explicit mode methods:
+
+- `lex_term_token()` — lex a token in term position.  `/` starts a
+  regex, `<<` starts a heredoc, `{` returns `LBrace`.
+- `lex_operator_token()` — lex a token in operator position.  `/`
+  is division, `<<` is left shift, `{` returns `LBrace`.
+- `lex_interp_token()` — lex inside an interpolating string/heredoc.
+- `lex_prototype()` — scan a raw prototype string inside `(...)`.
+- `lex_regex()` — scan a regex pattern (if separated from the
+  general quote-like scanning).
+
+The parser calls whichever method is appropriate for its current
+production.  No shared mutable state.  No re-lex.  No checkpoints.
+
+**Implementation order.**  This is a multi-step refactoring:
+
+1. Eliminate `HashBrace` and the brace heuristic (§6.5).  This
+   removes the primary re-lex trigger.
+2. Convert each speculative lookahead to consume-then-decide, one at
+   a time, verifying test compatibility at each step.
+3. Once all lookaheads are removed, delete `Expect`, `ExpectNext`,
+   `LexerCheckpoint`, and the checkpoint/restore machinery.
+4. Split `next_token(expect)` into explicit mode methods.
 
 ---
 
