@@ -1593,7 +1593,7 @@ impl Lexer {
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
         let pattern = self.scan_balanced_string(open, close)?;
-        let flags = self.scan_regex_flags();
+        let flags = self.scan_adjacent_word_chars();
         Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
     }
 
@@ -1601,7 +1601,7 @@ impl Lexer {
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
         let pattern = self.scan_balanced_string(open, close)?;
-        let flags = self.scan_regex_flags();
+        let flags = self.scan_adjacent_word_chars();
         Ok(Token::RegexLit(RegexKind::Qr, pattern, flags))
     }
 
@@ -1617,7 +1617,7 @@ impl Lexer {
         } else {
             self.scan_balanced_string(open, close)?
         };
-        let flags = self.scan_regex_flags();
+        let flags = self.scan_adjacent_word_chars();
         Ok(Token::SubstLit(pattern, replacement, flags))
     }
 
@@ -1631,11 +1631,25 @@ impl Lexer {
         } else {
             self.scan_balanced_string(open, close)?
         };
-        let flags = self.scan_regex_flags();
+        let flags = self.scan_adjacent_word_chars();
         Ok(Token::TranslitLit(from, to, flags))
     }
 
     fn read_quote_delimiters(&mut self) -> Result<(u8, u8), ParseError> {
+        // Match toke.c's scan_str: skip whitespace before the delimiter
+        // only if the current byte IS whitespace (or the line is exhausted).
+        // `m#foo#` uses `#` as the delimiter — it's not a comment.
+        // `m /foo/` skips the space and uses `/`.
+        match self.peek_byte() {
+            Some(b) if b == b' ' || b == b'\t' => {
+                self.skip_ws_and_comments()?;
+            }
+            None => {
+                // End of line — need to cross to next line.
+                self.skip_ws_and_comments()?;
+            }
+            _ => {}
+        }
         let open = self.advance_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))?;
         let close = matching_delimiter(open);
         Ok((open, close))
@@ -1755,7 +1769,7 @@ impl Lexer {
             // Single / in term context: regex.
             self.skip(1); // skip opening /
             let pattern = self.scan_to_delimiter(b'/')?;
-            let flags = self.scan_regex_flags();
+            let flags = self.scan_adjacent_word_chars();
             Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
         } else {
             self.skip(1);
@@ -1768,16 +1782,26 @@ impl Lexer {
         }
     }
 
-    fn scan_regex_flags(&mut self) -> String {
+    /// Consume adjacent ASCII word characters (letters, digits,
+    /// underscore) without skipping whitespace first.  Returns `None`
+    /// if the next byte is not a word character.  Used by the parser
+    /// to collect regex and transliteration flags immediately after a
+    /// closing delimiter.  Perl's flag scanner (`S_pmflag`) consumes
+    /// all word characters and reports errors for invalid ones.
+    pub fn scan_adjacent_word_chars(&mut self) -> Option<String> {
         let start = self.line_pos();
         while let Some(b) = self.peek_byte() {
-            if b.is_ascii_alphabetic() {
+            if b.is_ascii_alphanumeric() || b == b'_' {
                 self.skip(1);
             } else {
                 break;
             }
         }
-        String::from_utf8_lossy(self.line_slice(start)).into_owned()
+        let slice = self.line_slice(start);
+        if slice.is_empty() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(slice).into_owned())
     }
 
     fn lex_dot(&mut self) -> Token {
@@ -2570,62 +2594,62 @@ mod tests {
     #[test]
     fn lex_bare_regex() {
         let tokens = lex_all("/foo/i");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), "i".into()),]);
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), Some("i".into())),]);
     }
 
     #[test]
     fn lex_bare_regex_no_flags() {
         let tokens = lex_all("/hello world/");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "hello world".into(), "".into()),]);
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "hello world".into(), None),]);
     }
 
     #[test]
     fn lex_m_regex() {
         let tokens = lex_all("m{foo}i");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), "i".into()),]);
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), Some("i".into())),]);
     }
 
     #[test]
     fn lex_m_regex_slash() {
         let tokens = lex_all("m/bar/gx");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "bar".into(), "gx".into()),]);
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "bar".into(), Some("gx".into())),]);
     }
 
     #[test]
     fn lex_qr_regex() {
         let tokens = lex_all("qr/\\d+/");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Qr, "\\d+".into(), "".into()),]);
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Qr, "\\d+".into(), None),]);
     }
 
     #[test]
     fn lex_substitution() {
         let tokens = lex_all("s/foo/bar/g");
-        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), "g".into()),]);
+        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), Some("g".into())),]);
     }
 
     #[test]
     fn lex_substitution_braces() {
         let tokens = lex_all("s{foo}{bar}g");
-        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), "g".into()),]);
+        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), Some("g".into())),]);
     }
 
     #[test]
     fn lex_transliteration() {
         let tokens = lex_all("tr/a-z/A-Z/");
-        assert_eq!(tokens, vec![Token::TranslitLit("a-z".into(), "A-Z".into(), "".into()),]);
+        assert_eq!(tokens, vec![Token::TranslitLit("a-z".into(), "A-Z".into(), None),]);
     }
 
     #[test]
     fn lex_y_transliteration() {
         let tokens = lex_all("y/abc/def/");
-        assert_eq!(tokens, vec![Token::TranslitLit("abc".into(), "def".into(), "".into()),]);
+        assert_eq!(tokens, vec![Token::TranslitLit("abc".into(), "def".into(), None),]);
     }
 
     #[test]
     fn lex_regex_in_expression() {
         // After $x =~ the / should be a regex, not division.
         let tokens = lex_all("$x =~ /foo/");
-        assert_eq!(tokens, vec![Token::ScalarVar("x".into()), Token::Binding, Token::RegexLit(RegexKind::Match, "foo".into(), "".into()),]);
+        assert_eq!(tokens, vec![Token::ScalarVar("x".into()), Token::Binding, Token::RegexLit(RegexKind::Match, "foo".into(), None),]);
     }
 
     #[test]
@@ -3269,25 +3293,25 @@ mod tests {
     #[test]
     fn lex_regex_many_flags() {
         let tokens = lex_all("/foo/imsxg");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), "imsxg".into())]);
+        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), Some("imsxg".into()))]);
     }
 
     #[test]
     fn lex_substitution_global() {
         let tokens = lex_all("s/old/new/g");
-        assert_eq!(tokens, vec![Token::SubstLit("old".into(), "new".into(), "g".into())]);
+        assert_eq!(tokens, vec![Token::SubstLit("old".into(), "new".into(), Some("g".into()))]);
     }
 
     #[test]
     fn lex_transliteration_flags() {
         let tokens = lex_all("tr/a-z/A-Z/cs");
-        assert_eq!(tokens, vec![Token::TranslitLit("a-z".into(), "A-Z".into(), "cs".into())]);
+        assert_eq!(tokens, vec![Token::TranslitLit("a-z".into(), "A-Z".into(), Some("cs".into()))]);
     }
 
     #[test]
     fn lex_regex_after_keyword_term() {
         let tokens = lex_all("print /foo/");
-        assert!(tokens.contains(&Token::RegexLit(RegexKind::Match, "foo".into(), "".into())));
+        assert!(tokens.contains(&Token::RegexLit(RegexKind::Match, "foo".into(), None)));
     }
 
     // ── Filetest tokens ───────────────────────────────────────

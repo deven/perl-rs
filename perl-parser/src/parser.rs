@@ -211,6 +211,41 @@ impl Parser {
         self.depth -= 1;
     }
 
+    // ── Flag validation ───────────────────────────────────────
+
+    /// Validate regex modifier flags.  Returns an error for any
+    /// unrecognized modifier character.
+    fn validate_regex_flags(flags: &str, span: Span) -> Result<(), ParseError> {
+        for ch in flags.chars() {
+            if !"msixpgcadlun".contains(ch) {
+                return Err(ParseError::new(format!("Unknown regexp modifier \"/{ch}\""), span));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate substitution modifier flags.  Includes regex flags
+    /// plus `e` (eval replacement) and `r` (non-destructive).
+    fn validate_subst_flags(flags: &str, span: Span) -> Result<(), ParseError> {
+        for ch in flags.chars() {
+            if !"msixpgcadluner".contains(ch) {
+                return Err(ParseError::new(format!("Unknown regexp modifier \"/{ch}\""), span));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate transliteration modifier flags.  Returns an error for
+    /// any unrecognized modifier character.
+    fn validate_tr_flags(flags: &str, span: Span) -> Result<(), ParseError> {
+        for ch in flags.chars() {
+            if !"cdsr".contains(ch) {
+                return Err(ParseError::new(format!("Unknown transliteration modifier \"/{ch}\""), span));
+            }
+        }
+        Ok(())
+    }
+
     // ── Public entry point ────────────────────────────────────
 
     /// Parse a complete program.
@@ -1517,23 +1552,28 @@ impl Parser {
             Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
 
             // Regex, substitution, transliteration
-            Token::RegexLit(_kind, pattern, flags) => Ok(Expr { kind: ExprKind::Regex(pattern, flags), span }),
+            Token::RegexLit(_kind, pattern, flags) => {
+                if let Some(ref f) = flags {
+                    Self::validate_regex_flags(f, span)?;
+                }
+                Ok(Expr { kind: ExprKind::Regex(pattern, flags), span })
+            }
             // // in term position is an empty regex, not defined-or.
-            // The lexer always returns DefinedOr for //; we convert here.
-            // Optional flags follow as an Ident (e.g. //i → DefinedOr + Ident("i")).
+            // The lexer always returns DefinedOr for //; the parser converts
+            // here.  Flags are scanned directly from the lexer position —
+            // they must be adjacent to the // with no whitespace.
             Token::DefinedOr => {
-                let flags = match self.peek() {
-                    Token::Ident(s) if s.chars().all(|c| "msixpgcadlun".contains(c)) => {
-                        let f = s.clone();
-                        self.advance()?;
-                        f
-                    }
-                    _ => String::new(),
-                };
+                let flags = self.lexer.scan_adjacent_word_chars();
+                if let Some(ref f) = flags {
+                    Self::validate_regex_flags(f, span)?;
+                }
                 Ok(Expr { kind: ExprKind::Regex(String::new(), flags), span })
             }
             Token::SubstLit(pattern, replacement, flags) => {
-                let repl = if flags.contains('e') {
+                if let Some(ref f) = flags {
+                    Self::validate_subst_flags(f, span)?;
+                }
+                let repl = if flags.as_ref().is_some_and(|f| f.contains('e')) {
                     // With /e flag, the replacement is Perl code.
                     // Parse it as an expression using a sub-parser.
                     let repl_src = format!("{};", replacement);
@@ -1547,7 +1587,12 @@ impl Parser {
                 };
                 Ok(Expr { kind: ExprKind::Subst(pattern, repl, flags), span })
             }
-            Token::TranslitLit(from, to, flags) => Ok(Expr { kind: ExprKind::Translit(from, to, flags), span }),
+            Token::TranslitLit(from, to, flags) => {
+                if let Some(ref f) = flags {
+                    Self::validate_tr_flags(f, span)?;
+                }
+                Ok(Expr { kind: ExprKind::Translit(from, to, flags), span })
+            }
 
             // Heredoc (body already collected by lexer).
             // Literal heredocs (body collected by lexer as raw string).
@@ -2839,7 +2884,7 @@ mod tests {
         match &e.kind {
             ExprKind::Regex(pat, flags) => {
                 assert_eq!(pat, "foo");
-                assert_eq!(flags, "i");
+                assert_eq!(flags.as_deref(), Some("i"));
             }
             other => panic!("expected Regex, got {other:?}"),
         }
@@ -2864,7 +2909,7 @@ mod tests {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(pat, flags) => {
                     assert_eq!(pat, "");
-                    assert_eq!(flags, "");
+                    assert!(flags.is_none());
                 }
                 other => panic!("expected empty Regex, got {other:?}"),
             },
@@ -2879,7 +2924,7 @@ mod tests {
         match &e.kind {
             ExprKind::Regex(pat, flags) => {
                 assert_eq!(pat, "");
-                assert_eq!(flags, "");
+                assert!(flags.is_none());
             }
             other => panic!("expected empty Regex, got {other:?}"),
         }
@@ -2893,7 +2938,7 @@ mod tests {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(pat, flags) => {
                     assert_eq!(pat, "");
-                    assert_eq!(flags, "gi");
+                    assert_eq!(flags.as_deref(), Some("gi"));
                 }
                 other => panic!("expected empty Regex with flags, got {other:?}"),
             },
@@ -2908,7 +2953,7 @@ mod tests {
         match &e.kind {
             ExprKind::Regex(pat, flags) => {
                 assert_eq!(pat, "");
-                assert_eq!(flags, "gi");
+                assert_eq!(flags.as_deref(), Some("gi"));
             }
             other => panic!("expected empty Regex with flags, got {other:?}"),
         }
@@ -2942,10 +2987,57 @@ mod tests {
     }
 
     #[test]
+    fn parse_empty_regex_space_not_flags() {
+        // // gi — space separates, so gi is NOT flags.
+        // This produces an empty regex with no flags.
+        let e = parse_expr_str("$x =~ //gi;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
+                ExprKind::Regex(pat, flags) => {
+                    assert_eq!(pat, "");
+                    assert_eq!(flags.as_deref(), Some("gi"));
+                }
+                other => panic!("expected Regex, got {other:?}"),
+            },
+            other => panic!("expected Binding, got {other:?}"),
+        }
+        // But with space: flags are NOT consumed.
+        let e2 = parse_expr_str("$x =~ // gi;");
+        match &e2.kind {
+            ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
+                ExprKind::Regex(pat, flags) => {
+                    assert_eq!(pat, "");
+                    assert!(flags.is_none());
+                }
+                other => panic!("expected Regex with empty flags, got {other:?}"),
+            },
+            other => panic!("expected Binding, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_empty_regex_in_ternary() {
         // $x = // ? 1 : 0 — empty regex match, then ternary.
         let e = parse_expr_str("$x = // ? 1 : 0;");
         assert!(matches!(e.kind, ExprKind::Assign(_, _, _)));
+    }
+
+    #[test]
+    fn parse_regex_invalid_flag() {
+        // /foo/q — invalid flag 'q' should produce an error.
+        let mut parser = Parser::new(b"/foo/q;").unwrap();
+        let result = parser.parse_program();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Unknown regexp modifier"));
+    }
+
+    #[test]
+    fn parse_tr_invalid_flag() {
+        // tr/a/b/q — invalid flag 'q' should produce an error.
+        let mut parser = Parser::new(b"tr/a/b/q;").unwrap();
+        let result = parser.parse_program();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Unknown transliteration modifier"));
     }
 
     // ── prefers_defined_or: UNIDOR operators ────────────────
@@ -3023,7 +3115,7 @@ mod tests {
         match &e.kind {
             ExprKind::Subst(pat, _, flags) => {
                 assert_eq!(pat, "foo");
-                assert_eq!(flags, "g");
+                assert_eq!(flags.as_deref(), Some("g"));
             }
             other => panic!("expected Subst, got {other:?}"),
         }
@@ -5334,7 +5426,7 @@ mod tests {
         match &e.kind {
             ExprKind::Regex(pat, flags) => {
                 assert_eq!(pat, "foo");
-                assert_eq!(flags, "imsxg");
+                assert_eq!(flags.as_deref(), Some("imsxg"));
             }
             other => panic!("expected Regex with flags, got {other:?}"),
         }
@@ -5353,7 +5445,7 @@ mod tests {
     fn parse_tr_with_flags() {
         let e = parse_expr_str("tr/a-z/A-Z/cs;");
         match &e.kind {
-            ExprKind::Translit(_, _, flags) => assert_eq!(flags, "cs"),
+            ExprKind::Translit(_, _, flags) => assert_eq!(flags.as_deref(), Some("cs")),
             other => panic!("expected Translit with flags, got {other:?}"),
         }
     }
@@ -5417,6 +5509,19 @@ mod tests {
             ExprKind::List(items) => match &items[0].kind {
                 ExprKind::StringLit(s) => assert_eq!(s, "if"),
                 other => panic!("expected StringLit('if'), got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_fat_comma_keyword_cross_line() {
+        // Keyword on one line, => on the next — should still autoquote.
+        let e = parse_expr_str("my\n  => 1;");
+        match &e.kind {
+            ExprKind::List(items) => match &items[0].kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "my"),
+                other => panic!("expected StringLit('my'), got {other:?}"),
             },
             other => panic!("expected List, got {other:?}"),
         }
