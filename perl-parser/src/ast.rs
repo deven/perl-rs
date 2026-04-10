@@ -111,7 +111,7 @@ pub enum ExprKind {
     QwList(Vec<String>),
     Undef,
     /// Regex literal: `m/.../flags` or `/.../flags`.
-    Regex(String, String),
+    Regex(String, Option<String>),
 
     // ── Variables ─────────────────────────────────────────────
     ScalarVar(String),
@@ -201,9 +201,9 @@ pub enum ExprKind {
 
     // ── Regex operations ──────────────────────────────────────
     /// `s/pattern/replacement/flags`.
-    Subst(String, SubstReplacement, String),
+    Subst(String, SubstReplacement, Option<String>),
     /// `tr/from/to/flags` or `y/from/to/flags`.
-    Translit(String, String, String),
+    Translit(String, String, Option<String>),
 
     // ── Control flow expressions ──────────────────────────────
     /// Postfix `if`/`unless`/`while`/`until`/`for`/`foreach`.

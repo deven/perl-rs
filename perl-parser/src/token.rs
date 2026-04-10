@@ -386,11 +386,11 @@ pub enum Token {
 
     // ── Compound regex tokens (bootstrap, pre-interpolation) ──
     /// Complete regex: `/pattern/flags`, `m/pattern/flags`, `qr/pattern/flags`.
-    RegexLit(RegexKind, String, String),
+    RegexLit(RegexKind, String, Option<String>),
     /// Complete substitution: `s/pattern/replacement/flags`.
-    SubstLit(String, String, String),
+    SubstLit(String, String, Option<String>),
     /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
-    TranslitLit(String, String, String),
+    TranslitLit(String, String, Option<String>),
 
     // ── Heredoc ───────────────────────────────────────────────
     /// `<<TAG`, `<<"TAG"`, `<<'TAG'`.
