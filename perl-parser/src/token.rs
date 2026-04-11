@@ -337,12 +337,7 @@ pub enum Token {
     LeftBracket,  // [
     RightBracket, // ]
     LeftBrace,    // { (block, hash subscript)
-    /// `{` that opens an anonymous hash constructor.
-    /// Distinct from `LeftBrace` (which opens blocks and subscripts).
-    /// The lexer decides which to emit, matching toke.c's
-    /// `PERLY_BRACE_OPEN` vs `HASHBRACK` distinction.
-    HashBrace,
-    RightBrace, // }
+    RightBrace,   // }
 
     // ── Punctuation ───────────────────────────────────────────
     Semi,     // ;
@@ -483,7 +478,6 @@ impl Token {
                 | Token::LeftParen
                 | Token::LeftBracket
                 | Token::LeftBrace
-                | Token::HashBrace
                 | Token::Minus
                 | Token::Plus
                 | Token::Bang
@@ -530,7 +524,6 @@ impl std::fmt::Display for Token {
             Token::LeftParen => write!(f, "("),
             Token::RightParen => write!(f, ")"),
             Token::LeftBrace => write!(f, "{{"),
-            Token::HashBrace => write!(f, "{{"),
             Token::RightBrace => write!(f, "}}"),
             Token::Prototype(s) => write!(f, "({})", s),
             Token::LeftBracket => write!(f, "["),

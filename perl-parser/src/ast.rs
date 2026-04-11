@@ -18,6 +18,10 @@ pub struct Program {
 pub struct Statement {
     pub kind: StmtKind,
     pub span: Span,
+    /// Whether the statement was followed by a semicolon.
+    /// Used to distinguish `{ expr }` (hash constructor candidate)
+    /// from `{ expr; }` (block) at statement level.
+    pub terminated: bool,
 }
 
 #[derive(Clone, Debug)]
