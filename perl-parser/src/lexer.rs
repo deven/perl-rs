@@ -453,7 +453,7 @@ impl Lexer {
                 if *expect == Expect::Prototype {
                     // Prototype scanning: read raw bytes until matching ).
                     // Matches toke.c's scan_str() call in yyl_sub().
-                    let content = self.scan_balanced_string(b'(', b')')?;
+                    let content = self.scan_body(b'(', b')', false)?;
                     Token::Prototype(content)
                 } else {
                     Token::LeftParen
@@ -1082,25 +1082,7 @@ impl Lexer {
 
     fn lex_single_quoted_string(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip opening '
-        let mut s = String::new();
-        loop {
-            match self.advance_byte_in_string(&mut s)? {
-                None => return Err(ParseError::new("unterminated string", Span::new(self.span_pos(), self.span_pos()))),
-                Some(b'\\') => match self.peek_byte() {
-                    Some(b'\\') => {
-                        self.skip(1);
-                        s.push('\\');
-                    }
-                    Some(b'\'') => {
-                        self.skip(1);
-                        s.push('\'');
-                    }
-                    _ => s.push('\\'),
-                },
-                Some(b'\'') => break,
-                Some(b) => s.push(b as char),
-            }
-        }
+        let s = self.scan_body(b'\'', b'\'', true)?;
         Ok(Token::StrLit(s))
     }
 
@@ -1385,7 +1367,7 @@ impl Lexer {
 
     fn lex_q_string(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
-        let s = self.scan_balanced_string(open, close)?;
+        let s = self.scan_body(open, close, true)?;
         Ok(Token::StrLit(s))
     }
 
@@ -1405,7 +1387,7 @@ impl Lexer {
 
     fn lex_qw(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
-        let body = self.scan_balanced_string(open, close)?;
+        let body = self.scan_body(open, close, false)?;
         let words: Vec<String> = body.split_whitespace().map(String::from).collect();
         Ok(Token::QwList(words))
     }
@@ -1415,7 +1397,7 @@ impl Lexer {
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
-        let pattern = self.scan_balanced_string(open, close)?;
+        let pattern = self.scan_body(open, close, false)?;
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
     }
@@ -1423,7 +1405,7 @@ impl Lexer {
     /// `qr/pattern/flags` or `qr{pattern}flags`
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
-        let pattern = self.scan_balanced_string(open, close)?;
+        let pattern = self.scan_body(open, close, false)?;
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::RegexLit(RegexKind::Qr, pattern, flags))
     }
@@ -1431,14 +1413,14 @@ impl Lexer {
     /// `s/pattern/replacement/flags` or `s{pattern}{replacement}flags`
     fn lex_s(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
-        let pattern = self.scan_balanced_string(open, close)?;
+        let pattern = self.scan_body(open, close, false)?;
         // For paired delimiters like s{pat}{repl}, read a new pair.
         // For same-char delimiters like s/pat/repl/, reuse the same delimiter.
         let replacement = if open != close {
             let (_open2, close2) = self.read_quote_delimiters()?;
-            self.scan_balanced_string(_open2, close2)?
+            self.scan_body(_open2, close2, false)?
         } else {
-            self.scan_balanced_string(open, close)?
+            self.scan_body(open, close, false)?
         };
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::SubstLit(pattern, replacement, flags))
@@ -1447,12 +1429,12 @@ impl Lexer {
     /// `tr/from/to/flags` or `y/from/to/flags`
     fn lex_tr(&mut self) -> Result<Token, ParseError> {
         let (open, close) = self.read_quote_delimiters()?;
-        let from = self.scan_balanced_string(open, close)?;
+        let from = self.scan_body(open, close, false)?;
         let to = if open != close {
             let (_open2, close2) = self.read_quote_delimiters()?;
-            self.scan_balanced_string(_open2, close2)?
+            self.scan_body(_open2, close2, false)?
         } else {
-            self.scan_balanced_string(open, close)?
+            self.scan_body(open, close, false)?
         };
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::TranslitLit(from, to, flags))
@@ -1478,23 +1460,59 @@ impl Lexer {
         Ok((open, close))
     }
 
-    fn scan_balanced_string(&mut self, open: u8, close: u8) -> Result<String, ParseError> {
+    /// Scan a delimited body, consuming bytes until the closing
+    /// delimiter is found.  Handles paired delimiter nesting for
+    /// `()`, `[]`, `{}`, `<>`.
+    ///
+    /// `open` and `close` are the delimiter bytes (equal for
+    /// non-paired delimiters like `/`).
+    ///
+    /// `literal` controls escape handling:
+    /// - `true` (q//, '...'): `\\` → `\`, `\close` → close char.
+    ///   Matches Perl's single-quote escape semantics.
+    /// - `false` (regex, tr//, raw bootstrap): `\close` and `\open`
+    ///   consume the backslash (delimiter not treated as terminator),
+    ///   everything else passes through raw including `\\`.
+    fn scan_body(&mut self, open: u8, close: u8, literal: bool) -> Result<String, ParseError> {
         let mut s = String::new();
         let mut depth = 1u32;
-        let paired = open != close; // e.g. {}, [], (), <>
+        let paired = open != close;
 
         loop {
             match self.advance_byte_in_string(&mut s)? {
                 None => return Err(ParseError::new("unterminated string", Span::new(self.span_pos(), self.span_pos()))),
                 Some(b'\\') => {
-                    if let Some(next) = self.peek_byte() {
-                        if next == close || next == open {
-                            self.skip(1);
-                            s.push(next as char);
-                            continue;
+                    if literal {
+                        // Single-quote escapes: only \\ and \close
+                        // (and \open for paired delimiters) are special.
+                        match self.peek_byte() {
+                            Some(b'\\') => {
+                                self.skip(1);
+                                s.push('\\');
+                            }
+                            Some(b) if b == close => {
+                                self.skip(1);
+                                s.push(close as char);
+                            }
+                            Some(b) if paired && b == open => {
+                                self.skip(1);
+                                s.push(open as char);
+                            }
+                            _ => s.push('\\'),
                         }
+                    } else {
+                        // Raw escapes: \close and \open prevent
+                        // delimiter matching.  Everything else
+                        // passes through including the backslash.
+                        if let Some(next) = self.peek_byte() {
+                            if next == close || (paired && next == open) {
+                                self.skip(1);
+                                s.push(next as char);
+                                continue;
+                            }
+                        }
+                        s.push('\\');
                     }
-                    s.push('\\');
                 }
                 Some(b) if b == close => {
                     depth -= 1;
