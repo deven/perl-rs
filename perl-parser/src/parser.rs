@@ -324,9 +324,18 @@ impl Parser {
             Token::Keyword(Keyword::Local) => self.parse_expr_statement()?,
             Token::Keyword(Keyword::State) => (self.parse_state_decl()?, false),
             Token::Keyword(Keyword::Sub) => {
-                // Named sub declaration if an identifier follows.
-                // Otherwise fall through to expression (anonymous sub).
-                if self.is_named_sub_ahead() { (self.parse_sub_decl()?, false) } else { self.parse_expr_statement()? }
+                let sub_span = self.peek_span();
+                self.advance()?; // consume 'sub'
+                if matches!(self.peek(), Token::Ident(_)) {
+                    // Named sub declaration.
+                    (self.parse_sub_decl_body(sub_span)?, false)
+                } else {
+                    // Anonymous sub as expression statement.
+                    let expr = self.parse_anon_sub(sub_span)?;
+                    let kind = self.maybe_postfix_control(expr)?;
+                    let terminated = self.eat(&Token::Semi)?;
+                    (kind, terminated)
+                }
             }
             Token::Keyword(Keyword::If) => (self.parse_if_stmt()?, false),
             Token::Keyword(Keyword::Unless) => (self.parse_unless_stmt()?, false),
@@ -392,12 +401,27 @@ impl Parser {
                 }
             }
 
-            // Check for label: IDENT followed by ':'
+            // Identifier: could be a label (IDENT:) or start of expression.
             Token::Ident(_) => {
-                if self.is_label_ahead() {
-                    (self.parse_labeled_stmt()?, false)
+                let ident_span = self.peek_span();
+                let name = match self.advance()?.token {
+                    Token::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                if matches!(self.peek(), Token::Colon) {
+                    // Label: consume ':' and parse the labeled statement.
+                    self.advance()?;
+                    let stmt = self.parse_statement()?;
+                    (StmtKind::Labeled(name, Box::new(stmt)), false)
                 } else {
-                    self.parse_expr_statement()?
+                    // Expression starting with an identifier.
+                    self.descend()?;
+                    let initial = self.parse_ident_term(name, ident_span)?;
+                    let expr = self.parse_expr_continuation(initial, PREC_LOW)?;
+                    self.ascend();
+                    let kind = self.maybe_postfix_control(expr)?;
+                    let terminated = self.eat(&Token::Semi)?;
+                    (kind, terminated)
                 }
             }
 
@@ -513,9 +537,9 @@ impl Parser {
 
     // ── Sub declaration ───────────────────────────────────────
 
-    fn parse_sub_decl(&mut self) -> Result<StmtKind, ParseError> {
-        let start = self.peek_span();
-        self.advance()?; // eat 'sub'
+    /// Parse the body of a named sub declaration after `sub` has
+    /// already been consumed.  `start` is the span of the `sub` keyword.
+    fn parse_sub_decl_body(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.advance()?.token {
             Token::Ident(name) => name,
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
@@ -1037,40 +1061,6 @@ impl Parser {
 
     // ── Labels ────────────────────────────────────────────────
 
-    /// Check if we're looking at `IDENT :` (a label).
-    fn is_label_ahead(&mut self) -> bool {
-        let cp = self.lexer.checkpoint();
-        let saved_expect = self.expect;
-        let saved_current = self.current.take();
-
-        // Lexer is already past the Ident (it was cached).
-        // Lex the next token and check if it's a colon.
-        self.ensure_current();
-        let is_colon = matches!(self.peek(), Token::Colon);
-
-        self.current = saved_current;
-        self.expect = saved_expect;
-        self.lexer.restore(cp);
-        is_colon
-    }
-
-    /// Check if `sub` is followed by an identifier (named sub decl).
-    fn is_named_sub_ahead(&mut self) -> bool {
-        let cp = self.lexer.checkpoint();
-        let saved_expect = self.expect;
-        let saved_current = self.current.take();
-
-        // Lexer is already past `sub` (it was cached).
-        // Lex the next token and check if it's an identifier.
-        self.ensure_current();
-        let is_ident = matches!(self.peek(), Token::Ident(_));
-
-        self.current = saved_current;
-        self.expect = saved_expect;
-        self.lexer.restore(cp);
-        is_ident
-    }
-
     /// Speculative lookahead: is the token after the current keyword a fat comma?
     /// Used to detect `if => 1` (autoquoting) vs `if ($cond) { ... }`.
     fn is_fat_comma_after_keyword(&mut self) -> bool {
@@ -1085,19 +1075,6 @@ impl Parser {
         self.expect = saved_expect;
         self.lexer.restore(cp);
         is_fat_comma
-    }
-
-    /// Determine if `{` at statement level starts an anon hash or a block.
-    /// The lexer has already advanced past `{` (it's the cached current token),
-    /// so `lexer.remaining()` gives us the bytes after `{`.
-    fn parse_labeled_stmt(&mut self) -> Result<StmtKind, ParseError> {
-        let label = match self.advance()?.token {
-            Token::Ident(name) => name,
-            _ => unreachable!(),
-        };
-        self.expect_token(&Token::Colon)?; // eat ':'
-        let stmt = self.parse_statement()?;
-        Ok(StmtKind::Labeled(label, Box::new(stmt)))
     }
 
     // ── Expression statements ─────────────────────────────────
@@ -1269,8 +1246,16 @@ impl Parser {
         self.descend()?;
         self.expect = Expect::Term;
 
-        let mut left = self.parse_term()?;
+        let left = self.parse_term()?;
+        let result = self.parse_expr_continuation(left, min_prec)?;
 
+        self.ascend();
+        Ok(result)
+    }
+
+    /// Continue parsing an expression from a pre-built left-hand side.
+    /// Runs the Pratt operator loop without calling parse_term first.
+    fn parse_expr_continuation(&mut self, mut left: Expr, min_prec: Precedence) -> Result<Expr, ParseError> {
         // After a term, expect an operator
         self.expect = Expect::Operator;
 
@@ -1282,7 +1267,6 @@ impl Parser {
             self.expect = Expect::Operator;
         }
 
-        self.ascend();
         Ok(left)
     }
 
@@ -1479,23 +1463,15 @@ impl Parser {
                 // -bareword (not followed by parens) → StringLit("-bareword")
                 // Perl: unary minus on an identifier always returns "-identifier".
                 if let Token::Ident(name) = self.peek().clone() {
-                    let cp = self.lexer.checkpoint();
-                    let saved_expect = self.expect;
-                    let saved_current = self.current.take();
-
-                    // Peek past the Ident to check what follows.
-                    self.ensure_current();
-                    let next_is_paren = matches!(self.peek(), Token::LeftParen);
-
-                    self.current = saved_current;
-                    self.expect = saved_expect;
-                    self.lexer.restore(cp);
-
-                    if !next_is_paren {
-                        let end = self.peek_span();
-                        self.advance()?; // eat the ident
-                        return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(end) });
+                    let ident_span = self.peek_span();
+                    self.advance()?; // consume the ident
+                    if matches!(self.peek(), Token::LeftParen) {
+                        // -func(...) → unary minus on function call.
+                        let func = self.parse_ident_term(name, ident_span)?;
+                        return Ok(Expr { span: span.merge(func.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(func)) });
                     }
+                    // -bareword → StringLit("-bareword")
+                    return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(ident_span) });
                 }
                 self.expect = Expect::Term;
                 let operand = self.parse_expr(PREC_UNARY)?;
