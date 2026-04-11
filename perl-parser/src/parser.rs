@@ -281,7 +281,7 @@ impl Parser {
 
         // Empty statement
         if self.eat(&Token::Semi)? {
-            return Ok(Statement { kind: StmtKind::Empty, span: start });
+            return Ok(Statement { kind: StmtKind::Empty, span: start, terminated: true });
         }
 
         // __END__ / __DATA__ / ^D / ^Z — stop parsing immediately
@@ -306,86 +306,96 @@ impl Parser {
             };
             // Skip all remaining source — everything after is not code.
             self.lexer.skip_to_end();
-            return Ok(Statement { kind: StmtKind::DataEnd(marker, data_offset), span: start.merge(self.peek_span()) });
+            return Ok(Statement { kind: StmtKind::DataEnd(marker, data_offset), span: start.merge(self.peek_span()), terminated: false });
         }
 
         // Fat comma autoquotes keywords at statement level too:
         // `if => 1` should not trigger the if-statement parser.
         if let Token::Keyword(_) = self.peek() {
             if self.is_fat_comma_after_keyword() {
-                let kind = self.parse_expr_statement()?;
-                return Ok(Statement { kind, span: start.merge(self.peek_span()) });
+                let (kind, terminated) = self.parse_expr_statement()?;
+                return Ok(Statement { kind, span: start.merge(self.peek_span()), terminated });
             }
         }
 
-        let kind = match self.peek().clone() {
-            Token::Keyword(Keyword::My) => self.parse_my_decl()?,
-            Token::Keyword(Keyword::Our) => self.parse_our_decl()?,
+        let (kind, terminated) = match self.peek().clone() {
+            Token::Keyword(Keyword::My) => (self.parse_my_decl()?, false),
+            Token::Keyword(Keyword::Our) => (self.parse_our_decl()?, false),
             Token::Keyword(Keyword::Local) => self.parse_expr_statement()?,
-            Token::Keyword(Keyword::State) => self.parse_state_decl()?,
+            Token::Keyword(Keyword::State) => (self.parse_state_decl()?, false),
             Token::Keyword(Keyword::Sub) => {
                 // Named sub declaration if an identifier follows.
                 // Otherwise fall through to expression (anonymous sub).
-                if self.is_named_sub_ahead() { self.parse_sub_decl()? } else { self.parse_expr_statement()? }
+                if self.is_named_sub_ahead() { (self.parse_sub_decl()?, false) } else { self.parse_expr_statement()? }
             }
-            Token::Keyword(Keyword::If) => self.parse_if_stmt()?,
-            Token::Keyword(Keyword::Unless) => self.parse_unless_stmt()?,
-            Token::Keyword(Keyword::While) => self.parse_while_stmt()?,
-            Token::Keyword(Keyword::Until) => self.parse_until_stmt()?,
-            Token::Keyword(Keyword::For) | Token::Keyword(Keyword::Foreach) => self.parse_for_stmt()?,
-            Token::Keyword(Keyword::Package) => self.parse_package_decl()?,
-            Token::Keyword(Keyword::Use) | Token::Keyword(Keyword::No) => self.parse_use_decl()?,
+            Token::Keyword(Keyword::If) => (self.parse_if_stmt()?, false),
+            Token::Keyword(Keyword::Unless) => (self.parse_unless_stmt()?, false),
+            Token::Keyword(Keyword::While) => (self.parse_while_stmt()?, false),
+            Token::Keyword(Keyword::Until) => (self.parse_until_stmt()?, false),
+            Token::Keyword(Keyword::For) | Token::Keyword(Keyword::Foreach) => (self.parse_for_stmt()?, false),
+            Token::Keyword(Keyword::Package) => (self.parse_package_decl()?, false),
+            Token::Keyword(Keyword::Use) | Token::Keyword(Keyword::No) => (self.parse_use_decl()?, false),
 
             // Phaser blocks
-            Token::Keyword(Keyword::BEGIN) => self.parse_phaser(PhaserKind::Begin)?,
-            Token::Keyword(Keyword::END) => self.parse_phaser(PhaserKind::End)?,
-            Token::Keyword(Keyword::INIT) => self.parse_phaser(PhaserKind::Init)?,
-            Token::Keyword(Keyword::CHECK) => self.parse_phaser(PhaserKind::Check)?,
-            Token::Keyword(Keyword::UNITCHECK) => self.parse_phaser(PhaserKind::Unitcheck)?,
+            Token::Keyword(Keyword::BEGIN) => (self.parse_phaser(PhaserKind::Begin)?, false),
+            Token::Keyword(Keyword::END) => (self.parse_phaser(PhaserKind::End)?, false),
+            Token::Keyword(Keyword::INIT) => (self.parse_phaser(PhaserKind::Init)?, false),
+            Token::Keyword(Keyword::CHECK) => (self.parse_phaser(PhaserKind::Check)?, false),
+            Token::Keyword(Keyword::UNITCHECK) => (self.parse_phaser(PhaserKind::Unitcheck)?, false),
 
             // given/when/default
-            Token::Keyword(Keyword::Given) => self.parse_given()?,
-            Token::Keyword(Keyword::When) => self.parse_when()?,
+            Token::Keyword(Keyword::Given) => (self.parse_given()?, false),
+            Token::Keyword(Keyword::When) => (self.parse_when()?, false),
             Token::Keyword(Keyword::Default) => {
                 self.advance()?;
                 self.expect = Expect::Block(ExpectNext::Statement);
                 let block = self.parse_block()?;
-                StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: start }, block)
+                (StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: start }, block), false)
             }
 
             // try/catch/finally/defer
-            Token::Keyword(Keyword::Try) => self.parse_try()?,
+            Token::Keyword(Keyword::Try) => (self.parse_try()?, false),
             Token::Keyword(Keyword::Defer) => {
                 self.advance()?;
                 self.expect = Expect::Block(ExpectNext::Statement);
                 let block = self.parse_block()?;
-                StmtKind::Defer(block)
+                (StmtKind::Defer(block), false)
             }
 
             // format NAME = ... .
-            Token::Keyword(Keyword::Format) => self.parse_format()?,
+            Token::Keyword(Keyword::Format) => (self.parse_format()?, false),
 
             // class Name :attrs { ... }
-            Token::Keyword(Keyword::Class) => self.parse_class()?,
+            Token::Keyword(Keyword::Class) => (self.parse_class()?, false),
 
             // field $var :attrs = default;
-            Token::Keyword(Keyword::Field) => self.parse_field()?,
+            Token::Keyword(Keyword::Field) => (self.parse_field()?, false),
 
             // method name(params) { ... }
-            Token::Keyword(Keyword::Method) => self.parse_method()?,
+            Token::Keyword(Keyword::Method) => (self.parse_method()?, false),
 
-            // The lexer already decided: LeftBrace = block, HashBrace = hash.
+            // `{` at statement level — parse as block, then check if it
+            // should be reclassified as a hash constructor.
             Token::LeftBrace => {
                 self.expect = Expect::Block(ExpectNext::Statement);
                 let block = self.parse_block()?;
-                StmtKind::Block(block)
+                match Self::try_reclassify_as_hash(block) {
+                    Ok(hash_expr) => {
+                        // Reclassified as hash constructor.  Continue as
+                        // an expression statement: check for postfix
+                        // control flow and optional semicolon.
+                        let kind = self.maybe_postfix_control(hash_expr)?;
+                        let terminated = self.eat(&Token::Semi)?;
+                        (kind, terminated)
+                    }
+                    Err(block) => (StmtKind::Block(block), false),
+                }
             }
-            Token::HashBrace => self.parse_expr_statement()?,
 
             // Check for label: IDENT followed by ':'
             Token::Ident(_) => {
                 if self.is_label_ahead() {
-                    self.parse_labeled_stmt()?
+                    (self.parse_labeled_stmt()?, false)
                 } else {
                     self.parse_expr_statement()?
                 }
@@ -395,7 +405,7 @@ impl Parser {
         };
 
         let end = self.peek_span();
-        Ok(Statement { kind, span: start.merge(end) })
+        Ok(Statement { kind, span: start.merge(end), terminated })
     }
 
     fn maybe_postfix_control(&mut self, expr: Expr) -> Result<StmtKind, ParseError> {
@@ -1092,15 +1102,127 @@ impl Parser {
 
     // ── Expression statements ─────────────────────────────────
 
-    fn parse_expr_statement(&mut self) -> Result<StmtKind, ParseError> {
+    fn parse_expr_statement(&mut self) -> Result<(StmtKind, bool), ParseError> {
         self.expect = Expect::Term;
         let expr = self.parse_expr(PREC_LOW)?;
 
         // Check for postfix control flow
         let kind = self.maybe_postfix_control(expr)?;
 
-        self.eat(&Token::Semi)?;
-        Ok(kind)
+        let terminated = self.eat(&Token::Semi)?;
+        Ok((kind, terminated))
+    }
+
+    // ── Block-to-hash reclassification ─────────────────────────
+
+    /// Inspect a block parsed at statement level and determine if it
+    /// should be reclassified as an anonymous hash constructor.
+    ///
+    /// Returns `Ok(expr)` with an `AnonHash` expression if the block
+    /// looks like a hash constructor, or `Err(block)` to keep it as
+    /// a block.
+    ///
+    /// A block is reclassified as a hash constructor when:
+    /// - It contains exactly one statement.
+    /// - That statement is a plain expression (not `my`, `if`, etc.).
+    /// - The expression was NOT terminated by a semicolon.
+    /// - The expression contains a top-level fat comma (`=>`), OR
+    ///   the expression is a comma-list whose first element is a
+    ///   string literal, non-lowercase bareword, or other non-function
+    ///   term.
+    ///
+    /// This matches Perl's behavior for common cases while being
+    /// strictly more accurate than the byte-level heuristic it
+    /// replaces, because it operates on parsed AST nodes rather
+    /// than raw bytes.
+    fn try_reclassify_as_hash(block: Block) -> Result<Expr, Block> {
+        // Empty block → empty hash (matching Perl's toke.c line 6368).
+        if block.statements.is_empty() {
+            return Ok(Expr { kind: ExprKind::AnonHash(Vec::new()), span: block.span });
+        }
+
+        // Multiple statements → definitely a block.
+        if block.statements.len() != 1 {
+            return Err(block);
+        }
+
+        let stmt = &block.statements[0];
+
+        // Terminated by semicolon → block.
+        if stmt.terminated {
+            return Err(block);
+        }
+
+        // Not an expression statement → block.
+        let expr = match &stmt.kind {
+            StmtKind::Expr(e) => e,
+            _ => return Err(block),
+        };
+
+        // Check if the expression looks like hash content.
+        if Self::looks_like_hash_expr(expr) {
+            // Destructure to take ownership.
+            let span = block.span;
+            let mut stmts = block.statements;
+            let stmt = stmts.remove(0);
+            let expr = match stmt.kind {
+                StmtKind::Expr(e) => e,
+                _ => unreachable!(),
+            };
+            // Flatten List into individual AnonHash elements to
+            // match the structure produced by parse_term for hash
+            // constructors in term position.
+            let elems = match expr.kind {
+                ExprKind::List(items) => items,
+                _ => vec![expr],
+            };
+            Ok(Expr { kind: ExprKind::AnonHash(elems), span })
+        } else {
+            Err(block)
+        }
+    }
+
+    /// Check whether an expression looks like hash constructor
+    /// content rather than a block body.
+    ///
+    /// Matches Perl's byte-level heuristic at the AST level:
+    /// - A comma-list whose first element is a string literal,
+    ///   numeric literal, variable, or non-lowercase bareword is
+    ///   hash-like (Perl: non-lowercase first byte + comma → hash).
+    /// - A comma-list whose first element is a lowercase bareword
+    ///   or function call is block-like (`func arg, arg`).
+    /// - A non-list expression (no commas) is block-like.
+    ///
+    /// Fat comma (`=>`) autoquotes barewords to StringLit before we
+    /// see them, so `key => val` appears as `List([StringLit, val])`.
+    fn looks_like_hash_expr(expr: &Expr) -> bool {
+        match &expr.kind {
+            // A comma-list: check the first element.
+            ExprKind::List(items) => {
+                match items.first().map(|e| &e.kind) {
+                    // String literal — covers autoquoted barewords from
+                    // fat comma, explicit strings, q//.
+                    Some(ExprKind::StringLit(_)) => true,
+                    // Numeric literals.
+                    Some(ExprKind::IntLit(_)) => true,
+                    Some(ExprKind::FloatLit(_)) => true,
+                    // Variables — `$x => 1` or `$x, 1`.  Perl's
+                    // heuristic: `$` is not lowercase → hash.
+                    Some(ExprKind::ScalarVar(_)) => true,
+                    Some(ExprKind::ArrayVar(_)) => true,
+                    Some(ExprKind::HashVar(_)) => true,
+                    // Unary prefix on a variable — `-$x => 1`.
+                    Some(ExprKind::UnaryOp(_, _)) => true,
+                    // Non-lowercase bareword — `Foo, 1`.
+                    Some(ExprKind::Bareword(name)) => name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_'),
+                    // Lowercase bareword looks like `func arg, arg`.
+                    // Anything else (function calls, complex exprs) → block.
+                    _ => false,
+                }
+            }
+            // No commas at all — not hash-like.
+            _ => false,
+        }
     }
 
     // ── Block parsing ─────────────────────────────────────────
@@ -1531,11 +1653,9 @@ impl Parser {
                 Ok(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) })
             }
 
-            // Anonymous hash ref or block — depends on context
             // Anonymous hash constructor: {key => val, ...}
-            // The lexer emits HashBrace for anon hashes (matching toke.c HASHBRACK).
-            // LeftBrace is kept as a fallback for robustness.
-            Token::HashBrace | Token::LeftBrace => {
+            // In term position, `{` is always a hash constructor.
+            Token::LeftBrace => {
                 self.expect = Expect::Term;
                 let mut elems = Vec::new();
                 while !self.at(&Token::RightBrace)? && !self.at_eof()? {
@@ -2112,8 +2232,7 @@ impl Parser {
     fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         // Handle chained subscripts: $x[0][1], $x{a}{b}, $x[0]{key}
         loop {
-            // After a term, we're in operator position — ensures {
-            // is lexed as LeftBrace (subscript), not HashBrace.
+            // After a term, we're in operator position.
             self.expect = Expect::Operator;
             if self.at(&Token::LeftBracket)? {
                 self.advance()?;
