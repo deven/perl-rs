@@ -411,3 +411,39 @@ pub fn is_block_list_op(kw: Keyword) -> bool {
 pub fn is_print_op(kw: Keyword) -> bool {
     matches!(kw, Keyword::Print | Keyword::Say | Keyword::Printf)
 }
+
+/// Keywords that have dedicated statement-level handlers in the parser.
+/// These are consumed before dispatching, so they need the fat comma
+/// check at the statement level rather than in parse_term.
+pub fn is_statement_keyword(kw: Keyword) -> bool {
+    matches!(
+        kw,
+        Keyword::My
+            | Keyword::Our
+            | Keyword::State
+            | Keyword::Sub
+            | Keyword::If
+            | Keyword::Unless
+            | Keyword::While
+            | Keyword::Until
+            | Keyword::For
+            | Keyword::Foreach
+            | Keyword::Package
+            | Keyword::Use
+            | Keyword::No
+            | Keyword::BEGIN
+            | Keyword::END
+            | Keyword::INIT
+            | Keyword::CHECK
+            | Keyword::UNITCHECK
+            | Keyword::Given
+            | Keyword::When
+            | Keyword::Default
+            | Keyword::Try
+            | Keyword::Defer
+            | Keyword::Format
+            | Keyword::Class
+            | Keyword::Field
+            | Keyword::Method
+    )
+}

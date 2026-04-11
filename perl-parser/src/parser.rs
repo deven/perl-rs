@@ -309,79 +309,91 @@ impl Parser {
             return Ok(Statement { kind: StmtKind::DataEnd(marker, data_offset), span: start.merge(self.peek_span()), terminated: false });
         }
 
-        // Fat comma autoquotes keywords at statement level too:
-        // `if => 1` should not trigger the if-statement parser.
-        if let Token::Keyword(_) = self.peek() {
-            if self.is_fat_comma_after_keyword() {
-                let (kind, terminated) = self.parse_expr_statement()?;
-                return Ok(Statement { kind, span: start.merge(self.peek_span()), terminated });
-            }
-        }
-
         let (kind, terminated) = match self.peek().clone() {
-            Token::Keyword(Keyword::My) => (self.parse_my_decl()?, false),
-            Token::Keyword(Keyword::Our) => (self.parse_our_decl()?, false),
-            Token::Keyword(Keyword::Local) => self.parse_expr_statement()?,
-            Token::Keyword(Keyword::State) => (self.parse_state_decl()?, false),
-            Token::Keyword(Keyword::Sub) => {
-                let sub_span = self.peek_span();
-                self.advance()?; // consume 'sub'
-                if matches!(self.peek(), Token::Ident(_)) {
-                    // Named sub declaration.
-                    (self.parse_sub_decl_body(sub_span)?, false)
-                } else {
-                    // Anonymous sub as expression statement.
-                    let expr = self.parse_anon_sub(sub_span)?;
+            // Statement-level keywords: consume first, check for fat comma
+            // autoquoting (e.g. `if => 1`), then dispatch to handler.
+            Token::Keyword(kw) if keyword::is_statement_keyword(kw) => {
+                let kw_span = self.peek_span();
+                self.advance()?; // consume the keyword
+                if matches!(self.peek(), Token::FatComma) {
+                    // Autoquote: keyword is used as a hash key.
+                    self.descend()?;
+                    let name: &str = kw.into();
+                    let initial = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
+                    let expr = self.parse_expr_continuation(initial, PREC_LOW)?;
+                    self.ascend();
                     let kind = self.maybe_postfix_control(expr)?;
                     let terminated = self.eat(&Token::Semi)?;
                     (kind, terminated)
+                } else {
+                    match kw {
+                        Keyword::My => (self.parse_my_decl()?, false),
+                        Keyword::Our => (self.parse_our_decl()?, false),
+                        Keyword::State => (self.parse_state_decl()?, false),
+                        Keyword::Sub => {
+                            if matches!(self.peek(), Token::Ident(_)) {
+                                (self.parse_sub_decl_body(kw_span)?, false)
+                            } else {
+                                let expr = self.parse_anon_sub(kw_span)?;
+                                let kind = self.maybe_postfix_control(expr)?;
+                                let terminated = self.eat(&Token::Semi)?;
+                                (kind, terminated)
+                            }
+                        }
+                        Keyword::If => (self.parse_if_stmt()?, false),
+                        Keyword::Unless => (self.parse_unless_stmt()?, false),
+                        Keyword::While => (self.parse_while_stmt()?, false),
+                        Keyword::Until => (self.parse_until_stmt()?, false),
+                        Keyword::For | Keyword::Foreach => (self.parse_for_stmt()?, false),
+                        Keyword::Package => (self.parse_package_decl(kw_span)?, false),
+                        Keyword::Use | Keyword::No => (self.parse_use_decl(kw_span, kw == Keyword::No)?, false),
+
+                        // Phaser blocks
+                        Keyword::BEGIN => (self.parse_phaser(PhaserKind::Begin)?, false),
+                        Keyword::END => (self.parse_phaser(PhaserKind::End)?, false),
+                        Keyword::INIT => (self.parse_phaser(PhaserKind::Init)?, false),
+                        Keyword::CHECK => (self.parse_phaser(PhaserKind::Check)?, false),
+                        Keyword::UNITCHECK => (self.parse_phaser(PhaserKind::Unitcheck)?, false),
+
+                        // given/when/default
+                        Keyword::Given => (self.parse_given()?, false),
+                        Keyword::When => (self.parse_when()?, false),
+                        Keyword::Default => {
+                            self.expect = Expect::Block(ExpectNext::Statement);
+                            let block = self.parse_block()?;
+                            (StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: kw_span }, block), false)
+                        }
+
+                        // try/catch/finally/defer
+                        Keyword::Try => (self.parse_try()?, false),
+                        Keyword::Defer => {
+                            self.expect = Expect::Block(ExpectNext::Statement);
+                            let block = self.parse_block()?;
+                            (StmtKind::Defer(block), false)
+                        }
+
+                        // format NAME = ... .
+                        Keyword::Format => (self.parse_format(kw_span)?, false),
+
+                        // class Name :attrs { ... }
+                        Keyword::Class => (self.parse_class(kw_span)?, false),
+
+                        // field $var :attrs = default;
+                        Keyword::Field => (self.parse_field(kw_span)?, false),
+
+                        // method name(params) { ... }
+                        Keyword::Method => (self.parse_method(kw_span)?, false),
+
+                        // Any other statement keyword not handled above.
+                        _ => unreachable!("unhandled statement keyword: {kw:?}"),
+                    }
                 }
             }
-            Token::Keyword(Keyword::If) => (self.parse_if_stmt()?, false),
-            Token::Keyword(Keyword::Unless) => (self.parse_unless_stmt()?, false),
-            Token::Keyword(Keyword::While) => (self.parse_while_stmt()?, false),
-            Token::Keyword(Keyword::Until) => (self.parse_until_stmt()?, false),
-            Token::Keyword(Keyword::For) | Token::Keyword(Keyword::Foreach) => (self.parse_for_stmt()?, false),
-            Token::Keyword(Keyword::Package) => (self.parse_package_decl()?, false),
-            Token::Keyword(Keyword::Use) | Token::Keyword(Keyword::No) => (self.parse_use_decl()?, false),
 
-            // Phaser blocks
-            Token::Keyword(Keyword::BEGIN) => (self.parse_phaser(PhaserKind::Begin)?, false),
-            Token::Keyword(Keyword::END) => (self.parse_phaser(PhaserKind::End)?, false),
-            Token::Keyword(Keyword::INIT) => (self.parse_phaser(PhaserKind::Init)?, false),
-            Token::Keyword(Keyword::CHECK) => (self.parse_phaser(PhaserKind::Check)?, false),
-            Token::Keyword(Keyword::UNITCHECK) => (self.parse_phaser(PhaserKind::Unitcheck)?, false),
-
-            // given/when/default
-            Token::Keyword(Keyword::Given) => (self.parse_given()?, false),
-            Token::Keyword(Keyword::When) => (self.parse_when()?, false),
-            Token::Keyword(Keyword::Default) => {
-                self.advance()?;
-                self.expect = Expect::Block(ExpectNext::Statement);
-                let block = self.parse_block()?;
-                (StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: start }, block), false)
-            }
-
-            // try/catch/finally/defer
-            Token::Keyword(Keyword::Try) => (self.parse_try()?, false),
-            Token::Keyword(Keyword::Defer) => {
-                self.advance()?;
-                self.expect = Expect::Block(ExpectNext::Statement);
-                let block = self.parse_block()?;
-                (StmtKind::Defer(block), false)
-            }
-
-            // format NAME = ... .
-            Token::Keyword(Keyword::Format) => (self.parse_format()?, false),
-
-            // class Name :attrs { ... }
-            Token::Keyword(Keyword::Class) => (self.parse_class()?, false),
-
-            // field $var :attrs = default;
-            Token::Keyword(Keyword::Field) => (self.parse_field()?, false),
-
-            // method name(params) { ... }
-            Token::Keyword(Keyword::Method) => (self.parse_method()?, false),
+            // Expression keywords (local, return, etc.) and non-keywords
+            // go through parse_expr_statement.  parse_term handles fat
+            // comma autoquoting for these.
+            Token::Keyword(Keyword::Local) => self.parse_expr_statement()?,
 
             // `{` at statement level — parse as block, then check if it
             // should be reclassified as a hash constructor.
@@ -518,19 +530,16 @@ impl Parser {
     }
 
     fn parse_my_decl(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?; // eat 'my'
         let (vars, init) = self.parse_var_list()?;
         Ok(StmtKind::My(vars, init))
     }
 
     fn parse_our_decl(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?;
         let (vars, init) = self.parse_var_list()?;
         Ok(StmtKind::Our(vars, init))
     }
 
     fn parse_state_decl(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?;
         let (vars, init) = self.parse_var_list()?;
         Ok(StmtKind::State(vars, init))
     }
@@ -660,7 +669,6 @@ impl Parser {
     // ── Control flow statements ───────────────────────────────
 
     fn parse_if_stmt(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?; // eat 'if'
         let condition = self.parse_paren_expr()?;
         self.expect = Expect::Block(ExpectNext::Statement);
         let then_block = self.parse_block()?;
@@ -684,7 +692,6 @@ impl Parser {
     }
 
     fn parse_unless_stmt(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?;
         let condition = self.parse_paren_expr()?;
         self.expect = Expect::Block(ExpectNext::Statement);
         let then_block = self.parse_block()?;
@@ -707,7 +714,6 @@ impl Parser {
     }
 
     fn parse_while_stmt(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?;
         let condition = self.parse_paren_expr()?;
         self.expect = Expect::Block(ExpectNext::Statement);
         let body = self.parse_block()?;
@@ -721,7 +727,6 @@ impl Parser {
     }
 
     fn parse_until_stmt(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?;
         let condition = self.parse_paren_expr()?;
         self.expect = Expect::Block(ExpectNext::Statement);
         let body = self.parse_block()?;
@@ -735,25 +740,31 @@ impl Parser {
     }
 
     fn parse_for_stmt(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?; // eat for/foreach
-
         // If next is a variable or 'my', it's foreach-style
         if matches!(self.peek(), Token::Keyword(Keyword::My) | Token::ScalarVar(_)) {
             return self.parse_foreach_body();
         }
 
-        // If next is '(' we need to distinguish C-style from foreach.
-        // C-style: for (init; cond; step) { ... }
-        // Foreach: for (LIST) { ... }
-        // Heuristic: scan inside parens for a semicolon at depth 0.
-        if self.at(&Token::LeftParen)? {
-            if self.is_c_style_for() {
-                return self.parse_c_style_for();
-            }
+        // Consume '(' then decide: C-style or foreach based on
+        // whether a `;` appears after the first expression.
+        self.expect_token(&Token::LeftParen)?;
+        self.expect = Expect::Term;
+
+        // Empty init (`;` immediately) → definitely C-style.
+        if self.at(&Token::Semi)? {
+            return self.parse_c_style_for_body(None);
         }
 
-        // Foreach-style with bare list
-        let list = self.parse_paren_expr()?;
+        // Parse the first expression.
+        let first = self.parse_expr(PREC_LOW)?;
+
+        // Semicolon after first expression → C-style, first was init.
+        if self.at(&Token::Semi)? {
+            return self.parse_c_style_for_body(Some(first));
+        }
+
+        // No semicolon → foreach-style, first was the list.
+        self.expect_token(&Token::RightParen)?;
         self.expect = Expect::Block(ExpectNext::Statement);
         let body = self.parse_block()?;
         let continue_block = if self.eat(&Token::Keyword(Keyword::Continue))? {
@@ -763,64 +774,12 @@ impl Parser {
             None
         };
 
-        Ok(StmtKind::ForEach(ForEachStmt { var: None, list, body, continue_block }))
+        Ok(StmtKind::ForEach(ForEachStmt { var: None, list: first, body, continue_block }))
     }
 
-    /// Lookahead: is this `for (init; cond; step)` (C-style)?
-    /// Scans inside parens looking for a semicolon at paren depth 0.
-    fn is_c_style_for(&mut self) -> bool {
-        let cp = self.lexer.checkpoint();
-        let saved_expect = self.expect;
-        let saved_current = self.current.take();
-
-        // We're looking at '('. Skip it.
-        self.ensure_current();
-        let _ = self.current.take();
-
-        let mut depth = 1u32;
-        let mut found_semi = false;
-        loop {
-            self.ensure_current();
-            match self.peek() {
-                Token::LeftParen => {
-                    depth += 1;
-                }
-                Token::RightParen => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                Token::Semi => {
-                    if depth == 1 {
-                        found_semi = true;
-                        break;
-                    }
-                }
-                Token::Eof => break,
-                _ => {}
-            }
-            let _ = self.current.take();
-        }
-
-        self.current = saved_current;
-        self.expect = saved_expect;
-        self.lexer.restore(cp);
-        found_semi
-    }
-
-    /// Parse C-style: `for (init; cond; step) { ... }`
-    fn parse_c_style_for(&mut self) -> Result<StmtKind, ParseError> {
-        self.expect_token(&Token::LeftParen)?;
-        self.expect = Expect::Term;
-
-        // init (may be empty)
-        let init = if self.at(&Token::Semi)? {
-            None
-        } else {
-            self.expect = Expect::Term;
-            Some(self.parse_expr(PREC_LOW)?)
-        };
+    /// Parse the rest of a C-style for loop after `(` and the optional
+    /// init expression have been consumed.  Next token should be `;`.
+    fn parse_c_style_for_body(&mut self, init: Option<Expr>) -> Result<StmtKind, ParseError> {
         self.expect_token(&Token::Semi)?;
 
         // condition (may be empty)
@@ -868,9 +827,7 @@ impl Parser {
 
     // ── Package and use ───────────────────────────────────────
 
-    fn parse_package_decl(&mut self) -> Result<StmtKind, ParseError> {
-        let start = self.peek_span();
-        self.advance()?; // eat 'package'
+    fn parse_package_decl(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.advance()?.token {
             Token::Ident(n) => n,
             other => return Err(ParseError::new(format!("expected package name, got {other:?}"), start)),
@@ -893,11 +850,7 @@ impl Parser {
         Ok(StmtKind::PackageDecl(PackageDecl { name, version, block, span: start.merge(self.peek_span()) }))
     }
 
-    fn parse_use_decl(&mut self) -> Result<StmtKind, ParseError> {
-        let start = self.peek_span();
-        let is_no = matches!(self.peek(), Token::Keyword(Keyword::No));
-        self.advance()?; // eat 'use'/'no'
-
+    fn parse_use_decl(&mut self, start: Span, is_no: bool) -> Result<StmtKind, ParseError> {
         let module = match self.advance()?.token {
             Token::Ident(n) => n,
             Token::StrLit(n) => n, // v-strings: use v5.26.0
@@ -918,7 +871,6 @@ impl Parser {
     // ── Phaser blocks ─────────────────────────────────────────
 
     fn parse_phaser(&mut self, kind: PhaserKind) -> Result<StmtKind, ParseError> {
-        self.advance()?; // eat the phaser keyword
         self.expect = Expect::Block(ExpectNext::Statement);
         let block = self.parse_block()?;
         Ok(StmtKind::Phaser(kind, block))
@@ -927,7 +879,6 @@ impl Parser {
     // ── given/when ────────────────────────────────────────────
 
     fn parse_given(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?; // eat 'given'
         let expr = self.parse_paren_expr()?;
         self.expect = Expect::Block(ExpectNext::Statement);
         let block = self.parse_block()?;
@@ -935,7 +886,6 @@ impl Parser {
     }
 
     fn parse_when(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?; // eat 'when'
         let expr = self.parse_paren_expr()?;
         self.expect = Expect::Block(ExpectNext::Statement);
         let block = self.parse_block()?;
@@ -945,7 +895,6 @@ impl Parser {
     // ── try/catch/finally ─────────────────────────────────────
 
     fn parse_try(&mut self) -> Result<StmtKind, ParseError> {
-        self.advance()?; // eat 'try'
         self.expect = Expect::Block(ExpectNext::Statement);
         let body = self.parse_block()?;
 
@@ -977,10 +926,7 @@ impl Parser {
 
     // ── format ────────────────────────────────────────────────
 
-    fn parse_format(&mut self) -> Result<StmtKind, ParseError> {
-        let start = self.peek_span();
-        self.advance()?; // eat 'format'
-
+    fn parse_format(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         // Optional name (defaults to STDOUT)
         let name = if let Token::Ident(_) = self.peek() {
             match self.advance()?.token {
@@ -1006,10 +952,7 @@ impl Parser {
 
     // ── class / field / method (5.38+ Corinna) ────────────────
 
-    fn parse_class(&mut self) -> Result<StmtKind, ParseError> {
-        let start = self.peek_span();
-        self.advance()?; // eat 'class'
-
+    fn parse_class(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.advance()?.token {
             Token::Ident(n) => n,
             other => return Err(ParseError::new(format!("expected class name, got {other:?}"), start)),
@@ -1022,10 +965,7 @@ impl Parser {
         Ok(StmtKind::ClassDecl(ClassDecl { name, attributes, body, span: start.merge(self.peek_span()) }))
     }
 
-    fn parse_field(&mut self) -> Result<StmtKind, ParseError> {
-        let start = self.peek_span();
-        self.advance()?; // eat 'field'
-
+    fn parse_field(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let var = self.parse_single_var_decl()?;
         let attributes = self.parse_attributes()?;
 
@@ -1041,10 +981,7 @@ impl Parser {
         Ok(StmtKind::FieldDecl(FieldDecl { var, attributes, default, span: start.merge(self.peek_span()) }))
     }
 
-    fn parse_method(&mut self) -> Result<StmtKind, ParseError> {
-        let start = self.peek_span();
-        self.advance()?; // eat 'method'
-
+    fn parse_method(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.advance()?.token {
             Token::Ident(n) => n,
             other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
@@ -1057,24 +994,6 @@ impl Parser {
         let body = self.parse_block()?;
 
         Ok(StmtKind::MethodDecl(SubDecl { name, prototype, attributes, params: None, body, span: start.merge(self.peek_span()) }))
-    }
-
-    // ── Labels ────────────────────────────────────────────────
-
-    /// Speculative lookahead: is the token after the current keyword a fat comma?
-    /// Used to detect `if => 1` (autoquoting) vs `if ($cond) { ... }`.
-    fn is_fat_comma_after_keyword(&mut self) -> bool {
-        let cp = self.lexer.checkpoint();
-        let saved_expect = self.expect;
-        let saved_current = self.current.take();
-
-        self.ensure_current();
-        let is_fat_comma = matches!(self.peek(), Token::FatComma);
-
-        self.current = saved_current;
-        self.expect = saved_expect;
-        self.lexer.restore(cp);
-        is_fat_comma
     }
 
     // ── Expression statements ─────────────────────────────────
@@ -2038,10 +1957,89 @@ impl Parser {
         let in_parens = self.eat(&Token::LeftParen)?;
 
         // Try to detect filehandle before argument list.
-        let filehandle = self.try_parse_print_filehandle()?;
+        // Consume-then-decide: take the candidate token, peek at
+        // what follows to determine if it's a filehandle or the
+        // first argument.
+        let mut filehandle: Option<Box<Expr>> = None;
+        let mut first_arg: Option<Expr> = None;
+
+        let is_bareword = matches!(self.peek(), Token::Ident(_));
+        let is_scalar = matches!(self.peek(), Token::ScalarVar(_));
+
+        if is_bareword {
+            let fh_span = self.peek_span();
+            let fh_name = match self.advance()?.token {
+                Token::Ident(n) => n,
+                _ => unreachable!(),
+            };
+            if matches!(self.peek(), Token::Comma) {
+                // Bareword followed by comma → first argument, not filehandle.
+                // `print CONSTANT, "hello"`.
+                self.descend()?;
+                let initial = self.parse_ident_term(fh_name, fh_span)?;
+                let expr = self.parse_expr_continuation(initial, PREC_COMMA + 1)?;
+                self.ascend();
+                first_arg = Some(expr);
+            } else {
+                // Bareword not followed by comma → filehandle.
+                // `print STDERR "hello"`.
+                filehandle = Some(Box::new(Expr { kind: ExprKind::Bareword(fh_name), span: fh_span }));
+            }
+        } else if is_scalar {
+            let var_span = self.peek_span();
+            let var_name = match self.advance()?.token {
+                Token::ScalarVar(n) => n,
+                _ => unreachable!(),
+            };
+            let next_is_term = matches!(
+                self.peek(),
+                Token::QuoteBegin(_, _)
+                    | Token::StrLit(_)
+                    | Token::IntLit(_)
+                    | Token::FloatLit(_)
+                    | Token::ScalarVar(_)
+                    | Token::ArrayVar(_)
+                    | Token::HashVar(_)
+                    | Token::SpecialVar(_)
+                    | Token::SpecialArrayVar(_)
+                    | Token::SpecialHashVar(_)
+                    | Token::Ident(_)
+                    | Token::LeftParen
+                    | Token::LeftBracket
+                    | Token::RegexLit(_, _, _)
+                    | Token::SubstLit(_, _, _)
+                    | Token::HeredocLit(_, _, _)
+                    | Token::QwList(_)
+                    | Token::Backslash
+            );
+            if next_is_term {
+                // `print $fh "hello"` → filehandle.
+                filehandle = Some(Box::new(Expr { kind: ExprKind::ScalarVar(var_name), span: var_span }));
+            } else {
+                // `print $x + 1` → not filehandle, first argument.
+                self.descend()?;
+                let var_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
+                let initial = self.maybe_postfix_subscript(var_expr)?;
+                let expr = self.parse_expr_continuation(initial, PREC_COMMA + 1)?;
+                self.ascend();
+                first_arg = Some(expr);
+            }
+        }
 
         // Collect args as comma-separated list.
         let mut args = Vec::new();
+        if let Some(arg) = first_arg {
+            args.push(arg);
+            // Consume comma after the first arg if present.
+            if !self.eat(&Token::Comma)? {
+                // No comma — this was the only argument.
+                if in_parens {
+                    self.expect_token(&Token::RightParen)?;
+                }
+                let end_span = args.last().map(|a| a.span).unwrap_or(span);
+                return Ok(Expr { kind: ExprKind::PrintOp(name, filehandle, args), span: span.merge(end_span) });
+            }
+        }
         while !self.at_print_end(in_parens)? {
             args.push(self.parse_expr(PREC_COMMA + 1)?);
             if !self.eat(&Token::Comma)? {
@@ -2074,83 +2072,6 @@ impl Parser {
                 | Token::Keyword(Keyword::For)
                 | Token::Keyword(Keyword::Foreach)
         ))
-    }
-
-    /// Speculative lookahead: detect a filehandle after print/say/printf.
-    ///
-    /// Perl's rule: a bareword not followed by comma is a filehandle.
-    /// A scalar variable followed by a clearly term-starting token (not
-    /// an operator or comma) is a filehandle.
-    fn try_parse_print_filehandle(&mut self) -> Result<Option<Box<Expr>>, ParseError> {
-        let is_bareword = matches!(self.peek(), Token::Ident(_));
-        let is_scalar = matches!(self.peek(), Token::ScalarVar(_));
-
-        if !is_bareword && !is_scalar {
-            return Ok(None);
-        }
-
-        // Save state for speculative lookahead.
-        let cp = self.lexer.checkpoint();
-        let saved_expect = self.expect;
-        let saved_current = self.current.take();
-
-        // Peek at what follows the candidate token.
-        // (Taking saved_current already moved past it in the lexer.)
-        self.ensure_current();
-        let next = self.peek().clone();
-
-        // Restore parser state.
-        self.current = saved_current;
-        self.expect = saved_expect;
-        self.lexer.restore(cp);
-
-        // Decision:
-        // Bareword: filehandle if NOT followed by comma.
-        //   `print STDERR "hello"` → fh.  `print STDERR;` → fh.
-        //   `print STDERR, "hello"` → not fh.
-        // ScalarVar: filehandle if followed by an unambiguous term start
-        //   (string, variable, paren, keyword).  Not if followed by
-        //   comma, operator, semicolon, or EOF.
-        //   `print $fh "hello"` → fh.  `print $fh;` → not fh.
-        //   `print $x + 1;` → not fh.
-        let is_filehandle = if is_bareword {
-            !matches!(next, Token::Comma)
-        } else {
-            // ScalarVar — conservative: only if next is clearly a new term.
-            matches!(
-                next,
-                Token::QuoteBegin(_, _)
-                    | Token::StrLit(_)
-                    | Token::IntLit(_)
-                    | Token::FloatLit(_)
-                    | Token::ScalarVar(_)
-                    | Token::ArrayVar(_)
-                    | Token::HashVar(_)
-                    | Token::SpecialVar(_)
-                    | Token::SpecialArrayVar(_)
-                    | Token::SpecialHashVar(_)
-                    | Token::Ident(_)
-                    | Token::LeftParen
-                    | Token::LeftBracket
-                    | Token::RegexLit(_, _, _)
-                    | Token::SubstLit(_, _, _)
-                    | Token::HeredocLit(_, _, _)
-                    | Token::QwList(_)
-                    | Token::Backslash
-            )
-        };
-
-        if is_filehandle {
-            let fh_span = self.peek_span();
-            let fh = match self.advance()?.token {
-                Token::Ident(n) => Expr { kind: ExprKind::Bareword(n), span: fh_span },
-                Token::ScalarVar(n) => Expr { kind: ExprKind::ScalarVar(n), span: fh_span },
-                _ => unreachable!(),
-            };
-            Ok(Some(Box::new(fh)))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Parse the operand of a prefix dereference ($$ref, @$ref, etc.).
