@@ -189,26 +189,26 @@ pub enum Keyword {
 /// Assignment operator variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignOp {
-    Eq,          // =
-    AddEq,       // +=
-    SubEq,       // -=
-    MulEq,       // *=
-    DivEq,       // /=
-    ModEq,       // %=
-    PowEq,       // **=
-    ConcatEq,    // .=
-    AndEq,       // &&=
-    OrEq,        // ||=
-    DefinedOrEq, // //=
-    BitAndEq,    // &=
-    BitOrEq,     // |=
-    BitXorEq,    // ^=
-    ShiftLEq,    // <<=
-    ShiftREq,    // >>=
-    RepeatEq,    // x=
-    BandEq,      // &.=   (string bitand)
-    BorEq,       // |.=   (string bitor)
-    BxorEq,      // ^.=   (string bitxor)
+    Eq,           // =
+    AddEq,        // +=
+    SubEq,        // -=
+    MulEq,        // *=
+    DivEq,        // /=
+    ModEq,        // %=
+    PowEq,        // **=
+    ConcatEq,     // .=
+    AndEq,        // &&=
+    OrEq,         // ||=
+    DefinedOrEq,  // //=
+    BitAndEq,     // &=
+    BitOrEq,      // |=
+    BitXorEq,     // ^=
+    ShiftLeftEq,  // <<=
+    ShiftRightEq, // >>=
+    RepeatEq,     // x=
+    BandEq,       // &.=   (string bitand)
+    BorEq,        // |.=   (string bitor)
+    BxorEq,       // ^.=   (string bitxor)
 }
 
 /// Tokens emitted by the lexer.
@@ -332,17 +332,17 @@ pub enum Token {
     Filetest(u8),
 
     // ── Delimiters ────────────────────────────────────────────
-    LParen,   // (
-    RParen,   // )
-    LBracket, // [
-    RBracket, // ]
-    LBrace,   // { (block, hash subscript)
+    LeftParen,    // (
+    RightParen,   // )
+    LeftBracket,  // [
+    RightBracket, // ]
+    LeftBrace,    // { (block, hash subscript)
     /// `{` that opens an anonymous hash constructor.
-    /// Distinct from `LBrace` (which opens blocks and subscripts).
+    /// Distinct from `LeftBrace` (which opens blocks and subscripts).
     /// The lexer decides which to emit, matching toke.c's
     /// `PERLY_BRACE_OPEN` vs `HASHBRACK` distinction.
     HashBrace,
-    RBrace, // }
+    RightBrace, // }
 
     // ── Punctuation ───────────────────────────────────────────
     Semi,     // ;
@@ -351,7 +351,7 @@ pub enum Token {
     HashSign, // # (should not normally reach parser)
 
     /// Subroutine prototype scanned as a raw string: `($$)` → `"$$"`.
-    /// The lexer produces this instead of `LParen` when `base = Proto`.
+    /// The lexer produces this instead of `LeftParen` when `base = Proto`.
     /// Matches toke.c's `scan_str` + `force_next(THING)` for prototypes.
     Prototype(String),
 
@@ -367,7 +367,7 @@ pub enum Token {
     /// `@name` interpolation inside a quote (array in string).
     InterpArray(String),
     /// `${expr}` expression interpolation — lexer switches to normal code mode.
-    /// Parser calls parse_expr(), then expect_token(RBrace).
+    /// Parser calls parse_expr(), then expect_token(RightBrace).
     InterpScalarExprStart,
     /// `@{expr}` expression interpolation — lexer switches to normal code mode.
     InterpArrayExprStart,
@@ -480,9 +480,9 @@ impl Token {
                 | Token::SpecialVar(_)
                 | Token::SpecialArrayVar(_)
                 | Token::SpecialHashVar(_)
-                | Token::LParen
-                | Token::LBracket
-                | Token::LBrace
+                | Token::LeftParen
+                | Token::LeftBracket
+                | Token::LeftBrace
                 | Token::HashBrace
                 | Token::Minus
                 | Token::Plus
@@ -527,14 +527,14 @@ impl std::fmt::Display for Token {
             Token::Star => write!(f, "*"),
             Token::Slash => write!(f, "/"),
             Token::Assign(AssignOp::Eq) => write!(f, "="),
-            Token::LParen => write!(f, "("),
-            Token::RParen => write!(f, ")"),
-            Token::LBrace => write!(f, "{{"),
+            Token::LeftParen => write!(f, "("),
+            Token::RightParen => write!(f, ")"),
+            Token::LeftBrace => write!(f, "{{"),
             Token::HashBrace => write!(f, "{{"),
-            Token::RBrace => write!(f, "}}"),
+            Token::RightBrace => write!(f, "}}"),
             Token::Prototype(s) => write!(f, "({})", s),
-            Token::LBracket => write!(f, "["),
-            Token::RBracket => write!(f, "]"),
+            Token::LeftBracket => write!(f, "["),
+            Token::RightBracket => write!(f, "]"),
             Token::Comma => write!(f, ","),
             Token::Arrow => write!(f, "->"),
             Token::Keyword(kw) => write!(f, "{kw:?}"),

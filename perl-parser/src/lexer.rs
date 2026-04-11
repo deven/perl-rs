@@ -497,12 +497,12 @@ impl Lexer {
                 let result = self.lex_normal_token(expect)?;
                 // Track brace depth to find the closing }.
                 match &result.token {
-                    Token::LBrace | Token::HashBrace => {
+                    Token::LeftBrace | Token::HashBrace => {
                         if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
                             *d += 1;
                         }
                     }
-                    Token::RBrace => {
+                    Token::RightBrace => {
                         if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
                             if *d == 0 {
                                 self.context_stack.pop();
@@ -619,20 +619,20 @@ impl Lexer {
                     let content = self.scan_balanced_string(b'(', b')')?;
                     Token::Prototype(content)
                 } else {
-                    Token::LParen
+                    Token::LeftParen
                 }
             }
             b')' => {
                 self.skip(1);
-                Token::RParen
+                Token::RightParen
             }
             b'[' => {
                 self.skip(1);
-                Token::LBracket
+                Token::LeftBracket
             }
             b']' => {
                 self.skip(1);
-                Token::RBracket
+                Token::RightBracket
             }
             b'{' => {
                 self.skip(1);
@@ -645,16 +645,16 @@ impl Lexer {
                         if self.looks_like_hash_content() {
                             Token::HashBrace
                         } else {
-                            Token::LBrace
+                            Token::LeftBrace
                         }
                     }
                     // Everything else → block brace.
-                    _ => Token::LBrace,
+                    _ => Token::LeftBrace,
                 }
             }
             b'}' => {
                 self.skip(1);
-                Token::RBrace
+                Token::RightBrace
             }
 
             // ^D (0x04) and ^Z (0x1a) — logical end of script.
@@ -1861,7 +1861,7 @@ impl Lexer {
                             }
                             if self.peek_byte() == Some(b'=') {
                                 self.skip(1);
-                                return Ok(Token::Assign(AssignOp::ShiftLEq));
+                                return Ok(Token::Assign(AssignOp::ShiftLeftEq));
                             }
                             return Ok(Token::ShiftL);
                         }
@@ -1871,7 +1871,7 @@ impl Lexer {
                     self.skip(1);
                     if self.peek_byte() == Some(b'=') {
                         self.skip(1);
-                        Ok(Token::Assign(AssignOp::ShiftLEq))
+                        Ok(Token::Assign(AssignOp::ShiftLeftEq))
                     } else {
                         Ok(Token::ShiftL)
                     }
@@ -2019,7 +2019,7 @@ impl Lexer {
                 self.skip(1);
                 if self.peek_byte() == Some(b'=') {
                     self.skip(1);
-                    Token::Assign(AssignOp::ShiftREq)
+                    Token::Assign(AssignOp::ShiftRightEq)
                 } else {
                     Token::ShiftR
                 }
@@ -2179,9 +2179,9 @@ mod tests {
                 | Token::ArrayVar(_)
                 | Token::HashVar(_)
                 | Token::Ident(_)
-                | Token::RParen
-                | Token::RBracket
-                | Token::RBrace
+                | Token::RightParen
+                | Token::RightBracket
+                | Token::RightBrace
                 | Token::PlusPlus
                 | Token::MinusMinus
                 | Token::SpecialVar(_)
@@ -2201,7 +2201,7 @@ mod tests {
                     // so it inherits XOPERATOR from the preceding term.
                     expect = Expect::Operator;
                 }
-                Token::Semi | Token::LBrace => {
+                Token::Semi | Token::LeftBrace => {
                     expect = Expect::Statement;
                 }
                 // HASHBRACK in toke.c is returned via OPERATOR() which
@@ -2389,7 +2389,7 @@ mod tests {
     #[test]
     fn lex_arrow_and_deref() {
         let tokens = lex_all("$ref->{key}");
-        assert_eq!(tokens, vec![Token::ScalarVar("ref".into()), Token::Arrow, Token::LBrace, Token::Ident("key".into()), Token::RBrace,]);
+        assert_eq!(tokens, vec![Token::ScalarVar("ref".into()), Token::Arrow, Token::LeftBrace, Token::Ident("key".into()), Token::RightBrace,]);
     }
 
     #[test]
@@ -2990,13 +2990,13 @@ mod tests {
     #[test]
     fn lex_shift_l_eq() {
         let tokens = lex_all("$x <<= 2");
-        assert!(tokens.contains(&Token::Assign(AssignOp::ShiftLEq)));
+        assert!(tokens.contains(&Token::Assign(AssignOp::ShiftLeftEq)));
     }
 
     #[test]
     fn lex_shift_r_eq() {
         let tokens = lex_all("$x >>= 2");
-        assert!(tokens.contains(&Token::Assign(AssignOp::ShiftREq)));
+        assert!(tokens.contains(&Token::Assign(AssignOp::ShiftRightEq)));
     }
 
     // ── Operator edge cases ───────────────────────────────────
@@ -3375,15 +3375,15 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // Brace disambiguation: Token::LBrace vs Token::HashBrace
+    // Brace disambiguation: Token::LeftBrace vs Token::HashBrace
     //
     // These tests verify that the lexer faithfully reproduces
     // toke.c's yyl_leftcurly() decision for every code path.
     //
     // Each named Expect constant maps to a toke.c PL_expect state.
     // The expected token matches what toke.c would return:
-    //   LBrace   = PERLY_BRACE_OPEN  (block / subscript)
-    //   HashBrace = HASHBRACK          (anonymous hash)
+    //   LeftBrace = PERLY_BRACE_OPEN  (block / subscript)
+    //   HashBrace = HASHBRACK         (anonymous hash)
     // ═══════════════════════════════════════════════════════════
 
     /// Lex `{` (and whatever follows) under an explicit expect state.
@@ -3409,52 +3409,52 @@ mod tests {
     #[test]
     fn brace_operator_always_block() {
         // Operator: { is always a block brace (subscript).
-        assert_eq!(lex_brace("{key}", Expect::Operator), Token::LBrace);
+        assert_eq!(lex_brace("{key}", Expect::Operator), Token::LeftBrace);
     }
 
     #[test]
     fn brace_operator_block_even_with_hash_content() {
-        assert_eq!(lex_brace("{key => val}", Expect::Operator), Token::LBrace);
+        assert_eq!(lex_brace("{key => val}", Expect::Operator), Token::LeftBrace);
     }
 
     #[test]
     fn brace_block_statement_always_block() {
         // Block(Statement): { after if/while/sub — always block.
-        assert_eq!(lex_brace("{1}", Expect::Block(ExpectNext::Statement)), Token::LBrace);
+        assert_eq!(lex_brace("{1}", Expect::Block(ExpectNext::Statement)), Token::LeftBrace);
     }
 
     #[test]
     fn brace_block_statement_block_even_with_hash_content() {
-        assert_eq!(lex_brace("{key => val}", Expect::Block(ExpectNext::Statement)), Token::LBrace);
+        assert_eq!(lex_brace("{key => val}", Expect::Block(ExpectNext::Statement)), Token::LeftBrace);
     }
 
     #[test]
     fn brace_block_operator_always_block() {
         // Block(Operator): { for eval/do/anon sub — always block.
-        assert_eq!(lex_brace("{1}", Expect::Block(ExpectNext::Operator)), Token::LBrace);
+        assert_eq!(lex_brace("{1}", Expect::Block(ExpectNext::Operator)), Token::LeftBrace);
     }
 
     #[test]
     fn brace_block_term_always_block() {
         // Block(Term): { for sort/map/grep block arg — always block.
-        assert_eq!(lex_brace("{1}", Expect::Block(ExpectNext::Term)), Token::LBrace);
+        assert_eq!(lex_brace("{1}", Expect::Block(ExpectNext::Term)), Token::LeftBrace);
     }
 
     #[test]
     fn brace_deref_always_block() {
         // Deref: ${...}, @{...} — always block.
-        assert_eq!(lex_brace("{expr}", Expect::Deref), Token::LBrace);
+        assert_eq!(lex_brace("{expr}", Expect::Deref), Token::LeftBrace);
     }
 
     #[test]
     fn brace_deref_block_even_with_hash_content() {
-        assert_eq!(lex_brace("{key => val}", Expect::Deref), Token::LBrace);
+        assert_eq!(lex_brace("{key => val}", Expect::Deref), Token::LeftBrace);
     }
 
     #[test]
     fn brace_postderef_always_block() {
         // Postderef: ->@*, ->$* context — always block.
-        assert_eq!(lex_brace("{key}", Expect::Postderef), Token::LBrace);
+        assert_eq!(lex_brace("{key}", Expect::Postderef), Token::LeftBrace);
     }
 
     // ── Heuristic (XSTATE / Statement) — toke.c default case ─
@@ -3495,7 +3495,7 @@ mod tests {
     #[test]
     fn brace_heuristic_lowercase_comma_is_block() {
         // {foo, 1} → block: isLOWER('f'), could be func call (line 6469)
-        assert_eq!(lex_brace("{foo, 1}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{foo, 1}", Expect::Statement), Token::LeftBrace);
     }
 
     #[test]
@@ -3507,7 +3507,7 @@ mod tests {
     #[test]
     fn brace_heuristic_no_comma_is_block() {
         // {my $x = 1} → block: no comma/=> after first term
-        assert_eq!(lex_brace("{my $x = 1}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{my $x = 1}", Expect::Statement), Token::LeftBrace);
     }
 
     // ── Heuristic: string first term (lines 6401–6406) ───────
@@ -3541,7 +3541,7 @@ mod tests {
     #[test]
     fn brace_heuristic_string_no_comma_is_block() {
         // {"key"; 1} → block: string but no comma/=> after
-        assert_eq!(lex_brace("{\"key\"; 1}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{\"key\"; 1}", Expect::Statement), Token::LeftBrace);
     }
 
     #[test]
@@ -3567,13 +3567,13 @@ mod tests {
     #[test]
     fn brace_heuristic_dollar_is_block() {
         // {$x + 1} → block: '$' doesn't start a word/quote
-        assert_eq!(lex_brace("{$x + 1}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{$x + 1}", Expect::Statement), Token::LeftBrace);
     }
 
     #[test]
     fn brace_heuristic_at_is_block() {
         // {@array} → block: '@' doesn't start a word/quote
-        assert_eq!(lex_brace("{@array}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{@array}", Expect::Statement), Token::LeftBrace);
     }
 
     // ── Heuristic: q-quote constructs (lines 6408–6455) ──────
@@ -3640,12 +3640,12 @@ mod tests {
     #[test]
     fn brace_heuristic_qr_word_no_comma_is_block() {
         // {qr; 1} → block: 'qr' is a word, no comma/=> after
-        assert_eq!(lex_brace("{qr; 1}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{qr; 1}", Expect::Statement), Token::LeftBrace);
     }
 
     #[test]
     fn brace_heuristic_query_word_no_comma_is_block() {
-        assert_eq!(lex_brace("{query; 1}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{query; 1}", Expect::Statement), Token::LeftBrace);
     }
 
     // ── Heuristic: comments (skipspace) ───────────────────────
@@ -3658,7 +3658,7 @@ mod tests {
 
     #[test]
     fn brace_heuristic_comment_then_block() {
-        assert_eq!(lex_brace("{ # comment\nmy $x = 1}", Expect::Statement), Token::LBrace);
+        assert_eq!(lex_brace("{ # comment\nmy $x = 1}", Expect::Statement), Token::LeftBrace);
     }
 
     // ── Integration: lex_all with natural context ─────────────
@@ -3668,7 +3668,7 @@ mod tests {
         // $x = {...} — after =, lex_all sets Term → HashBrace
         let tokens = lex_all("$x = {key => 1}");
         assert!(tokens.contains(&Token::HashBrace));
-        assert!(!tokens.iter().any(|t| *t == Token::LBrace));
+        assert!(!tokens.iter().any(|t| *t == Token::LeftBrace));
     }
 
     #[test]
@@ -3682,14 +3682,14 @@ mod tests {
     fn brace_after_semicolon_block() {
         // ; {my $x} — after ;, XSTATE → heuristic → block
         let tokens = lex_all("1; {my $x}");
-        assert!(tokens.contains(&Token::LBrace));
+        assert!(tokens.contains(&Token::LeftBrace));
     }
 
     #[test]
     fn brace_after_arrow_is_block() {
-        // $ref->{key} — after ->, XOPERATOR → LBrace (subscript)
+        // $ref->{key} — after ->, XOPERATOR → LeftBrace (subscript)
         let tokens = lex_all("$ref->{key}");
-        assert!(tokens.contains(&Token::LBrace));
+        assert!(tokens.contains(&Token::LeftBrace));
         assert!(!tokens.contains(&Token::HashBrace));
     }
 }

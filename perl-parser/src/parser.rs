@@ -374,8 +374,8 @@ impl Parser {
             // method name(params) { ... }
             Token::Keyword(Keyword::Method) => self.parse_method()?,
 
-            // The lexer already decided: LBrace = block, HashBrace = hash.
-            Token::LBrace => {
+            // The lexer already decided: LeftBrace = block, HashBrace = hash.
+            Token::LeftBrace => {
                 self.expect = Expect::Block(ExpectNext::Statement);
                 let block = self.parse_block()?;
                 StmtKind::Block(block)
@@ -448,7 +448,7 @@ impl Parser {
     fn parse_var_list(&mut self) -> Result<(Vec<VarDecl>, Option<Expr>), ParseError> {
         let mut vars = Vec::new();
 
-        if self.eat(&Token::LParen)? {
+        if self.eat(&Token::LeftParen)? {
             // my ($x, @y, %z)
             loop {
                 let decl = self.parse_single_var_decl()?;
@@ -457,7 +457,7 @@ impl Parser {
                     break;
                 }
             }
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
         } else {
             vars.push(self.parse_single_var_decl()?);
         }
@@ -549,18 +549,18 @@ impl Parser {
                 let name_span = self.peek_span();
                 self.advance()?; // eat the name
                 // Optional parenthesized args
-                let value = if self.at(&Token::LParen)? {
+                let value = if self.at(&Token::LeftParen)? {
                     self.advance()?;
                     let mut args = String::new();
                     let mut depth = 1u32;
                     loop {
                         match self.peek().clone() {
-                            Token::LParen => {
+                            Token::LeftParen => {
                                 depth += 1;
                                 args.push('(');
                                 self.advance()?;
                             }
-                            Token::RParen => {
+                            Token::RightParen => {
                                 depth -= 1;
                                 if depth == 0 {
                                     self.advance()?;
@@ -592,17 +592,17 @@ impl Parser {
     fn parse_decl_expr(&mut self, scope: DeclScope, span: Span) -> Result<Expr, ParseError> {
         let mut vars = Vec::new();
 
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             // List form: my ($x, @y, %z)
             self.advance()?;
-            while !self.at(&Token::RParen)? && !self.at_eof()? {
+            while !self.at(&Token::RightParen)? && !self.at_eof()? {
                 vars.push(self.parse_single_var_decl()?);
                 if !self.eat(&Token::Comma)? {
                     break;
                 }
             }
             let end = self.peek_span();
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
             Ok(Expr { kind: ExprKind::Decl(scope, vars), span: span.merge(end) })
         } else {
             // Single variable: my $x, my @arr, my %hash
@@ -712,7 +712,7 @@ impl Parser {
         // C-style: for (init; cond; step) { ... }
         // Foreach: for (LIST) { ... }
         // Heuristic: scan inside parens for a semicolon at depth 0.
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             if self.is_c_style_for() {
                 return self.parse_c_style_for();
             }
@@ -748,10 +748,10 @@ impl Parser {
         loop {
             self.ensure_current();
             match self.peek() {
-                Token::LParen => {
+                Token::LeftParen => {
                     depth += 1;
                 }
-                Token::RParen => {
+                Token::RightParen => {
                     depth -= 1;
                     if depth == 0 {
                         break;
@@ -777,7 +777,7 @@ impl Parser {
 
     /// Parse C-style: `for (init; cond; step) { ... }`
     fn parse_c_style_for(&mut self) -> Result<StmtKind, ParseError> {
-        self.expect_token(&Token::LParen)?;
+        self.expect_token(&Token::LeftParen)?;
         self.expect = Expect::Term;
 
         // init (may be empty)
@@ -796,8 +796,8 @@ impl Parser {
 
         // step (may be empty)
         self.expect = Expect::Term;
-        let step = if self.at(&Token::RParen)? { None } else { Some(self.parse_expr(PREC_LOW)?) };
-        self.expect_token(&Token::RParen)?;
+        let step = if self.at(&Token::RightParen)? { None } else { Some(self.parse_expr(PREC_LOW)?) };
+        self.expect_token(&Token::RightParen)?;
 
         self.expect = Expect::Block(ExpectNext::Statement);
         let body = self.parse_block()?;
@@ -848,7 +848,7 @@ impl Parser {
 
         let block = if {
             self.expect = Expect::Block(ExpectNext::Statement);
-            self.at(&Token::LBrace)?
+            self.at(&Token::LeftBrace)?
         } {
             Some(self.parse_block()?)
         } else {
@@ -916,10 +916,10 @@ impl Parser {
         let body = self.parse_block()?;
 
         let (catch_var, catch_block) = if self.eat(&Token::Keyword(Keyword::Catch))? {
-            let var = if self.at(&Token::LParen)? {
+            let var = if self.at(&Token::LeftParen)? {
                 self.advance()?;
                 let decl = self.parse_single_var_decl()?;
-                self.expect_token(&Token::RParen)?;
+                self.expect_token(&Token::RightParen)?;
                 Some(decl)
             } else {
                 None
@@ -1113,16 +1113,16 @@ impl Parser {
             Expect::Block(next) => next,
             _ => ExpectNext::Statement,
         };
-        self.expect_token(&Token::LBrace)?;
+        self.expect_token(&Token::LeftBrace)?;
         self.expect = Expect::Statement;
 
         let mut statements = Vec::new();
-        while !self.at(&Token::RBrace)? && !self.at_eof()? {
+        while !self.at(&Token::RightBrace)? && !self.at_eof()? {
             statements.push(self.parse_statement()?);
         }
 
         let end = self.peek_span();
-        self.expect_token(&Token::RBrace)?;
+        self.expect_token(&Token::RightBrace)?;
         self.expect = match restore {
             ExpectNext::Statement => Expect::Statement,
             ExpectNext::Operator => Expect::Operator,
@@ -1134,10 +1134,10 @@ impl Parser {
     }
 
     fn parse_paren_expr(&mut self) -> Result<Expr, ParseError> {
-        self.expect_token(&Token::LParen)?;
+        self.expect_token(&Token::LeftParen)?;
         self.expect = Expect::Term;
         let expr = self.parse_expr(PREC_LOW)?;
-        self.expect_token(&Token::RParen)?;
+        self.expect_token(&Token::RightParen)?;
         Ok(expr)
     }
 
@@ -1193,31 +1193,31 @@ impl Parser {
             Token::ArrayVar(name) => {
                 // @array[0,1] → array slice; @array{qw(a b)} → hash slice
                 self.expect = Expect::Operator;
-                if self.at(&Token::LBracket)? {
+                if self.at(&Token::LeftBracket)? {
                     self.advance()?;
                     self.expect = Expect::Term;
                     let mut indices = Vec::new();
-                    while !self.at(&Token::RBracket)? && !self.at_eof()? {
+                    while !self.at(&Token::RightBracket)? && !self.at_eof()? {
                         indices.push(self.parse_expr(PREC_COMMA + 1)?);
                         if !self.eat(&Token::Comma)? {
                             break;
                         }
                     }
                     let end = self.peek_span();
-                    self.expect_token(&Token::RBracket)?;
+                    self.expect_token(&Token::RightBracket)?;
                     Ok(Expr { span: span.merge(end), kind: ExprKind::ArraySlice(Box::new(Expr { kind: ExprKind::ArrayVar(name), span }), indices) })
-                } else if self.at(&Token::LBrace)? {
+                } else if self.at(&Token::LeftBrace)? {
                     self.advance()?;
                     self.expect = Expect::Term;
                     let mut keys = Vec::new();
-                    while !self.at(&Token::RBrace)? && !self.at_eof()? {
+                    while !self.at(&Token::RightBrace)? && !self.at_eof()? {
                         keys.push(self.parse_expr(PREC_COMMA + 1)?);
                         if !self.eat(&Token::Comma)? {
                             break;
                         }
                     }
                     let end = self.peek_span();
-                    self.expect_token(&Token::RBrace)?;
+                    self.expect_token(&Token::RightBrace)?;
                     Ok(Expr { span: span.merge(end), kind: ExprKind::HashSlice(Box::new(Expr { kind: ExprKind::ArrayVar(name), span }), keys) })
                 } else {
                     Ok(Expr { kind: ExprKind::ArrayVar(name), span })
@@ -1236,12 +1236,12 @@ impl Parser {
             // Prefix dereference: $$ref, @$ref, %$ref, ${expr}, @{expr}
             Token::Dollar => {
                 self.expect = Expect::Deref;
-                if self.at(&Token::LBrace)? {
+                if self.at(&Token::LeftBrace)? {
                     // ${expr} — dereference block
                     self.advance()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
-                    self.expect_token(&Token::RBrace)?;
+                    self.expect_token(&Token::RightBrace)?;
                     let expr = Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Scalar, Box::new(inner)) };
                     self.maybe_postfix_subscript(expr)
                 } else {
@@ -1254,12 +1254,12 @@ impl Parser {
             }
             Token::At => {
                 self.expect = Expect::Deref;
-                if self.at(&Token::LBrace)? {
+                if self.at(&Token::LeftBrace)? {
                     // @{expr} — array dereference block
                     self.advance()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
-                    self.expect_token(&Token::RBrace)?;
+                    self.expect_token(&Token::RightBrace)?;
                     Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Array, Box::new(inner)) })
                 } else {
                     let operand = self.parse_deref_operand()?;
@@ -1270,11 +1270,11 @@ impl Parser {
             // Prefix hash dereference: %$ref, %{expr}
             Token::Percent => {
                 self.expect = Expect::Deref;
-                if self.at(&Token::LBrace)? {
+                if self.at(&Token::LeftBrace)? {
                     self.advance()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
-                    self.expect_token(&Token::RBrace)?;
+                    self.expect_token(&Token::RightBrace)?;
                     Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Hash, Box::new(inner)) })
                 } else {
                     let operand = self.parse_deref_operand()?;
@@ -1285,12 +1285,12 @@ impl Parser {
             // Ampersand prefix: &foo, &foo(args), &$coderef(args), &{expr}(args)
             Token::BitAnd => {
                 self.expect = Expect::Deref;
-                if self.at(&Token::LBrace)? {
+                if self.at(&Token::LeftBrace)? {
                     // &{expr}
                     self.advance()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
-                    self.expect_token(&Token::RBrace)?;
+                    self.expect_token(&Token::RightBrace)?;
                     let deref = Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Code, Box::new(inner)) };
                     self.maybe_call_args(deref)
                 } else if let Token::Ident(_) = self.peek() {
@@ -1300,18 +1300,18 @@ impl Parser {
                         Token::Ident(s) => s,
                         _ => unreachable!(),
                     };
-                    if self.at(&Token::LParen)? {
+                    if self.at(&Token::LeftParen)? {
                         self.advance()?;
                         self.expect = Expect::Term;
                         let mut args = Vec::new();
-                        while !self.at(&Token::RParen)? && !self.at_eof()? {
+                        while !self.at(&Token::RightParen)? && !self.at_eof()? {
                             args.push(self.parse_expr(PREC_COMMA + 1)?);
                             if !self.eat(&Token::Comma)? {
                                 break;
                             }
                         }
                         let end = self.peek_span();
-                        self.expect_token(&Token::RParen)?;
+                        self.expect_token(&Token::RightParen)?;
                         Ok(Expr { kind: ExprKind::FuncCall(name, args), span: span.merge(end) })
                     } else {
                         // &foo with no parens — call with current @_
@@ -1328,11 +1328,11 @@ impl Parser {
             // Typeglob: *foo, *$ref, *{expr}
             Token::Star => {
                 self.expect = Expect::Term;
-                if self.at(&Token::LBrace)? {
+                if self.at(&Token::LeftBrace)? {
                     self.advance()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
-                    self.expect_token(&Token::RBrace)?;
+                    self.expect_token(&Token::RightBrace)?;
                     Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Glob, Box::new(inner)) })
                 } else if let Token::Ident(_) = self.peek() {
                     let name_span = self.peek_span();
@@ -1363,7 +1363,7 @@ impl Parser {
 
                     // Peek past the Ident to check what follows.
                     self.ensure_current();
-                    let next_is_paren = matches!(self.peek(), Token::LParen);
+                    let next_is_paren = matches!(self.peek(), Token::LeftParen);
 
                     self.current = saved_current;
                     self.expect = saved_expect;
@@ -1446,7 +1446,7 @@ impl Parser {
             // eval BLOCK vs eval EXPR
             Token::Keyword(Keyword::Eval) => {
                 self.expect = Expect::Block(ExpectNext::Operator);
-                if self.at(&Token::LBrace)? {
+                if self.at(&Token::LeftBrace)? {
                     let block = self.parse_block()?;
                     Ok(Expr { span: span.merge(block.span), kind: ExprKind::EvalBlock(block) })
                 } else {
@@ -1460,7 +1460,7 @@ impl Parser {
             // return with optional value
             Token::Keyword(Keyword::Return) => {
                 self.expect = Expect::Term;
-                if self.at(&Token::Semi)? || self.at(&Token::RBrace)? || self.at_eof()? {
+                if self.at(&Token::Semi)? || self.at(&Token::RightBrace)? || self.at_eof()? {
                     Ok(Expr { kind: ExprKind::FuncCall("return".into(), vec![]), span })
                 } else {
                     let val = self.parse_expr(PREC_COMMA)?;
@@ -1503,49 +1503,49 @@ impl Parser {
             Token::Keyword(kw) if keyword::is_list_op(kw) => self.parse_list_op(kw, span),
 
             // Parenthesized expression or list
-            Token::LParen => {
+            Token::LeftParen => {
                 self.expect = Expect::Term;
-                if self.at(&Token::RParen)? {
+                if self.at(&Token::RightParen)? {
                     self.advance()?;
                     Ok(Expr { kind: ExprKind::List(vec![]), span })
                 } else {
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
-                    self.expect_token(&Token::RParen)?;
+                    self.expect_token(&Token::RightParen)?;
                     Ok(Expr { kind: ExprKind::Paren(Box::new(inner)), span: span.merge(end) })
                 }
             }
 
             // Anonymous array ref [...]
-            Token::LBracket => {
+            Token::LeftBracket => {
                 self.expect = Expect::Term;
                 let mut elems = Vec::new();
-                while !self.at(&Token::RBracket)? && !self.at_eof()? {
+                while !self.at(&Token::RightBracket)? && !self.at_eof()? {
                     elems.push(self.parse_expr(PREC_COMMA + 1)?);
                     if !self.eat(&Token::Comma)? {
                         break;
                     }
                 }
                 let end = self.peek_span();
-                self.expect_token(&Token::RBracket)?;
+                self.expect_token(&Token::RightBracket)?;
                 Ok(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) })
             }
 
             // Anonymous hash ref or block — depends on context
             // Anonymous hash constructor: {key => val, ...}
             // The lexer emits HashBrace for anon hashes (matching toke.c HASHBRACK).
-            // LBrace is kept as a fallback for robustness.
-            Token::HashBrace | Token::LBrace => {
+            // LeftBrace is kept as a fallback for robustness.
+            Token::HashBrace | Token::LeftBrace => {
                 self.expect = Expect::Term;
                 let mut elems = Vec::new();
-                while !self.at(&Token::RBrace)? && !self.at_eof()? {
+                while !self.at(&Token::RightBrace)? && !self.at_eof()? {
                     elems.push(self.parse_expr(PREC_COMMA + 1)?);
                     if !self.eat(&Token::Comma)? && !self.eat(&Token::FatComma)? {
                         break;
                     }
                 }
                 let end = self.peek_span();
-                self.expect_token(&Token::RBrace)?;
+                self.expect_token(&Token::RightBrace)?;
                 Ok(Expr { kind: ExprKind::AnonHash(elems), span: span.merge(end) })
             }
 
@@ -1617,7 +1617,7 @@ impl Parser {
             Token::Filetest(test_byte) => {
                 let test_char = test_byte as char;
                 // In autoquoting contexts (=> or }), treat as StringLit("-x")
-                if matches!(self.peek(), Token::FatComma | Token::RBrace) {
+                if matches!(self.peek(), Token::FatComma | Token::RightBrace) {
                     return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
                 }
                 let (target, end) = self.parse_stat_target(span)?;
@@ -1643,7 +1643,7 @@ impl Parser {
 
             Token::Keyword(Keyword::Do) => {
                 self.expect = Expect::Block(ExpectNext::Operator);
-                if self.at(&Token::LBrace)? {
+                if self.at(&Token::LeftBrace)? {
                     let block = self.parse_block()?;
                     Ok(Expr { span: span.merge(block.span), kind: ExprKind::DoBlock(block) })
                 } else {
@@ -1659,23 +1659,23 @@ impl Parser {
 
     fn parse_ident_term(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
         // Autoquote: bareword followed by `=>` (fat comma) or `}` (hash subscript)
-        if matches!(self.peek(), Token::FatComma | Token::RBrace) {
+        if matches!(self.peek(), Token::FatComma | Token::RightBrace) {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
 
         // Check if followed by `(` — function call
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             self.advance()?;
             self.expect = Expect::Term;
             let mut args = Vec::new();
-            while !self.at(&Token::RParen)? && !self.at_eof()? {
+            while !self.at(&Token::RightParen)? && !self.at_eof()? {
                 args.push(self.parse_expr(PREC_COMMA + 1)?);
                 if !self.eat(&Token::Comma)? {
                     break;
                 }
             }
             let end = self.peek_span();
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
             return Ok(Expr { kind: ExprKind::FuncCall(name, args), span: span.merge(end) });
         }
 
@@ -1691,17 +1691,17 @@ impl Parser {
 
                 // Optional args
                 let mut args = Vec::new();
-                if self.at(&Token::LParen)? {
+                if self.at(&Token::LeftParen)? {
                     self.advance()?;
                     self.expect = Expect::Term;
-                    while !self.at(&Token::RParen)? && !self.at_eof()? {
+                    while !self.at(&Token::RightParen)? && !self.at_eof()? {
                         args.push(self.parse_expr(PREC_COMMA + 1)?);
                         if !self.eat(&Token::Comma)? {
                             break;
                         }
                     }
                     let end = self.peek_span();
-                    self.expect_token(&Token::RParen)?;
+                    self.expect_token(&Token::RightParen)?;
                     return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(end) });
                 }
 
@@ -1716,17 +1716,17 @@ impl Parser {
                 let invocant = Expr { kind: ExprKind::ScalarVar(var), span: var_span };
 
                 let mut args = Vec::new();
-                if self.at(&Token::LParen)? {
+                if self.at(&Token::LeftParen)? {
                     self.advance()?;
                     self.expect = Expect::Term;
-                    while !self.at(&Token::RParen)? && !self.at_eof()? {
+                    while !self.at(&Token::RightParen)? && !self.at_eof()? {
                         args.push(self.parse_expr(PREC_COMMA + 1)?);
                         if !self.eat(&Token::Comma)? {
                             break;
                         }
                     }
                     let end = self.peek_span();
-                    self.expect_token(&Token::RParen)?;
+                    self.expect_token(&Token::RightParen)?;
                     return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(end) });
                 }
 
@@ -1744,7 +1744,7 @@ impl Parser {
         self.expect = Expect::Term;
 
         // Named unary with optional arg
-        if self.at(&Token::Semi)? || self.at_eof()? || self.at(&Token::RBrace)? || self.at(&Token::RParen)? {
+        if self.at(&Token::Semi)? || self.at_eof()? || self.at(&Token::RightBrace)? || self.at(&Token::RightParen)? {
             // No argument
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
         }
@@ -1756,11 +1756,11 @@ impl Parser {
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
         }
 
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             self.advance()?;
             let arg = self.parse_expr(PREC_LOW)?;
             let end = self.peek_span();
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: span.merge(end) });
         }
 
@@ -1783,11 +1783,11 @@ impl Parser {
         self.expect = Expect::Term;
 
         // Parenthesized form: stat($file), stat(_)
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             self.advance()?;
             let (target, _) = self.parse_stat_target_inner(start)?;
             let end = self.peek_span();
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
             return Ok((target, end));
         }
 
@@ -1798,7 +1798,7 @@ impl Parser {
     fn parse_stat_target_inner(&mut self, start: Span) -> Result<(StatTarget, Span), ParseError> {
         // No argument: ;, }, ), EOF, or // (defined-or, not empty regex —
         // matches toke.c's FTST macro setting XTERMORDORDOR).
-        if self.at(&Token::Semi)? || self.at(&Token::RBrace)? || self.at(&Token::RParen)? || self.at_eof()? || matches!(self.peek(), Token::DefinedOr) {
+        if self.at(&Token::Semi)? || self.at(&Token::RightBrace)? || self.at(&Token::RightParen)? || self.at_eof()? || matches!(self.peek(), Token::DefinedOr) {
             Ok((StatTarget::Default, start))
         } else if matches!(self.peek(), Token::Ident(name) if name == "_") {
             let end = self.peek_span();
@@ -1823,23 +1823,23 @@ impl Parser {
         self.expect = Expect::Term;
 
         // Check for parens
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             self.advance()?;
             let mut args = Vec::new();
-            while !self.at(&Token::RParen)? && !self.at_eof()? {
+            while !self.at(&Token::RightParen)? && !self.at_eof()? {
                 args.push(self.parse_expr(PREC_COMMA + 1)?);
                 if !self.eat(&Token::Comma)? {
                     break;
                 }
             }
             let end = self.peek_span();
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
             return Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end) });
         }
 
         // No parens — parse everything up to end of statement as args
         let mut args = Vec::new();
-        while !self.at(&Token::Semi)? && !self.at_eof()? && !self.at(&Token::RBrace)? {
+        while !self.at(&Token::Semi)? && !self.at_eof()? && !self.at(&Token::RightBrace)? {
             // Check for postfix control keywords
             if matches!(
                 self.peek(),
@@ -1869,24 +1869,24 @@ impl Parser {
         self.expect = Expect::Term;
 
         // Check for parens: sort(...), map(...), grep(...)
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             self.advance()?;
             let mut args = Vec::new();
             // Check for block as first arg inside parens
             self.expect = Expect::Block(ExpectNext::Term);
-            if self.at(&Token::LBrace)? {
+            if self.at(&Token::LeftBrace)? {
                 let block = self.parse_block()?;
                 args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
                 self.eat(&Token::Comma)?;
             }
-            while !self.at(&Token::RParen)? && !self.at_eof()? {
+            while !self.at(&Token::RightParen)? && !self.at_eof()? {
                 args.push(self.parse_expr(PREC_COMMA + 1)?);
                 if !self.eat(&Token::Comma)? {
                     break;
                 }
             }
             let end = self.peek_span();
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
             return Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end) });
         }
 
@@ -1894,7 +1894,7 @@ impl Parser {
 
         // Check for block or sub name as first arg
         self.expect = Expect::Block(ExpectNext::Term);
-        if self.at(&Token::LBrace)? {
+        if self.at(&Token::LeftBrace)? {
             let block = self.parse_block()?;
             args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
         } else if kw == Keyword::Sort {
@@ -1910,7 +1910,7 @@ impl Parser {
         }
 
         // Rest of arguments
-        while !self.at(&Token::Semi)? && !self.at_eof()? && !self.at(&Token::RBrace)? && !self.at(&Token::RParen)? {
+        while !self.at(&Token::Semi)? && !self.at_eof()? && !self.at(&Token::RightBrace)? && !self.at(&Token::RightParen)? {
             if matches!(
                 self.peek(),
                 Token::Keyword(Keyword::If)
@@ -1939,7 +1939,7 @@ impl Parser {
         self.expect = Expect::Term;
 
         // Handle optional parens — print(...) form
-        let in_parens = self.eat(&Token::LParen)?;
+        let in_parens = self.eat(&Token::LeftParen)?;
 
         // Try to detect filehandle before argument list.
         let filehandle = self.try_parse_print_filehandle()?;
@@ -1954,7 +1954,7 @@ impl Parser {
         }
 
         if in_parens {
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
         }
 
         let end_span = args.last().map(|a| a.span).unwrap_or(span);
@@ -1963,10 +1963,10 @@ impl Parser {
 
     /// Check whether we're at the end of a print argument list.
     fn at_print_end(&mut self, in_parens: bool) -> Result<bool, ParseError> {
-        if self.at(&Token::Semi)? || self.at_eof()? || self.at(&Token::RBrace)? {
+        if self.at(&Token::Semi)? || self.at_eof()? || self.at(&Token::RightBrace)? {
             return Ok(true);
         }
-        if in_parens && self.at(&Token::RParen)? {
+        if in_parens && self.at(&Token::RightParen)? {
             return Ok(true);
         }
         Ok(matches!(
@@ -2034,8 +2034,8 @@ impl Parser {
                     | Token::SpecialArrayVar(_)
                     | Token::SpecialHashVar(_)
                     | Token::Ident(_)
-                    | Token::LParen
-                    | Token::LBracket
+                    | Token::LeftParen
+                    | Token::LeftBracket
                     | Token::RegexLit(_, _, _)
                     | Token::SubstLit(_, _, _)
                     | Token::HeredocLit(_, _, _)
@@ -2081,18 +2081,18 @@ impl Parser {
 
     /// If `(` follows, parse arguments for a coderef call: `&$ref(args)`.
     fn maybe_call_args(&mut self, callee: Expr) -> Result<Expr, ParseError> {
-        if self.at(&Token::LParen)? {
+        if self.at(&Token::LeftParen)? {
             self.advance()?;
             self.expect = Expect::Term;
             let mut args = Vec::new();
-            while !self.at(&Token::RParen)? && !self.at_eof()? {
+            while !self.at(&Token::RightParen)? && !self.at_eof()? {
                 args.push(self.parse_expr(PREC_COMMA + 1)?);
                 if !self.eat(&Token::Comma)? {
                     break;
                 }
             }
             let end = self.peek_span();
-            self.expect_token(&Token::RParen)?;
+            self.expect_token(&Token::RightParen)?;
             Ok(Expr { span: callee.span.merge(end), kind: ExprKind::MethodCall(Box::new(callee), String::new(), args) })
         } else {
             Ok(callee)
@@ -2103,7 +2103,7 @@ impl Parser {
     /// Handles bareword autoquoting: `$hash{key}` → StringLit("key"),
     /// `$hash{-key}` → StringLit("-key").
     fn parse_hash_subscript_key(&mut self) -> Result<Expr, ParseError> {
-        // Bareword autoquoting ($hash{key}) handled by parse_ident_term (RBrace check).
+        // Bareword autoquoting ($hash{key}) handled by parse_ident_term (RightBrace check).
         // -bareword autoquoting ($hash{-key}) handled by parse_term Minus handler.
         self.expect = Expect::Term;
         self.parse_expr(PREC_LOW)
@@ -2113,20 +2113,20 @@ impl Parser {
         // Handle chained subscripts: $x[0][1], $x{a}{b}, $x[0]{key}
         loop {
             // After a term, we're in operator position — ensures {
-            // is lexed as LBrace (subscript), not HashBrace.
+            // is lexed as LeftBrace (subscript), not HashBrace.
             self.expect = Expect::Operator;
-            if self.at(&Token::LBracket)? {
+            if self.at(&Token::LeftBracket)? {
                 self.advance()?;
                 self.expect = Expect::Term;
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
-                self.expect_token(&Token::RBracket)?;
+                self.expect_token(&Token::RightBracket)?;
                 expr = Expr { span: expr.span.merge(end), kind: ExprKind::ArrayElem(Box::new(expr), Box::new(idx)) };
-            } else if self.at(&Token::LBrace)? {
+            } else if self.at(&Token::LeftBrace)? {
                 self.advance()?;
                 let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
-                self.expect_token(&Token::RBrace)?;
+                self.expect_token(&Token::RightBrace)?;
                 expr = Expr { span: expr.span.merge(end), kind: ExprKind::HashElem(Box::new(expr), Box::new(key)) };
             } else {
                 break;
@@ -2188,7 +2188,7 @@ impl Parser {
                     // then consume the } (which pops the context).
                     self.expect = Expect::Term;
                     let expr = self.parse_expr(PREC_LOW)?;
-                    self.expect_token(&Token::RBrace)?;
+                    self.expect_token(&Token::RightBrace)?;
                     parts.push(StringPart::ExprInterp(Box::new(expr)));
                 }
                 Token::Eof => {
@@ -2305,7 +2305,7 @@ impl Parser {
             // Comma / fat comma — build a list
             Token::Comma | Token::FatComma => {
                 self.expect = Expect::Term;
-                if self.at(&Token::Semi)? || self.at(&Token::RParen)? || self.at(&Token::RBracket)? || self.at(&Token::RBrace)? || self.at_eof()? {
+                if self.at(&Token::Semi)? || self.at(&Token::RightParen)? || self.at(&Token::RightBracket)? || self.at(&Token::RightBrace)? || self.at_eof()? {
                     // Trailing comma
                     return Ok(left);
                 }
@@ -2353,56 +2353,56 @@ impl Parser {
             Token::Ident(name) => {
                 self.advance()?;
                 // Method call: ->method(...)
-                if self.at(&Token::LParen)? {
+                if self.at(&Token::LeftParen)? {
                     self.advance()?;
                     self.expect = Expect::Term;
                     let mut args = Vec::new();
-                    while !self.at(&Token::RParen)? && !self.at_eof()? {
+                    while !self.at(&Token::RightParen)? && !self.at_eof()? {
                         args.push(self.parse_expr(PREC_COMMA + 1)?);
                         if !self.eat(&Token::Comma)? {
                             break;
                         }
                     }
                     let end = self.peek_span();
-                    self.expect_token(&Token::RParen)?;
+                    self.expect_token(&Token::RightParen)?;
                     Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), name, args) })
                 } else {
                     // Bare method call with no parens
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::MethodCall(Box::new(left), name, vec![]) })
                 }
             }
-            Token::LBracket => {
+            Token::LeftBracket => {
                 self.advance()?;
                 self.expect = Expect::Term;
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
-                self.expect_token(&Token::RBracket)?;
+                self.expect_token(&Token::RightBracket)?;
                 let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArrayElem(Box::new(idx))) };
                 // Handle chained subscripts: $ref->[0][1], $ref->[0]{key}
                 self.maybe_postfix_subscript(expr)
             }
-            Token::LBrace => {
+            Token::LeftBrace => {
                 self.advance()?;
                 let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
-                self.expect_token(&Token::RBrace)?;
+                self.expect_token(&Token::RightBrace)?;
                 let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::HashElem(Box::new(key))) };
                 // Handle chained subscripts: $ref->{a}{b}, $ref->{a}[0]
                 self.maybe_postfix_subscript(expr)
             }
-            Token::LParen => {
+            Token::LeftParen => {
                 // ->(...) — coderef call
                 self.advance()?;
                 self.expect = Expect::Term;
                 let mut args = Vec::new();
-                while !self.at(&Token::RParen)? && !self.at_eof()? {
+                while !self.at(&Token::RightParen)? && !self.at_eof()? {
                     args.push(self.parse_expr(PREC_COMMA + 1)?);
                     if !self.eat(&Token::Comma)? {
                         break;
                     }
                 }
                 let end = self.peek_span();
-                self.expect_token(&Token::RParen)?;
+                self.expect_token(&Token::RightParen)?;
                 Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), String::new(), args) })
             }
             // Dynamic method dispatch: ->$method or ->$method(args)
@@ -2410,18 +2410,18 @@ impl Parser {
                 let var_span = self.peek_span();
                 self.advance()?;
                 let method_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
-                if self.at(&Token::LParen)? {
+                if self.at(&Token::LeftParen)? {
                     self.advance()?;
                     self.expect = Expect::Term;
                     let mut args = Vec::new();
-                    while !self.at(&Token::RParen)? && !self.at_eof()? {
+                    while !self.at(&Token::RightParen)? && !self.at_eof()? {
                         args.push(self.parse_expr(PREC_COMMA + 1)?);
                         if !self.eat(&Token::Comma)? {
                             break;
                         }
                     }
                     let end = self.peek_span();
-                    self.expect_token(&Token::RParen)?;
+                    self.expect_token(&Token::RightParen)?;
                     Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DynMethod(Box::new(method_expr), args)) })
                 } else {
                     Ok(Expr {
@@ -4754,13 +4754,13 @@ mod tests {
     #[test]
     fn parse_assign_shift_l() {
         let e = parse_expr_str("$x <<= 2;");
-        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ShiftLEq, _, _)));
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ShiftLeftEq, _, _)));
     }
 
     #[test]
     fn parse_assign_shift_r() {
         let e = parse_expr_str("$x >>= 2;");
-        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ShiftREq, _, _)));
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::ShiftRightEq, _, _)));
     }
 
     // ═══════════════════════════════════════════════════════════
