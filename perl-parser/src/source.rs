@@ -8,6 +8,8 @@
 //!
 //! See design document §5.4 for the full design rationale.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 
 use crate::error::ParseError;
@@ -138,9 +140,9 @@ pub(crate) struct LexerSource {
     line_number: usize,
     /// Stack of active heredoc contexts.
     heredoc_stack: Vec<HeredocContext>,
-    /// A line queued for delivery on the next `next_line()` call.
-    /// Used to deliver the saved remainder after a heredoc finishes.
-    queued_line: Option<LexerLine>,
+    /// Lines queued for delivery by future `next_line()` calls.
+    /// Used for heredoc remainder delivery and `push_back`.
+    queued_lines: VecDeque<LexerLine>,
     /// Indentation prefix to strip from every non-empty line.
     /// Set by `start_indented_heredoc`, restored when the heredoc
     /// finishes.
@@ -169,7 +171,7 @@ impl LexerSource {
             cursor: 0,
             line_number: 1,
             heredoc_stack: Vec::new(),
-            queued_line: None,
+            queued_lines: VecDeque::new(),
             required_indent: None,
             terminator_pending: false,
         }
@@ -178,7 +180,15 @@ impl LexerSource {
     /// Create a new `LexerSource` from an existing `Bytes` buffer.
     /// Zero-copy — just a refcount bump.
     pub fn from_bytes(src: Bytes) -> Self {
-        LexerSource { src, cursor: 0, line_number: 1, heredoc_stack: Vec::new(), queued_line: None, required_indent: None, terminator_pending: false }
+        LexerSource {
+            src,
+            cursor: 0,
+            line_number: 1,
+            heredoc_stack: Vec::new(),
+            queued_lines: VecDeque::new(),
+            required_indent: None,
+            terminator_pending: false,
+        }
     }
 
     /// Current byte position in the source buffer.
@@ -200,7 +210,7 @@ impl LexerSource {
         // If heredoc stack shrank, clear stale state from undone heredocs.
         if heredoc_depth < self.heredoc_stack.len() {
             self.heredoc_stack.truncate(heredoc_depth);
-            self.queued_line = None;
+            self.queued_lines.clear();
             self.terminator_pending = false;
         }
     }
@@ -221,6 +231,13 @@ impl LexerSource {
         &self.src[start..end]
     }
 
+    /// Push lines to be returned by future `next_line()` calls,
+    /// ahead of any lines read from the source.
+    pub fn push_back(&mut self, mut lines: VecDeque<LexerLine>) {
+        lines.append(&mut self.queued_lines);
+        self.queued_lines = lines;
+    }
+
     /// Get the next line.
     ///
     /// Returns `Ok(Some(line))` for content, `Ok(None)` when a heredoc
@@ -230,7 +247,7 @@ impl LexerSource {
     ///
     /// `peek_heredoc`: when true and a heredoc terminator is found,
     /// returns `Ok(None)` without consuming the signal — the heredoc
-    /// context stays on the stack and `queued_line` is not set.
+    /// context stays on the stack and `queued_lines` is not modified.
     /// The next call with `peek_heredoc=false` will consume it.
     pub fn next_line(&mut self, peek_heredoc: bool) -> Result<Option<LexerLine>, ParseError> {
         // 0. If a terminator was found during a previous peek call,
@@ -241,15 +258,15 @@ impl LexerSource {
                 self.terminator_pending = false;
                 if let Some(ctx) = self.heredoc_stack.pop() {
                     self.required_indent = ctx.prev_indent;
-                    self.queued_line = Some(ctx.saved_line);
+                    self.queued_lines.push_back(ctx.saved_line);
                 }
             }
             return Ok(None);
         }
 
-        // 1. Return queued line if present (saved remainder from a
-        //    completed heredoc — not subject to terminator check).
-        if let Some(line) = self.queued_line.take() {
+        // 1. Return queued line if present (from heredoc remainder
+        //    or push_back — not subject to terminator check).
+        if let Some(line) = self.queued_lines.pop_front() {
             return Ok(Some(line));
         }
 
@@ -279,7 +296,7 @@ impl LexerSource {
                 // Consume mode: pop the heredoc context.
                 if let Some(ctx) = self.heredoc_stack.pop() {
                     self.required_indent = ctx.prev_indent;
-                    self.queued_line = Some(ctx.saved_line);
+                    self.queued_lines.push_back(ctx.saved_line);
                 }
             }
             return Ok(None);
