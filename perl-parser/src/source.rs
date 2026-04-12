@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 
 use crate::error::ParseError;
+use crate::lexer::matching_delimiter;
 use crate::span::Span;
 
 // ── LexerLine ─────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ pub(crate) struct LexerSource {
     /// Stack of active heredoc contexts.
     heredoc_stack: Vec<HeredocContext>,
     /// Lines queued for delivery by future `next_line()` calls.
-    /// Used for heredoc remainder delivery and `push_back`.
+    /// Used for heredoc remainder delivery, push_back, and subst bodies.
     queued_lines: VecDeque<LexerLine>,
     /// Indentation prefix to strip from every non-empty line.
     /// Set by `start_indented_heredoc`, restored when the heredoc
@@ -150,6 +151,13 @@ pub(crate) struct LexerSource {
     /// Set when a heredoc terminator was found during a peek call.
     /// The next consuming call will pop the heredoc context.
     terminator_pending: bool,
+    /// Set when the queued body lines of a substitution have been
+    /// delivered.  The next `next_line` returns `None` (virtual EOF),
+    /// then delivers the saved remainder.
+    subst_eof_pending: bool,
+    /// Line to deliver after the virtual EOF of a subst body.
+    /// Contains the remainder of the source line after the flags.
+    subst_saved_line: Option<LexerLine>,
 }
 
 /// A raw line read from the source buffer before indent processing.
@@ -174,6 +182,8 @@ impl LexerSource {
             queued_lines: VecDeque::new(),
             required_indent: None,
             terminator_pending: false,
+            subst_eof_pending: false,
+            subst_saved_line: None,
         }
     }
 
@@ -188,6 +198,8 @@ impl LexerSource {
             queued_lines: VecDeque::new(),
             required_indent: None,
             terminator_pending: false,
+            subst_eof_pending: false,
+            subst_saved_line: None,
         }
     }
 
@@ -264,10 +276,22 @@ impl LexerSource {
             return Ok(None);
         }
 
-        // 1. Return queued line if present (from heredoc remainder
-        //    or push_back — not subject to terminator check).
+        // 1. Return queued line if present (from heredoc remainder,
+        //    push_back, or subst body — not subject to terminator check).
         if let Some(line) = self.queued_lines.pop_front() {
             return Ok(Some(line));
+        }
+
+        // 1b. Subst body virtual EOF — all body lines delivered.
+        if self.subst_eof_pending {
+            if !peek_heredoc {
+                // Consume: queue the saved remainder for next call.
+                self.subst_eof_pending = false;
+                if let Some(saved) = self.subst_saved_line.take() {
+                    self.queued_lines.push_back(saved);
+                }
+            }
+            return Ok(None);
         }
 
         // 2. Read next raw line from source.
@@ -335,6 +359,83 @@ impl LexerSource {
         let prev_indent = self.required_indent.clone();
 
         self.heredoc_stack.push(HeredocContext { tag, saved_line: line, prev_indent });
+    }
+
+    /// Begin processing a substitution replacement body.
+    ///
+    /// Takes the current line, scans ahead to find the closing
+    /// delimiter and flags, then queues the body lines for delivery
+    /// with a virtual EOF at the end.  The remainder of the source
+    /// line after the flags is saved for delivery after the EOF.
+    ///
+    /// Returns the captured flags (or None if no flags).
+    pub fn start_subst_body(&mut self, delim: u8, current_line: &mut Option<LexerLine>) -> Result<Option<String>, ParseError> {
+        let mut line = current_line.take().expect("start_subst_body: must have current line");
+
+        let (open, close) = matching_delimiter(delim);
+        let mut body_lines: VecDeque<LexerLine> = VecDeque::new();
+        let mut pos = line.pos;
+        let mut depth = 0u32;
+
+        loop {
+            if pos >= line.line.len() {
+                // Line exhausted — queue it as a body line.
+                body_lines.push_back(line);
+                match self.next_line(false)? {
+                    Some(next) => {
+                        line = next;
+                        pos = 0;
+                        continue;
+                    }
+                    None => {
+                        // EOF inside replacement body.
+                        self.push_back(body_lines);
+                        return Err(ParseError::new("unterminated substitution", Span::new(0, self.src.len() as u32)));
+                    }
+                }
+            }
+
+            let b = line.line[pos];
+            if b == b'\\' {
+                pos += 2;
+            } else if b == close && depth == 0 {
+                // Found closing delimiter at `pos`.
+                // Body content on this line: everything before `pos`.
+                let truncated = LexerLine {
+                    line: line.line.slice(..pos),
+                    offset: line.offset,
+                    pos: if body_lines.is_empty() { line.pos } else { 0 },
+                    terminated: false, // virtual EOF, no newline
+                    number: line.number,
+                };
+                body_lines.push_back(truncated);
+
+                // Read flags starting after the delimiter.
+                let mut flag_end = pos + 1;
+                while flag_end < line.line.len() && (line.line[flag_end].is_ascii_alphanumeric() || line.line[flag_end] == b'_') {
+                    flag_end += 1;
+                }
+                let flags = if flag_end > pos + 1 { Some(String::from_utf8_lossy(&line.line[pos + 1..flag_end]).into_owned()) } else { None };
+
+                // Saved remainder: rest of the line after flags.
+                let saved = LexerLine { line: line.line.clone(), offset: line.offset, pos: flag_end, terminated: line.terminated, number: line.number };
+
+                // Queue body lines and set up virtual EOF.
+                self.push_back(body_lines);
+                self.subst_eof_pending = true;
+                self.subst_saved_line = Some(saved);
+
+                return Ok(flags);
+            } else if open == Some(b) {
+                depth += 1;
+                pos += 1;
+            } else if b == close {
+                depth -= 1;
+                pos += 1;
+            } else {
+                pos += 1;
+            }
+        }
     }
 
     // ── Internal methods ──────────────────────────────────────────
