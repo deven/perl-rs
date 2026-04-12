@@ -1,34 +1,32 @@
 //! Lexer expectation state.
 //!
 //! The `Expect` enum tells the lexer how to resolve context-sensitive
-//! tokens: `/` (regex vs division), `{` (block vs hash), and `(`
-//! (prototype vs grouping).  The parser sets this before each peek
-//! to communicate syntactic context to the lexer.
+//! tokens: `/` (regex vs division) and `%` (hash sigil vs modulo).
+//! The parser sets this before each peek to communicate syntactic
+//! context to the lexer.
 //!
 //! Maps to Perl 5's `PL_expect` states.  `XTERMORDORDOR` is folded
 //! into `Term` (we always lex `//` as defined-or), and the five block
 //! variants are collapsed into `Block(ExpectNext)`, where `ExpectNext`
-//! carries the state to restore after `}` — the equivalent of Perl's
-//! bracket stack.  `Prototype` has no `PL_expect` equivalent.
+//! carries the state to restore after `}`.
 
 /// Lexer expectation state.
 ///
 /// Set by the parser before each peek to tell the lexer how to resolve
-/// context-sensitive tokens (`/`, `{`, `(`).
+/// context-sensitive tokens (`/`, `%`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Expect {
     /// Expecting a term (value, prefix operator, or keyword).
-    /// `/` starts a regex; `{` is a hash constructor.
+    /// `/` starts a regex; `%` is a hash sigil.
     #[default]
     Term, // XTERM | XTERMORDORDOR
 
     /// Expecting an infix or postfix operator.
-    /// `/` is division; `{` is a block brace.
+    /// `/` is division; `%` is modulo.
     Operator, // XOPERATOR
 
     /// Start of a statement.  Like Term, but labels are allowed
     /// and statement-level declarations (format, sub) are valid.
-    /// `/` starts a regex; `{` uses the byte-level heuristic.
     Statement, // XSTATE
 
     /// Expecting `{` to open a block.
@@ -36,15 +34,10 @@ pub enum Expect {
     Block(ExpectNext), // XBLOCK | XATTRBLOCK | XATTRTERM | XTERMBLOCK | XBLOCKTERM
 
     /// After a sigil (`$`, `@`, `%`, `&`) for dereference.
-    /// `{` is a deref block, not a hash constructor.
     Deref, // XREF
 
     /// After `->` for postfix dereference (`->@*`, `->$*`, `->%*`).
     Postderef, // XPOSTDEREF
-
-    /// After `sub name` (without `use feature 'signatures'`).
-    /// `(` scans a raw prototype string instead of tokenizing.
-    Prototype,
 }
 
 /// What to expect after a block's closing `}`.
@@ -71,23 +64,23 @@ pub enum ExpectNext {
 impl Expect {
     /// Are we in a position where `/` should be a regex?
     pub fn slash_is_regex(&self) -> bool {
-        matches!(self, Expect::Term | Expect::Statement | Expect::Deref)
+        matches!(self, Expect::Term | Expect::Statement | Expect::Block(_) | Expect::Deref)
     }
 
     /// Are we expecting a term (value, prefix, keyword)?
     pub fn expecting_term(&self) -> bool {
-        matches!(self, Expect::Term | Expect::Statement | Expect::Deref)
+        matches!(self, Expect::Term | Expect::Statement | Expect::Block(_) | Expect::Deref)
     }
 
     /// Whether two expects produce identical lexer behavior.
-    /// Statement and Term are equivalent for the lexer: both expect
-    /// a term, both treat `/` as regex, both treat `<<` as heredoc.
-    /// The only difference (`{` heuristic vs always-hash) is handled
-    /// at the parser level before any expect transition.
+    /// All term-like states (Term, Statement, Block, Deref) are
+    /// equivalent for the lexer: `/` is regex, `%` is hash sigil.
+    /// Operator and Postderef are equivalent: `/` is divide, `%`
+    /// is modulo.
     pub fn lexer_equivalent(&self, other: &Expect) -> bool {
         if self == other {
             return true;
         }
-        matches!((self, other), (Expect::Statement, Expect::Term) | (Expect::Term, Expect::Statement))
+        self.expecting_term() == other.expecting_term()
     }
 }

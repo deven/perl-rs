@@ -17,20 +17,27 @@ use crate::span::Span;
 use crate::token::*;
 
 /// Sublexing context — tracks what mode the lexer is in.
+///
+/// When `expr_depth > 0`, the lexer is in expression-parsing mode
+/// inside `${expr}` or `@{expr}`.  When `expr_depth == 0`, the
+/// lexer is in body-scanning mode (string/regex content).
 #[derive(Clone, Debug)]
-enum LexContext {
-    /// Inside an interpolating string ("...", qq//, `...`, heredoc body).
-    /// `close` is `None` for heredocs (end signaled by LexerSource).
-    Interpolating {
-        close: Option<u8>,
-        /// For paired delimiters like qq{...}, the open delimiter
-        /// for nesting depth tracking.  None for non-paired (qq//).
-        open: Option<u8>,
-        depth: u32,
-    },
-    /// Inside `${expr}` or `@{expr}` — normal code lexing, but
-    /// when `}` is reached at depth 0, pop back to Interpolating.
-    ExprInString { depth: u32 },
+struct LexContext {
+    /// Opening delimiter byte.  `None` for heredocs (end signaled
+    /// by LexerSource).
+    delim: Option<u8>,
+    /// Delimiter nesting depth (for paired delimiters like `{}`).
+    depth: u32,
+    /// Brace depth inside `${expr}` or `@{expr}`.  When > 0,
+    /// the lexer produces normal code tokens.  When 0, it
+    /// produces string body tokens via `lex_body`.
+    expr_depth: u32,
+    /// Whether `$`/`@` trigger interpolation.
+    interpolating: bool,
+    /// Whether escapes pass through raw (for regex, tr, prototypes).
+    raw: bool,
+    /// Whether to detect `(?{...})` code blocks (regex mode).
+    regex: bool,
 }
 
 /// Saved lexer state for checkpoint/restore (used by the parser's
@@ -39,6 +46,9 @@ enum LexContext {
 pub(crate) struct LexerCheckpoint {
     pub line: Option<LexerLine>,
     pub context_depth: usize,
+    /// Saved expr_depth of the top context (if any) for restoring
+    /// modifications made during speculative lexing.
+    pub top_expr_depth: Option<u32>,
     pub source_cursor: usize,
     pub source_line_number: usize,
     pub heredoc_depth: usize,
@@ -76,6 +86,7 @@ impl Lexer {
         LexerCheckpoint {
             line: self.current_line.clone(),
             context_depth: self.context_stack.len(),
+            top_expr_depth: self.context_stack.last().map(|ctx| ctx.expr_depth),
             source_cursor: self.source.cursor(),
             source_line_number: self.source.line_number(),
             heredoc_depth: self.source.heredoc_depth(),
@@ -87,6 +98,9 @@ impl Lexer {
     pub fn restore(&mut self, cp: LexerCheckpoint) {
         self.current_line = cp.line;
         self.context_stack.truncate(cp.context_depth);
+        if let (Some(ctx), Some(saved)) = (self.context_stack.last_mut(), cp.top_expr_depth) {
+            ctx.expr_depth = saved;
+        }
         self.source.set_cursor(cp.source_cursor, cp.source_line_number, cp.heredoc_depth);
     }
 
@@ -325,32 +339,28 @@ impl Lexer {
     pub fn next_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
         // If inside a sublexing context, dispatch there.
         match self.context_stack.last() {
-            Some(LexContext::Interpolating { close, open, depth }) => {
-                let (close, open, depth) = (*close, *open, *depth);
-                return self.lex_interp_token(close, open, depth);
-            }
-            Some(LexContext::ExprInString { .. }) => {
+            Some(ctx) if ctx.expr_depth > 0 => {
                 // Normal code lexing inside ${expr} or @{expr}.
                 let result = self.lex_normal_token(expect)?;
                 // Track brace depth to find the closing }.
                 match &result.token {
                     Token::LeftBrace => {
-                        if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
-                            *d += 1;
+                        if let Some(ctx) = self.context_stack.last_mut() {
+                            ctx.expr_depth += 1;
                         }
                     }
                     Token::RightBrace => {
-                        if let Some(LexContext::ExprInString { depth: d }) = self.context_stack.last_mut() {
-                            if *d == 0 {
-                                self.context_stack.pop();
-                            } else {
-                                *d -= 1;
-                            }
+                        if let Some(ctx) = self.context_stack.last_mut() {
+                            ctx.expr_depth -= 1;
                         }
                     }
                     _ => {}
                 }
                 return Ok(result);
+            }
+            Some(ctx) => {
+                let (delim, depth, interpolating, raw, regex) = (ctx.delim, ctx.depth, ctx.interpolating, ctx.raw, ctx.regex);
+                return self.lex_body(delim, depth, interpolating, regex, raw);
             }
             None => {}
         }
@@ -394,12 +404,12 @@ impl Lexer {
             b'\'' => self.lex_single_quoted_string()?,
             b'"' => {
                 self.skip(1); // skip opening "
-                self.context_stack.push(LexContext::Interpolating { close: Some(b'"'), open: None, depth: 0 });
+                self.context_stack.push(LexContext { delim: Some(b'"'), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
                 Token::QuoteBegin(QuoteKind::Double, b'"')
             }
             b'`' => {
                 self.skip(1); // skip opening `
-                self.context_stack.push(LexContext::Interpolating { close: Some(b'`'), open: None, depth: 0 });
+                self.context_stack.push(LexContext { delim: Some(b'`'), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
                 Token::QuoteBegin(QuoteKind::Backtick, b'`')
             }
 
@@ -450,14 +460,7 @@ impl Lexer {
             }
             b'(' => {
                 self.skip(1);
-                if *expect == Expect::Prototype {
-                    // Prototype scanning: read raw bytes until matching ).
-                    // Matches toke.c's scan_str() call in yyl_sub().
-                    let content = self.scan_body(b'(', b')', false)?;
-                    Token::Prototype(content)
-                } else {
-                    Token::LeftParen
-                }
+                Token::LeftParen
             }
             b')' => {
                 self.skip(1);
@@ -1082,16 +1085,43 @@ impl Lexer {
 
     fn lex_single_quoted_string(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip opening '
-        let s = self.scan_body(b'\'', b'\'', true)?;
+        let s = self.lex_body_str(b'\'', false)?;
         Ok(Token::StrLit(s))
     }
 
-    // ── Interpolating string sublexer (§5.4) ────────────────────
+    // ── Unified string/regex body scanner (§5.4) ──────────────────
 
-    /// Lex one sub-token from inside an interpolating string.
-    /// Called when the context stack top is `Interpolating`.
-    /// `close` is `None` for heredocs (end signaled by LexerSource).
-    fn lex_interp_token(&mut self, close: Option<u8>, open: Option<u8>, depth: u32) -> Result<Spanned, ParseError> {
+    /// Scan one token from a string/regex body.
+    ///
+    /// In interpolating mode (called repeatedly via context stack):
+    /// returns one sub-token per call — `ConstSegment`, `InterpScalar`,
+    /// `InterpScalarExprStart`, etc.  Returns `QuoteEnd` when the
+    /// closing delimiter is reached.
+    ///
+    /// In non-interpolating mode (called once by q//, '...', etc.):
+    /// scans the entire body and returns a single `ConstSegment`.
+    /// The closing delimiter is consumed.
+    ///
+    /// Escape handling is controlled by the flags:
+    /// - `!raw && !interpolating`: literal escapes (`\\`→`\`,
+    ///   `\delim`→delim).  For `q//`, `'...'`.
+    /// - `!raw && interpolating`: double-quote escapes (`\n`,
+    ///   `\t`, etc.) via `process_escape`.  For `qq//`, `"..."`.
+    /// - `raw`: passthrough (backslash prevents delimiter
+    ///   matching but both bytes are kept).  For `m//`, `tr//`.
+    /// - `regex`: detect `(?{...})` code blocks (future).
+    fn lex_body(&mut self, delim: Option<u8>, depth: u32, interpolating: bool, _regex: bool, raw: bool) -> Result<Spanned, ParseError> {
+        // Compute open/close from the delimiter.
+        // None means heredoc (no delimiter — end signaled by LexerSource).
+        let (open, close) = match delim {
+            Some(b'(') => (Some(b'('), Some(b')')),
+            Some(b'[') => (Some(b'['), Some(b']')),
+            Some(b'{') => (Some(b'{'), Some(b'}')),
+            Some(b'<') => (Some(b'<'), Some(b'>')),
+            Some(d) => (None, Some(d)),
+            None => (None, None),
+        };
+
         let start = self.span_pos();
 
         // For heredocs, ensure we have a line loaded.
@@ -1119,22 +1149,28 @@ impl Lexer {
         // Check for closing delimiter (not for heredocs — close is None).
         if let Some(c) = close {
             if b == c && depth == 0 {
-                self.skip(1);
-                self.context_stack.pop();
-                return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
+                if interpolating {
+                    self.skip(1);
+                    self.context_stack.pop();
+                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
+                }
+                // Non-interpolating: closing delimiter is consumed
+                // by the main loop below as the exit condition.
             }
         }
 
-        // Check for interpolation.
-        if b == b'$' {
-            return self.lex_interp_scalar(start);
-        }
-        if b == b'@' {
-            return self.lex_interp_array(start);
+        // Check for interpolation (only in interpolating mode).
+        if interpolating {
+            if b == b'$' {
+                return self.lex_interp_scalar(start);
+            }
+            if b == b'@' {
+                return self.lex_interp_array(start);
+            }
         }
 
-        // Otherwise, scan a ConstSegment: everything until we hit
-        // $, @, the closing delimiter, or end of line.
+        // Scan a ConstSegment: everything until we hit the closing
+        // delimiter (or $/@/end-of-line in interpolating mode).
         let mut s = String::new();
         let mut current_depth = depth;
 
@@ -1145,9 +1181,6 @@ impl Lexer {
                     let terminated = self.current_line.as_ref().is_some_and(|l| l.terminated);
                     if close.is_none() {
                         // Heredoc: push newline, drop line, break.
-                        // Next call to lex_interp_token will ensure_line,
-                        // which either gets the next body line or detects
-                        // heredoc end (QuoteEnd).
                         if terminated {
                             s.push('\n');
                         }
@@ -1166,11 +1199,52 @@ impl Lexer {
                         break; // unterminated line — EOF
                     }
                 }
-                Some(b) if Some(b) == close && current_depth == 0 => break,
-                Some(b'$') | Some(b'@') => break,
+                Some(b) if Some(b) == close && current_depth == 0 => {
+                    if !interpolating {
+                        // Non-interpolating: consume the closing
+                        // delimiter as part of this scan.
+                        self.skip(1);
+                    }
+                    break;
+                }
+                Some(b'$') | Some(b'@') if interpolating => break,
                 Some(b'\\') => {
                     self.skip(1);
-                    self.process_escape(&mut s, close);
+                    if raw {
+                        // Raw: backslash prevents delimiter matching.
+                        // For \delim, consume the delimiter (backslash
+                        // dropped).  For everything else, keep both.
+                        if let Some(next) = self.peek_byte() {
+                            if Some(next) == close || Some(next) == open {
+                                self.skip(1);
+                                s.push(next as char);
+                            } else {
+                                s.push('\\');
+                            }
+                        } else {
+                            s.push('\\');
+                        }
+                    } else if interpolating {
+                        // Double-quote escapes.
+                        self.process_escape(&mut s, close);
+                    } else {
+                        // Literal (single-quote) escapes.
+                        match self.peek_byte() {
+                            Some(b'\\') => {
+                                self.skip(1);
+                                s.push('\\');
+                            }
+                            Some(b) if Some(b) == close => {
+                                self.skip(1);
+                                s.push(b as char);
+                            }
+                            Some(b) if Some(b) == open => {
+                                self.skip(1);
+                                s.push(b as char);
+                            }
+                            _ => s.push('\\'),
+                        }
+                    }
                 }
                 Some(b) if Some(b) == open => {
                     current_depth += 1;
@@ -1189,12 +1263,29 @@ impl Lexer {
             }
         }
 
-        // Update depth in context stack.
-        if let Some(LexContext::Interpolating { depth: d, .. }) = self.context_stack.last_mut() {
-            *d = current_depth;
+        // Update depth in context stack (only relevant for
+        // interpolating mode with paired delimiters).
+        if interpolating {
+            if let Some(ctx) = self.context_stack.last_mut() {
+                ctx.depth = current_depth;
+            }
         }
 
         Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.span_pos()) })
+    }
+
+    /// Non-interpolating convenience: scan the entire body and return
+    /// the content as a String.  The closing delimiter is consumed.
+    ///
+    /// `raw` selects escape handling:
+    /// - `false`: single-quote escapes (`\\`→`\`, `\delim`→delim).
+    /// - `true`: raw passthrough (`\delim`→delim, else pass through).
+    pub fn lex_body_str(&mut self, delim: u8, raw: bool) -> Result<String, ParseError> {
+        let spanned = self.lex_body(Some(delim), 0, false, false, raw)?;
+        match spanned.token {
+            Token::ConstSegment(s) => Ok(s),
+            _ => unreachable!("lex_body in non-interpolating mode should return ConstSegment"),
+        }
     }
 
     /// Process a backslash escape inside a double-quoted string.
@@ -1311,8 +1402,10 @@ impl Lexer {
                 }
             }
             // Expression interpolation: ${\ expr}, ${$ref}, etc.
-            // Push ExprInString — next tokens are normal code until }.
-            self.context_stack.push(LexContext::ExprInString { depth: 0 });
+            // Enter expression-parsing mode — normal code until }.
+            if let Some(ctx) = self.context_stack.last_mut() {
+                ctx.expr_depth = 1;
+            }
             return Ok(Spanned { token: Token::InterpScalarExprStart, span: Span::new(start, self.span_pos()) });
         }
 
@@ -1333,7 +1426,9 @@ impl Lexer {
         // @{...} form — expression interpolation: @{[ expr ]}
         if self.peek_byte() == Some(b'{') {
             self.skip(1); // skip {
-            self.context_stack.push(LexContext::ExprInString { depth: 0 });
+            if let Some(ctx) = self.context_stack.last_mut() {
+                ctx.expr_depth = 1;
+            }
             return Ok(Spanned { token: Token::InterpArrayExprStart, span: Span::new(start, self.span_pos()) });
         }
 
@@ -1366,28 +1461,26 @@ impl Lexer {
     // ── q// qq// qw// ─────────────────────────────────────────
 
     fn lex_q_string(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let s = self.scan_body(open, close, true)?;
+        let delim = self.read_quote_delimiter()?;
+        let s = self.lex_body_str(delim, false)?;
         Ok(Token::StrLit(s))
     }
 
     fn lex_qq_string(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let paired_open = if open != close { Some(open) } else { None };
-        self.context_stack.push(LexContext::Interpolating { close: Some(close), open: paired_open, depth: 0 });
-        Ok(Token::QuoteBegin(QuoteKind::Double, open))
+        let delim = self.read_quote_delimiter()?;
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+        Ok(Token::QuoteBegin(QuoteKind::Double, delim))
     }
 
     fn lex_qx(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let paired_open = if open != close { Some(open) } else { None };
-        self.context_stack.push(LexContext::Interpolating { close: Some(close), open: paired_open, depth: 0 });
-        Ok(Token::QuoteBegin(QuoteKind::Backtick, open))
+        let delim = self.read_quote_delimiter()?;
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+        Ok(Token::QuoteBegin(QuoteKind::Backtick, delim))
     }
 
     fn lex_qw(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let body = self.scan_body(open, close, false)?;
+        let delim = self.read_quote_delimiter()?;
+        let body = self.lex_body_str(delim, true)?;
         let words: Vec<String> = body.split_whitespace().map(String::from).collect();
         Ok(Token::QwList(words))
     }
@@ -1396,31 +1489,31 @@ impl Lexer {
 
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let pattern = self.scan_body(open, close, false)?;
+        let delim = self.read_quote_delimiter()?;
+        let pattern = self.lex_body_str(delim, true)?;
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
     }
 
     /// `qr/pattern/flags` or `qr{pattern}flags`
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let pattern = self.scan_body(open, close, false)?;
+        let delim = self.read_quote_delimiter()?;
+        let pattern = self.lex_body_str(delim, true)?;
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::RegexLit(RegexKind::Qr, pattern, flags))
     }
 
     /// `s/pattern/replacement/flags` or `s{pattern}{replacement}flags`
     fn lex_s(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let pattern = self.scan_body(open, close, false)?;
-        // For paired delimiters like s{pat}{repl}, read a new pair.
-        // For same-char delimiters like s/pat/repl/, reuse the same delimiter.
-        let replacement = if open != close {
-            let (_open2, close2) = self.read_quote_delimiters()?;
-            self.scan_body(_open2, close2, false)?
+        let delim = self.read_quote_delimiter()?;
+        let pattern = self.lex_body_str(delim, true)?;
+        // For paired delimiters like s{pat}{repl}, read a new delimiter.
+        // For same-char delimiters like s/pat/repl/, reuse the same one.
+        let replacement = if Self::is_paired(delim) {
+            let delim2 = self.read_quote_delimiter()?;
+            self.lex_body_str(delim2, true)?
         } else {
-            self.scan_body(open, close, false)?
+            self.lex_body_str(delim, true)?
         };
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::SubstLit(pattern, replacement, flags))
@@ -1428,19 +1521,26 @@ impl Lexer {
 
     /// `tr/from/to/flags` or `y/from/to/flags`
     fn lex_tr(&mut self) -> Result<Token, ParseError> {
-        let (open, close) = self.read_quote_delimiters()?;
-        let from = self.scan_body(open, close, false)?;
-        let to = if open != close {
-            let (_open2, close2) = self.read_quote_delimiters()?;
-            self.scan_body(_open2, close2, false)?
+        let delim = self.read_quote_delimiter()?;
+        let from = self.lex_body_str(delim, true)?;
+        let to = if Self::is_paired(delim) {
+            let delim2 = self.read_quote_delimiter()?;
+            self.lex_body_str(delim2, true)?
         } else {
-            self.scan_body(open, close, false)?
+            self.lex_body_str(delim, true)?
         };
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::TranslitLit(from, to, flags))
     }
 
-    fn read_quote_delimiters(&mut self) -> Result<(u8, u8), ParseError> {
+    /// Whether a delimiter is a paired bracket.
+    fn is_paired(delim: u8) -> bool {
+        matches!(delim, b'(' | b'[' | b'{' | b'<')
+    }
+
+    /// Read the delimiter byte for a quote-like construct.
+    /// Skips whitespace first if the current byte is whitespace.
+    fn read_quote_delimiter(&mut self) -> Result<u8, ParseError> {
         // Match toke.c's scan_str: skip whitespace before the delimiter
         // only if the current byte IS whitespace (or the line is exhausted).
         // `m#foo#` uses `#` as the delimiter — it's not a comment.
@@ -1455,80 +1555,7 @@ impl Lexer {
             }
             _ => {}
         }
-        let open = self.advance_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))?;
-        let close = matching_delimiter(open);
-        Ok((open, close))
-    }
-
-    /// Scan a delimited body, consuming bytes until the closing
-    /// delimiter is found.  Handles paired delimiter nesting for
-    /// `()`, `[]`, `{}`, `<>`.
-    ///
-    /// `open` and `close` are the delimiter bytes (equal for
-    /// non-paired delimiters like `/`).
-    ///
-    /// `literal` controls escape handling:
-    /// - `true` (q//, '...'): `\\` → `\`, `\close` → close char.
-    ///   Matches Perl's single-quote escape semantics.
-    /// - `false` (regex, tr//, raw bootstrap): `\close` and `\open`
-    ///   consume the backslash (delimiter not treated as terminator),
-    ///   everything else passes through raw including `\\`.
-    fn scan_body(&mut self, open: u8, close: u8, literal: bool) -> Result<String, ParseError> {
-        let mut s = String::new();
-        let mut depth = 1u32;
-        let paired = open != close;
-
-        loop {
-            match self.advance_byte_in_string(&mut s)? {
-                None => return Err(ParseError::new("unterminated string", Span::new(self.span_pos(), self.span_pos()))),
-                Some(b'\\') => {
-                    if literal {
-                        // Single-quote escapes: only \\ and \close
-                        // (and \open for paired delimiters) are special.
-                        match self.peek_byte() {
-                            Some(b'\\') => {
-                                self.skip(1);
-                                s.push('\\');
-                            }
-                            Some(b) if b == close => {
-                                self.skip(1);
-                                s.push(close as char);
-                            }
-                            Some(b) if paired && b == open => {
-                                self.skip(1);
-                                s.push(open as char);
-                            }
-                            _ => s.push('\\'),
-                        }
-                    } else {
-                        // Raw escapes: \close and \open prevent
-                        // delimiter matching.  Everything else
-                        // passes through including the backslash.
-                        if let Some(next) = self.peek_byte() {
-                            if next == close || (paired && next == open) {
-                                self.skip(1);
-                                s.push(next as char);
-                                continue;
-                            }
-                        }
-                        s.push('\\');
-                    }
-                }
-                Some(b) if b == close => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                    s.push(b as char);
-                }
-                Some(b) if paired && b == open => {
-                    depth += 1;
-                    s.push(b as char);
-                }
-                Some(b) => s.push(b as char),
-            }
-        }
-        Ok(s)
+        self.advance_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))
     }
 
     // ── Operators ─────────────────────────────────────────────
@@ -1804,12 +1831,12 @@ impl Lexer {
         match kind {
             HeredocKind::Interpolating => {
                 self.source.start_heredoc(tag_bytes, &mut self.current_line);
-                self.context_stack.push(LexContext::Interpolating { close: None, open: None, depth: 0 });
+                self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
                 Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
             }
             HeredocKind::Indented => {
                 self.source.start_indented_heredoc(tag_bytes, &mut self.current_line)?;
-                self.context_stack.push(LexContext::Interpolating { close: None, open: None, depth: 0 });
+                self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
                 Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
             }
             HeredocKind::Literal => {
@@ -1948,16 +1975,6 @@ impl Lexer {
     }
 }
 
-fn matching_delimiter(open: u8) -> u8 {
-    match open {
-        b'(' => b')',
-        b'[' => b']',
-        b'{' => b'}',
-        b'<' => b'>',
-        other => other, // same char for non-paired delimiters like / | ! etc.
-    }
-}
-
 fn hex_digit(b: u8) -> u8 {
     match b {
         b'0'..=b'9' => b - b'0',
@@ -1970,7 +1987,6 @@ fn hex_digit(b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expect::ExpectNext;
 
     fn lex_all(src: &str) -> Vec<Token> {
         let mut lexer = Lexer::new(src.as_bytes());

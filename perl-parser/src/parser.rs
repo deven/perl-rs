@@ -8,7 +8,7 @@ use crate::ast::*;
 use crate::error::ParseError;
 use crate::expect::{Expect, ExpectNext};
 use crate::keyword;
-use crate::lexer::{Lexer, LexerCheckpoint};
+use crate::lexer::Lexer;
 use crate::span::Span;
 use crate::token::Keyword;
 use crate::token::*;
@@ -78,11 +78,9 @@ impl OpInfo {
 /// The combined parser/lexer.
 pub struct Parser {
     lexer: Lexer,
-    /// Cached current token with the lexer checkpoint that produced it.
-    /// `None` means no token is cached — the next peek/advance will lex.
-    /// On rewind, the full lexer state (position, context stack)
-    /// is restored via the checkpoint.
-    current: Option<(Spanned, LexerCheckpoint, Expect)>,
+    /// Cached current token.  `None` means no token is cached —
+    /// the next peek/advance will lex one.
+    current: Option<Spanned>,
     expect: Expect,
     /// Stored lexer error — surfaced by advance() or checked by parse_program().
     lexer_error: Option<ParseError>,
@@ -99,23 +97,12 @@ impl Parser {
 
     // ── Token access ──────────────────────────────────────────
 
-    /// Ensure `self.current` holds a token lexed under the current
-    /// expect state.  If the cached token was lexed under a different
-    /// expect, restore the full lexer checkpoint and re-lex.
+    /// Ensure `self.current` holds a cached token.
     fn ensure_current(&mut self) {
-        match &self.current {
-            Some((spanned, _, cached_expect)) if cached_expect.lexer_equivalent(&self.expect) => {
-                return;
-            }
-            Some((_, checkpoint, cached_expect)) => {
-                let cp = checkpoint.clone();
-                self.lexer.restore(cp);
-                self.current = None;
-            }
-            None => {}
+        if self.current.is_some() {
+            return;
         }
 
-        let checkpoint = self.lexer.checkpoint();
         let spanned = match self.lexer.next_token(&self.expect) {
             Ok(s) => s,
             Err(e) => {
@@ -123,15 +110,13 @@ impl Parser {
                 Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) }
             }
         };
-        self.current = Some((spanned, checkpoint, self.expect));
+        self.current = Some(spanned);
     }
 
     fn peek(&mut self) -> &Token {
         self.ensure_current();
         match &self.current {
-            Some((spanned, _, _)) => &spanned.token,
-            // ensure_current always populates self.current; this is
-            // unreachable but avoids a panicking unwrap.
+            Some(spanned) => &spanned.token,
             None => &Token::Eof,
         }
     }
@@ -139,7 +124,7 @@ impl Parser {
     fn peek_span(&mut self) -> Span {
         self.ensure_current();
         match &self.current {
-            Some((spanned, _, _)) => spanned.span,
+            Some(spanned) => spanned.span,
             None => Span::new(0, 0),
         }
     }
@@ -150,7 +135,7 @@ impl Parser {
             return Err(e);
         }
         match self.current.take() {
-            Some((spanned, _, _)) => Ok(spanned),
+            Some(spanned) => Ok(spanned),
             None => Err(ParseError::new("internal: no current token", Span::new(0, 0))),
         }
     }
@@ -184,7 +169,7 @@ impl Parser {
             return Err(e);
         }
         match &self.current {
-            Some((spanned, _, _)) => Ok(spanned.token == *token),
+            Some(spanned) => Ok(spanned.token == *token),
             None => Ok(false),
         }
     }
@@ -195,7 +180,7 @@ impl Parser {
             return Err(e);
         }
         match &self.current {
-            Some((spanned, _, _)) => Ok(matches!(spanned.token, Token::Eof)),
+            Some(spanned) => Ok(matches!(spanned.token, Token::Eof)),
             None => Ok(true),
         }
     }
@@ -563,14 +548,13 @@ impl Parser {
         Ok(StmtKind::SubDecl(SubDecl { name, prototype, attributes, params: None, body, span: start.merge(self.peek_span()) }))
     }
 
-    /// Parse attributes: `:lvalue :method(args)` etc.
     /// Parse an optional prototype: `($$)`, `(\@\%)`, etc.
-    /// Sets `Expect::Prototype` so the lexer scans `(...)` as a raw
-    /// string, matching toke.c's `scan_str()` call in `yyl_sub()`.
+    /// If `(` follows, consume it and scan the body as raw bytes
+    /// until `)`, matching toke.c's `scan_str()` call in `yyl_sub()`.
     fn parse_prototype(&mut self) -> Result<Option<String>, ParseError> {
-        self.expect = Expect::Prototype;
-        if let Token::Prototype(proto) = self.peek().clone() {
-            self.advance()?;
+        if self.at(&Token::LeftParen)? {
+            self.advance()?; // consume (
+            let proto = self.lexer.lex_body_str(b'(', true)?;
             Ok(Some(proto))
         } else {
             Ok(None)
