@@ -378,7 +378,13 @@ pub enum Token {
     /// Complete regex: `/pattern/flags`, `m/pattern/flags`, `qr/pattern/flags`.
     RegexLit(RegexKind, String, Option<String>),
     /// Complete substitution: `s/pattern/replacement/flags`.
+    /// Bootstrap token — will be replaced by SubstBegin when
+    /// interpolation is fully implemented.
     SubstLit(String, String, Option<String>),
+    /// Start of a substitution replacement body.
+    /// Pattern and flags are captured upfront by the lexer.
+    /// Replacement body tokens follow until QuoteEnd.
+    SubstBegin(String, Option<String>),
     /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
     TranslitLit(String, String, Option<String>),
 
@@ -486,6 +492,7 @@ impl Token {
                 | Token::HeredocBegin(_, _)
                 | Token::RegexLit(_, _, _)
                 | Token::SubstLit(_, _, _)
+                | Token::SubstBegin(_, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
                 | Token::Readline(_)

@@ -1567,6 +1567,42 @@ impl Parser {
                 };
                 Ok(Expr { kind: ExprKind::Subst(pattern, repl, flags), span })
             }
+            Token::SubstBegin(pattern, flags) => {
+                if let Some(ref f) = flags {
+                    Self::validate_subst_flags(f, span)?;
+                }
+                let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
+                let repl = if has_eval {
+                    // With /e: body is raw bytes in a single ConstSegment.
+                    // Reparse as code.
+                    let raw = match self.peek_token().clone() {
+                        Token::ConstSegment(s) => {
+                            self.next_token()?;
+                            s
+                        }
+                        Token::QuoteEnd => String::new(),
+                        other => return Err(ParseError::new(format!("unexpected token in s///e: {other:?}"), self.peek_span())),
+                    };
+                    // Consume QuoteEnd.
+                    self.expect_token(&Token::QuoteEnd)?;
+                    let repl_src = format!("{};", raw);
+                    let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
+                    match prog.statements.into_iter().next() {
+                        Some(Statement { kind: StmtKind::Expr(expr), .. }) => SubstReplacement::Expr(Box::new(expr)),
+                        _ => SubstReplacement::Literal(raw),
+                    }
+                } else {
+                    // Without /e: body is an interpolated string.
+                    // Collect tokens until QuoteEnd.
+                    let body = self.parse_interpolated_string(span)?;
+                    match body.kind {
+                        ExprKind::StringLit(s) => SubstReplacement::Literal(s),
+                        _ => SubstReplacement::Expr(Box::new(body)),
+                    }
+                };
+                let end = self.peek_span();
+                Ok(Expr { kind: ExprKind::Subst(pattern, repl, flags), span: span.merge(end) })
+            }
             Token::TranslitLit(from, to, flags) => {
                 if let Some(ref f) = flags {
                     Self::validate_tr_flags(f, span)?;
@@ -1978,6 +2014,7 @@ impl Parser {
                     | Token::LeftBracket
                     | Token::RegexLit(_, _, _)
                     | Token::SubstLit(_, _, _)
+                    | Token::SubstBegin(_, _)
                     | Token::HeredocLit(_, _, _)
                     | Token::QwList(_)
                     | Token::Backslash

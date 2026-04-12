@@ -1109,21 +1109,24 @@ impl Lexer {
             None => (None, None),
         };
 
-        let start = self.span_pos();
-
         // peek_byte(false) auto-loads the next line, consuming
-        // the heredoc end-of-body signal if pending.
+        // the virtual EOF signal if pending (heredoc or subst body).
         let b = match self.peek_byte(false) {
             Some(b) => b,
             None => {
+                let pos = self.span_pos();
                 if close.is_none() {
-                    // Heredoc finished.
+                    // Heredoc or subst body finished (virtual EOF).
                     self.context_stack.pop();
-                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
+                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(pos, pos) });
                 }
-                return Err(ParseError::new("unterminated string", Span::new(start, start)));
+                return Err(ParseError::new("unterminated string", Span::new(pos, pos)));
             }
         };
+
+        // Compute start AFTER peek_byte, so the position reflects
+        // the loaded line (not a stale source cursor).
+        let start = self.span_pos();
 
         // Fast dispatch for closing delimiter, $, @.
         if let Some(c) = close {
@@ -1466,97 +1469,19 @@ impl Lexer {
         // Determine the replacement delimiter.
         let repl_delim = if is_paired(delim) { self.read_quote_delimiter()? } else { delim };
 
-        // Scan ahead to check for /e flag before consuming the
-        // replacement body.  This determines whether the replacement
-        // is an interpolating string or code.
-        let has_eval = self.scan_eval_flag(repl_delim)?;
+        // Scan ahead to capture flags, then set up the replacement
+        // body for delivery with a virtual EOF.
+        let flags = self.source.start_subst_body(repl_delim, &mut self.current_line)?;
+        let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
 
-        // Now scan the replacement in the appropriate mode.
-        if has_eval {
-            // With /e: replacement is code.  Scan as raw bytes —
-            // the parser will re-parse as an expression.
-            let replacement = self.lex_body_str(repl_delim, true)?;
-            let flags = self.scan_adjacent_word_chars();
-            Ok(Token::SubstLit(pattern, replacement, flags))
-        } else {
-            // Without /e: replacement is an interpolating string.
-            // For now, scan as raw — interpolation will be added
-            // when the context stack emits SubstBegin/SubstEnd.
-            let replacement = self.lex_body_str(repl_delim, true)?;
-            let flags = self.scan_adjacent_word_chars();
-            Ok(Token::SubstLit(pattern, replacement, flags))
-        }
-    }
+        // Push context for the replacement body.
+        // delim is None — the body ends at the virtual EOF set up
+        // by start_subst_body, not at a delimiter byte.
+        // With /e: raw scan (code, parser will reparse).
+        // Without /e: interpolating string.
+        self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: !has_eval, raw: has_eval, regex: false });
 
-    /// Scan ahead through a replacement body and flags to check
-    /// for the `e` flag.  Iterates byte slices from the current
-    /// line and source lines without modifying self.current_line.
-    /// Any source lines consumed are pushed back for re-scanning.
-    fn scan_eval_flag(&mut self, delim: u8) -> Result<bool, ParseError> {
-        let (open, close) = matching_delimiter(delim);
-
-        // Start with the remaining bytes on the current line.
-        let mut bytes = match &self.current_line {
-            Some(l) => l.line.slice(l.pos..),
-            None => return Ok(false),
-        };
-        let mut i = 0;
-        let mut lines: VecDeque<LexerLine> = VecDeque::new();
-        let mut depth = 0u32;
-
-        // Scan through the replacement body.
-        loop {
-            if i >= bytes.len() {
-                match self.source.next_line(false)? {
-                    Some(line) => {
-                        bytes = line.line.clone();
-                        lines.push_back(line);
-                        i = 0;
-                        continue;
-                    }
-                    None => {
-                        self.source.push_back(lines);
-                        return Ok(false);
-                    }
-                }
-            }
-            let b = bytes[i];
-            if b == b'\\' {
-                i += 2;
-            } else if b == close && depth == 0 {
-                i += 1;
-                break;
-            } else if open == Some(b) {
-                depth += 1;
-                i += 1;
-            } else if b == close {
-                depth -= 1;
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-
-        // Read flags.
-        let mut has_eval = false;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'e' {
-                has_eval = true;
-                i += 1;
-            } else if b.is_ascii_alphanumeric() || b == b'_' {
-                i += 1;
-            } else {
-                break;
-            }
-        }
-
-        // Push back any source lines consumed during the scan.
-        if !lines.is_empty() {
-            self.source.push_back(lines);
-        }
-
-        Ok(has_eval)
+        Ok(Token::SubstBegin(pattern, flags))
     }
 
     /// `tr/from/to/flags` or `y/from/to/flags`
@@ -2013,7 +1938,7 @@ impl Lexer {
 /// Return the (open, close) delimiter pair for a given delimiter.
 /// For paired brackets, open is `Some(delim)` and close is the
 /// matching bracket.  For same-char delimiters, open is `None`.
-fn matching_delimiter(delim: u8) -> (Option<u8>, u8) {
+pub fn matching_delimiter(delim: u8) -> (Option<u8>, u8) {
     match delim {
         b'(' => (Some(b'('), b')'),
         b'[' => (Some(b'['), b']'),
@@ -2024,7 +1949,7 @@ fn matching_delimiter(delim: u8) -> (Option<u8>, u8) {
 }
 
 /// Whether a delimiter is a paired bracket.
-fn is_paired(delim: u8) -> bool {
+pub fn is_paired(delim: u8) -> bool {
     matching_delimiter(delim).0.is_some()
 }
 
@@ -2069,6 +1994,7 @@ mod tests {
                 | Token::QuoteEnd
                 | Token::RegexLit(_, _, _)
                 | Token::SubstLit(_, _, _)
+                | Token::SubstBegin(_, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
                 | Token::Readline(_)
@@ -2498,13 +2424,13 @@ mod tests {
     #[test]
     fn lex_substitution() {
         let tokens = lex_all("s/foo/bar/g");
-        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), Some("g".into())),]);
+        assert_eq!(tokens, vec![Token::SubstBegin("foo".into(), Some("g".into())), Token::ConstSegment("bar".into()), Token::QuoteEnd,]);
     }
 
     #[test]
     fn lex_substitution_braces() {
         let tokens = lex_all("s{foo}{bar}g");
-        assert_eq!(tokens, vec![Token::SubstLit("foo".into(), "bar".into(), Some("g".into())),]);
+        assert_eq!(tokens, vec![Token::SubstBegin("foo".into(), Some("g".into())), Token::ConstSegment("bar".into()), Token::QuoteEnd,]);
     }
 
     #[test]
@@ -3228,7 +3154,7 @@ mod tests {
     #[test]
     fn lex_substitution_global() {
         let tokens = lex_all("s/old/new/g");
-        assert_eq!(tokens, vec![Token::SubstLit("old".into(), "new".into(), Some("g".into()))]);
+        assert_eq!(tokens, vec![Token::SubstBegin("old".into(), Some("g".into())), Token::ConstSegment("new".into()), Token::QuoteEnd,]);
     }
 
     #[test]
