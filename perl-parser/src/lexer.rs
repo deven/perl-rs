@@ -7,8 +7,6 @@
 //! This module implements the core tokenization loop.  Quote-like sublexing,
 //! heredocs, and regex scanning are handled by helper methods.
 
-use std::collections::VecDeque;
-
 use bytes::Bytes;
 
 use crate::error::ParseError;
@@ -42,20 +40,6 @@ struct LexContext {
     regex: bool,
 }
 
-/// Saved lexer state for checkpoint/restore (used by the parser's
-/// re-lex mechanism to undo a speculatively-lexed token).
-#[derive(Clone, Debug)]
-pub(crate) struct LexerCheckpoint {
-    pub line: Option<LexerLine>,
-    pub context_depth: usize,
-    /// Saved expr_depth of the top context (if any) for restoring
-    /// modifications made during speculative lexing.
-    pub top_expr_depth: Option<u32>,
-    pub source_cursor: usize,
-    pub source_line_number: usize,
-    pub heredoc_depth: usize,
-}
-
 /// Lexer state, embedded in the `Parser` struct (not standalone).
 ///
 /// The lexer operates on lines delivered by `LexerSource`.  It reads
@@ -84,29 +68,6 @@ impl Lexer {
             Some(line) => line.offset + line.pos,
             None => self.source.cursor(),
         }
-    }
-
-    /// Save a checkpoint for the parser's re-lex mechanism.
-    pub fn checkpoint(&self) -> LexerCheckpoint {
-        LexerCheckpoint {
-            line: self.current_line.clone(),
-            context_depth: self.context_stack.len(),
-            top_expr_depth: self.context_stack.last().map(|ctx| ctx.expr_depth),
-            source_cursor: self.source.cursor(),
-            source_line_number: self.source.line_number(),
-            heredoc_depth: self.source.heredoc_depth(),
-        }
-    }
-
-    /// Restore to a saved checkpoint, undoing any state changes
-    /// (context pushes, line transitions, heredoc starts) since the checkpoint.
-    pub fn restore(&mut self, cp: LexerCheckpoint) {
-        self.current_line = cp.line;
-        self.context_stack.truncate(cp.context_depth);
-        if let (Some(ctx), Some(saved)) = (self.context_stack.last_mut(), cp.top_expr_depth) {
-            ctx.expr_depth = saved;
-        }
-        self.source.set_cursor(cp.source_cursor, cp.source_line_number, cp.heredoc_depth);
     }
 
     // ── Byte access (auto-loading) ──────────────────────────
@@ -157,23 +118,6 @@ impl Lexer {
         self.current_line.as_mut()?.advance_byte()
     }
 
-    /// Advance to the next byte, crossing line boundaries.
-    /// Combines `advance_byte` with auto-loading: when the current
-    /// line is exhausted, loads the next line and continues.
-    /// Returns `None` only at true EOF.
-    fn advance_byte_in_string(&mut self) -> Option<u8> {
-        loop {
-            if let Some(b) = self.advance_byte() {
-                return Some(b);
-            }
-            // Line exhausted.  Use peek_byte to auto-load.
-            match self.peek_byte(false) {
-                Some(_) => continue, // loaded, retry advance
-                None => return None, // EOF
-            }
-        }
-    }
-
     /// Remaining bytes in the current line (not including synthetic \n).
     pub fn remaining(&self) -> &[u8] {
         match &self.current_line {
@@ -219,6 +163,14 @@ impl Lexer {
     fn skip(&mut self, n: usize) {
         if let Some(line) = self.current_line.as_mut() {
             line.pos += n;
+        }
+    }
+
+    /// Rewind the cursor by `n` bytes within the current line.
+    /// The caller must ensure `n` does not exceed the current position.
+    pub fn rewind(&mut self, n: usize) {
+        if let Some(line) = self.current_line.as_mut() {
+            line.pos -= n;
         }
     }
 
@@ -405,7 +357,7 @@ impl Lexer {
             b'+' => self.lex_plus(),
             b'-' => self.lex_minus(expect)?,
             b'*' => self.lex_star(),
-            b'/' => self.lex_slash(expect)?,
+            b'/' => self.lex_slash(),
             b'.' => self.lex_dot(),
             b'<' => self.lex_less_than(expect)?,
             b'>' => self.lex_greater_than(),
@@ -1156,7 +1108,15 @@ impl Lexer {
 
         loop {
             match self.peek_byte(true) {
-                None => break, // EOF or heredoc finished (peeked)
+                None => {
+                    // EOF or virtual EOF (peeked).  For delimited
+                    // strings (close is Some), this means the closing
+                    // delimiter was not found — that's an error.
+                    if close.is_some() {
+                        return Err(ParseError::new("unterminated string", Span::new(start, self.span_pos())));
+                    }
+                    break;
+                }
                 Some(b) if Some(b) == close && current_depth == 0 => {
                     if !interpolating {
                         // Non-interpolating: consume the closing
@@ -1400,22 +1360,6 @@ impl Lexer {
         Ok(Spanned { token: Token::ConstSegment("@".into()), span: Span::new(start, self.span_pos()) })
     }
 
-    fn scan_to_delimiter(&mut self, delim: u8) -> Result<String, ParseError> {
-        let mut s = String::new();
-        loop {
-            match self.advance_byte_in_string() {
-                None => return Err(ParseError::new("unterminated string", Span::new(self.span_pos(), self.span_pos()))),
-                Some(b'\\') if self.peek_byte(false) == Some(delim) => {
-                    self.skip(1);
-                    s.push(delim as char);
-                }
-                Some(b) if b == delim => break,
-                Some(b) => s.push(b as char),
-            }
-        }
-        Ok(s)
-    }
-
     // ── q// qq// qw// ─────────────────────────────────────────
 
     fn lex_q_string(&mut self) -> Result<Token, ParseError> {
@@ -1579,33 +1523,22 @@ impl Lexer {
         }
     }
 
-    fn lex_slash(&mut self, expect: &Expect) -> Result<Token, ParseError> {
-        // The lexer always returns Token::DefinedOr for //.  The parser
-        // converts it to an empty regex in term position (and consumes
-        // any trailing flags like //gi → DefinedOr + Ident("gi")).
-        // Only m// produces Token::RegexLit with an empty pattern directly
-        // from the lexer.  This eliminates the need for XTERMORDORDOR.
+    fn lex_slash(&mut self) -> Token {
         if self.peek_byte_at(1) == Some(b'/') {
             self.skip(2);
             if self.peek_byte(false) == Some(b'=') {
                 self.skip(1);
-                Ok(Token::Assign(AssignOp::DefinedOrEq))
+                Token::Assign(AssignOp::DefinedOrEq)
             } else {
-                Ok(Token::DefinedOr)
+                Token::DefinedOr
             }
-        } else if expect.slash_is_regex() {
-            // Single / in term context: regex.
-            self.skip(1); // skip opening /
-            let pattern = self.scan_to_delimiter(b'/')?;
-            let flags = self.scan_adjacent_word_chars();
-            Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
         } else {
             self.skip(1);
             if self.peek_byte(false) == Some(b'=') {
                 self.skip(1);
-                Ok(Token::Assign(AssignOp::DivEq))
+                Token::Assign(AssignOp::DivEq)
             } else {
-                Ok(Token::Slash)
+                Token::Slash
             }
         }
     }
@@ -1993,7 +1926,6 @@ mod tests {
                 | Token::ArrayLen(_)
                 | Token::QuoteEnd
                 | Token::RegexLit(_, _, _)
-                | Token::SubstLit(_, _, _)
                 | Token::SubstBegin(_, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
@@ -2393,14 +2325,16 @@ mod tests {
 
     #[test]
     fn lex_bare_regex() {
+        // The lexer always returns Slash for /; the parser
+        // interprets it as a regex in term position.
         let tokens = lex_all("/foo/i");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), Some("i".into())),]);
+        assert_eq!(tokens, vec![Token::Slash, Token::Ident("foo".into()), Token::Slash, Token::Ident("i".into())]);
     }
 
     #[test]
     fn lex_bare_regex_no_flags() {
         let tokens = lex_all("/hello world/");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "hello world".into(), None),]);
+        assert_eq!(tokens, vec![Token::Slash, Token::Ident("hello".into()), Token::Ident("world".into()), Token::Slash]);
     }
 
     #[test]
@@ -2447,9 +2381,10 @@ mod tests {
 
     #[test]
     fn lex_regex_in_expression() {
-        // After $x =~ the / should be a regex, not division.
+        // After $x =~ the / is still just Slash from the lexer;
+        // the parser handles regex interpretation.
         let tokens = lex_all("$x =~ /foo/");
-        assert_eq!(tokens, vec![Token::ScalarVar("x".into()), Token::Binding, Token::RegexLit(RegexKind::Match, "foo".into(), None),]);
+        assert_eq!(tokens, vec![Token::ScalarVar("x".into()), Token::Binding, Token::Slash, Token::Ident("foo".into()), Token::Slash]);
     }
 
     #[test]
@@ -3147,8 +3082,9 @@ mod tests {
 
     #[test]
     fn lex_regex_many_flags() {
+        // Bare / is always Slash from the lexer.
         let tokens = lex_all("/foo/imsxg");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), Some("imsxg".into()))]);
+        assert_eq!(tokens, vec![Token::Slash, Token::Ident("foo".into()), Token::Slash, Token::Ident("imsxg".into())]);
     }
 
     #[test]
@@ -3165,8 +3101,9 @@ mod tests {
 
     #[test]
     fn lex_regex_after_keyword_term() {
+        // Lexer returns Slash; parser interprets as regex after print.
         let tokens = lex_all("print /foo/");
-        assert!(tokens.contains(&Token::RegexLit(RegexKind::Match, "foo".into(), None)));
+        assert_eq!(tokens, vec![Token::Keyword(Keyword::Print), Token::Slash, Token::Ident("foo".into()), Token::Slash]);
     }
 
     // ── Filetest tokens ───────────────────────────────────────

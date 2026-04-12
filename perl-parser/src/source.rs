@@ -209,17 +209,19 @@ impl LexerSource {
         self.cursor
     }
 
+    // TODO: line_number, set_cursor, and heredoc_depth have zero
+    // callers after checkpoint/restore removal.  Decide whether to
+    // keep them as potentially useful API or remove.
+
     /// Current line number (1-based).
     pub fn line_number(&self) -> usize {
         self.line_number
     }
 
-    /// Rewind the source cursor for checkpoint/restore.
-    /// Also truncates the heredoc stack if it grew since the checkpoint.
+    /// Rewind the source cursor.  Previously used by checkpoint/restore.
     pub fn set_cursor(&mut self, cursor: usize, line_number: usize, heredoc_depth: usize) {
         self.cursor = cursor;
         self.line_number = line_number;
-        // If heredoc stack shrank, clear stale state from undone heredocs.
         if heredoc_depth < self.heredoc_stack.len() {
             self.heredoc_stack.truncate(heredoc_depth);
             self.queued_lines.clear();
@@ -227,7 +229,7 @@ impl LexerSource {
         }
     }
 
-    /// Current heredoc stack depth (for checkpoint/restore).
+    /// Current heredoc stack depth.
     pub fn heredoc_depth(&self) -> usize {
         self.heredoc_stack.len()
     }

@@ -377,10 +377,6 @@ pub enum Token {
     // ── Compound regex tokens (bootstrap, pre-interpolation) ──
     /// Complete regex: `/pattern/flags`, `m/pattern/flags`, `qr/pattern/flags`.
     RegexLit(RegexKind, String, Option<String>),
-    /// Complete substitution: `s/pattern/replacement/flags`.
-    /// Bootstrap token — will be replaced by SubstBegin when
-    /// interpolation is fully implemented.
-    SubstLit(String, String, Option<String>),
     /// Start of a substitution replacement body.
     /// Pattern and flags are captured upfront by the lexer.
     /// Replacement body tokens follow until QuoteEnd.
@@ -491,7 +487,6 @@ impl Token {
                 | Token::RegexBegin(_, _)
                 | Token::HeredocBegin(_, _)
                 | Token::RegexLit(_, _, _)
-                | Token::SubstLit(_, _, _)
                 | Token::SubstBegin(_, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
@@ -499,6 +494,9 @@ impl Token {
                 | Token::QwList(_)
                 | Token::Dollar
                 | Token::At
+                | Token::Slash
+                | Token::DefinedOr
+                | Token::Assign(AssignOp::DivEq)
         )
     }
 }

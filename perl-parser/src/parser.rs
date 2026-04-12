@@ -1549,23 +1549,27 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::Regex(String::new(), flags), span })
             }
-            Token::SubstLit(pattern, replacement, flags) => {
+            // / in term position is a regex, not division.
+            // The lexer returned Slash; the parser scans the body.
+            Token::Slash => {
+                let pattern = self.lexer.lex_body_str(b'/', true)?;
+                let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
-                    Self::validate_subst_flags(f, span)?;
+                    Self::validate_regex_flags(f, span)?;
                 }
-                let repl = if flags.as_ref().is_some_and(|f| f.contains('e')) {
-                    // With /e flag, the replacement is Perl code.
-                    // Parse it as an expression using a sub-parser.
-                    let repl_src = format!("{};", replacement);
-                    let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
-                    match prog.statements.into_iter().next() {
-                        Some(Statement { kind: StmtKind::Expr(expr), .. }) => SubstReplacement::Expr(Box::new(expr)),
-                        _ => SubstReplacement::Literal(replacement),
-                    }
-                } else {
-                    SubstReplacement::Literal(replacement)
-                };
-                Ok(Expr { kind: ExprKind::Subst(pattern, repl, flags), span })
+                Ok(Expr { kind: ExprKind::Regex(pattern, flags), span })
+            }
+            // /= in term position: = is the first character of the
+            // regex pattern, not a division-assignment operator.
+            // Rewind past the = so the body scanner includes it.
+            Token::Assign(AssignOp::DivEq) => {
+                self.lexer.rewind(1);
+                let pattern = self.lexer.lex_body_str(b'/', true)?;
+                let flags = self.lexer.scan_adjacent_word_chars();
+                if let Some(ref f) = flags {
+                    Self::validate_regex_flags(f, span)?;
+                }
+                Ok(Expr { kind: ExprKind::Regex(pattern, flags), span })
             }
             Token::SubstBegin(pattern, flags) => {
                 if let Some(ref f) = flags {
@@ -2013,7 +2017,6 @@ impl Parser {
                     | Token::LeftParen
                     | Token::LeftBracket
                     | Token::RegexLit(_, _, _)
-                    | Token::SubstLit(_, _, _)
                     | Token::SubstBegin(_, _)
                     | Token::HeredocLit(_, _, _)
                     | Token::QwList(_)

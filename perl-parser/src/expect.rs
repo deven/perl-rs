@@ -62,11 +62,6 @@ pub enum ExpectNext {
 }
 
 impl Expect {
-    /// Are we in a position where `/` should be a regex?
-    pub fn slash_is_regex(&self) -> bool {
-        matches!(self, Expect::Term | Expect::Statement | Expect::Block(_) | Expect::Deref)
-    }
-
     /// Are we expecting a term (value, prefix, keyword)?
     pub fn expecting_term(&self) -> bool {
         matches!(self, Expect::Term | Expect::Statement | Expect::Block(_) | Expect::Deref)
@@ -74,9 +69,8 @@ impl Expect {
 
     /// Whether two expects produce identical lexer behavior.
     /// All term-like states (Term, Statement, Block, Deref) are
-    /// equivalent for the lexer: `/` is regex, `%` is hash sigil.
-    /// Operator and Postderef are equivalent: `/` is divide, `%`
-    /// is modulo.
+    /// equivalent for the lexer: `%` is hash sigil.
+    /// Operator and Postderef are equivalent: `%` is modulo.
     pub fn lexer_equivalent(&self, other: &Expect) -> bool {
         if self == other {
             return true;
