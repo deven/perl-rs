@@ -37,40 +37,62 @@ pub(crate) struct LexerLine {
 
 impl LexerLine {
     /// Peek at the current byte without advancing.
+    /// Returns `b'\n'` at the end of a terminated line.
+    /// Returns `None` only when truly exhausted (past \n or
+    /// unterminated line fully consumed).
     #[inline]
     pub fn peek_byte(&self) -> Option<u8> {
-        if self.pos < self.line.len() { Some(self.line[self.pos]) } else { None }
+        if self.pos < self.line.len() {
+            Some(self.line[self.pos])
+        } else if self.pos == self.line.len() && self.terminated {
+            Some(b'\n')
+        } else {
+            None
+        }
     }
 
     /// Peek at a byte at an offset from the current position.
     #[inline]
     pub fn peek_byte_at(&self, offset: usize) -> Option<u8> {
         let idx = self.pos + offset;
-        if idx < self.line.len() { Some(self.line[idx]) } else { None }
+        if idx < self.line.len() {
+            Some(self.line[idx])
+        } else if idx == self.line.len() && self.terminated {
+            Some(b'\n')
+        } else {
+            None
+        }
     }
 
     /// Consume the current byte and advance the cursor.
+    /// Returns `b'\n'` at the end of a terminated line.
+    /// Returns `None` only when truly exhausted.
     #[inline]
     pub fn advance_byte(&mut self) -> Option<u8> {
         if self.pos < self.line.len() {
             let b = self.line[self.pos];
             self.pos += 1;
             Some(b)
+        } else if self.pos == self.line.len() && self.terminated {
+            self.pos += 1;
+            Some(b'\n')
         } else {
             None
         }
     }
 
-    /// The remaining unscanned bytes.
+    /// The remaining unscanned content bytes (not including the
+    /// virtual `\n` line terminator).
     #[inline]
     pub fn remaining(&self) -> &[u8] {
-        &self.line[self.pos..]
+        if self.pos < self.line.len() { &self.line[self.pos..] } else { &[] }
     }
 
-    /// Whether the cursor has reached the end of the line.
+    /// Whether the cursor has consumed everything including the
+    /// virtual `\n` (if terminated).
     #[inline]
     pub fn at_end(&self) -> bool {
-        self.pos >= self.line.len()
+        if self.terminated { self.pos > self.line.len() } else { self.pos >= self.line.len() }
     }
 
     /// Zero-copy slice of the line content between `start` and `end`.
@@ -123,6 +145,9 @@ pub(crate) struct LexerSource {
     /// Set by `start_indented_heredoc`, restored when the heredoc
     /// finishes.
     required_indent: Option<Bytes>,
+    /// Set when a heredoc terminator was found during a peek call.
+    /// The next consuming call will pop the heredoc context.
+    terminator_pending: bool,
 }
 
 /// A raw line read from the source buffer before indent processing.
@@ -139,13 +164,21 @@ impl LexerSource {
     /// The bytes are copied into a `Bytes` buffer once.  All subsequent
     /// line slicing is zero-copy.
     pub fn new(src: &[u8]) -> Self {
-        LexerSource { src: Bytes::copy_from_slice(src), cursor: 0, line_number: 1, heredoc_stack: Vec::new(), queued_line: None, required_indent: None }
+        LexerSource {
+            src: Bytes::copy_from_slice(src),
+            cursor: 0,
+            line_number: 1,
+            heredoc_stack: Vec::new(),
+            queued_line: None,
+            required_indent: None,
+            terminator_pending: false,
+        }
     }
 
     /// Create a new `LexerSource` from an existing `Bytes` buffer.
     /// Zero-copy — just a refcount bump.
     pub fn from_bytes(src: Bytes) -> Self {
-        LexerSource { src, cursor: 0, line_number: 1, heredoc_stack: Vec::new(), queued_line: None, required_indent: None }
+        LexerSource { src, cursor: 0, line_number: 1, heredoc_stack: Vec::new(), queued_line: None, required_indent: None, terminator_pending: false }
     }
 
     /// Current byte position in the source buffer.
@@ -168,6 +201,7 @@ impl LexerSource {
         if heredoc_depth < self.heredoc_stack.len() {
             self.heredoc_stack.truncate(heredoc_depth);
             self.queued_line = None;
+            self.terminator_pending = false;
         }
     }
 
@@ -193,7 +227,26 @@ impl LexerSource {
     /// body is finished (the saved remainder will be returned by the
     /// next call), or `Err` for real errors (unterminated heredoc,
     /// indentation mismatch).
-    pub fn next_line(&mut self) -> Result<Option<LexerLine>, ParseError> {
+    ///
+    /// `peek_heredoc`: when true and a heredoc terminator is found,
+    /// returns `Ok(None)` without consuming the signal — the heredoc
+    /// context stays on the stack and `queued_line` is not set.
+    /// The next call with `peek_heredoc=false` will consume it.
+    pub fn next_line(&mut self, peek_heredoc: bool) -> Result<Option<LexerLine>, ParseError> {
+        // 0. If a terminator was found during a previous peek call,
+        //    handle it without reading another line.
+        if self.terminator_pending {
+            if !peek_heredoc {
+                // Consume the pending terminator.
+                self.terminator_pending = false;
+                if let Some(ctx) = self.heredoc_stack.pop() {
+                    self.required_indent = ctx.prev_indent;
+                    self.queued_line = Some(ctx.saved_line);
+                }
+            }
+            return Ok(None);
+        }
+
         // 1. Return queued line if present (saved remainder from a
         //    completed heredoc — not subject to terminator check).
         if let Some(line) = self.queued_line.take() {
@@ -219,10 +272,15 @@ impl LexerSource {
         // 4. If inside a heredoc, check for terminator.
         let is_terminator = self.heredoc_stack.last().is_some_and(|ctx| stripped.line.as_ref() == ctx.tag.as_ref());
         if is_terminator {
-            // last() returned Some, so pop() is guaranteed to succeed.
-            if let Some(ctx) = self.heredoc_stack.pop() {
-                self.required_indent = ctx.prev_indent;
-                self.queued_line = Some(ctx.saved_line);
+            if peek_heredoc {
+                // Peek mode: signal end without consuming.
+                self.terminator_pending = true;
+            } else {
+                // Consume mode: pop the heredoc context.
+                if let Some(ctx) = self.heredoc_stack.pop() {
+                    self.required_indent = ctx.prev_indent;
+                    self.queued_line = Some(ctx.saved_line);
+                }
             }
             return Ok(None);
         }
@@ -387,7 +445,7 @@ mod tests {
     fn collect_lines(src: &str) -> Vec<String> {
         let mut source = LexerSource::new(src.as_bytes());
         let mut lines = Vec::new();
-        while let Ok(Some(line)) = source.next_line() {
+        while let Ok(Some(line)) = source.next_line(false) {
             lines.push(String::from_utf8_lossy(&line.line).into_owned());
         }
         lines
@@ -398,26 +456,26 @@ mod tests {
     #[test]
     fn empty_source() {
         let mut source = LexerSource::new(b"");
-        assert!(matches!(source.next_line(), Ok(None)));
+        assert!(matches!(source.next_line(false), Ok(None)));
     }
 
     #[test]
     fn single_line_no_newline() {
         let mut source = LexerSource::new(b"hello");
-        let line = source.next_line().unwrap().unwrap();
+        let line = source.next_line(false).unwrap().unwrap();
         assert_eq!(&line.line[..], b"hello");
         assert!(!line.terminated);
         assert_eq!(line.number, 1);
-        assert!(matches!(source.next_line(), Ok(None)));
+        assert!(matches!(source.next_line(false), Ok(None)));
     }
 
     #[test]
     fn single_line_with_newline() {
         let mut source = LexerSource::new(b"hello\n");
-        let line = source.next_line().unwrap().unwrap();
+        let line = source.next_line(false).unwrap().unwrap();
         assert_eq!(&line.line[..], b"hello");
         assert!(line.terminated);
-        assert!(matches!(source.next_line(), Ok(None)));
+        assert!(matches!(source.next_line(false), Ok(None)));
     }
 
     #[test]
@@ -441,19 +499,19 @@ mod tests {
     #[test]
     fn line_numbers() {
         let mut source = LexerSource::new(b"a\nb\nc\n");
-        assert_eq!(source.next_line().unwrap().unwrap().number, 1);
-        assert_eq!(source.next_line().unwrap().unwrap().number, 2);
-        assert_eq!(source.next_line().unwrap().unwrap().number, 3);
+        assert_eq!(source.next_line(false).unwrap().unwrap().number, 1);
+        assert_eq!(source.next_line(false).unwrap().unwrap().number, 2);
+        assert_eq!(source.next_line(false).unwrap().unwrap().number, 3);
     }
 
     #[test]
     fn byte_offsets() {
         let mut source = LexerSource::new(b"ab\ncde\nf\n");
-        let l1 = source.next_line().unwrap().unwrap();
+        let l1 = source.next_line(false).unwrap().unwrap();
         assert_eq!(l1.offset, 0);
-        let l2 = source.next_line().unwrap().unwrap();
+        let l2 = source.next_line(false).unwrap().unwrap();
         assert_eq!(l2.offset, 3);
-        let l3 = source.next_line().unwrap().unwrap();
+        let l3 = source.next_line(false).unwrap().unwrap();
         assert_eq!(l3.offset, 7);
     }
 
@@ -468,7 +526,7 @@ mod tests {
     #[test]
     fn standalone_cr_preserved() {
         let mut source = LexerSource::new(b"a\rb\n");
-        let line = source.next_line().unwrap().unwrap();
+        let line = source.next_line(false).unwrap().unwrap();
         assert_eq!(&line.line[..], b"a\rb");
     }
 
@@ -483,12 +541,17 @@ mod tests {
     #[test]
     fn lexer_line_peek_and_advance() {
         let mut source = LexerSource::new(b"abc\n");
-        let mut line = source.next_line().unwrap().unwrap();
+        let mut line = source.next_line(false).unwrap().unwrap();
         assert_eq!(line.peek_byte(), Some(b'a'));
         assert_eq!(line.advance_byte(), Some(b'a'));
         assert_eq!(line.peek_byte(), Some(b'b'));
         assert_eq!(line.advance_byte(), Some(b'b'));
         assert_eq!(line.advance_byte(), Some(b'c'));
+        // Terminated line delivers \n as the last byte.
+        assert!(!line.at_end());
+        assert_eq!(line.peek_byte(), Some(b'\n'));
+        assert_eq!(line.advance_byte(), Some(b'\n'));
+        // Now truly exhausted.
         assert_eq!(line.advance_byte(), None);
         assert!(line.at_end());
     }
@@ -496,7 +559,7 @@ mod tests {
     #[test]
     fn lexer_line_remaining() {
         let mut source = LexerSource::new(b"abcdef\n");
-        let mut line = source.next_line().unwrap().unwrap();
+        let mut line = source.next_line(false).unwrap().unwrap();
         line.pos = 3;
         assert_eq!(line.remaining(), b"def");
     }
@@ -504,7 +567,7 @@ mod tests {
     #[test]
     fn lexer_line_slice() {
         let mut source = LexerSource::new(b"hello world\n");
-        let line = source.next_line().unwrap().unwrap();
+        let line = source.next_line(false).unwrap().unwrap();
         let s = line.slice(0, 5);
         assert_eq!(&s[..], b"hello");
         let s2 = line.slice(6, 11);
@@ -514,7 +577,7 @@ mod tests {
     #[test]
     fn lexer_line_slice_since() {
         let mut source = LexerSource::new(b"abcdef\n");
-        let mut line = source.next_line().unwrap().unwrap();
+        let mut line = source.next_line(false).unwrap().unwrap();
         line.pos = 4;
         let s = line.slice_since(2);
         assert_eq!(&s[..], b"cd");
@@ -531,7 +594,7 @@ mod tests {
         let mut source = LexerSource::new(src);
 
         // Line 1: the declaration line.
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
         assert_eq!(&decl.line[..], b"my $x = <<END . \"suffix\";");
 
         // Simulate lexer: found <<END at some position in decl.
@@ -547,19 +610,19 @@ mod tests {
         assert!(current_line.is_none());
 
         // Next line: heredoc body.
-        let body = source.next_line().unwrap().unwrap();
+        let body = source.next_line(false).unwrap().unwrap();
         assert_eq!(&body.line[..], b"hello");
 
         // Next line: terminator → None.
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
 
         // Next line: saved remainder (the declaration tail).
-        let remainder = source.next_line().unwrap().unwrap();
+        let remainder = source.next_line(false).unwrap().unwrap();
         assert_eq!(remainder.pos, 13); // cursor preserved
         assert_eq!(&remainder.line[remainder.pos..], b" . \"suffix\";");
 
         // Next line: code after the heredoc.
-        let after = source.next_line().unwrap().unwrap();
+        let after = source.next_line(false).unwrap().unwrap();
         assert_eq!(&after.line[..], b"more code");
     }
 
@@ -567,30 +630,30 @@ mod tests {
     fn heredoc_empty_body() {
         let src = b"<<END;\nEND\n";
         let mut source = LexerSource::new(src);
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
 
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5 });
         source.start_heredoc(Bytes::from_static(b"END"), &mut current);
 
         // Immediate terminator → None.
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
     }
 
     #[test]
     fn heredoc_unterminated() {
         let src = b"<<END;\nhello\nworld\n";
         let mut source = LexerSource::new(src);
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
 
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5 });
         source.start_heredoc(Bytes::from_static(b"END"), &mut current);
 
         // Read body lines.
-        source.next_line().unwrap().unwrap(); // hello
-        source.next_line().unwrap().unwrap(); // world
+        source.next_line(false).unwrap().unwrap(); // hello
+        source.next_line(false).unwrap().unwrap(); // world
 
         // EOF without terminator → error.
-        assert!(source.next_line().is_err());
+        assert!(source.next_line(false).is_err());
     }
 
     // ── Stacked heredocs ──────────────────────────────────────────
@@ -605,7 +668,7 @@ mod tests {
         // after
         let src = b"(<<A, <<B);\nbody A\nA\nbody B\nB\nafter\n";
         let mut source = LexerSource::new(src);
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
 
         // Start <<A, save remainder ", <<B);"
         let mut current = Some(LexerLine {
@@ -618,14 +681,14 @@ mod tests {
         source.start_heredoc(Bytes::from_static(b"A"), &mut current);
 
         // A's body.
-        let body_a = source.next_line().unwrap().unwrap();
+        let body_a = source.next_line(false).unwrap().unwrap();
         assert_eq!(&body_a.line[..], b"body A");
 
         // A's terminator → None.
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
 
         // Remainder restored: ", <<B);"
-        let remainder = source.next_line().unwrap().unwrap();
+        let remainder = source.next_line(false).unwrap().unwrap();
         assert_eq!(remainder.pos, 4);
 
         // Now start <<B from the remainder.
@@ -639,18 +702,18 @@ mod tests {
         source.start_heredoc(Bytes::from_static(b"B"), &mut current);
 
         // B's body.
-        let body_b = source.next_line().unwrap().unwrap();
+        let body_b = source.next_line(false).unwrap().unwrap();
         assert_eq!(&body_b.line[..], b"body B");
 
         // B's terminator → None.
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
 
         // Remainder restored: ");"
-        let remainder2 = source.next_line().unwrap().unwrap();
+        let remainder2 = source.next_line(false).unwrap().unwrap();
         assert_eq!(remainder2.pos, 10);
 
         // After heredocs.
-        let after = source.next_line().unwrap().unwrap();
+        let after = source.next_line(false).unwrap().unwrap();
         assert_eq!(&after.line[..], b"after");
     }
 
@@ -660,7 +723,7 @@ mod tests {
     fn heredoc_indented() {
         let src = b"<<~END;\n    hello\n    world\n    END\n";
         let mut source = LexerSource::new(src);
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
 
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6 });
         source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
@@ -669,15 +732,15 @@ mod tests {
         // Source: "<<~END;\n    hello\n    world\n    END\n"
         //          0       8          18
         // "    hello" at raw offset 8, 4-byte indent stripped → offset 12.
-        let l1 = source.next_line().unwrap().unwrap();
+        let l1 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l1.line[..], b"hello");
         assert_eq!(l1.offset, 12);
-        let l2 = source.next_line().unwrap().unwrap();
+        let l2 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l2.line[..], b"world");
         assert_eq!(l2.offset, 22);
 
         // Terminator → None.
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
     }
 
     #[test]
@@ -685,18 +748,18 @@ mod tests {
         // Empty lines are allowed without indentation.
         let src = b"<<~END;\n    hello\n\n    world\n    END\n";
         let mut source = LexerSource::new(src);
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
 
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6 });
         source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
-        let l1 = source.next_line().unwrap().unwrap();
+        let l1 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l1.line[..], b"hello");
-        let l2 = source.next_line().unwrap().unwrap();
+        let l2 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l2.line[..], b""); // empty line
-        let l3 = source.next_line().unwrap().unwrap();
+        let l3 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l3.line[..], b"world");
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
     }
 
     #[test]
@@ -704,16 +767,16 @@ mod tests {
         // Body line with wrong indentation.
         let src = b"<<~END;\n    hello\n  bad\n    END\n";
         let mut source = LexerSource::new(src);
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
 
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6 });
         source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
-        let l1 = source.next_line().unwrap().unwrap();
+        let l1 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l1.line[..], b"hello");
 
         // Next line has wrong indent → error.
-        assert!(source.next_line().is_err());
+        assert!(source.next_line(false).is_err());
     }
 
     // ── Nested heredocs ───────────────────────────────────────────
@@ -727,14 +790,14 @@ mod tests {
         //     OUTER
         let src = b"<<~OUTER;\n    prefix <<INNER suffix\n    inner body\n    INNER\n    outer continues\n    OUTER\n";
         let mut source = LexerSource::new(src);
-        let decl = source.next_line().unwrap().unwrap();
+        let decl = source.next_line(false).unwrap().unwrap();
 
         // Start <<~OUTER
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 9 });
         source.start_indented_heredoc(Bytes::from_static(b"OUTER"), &mut current).unwrap();
 
         // First body line of OUTER (indent stripped).
-        let l1 = source.next_line().unwrap().unwrap();
+        let l1 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l1.line[..], b"prefix <<INNER suffix");
 
         // Start <<INNER (non-indented, inside indented OUTER).
@@ -748,22 +811,22 @@ mod tests {
         source.start_heredoc(Bytes::from_static(b"INNER"), &mut current);
 
         // INNER body (outer indent still stripped).
-        let inner_body = source.next_line().unwrap().unwrap();
+        let inner_body = source.next_line(false).unwrap().unwrap();
         assert_eq!(&inner_body.line[..], b"inner body");
 
         // INNER terminator → None.
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
 
         // Remainder of OUTER body line restored.
-        let remainder = source.next_line().unwrap().unwrap();
+        let remainder = source.next_line(false).unwrap().unwrap();
         assert_eq!(remainder.pos, 14);
         assert_eq!(&remainder.line[remainder.pos..], b" suffix");
 
         // OUTER body continues.
-        let l2 = source.next_line().unwrap().unwrap();
+        let l2 = source.next_line(false).unwrap().unwrap();
         assert_eq!(&l2.line[..], b"outer continues");
 
         // OUTER terminator → None.
-        assert!(source.next_line().unwrap().is_none());
+        assert!(source.next_line(false).unwrap().is_none());
     }
 }

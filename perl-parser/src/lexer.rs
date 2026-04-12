@@ -108,15 +108,19 @@ impl Lexer {
 
     /// Ensure a line is loaded.  Returns true if a line is available,
     /// false if EOF or heredoc finished (current_line stays None).
-    fn ensure_line(&mut self) -> Result<bool, ParseError> {
+    ///
+    /// `peek_heredoc`: when true, a heredoc end-of-body signal is
+    /// returned without consuming it — the next call with `false`
+    /// will consume the signal and restore the saved remainder.
+    fn ensure_line(&mut self, peek_heredoc: bool) -> Result<bool, ParseError> {
         if let Some(line) = &self.current_line {
-            if line.pos < line.line.len() {
-                return Ok(true); // has content
+            if !line.at_end() {
+                return Ok(true); // has content (or \n)
             }
-            // Exhausted — drop it.
+            // Truly exhausted — drop it.
             self.current_line = None;
         }
-        match self.source.next_line()? {
+        match self.source.next_line(peek_heredoc)? {
             Some(line) => {
                 self.current_line = Some(line);
                 Ok(true)
@@ -146,26 +150,21 @@ impl Lexer {
         self.current_line.as_mut()?.advance_byte()
     }
 
-    /// Advance to the next content byte, crossing line boundaries.
-    /// When the current line is exhausted and terminated, pushes
-    /// `'\n'` to `content`, drops the line, and fetches the next.
-    /// Returns `None` only at true EOF (unterminated line or source
-    /// exhausted).
-    fn advance_byte_in_string(&mut self, content: &mut String) -> Result<Option<u8>, ParseError> {
+    /// Advance to the next byte, crossing line boundaries.
+    /// The `\n` line terminator is delivered as a byte by
+    /// `advance_byte`.  When `None` is returned (line truly
+    /// exhausted), drops the line and loads the next.
+    /// Returns `None` only at true EOF.
+    fn advance_byte_in_string(&mut self, _content: &mut String) -> Result<Option<u8>, ParseError> {
         loop {
             if let Some(b) = self.advance_byte() {
                 return Ok(Some(b));
             }
-            // End of line content.  If terminated, the line boundary
-            // is a newline in the source — add it and fetch next line.
-            if self.current_line.as_ref().is_some_and(|l| l.terminated) {
-                content.push('\n');
-                self.current_line = None;
-                if !self.ensure_line()? {
-                    return Ok(None); // EOF after newline
-                }
-            } else {
-                return Ok(None); // unterminated — true EOF
+            // Line truly exhausted (past \n or unterminated).
+            // Drop it and load the next.
+            self.current_line = None;
+            if !self.ensure_line(false)? {
+                return Ok(None); // EOF
             }
         }
     }
@@ -243,7 +242,7 @@ impl Lexer {
     pub fn skip_to_end(&mut self) {
         self.current_line = None;
         // Drain the source.
-        while let Ok(Some(_)) = self.source.next_line() {}
+        while let Ok(Some(_)) = self.source.next_line(false) {}
     }
 
     /// Current byte position in source (global).
@@ -263,7 +262,7 @@ impl Lexer {
         // Skip the rest of the current line (after `=`).
         self.current_line = None;
         loop {
-            match self.source.next_line() {
+            match self.source.next_line(false) {
                 Ok(Some(line)) => {
                     // Terminator: '.' at start of line, optionally followed by ws.
                     if line.line.first() == Some(&b'.') && line.line[1..].iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r') {
@@ -279,15 +278,17 @@ impl Lexer {
 
     fn skip_ws_and_comments(&mut self) -> Result<(), ParseError> {
         loop {
-            if !self.ensure_line()? {
+            if !self.ensure_line(false)? {
                 break; // EOF
             }
-            // Skip spaces and tabs within the line.
-            while self.peek_byte().is_some_and(|b| b == b' ' || b == b'\t') {
+            // Skip whitespace: spaces, tabs, and newlines (\n is
+            // delivered by peek_byte as the line terminator).
+            while self.peek_byte().is_some_and(|b| b == b' ' || b == b'\t' || b == b'\n') {
                 self.skip(1);
             }
-            // End of line content — ensure_line will drop and fetch next.
+            // Line truly exhausted — drop it and fetch next.
             if self.peek_byte().is_none() {
+                self.current_line = None;
                 continue;
             }
             // Comment — rest of line is comment, drop it.
@@ -313,7 +314,7 @@ impl Lexer {
         self.current_line = None;
         // Read lines until =cut at start of line.
         loop {
-            if !self.ensure_line()? {
+            if !self.ensure_line(false)? {
                 break; // EOF inside pod — not an error per Perl
             }
             let is_cut = {
@@ -373,7 +374,7 @@ impl Lexer {
         self.skip_ws_and_comments()?;
 
         // Ensure a line is available after skipping whitespace.
-        if !self.ensure_line()? {
+        if !self.ensure_line(false)? {
             let start = self.span_pos();
             return Ok(Spanned { token: Token::Eof, span: Span::new(start, start) });
         }
@@ -1124,48 +1125,47 @@ impl Lexer {
 
         let start = self.span_pos();
 
-        // For heredocs, ensure we have a line loaded.
-        if close.is_none() {
-            if !self.ensure_line()? {
-                // LexerSource returned None — heredoc finished.
-                self.context_stack.pop();
-                return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
-            }
-        }
-
-        let b = match self.peek_byte() {
-            Some(b) => b,
-            None if close.is_none() => {
-                // Empty heredoc line — return newline as ConstSegment.
-                if self.current_line.as_ref().is_some_and(|l| l.terminated) {
-                    self.current_line = None;
-                    return Ok(Spanned { token: Token::ConstSegment("\n".into()), span: Span::new(start, self.span_pos()) });
+        // If no line is loaded, try to load one.
+        // For heredocs, this consumes the end-of-body signal.
+        // For regular strings, this detects EOF.
+        // If a line IS loaded (even if exhausted), skip this —
+        // the inner loop handles exhausted lines with their newline.
+        if self.current_line.is_none() {
+            if !self.ensure_line(false)? {
+                if close.is_none() {
+                    // Heredoc finished.
+                    self.context_stack.pop();
+                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, start) });
                 }
                 return Err(ParseError::new("unterminated string", Span::new(start, start)));
             }
-            None => return Err(ParseError::new("unterminated string", Span::new(start, start))),
-        };
-
-        // Check for closing delimiter (not for heredocs — close is None).
-        if let Some(c) = close {
-            if b == c && depth == 0 {
-                if interpolating {
-                    self.skip(1);
-                    self.context_stack.pop();
-                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
-                }
-                // Non-interpolating: closing delimiter is consumed
-                // by the main loop below as the exit condition.
-            }
         }
 
-        // Check for interpolation (only in interpolating mode).
-        if interpolating {
-            if b == b'$' {
-                return self.lex_interp_scalar(start);
+        // Check the first byte for fast dispatch (delimiter, $, @).
+        // If the line is exhausted (e.g. after $x at end of line),
+        // skip these checks — the inner loop will handle line crossing.
+        if let Some(b) = self.peek_byte() {
+            // Check for closing delimiter (not for heredocs — close is None).
+            if let Some(c) = close {
+                if b == c && depth == 0 {
+                    if interpolating {
+                        self.skip(1);
+                        self.context_stack.pop();
+                        return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
+                    }
+                    // Non-interpolating: closing delimiter is consumed
+                    // by the main loop below as the exit condition.
+                }
             }
-            if b == b'@' {
-                return self.lex_interp_array(start);
+
+            // Check for interpolation (only in interpolating mode).
+            if interpolating {
+                if b == b'$' {
+                    return self.lex_interp_scalar(start);
+                }
+                if b == b'@' {
+                    return self.lex_interp_array(start);
+                }
             }
         }
 
@@ -1177,27 +1177,13 @@ impl Lexer {
         loop {
             match self.peek_byte() {
                 None => {
-                    // End of line content.
-                    let terminated = self.current_line.as_ref().is_some_and(|l| l.terminated);
-                    if close.is_none() {
-                        // Heredoc: push newline, drop line, break.
-                        if terminated {
-                            s.push('\n');
-                        }
-                        self.current_line = None;
-                        break;
-                    } else {
-                        // Regular string: cross line boundary.
-                        if terminated {
-                            s.push('\n');
-                            self.current_line = None;
-                            if !self.ensure_line()? {
-                                break; // EOF inside string
-                            }
-                            continue;
-                        }
-                        break; // unterminated line — EOF
+                    // Line truly exhausted (past \n or unterminated
+                    // EOF).  Drop it and load the next.
+                    self.current_line = None;
+                    if !self.ensure_line(true)? {
+                        break; // EOF or heredoc finished
                     }
+                    continue;
                 }
                 Some(b) if Some(b) == close && current_depth == 0 => {
                     if !interpolating {
@@ -1855,7 +1841,7 @@ impl Lexer {
     fn collect_heredoc_literal(&mut self, tag: &str, indented: bool) -> Result<Token, ParseError> {
         let mut body = String::new();
         loop {
-            match self.source.next_line()? {
+            match self.source.next_line(false)? {
                 Some(line) => {
                     body.push_str(&String::from_utf8_lossy(&line.line));
                     body.push('\n');
@@ -2078,10 +2064,9 @@ mod tests {
         // Consume QuoteBegin.
         let tok = lexer.next_token(&expect).unwrap();
         assert_eq!(tok.token, Token::QuoteBegin(QuoteKind::Heredoc, 0));
-        // Consume body content — "hello\rEND\n" is a single non-terminator line.
-        let tok = lexer.next_token(&expect).unwrap();
-        assert!(matches!(tok.token, Token::ConstSegment(_)));
-        // Now at EOF with no terminator found — should error.
+        // Body scanning hits EOF — unterminated heredoc error.
+        // The body line "hello\rEND" is not a terminator, and there
+        // are no more lines, so the error is detected during scanning.
         let result = lexer.next_token(&expect);
         assert!(result.is_err(), "expected unterminated heredoc error");
     }
@@ -2507,11 +2492,12 @@ mod tests {
     fn lex_heredoc_multiline_body() {
         let src = "<<END;\nline 1\nline 2\nline 3\nEND\n";
         let tokens = lex_all(src);
-        // Heredoc body is split into ConstSegments at line boundaries.
-        assert_eq!(tokens[0], Token::QuoteBegin(QuoteKind::Heredoc, 0));
-        // Collect all ConstSegment content.
-        let body: String = tokens.iter().filter_map(|t| if let Token::ConstSegment(s) = t { Some(s.as_str()) } else { None }).collect();
-        assert_eq!(body, "line 1\nline 2\nline 3\n");
+        // Heredoc body is returned as a single ConstSegment
+        // covering all lines, same as regular strings.
+        assert_eq!(
+            tokens,
+            vec![Token::QuoteBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("line 1\nline 2\nline 3\n".into()), Token::QuoteEnd, Token::Semi,]
+        );
     }
 
     #[test]
@@ -2741,6 +2727,60 @@ mod tests {
             }
             other => panic!("expected IndentedLiteral HeredocLit, got {other:?}"),
         }
+    }
+
+    // ── Multiline string handling ────────────────────────────────
+
+    #[test]
+    fn lex_single_quoted_multiline_one_segment() {
+        // A multiline single-quoted string should produce one StrLit
+        // covering all lines, not one per line.
+        let tokens = lex_all("'line 1\nline 2\nline 3'");
+        assert_eq!(tokens, vec![Token::StrLit("line 1\nline 2\nline 3".into())]);
+    }
+
+    #[test]
+    fn lex_q_multiline_one_segment() {
+        // q// across lines should also produce one StrLit.
+        let tokens = lex_all("q/line 1\nline 2\nline 3/");
+        assert_eq!(tokens, vec![Token::StrLit("line 1\nline 2\nline 3".into())]);
+    }
+
+    #[test]
+    fn lex_double_quoted_multiline_one_segment() {
+        // A multiline double-quoted string without interpolation
+        // should produce one ConstSegment covering all lines.
+        let tokens = lex_all("\"line 1\nline 2\nline 3\"");
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("line 1\nline 2\nline 3".into()), Token::QuoteEnd,]);
+    }
+
+    #[test]
+    fn lex_double_quoted_multiline_breaks_at_interp() {
+        // A multiline double-quoted string breaks ConstSegment at
+        // interpolation points, but lines without interpolation
+        // are merged into one segment.
+        let tokens = lex_all("\"line 1\nline 2\n$x\nline 4\"");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::QuoteBegin(QuoteKind::Double, b'"'),
+                Token::ConstSegment("line 1\nline 2\n".into()),
+                Token::InterpScalar("x".into()),
+                Token::ConstSegment("\nline 4".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_heredoc_multiline_single_segment() {
+        // Heredocs return all body lines in one ConstSegment,
+        // same as regular strings.  The peek_heredoc mechanism
+        // in next_line prevents the one-shot signal from being
+        // consumed prematurely.
+        let src = "<<END;\nline 1\nline 2\nEND\n";
+        let tokens = lex_all(src);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("line 1\nline 2\n".into()), Token::QuoteEnd, Token::Semi,]);
     }
 
     // ── Assignment operator tokens ────────────────────────────
