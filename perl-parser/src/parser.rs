@@ -79,10 +79,10 @@ impl OpInfo {
 pub struct Parser {
     lexer: Lexer,
     /// Cached current token.  `None` means no token is cached —
-    /// the next peek/advance will lex one.
+    /// the next peek/next will lex one.
     current: Option<Spanned>,
     expect: Expect,
-    /// Stored lexer error — surfaced by advance() or checked by parse_program().
+    /// Stored lexer error — surfaced by next_token().
     lexer_error: Option<ParseError>,
     depth: ParseDepth,
 }
@@ -97,58 +97,44 @@ impl Parser {
 
     // ── Token access ──────────────────────────────────────────
 
-    /// Ensure `self.current` holds a cached token.
-    fn ensure_current(&mut self) {
-        if self.current.is_some() {
-            return;
+    /// Peek at the current token without consuming it.
+    /// Lexes on demand if no token is cached.
+    fn peek_token(&mut self) -> &Token {
+        if self.current.is_none() {
+            self.current = Some(match self.lexer.lex_token(&self.expect) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.lexer_error = Some(e);
+                    Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) }
+                }
+            });
         }
-
-        let spanned = match self.lexer.next_token(&self.expect) {
-            Ok(s) => s,
-            Err(e) => {
-                self.lexer_error = Some(e);
-                Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) }
-            }
-        };
-        self.current = Some(spanned);
+        &self.current.as_ref().unwrap().token
     }
 
-    fn peek(&mut self) -> &Token {
-        self.ensure_current();
-        match &self.current {
-            Some(spanned) => &spanned.token,
-            None => &Token::Eof,
-        }
-    }
-
+    /// Peek at the span of the current token.
     fn peek_span(&mut self) -> Span {
-        self.ensure_current();
-        match &self.current {
-            Some(spanned) => spanned.span,
-            None => Span::new(0, 0),
-        }
+        self.peek_token();
+        self.current.as_ref().unwrap().span
     }
 
-    fn advance(&mut self) -> Result<Spanned, ParseError> {
-        self.ensure_current();
+    /// Consume and return the current token.
+    fn next_token(&mut self) -> Result<Spanned, ParseError> {
+        self.peek_token();
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        match self.current.take() {
-            Some(spanned) => Ok(spanned),
-            None => Err(ParseError::new("internal: no current token", Span::new(0, 0))),
-        }
+        Ok(self.current.take().unwrap())
     }
 
     fn expect_token(&mut self, expected: &Token) -> Result<Spanned, ParseError> {
-        self.ensure_current();
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        if self.peek() == expected {
-            self.advance()
+        if self.peek_token() == expected {
+            self.next_token()
         } else {
-            let msg = format!("expected {expected}, got {}", self.peek());
+            let msg = format!("expected {expected}, got {}", self.peek_token());
             let span = self.peek_span();
             Err(ParseError::new(msg, span))
         }
@@ -156,7 +142,7 @@ impl Parser {
 
     fn eat(&mut self, token: &Token) -> Result<bool, ParseError> {
         if self.at(token)? {
-            self.advance()?;
+            self.next_token()?;
             Ok(true)
         } else {
             Ok(false)
@@ -164,25 +150,17 @@ impl Parser {
     }
 
     fn at(&mut self, token: &Token) -> Result<bool, ParseError> {
-        self.ensure_current();
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        match &self.current {
-            Some(spanned) => Ok(spanned.token == *token),
-            None => Ok(false),
-        }
+        Ok(self.peek_token() == token)
     }
 
     fn at_eof(&mut self) -> Result<bool, ParseError> {
-        self.ensure_current();
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        match &self.current {
-            Some(spanned) => Ok(matches!(spanned.token, Token::Eof)),
-            None => Ok(true),
-        }
+        Ok(matches!(self.peek_token(), Token::Eof))
     }
 
     // ── Depth control ─────────────────────────────────────────
@@ -270,9 +248,9 @@ impl Parser {
         }
 
         // __END__ / __DATA__ / ^D / ^Z — stop parsing immediately
-        if let Token::DataEnd(marker) = self.peek() {
+        if let Token::DataEnd(marker) = self.peek_token() {
             let marker = *marker;
-            self.advance()?;
+            self.next_token()?;
             // Compute the byte offset where trailing data begins.
             let data_offset = match marker {
                 // ^D / ^Z: data starts immediately after the control char.
@@ -294,13 +272,13 @@ impl Parser {
             return Ok(Statement { kind: StmtKind::DataEnd(marker, data_offset), span: start.merge(self.peek_span()), terminated: false });
         }
 
-        let (kind, terminated) = match self.peek().clone() {
+        let (kind, terminated) = match self.peek_token().clone() {
             // Statement-level keywords: consume first, check for fat comma
             // autoquoting (e.g. `if => 1`), then dispatch to handler.
             Token::Keyword(kw) if keyword::is_statement_keyword(kw) => {
                 let kw_span = self.peek_span();
-                self.advance()?; // consume the keyword
-                if matches!(self.peek(), Token::FatComma) {
+                self.next_token()?; // consume the keyword
+                if matches!(self.peek_token(), Token::FatComma) {
                     // Autoquote: keyword is used as a hash key.
                     self.descend()?;
                     let name: &str = kw.into();
@@ -316,7 +294,7 @@ impl Parser {
                         Keyword::Our => (self.parse_our_decl()?, false),
                         Keyword::State => (self.parse_state_decl()?, false),
                         Keyword::Sub => {
-                            if matches!(self.peek(), Token::Ident(_)) {
+                            if matches!(self.peek_token(), Token::Ident(_)) {
                                 (self.parse_sub_decl_body(kw_span)?, false)
                             } else {
                                 let expr = self.parse_anon_sub(kw_span)?;
@@ -401,13 +379,13 @@ impl Parser {
             // Identifier: could be a label (IDENT:) or start of expression.
             Token::Ident(_) => {
                 let ident_span = self.peek_span();
-                let name = match self.advance()?.token {
+                let name = match self.next_token()?.token {
                     Token::Ident(n) => n,
                     _ => unreachable!(),
                 };
-                if matches!(self.peek(), Token::Colon) {
+                if matches!(self.peek_token(), Token::Colon) {
                     // Label: consume ':' and parse the labeled statement.
-                    self.advance()?;
+                    self.next_token()?;
                     let stmt = self.parse_statement()?;
                     (StmtKind::Labeled(name, Box::new(stmt)), false)
                 } else {
@@ -430,15 +408,15 @@ impl Parser {
     }
 
     fn maybe_postfix_control(&mut self, expr: Expr) -> Result<StmtKind, ParseError> {
-        match self.peek() {
+        match self.peek_token() {
             Token::Keyword(Keyword::If) => {
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let cond = self.parse_expr(PREC_LOW)?;
                 Ok(StmtKind::Expr(Expr { span: expr.span.merge(cond.span), kind: ExprKind::PostfixControl(PostfixKind::If, Box::new(expr), Box::new(cond)) }))
             }
             Token::Keyword(Keyword::Unless) => {
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let cond = self.parse_expr(PREC_LOW)?;
                 Ok(StmtKind::Expr(Expr {
@@ -447,7 +425,7 @@ impl Parser {
                 }))
             }
             Token::Keyword(Keyword::While) => {
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let cond = self.parse_expr(PREC_LOW)?;
                 Ok(StmtKind::Expr(Expr {
@@ -456,7 +434,7 @@ impl Parser {
                 }))
             }
             Token::Keyword(Keyword::Until) => {
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let cond = self.parse_expr(PREC_LOW)?;
                 Ok(StmtKind::Expr(Expr {
@@ -465,7 +443,7 @@ impl Parser {
                 }))
             }
             Token::Keyword(Keyword::For) | Token::Keyword(Keyword::Foreach) => {
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let list = self.parse_expr(PREC_LOW)?;
                 Ok(StmtKind::Expr(Expr { span: expr.span.merge(list.span), kind: ExprKind::PostfixControl(PostfixKind::For, Box::new(expr), Box::new(list)) }))
@@ -506,7 +484,7 @@ impl Parser {
 
     fn parse_single_var_decl(&mut self) -> Result<VarDecl, ParseError> {
         let span = self.peek_span();
-        match self.advance()?.token {
+        match self.next_token()?.token {
             Token::ScalarVar(name) => Ok(VarDecl { sigil: Sigil::Scalar, name, span }),
             Token::ArrayVar(name) => Ok(VarDecl { sigil: Sigil::Array, name, span }),
             Token::HashVar(name) => Ok(VarDecl { sigil: Sigil::Hash, name, span }),
@@ -534,7 +512,7 @@ impl Parser {
     /// Parse the body of a named sub declaration after `sub` has
     /// already been consumed.  `start` is the span of the `sub` keyword.
     fn parse_sub_decl_body(&mut self, start: Span) -> Result<StmtKind, ParseError> {
-        let name = match self.advance()?.token {
+        let name = match self.next_token()?.token {
             Token::Ident(name) => name,
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
         };
@@ -553,7 +531,7 @@ impl Parser {
     /// until `)`, matching toke.c's `scan_str()` call in `yyl_sub()`.
     fn parse_prototype(&mut self) -> Result<Option<String>, ParseError> {
         if self.at(&Token::LeftParen)? {
-            self.advance()?; // consume (
+            self.next_token()?; // consume (
             let proto = self.lexer.lex_body_str(b'(', true)?;
             Ok(Some(proto))
         } else {
@@ -565,40 +543,40 @@ impl Parser {
         let mut attrs = Vec::new();
         while self.at(&Token::Colon)? {
             let attr_start = self.peek_span();
-            self.advance()?; // eat ':'
+            self.next_token()?; // eat ':'
             // Attribute names can be identifiers or keywords (e.g. :method, :lvalue)
-            let name = match self.peek().clone() {
+            let name = match self.peek_token().clone() {
                 Token::Ident(s) => Some(s),
                 Token::Keyword(kw) => Some((<&str>::from(kw)).to_string()),
                 _ => None,
             };
             if let Some(name) = name {
                 let name_span = self.peek_span();
-                self.advance()?; // eat the name
+                self.next_token()?; // eat the name
                 // Optional parenthesized args
                 let value = if self.at(&Token::LeftParen)? {
-                    self.advance()?;
+                    self.next_token()?;
                     let mut args = String::new();
                     let mut depth = 1u32;
                     loop {
-                        match self.peek().clone() {
+                        match self.peek_token().clone() {
                             Token::LeftParen => {
                                 depth += 1;
                                 args.push('(');
-                                self.advance()?;
+                                self.next_token()?;
                             }
                             Token::RightParen => {
                                 depth -= 1;
                                 if depth == 0 {
-                                    self.advance()?;
+                                    self.next_token()?;
                                     break;
                                 }
                                 args.push(')');
-                                self.advance()?;
+                                self.next_token()?;
                             }
                             Token::Eof => break,
                             _ => {
-                                args.push_str(&format!("{}", self.advance()?.token));
+                                args.push_str(&format!("{}", self.next_token()?.token));
                             }
                         }
                     }
@@ -621,7 +599,7 @@ impl Parser {
 
         if self.at(&Token::LeftParen)? {
             // List form: my ($x, @y, %z)
-            self.advance()?;
+            self.next_token()?;
             while !self.at(&Token::RightParen)? && !self.at_eof()? {
                 vars.push(self.parse_single_var_decl()?);
                 if !self.eat(&Token::Comma)? {
@@ -725,7 +703,7 @@ impl Parser {
 
     fn parse_for_stmt(&mut self) -> Result<StmtKind, ParseError> {
         // If next is a variable or 'my', it's foreach-style
-        if matches!(self.peek(), Token::Keyword(Keyword::My) | Token::ScalarVar(_)) {
+        if matches!(self.peek_token(), Token::Keyword(Keyword::My) | Token::ScalarVar(_)) {
             return self.parse_foreach_body();
         }
 
@@ -785,9 +763,9 @@ impl Parser {
     fn parse_foreach_body(&mut self) -> Result<StmtKind, ParseError> {
         let var = if self.eat(&Token::Keyword(Keyword::My))? {
             Some(self.parse_single_var_decl()?)
-        } else if matches!(self.peek(), Token::ScalarVar(_)) {
+        } else if matches!(self.peek_token(), Token::ScalarVar(_)) {
             let span = self.peek_span();
-            let name = match self.advance()?.token {
+            let name = match self.next_token()?.token {
                 Token::ScalarVar(n) => n,
                 _ => unreachable!(),
             };
@@ -812,14 +790,17 @@ impl Parser {
     // ── Package and use ───────────────────────────────────────
 
     fn parse_package_decl(&mut self, start: Span) -> Result<StmtKind, ParseError> {
-        let name = match self.advance()?.token {
+        let name = match self.next_token()?.token {
             Token::Ident(n) => n,
             other => return Err(ParseError::new(format!("expected package name, got {other:?}"), start)),
         };
 
         // Optional version
-        let version =
-            if matches!(self.peek(), Token::IntLit(_) | Token::FloatLit(_) | Token::VersionLit(_)) { Some(format!("{}", self.advance()?.token)) } else { None };
+        let version = if matches!(self.peek_token(), Token::IntLit(_) | Token::FloatLit(_) | Token::VersionLit(_)) {
+            Some(format!("{}", self.next_token()?.token))
+        } else {
+            None
+        };
 
         let block = if {
             self.expect = Expect::Block(ExpectNext::Statement);
@@ -835,7 +816,7 @@ impl Parser {
     }
 
     fn parse_use_decl(&mut self, start: Span, is_no: bool) -> Result<StmtKind, ParseError> {
-        let module = match self.advance()?.token {
+        let module = match self.next_token()?.token {
             Token::Ident(n) => n,
             Token::StrLit(n) => n, // v-strings: use v5.26.0
             Token::IntLit(n) => format!("{n}"),
@@ -884,7 +865,7 @@ impl Parser {
 
         let (catch_var, catch_block) = if self.eat(&Token::Keyword(Keyword::Catch))? {
             let var = if self.at(&Token::LeftParen)? {
-                self.advance()?;
+                self.next_token()?;
                 let decl = self.parse_single_var_decl()?;
                 self.expect_token(&Token::RightParen)?;
                 Some(decl)
@@ -912,8 +893,8 @@ impl Parser {
 
     fn parse_format(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         // Optional name (defaults to STDOUT)
-        let name = if let Token::Ident(_) = self.peek() {
-            match self.advance()?.token {
+        let name = if let Token::Ident(_) = self.peek_token() {
+            match self.next_token()?.token {
                 Token::Ident(s) => s,
                 _ => unreachable!(),
             }
@@ -937,7 +918,7 @@ impl Parser {
     // ── class / field / method (5.38+ Corinna) ────────────────
 
     fn parse_class(&mut self, start: Span) -> Result<StmtKind, ParseError> {
-        let name = match self.advance()?.token {
+        let name = match self.next_token()?.token {
             Token::Ident(n) => n,
             other => return Err(ParseError::new(format!("expected class name, got {other:?}"), start)),
         };
@@ -966,7 +947,7 @@ impl Parser {
     }
 
     fn parse_method(&mut self, start: Span) -> Result<StmtKind, ParseError> {
-        let name = match self.advance()?.token {
+        let name = match self.next_token()?.token {
             Token::Ident(n) => n,
             other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
         };
@@ -1176,12 +1157,12 @@ impl Parser {
     // ── Term parsing ──────────────────────────────────────────
 
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
-        let spanned = self.advance()?;
+        let spanned = self.next_token()?;
         let span = spanned.span;
 
         // Fat comma autoquotes keywords: `if => 1` produces StringLit("if").
         if let Token::Keyword(kw) = &spanned.token {
-            if matches!(self.peek(), Token::FatComma) {
+            if matches!(self.peek_token(), Token::FatComma) {
                 let name: &str = (*kw).into();
                 return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
             }
@@ -1203,7 +1184,7 @@ impl Parser {
                 // @array[0,1] → array slice; @array{qw(a b)} → hash slice
                 self.expect = Expect::Operator;
                 if self.at(&Token::LeftBracket)? {
-                    self.advance()?;
+                    self.next_token()?;
                     self.expect = Expect::Term;
                     let mut indices = Vec::new();
                     while !self.at(&Token::RightBracket)? && !self.at_eof()? {
@@ -1216,7 +1197,7 @@ impl Parser {
                     self.expect_token(&Token::RightBracket)?;
                     Ok(Expr { span: span.merge(end), kind: ExprKind::ArraySlice(Box::new(Expr { kind: ExprKind::ArrayVar(name), span }), indices) })
                 } else if self.at(&Token::LeftBrace)? {
-                    self.advance()?;
+                    self.next_token()?;
                     self.expect = Expect::Term;
                     let mut keys = Vec::new();
                     while !self.at(&Token::RightBrace)? && !self.at_eof()? {
@@ -1247,7 +1228,7 @@ impl Parser {
                 self.expect = Expect::Deref;
                 if self.at(&Token::LeftBrace)? {
                     // ${expr} — dereference block
-                    self.advance()?;
+                    self.next_token()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
@@ -1265,7 +1246,7 @@ impl Parser {
                 self.expect = Expect::Deref;
                 if self.at(&Token::LeftBrace)? {
                     // @{expr} — array dereference block
-                    self.advance()?;
+                    self.next_token()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
@@ -1280,7 +1261,7 @@ impl Parser {
             Token::Percent => {
                 self.expect = Expect::Deref;
                 if self.at(&Token::LeftBrace)? {
-                    self.advance()?;
+                    self.next_token()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
@@ -1296,21 +1277,21 @@ impl Parser {
                 self.expect = Expect::Deref;
                 if self.at(&Token::LeftBrace)? {
                     // &{expr}
-                    self.advance()?;
+                    self.next_token()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
                     let deref = Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Code, Box::new(inner)) };
                     self.maybe_call_args(deref)
-                } else if let Token::Ident(_) = self.peek() {
+                } else if let Token::Ident(_) = self.peek_token() {
                     // &foo or &foo(args)
                     let name_span = self.peek_span();
-                    let name = match self.advance()?.token {
+                    let name = match self.next_token()?.token {
                         Token::Ident(s) => s,
                         _ => unreachable!(),
                     };
                     if self.at(&Token::LeftParen)? {
-                        self.advance()?;
+                        self.next_token()?;
                         self.expect = Expect::Term;
                         let mut args = Vec::new();
                         while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -1338,14 +1319,14 @@ impl Parser {
             Token::Star => {
                 self.expect = Expect::Term;
                 if self.at(&Token::LeftBrace)? {
-                    self.advance()?;
+                    self.next_token()?;
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
                     Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Glob, Box::new(inner)) })
-                } else if let Token::Ident(_) = self.peek() {
+                } else if let Token::Ident(_) = self.peek_token() {
                     let name_span = self.peek_span();
-                    let name = match self.advance()?.token {
+                    let name = match self.next_token()?.token {
                         Token::Ident(s) => s,
                         _ => unreachable!(),
                     };
@@ -1365,10 +1346,10 @@ impl Parser {
             Token::Minus => {
                 // -bareword (not followed by parens) → StringLit("-bareword")
                 // Perl: unary minus on an identifier always returns "-identifier".
-                if let Token::Ident(name) = self.peek().clone() {
+                if let Token::Ident(name) = self.peek_token().clone() {
                     let ident_span = self.peek_span();
-                    self.advance()?; // consume the ident
-                    if matches!(self.peek(), Token::LeftParen) {
+                    self.next_token()?; // consume the ident
+                    if matches!(self.peek_token(), Token::LeftParen) {
                         // -func(...) → unary minus on function call.
                         let func = self.parse_ident_term(name, ident_span)?;
                         return Ok(Expr { span: span.merge(func.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(func)) });
@@ -1480,9 +1461,9 @@ impl Parser {
                 };
                 self.expect = Expect::Term;
                 // Optional label argument
-                if let Token::Ident(_) = self.peek() {
+                if let Token::Ident(_) = self.peek_token() {
                     let label_span = self.peek_span();
-                    let label = match self.advance()?.token {
+                    let label = match self.next_token()?.token {
                         Token::Ident(s) => s,
                         _ => unreachable!(),
                     };
@@ -1507,7 +1488,7 @@ impl Parser {
             Token::LeftParen => {
                 self.expect = Expect::Term;
                 if self.at(&Token::RightParen)? {
-                    self.advance()?;
+                    self.next_token()?;
                     Ok(Expr { kind: ExprKind::List(vec![]), span })
                 } else {
                     let inner = self.parse_expr(PREC_LOW)?;
@@ -1616,7 +1597,7 @@ impl Parser {
             Token::Filetest(test_byte) => {
                 let test_char = test_byte as char;
                 // In autoquoting contexts (=> or }), treat as StringLit("-x")
-                if matches!(self.peek(), Token::FatComma | Token::RightBrace) {
+                if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
                     return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
                 }
                 let (target, end) = self.parse_stat_target(span)?;
@@ -1658,13 +1639,13 @@ impl Parser {
 
     fn parse_ident_term(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
         // Autoquote: bareword followed by `=>` (fat comma) or `}` (hash subscript)
-        if matches!(self.peek(), Token::FatComma | Token::RightBrace) {
+        if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
 
         // Check if followed by `(` — function call
         if self.at(&Token::LeftParen)? {
-            self.advance()?;
+            self.next_token()?;
             self.expect = Expect::Term;
             let mut args = Vec::new();
             while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -1681,17 +1662,17 @@ impl Parser {
         // Indirect object syntax: METHOD CLASS ARGS
         // e.g. new Foo(args), new Foo args
         // Heuristic: bareword followed by a capitalized bareword or $var.
-        match self.peek() {
+        match self.peek_token() {
             Token::Ident(class_name) if class_name.starts_with(|c: char| c.is_ascii_uppercase()) => {
                 let class_name = class_name.clone();
                 let class_span = self.peek_span();
-                self.advance()?; // eat class name
+                self.next_token()?; // eat class name
                 let class_expr = Expr { kind: ExprKind::Bareword(class_name), span: class_span };
 
                 // Optional args
                 let mut args = Vec::new();
                 if self.at(&Token::LeftParen)? {
-                    self.advance()?;
+                    self.next_token()?;
                     self.expect = Expect::Term;
                     while !self.at(&Token::RightParen)? && !self.at_eof()? {
                         args.push(self.parse_expr(PREC_COMMA + 1)?);
@@ -1708,7 +1689,7 @@ impl Parser {
             }
             Token::ScalarVar(_) => {
                 let var_span = self.peek_span();
-                let var = match self.advance()?.token {
+                let var = match self.next_token()?.token {
                     Token::ScalarVar(n) => n,
                     _ => unreachable!(),
                 };
@@ -1716,7 +1697,7 @@ impl Parser {
 
                 let mut args = Vec::new();
                 if self.at(&Token::LeftParen)? {
-                    self.advance()?;
+                    self.next_token()?;
                     self.expect = Expect::Term;
                     while !self.at(&Token::RightParen)? && !self.at_eof()? {
                         args.push(self.parse_expr(PREC_COMMA + 1)?);
@@ -1751,12 +1732,12 @@ impl Parser {
         // Operators that prefer defined-or: // after shift/pop/undef/etc.
         // is defined-or, not an empty regex argument.  Matches toke.c's
         // XTERMORDORDOR.
-        if keyword::prefers_defined_or(kw) && matches!(self.peek(), Token::DefinedOr) {
+        if keyword::prefers_defined_or(kw) && matches!(self.peek_token(), Token::DefinedOr) {
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
         }
 
         if self.at(&Token::LeftParen)? {
-            self.advance()?;
+            self.next_token()?;
             let arg = self.parse_expr(PREC_LOW)?;
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
@@ -1783,7 +1764,7 @@ impl Parser {
 
         // Parenthesized form: stat($file), stat(_)
         if self.at(&Token::LeftParen)? {
-            self.advance()?;
+            self.next_token()?;
             let (target, _) = self.parse_stat_target_inner(start)?;
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
@@ -1797,11 +1778,16 @@ impl Parser {
     fn parse_stat_target_inner(&mut self, start: Span) -> Result<(StatTarget, Span), ParseError> {
         // No argument: ;, }, ), EOF, or // (defined-or, not empty regex —
         // matches toke.c's FTST macro setting XTERMORDORDOR).
-        if self.at(&Token::Semi)? || self.at(&Token::RightBrace)? || self.at(&Token::RightParen)? || self.at_eof()? || matches!(self.peek(), Token::DefinedOr) {
+        if self.at(&Token::Semi)?
+            || self.at(&Token::RightBrace)?
+            || self.at(&Token::RightParen)?
+            || self.at_eof()?
+            || matches!(self.peek_token(), Token::DefinedOr)
+        {
             Ok((StatTarget::Default, start))
-        } else if matches!(self.peek(), Token::Ident(name) if name == "_") {
+        } else if matches!(self.peek_token(), Token::Ident(name) if name == "_") {
             let end = self.peek_span();
-            self.advance()?;
+            self.next_token()?;
             Ok((StatTarget::StatCache, end))
         } else {
             let expr = self.parse_expr(PREC_UNARY)?;
@@ -1823,7 +1809,7 @@ impl Parser {
 
         // Check for parens
         if self.at(&Token::LeftParen)? {
-            self.advance()?;
+            self.next_token()?;
             let mut args = Vec::new();
             while !self.at(&Token::RightParen)? && !self.at_eof()? {
                 args.push(self.parse_expr(PREC_COMMA + 1)?);
@@ -1841,7 +1827,7 @@ impl Parser {
         while !self.at(&Token::Semi)? && !self.at_eof()? && !self.at(&Token::RightBrace)? {
             // Check for postfix control keywords
             if matches!(
-                self.peek(),
+                self.peek_token(),
                 Token::Keyword(Keyword::If)
                     | Token::Keyword(Keyword::Unless)
                     | Token::Keyword(Keyword::While)
@@ -1869,7 +1855,7 @@ impl Parser {
 
         // Check for parens: sort(...), map(...), grep(...)
         if self.at(&Token::LeftParen)? {
-            self.advance()?;
+            self.next_token()?;
             let mut args = Vec::new();
             // Check for block as first arg inside parens
             self.expect = Expect::Block(ExpectNext::Term);
@@ -1898,9 +1884,9 @@ impl Parser {
             args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
         } else if kw == Keyword::Sort {
             // sort can also take a sub name: sort subname @list
-            if let Token::Ident(_) = self.peek() {
+            if let Token::Ident(_) = self.peek_token() {
                 let ident_span = self.peek_span();
-                let ident = match self.advance()?.token {
+                let ident = match self.next_token()?.token {
                     Token::Ident(s) => s,
                     _ => unreachable!(),
                 };
@@ -1911,7 +1897,7 @@ impl Parser {
         // Rest of arguments
         while !self.at(&Token::Semi)? && !self.at_eof()? && !self.at(&Token::RightBrace)? && !self.at(&Token::RightParen)? {
             if matches!(
-                self.peek(),
+                self.peek_token(),
                 Token::Keyword(Keyword::If)
                     | Token::Keyword(Keyword::Unless)
                     | Token::Keyword(Keyword::While)
@@ -1947,16 +1933,16 @@ impl Parser {
         let mut filehandle: Option<Box<Expr>> = None;
         let mut first_arg: Option<Expr> = None;
 
-        let is_bareword = matches!(self.peek(), Token::Ident(_));
-        let is_scalar = matches!(self.peek(), Token::ScalarVar(_));
+        let is_bareword = matches!(self.peek_token(), Token::Ident(_));
+        let is_scalar = matches!(self.peek_token(), Token::ScalarVar(_));
 
         if is_bareword {
             let fh_span = self.peek_span();
-            let fh_name = match self.advance()?.token {
+            let fh_name = match self.next_token()?.token {
                 Token::Ident(n) => n,
                 _ => unreachable!(),
             };
-            if matches!(self.peek(), Token::Comma) {
+            if matches!(self.peek_token(), Token::Comma) {
                 // Bareword followed by comma → first argument, not filehandle.
                 // `print CONSTANT, "hello"`.
                 self.descend()?;
@@ -1971,12 +1957,12 @@ impl Parser {
             }
         } else if is_scalar {
             let var_span = self.peek_span();
-            let var_name = match self.advance()?.token {
+            let var_name = match self.next_token()?.token {
                 Token::ScalarVar(n) => n,
                 _ => unreachable!(),
             };
             let next_is_term = matches!(
-                self.peek(),
+                self.peek_token(),
                 Token::QuoteBegin(_, _)
                     | Token::StrLit(_)
                     | Token::IntLit(_)
@@ -2048,7 +2034,7 @@ impl Parser {
             return Ok(true);
         }
         Ok(matches!(
-            self.peek(),
+            self.peek_token(),
             Token::Keyword(Keyword::If)
                 | Token::Keyword(Keyword::Unless)
                 | Token::Keyword(Keyword::While)
@@ -2062,7 +2048,7 @@ impl Parser {
     /// Consumes just the variable — subscripts are NOT included.
     /// This ensures $$ref[0] parses as ($$ref)[0], not $(${ref}[0]).
     fn parse_deref_operand(&mut self) -> Result<Expr, ParseError> {
-        let spanned = self.advance()?;
+        let spanned = self.next_token()?;
         let span = spanned.span;
         match spanned.token {
             Token::ScalarVar(name) => Ok(Expr { kind: ExprKind::ScalarVar(name), span }),
@@ -2083,7 +2069,7 @@ impl Parser {
     /// If `(` follows, parse arguments for a coderef call: `&$ref(args)`.
     fn maybe_call_args(&mut self, callee: Expr) -> Result<Expr, ParseError> {
         if self.at(&Token::LeftParen)? {
-            self.advance()?;
+            self.next_token()?;
             self.expect = Expect::Term;
             let mut args = Vec::new();
             while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -2116,14 +2102,14 @@ impl Parser {
             // After a term, we're in operator position.
             self.expect = Expect::Operator;
             if self.at(&Token::LeftBracket)? {
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBracket)?;
                 expr = Expr { span: expr.span.merge(end), kind: ExprKind::ArrayElem(Box::new(expr), Box::new(idx)) };
             } else if self.at(&Token::LeftBrace)? {
-                self.advance()?;
+                self.next_token()?;
                 let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBrace)?;
@@ -2144,10 +2130,10 @@ impl Parser {
         let mut has_interp = false;
 
         loop {
-            match self.peek().clone() {
+            match self.peek_token().clone() {
                 Token::QuoteEnd => {
                     let end = self.peek_span();
-                    self.advance()?;
+                    self.next_token()?;
                     let span = start_span.merge(end);
 
                     // Optimize: if no interpolation, collapse to a plain string.
@@ -2167,21 +2153,21 @@ impl Parser {
                     return Ok(Expr { kind: ExprKind::InterpolatedString(merged), span });
                 }
                 Token::ConstSegment(s) => {
-                    self.advance()?;
+                    self.next_token()?;
                     parts.push(StringPart::Const(s));
                 }
                 Token::InterpScalar(name) => {
-                    self.advance()?;
+                    self.next_token()?;
                     has_interp = true;
                     parts.push(StringPart::ScalarInterp(name));
                 }
                 Token::InterpArray(name) => {
-                    self.advance()?;
+                    self.next_token()?;
                     has_interp = true;
                     parts.push(StringPart::ArrayInterp(name));
                 }
                 Token::InterpScalarExprStart | Token::InterpArrayExprStart => {
-                    self.advance()?;
+                    self.next_token()?;
                     has_interp = true;
                     // The lexer pushed ExprInString context — normal code
                     // lexing until the closing }.  Parse the expression,
@@ -2204,7 +2190,7 @@ impl Parser {
     // ── Operator parsing ──────────────────────────────────────
 
     fn peek_op_info(&mut self) -> Option<OpInfo> {
-        match self.peek() {
+        match self.peek_token() {
             Token::OrOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::DefinedOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::AndAnd => Some(OpInfo { prec: PREC_AND, assoc: Assoc::Left }),
@@ -2258,7 +2244,7 @@ impl Parser {
     }
 
     fn parse_operator(&mut self, left: Expr, info: OpInfo) -> Result<Expr, ParseError> {
-        let op_spanned = self.advance()?;
+        let op_spanned = self.next_token()?;
         let right_prec = info.right_prec();
 
         match op_spanned.token {
@@ -2349,12 +2335,12 @@ impl Parser {
     }
 
     fn parse_arrow_rhs(&mut self, left: Expr) -> Result<Expr, ParseError> {
-        match self.peek().clone() {
+        match self.peek_token().clone() {
             Token::Ident(name) => {
-                self.advance()?;
+                self.next_token()?;
                 // Method call: ->method(...)
                 if self.at(&Token::LeftParen)? {
-                    self.advance()?;
+                    self.next_token()?;
                     self.expect = Expect::Term;
                     let mut args = Vec::new();
                     while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -2372,7 +2358,7 @@ impl Parser {
                 }
             }
             Token::LeftBracket => {
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
@@ -2382,7 +2368,7 @@ impl Parser {
                 self.maybe_postfix_subscript(expr)
             }
             Token::LeftBrace => {
-                self.advance()?;
+                self.next_token()?;
                 let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBrace)?;
@@ -2392,7 +2378,7 @@ impl Parser {
             }
             Token::LeftParen => {
                 // ->(...) — coderef call
-                self.advance()?;
+                self.next_token()?;
                 self.expect = Expect::Term;
                 let mut args = Vec::new();
                 while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -2408,10 +2394,10 @@ impl Parser {
             // Dynamic method dispatch: ->$method or ->$method(args)
             Token::ScalarVar(var_name) => {
                 let var_span = self.peek_span();
-                self.advance()?;
+                self.next_token()?;
                 let method_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
                 if self.at(&Token::LeftParen)? {
-                    self.advance()?;
+                    self.next_token()?;
                     self.expect = Expect::Term;
                     let mut args = Vec::new();
                     while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -2432,7 +2418,7 @@ impl Parser {
             }
             // Postfix dereference: ->@*, ->%*, ->$*, ->@[...], ->@{...}
             Token::At => {
-                self.advance()?;
+                self.next_token()?;
                 if self.eat(&Token::Star)? {
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefArray) })
                 } else {
@@ -2440,7 +2426,7 @@ impl Parser {
                 }
             }
             Token::Dollar => {
-                self.advance()?;
+                self.next_token()?;
                 if self.eat(&Token::Star)? {
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefScalar) })
                 } else {
@@ -2448,7 +2434,7 @@ impl Parser {
                 }
             }
             Token::Percent => {
-                self.advance()?;
+                self.next_token()?;
                 if self.eat(&Token::Star)? {
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefHash) })
                 } else {

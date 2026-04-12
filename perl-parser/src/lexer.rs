@@ -67,7 +67,7 @@ pub(crate) struct Lexer {
     current_line: Option<LexerLine>,
     context_stack: Vec<LexContext>,
     /// Deferred error from auto-loading in `peek_byte`.
-    /// Surfaced on the next call to `next_token`.
+    /// Surfaced on the next call to `lex_token`.
     pending_error: Option<ParseError>,
 }
 
@@ -324,7 +324,7 @@ impl Lexer {
     /// Lex the next token.  Uses `expect` to resolve ambiguities.
     /// When inside a sublexing context (interpolating string, etc.),
     /// dispatches to the appropriate sub-lexer instead.
-    pub fn next_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
+    pub fn lex_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
         // Surface any deferred error from auto-loading in peek_byte.
         if let Some(e) = self.pending_error.take() {
             return Err(e);
@@ -1947,7 +1947,7 @@ mod tests {
         let mut expect = Expect::Statement;
         let mut tokens = Vec::new();
         loop {
-            let spanned = lexer.next_token(&expect).unwrap();
+            let spanned = lexer.lex_token(&expect).unwrap();
             if matches!(spanned.token, Token::Eof) {
                 break;
             }
@@ -2030,13 +2030,13 @@ mod tests {
         let mut lexer = Lexer::new(src);
         let expect = Expect::Statement;
         // Consume QuoteBegin.
-        let tok = lexer.next_token(&expect).unwrap();
+        let tok = lexer.lex_token(&expect).unwrap();
         assert_eq!(tok.token, Token::QuoteBegin(QuoteKind::Heredoc, 0));
         // Body line "hello\rEND\n" is not a terminator — returned as content.
-        let tok = lexer.next_token(&expect).unwrap();
+        let tok = lexer.lex_token(&expect).unwrap();
         assert!(matches!(tok.token, Token::ConstSegment(_)));
         // Next call surfaces the deferred unterminated heredoc error.
-        let result = lexer.next_token(&expect);
+        let result = lexer.lex_token(&expect);
         assert!(result.is_err(), "expected unterminated heredoc error");
     }
 
@@ -2049,11 +2049,11 @@ mod tests {
         let mut lexer = Lexer::new(src.as_bytes());
         let expect = Expect::Statement;
         // Consume QuoteBegin.
-        lexer.next_token(&expect).unwrap();
+        lexer.lex_token(&expect).unwrap();
         // Consume tokens until we hit the error.
         let mut got_error = false;
         for _ in 0..20 {
-            match lexer.next_token(&expect) {
+            match lexer.lex_token(&expect) {
                 Err(e) => {
                     assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
                     got_error = true;
@@ -2072,10 +2072,10 @@ mod tests {
         let src = "<<~END;\n\t  hello\n    wrong\n\t  END\n";
         let mut lexer = Lexer::new(src.as_bytes());
         let expect = Expect::Statement;
-        lexer.next_token(&expect).unwrap();
+        lexer.lex_token(&expect).unwrap();
         let mut got_error = false;
         for _ in 0..20 {
-            match lexer.next_token(&expect) {
+            match lexer.lex_token(&expect) {
                 Err(e) => {
                     assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
                     got_error = true;
