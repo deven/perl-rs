@@ -91,25 +91,6 @@ impl LexerLine {
         if self.pos < self.line.len() { &self.line[self.pos..] } else { &[] }
     }
 
-    /// Whether the cursor has consumed everything including the
-    /// virtual `\n` (if terminated).
-    #[inline]
-    pub fn at_end(&self) -> bool {
-        if self.terminated { self.pos > self.line.len() } else { self.pos >= self.line.len() }
-    }
-
-    /// Zero-copy slice of the line content between `start` and `end`.
-    #[inline]
-    pub fn slice(&self, start: usize, end: usize) -> Bytes {
-        self.line.slice(start..end)
-    }
-
-    /// Zero-copy slice from `start` to the current cursor position.
-    #[inline]
-    pub fn slice_since(&self, start: usize) -> Bytes {
-        self.line.slice(start..self.pos)
-    }
-
     /// Byte offset in the original source at the current cursor position.
     /// Used for span construction.
     #[inline]
@@ -189,6 +170,7 @@ impl LexerSource {
 
     /// Create a new `LexerSource` from an existing `Bytes` buffer.
     /// Zero-copy — just a refcount bump.
+    #[allow(dead_code)]
     pub fn from_bytes(src: Bytes) -> Self {
         LexerSource {
             src,
@@ -209,34 +191,10 @@ impl LexerSource {
         self.cursor
     }
 
-    // TODO: line_number, set_cursor, and heredoc_depth have zero
-    // callers after checkpoint/restore removal.  Decide whether to
-    // keep them as potentially useful API or remove.
-
     /// Current line number (1-based).
+    #[allow(dead_code)]
     pub fn line_number(&self) -> usize {
         self.line_number
-    }
-
-    /// Rewind the source cursor.  Previously used by checkpoint/restore.
-    pub fn set_cursor(&mut self, cursor: usize, line_number: usize, heredoc_depth: usize) {
-        self.cursor = cursor;
-        self.line_number = line_number;
-        if heredoc_depth < self.heredoc_stack.len() {
-            self.heredoc_stack.truncate(heredoc_depth);
-            self.queued_lines.clear();
-            self.terminator_pending = false;
-        }
-    }
-
-    /// Current heredoc stack depth.
-    pub fn heredoc_depth(&self) -> usize {
-        self.heredoc_stack.len()
-    }
-
-    /// Total length of the source buffer.
-    pub fn src_len(&self) -> usize {
-        self.src.len()
     }
 
     /// Raw slice of the source buffer.  For rare operations that need
@@ -668,12 +626,11 @@ mod tests {
         assert_eq!(line.advance_byte(), Some(b'b'));
         assert_eq!(line.advance_byte(), Some(b'c'));
         // Terminated line delivers \n as the last byte.
-        assert!(!line.at_end());
         assert_eq!(line.peek_byte(), Some(b'\n'));
         assert_eq!(line.advance_byte(), Some(b'\n'));
         // Now truly exhausted.
         assert_eq!(line.advance_byte(), None);
-        assert!(line.at_end());
+        assert_eq!(line.peek_byte(), None);
     }
 
     #[test]
@@ -688,9 +645,9 @@ mod tests {
     fn lexer_line_slice() {
         let mut source = LexerSource::new(b"hello world\n");
         let line = source.next_line(false).unwrap().unwrap();
-        let s = line.slice(0, 5);
+        let s = line.line.slice(0..5);
         assert_eq!(&s[..], b"hello");
-        let s2 = line.slice(6, 11);
+        let s2 = line.line.slice(6..11);
         assert_eq!(&s2[..], b"world");
     }
 
@@ -699,7 +656,7 @@ mod tests {
         let mut source = LexerSource::new(b"abcdef\n");
         let mut line = source.next_line(false).unwrap().unwrap();
         line.pos = 4;
-        let s = line.slice_since(2);
+        let s = line.line.slice(2..line.pos);
         assert_eq!(&s[..], b"cd");
     }
 

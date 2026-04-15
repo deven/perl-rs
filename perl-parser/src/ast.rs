@@ -205,7 +205,7 @@ pub enum ExprKind {
 
     // ── Regex operations ──────────────────────────────────────
     /// `s/pattern/replacement/flags`.
-    Subst(String, SubstReplacement, Option<String>),
+    Subst(String, Box<Expr>, Option<String>),
     /// `tr/from/to/flags` or `y/from/to/flags`.
     Translit(String, String, Option<String>),
 
@@ -267,15 +267,6 @@ pub enum StringPart {
     ScalarInterp(String),
     ArrayInterp(String),
     ExprInterp(Box<Expr>),
-}
-
-/// Substitution replacement — can be a string or interpolated parts.
-#[derive(Clone, Debug)]
-pub enum SubstReplacement {
-    Literal(String),
-    Interpolated(Vec<StringPart>),
-    /// With `/e` flag: replacement is Perl code parsed as an expression.
-    Expr(Box<Expr>),
 }
 
 /// Binary operators.
