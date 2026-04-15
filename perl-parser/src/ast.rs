@@ -4,7 +4,7 @@
 //! lowering, and tooling.  It is the public output of `perl-parser`.
 
 use crate::span::Span;
-use crate::token::{AssignOp, DataEndMarker};
+use crate::token::{AssignOp, DataEndMarker, RegexKind};
 
 /// A complete Perl program.
 #[derive(Clone, Debug)]
@@ -114,8 +114,8 @@ pub enum ExprKind {
     /// `qw/.../`.
     QwList(Vec<String>),
     Undef,
-    /// Regex literal: `m/.../flags` or `/.../flags`.
-    Regex(String, Option<String>),
+    /// Regex literal: `m/.../flags`, `/.../flags`, or `qr/.../flags`.
+    Regex(RegexKind, String, Option<String>),
 
     // ── Variables ─────────────────────────────────────────────
     ScalarVar(String),

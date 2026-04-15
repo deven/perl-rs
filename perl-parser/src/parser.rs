@@ -1533,7 +1533,7 @@ impl Parser {
             Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
 
             // Regex, substitution, transliteration
-            Token::RegexBegin(_kind, _delim) => {
+            Token::RegexBegin(kind, _delim) => {
                 // Collect body tokens until QuoteEnd.
                 let body = self.parse_interpolated_string(span)?;
                 let pattern = match body.kind {
@@ -1545,7 +1545,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(pattern, flags), span })
+                Ok(Expr { kind: ExprKind::Regex(kind, pattern, flags), span })
             }
             // // in term position is an empty regex, not defined-or.
             // The lexer always returns DefinedOr for //; the parser converts
@@ -1556,7 +1556,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(String::new(), flags), span })
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, String::new(), flags), span })
             }
             // / in term position is a regex, not division.
             // The lexer returned Slash; the parser scans the body.
@@ -1566,7 +1566,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(pattern, flags), span })
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, pattern, flags), span })
             }
             // /= in term position: = is the first character of the
             // regex pattern, not a division-assignment operator.
@@ -1578,7 +1578,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(pattern, flags), span })
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, pattern, flags), span })
             }
             Token::SubstBegin(pattern, flags) => {
                 if let Some(ref f) = flags {
@@ -2911,7 +2911,7 @@ mod tests {
     fn parse_bare_regex() {
         let e = parse_expr_str("/foo/i;");
         match &e.kind {
-            ExprKind::Regex(pat, flags) => {
+            ExprKind::Regex(_, pat, flags) => {
                 assert_eq!(pat, "foo");
                 assert_eq!(flags.as_deref(), Some("i"));
             }
@@ -2924,7 +2924,7 @@ mod tests {
         let e = parse_expr_str("$x =~ /foo/;");
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => {
-                assert!(matches!(&right.kind, ExprKind::Regex(_, _)));
+                assert!(matches!(&right.kind, ExprKind::Regex(_, _, _)));
             }
             other => panic!("expected Binding, got {other:?}"),
         }
@@ -2936,7 +2936,7 @@ mod tests {
         let e = parse_expr_str("$x =~ //;");
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-                ExprKind::Regex(pat, flags) => {
+                ExprKind::Regex(_, pat, flags) => {
                     assert_eq!(pat, "");
                     assert!(flags.is_none());
                 }
@@ -2951,7 +2951,7 @@ mod tests {
         // // at statement level is an empty regex match against $_.
         let e = parse_expr_str("//;");
         match &e.kind {
-            ExprKind::Regex(pat, flags) => {
+            ExprKind::Regex(_, pat, flags) => {
                 assert_eq!(pat, "");
                 assert!(flags.is_none());
             }
@@ -2965,7 +2965,7 @@ mod tests {
         let e = parse_expr_str("$x =~ //gi;");
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-                ExprKind::Regex(pat, flags) => {
+                ExprKind::Regex(_, pat, flags) => {
                     assert_eq!(pat, "");
                     assert_eq!(flags.as_deref(), Some("gi"));
                 }
@@ -2980,7 +2980,7 @@ mod tests {
         // //gi at statement level is an empty regex with flags.
         let e = parse_expr_str("//gi;");
         match &e.kind {
-            ExprKind::Regex(pat, flags) => {
+            ExprKind::Regex(_, pat, flags) => {
                 assert_eq!(pat, "");
                 assert_eq!(flags.as_deref(), Some("gi"));
             }
@@ -2995,7 +2995,7 @@ mod tests {
         assert_eq!(prog.statements.len(), 1);
         match &prog.statements[0].kind {
             StmtKind::If(if_stmt) => {
-                assert!(matches!(if_stmt.condition.kind, ExprKind::Regex(_, _)));
+                assert!(matches!(if_stmt.condition.kind, ExprKind::Regex(_, _, _)));
             }
             other => panic!("expected If, got {other:?}"),
         }
@@ -3022,7 +3022,7 @@ mod tests {
         let e = parse_expr_str("$x =~ //gi;");
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-                ExprKind::Regex(pat, flags) => {
+                ExprKind::Regex(_, pat, flags) => {
                     assert_eq!(pat, "");
                     assert_eq!(flags.as_deref(), Some("gi"));
                 }
@@ -3034,7 +3034,7 @@ mod tests {
         let e2 = parse_expr_str("$x =~ // gi;");
         match &e2.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-                ExprKind::Regex(pat, flags) => {
+                ExprKind::Regex(_, pat, flags) => {
                     assert_eq!(pat, "");
                     assert!(flags.is_none());
                 }
@@ -4878,7 +4878,7 @@ mod tests {
         let e = parse_expr_str("$x !~ /foo/;");
         match &e.kind {
             ExprKind::BinOp(BinOp::NotBinding, _, right) => {
-                assert!(matches!(right.kind, ExprKind::Regex(_, _)));
+                assert!(matches!(right.kind, ExprKind::Regex(_, _, _)));
             }
             other => panic!("expected NotBinding, got {other:?}"),
         }
@@ -5220,7 +5220,7 @@ mod tests {
             ExprKind::ListOp(name, args) => {
                 assert_eq!(name, "split");
                 assert_eq!(args.len(), 2);
-                assert!(matches!(args[0].kind, ExprKind::Regex(_, _)));
+                assert!(matches!(args[0].kind, ExprKind::Regex(_, _, _)));
             }
             other => panic!("expected split ListOp, got {other:?}"),
         }
@@ -5453,7 +5453,7 @@ mod tests {
     fn parse_regex_with_many_flags() {
         let e = parse_expr_str("/foo/imsxg;");
         match &e.kind {
-            ExprKind::Regex(pat, flags) => {
+            ExprKind::Regex(_, pat, flags) => {
                 assert_eq!(pat, "foo");
                 assert_eq!(flags.as_deref(), Some("imsxg"));
             }
@@ -5465,7 +5465,7 @@ mod tests {
     fn parse_qr_regex() {
         let e = parse_expr_str("qr/\\d+/;");
         match &e.kind {
-            ExprKind::Regex(pat, _) => assert_eq!(pat, "\\d+"),
+            ExprKind::Regex(_, pat, _) => assert_eq!(pat, "\\d+"),
             other => panic!("expected Regex (qr), got {other:?}"),
         }
     }
