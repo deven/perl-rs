@@ -29,6 +29,7 @@ const PREC_LOW: Precedence = 0; // statement boundary
 const PREC_OR_LOW: Precedence = 2; // or
 const PREC_AND_LOW: Precedence = 4; // and
 const PREC_NOT_LOW: Precedence = 6; // not (prefix)
+#[allow(dead_code)]
 const PREC_LIST: Precedence = 8; // list operators
 const PREC_COMMA: Precedence = 10; // , =>
 const PREC_ASSIGN: Precedence = 12; // = += -= etc.
@@ -1532,7 +1533,15 @@ impl Parser {
             Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
 
             // Regex, substitution, transliteration
-            Token::RegexLit(_kind, pattern, flags) => {
+            Token::RegexBegin(_kind, _delim) => {
+                // Collect body tokens until QuoteEnd.
+                let body = self.parse_interpolated_string(span)?;
+                let pattern = match body.kind {
+                    ExprKind::StringLit(s) => s,
+                    _ => return Err(ParseError::new("regex interpolation not yet supported", span)),
+                };
+                // Flags are adjacent to the closing delimiter.
+                let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
@@ -1587,25 +1596,19 @@ impl Parser {
                         Token::QuoteEnd => String::new(),
                         other => return Err(ParseError::new(format!("unexpected token in s///e: {other:?}"), self.peek_span())),
                     };
-                    // Consume QuoteEnd.
                     self.expect_token(&Token::QuoteEnd)?;
                     let repl_src = format!("{};", raw);
                     let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
                     match prog.statements.into_iter().next() {
-                        Some(Statement { kind: StmtKind::Expr(expr), .. }) => SubstReplacement::Expr(Box::new(expr)),
-                        _ => SubstReplacement::Literal(raw),
+                        Some(Statement { kind: StmtKind::Expr(expr), .. }) => expr,
+                        _ => Expr { kind: ExprKind::StringLit(raw), span },
                     }
                 } else {
                     // Without /e: body is an interpolated string.
-                    // Collect tokens until QuoteEnd.
-                    let body = self.parse_interpolated_string(span)?;
-                    match body.kind {
-                        ExprKind::StringLit(s) => SubstReplacement::Literal(s),
-                        _ => SubstReplacement::Expr(Box::new(body)),
-                    }
+                    self.parse_interpolated_string(span)?
                 };
                 let end = self.peek_span();
-                Ok(Expr { kind: ExprKind::Subst(pattern, repl, flags), span: span.merge(end) })
+                Ok(Expr { kind: ExprKind::Subst(pattern, Box::new(repl), flags), span: span.merge(end) })
             }
             Token::TranslitLit(from, to, flags) => {
                 if let Some(ref f) = flags {
@@ -2016,7 +2019,7 @@ impl Parser {
                     | Token::Ident(_)
                     | Token::LeftParen
                     | Token::LeftBracket
-                    | Token::RegexLit(_, _, _)
+                    | Token::RegexBegin(_, _)
                     | Token::SubstBegin(_, _)
                     | Token::HeredocLit(_, _, _)
                     | Token::QwList(_)
@@ -5561,8 +5564,10 @@ mod tests {
     fn parse_subst_e_flag() {
         let e = parse_expr_str("s/foo/uc($&)/e;");
         match &e.kind {
-            ExprKind::Subst(_, SubstReplacement::Expr(_), _) => {}
-            other => panic!("expected Subst with Expr replacement, got {other:?}"),
+            ExprKind::Subst(_, repl, _) => {
+                assert!(!matches!(repl.kind, ExprKind::StringLit(_)), "expected non-literal replacement for /e, got {repl:?}");
+            }
+            other => panic!("expected Subst, got {other:?}"),
         }
     }
 

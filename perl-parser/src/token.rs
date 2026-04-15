@@ -369,14 +369,8 @@ pub enum Token {
     RegexBody(String),
     /// Regex flags (imsx etc.).
     RegexFlags(String),
-    /// End of regex.
-    RegexEnd,
-    /// Substitution replacement (between second and third delimiters).
-    SubstReplacement(String),
 
-    // ── Compound regex tokens (bootstrap, pre-interpolation) ──
-    /// Complete regex: `/pattern/flags`, `m/pattern/flags`, `qr/pattern/flags`.
-    RegexLit(RegexKind, String, Option<String>),
+    // ── Substitution / transliteration ──────────────────────────
     /// Start of a substitution replacement body.
     /// Pattern and flags are captured upfront by the lexer.
     /// Replacement body tokens follow until QuoteEnd.
@@ -486,7 +480,6 @@ impl Token {
                 | Token::QuoteBegin(_, _)
                 | Token::RegexBegin(_, _)
                 | Token::HeredocBegin(_, _)
-                | Token::RegexLit(_, _, _)
                 | Token::SubstBegin(_, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)

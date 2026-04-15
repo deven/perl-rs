@@ -126,12 +126,6 @@ impl Lexer {
         }
     }
 
-    /// Whether the source is fully exhausted (no current line, no
-    /// more lines in source, not inside a heredoc).
-    fn at_end(&self) -> bool {
-        self.current_line.is_none() && self.source.cursor() >= self.source.src_len()
-    }
-
     // ── Position and span helpers ─────────────────────────────
 
     /// Current position within the current line (line-local).
@@ -1080,16 +1074,13 @@ impl Lexer {
         // the loaded line (not a stale source cursor).
         let start = self.span_pos();
 
-        // Fast dispatch for closing delimiter, $, @.
+        // Fast dispatch for closing delimiter (incremental mode:
+        // context on the stack → pop and return QuoteEnd).
         if let Some(c) = close {
-            if b == c && depth == 0 {
-                if interpolating {
-                    self.skip(1);
-                    self.context_stack.pop();
-                    return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
-                }
-                // Non-interpolating: closing delimiter is consumed
-                // by the main loop below as the exit condition.
+            if b == c && depth == 0 && !self.context_stack.is_empty() {
+                self.skip(1);
+                self.context_stack.pop();
+                return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
             }
         }
         if interpolating {
@@ -1118,11 +1109,12 @@ impl Lexer {
                     break;
                 }
                 Some(b) if Some(b) == close && current_depth == 0 => {
-                    if !interpolating {
-                        // Non-interpolating: consume the closing
-                        // delimiter as part of this scan.
+                    if self.context_stack.is_empty() {
+                        // lex_body_str mode: consume the closing delimiter.
                         self.skip(1);
                     }
+                    // Incremental mode: leave the delimiter for
+                    // the QuoteEnd fast dispatch on the next call.
                     break;
                 }
                 Some(b'$') | Some(b'@') if interpolating => break,
@@ -1392,17 +1384,15 @@ impl Lexer {
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        let pattern = self.lex_body_str(delim, true)?;
-        let flags = self.scan_adjacent_word_chars();
-        Ok(Token::RegexLit(RegexKind::Match, pattern, flags))
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: false, raw: true, regex: true });
+        Ok(Token::RegexBegin(RegexKind::Match, delim))
     }
 
     /// `qr/pattern/flags` or `qr{pattern}flags`
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        let pattern = self.lex_body_str(delim, true)?;
-        let flags = self.scan_adjacent_word_chars();
-        Ok(Token::RegexLit(RegexKind::Qr, pattern, flags))
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: false, raw: true, regex: true });
+        Ok(Token::RegexBegin(RegexKind::Qr, delim))
     }
 
     /// `s/pattern/replacement/flags` or `s{pattern}{replacement}flags`
@@ -1925,7 +1915,6 @@ mod tests {
                 | Token::SpecialVar(_)
                 | Token::ArrayLen(_)
                 | Token::QuoteEnd
-                | Token::RegexLit(_, _, _)
                 | Token::SubstBegin(_, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
@@ -1942,8 +1931,9 @@ mod tests {
                 Token::Semi | Token::LeftBrace => {
                     expect = Expect::Statement;
                 }
-                // Sub-tokens inside strings don't affect expect.
+                // Sub-tokens inside strings/regex don't affect expect.
                 Token::QuoteBegin(_, _)
+                | Token::RegexBegin(_, _)
                 | Token::ConstSegment(_)
                 | Token::InterpScalar(_)
                 | Token::InterpArray(_)
@@ -2340,19 +2330,19 @@ mod tests {
     #[test]
     fn lex_m_regex() {
         let tokens = lex_all("m{foo}i");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "foo".into(), Some("i".into())),]);
+        assert_eq!(tokens, vec![Token::RegexBegin(RegexKind::Match, b'{'), Token::ConstSegment("foo".into()), Token::QuoteEnd, Token::Ident("i".into()),]);
     }
 
     #[test]
     fn lex_m_regex_slash() {
         let tokens = lex_all("m/bar/gx");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Match, "bar".into(), Some("gx".into())),]);
+        assert_eq!(tokens, vec![Token::RegexBegin(RegexKind::Match, b'/'), Token::ConstSegment("bar".into()), Token::QuoteEnd, Token::Ident("gx".into()),]);
     }
 
     #[test]
     fn lex_qr_regex() {
         let tokens = lex_all("qr/\\d+/");
-        assert_eq!(tokens, vec![Token::RegexLit(RegexKind::Qr, "\\d+".into(), None),]);
+        assert_eq!(tokens, vec![Token::RegexBegin(RegexKind::Qr, b'/'), Token::ConstSegment("\\d+".into()), Token::QuoteEnd,]);
     }
 
     #[test]
