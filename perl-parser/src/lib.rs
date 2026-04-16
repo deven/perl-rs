@@ -14,6 +14,7 @@
 pub mod ast;
 pub mod error;
 pub mod keyword;
+pub mod pragma;
 pub mod source;
 pub mod span;
 pub mod symbols;

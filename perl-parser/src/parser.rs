@@ -8,6 +8,7 @@ use crate::ast::*;
 use crate::error::ParseError;
 use crate::keyword;
 use crate::lexer::Lexer;
+use crate::pragma::{Features, Pragmas, resolve_feature_name};
 use crate::span::Span;
 use crate::symbols::{ProtoSlot, SubPrototype, SymbolTable};
 use crate::token::Keyword;
@@ -98,6 +99,10 @@ pub struct Parser {
     /// Name of the package currently being parsed.  Updated by
     /// `package Name;` and the block form `package Name { ... }`.
     current_package: std::sync::Arc<str>,
+    /// Lexically-scoped pragma state (`use feature`, `use utf8`,
+    /// version bundles).  Saved/restored across block boundaries
+    /// by `parse_block`.
+    pragmas: Pragmas,
 }
 
 impl Parser {
@@ -105,13 +110,28 @@ impl Parser {
 
     pub fn new(src: &[u8]) -> Result<Self, ParseError> {
         let lexer = Lexer::new(src);
-        Ok(Parser { lexer, current: None, lexer_error: None, depth: 0, symbols: SymbolTable::new(), current_package: std::sync::Arc::from("main") })
+        Ok(Parser {
+            lexer,
+            current: None,
+            lexer_error: None,
+            depth: 0,
+            symbols: SymbolTable::new(),
+            current_package: std::sync::Arc::from("main"),
+            pragmas: Pragmas::new(),
+        })
     }
 
     /// Read-only access to the accumulated symbol table.
     /// Primarily for tests and future cross-pass consumers.
     pub fn symbols(&self) -> &SymbolTable {
         &self.symbols
+    }
+
+    /// Read-only access to the current lexical pragma state.
+    /// Primarily for tests and future parsing-behavior dispatch
+    /// (signatures vs. prototypes, postderef enablement, etc.).
+    pub fn pragmas(&self) -> &Pragmas {
+        &self.pragmas
     }
 
     // ── Token access ──────────────────────────────────────────
@@ -850,14 +870,32 @@ impl Parser {
             // Bare version: `use 5.020;` / `use v5.36;` — module slot
             // gets the version; no further version or imports.
             Token::IntLit(n) => {
+                // Apply the matching bundle to pragma state.
+                // `use 5.036` / `use 5036` → major=5, minor=36.
+                if !is_no && let Some((maj, min)) = parse_int_version(n) {
+                    self.pragmas.features.apply_version_bundle(maj, min);
+                }
                 self.eat(&Token::Semi)?;
                 return Ok(StmtKind::UseDecl(UseDecl { is_no, module: format!("{n}"), version: None, imports: None, span: start.merge(self.peek_span()) }));
             }
             Token::FloatLit(n) => {
+                // `use 5.036` can also lex as FloatLit (5.036).
+                if !is_no && let Some((maj, min)) = parse_float_version(n) {
+                    self.pragmas.features.apply_version_bundle(maj, min);
+                }
                 self.eat(&Token::Semi)?;
                 return Ok(StmtKind::UseDecl(UseDecl { is_no, module: format!("{n}"), version: None, imports: None, span: start.merge(self.peek_span()) }));
             }
-            Token::StrLit(n) => n, // v-strings come through as StrLit
+            Token::StrLit(n) => {
+                // v-string: `use v5.36;` — arrives as StrLit starting "v".
+                if !is_no
+                    && n.starts_with('v')
+                    && let Some((maj, min)) = parse_v_string_version(&n)
+                {
+                    self.pragmas.features.apply_version_bundle(maj, min);
+                }
+                n
+            }
             other => return Err(ParseError::new(format!("expected module name or version, got {other:?}"), start)),
         };
 
@@ -902,6 +940,12 @@ impl Parser {
         };
 
         self.eat(&Token::Semi)?;
+
+        // Pragma dispatch: apply any side effects to parser state
+        // before returning.  Unknown modules and non-pragma
+        // imports are silently ignored here; they'd require
+        // runtime module loading to take effect.
+        apply_pragma(&mut self.pragmas, &module, is_no, imports.as_ref());
 
         Ok(StmtKind::UseDecl(UseDecl { is_no, module, version, imports, span: start.merge(self.peek_span()) }))
     }
@@ -1244,18 +1288,29 @@ impl Parser {
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         self.with_descent(|this| {
+            // Pragmas are lexically scoped: any `use feature` / `use
+            // utf8` inside this block doesn't leak out.  Save state
+            // before parsing, restore after.  Done for both the
+            // success and error paths via early-return handling.
+            let saved_pragmas = this.pragmas;
+
             let start = this.peek_span();
-            this.expect_token(&Token::LeftBrace)?;
+            let result = (|this: &mut Parser| -> Result<Block, ParseError> {
+                this.expect_token(&Token::LeftBrace)?;
 
-            let mut statements = Vec::new();
-            while !this.at(&Token::RightBrace)? && !this.at_eof()? {
-                statements.push(this.parse_statement()?);
-            }
+                let mut statements = Vec::new();
+                while !this.at(&Token::RightBrace)? && !this.at_eof()? {
+                    statements.push(this.parse_statement()?);
+                }
 
-            let end = this.peek_span();
-            this.expect_token(&Token::RightBrace)?;
+                let end = this.peek_span();
+                this.expect_token(&Token::RightBrace)?;
 
-            Ok(Block { statements, span: start.merge(end) })
+                Ok(Block { statements, span: start.merge(end) })
+            })(this);
+
+            this.pragmas = saved_pragmas;
+            result
         })
     }
 
@@ -2815,6 +2870,122 @@ impl Parser {
             other => Err(ParseError::new(format!("expected method name or subscript after ->, got {other:?}"), self.peek_span())),
         }
     }
+}
+
+// ── Pragma application helpers ────────────────────────────────
+
+/// Apply the side effects of a `use` or `no` statement whose
+/// module name is a known pragma.  Unknown modules are ignored.
+fn apply_pragma(pragmas: &mut Pragmas, module: &str, is_no: bool, imports: Option<&Vec<Expr>>) {
+    match module {
+        "feature" => {
+            // Arguments are feature or bundle names as string
+            // literals, barewords, or a qw(...) list.  Bundle
+            // aliases (`:all`, `:default`, `:5.36`) are handled
+            // by resolve_feature_name.
+            match imports {
+                Some(items) if !items.is_empty() => {
+                    for item in items {
+                        for name in expr_to_pragma_strings(item) {
+                            if let Some(feats) = resolve_feature_name(&name) {
+                                // A bundle name evaluates to a set
+                                // of features; individual names
+                                // evaluate to single-bit sets.
+                                // Either way, OR/AND-NOT works.
+                                if is_no {
+                                    pragmas.features.remove(feats);
+                                } else {
+                                    // `use feature ':5.36'` resets
+                                    // to the bundle rather than
+                                    // ORing with prior state.  We
+                                    // detect that by checking for
+                                    // a leading colon in the name
+                                    // (same test the resolver uses).
+                                    if name.starts_with(':') {
+                                        pragmas.features = feats;
+                                    } else {
+                                        pragmas.features.insert(feats);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Per perlfeature: "no feature" with no args
+                    // resets to :default; "use feature" with no
+                    // args is a no-op.
+                    if is_no {
+                        pragmas.features = Features::DEFAULT;
+                    }
+                }
+            }
+        }
+        "utf8" => {
+            pragmas.utf8 = !is_no;
+        }
+        _ => {
+            // Any other pragma (strict, warnings, integer, ...) or
+            // module import is not yet parser-relevant.
+        }
+    }
+}
+
+/// Extract one or more pragma argument names from an AST
+/// expression.  `use feature 'say'` yields a StringLit (one name);
+/// `use feature qw(say state)` yields a QwList (multiple names);
+/// barewords are historically allowed too.  Returns an empty vec
+/// for anything else.
+fn expr_to_pragma_strings(expr: &Expr) -> Vec<String> {
+    match &expr.kind {
+        ExprKind::StringLit(s) => vec![s.clone()],
+        ExprKind::Bareword(s) => vec![s.clone()],
+        ExprKind::QwList(words) => words.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse a `use 5036` / `use 5.036` integer as a (major, minor) pair.
+/// The integer form is interpreted as `5_036` = major 5, minor 36
+/// (last three digits = minor).
+fn parse_int_version(n: i64) -> Option<(u32, u32)> {
+    if n <= 0 {
+        return None;
+    }
+    let n = n as u64;
+    // Historically, `use 5008001;` → 5.008.001 (major.minor.patch).
+    // For phase 1 we handle the common pattern `5NNN` where NNN is
+    // the minor version, which matches `use 5036`.
+    if n >= 1000 {
+        let major = (n / 1000) as u32;
+        let minor = (n % 1000) as u32;
+        Some((major, minor))
+    } else {
+        // Plain major number.
+        Some((n as u32, 0))
+    }
+}
+
+/// Parse a `use 5.036` float as a (major, minor) pair.
+fn parse_float_version(n: f64) -> Option<(u32, u32)> {
+    if !n.is_finite() || n <= 0.0 {
+        return None;
+    }
+    let major = n.trunc() as u32;
+    // Extract three decimal digits as the minor.  `5.036` → 36.
+    let frac = n - n.trunc();
+    let minor = (frac * 1000.0).round() as u32;
+    Some((major, minor))
+}
+
+/// Parse a v-string literal like `"v5.36"` or `"v5.36.0"` as a
+/// (major, minor) pair.  Only the first two components are used.
+fn parse_v_string_version(s: &str) -> Option<(u32, u32)> {
+    let rest = s.strip_prefix('v')?;
+    let mut it = rest.split('.');
+    let major: u32 = it.next()?.parse().ok()?;
+    let minor: u32 = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor))
 }
 
 fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
@@ -4665,6 +4836,148 @@ mod tests {
             ExprKind::StringLit(s) => assert_eq!(s, "v5"),
             other => panic!("expected StringLit(\"v5\"), got {other:?}"),
         }
+    }
+
+    // ── pragma tests ──────────────────────────────────────────
+
+    /// Parse a program and return the parser's final pragma state.
+    /// Because pragmas are lexically scoped, this reflects whatever
+    /// was in effect at end-of-file (i.e., the outermost scope).
+    fn parse_pragmas(src: &str) -> crate::pragma::Pragmas {
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        let _ = p.parse_program().unwrap();
+        *p.pragmas()
+    }
+
+    #[test]
+    fn pragma_default_has_default_bundle() {
+        let p = parse_pragmas("my $x = 1;");
+        // Pre-`use feature` state: the `:default` bundle (indirect,
+        // multidimensional, bareword_filehandles,
+        // apostrophe_as_package_separator, smartmatch).
+        assert_eq!(p.features, Features::DEFAULT);
+        assert!(p.features.contains(Features::INDIRECT));
+        assert!(!p.features.contains(Features::SAY));
+        assert!(!p.utf8);
+    }
+
+    #[test]
+    fn pragma_use_feature_single() {
+        let p = parse_pragmas("use feature 'signatures';");
+        assert!(p.features.contains(Features::SIGNATURES));
+        // Other non-default features untouched.
+        assert!(!p.features.contains(Features::SAY));
+        // :default features still present (use feature just adds).
+        assert!(p.features.contains(Features::INDIRECT));
+    }
+
+    #[test]
+    fn pragma_use_feature_multiple_via_qw() {
+        let p = parse_pragmas("use feature qw(say state);");
+        assert!(p.features.contains(Features::SAY));
+        assert!(p.features.contains(Features::STATE));
+    }
+
+    #[test]
+    fn pragma_no_feature_removes_specific() {
+        // Enable a non-default feature, then disable it.
+        let p = parse_pragmas("use feature 'signatures';\nno feature 'signatures';\n");
+        assert!(!p.features.contains(Features::SIGNATURES));
+        // :default still intact.
+        assert!(p.features.contains(Features::INDIRECT));
+    }
+
+    #[test]
+    fn pragma_no_feature_bare_resets_to_default() {
+        // Per perlfeature: `no feature;` with no args resets to
+        // :default, not to empty.
+        let p = parse_pragmas("use feature qw(say state signatures);\nno feature;\n");
+        assert_eq!(p.features, Features::DEFAULT);
+    }
+
+    #[test]
+    fn pragma_no_feature_all_clears_everything() {
+        // `no feature ':all'` is how you get to truly-empty state.
+        let p = parse_pragmas("no feature ':all';");
+        assert_eq!(p.features, Features::EMPTY);
+    }
+
+    #[test]
+    fn pragma_use_feature_bundle_by_name() {
+        // `use feature ':5.36'` applies the bundle directly.
+        let p = parse_pragmas("use feature ':5.36';");
+        assert!(p.features.contains(Features::SIGNATURES));
+        assert!(!p.features.contains(Features::INDIRECT), "5.36 bundle excludes indirect");
+    }
+
+    #[test]
+    fn pragma_use_vstring_bundle() {
+        let p = parse_pragmas("use v5.36;");
+        assert!(p.features.contains(Features::SAY));
+        assert!(p.features.contains(Features::SIGNATURES));
+        assert!(!p.features.contains(Features::SWITCH), "5.36 bundle should not include switch");
+        assert!(!p.features.contains(Features::INDIRECT), "5.36 bundle should not include indirect");
+    }
+
+    #[test]
+    fn pragma_use_int_version_bundle() {
+        let p = parse_pragmas("use 5036;");
+        assert!(p.features.contains(Features::SIGNATURES));
+    }
+
+    #[test]
+    fn pragma_use_float_version_bundle() {
+        let p = parse_pragmas("use 5.036;");
+        assert!(p.features.contains(Features::SIGNATURES));
+    }
+
+    #[test]
+    fn pragma_use_utf8() {
+        let p = parse_pragmas("use utf8;");
+        assert!(p.utf8);
+    }
+
+    #[test]
+    fn pragma_no_utf8() {
+        let p = parse_pragmas("use utf8;\nno utf8;\n");
+        assert!(!p.utf8);
+    }
+
+    #[test]
+    fn pragma_unknown_module_is_noop() {
+        // `use strict;` doesn't set any parsing-relevant flag yet
+        // and must not cause a panic.
+        let p = parse_pragmas("use strict;");
+        assert_eq!(p.features, Features::DEFAULT);
+        assert!(!p.utf8);
+    }
+
+    #[test]
+    fn pragma_unknown_feature_name_silently_ignored() {
+        let p = parse_pragmas("use feature 'totally_fake_feature';");
+        assert_eq!(p.features, Features::DEFAULT);
+    }
+
+    #[test]
+    fn pragma_lexical_scoping_block_doesnt_leak() {
+        let p = parse_pragmas("{ use feature 'signatures'; }");
+        assert!(!p.features.contains(Features::SIGNATURES), "signatures enabled inside block should not leak out");
+    }
+
+    #[test]
+    fn pragma_lexical_scoping_outer_preserved() {
+        let p = parse_pragmas("use feature 'signatures';\n{ no feature 'signatures'; }\n");
+        assert!(p.features.contains(Features::SIGNATURES), "outer scope's signatures should be preserved across the inner block");
+    }
+
+    #[test]
+    fn pragma_version_bundle_resets_features() {
+        // `use v5.36` does implicit `no feature ':all'; use feature ':5.36'`.
+        // Applying after unrelated feature enables should leave only
+        // the bundle.
+        let p = parse_pragmas("use feature 'keyword_any';\nuse v5.36;\n");
+        assert!(!p.features.contains(Features::KEYWORD_ANY), "version bundle should reset, not union");
+        assert!(p.features.contains(Features::SIGNATURES));
     }
 
     // ── format tests ──────────────────────────────────────────
