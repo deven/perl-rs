@@ -1253,9 +1253,19 @@ impl Lexer {
 
         // Special tokens
         match name.as_str() {
-            "__FILE__" | "__LINE__" | "__PACKAGE__" | "__SUB__" => {
-                return Ok(Token::Ident(name));
+            "__FILE__" => {
+                let fname = self.source.filename().to_string();
+                return Ok(Token::SourceFile(fname));
             }
+            "__LINE__" => {
+                // Use the line number of the line currently being
+                // scanned.  `current_line` is always Some here
+                // because we just scanned an identifier from it.
+                let line_no = self.current_line.as_ref().map(|l| l.number).unwrap_or(0) as u32;
+                return Ok(Token::SourceLine(line_no));
+            }
+            "__PACKAGE__" => return Ok(Token::CurrentPackage),
+            "__SUB__" => return Ok(Token::CurrentSub),
             // __END__ / __DATA__ are only recognized at column 0 —
             // matching Perl's behavior.  When indented or preceded
             // by other tokens on the line, they're just barewords.

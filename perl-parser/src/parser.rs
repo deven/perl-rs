@@ -42,19 +42,24 @@ const PREC_BIT_OR: Precedence = 22; // |
 const PREC_BIT_AND: Precedence = 24; // &
 const PREC_EQ: Precedence = 26; // == != eq ne <=> cmp
 const PREC_REL: Precedence = 28; // < > <= >= lt gt le ge
+/// `isa` — class-instance infix operator (5.32+).  Non-associative.
+/// Tighter than relational, looser than named unary: `$x isa Foo < 1`
+/// parses as `($x isa Foo) < 1`, while `foo $x isa Bar` parses as
+/// `foo($x isa Bar)`.
+const PREC_ISA: Precedence = 29;
 /// Named unary operators and prototyped subs with a scalar-ish
 /// slot (`$`, `_`, `+`, `\X`, `\[...]`, etc.).  Sits between
-/// relational and shift: `foo $a < 1` parses as `foo($a) < 1`,
+/// isa and shift: `foo $a < 1` parses as `foo($a) < 1`,
 /// while `foo $a << 1` parses as `foo($a << 1)`.  Non-associative.
-const PREC_NAMED_UNARY: Precedence = 29;
-const PREC_SHIFT: Precedence = 30; // << >>
-const PREC_ADD: Precedence = 32; // + - .
-const PREC_MUL: Precedence = 34; // * / % x
-const PREC_BINDING: Precedence = 36; // =~ !~
-const PREC_UNARY: Precedence = 38; // ! ~ \ - + (prefix)
-const PREC_POW: Precedence = 40; // **
-const PREC_INC: Precedence = 42; // ++ -- (postfix)
-const PREC_ARROW: Precedence = 44; // ->
+const PREC_NAMED_UNARY: Precedence = 30;
+const PREC_SHIFT: Precedence = 32; // << >>
+const PREC_ADD: Precedence = 34; // + - .
+const PREC_MUL: Precedence = 36; // * / % x
+const PREC_BINDING: Precedence = 38; // =~ !~
+const PREC_UNARY: Precedence = 40; // ! ~ \ - + (prefix)
+const PREC_POW: Precedence = 42; // **
+const PREC_INC: Precedence = 44; // ++ -- (postfix)
+const PREC_ARROW: Precedence = 46; // ->
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Assoc {
@@ -1694,6 +1699,29 @@ impl Parser {
 
             Token::Ident(name) => self.parse_ident_term(name, span),
 
+            // Compile-time constants.  SourceFile/SourceLine carry
+            // their values in the token itself (captured at lex
+            // time); CurrentPackage is a marker filled with the
+            // parser's current package; CurrentSub is a marker
+            // that evaluates at runtime.
+            Token::SourceFile(path) => Ok(Expr { kind: ExprKind::SourceFile(path), span }),
+            Token::SourceLine(n) => Ok(Expr { kind: ExprKind::SourceLine(n), span }),
+            Token::CurrentPackage => {
+                let pkg = self.current_package.to_string();
+                Ok(Expr { kind: ExprKind::CurrentPackage(pkg), span })
+            }
+            Token::CurrentSub => {
+                // Gated on the `current_sub` feature.  Without it,
+                // `__SUB__` falls back to a bareword — matching
+                // Perl's behavior where unknown-at-compile-time
+                // barewords become string literals.
+                if self.pragmas.features.contains(Features::CURRENT_SUB) {
+                    Ok(Expr { kind: ExprKind::CurrentSub, span })
+                } else {
+                    Ok(Expr { kind: ExprKind::Bareword("__SUB__".to_string()), span })
+                }
+            }
+
             Token::Keyword(Keyword::Undef) => Ok(Expr { kind: ExprKind::Undef, span }),
             Token::Keyword(Keyword::Wantarray) => Ok(Expr { kind: ExprKind::Wantarray, span }),
 
@@ -2016,6 +2044,20 @@ impl Parser {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
 
+        // Feature-gated named-unary builtins.  `fc` and
+        // `evalbytes` become operators only when their feature is
+        // active; without the feature they're ordinary
+        // identifiers, which fall through to the general
+        // function-call/bareword path below.
+        let feature_gated_unary = match name.as_str() {
+            "fc" if self.pragmas.features.contains(Features::FC) => true,
+            "evalbytes" if self.pragmas.features.contains(Features::EVALBYTES) => true,
+            _ => false,
+        };
+        if feature_gated_unary {
+            return self.parse_feature_named_unary(name, span);
+        }
+
         // Look up in the symbol table to see if this is a known sub.
         // Clone the prototype (small: raw string + a Vec of slot enums)
         // and the "is known" flag so we can release the borrow on self
@@ -2299,6 +2341,37 @@ impl Parser {
 
         // Parse one term as the argument
         let arg = self.parse_expr(PREC_COMMA)?;
+        let end = span.merge(arg.span);
+        Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: end })
+    }
+
+    /// Parse a feature-gated named-unary builtin called by its
+    /// string name (rather than a `Keyword` enum variant).
+    ///
+    /// Used for `fc` and `evalbytes`, which are feature-gated and
+    /// therefore not in the keyword table: adding them there would
+    /// make them keywords even when the feature is off, shadowing
+    /// any user-defined sub of the same name.  This helper is
+    /// essentially the string-name version of `parse_named_unary`
+    /// minus the `prefers_defined_or` check (neither `fc` nor
+    /// `evalbytes` needs it).
+    fn parse_feature_named_unary(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
+        // No argument: `fc;` or `fc)` or at EOF.
+        if self.at(&Token::Semi)? || self.at_eof()? || self.at(&Token::RightBrace)? || self.at(&Token::RightParen)? {
+            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
+        }
+
+        // Parenthesized: `fc($x)`.
+        if self.at(&Token::LeftParen)? {
+            self.next_token()?;
+            let arg = self.parse_expr(PREC_LOW)?;
+            let end = self.peek_span();
+            self.expect_token(&Token::RightParen)?;
+            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: span.merge(end) });
+        }
+
+        // Unparenthesized: one argument at named-unary precedence.
+        let arg = self.parse_expr(PREC_NAMED_UNARY)?;
         let end = span.merge(arg.span);
         Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: end })
     }
@@ -2756,6 +2829,11 @@ impl Parser {
     // ── Operator parsing ──────────────────────────────────────
 
     fn peek_op_info(&mut self) -> Option<OpInfo> {
+        // Snapshot feature bits we may consult before the match
+        // on self.peek_token() — that call takes a mutable borrow
+        // of self, which we can't hold across further field access.
+        let isa_active = self.pragmas.features.contains(Features::ISA);
+
         match self.peek_token() {
             Token::OrOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::DefinedOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
@@ -2793,6 +2871,10 @@ impl Parser {
             Token::Ident(name) => match name.as_str() {
                 "x" => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
                 "xor" => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
+                // `isa` is feature-gated: treated as an infix
+                // operator only when the `isa` feature is active.
+                // Without it, it's an ordinary bareword.
+                "isa" if isa_active => Some(OpInfo { prec: PREC_ISA, assoc: Assoc::Non }),
                 _ => None,
             },
             _ => None,
@@ -3214,6 +3296,9 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::Ident(name) => match name.as_str() {
             "x" => Ok(BinOp::Repeat),
             "xor" => Ok(BinOp::LowXor),
+            // Only reaches here when op_info already gated on the
+            // `isa` feature, so no feature check needed.
+            "isa" => Ok(BinOp::Isa),
             _ => Err(ParseError::new(format!("not a binary operator: {token:?}"), Span::DUMMY)),
         },
         other => Err(ParseError::new(format!("not a binary operator: {other:?}"), Span::DUMMY)),
@@ -5520,6 +5605,173 @@ sub outer ($x) { 1 }
             ArrowTarget::ArraySliceIndices(_) => {}
             other => panic!("expected ArraySliceIndices, got {other:?}"),
         }
+    }
+
+    // ── Phase 4: isa / fc / evalbytes / compile-time tokens ──
+
+    // ── `isa` infix operator ──
+
+    #[test]
+    fn isa_requires_feature() {
+        // Without the `isa` feature, `isa` is just an ordinary
+        // bareword (would be a function call or bareword
+        // reference).  We verify by checking that parsing
+        // `$x isa Foo` with no feature does NOT produce a BinOp.
+        let e = parse_expr_stmt("$x isa Foo;");
+        assert!(!matches!(e.kind, ExprKind::BinOp(BinOp::Isa, _, _)), "no isa feature → must not parse as Isa binop");
+    }
+
+    #[test]
+    fn isa_with_feature() {
+        let e = parse_expr_stmt("use feature 'isa'; $x isa Foo;");
+        match e.kind {
+            ExprKind::BinOp(BinOp::Isa, lhs, rhs) => {
+                assert!(matches!(lhs.kind, ExprKind::ScalarVar(_)));
+                assert!(matches!(rhs.kind, ExprKind::Bareword(_)));
+            }
+            other => panic!("expected Isa binop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn isa_enabled_by_v5_36() {
+        // The :5.36 bundle includes isa.
+        let e = parse_expr_stmt("use v5.36; $x isa Foo;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Isa, _, _)));
+    }
+
+    #[test]
+    fn isa_precedence_vs_relational() {
+        // `isa` binds tighter than `<`, so `$x isa Foo < 1`
+        // groups as `($x isa Foo) < 1`.
+        let e = parse_expr_stmt("use feature 'isa'; $x isa Foo < 1;");
+        match e.kind {
+            ExprKind::BinOp(BinOp::NumLt, lhs, _) => {
+                assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Isa, _, _)), "isa should bind tighter than <");
+            }
+            other => panic!("expected NumLt at top level, got {other:?}"),
+        }
+    }
+
+    // ── `fc` feature-gated named unary ──
+
+    #[test]
+    fn fc_requires_feature() {
+        // Without `fc` feature, `fc($x)` parses as an ordinary
+        // function call to a user sub named `fc`.  Either way
+        // we get a FuncCall; just confirm it doesn't error and
+        // the function name is captured.
+        let e = parse_expr_stmt("fc($x);");
+        match e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "fc"),
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fc_with_feature_paren() {
+        let e = parse_expr_stmt("use feature 'fc'; fc($x);");
+        match e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "fc");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fc_with_feature_no_paren() {
+        // `fc $x` — named unary, one argument at NAMED_UNARY
+        // precedence.
+        let e = parse_expr_stmt("use feature 'fc'; fc $x;");
+        match e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "fc");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── `evalbytes` feature-gated named unary ──
+
+    #[test]
+    fn evalbytes_with_feature() {
+        let e = parse_expr_stmt(r#"use feature 'evalbytes'; evalbytes("1+1");"#);
+        match e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "evalbytes");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── Compile-time tokens ──
+
+    #[test]
+    fn source_file_captured_at_lex_time() {
+        let e = parse_expr_stmt("__FILE__;");
+        match e.kind {
+            ExprKind::SourceFile(path) => {
+                // Placeholder static value until filename is plumbed.
+                assert_eq!(path, "(script)");
+            }
+            other => panic!("expected SourceFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_line_captured_at_lex_time() {
+        // `__LINE__` on line 3 of a 3-line program.
+        let e = parse_expr_stmt("\n\n__LINE__;");
+        match e.kind {
+            ExprKind::SourceLine(n) => assert_eq!(n, 3),
+            other => panic!("expected SourceLine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_package_filled_by_parser() {
+        let e = parse_expr_stmt("__PACKAGE__;");
+        match e.kind {
+            ExprKind::CurrentPackage(name) => assert_eq!(name, "main"),
+            other => panic!("expected CurrentPackage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_package_reflects_package_decl() {
+        // After `package Foo;`, __PACKAGE__ should give "Foo".
+        let prog = parse("package Foo;\n__PACKAGE__;\n");
+        let e = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("expression statement");
+        match e.kind {
+            ExprKind::CurrentPackage(name) => assert_eq!(name, "Foo"),
+            other => panic!("expected CurrentPackage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_sub_requires_feature() {
+        // Without the current_sub feature, `__SUB__` falls back
+        // to bareword treatment.
+        let e = parse_expr_stmt("__SUB__;");
+        assert!(!matches!(e.kind, ExprKind::CurrentSub), "no current_sub feature → must not be CurrentSub");
+    }
+
+    #[test]
+    fn current_sub_with_feature() {
+        let e = parse_expr_stmt("use feature 'current_sub'; __SUB__;");
+        assert!(matches!(e.kind, ExprKind::CurrentSub));
+    }
+
+    #[test]
+    fn current_sub_via_v5_16() {
+        // The :5.16 bundle includes current_sub.
+        let e = parse_expr_stmt("use v5.16; __SUB__;");
+        assert!(matches!(e.kind, ExprKind::CurrentSub));
     }
 
     // ── format tests ──────────────────────────────────────────

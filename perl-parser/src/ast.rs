@@ -245,6 +245,22 @@ pub enum ExprKind {
     // ── Wantarray ─────────────────────────────────────────────
     Wantarray,
 
+    // ── Compile-time constants ────────────────────────────────
+    /// `__FILE__` — source filename at parse time.
+    SourceFile(String),
+    /// `__LINE__` — source line number at parse time (1-based).
+    SourceLine(u32),
+    /// `__PACKAGE__` — name of the package in effect when this
+    /// expression was parsed.  Filled by the parser from its
+    /// `current_package` state.
+    CurrentPackage(String),
+    /// `__SUB__` — reference to the current subroutine, or
+    /// `undef` if outside any sub.  Resolved at runtime; no
+    /// compile-time data.  Emitted only when the `current_sub`
+    /// feature is active; otherwise the token falls through as
+    /// a bareword.
+    CurrentSub,
+
     // ── Placeholder for incremental development ───────────────
     /// `...` — yada yada yada (unimplemented placeholder).
     YadaYada,
@@ -336,6 +352,8 @@ pub enum BinOp {
     StrLe,
     StrGe,
     StrCmp,
+    /// `isa` — class-instance test (feature-gated).
+    Isa,
     // Logical
     And,
     Or,

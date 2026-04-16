@@ -380,6 +380,23 @@ pub enum Token {
     /// Fields: kind, tag, body.
     HeredocLit(HeredocKind, String, String),
 
+    // ── Special compile-time tokens ───────────────────────────
+    /// `__FILE__` — current source filename.  Captured at lex
+    /// time from `LexerSource::filename()`.
+    SourceFile(String),
+    /// `__LINE__` — current source line number.  Captured at lex
+    /// time.
+    SourceLine(u32),
+    /// `__PACKAGE__` — marker.  The parser fills in the current
+    /// package name when building the AST node (the lexer
+    /// doesn't track packages).
+    CurrentPackage,
+    /// `__SUB__` — marker.  Gated on the `current_sub` feature;
+    /// the parser checks and either emits an `ExprKind::CurrentSub`
+    /// or falls back to treating it as a bareword.  No compile-time
+    /// value — it's a runtime reference to the current sub.
+    CurrentSub,
+
     // ── Format sub-tokens ─────────────────────────────────────
     /// Opens a `format NAME = ... .` body.  `name` is the format
     /// name (defaults to `STDOUT` when omitted at the call site).
@@ -426,7 +443,7 @@ pub enum Token {
     DataEnd(DataEndMarker),
     /// Yada yada yada (`...` as a statement).
     YadaYada,
-    /// `<STDIN>`, `<>`, `<$fh>`, `<*.txt>` — readline or glob.
+    /// `<STDIN>`, `<$fh>`, `<*.txt>` — readline or glob.
     Readline(String),
 }
 

@@ -197,6 +197,13 @@ impl LexerSource {
         self.line_number
     }
 
+    /// Name of the source file being lexed, for `__FILE__`
+    /// resolution.  Currently a static placeholder; a follow-up
+    /// will plumb the real filename from the caller of `Parser::new`.
+    pub fn filename(&self) -> &str {
+        "(script)"
+    }
+
     /// Raw slice of the source buffer.  For rare operations that need
     /// access to the underlying bytes (e.g. format body extraction).
     pub fn src_slice(&self, start: usize, end: usize) -> &[u8] {
