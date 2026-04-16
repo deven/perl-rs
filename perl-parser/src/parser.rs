@@ -1684,16 +1684,17 @@ impl Parser {
             Token::DotDotDot => Ok(Expr { kind: ExprKind::YadaYada, span }),
 
             // Readline / diamond: <STDIN>, <>, <$fh>, <*.txt>
-            Token::Readline(content) => {
-                if content.is_empty() {
-                    // <> — diamond operator, reads from ARGV
-                    Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![]), span })
-                } else if content.contains('*') || content.contains('?') {
-                    // <*.txt> — glob
-                    Ok(Expr { kind: ExprKind::FuncCall("glob".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+            Token::Readline(content) => Self::readline_expr(content, span),
+
+            // < in term position: try readline.  The lexer emitted NumLt;
+            // we ask it to attempt readline scanning.  If not a readline,
+            // that's a parse error (less-than is not a valid term).
+            Token::NumLt => {
+                if let Some(Token::Readline(content)) = self.lexer.lex_readline_after_lt() {
+                    let end = self.peek_span();
+                    Self::readline_expr(content, span.merge(end))
                 } else {
-                    // <STDIN>, <$fh> — readline
-                    Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+                    Err(ParseError::new("expected readline or glob after <", span))
                 }
             }
 
@@ -1838,6 +1839,18 @@ impl Parser {
     /// Parse a filetest expression given the test byte and the span
     /// of the leading `-X` tokens.  Shared between the Minus-triggered
     /// path and the explicit Filetest token arm.
+    /// Build an Expr from readline content: `<>` is readline/ARGV,
+    /// `<*.txt>` (with wildcards) is glob, otherwise `<FH>` is readline.
+    fn readline_expr(content: String, span: Span) -> Result<Expr, ParseError> {
+        if content.is_empty() {
+            Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![]), span })
+        } else if content.contains('*') || content.contains('?') {
+            Ok(Expr { kind: ExprKind::FuncCall("glob".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+        } else {
+            Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+        }
+    }
+
     fn parse_filetest(&mut self, test_byte: u8, span: Span) -> Result<Expr, ParseError> {
         let test_char = test_byte as char;
         // In autoquoting contexts (=> or }), treat as StringLit("-x")
