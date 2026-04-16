@@ -185,8 +185,12 @@ pub enum ExprKind {
     AnonArray(Vec<Expr>),
     /// `{...}` — anonymous hash ref (when disambiguated from block).
     AnonHash(Vec<Expr>),
-    /// `sub { ... }` — anonymous sub.
-    AnonSub(Option<String>, Option<Vec<Param>>, Block),
+    /// `sub { ... }` — anonymous sub.  Fields: prototype (raw
+    /// bytes), signature (parsed 5.20+ signatures syntax), body.
+    /// Prototype and signature are mutually exclusive per-call-site;
+    /// the `signatures` feature in scope at parse time picks which
+    /// form the parentheses were parsed as.
+    AnonSub(Option<String>, Option<Signature>, Block),
 
     // ── Calls ─────────────────────────────────────────────────
     /// Named function call: `foo(...)` or `foo ...`.
@@ -446,20 +450,54 @@ pub struct VarDecl {
 #[derive(Clone, Debug)]
 pub struct SubDecl {
     pub name: String,
+    /// Paren-form prototype from pre-signatures Perl (e.g. `($$)`,
+    /// `(\@\%)`).  Stored as raw bytes.  Mutually exclusive with
+    /// `signature` (the `signatures` feature controls which path
+    /// parses the paren-form).  A `:prototype(...)` attribute
+    /// shows up in `attributes` and coexists with either.
     pub prototype: Option<String>,
     pub attributes: Vec<Attribute>,
-    pub params: Option<Vec<Param>>,
+    /// Parsed parameter signature from 5.20+ signatures syntax.
+    /// Present when the `signatures` feature is active at the
+    /// declaration site.
+    pub signature: Option<Signature>,
     pub body: Block,
     pub span: Span,
 }
 
-/// Subroutine parameter (signatures).
+/// Parsed subroutine signature (the `signatures` feature).
+///
+/// Each parameter is one of several `SigParam` variants: named
+/// scalar (optionally with a default), slurpy array, slurpy hash,
+/// or an anonymous placeholder that accepts and discards a value.
 #[derive(Clone, Debug)]
-pub struct Param {
-    pub sigil: Sigil,
-    pub name: String,
-    pub default: Option<Expr>,
+pub struct Signature {
+    pub params: Vec<SigParam>,
     pub span: Span,
+}
+
+/// One parameter in a signature.
+#[derive(Clone, Debug)]
+pub enum SigParam {
+    /// `$name`, or `$name = DEFAULT`.  Positional.  When
+    /// `default` is `None`, the parameter is required; otherwise
+    /// it's optional and the expression evaluates at call time if
+    /// the caller didn't supply a value.
+    Scalar { name: String, default: Option<Expr>, span: Span },
+    /// `@name` — slurpy, captures all remaining positional
+    /// arguments.  Must appear last if at all.
+    SlurpyArray { name: String, span: Span },
+    /// `%name` — slurpy, captures remaining name/value pairs.
+    /// Must appear last if at all.
+    SlurpyHash { name: String, span: Span },
+    /// `$` — anonymous scalar placeholder; accepts a value without
+    /// binding it.
+    AnonScalar { span: Span },
+    /// `@` — anonymous slurpy array (consumes remaining positional
+    /// args without binding).
+    AnonArray { span: Span },
+    /// `%` — anonymous slurpy hash.
+    AnonHash { span: Span },
 }
 
 /// Attribute on a sub or variable.
