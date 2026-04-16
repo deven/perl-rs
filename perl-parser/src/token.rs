@@ -338,9 +338,9 @@ pub enum Token {
 
     // ── Quote/interpolation sub-tokens (§5.4) ─────────────────
     /// Start of a quote-like construct.  Contains quote type and delimiter.
-    QuoteBegin(QuoteKind, u8),
+    QuoteSublexBegin(QuoteKind, u8),
     /// End of a quote-like construct.
-    QuoteEnd,
+    SublexEnd,
     /// Literal segment inside a quote.
     ConstSegment(String),
     /// `$name` or `${name}` interpolation inside a quote.
@@ -355,7 +355,7 @@ pub enum Token {
 
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.
-    RegexBegin(RegexKind, u8),
+    RegexSublexBegin(RegexKind, u8),
     /// `(?{` — embedded code block in a regex pattern.
     /// Lexer switches to normal code mode until `}`.
     RegexCodeStart,
@@ -366,8 +366,8 @@ pub enum Token {
     // ── Substitution / transliteration ──────────────────────────
     /// Start of a substitution.  The delimiter byte is carried so
     /// the parser can pass it back to `start_subst_replacement`.
-    /// Pattern body tokens follow until QuoteEnd.
-    SubstBegin(u8),
+    /// Pattern body tokens follow until SublexEnd.
+    SubstSublexBegin(u8),
     /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
     TranslitLit(String, String, Option<String>),
 
@@ -470,10 +470,10 @@ impl Token {
                 | Token::PlusPlus
                 | Token::MinusMinus
                 | Token::Keyword(_)
-                | Token::QuoteBegin(_, _)
-                | Token::RegexBegin(_, _)
+                | Token::QuoteSublexBegin(_, _)
+                | Token::RegexSublexBegin(_, _)
                 | Token::HeredocBegin(_, _)
-                | Token::SubstBegin(_)
+                | Token::SubstSublexBegin(_)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
                 | Token::Readline(_)
