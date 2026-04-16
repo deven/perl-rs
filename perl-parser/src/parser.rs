@@ -527,6 +527,14 @@ impl Parser {
     /// Registers the sub (with its prototype, if any) in the symbol
     /// table before returning, so subsequent call sites can consult
     /// it for prototype-driven argument parsing.
+    ///
+    /// Prototypes may be declared in two syntactic forms:
+    /// * Paren-form after the name: `sub foo ($$) { ... }`.
+    /// * Attribute form: `sub foo :prototype($$) { ... }` (Perl 5.20+).
+    ///
+    /// Both are supported; the attribute form takes precedence if
+    /// both appear (matching the behavior needed once signatures are
+    /// enabled, where the paren form is a signature instead).
     fn parse_sub_decl_body(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(name) => name,
@@ -534,16 +542,19 @@ impl Parser {
         };
 
         let prototype_raw = self.parse_prototype()?;
+        let attributes = self.parse_attributes()?;
 
-        // Parse prototype string into structured form.  Invalid
-        // prototypes become a parse error with the reported position
-        // relative to the prototype body.
-        let prototype_parsed = match &prototype_raw {
+        // The effective prototype may come from either the paren
+        // form or a `:prototype(...)` attribute.  If both are
+        // present, the attribute wins.  The AST preserves both
+        // forms as written; the symbol table records whichever is
+        // effective.
+        let effective_proto_raw = attributes.iter().find(|a| a.name == "prototype").and_then(|a| a.value.clone()).or_else(|| prototype_raw.clone());
+
+        let prototype_parsed = match &effective_proto_raw {
             Some(raw) => Some(SubPrototype::parse(raw).map_err(|e| ParseError::new(format!("invalid prototype: {}", e.message), start))?),
             None => None,
         };
-
-        let attributes = self.parse_attributes()?;
 
         // Forward declaration: `sub name PROTO ATTRS;` with no body.
         if self.eat(&Token::Semi)? {
@@ -594,34 +605,43 @@ impl Parser {
             if let Some(name) = name {
                 let name_span = self.peek_span();
                 self.next_token()?; // eat the name
-                // Optional parenthesized args
+                // Optional parenthesized args.  For `:prototype(...)`
+                // specifically, the body is Perl prototype syntax
+                // (containing `$`, `@`, `%`, `\`, etc.) which must be
+                // read as raw bytes — token-by-token reconstruction
+                // via Display impls loses fidelity.  Other attributes
+                // use the general token-reconstruction path.
                 let value = if self.at(&Token::LeftParen)? {
-                    self.next_token()?;
-                    let mut args = String::new();
-                    let mut depth = 1u32;
-                    loop {
-                        match self.peek_token().clone() {
-                            Token::LeftParen => {
-                                depth += 1;
-                                args.push('(');
-                                self.next_token()?;
-                            }
-                            Token::RightParen => {
-                                depth -= 1;
-                                if depth == 0 {
+                    self.next_token()?; // consume (
+                    if name == "prototype" {
+                        Some(self.lexer.lex_body_str(b'(', true)?)
+                    } else {
+                        let mut args = String::new();
+                        let mut depth = 1u32;
+                        loop {
+                            match self.peek_token().clone() {
+                                Token::LeftParen => {
+                                    depth += 1;
+                                    args.push('(');
                                     self.next_token()?;
-                                    break;
                                 }
-                                args.push(')');
-                                self.next_token()?;
-                            }
-                            Token::Eof => break,
-                            _ => {
-                                args.push_str(&format!("{}", self.next_token()?.token));
+                                Token::RightParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        self.next_token()?;
+                                        break;
+                                    }
+                                    args.push(')');
+                                    self.next_token()?;
+                                }
+                                Token::Eof => break,
+                                _ => {
+                                    args.push_str(&format!("{}", self.next_token()?.token));
+                                }
                             }
                         }
+                        Some(args)
                     }
-                    Some(args)
                 } else {
                     None
                 };
@@ -1864,13 +1884,16 @@ impl Parser {
             match slot {
                 ProtoSlot::Block => {
                     // `&` slot accepts either:
-                    //   - A literal block `{ ... }` (wrapped as an
-                    //     anonymous sub).  This is the initial-slot
-                    //     form that drives map/grep-style syntax.
+                    //   - A literal block `{ ... }`, but ONLY when
+                    //     this is the initial slot.  That's the
+                    //     map/grep/sort pattern: `foo { ... } @list`.
+                    //     In non-initial positions, `{` at a call
+                    //     site is an ordinary hash-ref constructor;
+                    //     code references must be explicit.
                     //   - A code reference expression: `\&name`,
                     //     `$coderef`, `sub { ... }`, etc.  Parsed at
-                    //     named-unary precedence, like a scalar slot.
-                    let arg = if self.at(&Token::LeftBrace)? {
+                    //     named-unary precedence.
+                    let arg = if i == 0 && self.at(&Token::LeftBrace)? {
                         let block = self.parse_block()?;
                         let span = block.span;
                         Expr { kind: ExprKind::AnonSub(None, None, block), span }
@@ -8100,6 +8123,146 @@ mod tests {
                 // Remaining two are scalar slurpy args, not ref'd.
                 assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)));
                 assert!(matches!(args[2].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── Non-initial & slot: `{` is a hash-ref, not a block ──────
+    //
+    // In the initial slot, `&` plus a bare `{` parses the block as
+    // an anonymous sub (the map/grep pattern).  In any non-initial
+    // position, `{` at a call site is an ordinary hash-ref
+    // constructor; to pass a code reference the caller must spell
+    // it out: `sub { ... }`, `\&name`, `$coderef`, etc.
+
+    #[test]
+    fn proto_amp_non_initial_brace_is_hash_ref() {
+        // sub foo ($&); foo $x, { a => 1 };
+        // The `{ a => 1 }` is a hash-ref constructor, NOT a block.
+        let e = parse_call_with_proto("sub foo ($&); foo $x, { a => 1 };");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
+                assert!(matches!(args[1].kind, ExprKind::AnonHash(_)), "expected AnonHash, got {:?}", args[1].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_amp_non_initial_explicit_sub_works() {
+        // sub foo ($&); foo $x, sub { 1 };
+        let e = parse_call_with_proto("sub foo ($&); foo $x, sub { 1 };");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[1].kind, ExprKind::AnonSub(_, _, _)), "expected AnonSub, got {:?}", args[1].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_amp_non_initial_backslash_name_works() {
+        // sub foo ($&); foo $x, \&bar;
+        let e = parse_call_with_proto("sub foo ($&); foo $x, \\&bar;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[1].kind, ExprKind::Ref(_)), "expected Ref, got {:?}", args[1].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_amp_initial_block_still_works() {
+        // sub foo (&); foo { 1 };
+        // Regression: initial `&` with bare block still wraps as
+        // AnonSub.
+        let e = parse_call_with_proto("sub foo (&); foo { 1 };");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_amp_initial_map_style_still_works() {
+        // sub mymap (&@); mymap { $_ * 2 } @list;
+        // Regression: initial `&@` map-style syntax is unchanged.
+        let e = parse_call_with_proto("sub mymap (&@); mymap { $_ * 2 } @list;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── :prototype(...) attribute form ──────────────────────────
+    //
+    // Modern Perl (5.20+) allows the prototype to be declared via
+    // an attribute rather than the paren form:
+    //   sub foo :prototype($$) { ... }
+    // The attribute form is equivalent to the paren form but
+    // avoids the paren/signatures ambiguity.
+
+    #[test]
+    fn proto_attribute_form_registers_prototype() {
+        // sub foo :prototype($$) { } foo $a + $b, $c;
+        // Prototype declared via attribute drives call-site parsing
+        // just like the paren form.
+        let e = parse_call_with_proto("sub foo :prototype($$) { } foo $a + $b, $c;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2, ":prototype($$) should give 2 args");
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)));
+                assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_attribute_empty_proto_forces_zero_args() {
+        // sub foo :prototype() { } foo + 1;
+        // Empty :prototype() means zero args; `+ 1` is a binary op.
+        let e = parse_call_with_proto("sub foo :prototype() { } foo + 1;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Add, lhs, rhs) => {
+                match &lhs.kind {
+                    ExprKind::FuncCall(name, args) => {
+                        assert_eq!(name, "foo");
+                        assert_eq!(args.len(), 0);
+                    }
+                    other => panic!("expected FuncCall(foo, []), got {other:?}"),
+                }
+                assert!(matches!(rhs.kind, ExprKind::IntLit(1)));
+            }
+            other => panic!("expected BinOp(Add, ...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_attribute_form_on_forward_declaration() {
+        // sub foo :prototype(&@); foo { $_ } @list;
+        // Forward declaration with :prototype attribute.
+        let e = parse_call_with_proto("sub foo :prototype(&@); foo { $_ } @list;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
         }
