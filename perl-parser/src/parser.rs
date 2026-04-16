@@ -4546,6 +4546,208 @@ mod tests {
         }
     }
 
+    // ── Missing tests promised in the audit ───────────────────
+    //
+    // These cover interpolation contexts beyond plain `"..."` —
+    // heredoc bodies, `qr//`, `s///` pattern and replacement,
+    // and the `@{[expr]}` form mixed with chains.  A few cases
+    // don't work yet and are marked `#[ignore]` with a clear
+    // note explaining the gap; they're here rather than absent
+    // so the gap is visible in the test suite rather than only
+    // in my memory.
+
+    // Heredoc with chain in body.
+
+    #[test]
+    fn interp_chain_in_heredoc() {
+        let src = "<<END;\nvalue: $h->{key}\nEND\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::InterpolatedString(Interpolated(parts)), .. }) => {
+                let has_chain = parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        InterpPart::ScalarInterp(e) if matches!(
+                            e.kind,
+                            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))
+                        )
+                    )
+                });
+                assert!(has_chain, "expected arrow-hash chain in heredoc parts: {parts:?}");
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_direct_subscript_in_heredoc() {
+        // Bare `$a[0]` inside a heredoc body.
+        let src = "<<END;\nfirst: $a[0]\nEND\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::InterpolatedString(Interpolated(parts)), .. }) => {
+                let has_elem = parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        InterpPart::ScalarInterp(e) if matches!(e.kind, ExprKind::ArrayElem(_, _))
+                    )
+                });
+                assert!(has_elem, "expected ArrayElem chain in heredoc parts: {parts:?}");
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    // qr// compiled-regex with chain.
+
+    #[test]
+    fn interp_chain_in_qr() {
+        let e = parse_expr_str(r#"qr/$h->{key}/;"#);
+        match &e.kind {
+            ExprKind::Regex(RegexKind::Qr, pat, _) => {
+                let has_chain = pat.0.iter().any(|p| {
+                    matches!(
+                        p,
+                        InterpPart::ScalarInterp(e) if matches!(
+                            e.kind,
+                            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))
+                        )
+                    )
+                });
+                assert!(has_chain, "expected arrow-hash chain in qr// parts: {parts:?}", parts = pat.0);
+            }
+            other => panic!("expected Regex(Qr, ...), got {other:?}"),
+        }
+    }
+
+    // s/// — pattern AND replacement can interpolate.
+
+    #[test]
+    fn interp_chain_in_subst_pattern() {
+        let e = parse_expr_str(r#"s/$h->{key}/new/;"#);
+        match &e.kind {
+            ExprKind::Subst(pat, _, _) => {
+                let has_chain = pat.0.iter().any(|p| {
+                    matches!(
+                        p,
+                        InterpPart::ScalarInterp(e) if matches!(
+                            e.kind,
+                            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))
+                        )
+                    )
+                });
+                assert!(has_chain, "expected arrow-hash chain in subst pattern: {parts:?}", parts = pat.0);
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_chain_in_subst_replacement() {
+        let e = parse_expr_str(r#"s/old/$h->{key}/;"#);
+        match &e.kind {
+            ExprKind::Subst(_, repl, _) => {
+                let has_chain = repl.0.iter().any(|p| {
+                    matches!(
+                        p,
+                        InterpPart::ScalarInterp(e) if matches!(
+                            e.kind,
+                            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))
+                        )
+                    )
+                });
+                assert!(has_chain, "expected arrow-hash chain in subst replacement: {parts:?}", parts = repl.0);
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    // @{[expr]} expression-interpolation form.
+
+    #[test]
+    fn interp_array_expr_form_with_chain_inside() {
+        // `"@{[$h->{k}]}"` — the @{[...]} form wraps an
+        // expression; the expression internally uses a
+        // subscript chain.  Outer shape is ExprInterp (not
+        // ChainStart) because the leading token is `@{`, not
+        // `@name`.
+        let parts = interp_parts(r#""@{[$h->{k}]}";"#);
+        let expr_part = parts
+            .iter()
+            .find_map(|p| match p {
+                InterpPart::ExprInterp(e) => Some(e),
+                _ => None,
+            })
+            .expect("expected an ExprInterp part");
+        // Inside: anonymous array ref containing the chain.
+        // AnonArray([ArrowDeref(h, HashElem(k))])
+        match &expr_part.kind {
+            ExprKind::AnonArray(items) => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0].kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))));
+            }
+            other => panic!("expected AnonArray inside @{{[...]}}: {other:?}"),
+        }
+    }
+
+    // Escape sequences in hash-subscript position are NOT
+    // processed as string escapes.  `"$h{\x41}"` is NOT
+    // `$h{'A'}`; per `perl -MO=Deparse -e '"$h{\x41}"'` it
+    // parses as `"$h{\'x41'}"` — the `\` is the reference
+    // operator applied to the autoquoted bareword `x41`.  The
+    // hash lookup key is therefore a scalar reference (which
+    // stringifies to `SCALAR(0x...)` at runtime).
+    //
+    // Verified with the Perl debugger:
+    //
+    // ```perl
+    // my %h = (x41 => 'test');
+    // print "$h{\x41}\n";    # empty — lookup misses, stringified ref != 'x41'
+    // ```
+
+    #[test]
+    fn interp_escape_sequence_in_hash_subscript_is_ref_to_bareword() {
+        let parts = interp_parts(r#""$h{\x41}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::HashElem(_, k) => match &k.kind {
+                ExprKind::Ref(inner) => {
+                    // Inner: the autoquoted bareword "x41".
+                    assert!(matches!(inner.kind, ExprKind::StringLit(ref s) if s == "x41"), "expected Ref(StringLit('x41')), inner was {:?}", inner.kind);
+                }
+                other => panic!("expected Ref(StringLit('x41')) as hash key, got {other:?}"),
+            },
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    // ── Known gaps — ignored tests, kept visible ─────────────
+    //
+    // These encode behavior we haven't implemented yet.  Each
+    // is marked `#[ignore]` with a note explaining what's
+    // missing.  Running with `cargo test -- --ignored` will
+    // run them and show the real failures.
+
+    #[test]
+    #[ignore = "postderef_qq in strings: `\"$ref->@*\"`, `\"$ref->%*\"` etc. \
+        should interpolate the full dereference.  Current chain mode \
+        recognizes `->[` and `->{` but not `->@*` / `->%*`.  Needs \
+        extending peek_chain_starter and the chain-mode dispatch to \
+        recognize the postderef forms (feature-gated on postderef_qq)."]
+    fn interp_postderef_qq_array() {
+        let parts = interp_parts(r#""$ref->@*";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefArray)), "expected ArrowDeref(_, DerefArray), got {:?}", e.kind);
+    }
+
+    #[test]
+    #[ignore = "postderef_qq hash form: same gap as above."]
+    fn interp_postderef_qq_hash() {
+        let parts = interp_parts(r#""$ref->%*";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefHash)), "expected ArrowDeref(_, DerefHash), got {:?}", e.kind);
+    }
+
     // ── Regex / substitution / transliteration tests ──────────
 
     #[test]
