@@ -27,14 +27,14 @@ pub struct Statement {
 #[derive(Clone, Debug)]
 pub enum StmtKind {
     /// Expression statement (expression followed by `;`).
+    ///
+    /// In Perl, declarations (`my`, `our`, `state`, `local`) are
+    /// expressions, not statements — `my $x = 5, $y` parses as
+    /// `(my $x = 5), $y`.  They therefore appear here wrapped as
+    /// `Expr(...)`, with `ExprKind::Decl` / `ExprKind::Local`
+    /// (often inside `ExprKind::Assign` when an initializer is
+    /// present).
     Expr(Expr),
-
-    /// `my $x`, `my ($x, $y)`, with optional assignment.
-    My(Vec<VarDecl>, Option<Expr>),
-    /// `our $x`.
-    Our(Vec<VarDecl>, Option<Expr>),
-    /// `state $x`.
-    State(Vec<VarDecl>, Option<Expr>),
 
     /// `sub name { ... }` or `sub name (proto) { ... }`.
     SubDecl(SubDecl),
@@ -129,6 +129,15 @@ pub enum ExprKind {
     SpecialArrayVar(String),
     /// `%!`, `%+`, `%-`, `%{^CAPTURE}`, etc.
     SpecialHashVar(String),
+
+    /// The default variable (`$_`) inserted implicitly by the
+    /// parser — e.g., when a prototype's `_` slot is omitted from
+    /// a call.  Distinct from `ScalarVar("_")`, which represents
+    /// the scalar *variable* named `_` as written in the source
+    /// (and which may be a lexical `my $_` rather than the global
+    /// default).  At runtime, `DefaultVar` always refers to the
+    /// global default; `ScalarVar("_")` follows normal scope rules.
+    DefaultVar,
 
     /// `my $x`, `our ($a, $b)`, `state $x` in expression context.
     /// The Pratt parser handles `= expr` as normal assignment wrapping this.
