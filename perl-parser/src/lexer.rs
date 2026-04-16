@@ -1417,14 +1417,14 @@ impl Lexer {
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: false, raw: true, regex: true });
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: delim != b'\'', raw: true, regex: true });
         Ok(Token::RegexBegin(RegexKind::Match, delim))
     }
 
     /// `qr/pattern/flags` or `qr{pattern}flags`
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: false, raw: true, regex: true });
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: delim != b'\'', raw: true, regex: true });
         Ok(Token::RegexBegin(RegexKind::Qr, delim))
     }
 
@@ -1433,10 +1433,11 @@ impl Lexer {
         let delim = self.read_quote_delimiter()?;
 
         // Push context for the pattern body (raw, regex mode).
+        // Single-quote delimiter disables interpolation.
         // The parser will collect body tokens until QuoteEnd,
         // then call start_subst_replacement to set up the
         // replacement body.
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: false, raw: true, regex: true });
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: delim != b'\'', raw: true, regex: true });
 
         Ok(Token::SubstBegin(delim))
     }
@@ -3226,6 +3227,84 @@ mod tests {
         // (??{ in a double-quoted string is literal.
         let tokens = lex_all(r#""foo(??{bar})""#);
         assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("foo(??{bar})".into()), Token::QuoteEnd,]);
+    }
+
+    // ── Regex interpolation ───────────────────────────────────
+
+    #[test]
+    fn lex_regex_scalar_interp() {
+        // $var in a regex pattern triggers interpolation.
+        let tokens = lex_all("m/foo$bar/");
+        assert_eq!(
+            tokens,
+            vec![Token::RegexBegin(RegexKind::Match, b'/'), Token::ConstSegment("foo".into()), Token::InterpScalar("bar".into()), Token::QuoteEnd,]
+        );
+    }
+
+    #[test]
+    fn lex_regex_array_interp() {
+        // @arr in a regex pattern triggers interpolation.
+        let tokens = lex_all("m/foo@arr/");
+        assert_eq!(
+            tokens,
+            vec![Token::RegexBegin(RegexKind::Match, b'/'), Token::ConstSegment("foo".into()), Token::InterpArray("arr".into()), Token::QuoteEnd,]
+        );
+    }
+
+    #[test]
+    fn lex_regex_interp_and_code_block() {
+        // Both $var and (?{...}) in the same pattern.
+        let tokens = lex_all("m/foo$bar(?{ $x })baz/");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::RegexBegin(RegexKind::Match, b'/'),
+                Token::ConstSegment("foo".into()),
+                Token::InterpScalar("bar".into()),
+                Token::RegexCodeStart,
+                Token::ScalarVar("x".into()),
+                Token::RightBrace,
+                Token::ConstSegment(")baz".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_regex_literal_no_interp() {
+        // m'...' with single-quote delimiter: no $var interpolation.
+        let tokens = lex_all("m'foo$bar'");
+        assert_eq!(tokens, vec![Token::RegexBegin(RegexKind::Match, b'\''), Token::ConstSegment("foo$bar".into()), Token::QuoteEnd,]);
+    }
+
+    #[test]
+    fn lex_regex_literal_with_code_block() {
+        // m'...' still recognizes (?{...}) code blocks.
+        let tokens = lex_all("m'foo(?{ $x })bar'");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::RegexBegin(RegexKind::Match, b'\''),
+                Token::ConstSegment("foo".into()),
+                Token::RegexCodeStart,
+                Token::ScalarVar("x".into()),
+                Token::RightBrace,
+                Token::ConstSegment(")bar".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_subst_pattern_interp() {
+        // $var in s/// pattern triggers interpolation.
+        let tokens = lex_all("s/foo$bar/baz/");
+        assert_eq!(tokens[0], Token::SubstBegin(b'/'));
+        assert_eq!(tokens[1], Token::ConstSegment("foo".into()));
+        assert_eq!(tokens[2], Token::InterpScalar("bar".into()));
+        // ConstSegment("") before QuoteEnd for the empty segment
+        // after the interpolation.
+        assert!(tokens.contains(&Token::QuoteEnd));
     }
 
     #[test]

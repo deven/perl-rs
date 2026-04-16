@@ -110,14 +110,12 @@ pub enum ExprKind {
     FloatLit(f64),
     StringLit(String),
     /// Interpolated string: sequence of constant and interpolated parts.
-    InterpolatedString(Vec<StringPart>),
+    InterpolatedString(Interpolated),
     /// `qw/.../`.
     QwList(Vec<String>),
     Undef,
     /// Regex literal: `m/.../flags`, `/.../flags`, or `qr/.../flags`.
-    /// Pattern is an expression: `StringLit` for simple patterns,
-    /// `InterpolatedString` for patterns with code blocks.
-    Regex(RegexKind, Box<Expr>, Option<String>),
+    Regex(RegexKind, Interpolated, Option<String>),
 
     // ── Variables ─────────────────────────────────────────────
     ScalarVar(String),
@@ -207,7 +205,7 @@ pub enum ExprKind {
 
     // ── Regex operations ──────────────────────────────────────
     /// `s/pattern/replacement/flags`.
-    Subst(String, Box<Expr>, Option<String>),
+    Subst(Interpolated, Interpolated, Option<String>),
     /// `tr/from/to/flags` or `y/from/to/flags`.
     Translit(String, String, Option<String>),
 
@@ -262,9 +260,30 @@ pub enum StatTarget {
     Default,
 }
 
-/// Part of an interpolated string (§7.3).
+/// A sequence of interpolated parts — used for strings, regex
+/// patterns, and substitution replacements.
 #[derive(Clone, Debug)]
-pub enum StringPart {
+pub struct Interpolated(pub Vec<InterpPart>);
+
+impl Interpolated {
+    /// If this is a single constant with no interpolation, return
+    /// the plain string.  Returns `Some("")` for empty.
+    pub fn as_plain_string(&self) -> Option<String> {
+        if self.0.is_empty() {
+            return Some(String::new());
+        }
+        if self.0.len() == 1 {
+            if let InterpPart::Const(s) = &self.0[0] {
+                return Some(s.clone());
+            }
+        }
+        None
+    }
+}
+
+/// Part of an interpolated value (§7.3).
+#[derive(Clone, Debug)]
+pub enum InterpPart {
     Const(String),
     ScalarInterp(String),
     ArrayInterp(String),

@@ -365,10 +365,6 @@ pub enum Token {
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.
     RegexBegin(RegexKind, u8),
-    /// Regex body (pattern text, pre-interpolation).
-    RegexBody(String),
-    /// Regex flags (imsx etc.).
-    RegexFlags(String),
     /// `(?{` — embedded code block in a regex pattern.
     /// Lexer switches to normal code mode until `}`.
     RegexCodeStart,
