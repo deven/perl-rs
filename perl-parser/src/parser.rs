@@ -1170,8 +1170,9 @@ impl Parser {
         let span = spanned.span;
 
         // Fat comma autoquotes keywords: `if => 1` produces StringLit("if").
+        // RightBrace also autoquotes: $hash{if} produces StringLit("if").
         if let Token::Keyword(kw) = &spanned.token {
-            if matches!(self.peek_token(), Token::FatComma) {
+            if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
                 let name: &str = (*kw).into();
                 return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
             }
@@ -1427,7 +1428,7 @@ impl Parser {
                 let operand = self.parse_expr(PREC_UNARY)?;
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Ref(Box::new(operand)) })
             }
-            Token::Not | Token::Keyword(Keyword::Not) => {
+            Token::Keyword(Keyword::Not) => {
                 self.expect = Expect::Term;
                 let operand = self.parse_expr(PREC_NOT_LOW)?;
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Not, Box::new(operand)) })
@@ -2301,9 +2302,7 @@ impl Parser {
             Token::BitXor => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
             Token::BitAnd => Some(OpInfo { prec: PREC_BIT_AND, assoc: Assoc::Left }),
             Token::NumEq | Token::NumNe | Token::Spaceship => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
-            Token::StrEq | Token::StrNe | Token::StrCmp => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
             Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non }),
-            Token::StrLt | Token::StrGt | Token::StrLe | Token::StrGe => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non }),
             Token::ShiftLeft | Token::ShiftRight => Some(OpInfo { prec: PREC_SHIFT, assoc: Assoc::Left }),
             Token::Plus => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
             Token::Minus => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
@@ -2311,7 +2310,6 @@ impl Parser {
             Token::Star => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
             Token::Slash => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
             Token::Percent => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
-            Token::X => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
             Token::Binding | Token::NotBinding => Some(OpInfo { prec: PREC_BINDING, assoc: Assoc::Left }),
             Token::Power => Some(OpInfo { prec: PREC_POW, assoc: Assoc::Right }),
             Token::Arrow => Some(OpInfo { prec: PREC_ARROW, assoc: Assoc::Left }),
@@ -2323,6 +2321,18 @@ impl Parser {
             Token::Keyword(Keyword::Or) => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
             Token::PlusPlus => Some(OpInfo { prec: PREC_INC, assoc: Assoc::Non }),
             Token::MinusMinus => Some(OpInfo { prec: PREC_INC, assoc: Assoc::Non }),
+            // Word operators (always emitted as Keyword tokens):
+            // eq/ne/cmp at == precedence, lt/gt/le/ge at relational,
+            // x at multiplicative, xor at low-logical.
+            Token::Keyword(Keyword::Eq) | Token::Keyword(Keyword::Ne) | Token::Keyword(Keyword::Cmp) => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
+            Token::Keyword(Keyword::Lt) | Token::Keyword(Keyword::Gt) | Token::Keyword(Keyword::Le) | Token::Keyword(Keyword::Ge) => {
+                Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non })
+            }
+            Token::Ident(name) => match name.as_str() {
+                "x" => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
+                "xor" => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2558,7 +2568,6 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::Percent => Ok(BinOp::Mod),
         Token::Power => Ok(BinOp::Pow),
         Token::Dot => Ok(BinOp::Concat),
-        Token::X => Ok(BinOp::Repeat),
         Token::NumEq => Ok(BinOp::NumEq),
         Token::NumNe => Ok(BinOp::NumNe),
         Token::NumLt => Ok(BinOp::NumLt),
@@ -2566,13 +2575,6 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::NumLe => Ok(BinOp::NumLe),
         Token::NumGe => Ok(BinOp::NumGe),
         Token::Spaceship => Ok(BinOp::Spaceship),
-        Token::StrEq => Ok(BinOp::StrEq),
-        Token::StrNe => Ok(BinOp::StrNe),
-        Token::StrLt => Ok(BinOp::StrLt),
-        Token::StrGt => Ok(BinOp::StrGt),
-        Token::StrLe => Ok(BinOp::StrLe),
-        Token::StrGe => Ok(BinOp::StrGe),
-        Token::StrCmp => Ok(BinOp::StrCmp),
         Token::AndAnd => Ok(BinOp::And),
         Token::OrOr => Ok(BinOp::Or),
         Token::DefinedOr => Ok(BinOp::DefinedOr),
@@ -2585,6 +2587,18 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::NotBinding => Ok(BinOp::NotBinding),
         Token::Keyword(Keyword::And) => Ok(BinOp::LowAnd),
         Token::Keyword(Keyword::Or) => Ok(BinOp::LowOr),
+        Token::Keyword(Keyword::Eq) => Ok(BinOp::StrEq),
+        Token::Keyword(Keyword::Ne) => Ok(BinOp::StrNe),
+        Token::Keyword(Keyword::Lt) => Ok(BinOp::StrLt),
+        Token::Keyword(Keyword::Gt) => Ok(BinOp::StrGt),
+        Token::Keyword(Keyword::Le) => Ok(BinOp::StrLe),
+        Token::Keyword(Keyword::Ge) => Ok(BinOp::StrGe),
+        Token::Keyword(Keyword::Cmp) => Ok(BinOp::StrCmp),
+        Token::Ident(name) => match name.as_str() {
+            "x" => Ok(BinOp::Repeat),
+            "xor" => Ok(BinOp::LowXor),
+            _ => Err(ParseError::new(format!("not a binary operator: {token:?}"), Span::DUMMY)),
+        },
         other => Err(ParseError::new(format!("not a binary operator: {other:?}"), Span::DUMMY)),
     }
 }

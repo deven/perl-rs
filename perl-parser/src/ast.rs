@@ -329,6 +329,7 @@ pub enum BinOp {
     DefinedOr,
     LowAnd,
     LowOr,
+    LowXor,
     // Bitwise
     BitAnd,
     BitOr,

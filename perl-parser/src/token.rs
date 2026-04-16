@@ -267,7 +267,6 @@ pub enum Token {
 
     // ── Operators — string ────────────────────────────────────
     Dot, // . (concatenation)
-    X,   // x (string repetition)
 
     // ── Operators — comparison ────────────────────────────────
     NumEq,     // ==
@@ -277,20 +276,12 @@ pub enum Token {
     NumLe,     // <=
     NumGe,     // >=
     Spaceship, // <=>
-    StrEq,     // eq
-    StrNe,     // ne
-    StrLt,     // lt
-    StrGt,     // gt
-    StrLe,     // le
-    StrGe,     // ge
-    StrCmp,    // cmp
 
     // ── Operators — logical ───────────────────────────────────
     AndAnd,    // &&
     OrOr,      // ||
     DefinedOr, // //  (defined-or)
     Bang,      // !
-    Not,       // not (low precedence, also keyword)
 
     // ── Operators — bitwise ───────────────────────────────────
     BitAnd,     // &

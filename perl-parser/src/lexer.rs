@@ -940,24 +940,10 @@ impl Lexer {
         // We don't consume the `=>` — just recognize the word as a string
         // when `=>` follows.  Actually the parser should handle this.
 
-        // Check for string comparison keyword operators
-        // These are infix operators when in operator position.
-        if !expect.expecting_term() {
-            match name.as_str() {
-                "eq" => return Ok(Token::StrEq),
-                "ne" => return Ok(Token::StrNe),
-                "lt" => return Ok(Token::StrLt),
-                "gt" => return Ok(Token::StrGt),
-                "le" => return Ok(Token::StrLe),
-                "ge" => return Ok(Token::StrGe),
-                "cmp" => return Ok(Token::StrCmp),
-                "x" => return Ok(Token::X),
-                "and" => return Ok(Token::Keyword(Keyword::And)),
-                "or" => return Ok(Token::Keyword(Keyword::Or)),
-                "not" => return Ok(Token::Not),
-                _ => {}
-            }
-        }
+        // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or,
+        // xor, not) are always emitted as Ident(name).  The parser
+        // recognizes them as operators in operator context via
+        // peek_op_info and token_to_binop.
 
         // q// qq// qw// qr// m// s/// tr/// y///
         match name.as_str() {
@@ -2196,11 +2182,11 @@ mod tests {
             tokens,
             vec![
                 Token::ScalarVar("a".into()),
-                Token::StrEq,
+                Token::Keyword(Keyword::Eq),
                 Token::ScalarVar("b".into()),
-                Token::StrNe,
+                Token::Keyword(Keyword::Ne),
                 Token::ScalarVar("c".into()),
-                Token::StrLt,
+                Token::Keyword(Keyword::Lt),
                 Token::ScalarVar("d".into()),
             ]
         );
