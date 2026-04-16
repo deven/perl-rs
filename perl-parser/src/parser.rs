@@ -7848,6 +7848,142 @@ my $y = 1;
         assert!(result.is_err(), "expected error for unterminated heredoc");
     }
 
+    // ── Torture test pieces ──────────────────────────────────
+    //
+    // Derived from a real Perl program that exercises heredoc
+    // nesting, interpolation forms, and compile-time hoisting
+    // simultaneously.  Each test below isolates one aspect so
+    // failures are diagnostic.
+
+    #[test]
+    fn torture_heredoc_arithmetic_stacked() {
+        // `<<A + <<B + <<C` — three heredocs combined with `+`.
+        // Bodies are single numbers.  Deparse evaluates at
+        // compile time but we just verify parsing.
+        let src = "my $x = <<A + <<B + <<C;\n1\nA\n2\nB\n3\nC\n";
+        let prog = parse(src);
+        let init = decl_init(&prog.statements[0]);
+        // Shape: Add(Add(heredoc_A, heredoc_B), heredoc_C).
+        match &init.kind {
+            ExprKind::BinOp(BinOp::Add, left, right) => {
+                // Right is the third heredoc (literal "3\n").
+                assert!(matches!(&right.kind, ExprKind::StringLit(s) if s == "3\n"), "right should be heredoc C, got {:?}", right.kind);
+                match &left.kind {
+                    ExprKind::BinOp(BinOp::Add, a, b) => {
+                        assert!(matches!(&a.kind, ExprKind::StringLit(s) if s == "1\n"), "first should be heredoc A");
+                        assert!(matches!(&b.kind, ExprKind::StringLit(s) if s == "2\n"), "second should be heredoc B");
+                    }
+                    other => panic!("inner should be Add, got {other:?}"),
+                }
+            }
+            other => panic!("expected Add at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn torture_ref_to_expr_in_interp() {
+        // `"${\(1 + 2)}"` — `${...}` with `\(expr)` inside.
+        // This is a common Perl idiom for embedding arbitrary
+        // expressions in interpolated strings.
+        let parts = interp_parts(r#""${\(1 + 2)}";"#);
+        // Expect: ExprInterp containing Ref(Paren(Add(1, 2)))
+        // or Ref(Add(1, 2)) — depends on paren handling.
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            InterpPart::ExprInterp(e) => {
+                // Outer is Ref(\...).
+                match &e.kind {
+                    ExprKind::Ref(inner) => {
+                        // Inner is the paren-wrapped addition.
+                        let actual_add = match &inner.kind {
+                            ExprKind::Paren(p) => p,
+                            other => panic!("expected Paren inside Ref, got {other:?}"),
+                        };
+                        assert!(matches!(actual_add.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add, got {:?}", actual_add.kind);
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected ExprInterp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn torture_do_block_in_expression() {
+        // `my $x = do { 1 + 2 };` — do-block as expression.
+        let prog = parse("my $x = do { 1 + 2 };");
+        let init = decl_init(&prog.statements[0]);
+        match &init.kind {
+            ExprKind::DoBlock(_) => {}
+            other => panic!("expected DoBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn torture_begin_inside_do_block() {
+        // `do { BEGIN { our $a = 1; } $a }` — BEGIN hoists to
+        // compile time even inside a runtime do-block.  We just
+        // verify the parser accepts this; BEGIN semantics are
+        // runtime behavior.
+        let prog = parse("my $x = do { BEGIN { our $a = 1; } $a };");
+        let init = decl_init(&prog.statements[0]);
+        match &init.kind {
+            ExprKind::DoBlock(block) => {
+                // Block should contain a BEGIN and an expression.
+                assert!(block.statements.len() >= 2, "expected at least BEGIN + expr in do-block, got {:?}", block.statements);
+            }
+            other => panic!("expected DoBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn torture_heredoc_in_interp_of_heredoc() {
+        // Heredoc inside `${\(...)}` inside another heredoc body.
+        // This is the nesting pattern from the torture test:
+        //   <<OUTER contains `${\(do { my $a = <<INNER; ... })}`.
+        // Simplified version:
+        let src = "\
+my $x = <<OUTER;\n\
+prefix ${\\ do { <<INNER }}\n\
+inner body\n\
+INNER\n\
+suffix\n\
+OUTER\n";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "should parse without error");
+        let init = decl_init(&prog.statements[0]);
+        // Outer is an InterpolatedString (heredoc with interpolation).
+        assert!(matches!(init.kind, ExprKind::InterpolatedString(_)), "expected InterpolatedString for heredoc, got {:?}", init.kind);
+    }
+
+    #[test]
+    fn torture_array_interp_with_heredoc() {
+        // `"@{[<<END]}"` — array interpolation containing a heredoc.
+        let src = "my $x = \"@{[<<END]}\";\nheredoc body\nEND\n";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "should parse");
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::InterpolatedString(_)), "expected InterpolatedString, got {:?}", init.kind);
+    }
+
+    #[test]
+    fn torture_qq_with_nested_heredoc() {
+        // `qq{prefix ${\(<<END)} suffix}` — qq with heredoc inside.
+        let src = "my $x = qq{prefix ${\\<<END} suffix};\nheredoc body\nEND\n";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "should parse");
+    }
+
+    #[test]
+    fn torture_stacked_heredoc_list_assignment() {
+        // The exact pattern from the torture test:
+        // `my ($x, $y, $z) = (<<~X, <<Y, do { expr });`
+        // Simplified: just two heredocs plus a literal.
+        let src = "my ($x, $y, $z) = (<<~A, <<B, 42);\n    A-body\n    A\nB-body\nB\n";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "should parse");
+    }
+
     // ── Dynamic method dispatch tests ─────────────────────────
 
     #[test]
