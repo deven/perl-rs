@@ -329,7 +329,7 @@ impl Lexer {
             // ── Sigils → variables ────────────────────────────
             b'$' => self.lex_dollar(expect)?,
             b'@' => self.lex_at()?,
-            b'%' => self.lex_percent(expect)?,
+            b'%' => self.lex_percent()?,
 
             // ── Identifiers and keywords ──────────────────────
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_word(expect)?,
@@ -851,55 +851,61 @@ impl Lexer {
         }
     }
 
-    fn lex_percent(&mut self, expect: &Expect) -> Result<Token, ParseError> {
-        // % can be modulo or hash sigil
-        if expect.expecting_term() {
+    fn lex_percent(&mut self) -> Result<Token, ParseError> {
+        // Always return Percent or ModEq.  The parser, in term
+        // position, calls lex_hash_var_after_percent to attempt
+        // hash-variable detection.
+        self.skip(1);
+        if self.peek_byte(false) == Some(b'=') {
             self.skip(1);
-            match self.peek_byte(false) {
-                Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
-                    // %{^CAPTURE} etc.
-                    self.skip(2); // skip { and ^
-                    let ident_start = self.line_pos();
-                    while let Some(b) = self.peek_byte(false) {
-                        if b.is_ascii_alphanumeric() || b == b'_' {
-                            self.skip(1);
-                        } else {
-                            break;
-                        }
-                    }
-                    let ident = self.line_slice_str(ident_start)?;
-                    let name = format!("^{ident}");
-                    if self.peek_byte(false) == Some(b'}') {
-                        self.skip(1);
-                    }
-                    Ok(Token::SpecialHashVar(name))
-                }
-                Some(b'!') => {
-                    self.skip(1);
-                    Ok(Token::SpecialHashVar("!".into()))
-                }
-                Some(b'+') => {
-                    self.skip(1);
-                    Ok(Token::SpecialHashVar("+".into()))
-                }
-                Some(b'-') => {
-                    self.skip(1);
-                    Ok(Token::SpecialHashVar("-".into()))
-                }
-                Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
-                    let name = self.scan_ident();
-                    Ok(Token::HashVar(name))
-                }
-                _ => Ok(Token::Percent),
-            }
+            Ok(Token::Assign(AssignOp::ModEq))
         } else {
-            self.skip(1);
-            if self.peek_byte(false) == Some(b'=') {
-                self.skip(1);
-                Ok(Token::Assign(AssignOp::ModEq))
-            } else {
-                Ok(Token::Percent)
+            Ok(Token::Percent)
+        }
+    }
+
+    /// Called by the parser after consuming a `Percent` token in
+    /// term position.  Attempts to read a hash variable name and
+    /// returns the appropriate token, or `None` if `%` is not
+    /// followed by a valid hash name (in which case `%` is an
+    /// invalid standalone term).
+    pub fn lex_hash_var_after_percent(&mut self) -> Result<Option<Token>, ParseError> {
+        match self.peek_byte(false) {
+            Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
+                // %{^CAPTURE} etc.
+                self.skip(2); // skip { and ^
+                let ident_start = self.line_pos();
+                while let Some(b) = self.peek_byte(false) {
+                    if b.is_ascii_alphanumeric() || b == b'_' {
+                        self.skip(1);
+                    } else {
+                        break;
+                    }
+                }
+                let ident = self.line_slice_str(ident_start)?;
+                let name = format!("^{ident}");
+                if self.peek_byte(false) == Some(b'}') {
+                    self.skip(1);
+                }
+                Ok(Some(Token::SpecialHashVar(name)))
             }
+            Some(b'!') => {
+                self.skip(1);
+                Ok(Some(Token::SpecialHashVar("!".into())))
+            }
+            Some(b'+') => {
+                self.skip(1);
+                Ok(Some(Token::SpecialHashVar("+".into())))
+            }
+            Some(b'-') => {
+                self.skip(1);
+                Ok(Some(Token::SpecialHashVar("-".into())))
+            }
+            Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
+                let name = self.scan_ident();
+                Ok(Some(Token::HashVar(name)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1946,6 +1952,12 @@ mod tests {
             // mimic what the parser does by calling the heredoc hook.
             if matches!(spanned.token, Token::ShiftLeft) && expect.expecting_term() {
                 if let Some(tok) = lexer.lex_heredoc_after_shift_left().unwrap() {
+                    spanned.token = tok;
+                }
+            }
+            // In term context, Percent may introduce a hash variable.
+            if matches!(spanned.token, Token::Percent) && expect.expecting_term() {
+                if let Some(tok) = lexer.lex_hash_var_after_percent().unwrap() {
                     spanned.token = tok;
                 }
             }

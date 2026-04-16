@@ -489,6 +489,14 @@ impl Parser {
             Token::ScalarVar(name) => Ok(VarDecl { sigil: Sigil::Scalar, name, span }),
             Token::ArrayVar(name) => Ok(VarDecl { sigil: Sigil::Array, name, span }),
             Token::HashVar(name) => Ok(VarDecl { sigil: Sigil::Hash, name, span }),
+            Token::Percent => {
+                // my %hash — lexer emitted Percent; read the hash name.
+                match self.lexer.lex_hash_var_after_percent()? {
+                    Some(Token::HashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span }),
+                    Some(Token::SpecialHashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span }),
+                    _ => Err(ParseError::new("expected hash variable name after %", span)),
+                }
+            }
             other => Err(ParseError::new(format!("expected variable, got {other:?}"), span)),
         }
     }
@@ -1246,6 +1254,30 @@ impl Parser {
             Token::SpecialArrayVar(name) => Ok(Expr { kind: ExprKind::SpecialArrayVar(name), span }),
             Token::SpecialHashVar(name) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
 
+            // % in term position: try hash variable first, then
+            // fall through to hash-deref (%$ref, %{expr}).
+            Token::Percent => {
+                match self.lexer.lex_hash_var_after_percent()? {
+                    Some(Token::HashVar(name)) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
+                    Some(Token::SpecialHashVar(name)) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
+                    Some(other) => unreachable!("unexpected hash token: {other:?}"),
+                    None => {
+                        // No hash name — must be a deref (%$ref, %{expr}).
+                        self.expect = Expect::Deref;
+                        if self.at(&Token::LeftBrace)? {
+                            self.next_token()?;
+                            let inner = self.parse_expr(PREC_LOW)?;
+                            let end = self.peek_span();
+                            self.expect_token(&Token::RightBrace)?;
+                            Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Hash, Box::new(inner)) })
+                        } else {
+                            let operand = self.parse_deref_operand()?;
+                            Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Hash, Box::new(operand)) })
+                        }
+                    }
+                }
+            }
+
             // Prefix dereference: $$ref, @$ref, %$ref, ${expr}, @{expr}
             Token::Dollar => {
                 self.expect = Expect::Deref;
@@ -1277,21 +1309,6 @@ impl Parser {
                 } else {
                     let operand = self.parse_deref_operand()?;
                     Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Array, Box::new(operand)) })
-                }
-            }
-
-            // Prefix hash dereference: %$ref, %{expr}
-            Token::Percent => {
-                self.expect = Expect::Deref;
-                if self.at(&Token::LeftBrace)? {
-                    self.next_token()?;
-                    let inner = self.parse_expr(PREC_LOW)?;
-                    let end = self.peek_span();
-                    self.expect_token(&Token::RightBrace)?;
-                    Ok(Expr { span: span.merge(end), kind: ExprKind::Deref(Sigil::Hash, Box::new(inner)) })
-                } else {
-                    let operand = self.parse_deref_operand()?;
-                    Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Hash, Box::new(operand)) })
                 }
             }
 
