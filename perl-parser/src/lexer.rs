@@ -1374,7 +1374,9 @@ impl Lexer {
 
     fn lex_qw(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        let body = self.lex_body_str(delim, true)?;
+        // qw is documented as equivalent to split(' ', q/.../).
+        // Use literal (q//) escape mode: \\ → \, \delim → delim.
+        let body = self.lex_body_str(delim, false)?;
         let words: Vec<String> = body.split_whitespace().map(String::from).collect();
         Ok(Token::QwList(words))
     }
@@ -2620,6 +2622,27 @@ mod tests {
     fn lex_qw_slash_delimiter() {
         let tokens = lex_all("qw/foo bar baz/");
         assert_eq!(tokens, vec![Token::QwList(vec!["foo".into(), "bar".into(), "baz".into()])]);
+    }
+
+    #[test]
+    fn lex_qw_escaped_delimiter() {
+        // \] inside qw[] escapes the delimiter.
+        let tokens = lex_all("qw[a\\] b c]");
+        assert_eq!(tokens, vec![Token::QwList(vec!["a]".into(), "b".into(), "c".into()])]);
+    }
+
+    #[test]
+    fn lex_qw_escaped_backslash() {
+        // \\ inside qw produces a single backslash (q// escaping).
+        let tokens = lex_all("qw(a\\\\b c)");
+        assert_eq!(tokens, vec![Token::QwList(vec!["a\\b".into(), "c".into()])]);
+    }
+
+    #[test]
+    fn lex_qw_literal_backslash_n() {
+        // \n inside qw is literal (not a newline).
+        let tokens = lex_all("qw(a\\nb c)");
+        assert_eq!(tokens, vec![Token::QwList(vec!["a\\nb".into(), "c".into()])]);
     }
 
     #[test]
