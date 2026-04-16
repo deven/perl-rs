@@ -561,14 +561,27 @@ impl Parser {
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
         };
 
-        let prototype_raw = self.parse_prototype()?;
-        let attributes = self.parse_attributes()?;
+        // Dispatch on the `signatures` feature: when active, the
+        // grammar is `sub NAME [ATTRS] [SIGNATURE] BLOCK` — attrs
+        // come before the paren-form, which is a signature.
+        // When inactive, the grammar is `sub NAME [PROTO] [ATTRS]
+        // BLOCK` — the paren-form is a prototype.
+        let signatures_active = self.pragmas.features.contains(Features::SIGNATURES);
 
-        // The effective prototype may come from either the paren
-        // form or a `:prototype(...)` attribute.  If both are
-        // present, the attribute wins.  The AST preserves both
-        // forms as written; the symbol table records whichever is
-        // effective.
+        let (prototype_raw, attributes, signature) = if signatures_active {
+            let attrs = self.parse_attributes()?;
+            let sig = self.parse_signature()?;
+            (None, attrs, sig)
+        } else {
+            let proto = self.parse_prototype()?;
+            let attrs = self.parse_attributes()?;
+            (proto, attrs, None)
+        };
+
+        // The effective prototype (for symbol-table purposes) may
+        // come from either the paren form or a `:prototype(...)`
+        // attribute.  With signatures active the paren-form is a
+        // signature, so only the attribute contributes.
         let effective_proto_raw = attributes.iter().find(|a| a.name == "prototype").and_then(|a| a.value.clone()).or_else(|| prototype_raw.clone());
 
         let prototype_parsed = match &effective_proto_raw {
@@ -585,7 +598,7 @@ impl Parser {
             // that's a separate AST change.
             let span = start.merge(self.peek_span());
             let body = Block { statements: Vec::new(), span };
-            return Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, params: None, body, span }));
+            return Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, signature, body, span }));
         }
 
         let body = self.parse_block()?;
@@ -595,7 +608,7 @@ impl Parser {
         let attr_names: Vec<String> = attributes.iter().map(|a| a.name.clone()).collect();
         self.symbols.entry(&self.current_package.clone()).declare_sub(&name, prototype_parsed, attr_names, false);
 
-        Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, params: None, body, span: start.merge(self.peek_span()) }))
+        Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, signature, body, span: start.merge(self.peek_span()) }))
     }
 
     /// Parse an optional prototype: `($$)`, `(\@\%)`, etc.
@@ -608,6 +621,117 @@ impl Parser {
             Ok(Some(proto))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Parse an optional signature: `($x, $y, $z = default)`,
+    /// `(@rest)`, etc.  Called instead of [`Self::parse_prototype`]
+    /// when the `signatures` feature is active at the declaration
+    /// site.  Returns `None` when no paren-form is present.
+    ///
+    /// Grammar (non-normative):
+    ///
+    /// ```text
+    /// signature     := '(' params? ','? ')'
+    /// params        := param (',' param)*
+    /// param         := scalar_param | slurpy_param | anon_param
+    /// scalar_param  := '$' IDENT ( '=' expr )?
+    /// slurpy_param  := ('@'|'%') IDENT
+    /// anon_param    := '$' | '@' | '%'
+    /// ```
+    ///
+    /// This parser is permissive about slurpy placement — it
+    /// accepts slurpy params anywhere and trusts a later semantic
+    /// pass to diagnose "slurpy must be last".  Same for duplicate
+    /// parameter names.
+    fn parse_signature(&mut self) -> Result<Option<Signature>, ParseError> {
+        if !self.at(&Token::LeftParen)? {
+            return Ok(None);
+        }
+        let open = self.next_token()?; // consume (
+        let start_span = open.span;
+
+        let mut params = Vec::new();
+        loop {
+            if self.at(&Token::RightParen)? {
+                break;
+            }
+            params.push(self.parse_sig_param()?);
+            if !self.eat(&Token::Comma)? {
+                break;
+            }
+            // Trailing comma is allowed.
+        }
+        let close = self.expect_token(&Token::RightParen)?;
+
+        Ok(Some(Signature { params, span: start_span.merge(close.span) }))
+    }
+
+    /// Parse one signature parameter.  Handles the parser/lexer
+    /// interplay for sigils:
+    ///
+    /// * `Token::ScalarVar(name)` / `Token::ArrayVar(name)` arrive
+    ///   pre-combined because the lexer greedily consumes `$ident`
+    ///   / `@ident`.
+    /// * `Token::HashVar` does NOT arrive pre-combined — the lexer
+    ///   always emits `Token::Percent` and the parser opts in via
+    ///   `lex_hash_var_after_percent()` when in term position.
+    ///   We do that here.
+    /// * Bare `$`/`@`/`%` (followed by a non-identifier) arrive as
+    ///   `Token::Dollar` / `Token::At` / `Token::Percent`
+    ///   respectively, and mean anonymous placeholders.
+    /// * `$,`/`$)`/`$;` and similar get eagerly lexed as
+    ///   `Token::SpecialVar(c)` because those are real punctuation
+    ///   variables.  In a signature, `$` followed by a separator
+    ///   is an anonymous scalar; we split the SpecialVar back into
+    ///   a `Dollar` + synthetic delimiter.
+    fn parse_sig_param(&mut self) -> Result<SigParam, ParseError> {
+        // Intercept `SpecialVar(c)` where `c` is a signature
+        // separator — splits into anon scalar + delimiter.
+        if let Token::SpecialVar(name) = self.peek_token()
+            && name.len() == 1
+            && matches!(name.as_bytes()[0], b',' | b')')
+        {
+            let tok = self.next_token()?;
+            let span = tok.span;
+            let delim_byte = match tok.token {
+                Token::SpecialVar(n) => n.as_bytes()[0],
+                _ => unreachable!(),
+            };
+            let delim_tok = match delim_byte {
+                b',' => Token::Comma,
+                b')' => Token::RightParen,
+                _ => unreachable!(),
+            };
+            // Push the delimiter into the lookahead cache so the
+            // outer loop in parse_signature sees it next.
+            self.current = Some(Spanned { token: delim_tok, span });
+            return Ok(SigParam::AnonScalar { span });
+        }
+
+        let tok = self.next_token()?;
+        let span = tok.span;
+        match tok.token {
+            Token::ScalarVar(name) => {
+                let default = if self.eat(&Token::Assign(AssignOp::Eq))? { Some(self.parse_expr(PREC_COMMA + 1)?) } else { None };
+                Ok(SigParam::Scalar { name, default, span: span.merge(self.peek_span()) })
+            }
+            Token::ArrayVar(name) => Ok(SigParam::SlurpyArray { name, span }),
+            Token::Dollar => Ok(SigParam::AnonScalar { span }),
+            Token::At => Ok(SigParam::AnonArray { span }),
+            Token::Percent => {
+                // Either anon hash placeholder or named slurpy
+                // hash; ask the lexer to probe for a hash name.
+                match self.lexer.lex_hash_var_after_percent()? {
+                    Some(Token::HashVar(name)) => Ok(SigParam::SlurpyHash { name, span }),
+                    Some(Token::SpecialHashVar(_)) | Some(_) => {
+                        // `%^FOO` etc. — not valid in a signature.
+                        Err(ParseError::new("special hash variable not allowed in signature".to_string(), span))
+                    }
+                    None => Ok(SigParam::AnonHash { span }),
+                }
+            }
+            other => Err(ParseError::new(format!("expected signature parameter, got {other:?}"), span)),
         }
     }
 
@@ -701,11 +825,18 @@ impl Parser {
 
     /// Parse an anonymous sub expression: `sub { ... }` or `sub ($x) { ... }`.
     fn parse_anon_sub(&mut self, span: Span) -> Result<Expr, ParseError> {
-        let prototype = self.parse_prototype()?;
+        let signatures_active = self.pragmas.features.contains(Features::SIGNATURES);
+        let (prototype, signature) = if signatures_active {
+            let sig = self.parse_signature()?;
+            (None, sig)
+        } else {
+            let proto = self.parse_prototype()?;
+            (proto, None)
+        };
 
         let body = self.parse_block()?;
 
-        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonSub(prototype, None, body) })
+        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonSub(prototype, signature, body) })
     }
 
     // ── Control flow statements ───────────────────────────────
@@ -1152,12 +1283,24 @@ impl Parser {
             other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
         };
 
-        let prototype = self.parse_prototype()?;
+        // Methods get the same signature-vs-prototype dispatch as
+        // regular subs.  (Inside `class { ... }` with signatures
+        // active, methods bind `$self` implicitly — captured at
+        // runtime, not in the parser AST.)
+        let signatures_active = self.pragmas.features.contains(Features::SIGNATURES);
+        let (prototype, attributes, signature) = if signatures_active {
+            let attrs = self.parse_attributes()?;
+            let sig = self.parse_signature()?;
+            (None, attrs, sig)
+        } else {
+            let proto = self.parse_prototype()?;
+            let attrs = self.parse_attributes()?;
+            (proto, attrs, None)
+        };
 
-        let attributes = self.parse_attributes()?;
         let body = self.parse_block()?;
 
-        Ok(StmtKind::MethodDecl(SubDecl { name, prototype, attributes, params: None, body, span: start.merge(self.peek_span()) }))
+        Ok(StmtKind::MethodDecl(SubDecl { name, prototype, attributes, signature, body, span: start.merge(self.peek_span()) }))
     }
 
     // ── Expression statements ─────────────────────────────────
@@ -4978,6 +5121,251 @@ mod tests {
         let p = parse_pragmas("use feature 'keyword_any';\nuse v5.36;\n");
         assert!(!p.features.contains(Features::KEYWORD_ANY), "version bundle should reset, not union");
         assert!(p.features.contains(Features::SIGNATURES));
+    }
+
+    // ── signature tests ───────────────────────────────────────
+
+    /// Convenience: parse a program and return the last top-level
+    /// SubDecl, panicking if none exists.
+    fn parse_sub(src: &str) -> SubDecl {
+        let prog = parse(src);
+        for stmt in prog.statements.iter().rev() {
+            if let StmtKind::SubDecl(s) = &stmt.kind {
+                return s.clone();
+            }
+        }
+        panic!("no SubDecl in program; statements: {:#?}", prog.statements);
+    }
+
+    #[test]
+    fn sig_without_feature_is_prototype() {
+        // No `use feature 'signatures'` in scope: `($)` is a
+        // prototype (meaning "exactly one scalar argument").  We
+        // verify the signature path was NOT taken by checking
+        // that the prototype parser saw the raw text.
+        let s = parse_sub("sub f ($) { }");
+        assert!(s.signature.is_none(), "no signature when feature off");
+        assert_eq!(s.prototype.as_deref(), Some("$"), "paren-form goes to prototype");
+    }
+
+    #[test]
+    fn sig_empty_with_feature_on() {
+        let s = parse_sub("use feature 'signatures'; sub f () { }");
+        assert!(s.prototype.is_none());
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 0);
+    }
+
+    #[test]
+    fn sig_single_scalar() {
+        let s = parse_sub("use feature 'signatures'; sub f ($x) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 1);
+        match &sig.params[0] {
+            SigParam::Scalar { name, default, .. } => {
+                assert_eq!(name, "x");
+                assert!(default.is_none());
+            }
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_multiple_scalars() {
+        let s = parse_sub("use feature 'signatures'; sub f ($x, $y, $z) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 3);
+        for (p, expected) in sig.params.iter().zip(["x", "y", "z"]) {
+            match p {
+                SigParam::Scalar { name, default: None, .. } => {
+                    assert_eq!(name, expected);
+                }
+                other => panic!("expected Scalar({expected}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn sig_scalar_with_default() {
+        let s = parse_sub("use feature 'signatures'; sub f ($x = 42) { }");
+        let sig = s.signature.expect("signature present");
+        match &sig.params[0] {
+            SigParam::Scalar { name, default: Some(d), .. } => {
+                assert_eq!(name, "x");
+                assert!(matches!(d.kind, ExprKind::IntLit(42)));
+            }
+            other => panic!("expected Scalar with default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_default_references_prior_param() {
+        // Default expression can reference earlier parameter —
+        // parser shouldn't care (just an expression).
+        let s = parse_sub("use feature 'signatures'; sub f ($x, $y = $x * 2) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 2);
+        match &sig.params[1] {
+            SigParam::Scalar { name, default: Some(_), .. } => {
+                assert_eq!(name, "y");
+            }
+            other => panic!("expected Scalar with default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_slurpy_array() {
+        let s = parse_sub("use feature 'signatures'; sub f ($x, @rest) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 2);
+        match &sig.params[1] {
+            SigParam::SlurpyArray { name, .. } => assert_eq!(name, "rest"),
+            other => panic!("expected SlurpyArray, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_slurpy_hash() {
+        let s = parse_sub("use feature 'signatures'; sub f ($x, %opts) { }");
+        let sig = s.signature.expect("signature present");
+        match &sig.params[1] {
+            SigParam::SlurpyHash { name, .. } => assert_eq!(name, "opts"),
+            other => panic!("expected SlurpyHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_anonymous_placeholders() {
+        // `$`, `@`, `%` without names — accept-and-discard.
+        let s = parse_sub("use feature 'signatures'; sub f ($, @, %) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 3);
+        assert!(matches!(sig.params[0], SigParam::AnonScalar { .. }));
+        assert!(matches!(sig.params[1], SigParam::AnonArray { .. }));
+        assert!(matches!(sig.params[2], SigParam::AnonHash { .. }));
+    }
+
+    #[test]
+    fn sig_anon_scalar_then_named() {
+        // Skip first arg, bind second.
+        let s = parse_sub("use feature 'signatures'; sub f ($, $y) { }");
+        let sig = s.signature.expect("signature present");
+        assert!(matches!(sig.params[0], SigParam::AnonScalar { .. }));
+        match &sig.params[1] {
+            SigParam::Scalar { name, .. } => assert_eq!(name, "y"),
+            other => panic!("expected Scalar(y), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_trailing_comma_allowed() {
+        let s = parse_sub("use feature 'signatures'; sub f ($x, $y,) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 2);
+    }
+
+    // ── Interaction with :prototype(...) attribute ──
+
+    #[test]
+    fn sig_with_prototype_attribute() {
+        // `:prototype($$)` attaches a prototype; the paren-form is
+        // still a signature when the feature is active.
+        let s = parse_sub("use feature 'signatures'; sub f :prototype($$) ($x, $y) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 2);
+        // Attribute is captured too.
+        let has_proto_attr = s.attributes.iter().any(|a| a.name == "prototype" && a.value.as_deref() == Some("$$"));
+        assert!(has_proto_attr, "prototype attribute should be present");
+    }
+
+    // ── use v5.36 enables signatures via the bundle ──
+
+    #[test]
+    fn sig_enabled_by_use_v5_36() {
+        // Phase 1 hookup: the `:5.36` bundle includes signatures,
+        // so `use v5.36;` should enable the signature path without
+        // an explicit `use feature 'signatures';`.
+        let s = parse_sub("use v5.36; sub f ($x, $y) { }");
+        assert!(s.signature.is_some(), "use v5.36 should enable signatures");
+        assert!(s.prototype.is_none());
+    }
+
+    #[test]
+    fn sig_feature_is_lexically_scoped() {
+        // Outer scope has signatures; inner `no feature 'signatures'`
+        // disables it for a sub declared inside the inner block.
+        let src = "\
+use feature 'signatures';
+sub outer ($x) { 1 }
+{
+  no feature 'signatures';
+  sub inner ($) { 2 }
+}
+";
+        let prog = parse(src);
+        // Find `outer` at top level.
+        let outer = prog
+            .statements
+            .iter()
+            .find_map(|s| match &s.kind {
+                StmtKind::SubDecl(s) if s.name == "outer" => Some(s),
+                _ => None,
+            })
+            .expect("outer sub at top level");
+        assert!(outer.signature.is_some(), "outer has signature");
+        assert!(outer.prototype.is_none());
+
+        // Find `inner` inside the bare block.
+        let mut found_inner = false;
+        for stmt in &prog.statements {
+            if let StmtKind::Block(block) = &stmt.kind {
+                for inner_stmt in &block.statements {
+                    if let StmtKind::SubDecl(s) = &inner_stmt.kind
+                        && s.name == "inner"
+                    {
+                        assert!(s.signature.is_none(), "inner should NOT have signature");
+                        assert!(s.prototype.is_some(), "inner should have prototype");
+                        found_inner = true;
+                    }
+                }
+            }
+        }
+        assert!(found_inner, "didn't find `inner` sub inside block");
+    }
+
+    // ── Anonymous sub signatures ──
+
+    #[test]
+    fn sig_anon_sub_with_signature() {
+        let prog = parse("use feature 'signatures'; my $f = sub ($x) { $x };");
+        // Find the AnonSub expression in the statements.
+        let mut found = false;
+        for stmt in &prog.statements {
+            walk_for_anon_sub(&stmt.kind, &mut found);
+        }
+        assert!(found, "expected an AnonSub with signature");
+    }
+
+    /// Helper: recursively walk a stmt looking for an AnonSub with
+    /// a non-None signature.
+    fn walk_for_anon_sub(stmt: &StmtKind, found: &mut bool) {
+        if let StmtKind::Expr(expr) = stmt {
+            walk_expr(expr, found);
+        }
+    }
+
+    fn walk_expr(expr: &Expr, found: &mut bool) {
+        match &expr.kind {
+            ExprKind::AnonSub(_, Some(sig), _) => {
+                assert_eq!(sig.params.len(), 1);
+                *found = true;
+            }
+            ExprKind::Assign(_, l, r) => {
+                walk_expr(l, found);
+                walk_expr(r, found);
+            }
+            _ => {}
+        }
     }
 
     // ── format tests ──────────────────────────────────────────
