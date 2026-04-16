@@ -371,10 +371,10 @@ pub enum Token {
     RegexFlags(String),
 
     // ── Substitution / transliteration ──────────────────────────
-    /// Start of a substitution replacement body.
-    /// Pattern and flags are captured upfront by the lexer.
-    /// Replacement body tokens follow until QuoteEnd.
-    SubstBegin(String, Option<String>),
+    /// Start of a substitution.  The delimiter byte is carried so
+    /// the parser can pass it back to `start_subst_replacement`.
+    /// Pattern body tokens follow until QuoteEnd.
+    SubstBegin(u8),
     /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
     TranslitLit(String, String, Option<String>),
 
@@ -480,7 +480,7 @@ impl Token {
                 | Token::QuoteBegin(_, _)
                 | Token::RegexBegin(_, _)
                 | Token::HeredocBegin(_, _)
-                | Token::SubstBegin(_, _)
+                | Token::SubstBegin(_)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
                 | Token::Readline(_)

@@ -1400,13 +1400,27 @@ impl Lexer {
     /// `s/pattern/replacement/flags` or `s{pattern}{replacement}flags`
     fn lex_s(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        let pattern = self.lex_body_str(delim, true)?;
 
-        // Determine the replacement delimiter.
-        let repl_delim = if is_paired(delim) { self.read_quote_delimiter()? } else { delim };
+        // Push context for the pattern body (raw, regex mode).
+        // The parser will collect body tokens until QuoteEnd,
+        // then call start_subst_replacement to set up the
+        // replacement body.
+        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: false, raw: true, regex: true });
 
-        // Scan ahead to capture flags, then set up the replacement
-        // body for delivery with a virtual EOF.
+        Ok(Token::SubstBegin(delim))
+    }
+
+    /// Set up the replacement body of a substitution after the
+    /// pattern has been consumed.  Called by the parser after
+    /// collecting the pattern's QuoteEnd.
+    ///
+    /// For paired delimiters, reads the replacement delimiter.
+    /// Scans ahead for flags via `start_subst_body`, then pushes
+    /// the appropriate LexContext for the replacement body.
+    /// Returns the captured flags.
+    pub fn start_subst_replacement(&mut self, pattern_delim: u8) -> Result<Option<String>, ParseError> {
+        let repl_delim = if is_paired(pattern_delim) { self.read_quote_delimiter()? } else { pattern_delim };
+
         let flags = self.source.start_subst_body(repl_delim, &mut self.current_line)?;
         let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
 
@@ -1417,7 +1431,7 @@ impl Lexer {
         // Without /e: interpolating string.
         self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: !has_eval, raw: has_eval, regex: false });
 
-        Ok(Token::SubstBegin(pattern, flags))
+        Ok(flags)
     }
 
     /// `tr/from/to/flags` or `y/from/to/flags`
@@ -1917,7 +1931,6 @@ mod tests {
                 | Token::SpecialVar(_)
                 | Token::ArrayLen(_)
                 | Token::QuoteEnd
-                | Token::SubstBegin(_, _)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
                 | Token::Readline(_)
@@ -1936,6 +1949,7 @@ mod tests {
                 // Sub-tokens inside strings/regex don't affect expect.
                 Token::QuoteBegin(_, _)
                 | Token::RegexBegin(_, _)
+                | Token::SubstBegin(_)
                 | Token::ConstSegment(_)
                 | Token::InterpScalar(_)
                 | Token::InterpArray(_)
@@ -2349,14 +2363,20 @@ mod tests {
 
     #[test]
     fn lex_substitution() {
+        // lex_all only tests the pattern side; the full pipeline
+        // (replacement + flags) is tested by parser tests.
         let tokens = lex_all("s/foo/bar/g");
-        assert_eq!(tokens, vec![Token::SubstBegin("foo".into(), Some("g".into())), Token::ConstSegment("bar".into()), Token::QuoteEnd,]);
+        assert_eq!(tokens[0], Token::SubstBegin(b'/'));
+        assert_eq!(tokens[1], Token::ConstSegment("foo".into()));
+        assert_eq!(tokens[2], Token::QuoteEnd);
     }
 
     #[test]
     fn lex_substitution_braces() {
         let tokens = lex_all("s{foo}{bar}g");
-        assert_eq!(tokens, vec![Token::SubstBegin("foo".into(), Some("g".into())), Token::ConstSegment("bar".into()), Token::QuoteEnd,]);
+        assert_eq!(tokens[0], Token::SubstBegin(b'{'));
+        assert_eq!(tokens[1], Token::ConstSegment("foo".into()));
+        assert_eq!(tokens[2], Token::QuoteEnd);
     }
 
     #[test]
@@ -3103,7 +3123,9 @@ mod tests {
     #[test]
     fn lex_substitution_global() {
         let tokens = lex_all("s/old/new/g");
-        assert_eq!(tokens, vec![Token::SubstBegin("old".into(), Some("g".into())), Token::ConstSegment("new".into()), Token::QuoteEnd,]);
+        assert_eq!(tokens[0], Token::SubstBegin(b'/'));
+        assert_eq!(tokens[1], Token::ConstSegment("old".into()));
+        assert_eq!(tokens[2], Token::QuoteEnd);
     }
 
     #[test]

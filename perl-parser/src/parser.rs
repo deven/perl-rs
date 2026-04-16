@@ -1580,11 +1580,21 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, pattern, flags), span })
             }
-            Token::SubstBegin(pattern, flags) => {
+            Token::SubstBegin(delim) => {
+                // Collect pattern body tokens until QuoteEnd.
+                let pat_expr = self.parse_interpolated_string(span)?;
+                let pattern = match pat_expr.kind {
+                    ExprKind::StringLit(s) => s,
+                    _ => return Err(ParseError::new("regex interpolation not yet supported", span)),
+                };
+
+                // Set up the replacement body (virtual EOF, flags).
+                let flags = self.lexer.start_subst_replacement(delim)?;
                 if let Some(ref f) = flags {
                     Self::validate_subst_flags(f, span)?;
                 }
                 let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
+
                 let repl = if has_eval {
                     // With /e: body is raw bytes in a single ConstSegment.
                     // Reparse as code.
@@ -2020,7 +2030,7 @@ impl Parser {
                     | Token::LeftParen
                     | Token::LeftBracket
                     | Token::RegexBegin(_, _)
-                    | Token::SubstBegin(_, _)
+                    | Token::SubstBegin(_)
                     | Token::HeredocLit(_, _, _)
                     | Token::QwList(_)
                     | Token::Backslash
@@ -3142,9 +3152,45 @@ mod tests {
     fn parse_substitution() {
         let e = parse_expr_str("s/foo/bar/g;");
         match &e.kind {
-            ExprKind::Subst(pat, _, flags) => {
+            ExprKind::Subst(pat, repl, flags) => {
                 assert_eq!(pat, "foo");
                 assert_eq!(flags.as_deref(), Some("g"));
+                match &repl.kind {
+                    ExprKind::StringLit(s) => assert_eq!(s, "bar"),
+                    other => panic!("expected StringLit replacement, got {other:?}"),
+                }
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_substitution_no_flags() {
+        let e = parse_expr_str("s/old/new/;");
+        match &e.kind {
+            ExprKind::Subst(pat, repl, flags) => {
+                assert_eq!(pat, "old");
+                assert!(flags.is_none());
+                match &repl.kind {
+                    ExprKind::StringLit(s) => assert_eq!(s, "new"),
+                    other => panic!("expected StringLit replacement, got {other:?}"),
+                }
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_substitution_paired_delimiters() {
+        let e = parse_expr_str("s{foo}{bar}g;");
+        match &e.kind {
+            ExprKind::Subst(pat, repl, flags) => {
+                assert_eq!(pat, "foo");
+                assert_eq!(flags.as_deref(), Some("g"));
+                match &repl.kind {
+                    ExprKind::StringLit(s) => assert_eq!(s, "bar"),
+                    other => panic!("expected StringLit replacement, got {other:?}"),
+                }
             }
             other => panic!("expected Subst, got {other:?}"),
         }
