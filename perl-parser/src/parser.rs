@@ -308,9 +308,26 @@ impl Parser {
                     (kind, terminated)
                 } else {
                     match kw {
-                        Keyword::My => (self.parse_my_decl()?, false),
-                        Keyword::Our => (self.parse_our_decl()?, false),
-                        Keyword::State => (self.parse_state_decl()?, false),
+                        // my/our/state are expressions, not statements.
+                        // The keyword has already been consumed; construct
+                        // the Decl expression and run the Pratt loop to pick
+                        // up optional `= expr` assignment and trailing
+                        // `, $other` list members.
+                        Keyword::My | Keyword::Our | Keyword::State => {
+                            let scope = match kw {
+                                Keyword::My => DeclScope::My,
+                                Keyword::Our => DeclScope::Our,
+                                Keyword::State => DeclScope::State,
+                                _ => unreachable!(),
+                            };
+                            let expr = self.with_descent(|this| {
+                                let initial = this.parse_decl_expr(scope, kw_span)?;
+                                this.parse_expr_continuation(initial, PREC_LOW)
+                            })?;
+                            let kind = self.maybe_postfix_control(expr)?;
+                            let terminated = self.eat(&Token::Semi)?;
+                            (kind, terminated)
+                        }
                         Keyword::Sub => {
                             if matches!(self.peek_token(), Token::Ident(_)) {
                                 (self.parse_sub_decl_body(kw_span)?, false)
@@ -464,29 +481,6 @@ impl Parser {
 
     // ── Variable declarations ─────────────────────────────────
 
-    fn parse_var_list(&mut self) -> Result<(Vec<VarDecl>, Option<Expr>), ParseError> {
-        let mut vars = Vec::new();
-
-        if self.eat(&Token::LeftParen)? {
-            // my ($x, @y, %z)
-            loop {
-                let decl = self.parse_single_var_decl()?;
-                vars.push(decl);
-                if !self.eat(&Token::Comma)? {
-                    break;
-                }
-            }
-            self.expect_token(&Token::RightParen)?;
-        } else {
-            vars.push(self.parse_single_var_decl()?);
-        }
-
-        let init = if self.eat(&Token::Assign(AssignOp::Eq))? { Some(self.parse_expr(PREC_ASSIGN)?) } else { None };
-
-        self.eat(&Token::Semi)?;
-        Ok((vars, init))
-    }
-
     fn parse_single_var_decl(&mut self) -> Result<VarDecl, ParseError> {
         let span = self.peek_span();
         match self.next_token()?.token {
@@ -503,21 +497,6 @@ impl Parser {
             }
             other => Err(ParseError::new(format!("expected variable, got {other:?}"), span)),
         }
-    }
-
-    fn parse_my_decl(&mut self) -> Result<StmtKind, ParseError> {
-        let (vars, init) = self.parse_var_list()?;
-        Ok(StmtKind::My(vars, init))
-    }
-
-    fn parse_our_decl(&mut self) -> Result<StmtKind, ParseError> {
-        let (vars, init) = self.parse_var_list()?;
-        Ok(StmtKind::Our(vars, init))
-    }
-
-    fn parse_state_decl(&mut self) -> Result<StmtKind, ParseError> {
-        let (vars, init) = self.parse_var_list()?;
-        Ok(StmtKind::State(vars, init))
     }
 
     // ── Sub declaration ───────────────────────────────────────
@@ -2553,8 +2532,37 @@ mod tests {
         let prog = parse(src);
         match &prog.statements[0].kind {
             StmtKind::Expr(e) => e.clone(),
-            StmtKind::My(_, Some(e)) => e.clone(),
             other => panic!("expected expression, got {other:?}"),
+        }
+    }
+
+    /// For tests that need the initializer from a `my $x = expr;`
+    /// declaration-statement.  Returns the RHS of the Assign.
+    fn decl_init(stmt: &Statement) -> &Expr {
+        match &stmt.kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, rhs), .. }) => {
+                assert!(matches!(lhs.kind, ExprKind::Decl(_, _)), "expected Decl lhs, got {:?}", lhs.kind);
+                rhs
+            }
+            other => panic!("expected decl with initializer, got {other:?}"),
+        }
+    }
+
+    /// For tests that need the var list from a declaration.
+    /// Works for both `my $x;` (plain Decl) and `my $x = ...;` (Assign(Decl, _)).
+    fn decl_vars(stmt: &Statement) -> (DeclScope, &[VarDecl]) {
+        let expr = match &stmt.kind {
+            StmtKind::Expr(e) => e,
+            other => panic!("expected Expr stmt, got {other:?}"),
+        };
+        let decl = match &expr.kind {
+            ExprKind::Decl(_, _) => expr,
+            ExprKind::Assign(_, lhs, _) => lhs,
+            other => panic!("expected Decl or Assign(Decl, _), got {other:?}"),
+        };
+        match &decl.kind {
+            ExprKind::Decl(scope, vars) => (*scope, vars.as_slice()),
+            other => panic!("expected Decl, got {other:?}"),
         }
     }
 
@@ -2579,14 +2587,11 @@ mod tests {
     fn parse_simple_assignment() {
         let prog = parse("my $x = 42;");
         assert_eq!(prog.statements.len(), 1);
-        match &prog.statements[0].kind {
-            StmtKind::My(vars, Some(init)) => {
-                assert_eq!(vars.len(), 1);
-                assert_eq!(vars[0].name, "x");
-                assert!(matches!(init.kind, ExprKind::IntLit(42)));
-            }
-            other => panic!("expected My, got {other:?}"),
-        }
+        let (_scope, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name, "x");
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::IntLit(42)));
     }
 
     #[test]
@@ -2854,8 +2859,10 @@ mod tests {
     fn parse_multiple_statements() {
         let prog = parse("my $x = 1; my $y = 2; $x + $y;");
         assert_eq!(prog.statements.len(), 3);
-        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
-        assert!(matches!(prog.statements[1].kind, StmtKind::My(_, _)));
+        // First two are `my` declarations with initializers, so
+        // Stmt::Expr wrapping Assign(Decl, ...).
+        let (_s0, _v0) = decl_vars(&prog.statements[0]);
+        let (_s1, _v1) = decl_vars(&prog.statements[1]);
         match &prog.statements[2].kind {
             StmtKind::Expr(e) => assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Add, _, _))),
             other => panic!("expected Expr(Add), got {other:?}"),
@@ -3286,15 +3293,12 @@ mod tests {
         let src = "my $x = <<END;\nhello world\nEND\n";
         let prog = parse(src);
         assert_eq!(prog.statements.len(), 1);
-        match &prog.statements[0].kind {
-            StmtKind::My(vars, Some(init)) => {
-                assert_eq!(vars[0].name, "x");
-                match &init.kind {
-                    ExprKind::StringLit(s) => assert_eq!(s, "hello world\n"),
-                    other => panic!("expected StringLit, got {other:?}"),
-                }
-            }
-            other => panic!("expected My, got {other:?}"),
+        let (_s, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(vars[0].name, "x");
+        let init = decl_init(&prog.statements[0]);
+        match &init.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "hello world\n"),
+            other => panic!("expected StringLit, got {other:?}"),
         }
     }
 
@@ -3321,8 +3325,11 @@ mod tests {
             other => panic!("expected print PrintOp, got {other:?}"),
         }
         match &prog.statements[1].kind {
-            StmtKind::My(vars, Some(_)) => assert_eq!(vars[0].name, "x"),
-            other => panic!("expected My, got {other:?}"),
+            StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => match &lhs.kind {
+                ExprKind::Decl(_, vars) => assert_eq!(vars[0].name, "x"),
+                other => panic!("expected Decl lhs, got {other:?}"),
+            },
+            other => panic!("expected decl stmt, got {other:?}"),
         }
     }
 
@@ -3354,12 +3361,8 @@ mod tests {
     #[test]
     fn parse_anon_sub_as_arg() {
         let prog = parse("my $f = sub { 1; };");
-        match &prog.statements[0].kind {
-            StmtKind::My(_, Some(init)) => {
-                assert!(matches!(init.kind, ExprKind::AnonSub(_, _, _)));
-            }
-            other => panic!("expected My with AnonSub, got {other:?}"),
-        }
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::AnonSub(_, _, _)));
     }
 
     // ── Phaser block tests ────────────────────────────────────
@@ -3819,8 +3822,18 @@ mod tests {
     #[test]
     fn parse_pod_skipped() {
         let prog = parse("my $x = 1;\n\n=pod\n\nThis is pod.\n\n=cut\n\nmy $y = 2;\n");
-        // Should see both my declarations, pod is invisible
-        let my_count = prog.statements.iter().filter(|s| matches!(s.kind, StmtKind::My(_, _))).count();
+        // Should see both my declarations, pod is invisible.
+        // Each is Stmt::Expr wrapping Assign(Decl(My), _).
+        let my_count = prog
+            .statements
+            .iter()
+            .filter(|s| {
+                matches!(s.kind,
+                    StmtKind::Expr(Expr { kind: ExprKind::Assign(_, ref lhs, _), .. })
+                        if matches!(lhs.kind, ExprKind::Decl(DeclScope::My, _))
+                )
+            })
+            .count();
         assert_eq!(my_count, 2);
     }
 
@@ -3921,9 +3934,14 @@ mod tests {
 
     #[test]
     fn parse_decl_in_expr_context() {
-        // my $x = 5 in statement context still works
+        // my $x = 5 in statement context still works.
+        // Now represented as Stmt::Expr wrapping Assign(Decl(My), IntLit(5)).
         let prog = parse("my $x = 5;");
-        assert!(matches!(prog.statements[0].kind, StmtKind::My(_, _)));
+        let (scope, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(scope, DeclScope::My);
+        assert_eq!(vars[0].name, "x");
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::IntLit(5)));
     }
 
     // ── qx// test ─────────────────────────────────────────────
@@ -3965,27 +3983,19 @@ mod tests {
     #[test]
     fn parse_my_array_decl() {
         let prog = parse("my @arr = (1, 2, 3);");
-        match &prog.statements[0].kind {
-            StmtKind::My(vars, Some(_)) => {
-                assert_eq!(vars.len(), 1);
-                assert_eq!(vars[0].sigil, Sigil::Array);
-                assert_eq!(vars[0].name, "arr");
-            }
-            other => panic!("expected My with Array sigil, got {other:?}"),
-        }
+        let (_s, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].sigil, Sigil::Array);
+        assert_eq!(vars[0].name, "arr");
     }
 
     #[test]
     fn parse_my_hash_decl() {
         let prog = parse("my %hash = (a => 1);");
-        match &prog.statements[0].kind {
-            StmtKind::My(vars, Some(_)) => {
-                assert_eq!(vars.len(), 1);
-                assert_eq!(vars[0].sigil, Sigil::Hash);
-                assert_eq!(vars[0].name, "hash");
-            }
-            other => panic!("expected My with Hash sigil, got {other:?}"),
-        }
+        let (_s, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].sigil, Sigil::Hash);
+        assert_eq!(vars[0].name, "hash");
     }
 
     // ── while continue block ──────────────────────────────────
@@ -4132,14 +4142,10 @@ mod tests {
     #[test]
     fn lex_legacy_octal() {
         let prog = parse("my $x = 0777;");
-        match &prog.statements[0].kind {
-            StmtKind::My(_, Some(init)) => {
-                match &init.kind {
-                    ExprKind::IntLit(n) => assert_eq!(*n, 0o777), // 511 decimal
-                    other => panic!("expected IntLit, got {other:?}"),
-                }
-            }
-            other => panic!("expected My, got {other:?}"),
+        let init = decl_init(&prog.statements[0]);
+        match &init.kind {
+            ExprKind::IntLit(n) => assert_eq!(*n, 0o777), // 511 decimal
+            other => panic!("expected IntLit, got {other:?}"),
         }
     }
 
@@ -4534,14 +4540,10 @@ mod tests {
         let src = "my @a = (<<X, <<Y);\nX-body\nX\nY-body\nY\nmy $z = 1;\n";
         let prog = parse(src);
         assert_eq!(prog.statements.len(), 2);
-        match &prog.statements[0].kind {
-            StmtKind::My(vars, Some(_)) => assert_eq!(vars[0].name, "a"),
-            other => panic!("expected My @a, got {other:?}"),
-        }
-        match &prog.statements[1].kind {
-            StmtKind::My(vars, Some(_)) => assert_eq!(vars[0].name, "z"),
-            other => panic!("expected My $z, got {other:?}"),
-        }
+        let (_, vars0) = decl_vars(&prog.statements[0]);
+        assert_eq!(vars0[0].name, "a");
+        let (_, vars1) = decl_vars(&prog.statements[1]);
+        assert_eq!(vars1[0].name, "z");
     }
 
     #[test]
@@ -4596,18 +4598,14 @@ mod tests {
         // <<A . <<B — concatenation of two heredoc strings.
         let src = "my $x = <<A . <<B;\nalpha\nA\nbeta\nB\n";
         let prog = parse(src);
-        match &prog.statements[0].kind {
-            StmtKind::My(_, Some(init)) => {
-                // Should be a Concat of two StringLits.
-                match &init.kind {
-                    ExprKind::BinOp(BinOp::Concat, left, right) => {
-                        assert!(matches!(&left.kind, ExprKind::StringLit(s) if s == "alpha\n"));
-                        assert!(matches!(&right.kind, ExprKind::StringLit(s) if s == "beta\n"));
-                    }
-                    other => panic!("expected Concat, got {other:?}"),
-                }
+        let init = decl_init(&prog.statements[0]);
+        // Should be a Concat of two StringLits.
+        match &init.kind {
+            ExprKind::BinOp(BinOp::Concat, left, right) => {
+                assert!(matches!(&left.kind, ExprKind::StringLit(s) if s == "alpha\n"));
+                assert!(matches!(&right.kind, ExprKind::StringLit(s) if s == "beta\n"));
             }
-            other => panic!("expected My, got {other:?}"),
+            other => panic!("expected Concat, got {other:?}"),
         }
     }
 
@@ -5306,51 +5304,39 @@ mod tests {
     #[test]
     fn parse_our_decl() {
         let prog = parse("our $VERSION = '1.0';");
-        match &prog.statements[0].kind {
-            StmtKind::Our(vars, Some(_)) => {
-                assert_eq!(vars[0].name, "VERSION");
-                assert_eq!(vars[0].sigil, Sigil::Scalar);
-            }
-            other => panic!("expected Our, got {other:?}"),
-        }
+        let (scope, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(scope, DeclScope::Our);
+        assert_eq!(vars[0].name, "VERSION");
+        assert_eq!(vars[0].sigil, Sigil::Scalar);
     }
 
     #[test]
     fn parse_state_decl() {
         let prog = parse("state $counter = 0;");
-        match &prog.statements[0].kind {
-            StmtKind::State(vars, Some(_)) => {
-                assert_eq!(vars[0].name, "counter");
-            }
-            other => panic!("expected State, got {other:?}"),
-        }
+        let (scope, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(scope, DeclScope::State);
+        assert_eq!(vars[0].name, "counter");
     }
 
     #[test]
     fn parse_my_list_decl() {
+        // `my ($a, $b, $c);` — no initializer, so Stmt::Expr(Decl(...)).
         let prog = parse("my ($a, $b, $c);");
-        match &prog.statements[0].kind {
-            StmtKind::My(vars, None) => {
-                assert_eq!(vars.len(), 3);
-                assert_eq!(vars[0].name, "a");
-                assert_eq!(vars[1].name, "b");
-                assert_eq!(vars[2].name, "c");
-            }
-            other => panic!("expected My with 3 vars, got {other:?}"),
-        }
+        let (scope, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(scope, DeclScope::My);
+        assert_eq!(vars.len(), 3);
+        assert_eq!(vars[0].name, "a");
+        assert_eq!(vars[1].name, "b");
+        assert_eq!(vars[2].name, "c");
     }
 
     #[test]
     fn parse_my_mixed_sigil_list() {
         let prog = parse("my ($x, @y, %z);");
-        match &prog.statements[0].kind {
-            StmtKind::My(vars, None) => {
-                assert_eq!(vars[0].sigil, Sigil::Scalar);
-                assert_eq!(vars[1].sigil, Sigil::Array);
-                assert_eq!(vars[2].sigil, Sigil::Hash);
-            }
-            other => panic!("expected My with mixed sigils, got {other:?}"),
-        }
+        let (_scope, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(vars[0].sigil, Sigil::Scalar);
+        assert_eq!(vars[1].sigil, Sigil::Array);
+        assert_eq!(vars[2].sigil, Sigil::Hash);
     }
 
     #[test]
@@ -6391,5 +6377,801 @@ mod tests {
         // Error on the very first token — no valid code at all.
         let msg = parse_fails("\"unterminated");
         assert!(msg.contains("unterminated"), "expected unterminated error, got: {msg}");
+    }
+
+    // ── Hard parsing corpus ───────────────────────────────────
+    //
+    // The tests below are derived from a corpus of adversarial
+    // cases targeting the hardest ambiguities in Perl parsing:
+    // regex-vs-division, block-vs-hash, indirect object, ternary
+    // associativity, comma/assignment precedence, arrow chains,
+    // interpolation, and heredoc integration.
+    //
+    // For each case we assert the specific structural facts we're
+    // confident about — typically the top-level node kind and a
+    // key grouping relationship.  We deliberately don't try to
+    // match whole trees, to keep tests robust against AST
+    // refactoring.
+
+    // ── Regex vs division ─────────────────────────────────────
+
+    #[test]
+    fn hard_div_chain_is_left_assoc() {
+        // `$x / $y / $z` must be (($x / $y) / $z), not ($x / ($y / $z)).
+        let e = parse_expr_str("$x / $y / $z;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Div, lhs, rhs) => {
+                assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Div, _, _)), "expected left-associative division, got lhs = {:?}", lhs.kind);
+                assert!(matches!(rhs.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected Div BinOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_print_slash_is_regex() {
+        // `print /x/;` — after `print`, `/` starts a regex.
+        let prog = parse("print /x/;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _fh, args), .. }) => {
+                assert_eq!(name, "print");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::Regex(_, _, _)), "expected Regex arg, got {:?}", args[0].kind);
+            }
+            other => panic!("expected PrintOp with Regex arg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_print_scalar_slash_is_division() {
+        // `print $x / 2;` — here `/` is division, not regex.
+        let prog = parse("print $x / 2;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, _, args), .. }) => {
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Div, _, _)), "expected Div BinOp arg, got {:?}", args[0].kind);
+            }
+            other => panic!("expected PrintOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_slash_in_ternary_condition_is_regex() {
+        // `$x = /foo/ ? 1 : 2;` — ternary condition is regex.
+        let e = parse_expr_str("$x = /foo/ ? 1 : 2;");
+        match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::Ternary(cond, _, _) => {
+                    assert!(matches!(cond.kind, ExprKind::Regex(_, _, _)), "expected Regex condition, got {:?}", cond.kind);
+                }
+                other => panic!("expected Ternary, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_defined_or_rhs_is_regex() {
+        // `$x // /foo/;` — RHS of // is in term position, so regex.
+        let e = parse_expr_str("$x // /foo/;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::DefinedOr, _, rhs) => {
+                assert!(matches!(rhs.kind, ExprKind::Regex(_, _, _)), "expected Regex rhs, got {:?}", rhs.kind);
+            }
+            other => panic!("expected DefinedOr BinOp, got {other:?}"),
+        }
+    }
+
+    // ── Block vs hash ─────────────────────────────────────────
+
+    #[test]
+    fn hard_unary_plus_brace_is_hash() {
+        // `+{ a => 1 }` — unary + forces expression context, so hash.
+        let e = parse_expr_str("+{ a => 1 };");
+        match &e.kind {
+            ExprKind::UnaryOp(UnaryOp::NumPositive, inner) => {
+                assert!(matches!(inner.kind, ExprKind::AnonHash(_)), "expected AnonHash inside unary +, got {:?}", inner.kind);
+            }
+            other => panic!("expected UnaryOp(+, AnonHash), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_map_outer_brace_is_block() {
+        // `map { a => 1 } @list;` — outer braces are block argument.
+        let e = parse_expr_str("map { a => 1 } @list;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "map");
+                // First arg is the block (as AnonSub).
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)), "expected AnonSub block, got {:?}", args[0].kind);
+            }
+            other => panic!("expected map ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_map_nested_brace_is_hash() {
+        // `map { { a => 1 } } @list;` — outer = block, inner = hash.
+        let e = parse_expr_str("map { { a => 1 } } @list;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "map");
+                // Outer: AnonSub wrapping the block.
+                let body = match &args[0].kind {
+                    ExprKind::AnonSub(_, _, block) => block,
+                    other => panic!("expected AnonSub, got {other:?}"),
+                };
+                // Block body's single statement is an AnonHash expression.
+                assert_eq!(body.statements.len(), 1);
+                match &body.statements[0].kind {
+                    StmtKind::Expr(Expr { kind: ExprKind::AnonHash(_), .. }) => {}
+                    other => panic!("expected AnonHash stmt, got {other:?}"),
+                }
+            }
+            other => panic!("expected map ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_do_brace_is_block_not_hash() {
+        // `do { a => 1 };` — do BLOCK, not a hash constructor.
+        let e = parse_expr_str("do { a => 1 };");
+        assert!(matches!(e.kind, ExprKind::DoBlock(_)), "expected DoBlock, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn hard_sub_nested_hash() {
+        // `sub { { a => 1 } }` — anon sub whose body is a hash expression.
+        let e = parse_expr_str("sub { { a => 1 } };");
+        match &e.kind {
+            ExprKind::AnonSub(_, _, block) => {
+                assert_eq!(block.statements.len(), 1);
+                match &block.statements[0].kind {
+                    StmtKind::Expr(Expr { kind: ExprKind::AnonHash(_), .. }) => {}
+                    other => panic!("expected AnonHash stmt inside sub body, got {other:?}"),
+                }
+            }
+            other => panic!("expected AnonSub, got {other:?}"),
+        }
+    }
+
+    // ── Bareword ambiguity ────────────────────────────────────
+
+    #[test]
+    fn hard_bareword_plus_literal() {
+        // `foo + 1;` — bareword + literal (absent prototype/constant info).
+        let e = parse_expr_str("foo + 1;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Add, lhs, _) => {
+                assert!(matches!(lhs.kind, ExprKind::Bareword(_) | ExprKind::FuncCall(_, _)), "expected Bareword/FuncCall lhs, got {:?}", lhs.kind);
+            }
+            other => panic!("expected Add BinOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_label_on_statement() {
+        // `foo: bar();` — label at statement level.
+        let prog = parse("foo: bar();");
+        assert!(matches!(prog.statements[0].kind, StmtKind::Labeled(_, _)), "expected Labeled statement, got {:?}", prog.statements[0].kind);
+    }
+
+    // ── Indirect object ───────────────────────────────────────
+
+    #[test]
+    fn hard_print_filehandle_scalar() {
+        // `print $fh "hello";` — indirect-object filehandle form.
+        let prog = parse("print $fh \"hello\";");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, fh, args), .. }) => {
+                let fh = fh.as_ref().expect("expected filehandle");
+                assert!(matches!(fh.kind, ExprKind::ScalarVar(_)), "expected ScalarVar filehandle, got {:?}", fh.kind);
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected PrintOp with filehandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_print_filehandle_bareword() {
+        // `print STDERR "hello";` — bareword filehandle.
+        let prog = parse("print STDERR \"hello\";");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, fh, _), .. }) => {
+                let fh = fh.as_ref().expect("expected filehandle");
+                assert!(matches!(fh.kind, ExprKind::Bareword(_)), "expected Bareword filehandle, got {:?}", fh.kind);
+            }
+            other => panic!("expected PrintOp, got {other:?}"),
+        }
+    }
+
+    // ── Postfix control flow ──────────────────────────────────
+
+    #[test]
+    fn hard_postfix_if() {
+        // `print "x" if $cond;` — the whole `print "x"` is the modifier subject.
+        let prog = parse("print \"x\" if $cond;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(kind, subject, cond), .. }) => {
+                assert!(matches!(kind, PostfixKind::If));
+                assert!(matches!(subject.kind, ExprKind::PrintOp(_, _, _)), "expected PrintOp subject, got {:?}", subject.kind);
+                assert!(matches!(cond.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected PostfixControl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_postfix_while() {
+        let prog = parse("foo() while $cond;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(kind, _, _), .. }) => {
+                assert!(matches!(kind, PostfixKind::While));
+            }
+            other => panic!("expected PostfixControl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_postfix_for() {
+        let prog = parse("foo() for @list;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(kind, _, list), .. }) => {
+                assert!(matches!(kind, PostfixKind::For | PostfixKind::Foreach));
+                assert!(matches!(list.kind, ExprKind::ArrayVar(_)));
+            }
+            other => panic!("expected PostfixControl, got {other:?}"),
+        }
+    }
+
+    // ── do / eval ─────────────────────────────────────────────
+
+    #[test]
+    fn hard_do_file() {
+        // `do $file;` — do EXPR form, not do BLOCK.
+        let e = parse_expr_str("do $file;");
+        assert!(matches!(e.kind, ExprKind::DoExpr(_)), "expected DoExpr, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn hard_eval_block_vs_expr() {
+        let e1 = parse_expr_str("eval { 1 };");
+        assert!(matches!(e1.kind, ExprKind::EvalBlock(_)), "expected EvalBlock, got {:?}", e1.kind);
+
+        let e2 = parse_expr_str("eval $code;");
+        assert!(matches!(e2.kind, ExprKind::EvalExpr(_)), "expected EvalExpr, got {:?}", e2.kind);
+    }
+
+    // ── Ternary precedence ────────────────────────────────────
+
+    #[test]
+    fn hard_ternary_right_associative() {
+        // `$a ? $b : $c ? $d : $e;` — right-associative.
+        // Must group as: Ternary($a, $b, Ternary($c, $d, $e))
+        let e = parse_expr_str("$a ? $b : $c ? $d : $e;");
+        match &e.kind {
+            ExprKind::Ternary(_, then, else_) => {
+                assert!(matches!(then.kind, ExprKind::ScalarVar(_)), "expected scalar then-branch, got {:?}", then.kind);
+                assert!(matches!(else_.kind, ExprKind::Ternary(_, _, _)), "expected nested Ternary in else-branch (right-assoc), got {:?}", else_.kind);
+            }
+            other => panic!("expected Ternary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_ternary_condition_has_plus() {
+        // `$a + $b ? $c : $d;` — + binds tighter than ternary cond.
+        let e = parse_expr_str("$a + $b ? $c : $d;");
+        match &e.kind {
+            ExprKind::Ternary(cond, _, _) => {
+                assert!(matches!(cond.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add in condition, got {:?}", cond.kind);
+            }
+            other => panic!("expected Ternary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_ternary_then_has_plus() {
+        // `$a ? $b + $c : $d;` — full expression in then-branch.
+        let e = parse_expr_str("$a ? $b + $c : $d;");
+        match &e.kind {
+            ExprKind::Ternary(_, then, _) => {
+                assert!(matches!(then.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add in then-branch, got {:?}", then.kind);
+            }
+            other => panic!("expected Ternary, got {other:?}"),
+        }
+    }
+
+    // ── Assignment / comma precedence ─────────────────────────
+
+    #[test]
+    fn hard_assign_comma_precedence() {
+        // `$a = $b, $c;` — comma is lower than assignment.
+        // Must group as: List([Assign($a, $b), $c])
+        let e = parse_expr_str("$a = $b, $c;");
+        match &e.kind {
+            ExprKind::List(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0].kind, ExprKind::Assign(_, _, _)), "expected Assign as first list item, got {:?}", items[0].kind);
+                assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_assign_paren_comma() {
+        // `$a = ($b, $c);` — parens force comma expression as RHS.
+        let e = parse_expr_str("$a = ($b, $c);");
+        match &e.kind {
+            ExprKind::Assign(_, _, rhs) => {
+                // RHS should be a List (possibly wrapped in Paren).
+                let inner = match &rhs.kind {
+                    ExprKind::Paren(inner) => &inner.kind,
+                    other => other,
+                };
+                assert!(matches!(inner, ExprKind::List(_)), "expected List on RHS, got {inner:?}");
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    // ── Arrow / deref precedence ──────────────────────────────
+
+    #[test]
+    fn hard_arrow_method_call() {
+        let e = parse_expr_str("$obj->method;");
+        assert!(matches!(e.kind, ExprKind::MethodCall(_, _, _)), "expected MethodCall, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn hard_arrow_hash_deref() {
+        // `$obj->{key};` — hash element via arrow.
+        let e = parse_expr_str("$obj->{key};");
+        // Either ArrowDeref(_, Hash("key")) or HashElem form — both are valid.
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, _) | ExprKind::HashElem(_, _)), "expected ArrowDeref or HashElem, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn hard_arrow_chained_method() {
+        // `$obj->{key}->method;` — method call on hash-deref result.
+        let e = parse_expr_str("$obj->{key}->method;");
+        match &e.kind {
+            ExprKind::MethodCall(target, name, _) => {
+                assert_eq!(name, "method");
+                assert!(
+                    matches!(target.kind, ExprKind::ArrowDeref(_, _) | ExprKind::HashElem(_, _)),
+                    "expected arrow/hash deref target, got {:?}",
+                    target.kind
+                );
+            }
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_arrow_method_then_hash() {
+        // `$obj->method()->{key};` — index on method call result.
+        let e = parse_expr_str("$obj->method()->{key};");
+        // The outermost should be the hash index, inner should be MethodCall.
+        let inner = match &e.kind {
+            ExprKind::ArrowDeref(target, _) => &target.kind,
+            ExprKind::HashElem(target, _) => &target.kind,
+            other => panic!("expected arrow/hash deref, got {other:?}"),
+        };
+        assert!(matches!(inner, ExprKind::MethodCall(_, _, _)), "expected MethodCall inside, got {inner:?}");
+    }
+
+    // ── Interpolation ─────────────────────────────────────────
+
+    #[test]
+    fn hard_interp_scalar() {
+        // `"hello $x"` — interpolated string with scalar.
+        let e = parse_expr_str("\"hello $x\";");
+        match &e.kind {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
+                assert!(parts.iter().any(|p| matches!(p, InterpPart::ScalarInterp(_))), "expected ScalarInterp part, got {parts:?}");
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_interp_array() {
+        let e = parse_expr_str("\"@arr\";");
+        match &e.kind {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
+                assert!(parts.iter().any(|p| matches!(p, InterpPart::ArrayInterp(_))), "expected ArrayInterp part, got {parts:?}");
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    // ── Regex edge cases ──────────────────────────────────────
+
+    #[test]
+    fn hard_regex_m_slash() {
+        let e = parse_expr_str("m/foo/;");
+        assert!(matches!(e.kind, ExprKind::Regex(_, _, _)));
+    }
+
+    #[test]
+    fn hard_regex_bare_slash() {
+        let e = parse_expr_str("/foo/;");
+        assert!(matches!(e.kind, ExprKind::Regex(_, _, _)));
+    }
+
+    #[test]
+    fn hard_subst() {
+        let e = parse_expr_str("s/foo/bar/;");
+        assert!(matches!(e.kind, ExprKind::Subst(_, _, _)));
+    }
+
+    #[test]
+    fn hard_binding_regex() {
+        // `$x =~ /foo/;` — binding operator with regex on RHS.
+        let e = parse_expr_str("$x =~ /foo/;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Binding, _, rhs) => {
+                assert!(matches!(rhs.kind, ExprKind::Regex(_, _, _)));
+            }
+            other => panic!("expected Binding BinOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_regex_brace_delim() {
+        let e = parse_expr_str("$x =~ m{foo};");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Binding, _, rhs) => {
+                assert!(matches!(rhs.kind, ExprKind::Regex(_, _, _)));
+            }
+            other => panic!("expected Binding, got {other:?}"),
+        }
+    }
+
+    // ── Combined nightmare cases ──────────────────────────────
+
+    #[test]
+    fn hard_nightmare_map_ternary_hash() {
+        // `map { /x/ ? { a => 1 } : { b => 2 } } @list;`
+        // Exercises: block-vs-hash, regex-vs-division, ternary grouping.
+        let e = parse_expr_str("map { /x/ ? { a => 1 } : { b => 2 } } @list;");
+        match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "map");
+                let block = match &args[0].kind {
+                    ExprKind::AnonSub(_, _, b) => b,
+                    other => panic!("expected AnonSub, got {other:?}"),
+                };
+                assert_eq!(block.statements.len(), 1);
+                match &block.statements[0].kind {
+                    StmtKind::Expr(Expr { kind: ExprKind::Ternary(cond, then, else_), .. }) => {
+                        assert!(matches!(cond.kind, ExprKind::Regex(_, _, _)), "expected Regex condition, got {:?}", cond.kind);
+                        assert!(matches!(then.kind, ExprKind::AnonHash(_)), "expected AnonHash then-branch, got {:?}", then.kind);
+                        assert!(matches!(else_.kind, ExprKind::AnonHash(_)), "expected AnonHash else-branch, got {:?}", else_.kind);
+                    }
+                    other => panic!("expected Ternary stmt, got {other:?}"),
+                }
+            }
+            other => panic!("expected map ListOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_nightmare_do_ternary_hash() {
+        // `$x = do { /x/ ? { a => 1 } : { b => 2 } };`
+        let e = parse_expr_str("$x = do { /x/ ? { a => 1 } : { b => 2 } };");
+        match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::DoBlock(block) => {
+                    assert_eq!(block.statements.len(), 1);
+                    match &block.statements[0].kind {
+                        StmtKind::Expr(Expr { kind: ExprKind::Ternary(_, then, else_), .. }) => {
+                            assert!(matches!(then.kind, ExprKind::AnonHash(_)));
+                            assert!(matches!(else_.kind, ExprKind::AnonHash(_)));
+                        }
+                        other => panic!("expected Ternary stmt, got {other:?}"),
+                    }
+                }
+                other => panic!("expected DoBlock, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    // ── Parse-or-error (Tier 1) — just verify these parse ─────
+    //
+    // For cases where the exact AST shape depends on decisions we
+    // haven't firmed up (or features we haven't implemented yet),
+    // at least verify the parser accepts them.
+
+    #[test]
+    fn hard_parses_map_slash() {
+        // `map { /x/ } @list;` — regex inside map block.
+        parse("map { /x/ } @list;");
+    }
+
+    #[test]
+    fn hard_parses_regex_in_sub() {
+        // `sub f { /x/ }` — regex as sub body expression.
+        parse("sub f { /x/ }");
+    }
+
+    #[test]
+    fn hard_parses_map_list_form() {
+        // `map /x/, @list;` — non-block form of map.
+        parse("map /x/, @list;");
+    }
+
+    #[test]
+    fn hard_parses_foo_bareword_alone() {
+        // `foo;` — bare bareword statement.
+        parse("foo;");
+    }
+
+    #[test]
+    fn hard_parses_nested_brace_print() {
+        // `print { $fh } "hello";` — brace-filehandle form.
+        parse("print { $fh } \"hello\";");
+    }
+
+    #[test]
+    fn hard_parses_paren_grouping() {
+        parse("($a + $b) * $c;");
+    }
+
+    #[test]
+    fn hard_my_assign_comma_grouping() {
+        // `my $x = $a, $b;` — Perl parses as `(my $x = $a), $b`.
+        // Since `my` is an expression, the whole thing is a List with
+        // an Assign(Decl(My), $a) first, then $b.
+        let prog = parse("my $x = $a, $b;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+                assert_eq!(items.len(), 2, "expected 2 list items, got {}", items.len());
+                // First item: Assign(Decl(My, [$x]), $a)
+                match &items[0].kind {
+                    ExprKind::Assign(_, lhs, rhs) => {
+                        assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::My, _)), "expected Decl(My) lhs, got {:?}", lhs.kind);
+                        assert!(matches!(rhs.kind, ExprKind::ScalarVar(_)), "expected ScalarVar rhs, got {:?}", rhs.kind);
+                    }
+                    other => panic!("expected Assign as first list item, got {other:?}"),
+                }
+                // Second item: $b
+                assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)), "expected ScalarVar as second item, got {:?}", items[1].kind);
+            }
+            other => panic!("expected Stmt::Expr(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_our_assign_comma_grouping() {
+        // `our $x = $a, $b;` — same behavior as `my` with a different scope.
+        let prog = parse("our $x = $a, $b;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+                assert_eq!(items.len(), 2);
+                match &items[0].kind {
+                    ExprKind::Assign(_, lhs, _) => {
+                        assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::Our, _)), "expected Decl(Our) lhs, got {:?}", lhs.kind);
+                    }
+                    other => panic!("expected Assign, got {other:?}"),
+                }
+                assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected Stmt::Expr(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_state_assign_comma_grouping() {
+        // `state $x = $a, $b;` — same behavior as `my` with a different scope.
+        let prog = parse("state $x = $a, $b;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+                assert_eq!(items.len(), 2);
+                match &items[0].kind {
+                    ExprKind::Assign(_, lhs, _) => {
+                        assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::State, _)), "expected Decl(State) lhs, got {:?}", lhs.kind);
+                    }
+                    other => panic!("expected Assign, got {other:?}"),
+                }
+                assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected Stmt::Expr(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_local_assign_comma_grouping() {
+        // `local $x = $a, $b;` — local is an expression too; the trailing
+        // comma must NOT be absorbed into the Local operand.
+        // Must group as `(local $x = $a), $b`, giving List([Assign(Local($x), $a), $b]).
+        let prog = parse("local $x = $a, $b;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+                assert_eq!(items.len(), 2, "expected 2 list items, got {}", items.len());
+                match &items[0].kind {
+                    ExprKind::Assign(_, lhs, rhs) => {
+                        assert!(matches!(lhs.kind, ExprKind::Local(_)), "expected Local lhs, got {:?}", lhs.kind);
+                        assert!(matches!(rhs.kind, ExprKind::ScalarVar(_)), "expected ScalarVar rhs, got {:?}", rhs.kind);
+                    }
+                    other => panic!("expected Assign, got {other:?}"),
+                }
+                assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected Stmt::Expr(List), got {other:?}"),
+        }
+    }
+
+    // ── Declarations as expressions: basic forms ──────────────
+    //
+    // Verify that each declaration kind produces an expression
+    // (wrapped in Stmt::Expr), not a dedicated statement kind.
+
+    #[test]
+    fn hard_my_is_expression() {
+        // `my $x;` — no initializer, bare Decl expression.
+        let prog = parse("my $x;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Decl(DeclScope::My, vars), .. }) => {
+                assert_eq!(vars[0].name, "x");
+            }
+            other => panic!("expected Stmt::Expr(Decl(My)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_our_is_expression() {
+        let prog = parse("our $x;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Decl(DeclScope::Our, vars), .. }) => {
+                assert_eq!(vars[0].name, "x");
+            }
+            other => panic!("expected Stmt::Expr(Decl(Our)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_state_is_expression() {
+        let prog = parse("state $x;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Decl(DeclScope::State, vars), .. }) => {
+                assert_eq!(vars[0].name, "x");
+            }
+            other => panic!("expected Stmt::Expr(Decl(State)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_local_is_expression() {
+        let prog = parse("local $x;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Local(inner), .. }) => {
+                assert!(matches!(inner.kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected Stmt::Expr(Local), got {other:?}"),
+        }
+    }
+
+    // ── Declarations in expression position ───────────────────
+    //
+    // Declarations as expressions should be usable in any context
+    // that accepts an expression — not just at statement start.
+
+    #[test]
+    fn hard_my_in_parens() {
+        // `(my $x) = @list;` — decl inside parens on LHS of assignment.
+        let prog = parse("(my $x) = @list;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
+                // LHS should contain a Decl (possibly wrapped in Paren).
+                let inner = match &lhs.kind {
+                    ExprKind::Paren(inner) => &inner.kind,
+                    other => other,
+                };
+                assert!(matches!(inner, ExprKind::Decl(DeclScope::My, _)), "expected Decl on LHS, got {inner:?}");
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_my_list_in_parens() {
+        // `my ($a, $b) = @list;` — list form.
+        let prog = parse("my ($a, $b) = @list;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => match &lhs.kind {
+                ExprKind::Decl(DeclScope::My, vars) => {
+                    assert_eq!(vars.len(), 2);
+                    assert_eq!(vars[0].name, "a");
+                    assert_eq!(vars[1].name, "b");
+                }
+                other => panic!("expected Decl(My), got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    // ── Declarations in control-flow heads ────────────────────
+
+    #[test]
+    fn hard_my_in_if_condition() {
+        // `if (my $x = foo()) { ... }` — decl in an if condition.
+        // The decl is nested inside an If statement's paren-expr.
+        let prog = parse("if (my $x = foo()) { 1; }");
+        match &prog.statements[0].kind {
+            StmtKind::If(if_stmt) => match &if_stmt.condition.kind {
+                ExprKind::Assign(_, lhs, _) => {
+                    assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::My, _)), "expected Decl on LHS, got {:?}", lhs.kind);
+                }
+                other => panic!("expected Assign in if condition, got {other:?}"),
+            },
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_my_in_while_condition() {
+        let prog = parse("while (my $line = <$fh>) { 1; }");
+        match &prog.statements[0].kind {
+            StmtKind::While(w) => match &w.condition.kind {
+                ExprKind::Assign(_, lhs, _) => {
+                    assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::My, _)));
+                }
+                other => panic!("expected Assign, got {other:?}"),
+            },
+            other => panic!("expected While, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_parses_postfix_unless() {
+        parse("print \"x\" unless $cond;");
+    }
+
+    #[test]
+    fn hard_parses_heredoc_basic() {
+        parse("print <<EOF;\nhello\nEOF\n");
+    }
+
+    #[test]
+    fn hard_parses_heredoc_concat() {
+        // `print <<EOF . "x"; ... EOF` — heredoc in compound expression.
+        parse("print <<EOF . \"x\";\nhello\nEOF\n");
+    }
+
+    #[test]
+    fn hard_parses_heredoc_interp() {
+        parse("print <<\"EOF\";\n$interpolated\nEOF\n");
+    }
+
+    #[test]
+    fn hard_parses_heredoc_literal() {
+        parse("print <<'EOF';\n$not_interpolated\nEOF\n");
+    }
+
+    #[test]
+    fn hard_parses_two_heredocs_same_line() {
+        parse("print <<A . <<B;\na\nA\nb\nB\n");
+    }
+
+    #[test]
+    fn hard_parses_do_block_simple() {
+        parse("do { 1 };");
+    }
+
+    #[test]
+    fn hard_parses_if_hashlike_body() {
+        // `if (1) { a => 1 }` — body looks hashy but must parse as block.
+        parse("if (1) { a => 1 }");
+    }
+
+    #[test]
+    fn hard_parses_tricky_slash_combinations() {
+        parse("$x / 2;");
+        parse("$x / $y / $z;");
+        parse("$x // /foo/;");
     }
 }
