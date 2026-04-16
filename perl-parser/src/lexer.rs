@@ -349,7 +349,7 @@ impl Lexer {
 
             // ── Operators and punctuation ─────────────────────
             b'+' => self.lex_plus(),
-            b'-' => self.lex_minus(expect)?,
+            b'-' => self.lex_minus(),
             b'*' => self.lex_star(),
             b'/' => self.lex_slash(),
             b'.' => self.lex_dot(),
@@ -1523,28 +1523,40 @@ impl Lexer {
         }
     }
 
-    fn lex_minus(&mut self, expect: &Expect) -> Result<Token, ParseError> {
+    fn lex_minus(&mut self) -> Token {
         self.skip(1);
         match self.peek_byte(false) {
             Some(b'-') => {
                 self.skip(1);
-                Ok(Token::MinusMinus)
+                Token::MinusMinus
             }
             Some(b'=') => {
                 self.skip(1);
-                Ok(Token::Assign(AssignOp::SubEq))
+                Token::Assign(AssignOp::SubEq)
             }
             Some(b'>') => {
                 self.skip(1);
-                Ok(Token::Arrow)
+                Token::Arrow
             }
-            Some(b) if expect.expecting_term() && b.is_ascii_alphabetic() && !self.peek_byte_at(1).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') => {
-                // Filetest: -f, -d, -r, etc.
-                self.skip(1);
-                Ok(Token::Filetest(b))
-            }
-            _ => Ok(Token::Minus),
+            _ => Token::Minus,
         }
+    }
+
+    /// Called by the parser after consuming a `Minus` token in term
+    /// position.  Returns `Some(Filetest(b))` if the next byte is
+    /// a single letter not followed by a word-continuation char
+    /// (e.g. `-f $file`, `-d "/tmp"`).  Returns `None` otherwise.
+    pub fn lex_filetest_after_minus(&mut self) -> Option<Token> {
+        let b = self.peek_byte(false)?;
+        if !b.is_ascii_alphabetic() {
+            return None;
+        }
+        // Must not be followed by a word-continuation char.
+        if self.peek_byte_at(1).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+            return None;
+        }
+        self.skip(1);
+        Some(Token::Filetest(b))
     }
 
     fn lex_star(&mut self) -> Token {
@@ -1958,6 +1970,12 @@ mod tests {
             // In term context, Percent may introduce a hash variable.
             if matches!(spanned.token, Token::Percent) && expect.expecting_term() {
                 if let Some(tok) = lexer.lex_hash_var_after_percent().unwrap() {
+                    spanned.token = tok;
+                }
+            }
+            // In term context, Minus may introduce a filetest operator.
+            if matches!(spanned.token, Token::Minus) && expect.expecting_term() {
+                if let Some(tok) = lexer.lex_filetest_after_minus() {
                     spanned.token = tok;
                 }
             }

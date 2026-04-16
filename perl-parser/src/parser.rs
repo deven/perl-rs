@@ -1384,6 +1384,12 @@ impl Parser {
 
             // Prefix unary operators
             Token::Minus => {
+                // -f, -d, -r, etc. → filetest operator (single letter
+                // not followed by word-continuation char).
+                if let Some(Token::Filetest(b)) = self.lexer.lex_filetest_after_minus() {
+                    let end = self.peek_span();
+                    return self.parse_filetest(b, span.merge(end));
+                }
                 // -bareword (not followed by parens) → StringLit("-bareword")
                 // Perl: unary minus on an identifier always returns "-identifier".
                 if let Token::Ident(name) = self.peek_token().clone() {
@@ -1672,15 +1678,7 @@ impl Parser {
             }
 
             // Filetest operators: -e, -f, -d, etc. (lexed as single token)
-            Token::Filetest(test_byte) => {
-                let test_char = test_byte as char;
-                // In autoquoting contexts (=> or }), treat as StringLit("-x")
-                if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
-                    return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
-                }
-                let (target, end) = self.parse_stat_target(span)?;
-                Ok(Expr { span: span.merge(end), kind: ExprKind::Filetest(test_char, target) })
-            }
+            Token::Filetest(test_byte) => self.parse_filetest(test_byte, span),
 
             // Yada yada yada (...)
             Token::DotDotDot => Ok(Expr { kind: ExprKind::YadaYada, span }),
@@ -1837,6 +1835,19 @@ impl Parser {
     ///
     /// Also handles the parenthesized form: `stat(_)`, `stat($file)`.
     /// Returns `(target, end_span)`.
+    /// Parse a filetest expression given the test byte and the span
+    /// of the leading `-X` tokens.  Shared between the Minus-triggered
+    /// path and the explicit Filetest token arm.
+    fn parse_filetest(&mut self, test_byte: u8, span: Span) -> Result<Expr, ParseError> {
+        let test_char = test_byte as char;
+        // In autoquoting contexts (=> or }), treat as StringLit("-x")
+        if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
+            return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
+        }
+        let (target, end) = self.parse_stat_target(span)?;
+        Ok(Expr { span: span.merge(end), kind: ExprKind::Filetest(test_char, target) })
+    }
+
     fn parse_stat_target(&mut self, start: Span) -> Result<(StatTarget, Span), ParseError> {
         self.expect = Expect::Term;
 
