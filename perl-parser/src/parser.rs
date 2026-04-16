@@ -9,7 +9,7 @@ use crate::error::ParseError;
 use crate::keyword;
 use crate::lexer::Lexer;
 use crate::span::Span;
-use crate::symbols::{SubPrototype, SymbolTable};
+use crate::symbols::{ProtoSlot, SubPrototype, SymbolTable};
 use crate::token::Keyword;
 use crate::token::*;
 
@@ -1694,6 +1694,15 @@ impl Parser {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
 
+        // Look up in the symbol table to see if this is a known sub.
+        // Clone the prototype (small: raw string + a Vec of slot enums)
+        // and the "is known" flag so we can release the borrow on self
+        // before parsing args.
+        let (is_known_sub, proto) = match self.symbols.lookup(&name, &self.current_package) {
+            Some(info) => (true, info.prototype.clone()),
+            None => (false, None),
+        };
+
         // Check if followed by `(` — function call
         if self.at(&Token::LeftParen)? {
             self.next_token()?;
@@ -1707,6 +1716,18 @@ impl Parser {
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
             return Ok(Expr { kind: ExprKind::FuncCall(name, args), span: span.merge(end) });
+        }
+
+        // No parens — if we know this sub has a prototype, use it to
+        // drive argument parsing.
+        if let Some(proto) = proto {
+            return self.parse_prototyped_call(name, span, &proto);
+        }
+
+        // No parens, no prototype, but the sub is known: parse as a
+        // list operator call (greedy args until end-of-statement).
+        if is_known_sub {
+            return self.parse_known_sub_call(name, span);
         }
 
         // Indirect object syntax: METHOD CLASS ARGS
@@ -1765,6 +1786,112 @@ impl Parser {
 
         // Bare identifier — not followed by ( or indirect object context.
         Ok(Expr { kind: ExprKind::Bareword(name), span })
+    }
+
+    /// True if the current token marks the end of a list-op / prototyped
+    /// argument list: statement terminator, closing bracket/brace/paren,
+    /// EOF, or a postfix-control keyword.
+    fn at_args_end(&mut self) -> Result<bool, ParseError> {
+        Ok(self.at(&Token::Semi)?
+            || self.at(&Token::RightParen)?
+            || self.at(&Token::RightBracket)?
+            || self.at(&Token::RightBrace)?
+            || self.at_eof()?
+            || matches!(
+                self.peek_token(),
+                Token::Keyword(Keyword::If)
+                    | Token::Keyword(Keyword::Unless)
+                    | Token::Keyword(Keyword::While)
+                    | Token::Keyword(Keyword::Until)
+                    | Token::Keyword(Keyword::For)
+                    | Token::Keyword(Keyword::Foreach)
+            ))
+    }
+
+    /// Parse a call to a known sub (no prototype) in list-operator
+    /// style: greedy comma-separated args until end of statement.
+    /// Produces `FuncCall` (not `ListOp`, which is reserved for
+    /// built-in list operators like `push`, `join`).
+    fn parse_known_sub_call(&mut self, name: String, start: Span) -> Result<Expr, ParseError> {
+        let mut args = Vec::new();
+        while !self.at_args_end()? {
+            args.push(self.parse_expr(PREC_COMMA + 1)?);
+            if !self.eat(&Token::Comma)? {
+                break;
+            }
+        }
+        let end_span = args.last().map(|a| a.span).unwrap_or(start);
+        Ok(Expr { kind: ExprKind::FuncCall(name, args), span: start.merge(end_span) })
+    }
+
+    /// Parse a call whose target sub has a known prototype.  Arguments
+    /// are consumed according to the prototype slots; trailing content
+    /// is left for the outer parser to deal with.
+    ///
+    /// * `$`, `_`, `*`, `+`, `\X`, `\[...]` — one scalar-ish expression
+    ///   per slot, stopping at comma precedence.  Optional comma
+    ///   consumed between slots.
+    /// * `&` — expect `{ ... }`, parsed as an anonymous sub body.
+    /// * `@`, `%` — slurpy, consumes all remaining comma-separated
+    ///   arguments.  Always last.
+    ///
+    /// Missing required arguments are silently tolerated (Perl would
+    /// error at compile time).  A later semantic pass can validate.
+    fn parse_prototyped_call(&mut self, name: String, start: Span, proto: &SubPrototype) -> Result<Expr, ParseError> {
+        let mut args = Vec::new();
+
+        for (i, slot) in proto.slots.iter().enumerate() {
+            let is_optional = i >= proto.required;
+
+            if self.at_args_end()? {
+                // No more input — break unless the slot is required
+                // (in which case we also break, silently; a later
+                // semantic pass could error).
+                let _ = is_optional;
+                break;
+            }
+
+            match slot {
+                ProtoSlot::Block => {
+                    if !self.at(&Token::LeftBrace)? {
+                        // Block slot expected a `{`.  For now, stop
+                        // parsing args here; a stricter implementation
+                        // would error if required.
+                        break;
+                    }
+                    let block = self.parse_block()?;
+                    let span = block.span;
+                    args.push(Expr { kind: ExprKind::AnonSub(None, None, block), span });
+                    // Optional comma between slots.
+                    if i + 1 < proto.slots.len() {
+                        self.eat(&Token::Comma)?;
+                    }
+                }
+                ProtoSlot::SlurpyList | ProtoSlot::SlurpyHash => {
+                    // Consume all remaining tokens as comma-separated
+                    // expressions.  Slurpy is always last.
+                    while !self.at_args_end()? {
+                        args.push(self.parse_expr(PREC_COMMA + 1)?);
+                        if !self.eat(&Token::Comma)? {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                _ => {
+                    // Scalar-ish slot: one expression at comma-plus-1
+                    // precedence so a comma terminates this arg.
+                    let arg = self.parse_expr(PREC_COMMA + 1)?;
+                    args.push(arg);
+                    if i + 1 < proto.slots.len() {
+                        self.eat(&Token::Comma)?;
+                    }
+                }
+            }
+        }
+
+        let end_span = args.last().map(|a| a.span).unwrap_or(start);
+        Ok(Expr { kind: ExprKind::FuncCall(name, args), span: start.merge(end_span) })
     }
 
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
@@ -7186,6 +7313,211 @@ mod tests {
     #[test]
     fn hard_parses_postfix_unless() {
         parse("print \"x\" unless $cond;");
+    }
+
+    // ── Prototype-driven call-site parsing ─────────────────────
+    //
+    // These verify that a sub's prototype — registered in the
+    // symbol table at declaration time — drives how arguments at
+    // call sites are parsed.  Anti-oracle cases adapted from
+    // ChatGPT's parser-breaker corpus.
+
+    /// Given `sub NAME (PROTO); CALL`, parse and return the
+    /// expression from the second statement (the call).
+    fn parse_call_with_proto(src: &str) -> Expr {
+        let prog = parse(src);
+        assert!(prog.statements.len() >= 2, "expected ≥2 statements (decl + call), got {}", prog.statements.len());
+        match &prog.statements[1].kind {
+            StmtKind::Expr(e) => e.clone(),
+            other => panic!("expected Stmt::Expr for call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_empty_stops_at_plus() {
+        // sub foo (); foo + 1;
+        // Empty prototype forces zero args, so `+ 1` is a binary op.
+        // Expected: BinOp(Add, FuncCall("foo", []), Int(1)).
+        let e = parse_call_with_proto("sub foo (); foo + 1;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Add, lhs, rhs) => {
+                match &lhs.kind {
+                    ExprKind::FuncCall(name, args) => {
+                        assert_eq!(name, "foo");
+                        assert_eq!(args.len(), 0, "empty-proto call should have 0 args");
+                    }
+                    other => panic!("expected FuncCall(foo, []), got {other:?}"),
+                }
+                assert!(matches!(rhs.kind, ExprKind::IntLit(1)));
+            }
+            other => panic!("expected BinOp(Add, FuncCall, 1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_single_scalar_takes_one_expr() {
+        // sub foo ($); foo $a + $b;
+        // One-scalar proto: `$a + $b` is the single arg.
+        let e = parse_call_with_proto("sub foo ($); foo $a + $b;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 1, "$-proto should take exactly 1 arg");
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)), "arg should be $a + $b, got {:?}", args[0].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_single_scalar_comma_terminates_arg() {
+        // sub foo ($); foo $a, $b;
+        // One-scalar proto: `$a` is the arg; comma ends the call,
+        // and `$b` is a separate list element.  Expected:
+        // List([FuncCall("foo", [$a]), $b]).
+        let e = parse_call_with_proto("sub foo ($); foo $a, $b;");
+        match &e.kind {
+            ExprKind::List(items) => {
+                assert_eq!(items.len(), 2);
+                match &items[0].kind {
+                    ExprKind::FuncCall(name, args) => {
+                        assert_eq!(name, "foo");
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
+                    }
+                    other => panic!("expected FuncCall(foo, [$a]), got {other:?}"),
+                }
+                assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected List with foo call and $b, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_two_scalars_takes_two_args() {
+        // sub foo ($$); foo $a + $b, $c;
+        // Two-scalar proto: `$a + $b` is arg 1, `$c` is arg 2.
+        let e = parse_call_with_proto("sub foo ($$); foo $a + $b, $c;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2, "$$-proto should take 2 args");
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)), "arg 1 should be Add, got {:?}", args[0].kind);
+                assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)), "arg 2 should be $c, got {:?}", args[1].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_block_and_list() {
+        // sub foo (&@); foo { $x } @list;
+        // &@-proto: first arg is a block (wrapped as AnonSub),
+        // second is the slurpy list.
+        let e = parse_call_with_proto("sub foo (&@); foo { $x } @list;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2, "&@-proto should take block + list = 2 args");
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)), "arg 1 should be AnonSub (block), got {:?}", args[0].kind);
+                assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)), "arg 2 should be @list, got {:?}", args[1].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_slurpy_list_takes_everything() {
+        // sub foo (@); foo $a, $b, $c;
+        // Slurpy proto: all three args are consumed.
+        let e = parse_call_with_proto("sub foo (@); foo $a, $b, $c;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected FuncCall with 3 args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_forward_declaration_registers_proto() {
+        // sub foo ($$);  # forward-decl only, no body
+        // foo $a, $b;    # should still use the proto
+        let e = parse_call_with_proto("sub foo ($$); foo $a, $b;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected FuncCall with 2 args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_sub_without_proto_is_list_op() {
+        // sub foo { 1 } foo 1, 2;
+        // No prototype, but sub is known: parses as list op call.
+        let e = parse_call_with_proto("sub foo { 1 } foo 1, 2;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::IntLit(1)));
+                assert!(matches!(args[1].kind, ExprKind::IntLit(2)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_sub_stays_bareword_before_operator() {
+        // foo + 1;  # no declaration — original behavior preserved.
+        // Should parse as BinOp(Add, Bareword("foo"), 1).
+        let prog = parse("foo + 1;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::BinOp(BinOp::Add, lhs, rhs), .. }) => {
+                assert!(matches!(lhs.kind, ExprKind::Bareword(_) | ExprKind::FuncCall(_, _)), "lhs should be Bareword or FuncCall, got {:?}", lhs.kind);
+                assert!(matches!(rhs.kind, ExprKind::IntLit(1)));
+            }
+            other => panic!("expected BinOp(Add, ..., 1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_respects_package_scope() {
+        // A proto declared in Foo shouldn't affect bare calls in main.
+        // package Foo; sub bar (); package main; bar + 1;
+        // The bare `bar` in main isn't found → falls through to
+        // Bareword + BinOp.
+        let prog = parse("package Foo; sub bar (); package main; bar + 1;");
+        // Find the last statement (the `bar + 1` call).
+        let last = prog.statements.last().expect("at least one stmt");
+        match &last.kind {
+            StmtKind::Expr(Expr { kind: ExprKind::BinOp(BinOp::Add, lhs, _), .. }) => {
+                // bar is not found in main → stays bareword.
+                assert!(matches!(lhs.kind, ExprKind::Bareword(_)), "expected Bareword (not found in main), got {:?}", lhs.kind);
+            }
+            other => panic!("expected BinOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_respects_fully_qualified_call() {
+        // package Foo; sub bar (); package main; Foo::bar + 1;
+        // Fully-qualified call finds the proto → zero-arg call.
+        let prog = parse("package Foo; sub bar (); package main; Foo::bar + 1;");
+        let last = prog.statements.last().expect("at least one stmt");
+        match &last.kind {
+            StmtKind::Expr(Expr { kind: ExprKind::BinOp(BinOp::Add, lhs, _), .. }) => match &lhs.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "Foo::bar");
+                    assert_eq!(args.len(), 0, "empty-proto FQN call should have 0 args");
+                }
+                other => panic!("expected FuncCall(Foo::bar, []), got {other:?}"),
+            },
+            other => panic!("expected BinOp, got {other:?}"),
+        }
     }
 
     #[test]
