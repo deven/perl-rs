@@ -1883,6 +1883,27 @@ impl Parser {
                     }
                     break;
                 }
+                ProtoSlot::Glob => {
+                    // `*` slot: a bare identifier is auto-promoted to
+                    // a typeglob reference (e.g., `foo STDIN` becomes
+                    // `foo(*STDIN)`).  Any other expression — a glob
+                    // literal `*NAME`, a scalar holding a glob ref,
+                    // etc. — is parsed normally.
+                    let arg = if let Token::Ident(_) = self.peek_token() {
+                        let glob_span = self.peek_span();
+                        let name = match self.next_token()?.token {
+                            Token::Ident(n) => n,
+                            _ => unreachable!(),
+                        };
+                        Expr { kind: ExprKind::GlobVar(name), span: glob_span }
+                    } else {
+                        self.parse_expr(PREC_COMMA + 1)?
+                    };
+                    args.push(arg);
+                    if i + 1 < proto.slots.len() {
+                        self.eat(&Token::Comma)?;
+                    }
+                }
                 _ => {
                     // Scalar-ish slot (including `_`, which only
                     // differs when omitted — handled above).  One
@@ -7571,6 +7592,53 @@ mod tests {
                 // ScalarVar depending on the lexer; either is fine,
                 // as long as it's NOT DefaultVar.
                 assert!(!matches!(args[0].kind, ExprKind::DefaultVar), "explicit $_ should not become DefaultVar");
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_glob_bareword_becomes_glob_var() {
+        // sub foo (*); foo STDIN;
+        // Bareword in a `*` slot is auto-promoted to a typeglob.
+        let e = parse_call_with_proto("sub foo (*); foo STDIN;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::GlobVar(n) => assert_eq!(n, "STDIN"),
+                    other => panic!("expected GlobVar(STDIN), got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_glob_explicit_star_stays_glob() {
+        // sub foo (*); foo *STDIN;
+        // Explicit *STDIN is already a GlobVar from the source.
+        let e = parse_call_with_proto("sub foo (*); foo *STDIN;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::GlobVar(_)), "expected GlobVar, got {:?}", args[0].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_glob_scalar_passed_through() {
+        // sub foo (*); foo $fh;
+        // A scalar expression in a `*` slot is parsed as-is —
+        // it's presumed to hold a glob ref at runtime.
+        let e = parse_call_with_proto("sub foo (*); foo $fh;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)), "expected ScalarVar, got {:?}", args[0].kind);
             }
             other => panic!("expected FuncCall, got {other:?}"),
         }
