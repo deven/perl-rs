@@ -41,6 +41,11 @@ const PREC_BIT_OR: Precedence = 22; // |
 const PREC_BIT_AND: Precedence = 24; // &
 const PREC_EQ: Precedence = 26; // == != eq ne <=> cmp
 const PREC_REL: Precedence = 28; // < > <= >= lt gt le ge
+/// Named unary operators and prototyped subs with a scalar-ish
+/// slot (`$`, `_`, `+`, `\X`, `\[...]`, etc.).  Sits between
+/// relational and shift: `foo $a < 1` parses as `foo($a) < 1`,
+/// while `foo $a << 1` parses as `foo($a << 1)`.  Non-associative.
+const PREC_NAMED_UNARY: Precedence = 29;
 const PREC_SHIFT: Precedence = 30; // << >>
 const PREC_ADD: Precedence = 32; // + - .
 const PREC_MUL: Precedence = 34; // * / % x
@@ -1888,7 +1893,8 @@ impl Parser {
                     // a typeglob reference (e.g., `foo STDIN` becomes
                     // `foo(*STDIN)`).  Any other expression — a glob
                     // literal `*NAME`, a scalar holding a glob ref,
-                    // etc. — is parsed normally.
+                    // etc. — is parsed normally at named-unary
+                    // precedence.
                     let arg = if let Token::Ident(_) = self.peek_token() {
                         let glob_span = self.peek_span();
                         let name = match self.next_token()?.token {
@@ -1897,7 +1903,7 @@ impl Parser {
                         };
                         Expr { kind: ExprKind::GlobVar(name), span: glob_span }
                     } else {
-                        self.parse_expr(PREC_COMMA + 1)?
+                        self.parse_expr(PREC_NAMED_UNARY)?
                     };
                     args.push(arg);
                     if i + 1 < proto.slots.len() {
@@ -1907,9 +1913,12 @@ impl Parser {
                 _ => {
                     // Scalar-ish slot (including `_`, which only
                     // differs when omitted — handled above).  One
-                    // expression at comma-plus-1 precedence so a
-                    // comma terminates this arg.
-                    let arg = self.parse_expr(PREC_COMMA + 1)?;
+                    // expression at named-unary precedence: operators
+                    // tighter than named unary (+ - * / << >>, etc.)
+                    // are consumed; operators looser (< == , ?:, etc.)
+                    // terminate the arg.  This matches Perl's semantics
+                    // for prototyped subs whose slot is a single scalar.
+                    let arg = self.parse_expr(PREC_NAMED_UNARY)?;
                     args.push(arg);
                     if i + 1 < proto.slots.len() {
                         self.eat(&Token::Comma)?;
@@ -7715,6 +7724,110 @@ mod tests {
             ExprKind::FuncCall(name, args) => {
                 assert_eq!(name, "foo");
                 assert_eq!(args.len(), 0, "&foo with no parens inherits @_");
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── Named-unary precedence for scalar-ish slots ─────────────
+    //
+    // A `$`-slot (or `_`, `+`, `\X`, `\[...]`, glob-expression)
+    // parses its arg at named-unary precedence.  That means
+    // operators tighter than named unary (shift, +, -, *, /, **,
+    // etc.) are consumed into the arg, while operators looser
+    // (relational, equality, ternary, assignment, comma) terminate
+    // the arg and apply at the outer level.
+
+    #[test]
+    fn proto_scalar_tight_op_is_consumed() {
+        // sub foo ($); foo $a << 1;
+        // `<<` (shift, tighter than named unary) is consumed.
+        let e = parse_call_with_proto("sub foo ($); foo $a << 1;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                assert!(
+                    matches!(args[0].kind, ExprKind::BinOp(BinOp::ShiftLeft, _, _)),
+                    "expected arg to be ShiftLeft (tighter than named-unary), got {:?}",
+                    args[0].kind
+                );
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_scalar_relational_terminates_arg() {
+        // sub foo ($); foo $a < 1;
+        // `<` (relational, looser than named unary) terminates the
+        // arg.  Parses as `foo($a) < 1`.
+        let e = parse_call_with_proto("sub foo ($); foo $a < 1;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::NumLt, lhs, rhs) => {
+                match &lhs.kind {
+                    ExprKind::FuncCall(name, args) => {
+                        assert_eq!(name, "foo");
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
+                    }
+                    other => panic!("expected FuncCall on lhs, got {other:?}"),
+                }
+                assert!(matches!(rhs.kind, ExprKind::IntLit(1)));
+            }
+            other => panic!("expected BinOp(NumLt, FuncCall, 1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_scalar_equality_terminates_arg() {
+        // sub foo ($); foo 1 == 2;
+        // `==` is looser than named unary → terminates arg.
+        // Parses as `foo(1) == 2`.
+        let e = parse_call_with_proto("sub foo ($); foo 1 == 2;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::NumEq, lhs, rhs) => {
+                match &lhs.kind {
+                    ExprKind::FuncCall(name, args) => {
+                        assert_eq!(name, "foo");
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(args[0].kind, ExprKind::IntLit(1)));
+                    }
+                    other => panic!("expected FuncCall on lhs, got {other:?}"),
+                }
+                assert!(matches!(rhs.kind, ExprKind::IntLit(2)));
+            }
+            other => panic!("expected BinOp(NumEq, FuncCall, 2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_scalar_ternary_terminates_arg() {
+        // sub foo ($); foo $a ? $b : $c;
+        // Ternary is far below named unary → terminates arg.
+        // Parses as `foo($a) ? $b : $c`.
+        let e = parse_call_with_proto("sub foo ($); foo $a ? $b : $c;");
+        match &e.kind {
+            ExprKind::Ternary(cond, _, _) => match &cond.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "foo");
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected FuncCall as ternary cond, got {other:?}"),
+            },
+            other => panic!("expected Ternary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_scalar_mul_and_add_both_consumed() {
+        // sub foo ($); foo 1 + 2 * 3;
+        // Both `+` and `*` are tighter than named unary, so the
+        // whole arithmetic expression is the single arg.
+        let e = parse_call_with_proto("sub foo ($); foo 1 + 2 * 3;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected top-level Add, got {:?}", args[0].kind);
             }
             other => panic!("expected FuncCall, got {other:?}"),
         }
