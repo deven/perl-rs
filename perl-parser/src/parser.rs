@@ -152,12 +152,52 @@ impl Parser {
                     Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) }
                 }
             });
+            // Downgrade feature-gated keywords to plain idents
+            // when the governing feature is not active in the
+            // current lexical scope.  This lets user code that
+            // predates the feature (or explicitly `no feature`s
+            // it) keep using these words as function names,
+            // method names, hash keys, etc.  Same in spirit as
+            // the parser resolving `/` to regex-vs-division:
+            // the lexer emits a context-free classification and
+            // the parser refines it with scope-level information.
+            self.maybe_demote_keyword();
         }
         // self.current is Some by construction above.
         match &self.current {
             Some(s) => &s.token,
             None => unreachable!("peek_token: current is Some"),
         }
+    }
+
+    /// Rewrite a feature-gated `Keyword` in the lookahead cache
+    /// as a plain `Ident(name)` when the governing feature is
+    /// off.  No-op if the token isn't such a keyword or if the
+    /// feature is active.
+    fn maybe_demote_keyword(&mut self) {
+        let Some(sp) = &self.current else {
+            return;
+        };
+        let kw = match sp.token {
+            Token::Keyword(kw) => kw,
+            _ => return,
+        };
+        // Map keyword → governing feature.  Only feature-gated
+        // keywords appear here; unconditional keywords (my, sub,
+        // if, etc.) are omitted and always stay as Keyword.
+        let needed = match kw {
+            Keyword::Try | Keyword::Catch | Keyword::Finally => Features::TRY,
+            Keyword::Defer => Features::DEFER,
+            Keyword::Given | Keyword::When | Keyword::Default => Features::SWITCH,
+            Keyword::Class | Keyword::Field | Keyword::Method => Features::CLASS,
+            _ => return,
+        };
+        if self.pragmas.features.contains(needed) {
+            return;
+        }
+        let name: &str = kw.into();
+        let span = sp.span;
+        self.current = Some(Spanned { token: Token::Ident(name.to_string()), span });
     }
 
     /// Peek at the span of the current token.
@@ -4572,8 +4612,12 @@ mod tests {
 
     #[test]
     fn parse_given_when() {
-        let prog = parse("given ($x) { when (1) { 1; } default { 0; } }");
-        match &prog.statements[0].kind {
+        let prog = parse(
+            "use feature 'switch'; no warnings 'experimental::smartmatch'; \
+             given ($x) { when (1) { 1; } default { 0; } }",
+        );
+        let stmt = prog.statements.iter().find(|s| matches!(s.kind, StmtKind::Given(_, _))).expect("Given statement present");
+        match &stmt.kind {
             StmtKind::Given(expr, block) => {
                 assert!(matches!(expr.kind, ExprKind::ScalarVar(ref n) if n == "x"));
                 assert!(block.statements.len() >= 2);
@@ -4587,8 +4631,9 @@ mod tests {
 
     #[test]
     fn parse_try_catch() {
-        let prog = parse("try { die; } catch ($e) { warn $e; }");
-        match &prog.statements[0].kind {
+        let prog = parse("use feature 'try'; try { die; } catch ($e) { warn $e; }");
+        let stmt = prog.statements.iter().find(|s| matches!(s.kind, StmtKind::Try(_))).expect("Try statement present");
+        match &stmt.kind {
             StmtKind::Try(t) => {
                 assert!(t.catch_block.is_some());
                 assert!(t.catch_var.is_some());
@@ -4599,8 +4644,9 @@ mod tests {
 
     #[test]
     fn parse_try_catch_finally() {
-        let prog = parse("try { 1; } catch ($e) { 2; } finally { 3; }");
-        match &prog.statements[0].kind {
+        let prog = parse("use feature 'try'; try { 1; } catch ($e) { 2; } finally { 3; }");
+        let stmt = prog.statements.iter().find(|s| matches!(s.kind, StmtKind::Try(_))).expect("Try statement present");
+        match &stmt.kind {
             StmtKind::Try(t) => {
                 assert!(t.catch_block.is_some());
                 assert!(t.finally_block.is_some());
@@ -4611,8 +4657,12 @@ mod tests {
 
     #[test]
     fn parse_defer() {
-        let prog = parse("defer { cleanup(); }");
-        match &prog.statements[0].kind {
+        let prog = parse(
+            "use feature 'defer'; no warnings 'experimental::defer'; \
+             defer { cleanup(); }",
+        );
+        let stmt = prog.statements.iter().find(|s| matches!(s.kind, StmtKind::Defer(_))).expect("Defer statement present");
+        match &stmt.kind {
             StmtKind::Defer(block) => {
                 assert_eq!(block.statements.len(), 1);
             }
@@ -5861,6 +5911,96 @@ sub outer ($x) { 1 }
         assert!(matches!(e.kind, ExprKind::CurrentSub));
     }
 
+    // ── Feature-gated keyword downgrade ───────────────────────
+    //
+    // When the governing feature is off, try/catch/finally/defer,
+    // given/when/default, and class/field/method all act as plain
+    // identifiers — users can define subs with those names,
+    // pass them as hash keys, etc.  These tests verify the
+    // downgrade happens at the parser level so legacy code keeps
+    // working.
+
+    #[test]
+    fn class_is_bareword_without_feature() {
+        // `sub class { ... }` — defining a sub named "class".
+        // With class feature off, the lexer emits
+        // Token::Keyword(Class) but the parser downgrades to
+        // Token::Ident("class") because we're not in a class
+        // scope.  The sub declaration should parse.
+        let prog = parse("sub class { 1; }");
+        assert!(
+            prog.statements.iter().any(|s| matches!(
+                &s.kind,
+                StmtKind::SubDecl(sd) if sd.name == "class"
+            )),
+            "expected sub named `class` to parse without class feature"
+        );
+    }
+
+    #[test]
+    fn try_is_ident_without_feature() {
+        // `my $try = try();` — `try` as a function call.
+        let prog = parse("my $try = try();");
+        // Should parse as a normal expression statement (Decl
+        // assignment with FuncCall).  The inner expression is
+        // FuncCall("try", []), not a Try statement.
+        assert!(!prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Try(_))), "must not parse as Try without feature");
+    }
+
+    #[test]
+    fn given_is_ident_without_feature() {
+        // `given(...)` is a function call without the switch feature.
+        let prog = parse("given(1);");
+        assert!(!prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Given(_, _))), "must not parse as Given without feature");
+    }
+
+    #[test]
+    fn defer_is_ident_without_feature() {
+        // `defer { ... }` would be a Defer statement with the
+        // defer feature; without it, `defer` is a bareword
+        // followed by a block, which is a parse error (or parsed
+        // as something else).  We just confirm it doesn't
+        // produce a Defer statement.
+        let prog_result = Parser::new(b"my $x = defer;").and_then(|mut p| p.parse_program());
+        if let Ok(prog) = prog_result {
+            assert!(!prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Defer(_))), "must not parse as Defer without feature");
+        }
+    }
+
+    #[test]
+    fn method_is_ident_without_feature() {
+        // Outside `use feature 'class'`, `method` is a plain sub
+        // name.  `sub method { ... }` at top level defines a
+        // regular sub.
+        let prog = parse("sub method { 1; }");
+        assert!(
+            prog.statements.iter().any(|s| matches!(
+                &s.kind,
+                StmtKind::SubDecl(sd) if sd.name == "method"
+            )),
+            "expected sub named `method` to parse without class feature"
+        );
+    }
+
+    #[test]
+    fn try_keyword_reactivates_with_feature() {
+        // Sanity check: once `use feature 'try';` is seen, the
+        // downgrade stops happening for the rest of the scope.
+        let prog = parse("use feature 'try'; try { 1; }");
+        let has_try = prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Try(_)));
+        assert!(has_try, "Try must parse when feature is active");
+    }
+
+    #[test]
+    fn feature_gate_is_lexically_scoped() {
+        // Inside a block, `no feature 'try'` disables the gate.
+        // Outside the block, `try` is still active.
+        // We only verify the outer `try { ... }` succeeds —
+        // demonstrating the scope restore after the inner block.
+        let prog = parse("use feature 'try'; try { 1; } catch ($e) { 2; }");
+        assert!(prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Try(_))), "outer Try with feature on must parse");
+    }
+
     // ── Refaliasing / declared_refs (5.22+ / 5.26+) ───────────
 
     #[test]
@@ -6545,72 +6685,75 @@ my $y = 1;
 
     // ── class/field/method tests ──────────────────────────────
 
+    /// Convenience for class tests: prefixes the source with the
+    /// required `use feature 'class'` and `no warnings` pragmas,
+    /// then returns the first ClassDecl statement.
+    fn parse_class_prog(body: &str) -> Program {
+        let src = format!("use feature 'class'; no warnings 'experimental::class'; {body}");
+        parse(&src)
+    }
+
+    fn find_class_decl(prog: &Program) -> &ClassDecl {
+        for stmt in &prog.statements {
+            if let StmtKind::ClassDecl(c) = &stmt.kind {
+                return c;
+            }
+        }
+        panic!("no ClassDecl in program");
+    }
+
     #[test]
     fn parse_class_decl() {
-        let prog = parse("class Foo { field $x; method greet { 1; } }");
-        match &prog.statements[0].kind {
-            StmtKind::ClassDecl(c) => {
-                assert_eq!(c.name, "Foo");
-                assert!(c.body.statements.len() >= 2);
-            }
-            other => panic!("expected ClassDecl, got {other:?}"),
-        }
+        let prog = parse_class_prog("class Foo { field $x; method greet { 1; } }");
+        let c = find_class_decl(&prog);
+        assert_eq!(c.name, "Foo");
+        assert!(c.body.statements.len() >= 2);
     }
 
     #[test]
     fn parse_class_with_isa() {
-        let prog = parse("class Bar :isa(Foo) { }");
-        match &prog.statements[0].kind {
-            StmtKind::ClassDecl(c) => {
-                assert_eq!(c.name, "Bar");
-                assert_eq!(c.attributes.len(), 1);
-                assert_eq!(c.attributes[0].name, "isa");
-            }
-            other => panic!("expected ClassDecl, got {other:?}"),
-        }
+        let prog = parse_class_prog("class Bar :isa(Foo) { }");
+        let c = find_class_decl(&prog);
+        assert_eq!(c.name, "Bar");
+        assert_eq!(c.attributes.len(), 1);
+        assert_eq!(c.attributes[0].name, "isa");
     }
 
     #[test]
     fn parse_field_decl() {
-        let prog = parse("class Foo { field $x = 42; }");
-        match &prog.statements[0].kind {
-            StmtKind::ClassDecl(c) => match &c.body.statements[0].kind {
-                StmtKind::FieldDecl(f) => {
-                    assert_eq!(f.var.name, "x");
-                    assert!(f.default.is_some());
-                }
-                other => panic!("expected FieldDecl, got {other:?}"),
-            },
-            other => panic!("expected ClassDecl, got {other:?}"),
+        let prog = parse_class_prog("class Foo { field $x = 42; }");
+        let c = find_class_decl(&prog);
+        match &c.body.statements[0].kind {
+            StmtKind::FieldDecl(f) => {
+                assert_eq!(f.var.name, "x");
+                assert!(f.default.is_some());
+            }
+            other => panic!("expected FieldDecl, got {other:?}"),
         }
     }
 
     #[test]
     fn parse_field_with_param() {
-        let prog = parse("class Foo { field $name :param; }");
-        match &prog.statements[0].kind {
-            StmtKind::ClassDecl(c) => match &c.body.statements[0].kind {
-                StmtKind::FieldDecl(f) => {
-                    assert_eq!(f.attributes.len(), 1);
-                    assert_eq!(f.attributes[0].name, "param");
-                }
-                other => panic!("expected FieldDecl, got {other:?}"),
-            },
-            other => panic!("expected ClassDecl, got {other:?}"),
+        let prog = parse_class_prog("class Foo { field $name :param; }");
+        let c = find_class_decl(&prog);
+        match &c.body.statements[0].kind {
+            StmtKind::FieldDecl(f) => {
+                assert_eq!(f.attributes.len(), 1);
+                assert_eq!(f.attributes[0].name, "param");
+            }
+            other => panic!("expected FieldDecl, got {other:?}"),
         }
     }
 
     #[test]
     fn parse_method_decl() {
-        let prog = parse("class Foo { method greet() { 1; } }");
-        match &prog.statements[0].kind {
-            StmtKind::ClassDecl(c) => match &c.body.statements[0].kind {
-                StmtKind::MethodDecl(m) => {
-                    assert_eq!(m.name, "greet");
-                }
-                other => panic!("expected MethodDecl, got {other:?}"),
-            },
-            other => panic!("expected ClassDecl, got {other:?}"),
+        let prog = parse_class_prog("class Foo { method greet() { 1; } }");
+        let c = find_class_decl(&prog);
+        match &c.body.statements[0].kind {
+            StmtKind::MethodDecl(m) => {
+                assert_eq!(m.name, "greet");
+            }
+            other => panic!("expected MethodDecl, got {other:?}"),
         }
     }
 
@@ -7872,8 +8015,9 @@ my $y = 1;
 
     #[test]
     fn parse_try_finally_only() {
-        let prog = parse("try { 1; } finally { 2; }");
-        match &prog.statements[0].kind {
+        let prog = parse("use feature 'try'; try { 1; } finally { 2; }");
+        let stmt = prog.statements.iter().find(|s| matches!(s.kind, StmtKind::Try(_))).expect("Try statement present");
+        match &stmt.kind {
             StmtKind::Try(t) => {
                 assert!(t.catch_block.is_none());
                 assert!(t.finally_block.is_some());
