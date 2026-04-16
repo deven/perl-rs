@@ -1916,14 +1916,30 @@ impl Parser {
                         self.eat(&Token::Comma)?;
                     }
                 }
+                ProtoSlot::AutoRef(_) | ProtoSlot::AutoRefOneOf(_) | ProtoSlot::ArrayOrHash => {
+                    // Auto-reference slots: `\$`, `\@`, `\%`, `\&`,
+                    // `\*`, `\[...]`, and `+` (which is effectively
+                    // `\[@%]`).  The argument is parsed at named-
+                    // unary precedence and then wrapped in a Ref
+                    // expression — the call site receives a reference
+                    // to the variable rather than its value.  Whether
+                    // the argument is actually of the expected kind
+                    // (array for `\@`, etc.) is a semantic-pass
+                    // concern, not a parsing one.
+                    let arg = self.parse_expr(PREC_NAMED_UNARY)?;
+                    let span = arg.span;
+                    args.push(Expr { kind: ExprKind::Ref(Box::new(arg)), span });
+                    if i + 1 < proto.slots.len() {
+                        self.eat(&Token::Comma)?;
+                    }
+                }
                 _ => {
-                    // Scalar-ish slot (including `_`, which only
-                    // differs when omitted — handled above).  One
-                    // expression at named-unary precedence: operators
-                    // tighter than named unary (+ - * / << >>, etc.)
-                    // are consumed; operators looser (< == , ?:, etc.)
-                    // terminate the arg.  This matches Perl's semantics
-                    // for prototyped subs whose slot is a single scalar.
+                    // Scalar-ish slot (`$`, `_`).  One expression at
+                    // named-unary precedence: operators tighter than
+                    // named unary (+ - * / << >>, etc.) are consumed;
+                    // operators looser (< == , ?:, etc.) terminate
+                    // the arg.  This matches Perl's semantics for
+                    // prototyped subs whose slot is a single scalar.
                     let arg = self.parse_expr(PREC_NAMED_UNARY)?;
                     args.push(arg);
                     if i + 1 < proto.slots.len() {
@@ -7904,6 +7920,186 @@ mod tests {
                 assert_eq!(args.len(), 2);
                 assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
                 assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── Auto-reference prototype slots ──────────────────────────
+    //
+    // `\$`, `\@`, `\%`, `\&`, `\*`, `\[...]`, and `+` all cause
+    // the argument to be implicitly referenced at the call site.
+    // `foo @arr` with `sub foo (\@)` is equivalent to `foo(\@arr)`.
+    // The parser wraps the argument in an ExprKind::Ref; any
+    // validation that the argument is of the expected kind is a
+    // semantic-pass concern.
+
+    #[test]
+    fn proto_auto_ref_array() {
+        // sub foo (\@); foo @arr;  →  foo(\@arr)
+        let e = parse_call_with_proto("sub foo (\\@); foo @arr;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::ArrayVar(_)), "expected Ref(ArrayVar), got Ref({:?})", inner.kind);
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_auto_ref_hash() {
+        // sub foo (\%); foo %h;  →  foo(\%h)
+        let e = parse_call_with_proto("sub foo (\\%); foo %h;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::HashVar(_)), "expected Ref(HashVar), got Ref({:?})", inner.kind);
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_auto_ref_scalar() {
+        // sub foo (\$); foo $x;  →  foo(\$x)
+        let e = parse_call_with_proto("sub foo (\\$); foo $x;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::ScalarVar(_)));
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_auto_ref_one_of_takes_array() {
+        // sub foo (\[@%]); foo @arr;  →  foo(\@arr)
+        let e = parse_call_with_proto("sub foo (\\[@%]); foo @arr;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::ArrayVar(_)));
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_auto_ref_one_of_takes_hash() {
+        // sub foo (\[@%]); foo %h;  →  foo(\%h)
+        let e = parse_call_with_proto("sub foo (\\[@%]); foo %h;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::HashVar(_)));
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_array_or_hash_takes_array() {
+        // sub foo (+); foo @arr;  →  foo(\@arr)
+        // The `+` slot is effectively `\[@%]`.
+        let e = parse_call_with_proto("sub foo (+); foo @arr;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::ArrayVar(_)), "expected Ref(ArrayVar), got Ref({:?})", inner.kind);
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_array_or_hash_takes_hash() {
+        // sub foo (+); foo %h;  →  foo(\%h)
+        let e = parse_call_with_proto("sub foo (+); foo %h;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::HashVar(_)));
+                    }
+                    other => panic!("expected Ref, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_auto_ref_multiple_slots() {
+        // sub foo (\@\@); foo @a, @b;  →  foo(\@a, \@b)
+        let e = parse_call_with_proto("sub foo (\\@\\@); foo @a, @b;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 2);
+                for arg in args {
+                    match &arg.kind {
+                        ExprKind::Ref(inner) => {
+                            assert!(matches!(inner.kind, ExprKind::ArrayVar(_)));
+                        }
+                        other => panic!("expected Ref(ArrayVar), got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_auto_ref_mixed_with_slurpy() {
+        // sub foo (\@@); foo @a, $x, $y;  →  foo(\@a, $x, $y)
+        // First slot takes the array by ref; slurpy takes the rest.
+        let e = parse_call_with_proto("sub foo (\\@@); foo @a, $x, $y;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 3);
+                // First arg is the ref'd array.
+                match &args[0].kind {
+                    ExprKind::Ref(inner) => {
+                        assert!(matches!(inner.kind, ExprKind::ArrayVar(_)));
+                    }
+                    other => panic!("expected Ref(ArrayVar) first, got {other:?}"),
+                }
+                // Remaining two are scalar slurpy args, not ref'd.
+                assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)));
+                assert!(matches!(args[2].kind, ExprKind::ScalarVar(_)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
         }
