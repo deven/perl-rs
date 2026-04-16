@@ -353,7 +353,7 @@ impl Lexer {
             b'*' => self.lex_star(),
             b'/' => self.lex_slash(),
             b'.' => self.lex_dot(),
-            b'<' => self.lex_less_than(expect)?,
+            b'<' => self.lex_less_than()?,
             b'>' => self.lex_greater_than(),
             b'=' => self.lex_equals(),
             b'!' => self.lex_bang(),
@@ -1641,7 +1641,7 @@ impl Lexer {
         }
     }
 
-    fn lex_less_than(&mut self, expect: &Expect) -> Result<Token, ParseError> {
+    fn lex_less_than(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // consume first <
         match self.peek_byte(false) {
             Some(b'<') => {
@@ -1665,35 +1665,40 @@ impl Lexer {
                     Ok(Token::NumLe)
                 }
             }
-            _ => {
-                // In term position, < could be readline/glob: <STDIN>, <>, <$fh>, <*.txt>
-                if expect.expecting_term() {
-                    // Try to scan a readline: <...> where ... is the content
-                    let start_pos = self.line_pos(); // just after <
-                    let mut content = String::new();
-                    let mut found_close = false;
-                    while let Some(b) = self.peek_byte(false) {
-                        if b == b'>' {
-                            self.skip(1);
-                            found_close = true;
-                            break;
-                        }
-                        if b == b'\n' {
-                            break;
-                        } // no multiline
-                        self.skip(1);
-                        content.push(b as char);
-                    }
-                    if found_close {
-                        return Ok(Token::Readline(content));
-                    }
-                    // Not a readline — rewind
-                    if let Some(line) = self.current_line.as_mut() {
-                        line.pos = start_pos;
-                    }
-                }
-                Ok(Token::NumLt)
+            _ => Ok(Token::NumLt),
+        }
+    }
+
+    /// Called by the parser after consuming a `NumLt` token in term
+    /// position.  Attempts to scan a readline/glob construct: `<...>`
+    /// where the content ends at `>` on the same line.  Returns the
+    /// `Readline(content)` token if successful, or `None` if no `>`
+    /// terminates the content (the parser should then treat `<` as
+    /// less-than).
+    pub fn lex_readline_after_lt(&mut self) -> Option<Token> {
+        let start_pos = self.line_pos();
+        let mut content = String::new();
+        let mut found_close = false;
+        while let Some(b) = self.peek_byte(false) {
+            if b == b'>' {
+                self.skip(1);
+                found_close = true;
+                break;
             }
+            if b == b'\n' {
+                break;
+            }
+            self.skip(1);
+            content.push(b as char);
+        }
+        if found_close {
+            Some(Token::Readline(content))
+        } else {
+            // Not a readline — rewind.
+            if let Some(line) = self.current_line.as_mut() {
+                line.pos = start_pos;
+            }
+            None
         }
     }
 
@@ -1976,6 +1981,12 @@ mod tests {
             // In term context, Minus may introduce a filetest operator.
             if matches!(spanned.token, Token::Minus) && expect.expecting_term() {
                 if let Some(tok) = lexer.lex_filetest_after_minus() {
+                    spanned.token = tok;
+                }
+            }
+            // In term context, NumLt may introduce a readline/glob.
+            if matches!(spanned.token, Token::NumLt) && expect.expecting_term() {
+                if let Some(tok) = lexer.lex_readline_after_lt() {
                     spanned.token = tok;
                 }
             }
