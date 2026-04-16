@@ -85,11 +85,10 @@ impl Lexer {
     /// body scanning loops, `false` at entry points.
     fn peek_byte(&mut self, peek_heredoc: bool) -> Option<u8> {
         // Check current line for available bytes.
-        if let Some(line) = &self.current_line {
-            if let Some(b) = line.peek_byte() {
-                return Some(b);
-            }
-            // Line exhausted — fall through to load replacement.
+        if let Some(line) = &self.current_line
+            && let Some(b) = line.peek_byte()
+        {
+            return Some(b);
         }
         // No line or line exhausted.  Try to load a new one.
         // On success, replace the old line.  On failure, keep
@@ -541,10 +540,10 @@ impl Lexer {
             }
         }
         // Check for illegal binary digits (2-9)
-        if let Some(b) = self.peek_byte(false) {
-            if b.is_ascii_digit() {
-                return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), self.span_from(start)));
-            }
+        if let Some(b) = self.peek_byte(false)
+            && b.is_ascii_digit()
+        {
+            return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), self.span_from(start)));
         }
         let s = self.line_slice_str(bin_start)?.replace('_', "");
         let n = i64::from_str_radix(&s, 2).map_err(|_| ParseError::new("invalid binary literal", self.span_from(start)))?;
@@ -563,10 +562,10 @@ impl Lexer {
             }
         }
         // Check for illegal octal digits (8, 9)
-        if let Some(b) = self.peek_byte(false) {
-            if b == b'8' || b == b'9' {
-                return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), self.span_from(start)));
-            }
+        if let Some(b) = self.peek_byte(false)
+            && (b == b'8' || b == b'9')
+        {
+            return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), self.span_from(start)));
         }
         let s = self.line_slice_str(oct_start)?.replace('_', "");
         let n = i64::from_str_radix(&s, 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
@@ -579,12 +578,10 @@ impl Lexer {
         self.skip(1); // skip $
 
         // $# — array length
-        if self.peek_byte(false) == Some(b'#') {
-            if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
-                self.skip(1); // skip #
-                let name = self.scan_ident();
-                return Ok(Token::ArrayLen(name));
-            }
+        if self.peek_byte(false) == Some(b'#') && self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+            self.skip(1); // skip #
+            let name = self.scan_ident();
+            return Ok(Token::ArrayLen(name));
         }
 
         // Special variables: $$, $!, $@, $_, $0-$9, $/, $\, etc.
@@ -640,8 +637,8 @@ impl Lexer {
                 // could start any variable expression ($name, ${expr}, $0,
                 // $$nested, $!, etc.).  Only return SpecialVar("$") (PID)
                 // when nothing variable-like follows.
-                if let Some(b) = self.peek_byte_at(1) {
-                    if b == b'_'
+                if let Some(b) = self.peek_byte_at(1)
+                    && (b == b'_'
                         || b.is_ascii_alphabetic()
                         || b == b'{'
                         || b == b'$'
@@ -671,22 +668,21 @@ impl Lexer {
                         || b == b'%'
                         || b == b':'
                         || b == b'='
-                        || b == b'~'
-                    {
-                        return Ok(Token::Dollar);
-                    }
+                        || b == b'~')
+                {
+                    return Ok(Token::Dollar);
                 }
                 self.skip(1);
                 return Ok(Token::SpecialVar("$".into()));
             }
             Some(b'^') => {
                 // $^X — caret variable (single character after ^)
-                if let Some(next) = self.peek_byte_at(1) {
-                    if next.is_ascii_alphabetic() || next == b'[' || next == b']' {
-                        self.skip(2); // skip ^ and the character
-                        let name = format!("^{}", next as char);
-                        return Ok(Token::SpecialVar(name));
-                    }
+                if let Some(next) = self.peek_byte_at(1)
+                    && (next.is_ascii_alphabetic() || next == b'[' || next == b']')
+                {
+                    self.skip(2); // skip ^ and the character
+                    let name = format!("^{}", next as char);
+                    return Ok(Token::SpecialVar(name));
                 }
                 // Bare $^ — not a caret variable
                 return Ok(Token::Dollar);
@@ -1060,12 +1056,14 @@ impl Lexer {
 
         // Fast dispatch for closing delimiter (incremental mode:
         // context on the stack → pop and return QuoteEnd).
-        if let Some(c) = close {
-            if b == c && depth == 0 && !self.context_stack.is_empty() {
-                self.skip(1);
-                self.context_stack.pop();
-                return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
-            }
+        if let Some(c) = close
+            && b == c
+            && depth == 0
+            && !self.context_stack.is_empty()
+        {
+            self.skip(1);
+            self.context_stack.pop();
+            return Ok(Spanned { token: Token::QuoteEnd, span: Span::new(start, self.span_pos()) });
         }
         if interpolating {
             if b == b'$' {
@@ -1077,24 +1075,22 @@ impl Lexer {
         }
 
         // Regex code blocks: (?{...}) and (??{...}).
-        if regex && b == b'(' {
-            if self.peek_byte_at(1) == Some(b'?') {
-                if self.peek_byte_at(2) == Some(b'{') {
-                    // (?{ — consume 3 bytes, enter code mode.
-                    self.skip(3);
-                    if let Some(ctx) = self.context_stack.last_mut() {
-                        ctx.expr_depth = 1;
-                    }
-                    return Ok(Spanned { token: Token::RegexCodeStart, span: Span::new(start, self.span_pos()) });
+        if regex && b == b'(' && self.peek_byte_at(1) == Some(b'?') {
+            if self.peek_byte_at(2) == Some(b'{') {
+                // (?{ — consume 3 bytes, enter code mode.
+                self.skip(3);
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.expr_depth = 1;
                 }
-                if self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{') {
-                    // (??{ — consume 4 bytes, enter code mode.
-                    self.skip(4);
-                    if let Some(ctx) = self.context_stack.last_mut() {
-                        ctx.expr_depth = 1;
-                    }
-                    return Ok(Spanned { token: Token::RegexCondCodeStart, span: Span::new(start, self.span_pos()) });
+                return Ok(Spanned { token: Token::RegexCodeStart, span: Span::new(start, self.span_pos()) });
+            }
+            if self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{') {
+                // (??{ — consume 4 bytes, enter code mode.
+                self.skip(4);
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.expr_depth = 1;
                 }
+                return Ok(Spanned { token: Token::RegexCondCodeStart, span: Span::new(start, self.span_pos()) });
             }
         }
 
@@ -1190,10 +1186,8 @@ impl Lexer {
 
         // Update depth in context stack (only relevant for
         // interpolating mode with paired delimiters).
-        if interpolating {
-            if let Some(ctx) = self.context_stack.last_mut() {
-                ctx.depth = current_depth;
-            }
+        if interpolating && let Some(ctx) = self.context_stack.last_mut() {
+            ctx.depth = current_depth;
         }
 
         Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.span_pos()) })
@@ -1782,14 +1776,9 @@ impl Lexer {
     /// LexerSource handles terminator detection and indent stripping.
     fn collect_heredoc_literal(&mut self, tag: &str, indented: bool) -> Result<Token, ParseError> {
         let mut body = String::new();
-        loop {
-            match self.source.next_line(false)? {
-                Some(line) => {
-                    body.push_str(&String::from_utf8_lossy(&line.line));
-                    body.push('\n');
-                }
-                None => break, // terminator found by LexerSource
-            }
+        while let Some(line) = self.source.next_line(false)? {
+            body.push_str(&String::from_utf8_lossy(&line.line));
+            body.push('\n');
         }
         let kind = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
         Ok(Token::HeredocLit(kind, tag.to_string(), body))
@@ -1946,28 +1935,32 @@ mod tests {
             }
             // In term context, ShiftLeft may introduce a heredoc —
             // mimic what the parser does by calling the heredoc hook.
-            if matches!(spanned.token, Token::ShiftLeft) && term_context {
-                if let Some(tok) = lexer.lex_heredoc_after_shift_left().unwrap() {
-                    spanned.token = tok;
-                }
+            if matches!(spanned.token, Token::ShiftLeft)
+                && term_context
+                && let Some(tok) = lexer.lex_heredoc_after_shift_left().unwrap()
+            {
+                spanned.token = tok;
             }
             // In term context, Percent may introduce a hash variable.
-            if matches!(spanned.token, Token::Percent) && term_context {
-                if let Some(tok) = lexer.lex_hash_var_after_percent().unwrap() {
-                    spanned.token = tok;
-                }
+            if matches!(spanned.token, Token::Percent)
+                && term_context
+                && let Some(tok) = lexer.lex_hash_var_after_percent().unwrap()
+            {
+                spanned.token = tok;
             }
             // In term context, Minus may introduce a filetest operator.
-            if matches!(spanned.token, Token::Minus) && term_context {
-                if let Some(tok) = lexer.lex_filetest_after_minus() {
-                    spanned.token = tok;
-                }
+            if matches!(spanned.token, Token::Minus)
+                && term_context
+                && let Some(tok) = lexer.lex_filetest_after_minus()
+            {
+                spanned.token = tok;
             }
             // In term context, NumLt may introduce a readline/glob.
-            if matches!(spanned.token, Token::NumLt) && term_context {
-                if let Some(tok) = lexer.lex_readline_after_lt() {
-                    spanned.token = tok;
-                }
+            if matches!(spanned.token, Token::NumLt)
+                && term_context
+                && let Some(tok) = lexer.lex_readline_after_lt()
+            {
+                spanned.token = tok;
             }
             // Update term/operator state based on the token.
             match &spanned.token {
@@ -2190,6 +2183,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn lex_float() {
         let tokens = lex_all("3.14 1e10 2.5e-3");
         assert_eq!(tokens.len(), 3);

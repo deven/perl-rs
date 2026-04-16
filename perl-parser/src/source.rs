@@ -500,10 +500,10 @@ impl LexerSource {
                 let raw_prefix = self.src.slice(line_start..indent_end);
 
                 // Validate that the terminator starts with the outer indent.
-                if let Some(outer) = &self.required_indent {
-                    if !raw_prefix.starts_with(outer.as_ref()) {
-                        return Err(ParseError::new("indentation of here-doc doesn't match delimiter", Span::new(line_start as u32, content_end as u32)));
-                    }
+                if let Some(outer) = &self.required_indent
+                    && !raw_prefix.starts_with(outer.as_ref())
+                {
+                    return Err(ParseError::new("indentation of here-doc doesn't match delimiter", Span::new(line_start as u32, content_end as u32)));
                 }
 
                 return Ok(raw_prefix);

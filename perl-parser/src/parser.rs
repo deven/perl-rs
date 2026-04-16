@@ -108,13 +108,20 @@ impl Parser {
                 }
             });
         }
-        &self.current.as_ref().unwrap().token
+        // self.current is Some by construction above.
+        match &self.current {
+            Some(s) => &s.token,
+            None => unreachable!("peek_token: current is Some"),
+        }
     }
 
     /// Peek at the span of the current token.
     fn peek_span(&mut self) -> Span {
         self.peek_token();
-        self.current.as_ref().unwrap().span
+        match &self.current {
+            Some(s) => s.span,
+            None => unreachable!("peek_span: peek_token ensures current is Some"),
+        }
     }
 
     /// Consume and return the current token.
@@ -123,7 +130,10 @@ impl Parser {
         if let Some(e) = self.lexer_error.take() {
             return Err(e);
         }
-        Ok(self.current.take().unwrap())
+        match self.current.take() {
+            Some(s) => Ok(s),
+            None => unreachable!("next_token: peek_token ensures current is Some"),
+        }
     }
 
     fn expect_token(&mut self, expected: &Token) -> Result<Spanned, ParseError> {
@@ -1072,11 +1082,11 @@ impl Parser {
 
         // Fat comma autoquotes keywords: `if => 1` produces StringLit("if").
         // RightBrace also autoquotes: $hash{if} produces StringLit("if").
-        if let Token::Keyword(kw) = &spanned.token {
-            if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
-                let name: &str = (*kw).into();
-                return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-            }
+        if let Token::Keyword(kw) = &spanned.token
+            && matches!(self.peek_token(), Token::FatComma | Token::RightBrace)
+        {
+            let name: &str = (*kw).into();
+            return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
         }
 
         match spanned.token {
@@ -2206,7 +2216,7 @@ impl Parser {
             ExprKind::Local(_) => true,
             ExprKind::Decl(_, _) => true,
             ExprKind::Paren(inner) => Self::is_valid_lvalue(inner),
-            ExprKind::List(items) => items.iter().all(|e| Self::is_valid_lvalue(e)),
+            ExprKind::List(items) => items.iter().all(Self::is_valid_lvalue),
             ExprKind::Undef => true, // (undef, $x) = (1, 2)
             _ => false,
         }
@@ -2457,11 +2467,11 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
 fn merge_interp_parts(parts: Vec<InterpPart>) -> Vec<InterpPart> {
     let mut merged: Vec<InterpPart> = Vec::new();
     for part in parts {
-        if let InterpPart::Const(s) = &part {
-            if let Some(InterpPart::Const(prev)) = merged.last_mut() {
-                prev.push_str(s);
-                continue;
-            }
+        if let InterpPart::Const(s) = &part
+            && let Some(InterpPart::Const(prev)) = merged.last_mut()
+        {
+            prev.push_str(s);
+            continue;
         }
         merged.push(part);
     }
@@ -2860,7 +2870,7 @@ mod tests {
         let e = parse_expr_str("/foo/i;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(&pat), "foo");
+                assert_eq!(pat_str(pat), "foo");
                 assert_eq!(flags.as_deref(), Some("i"));
             }
             other => panic!("expected Regex, got {other:?}"),
@@ -2885,7 +2895,7 @@ mod tests {
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat_str(&pat), "");
+                    assert_eq!(pat_str(pat), "");
                     assert!(flags.is_none());
                 }
                 other => panic!("expected empty Regex, got {other:?}"),
@@ -2900,7 +2910,7 @@ mod tests {
         let e = parse_expr_str("//;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(&pat), "");
+                assert_eq!(pat_str(pat), "");
                 assert!(flags.is_none());
             }
             other => panic!("expected empty Regex, got {other:?}"),
@@ -2914,7 +2924,7 @@ mod tests {
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat_str(&pat), "");
+                    assert_eq!(pat_str(pat), "");
                     assert_eq!(flags.as_deref(), Some("gi"));
                 }
                 other => panic!("expected empty Regex with flags, got {other:?}"),
@@ -2929,7 +2939,7 @@ mod tests {
         let e = parse_expr_str("//gi;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(&pat), "");
+                assert_eq!(pat_str(pat), "");
                 assert_eq!(flags.as_deref(), Some("gi"));
             }
             other => panic!("expected empty Regex with flags, got {other:?}"),
@@ -2971,7 +2981,7 @@ mod tests {
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat_str(&pat), "");
+                    assert_eq!(pat_str(pat), "");
                     assert_eq!(flags.as_deref(), Some("gi"));
                 }
                 other => panic!("expected Regex, got {other:?}"),
@@ -2983,7 +2993,7 @@ mod tests {
         match &e2.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat_str(&pat), "");
+                    assert_eq!(pat_str(pat), "");
                     assert!(flags.is_none());
                 }
                 other => panic!("expected Regex with empty flags, got {other:?}"),
@@ -5492,7 +5502,7 @@ mod tests {
         let prog = parse("{my $x = 1; $x};");
         match &prog.statements[0].kind {
             StmtKind::Block(block) => {
-                assert!(block.statements.len() >= 1);
+                assert!(!block.statements.is_empty());
             }
             other => panic!("expected Block, got {other:?}"),
         }
@@ -5576,7 +5586,7 @@ mod tests {
         let e = parse_expr_str("/foo/imsxg;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(&pat), "foo");
+                assert_eq!(pat_str(pat), "foo");
                 assert_eq!(flags.as_deref(), Some("imsxg"));
             }
             other => panic!("expected Regex with flags, got {other:?}"),
@@ -5587,7 +5597,7 @@ mod tests {
     fn parse_qr_regex() {
         let e = parse_expr_str("qr/\\d+/;");
         match &e.kind {
-            ExprKind::Regex(_, pat, _) => assert_eq!(pat_str(&pat), "\\d+"),
+            ExprKind::Regex(_, pat, _) => assert_eq!(pat_str(pat), "\\d+"),
             other => panic!("expected Regex (qr), got {other:?}"),
         }
     }
@@ -5613,7 +5623,7 @@ mod tests {
         let e = parse_expr_str("m'foo$bar';");
         match &e.kind {
             ExprKind::Regex(_, pat, _) => {
-                assert_eq!(pat_str(&pat), "foo$bar");
+                assert_eq!(pat_str(pat), "foo$bar");
             }
             other => panic!("expected Regex, got {other:?}"),
         }
