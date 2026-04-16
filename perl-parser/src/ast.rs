@@ -272,10 +272,10 @@ impl Interpolated {
         if self.0.is_empty() {
             return Some(String::new());
         }
-        if self.0.len() == 1 {
-            if let InterpPart::Const(s) = &self.0[0] {
-                return Some(s.clone());
-            }
+        if self.0.len() == 1
+            && let InterpPart::Const(s) = &self.0[0]
+        {
+            return Some(s.clone());
         }
         None
     }
