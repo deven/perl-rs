@@ -174,13 +174,24 @@ impl Parser {
 
     // ── Depth control ─────────────────────────────────────────
 
-    fn descend(&mut self) -> Result<(), ParseError> {
+    /// Increment the recursion-depth counter, invoke `f`, then
+    /// decrement unconditionally — even if `f` returns an error.
+    /// This is the closure-based alternative to RAII descent guards
+    /// (which would conflict with `&mut self` re-borrows inside `f`).
+    ///
+    /// If entering would exceed `MAX_DEPTH`, returns an error without
+    /// calling `f`.
+    fn with_descent<T, F>(&mut self, f: F) -> Result<T, ParseError>
+    where
+        F: FnOnce(&mut Self) -> Result<T, ParseError>,
+    {
+        if self.depth + 1 >= MAX_DEPTH {
+            return Err(ParseError::new("nesting too deep", self.peek_span()));
+        }
         self.depth += 1;
-        if self.depth >= MAX_DEPTH { Err(ParseError::new("nesting too deep", self.peek_span())) } else { Ok(()) }
-    }
-
-    fn ascend(&mut self) {
+        let result = f(self);
         self.depth -= 1;
+        result
     }
 
     // ── Flag validation ───────────────────────────────────────
@@ -287,11 +298,11 @@ impl Parser {
                 self.next_token()?; // consume the keyword
                 if matches!(self.peek_token(), Token::FatComma) {
                     // Autoquote: keyword is used as a hash key.
-                    self.descend()?;
-                    let name: &str = kw.into();
-                    let initial = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
-                    let expr = self.parse_expr_continuation(initial, PREC_LOW)?;
-                    self.ascend();
+                    let expr = self.with_descent(|this| {
+                        let name: &str = kw.into();
+                        let initial = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
+                        this.parse_expr_continuation(initial, PREC_LOW)
+                    })?;
                     let kind = self.maybe_postfix_control(expr)?;
                     let terminated = self.eat(&Token::Semi)?;
                     (kind, terminated)
@@ -394,10 +405,10 @@ impl Parser {
                     (StmtKind::Labeled(name, Box::new(stmt)), false)
                 } else {
                     // Expression starting with an identifier.
-                    self.descend()?;
-                    let initial = self.parse_ident_term(name, ident_span)?;
-                    let expr = self.parse_expr_continuation(initial, PREC_LOW)?;
-                    self.ascend();
+                    let expr = self.with_descent(|this| {
+                        let initial = this.parse_ident_term(name, ident_span)?;
+                        this.parse_expr_continuation(initial, PREC_LOW)
+                    })?;
                     let kind = self.maybe_postfix_control(expr)?;
                     let terminated = self.eat(&Token::Semi)?;
                     (kind, terminated)
@@ -771,17 +782,63 @@ impl Parser {
     }
 
     fn parse_use_decl(&mut self, start: Span, is_no: bool) -> Result<StmtKind, ParseError> {
-        let module = match self.next_token()?.token {
+        // First argument: either a version (use 5.020) or a module name.
+        let first = self.next_token()?;
+        let module = match first.token {
             Token::Ident(n) => n,
-            Token::StrLit(n) => n, // v-strings: use v5.26.0
-            Token::IntLit(n) => format!("{n}"),
-            Token::FloatLit(n) => format!("{n}"),
-            other => return Err(ParseError::new(format!("expected module name, got {other:?}"), start)),
+            // Bare version: `use 5.020;` / `use v5.36;` — module slot
+            // gets the version; no further version or imports.
+            Token::IntLit(n) => {
+                self.eat(&Token::Semi)?;
+                return Ok(StmtKind::UseDecl(UseDecl { is_no, module: format!("{n}"), version: None, imports: None, span: start.merge(self.peek_span()) }));
+            }
+            Token::FloatLit(n) => {
+                self.eat(&Token::Semi)?;
+                return Ok(StmtKind::UseDecl(UseDecl { is_no, module: format!("{n}"), version: None, imports: None, span: start.merge(self.peek_span()) }));
+            }
+            Token::StrLit(n) => n, // v-strings come through as StrLit
+            other => return Err(ParseError::new(format!("expected module name or version, got {other:?}"), start)),
         };
 
-        // Optional version and import list
-        let version = None; // simplified for bootstrap
-        let imports = None;
+        // Optional version after the module name: `use Module 1.23;`
+        // or `use Module v5.26;`.  Versions are either numeric literals or
+        // v-string StrLit tokens; anything else starts the import list.
+        let version = match self.peek_token() {
+            Token::IntLit(_) | Token::FloatLit(_) => {
+                let tok = self.next_token()?;
+                Some(match tok.token {
+                    Token::IntLit(n) => format!("{n}"),
+                    Token::FloatLit(n) => format!("{n}"),
+                    _ => unreachable!(),
+                })
+            }
+            // v-string literal like v5.26.0 — lexed as StrLit.
+            Token::StrLit(s) if s.starts_with('v') && s.len() > 1 && s.as_bytes()[1].is_ascii_digit() => {
+                let tok = self.next_token()?;
+                Some(match tok.token {
+                    Token::StrLit(s) => s,
+                    _ => unreachable!(),
+                })
+            }
+            _ => None,
+        };
+
+        // Optional import list: anything until the semicolon.
+        let imports = if self.at(&Token::Semi)? || self.at_eof()? {
+            None
+        } else {
+            let mut items = Vec::new();
+            loop {
+                if self.at(&Token::Semi)? || self.at_eof()? {
+                    break;
+                }
+                items.push(self.parse_expr(PREC_COMMA + 1)?);
+                if !self.eat(&Token::Comma)? && !self.eat(&Token::FatComma)? {
+                    break;
+                }
+            }
+            Some(items)
+        };
 
         self.eat(&Token::Semi)?;
 
@@ -1026,20 +1083,20 @@ impl Parser {
     // ── Block parsing ─────────────────────────────────────────
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
-        self.descend()?;
-        let start = self.peek_span();
-        self.expect_token(&Token::LeftBrace)?;
+        self.with_descent(|this| {
+            let start = this.peek_span();
+            this.expect_token(&Token::LeftBrace)?;
 
-        let mut statements = Vec::new();
-        while !self.at(&Token::RightBrace)? && !self.at_eof()? {
-            statements.push(self.parse_statement()?);
-        }
+            let mut statements = Vec::new();
+            while !this.at(&Token::RightBrace)? && !this.at_eof()? {
+                statements.push(this.parse_statement()?);
+            }
 
-        let end = self.peek_span();
-        self.expect_token(&Token::RightBrace)?;
-        self.ascend();
+            let end = this.peek_span();
+            this.expect_token(&Token::RightBrace)?;
 
-        Ok(Block { statements, span: start.merge(end) })
+            Ok(Block { statements, span: start.merge(end) })
+        })
     }
 
     fn parse_paren_expr(&mut self) -> Result<Expr, ParseError> {
@@ -1052,13 +1109,10 @@ impl Parser {
     // ── Expression parsing (Pratt) ────────────────────────────
 
     fn parse_expr(&mut self, min_prec: Precedence) -> Result<Expr, ParseError> {
-        self.descend()?;
-
-        let left = self.parse_term()?;
-        let result = self.parse_expr_continuation(left, min_prec)?;
-
-        self.ascend();
-        Ok(result)
+        self.with_descent(|this| {
+            let left = this.parse_term()?;
+            this.parse_expr_continuation(left, min_prec)
+        })
     }
 
     /// Continue parsing an expression from a pre-built left-hand side.
@@ -1920,10 +1974,10 @@ impl Parser {
             if matches!(self.peek_token(), Token::Comma) {
                 // Bareword followed by comma → first argument, not filehandle.
                 // `print CONSTANT, "hello"`.
-                self.descend()?;
-                let initial = self.parse_ident_term(fh_name, fh_span)?;
-                let expr = self.parse_expr_continuation(initial, PREC_COMMA + 1)?;
-                self.ascend();
+                let expr = self.with_descent(|this| {
+                    let initial = this.parse_ident_term(fh_name, fh_span)?;
+                    this.parse_expr_continuation(initial, PREC_COMMA + 1)
+                })?;
                 first_arg = Some(expr);
             } else {
                 // Bareword not followed by comma → filehandle.
@@ -1962,11 +2016,11 @@ impl Parser {
                 filehandle = Some(Box::new(Expr { kind: ExprKind::ScalarVar(var_name), span: var_span }));
             } else {
                 // `print $x + 1` → not filehandle, first argument.
-                self.descend()?;
-                let var_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
-                let initial = self.maybe_postfix_subscript(var_expr)?;
-                let expr = self.parse_expr_continuation(initial, PREC_COMMA + 1)?;
-                self.ascend();
+                let expr = self.with_descent(|this| {
+                    let var_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
+                    let initial = this.maybe_postfix_subscript(var_expr)?;
+                    this.parse_expr_continuation(initial, PREC_COMMA + 1)
+                })?;
                 first_arg = Some(expr);
             }
         }
@@ -2716,6 +2770,73 @@ mod tests {
         let prog = parse("use strict;");
         match &prog.statements[0].kind {
             StmtKind::UseDecl(u) => assert_eq!(u.module, "strict"),
+            other => panic!("expected UseDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_use_with_version() {
+        let prog = parse("use Foo 1.23;");
+        match &prog.statements[0].kind {
+            StmtKind::UseDecl(u) => {
+                assert_eq!(u.module, "Foo");
+                assert_eq!(u.version.as_deref(), Some("1.23"));
+                assert!(u.imports.is_none());
+            }
+            other => panic!("expected UseDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_use_with_imports() {
+        let prog = parse("use Foo qw(bar baz);");
+        match &prog.statements[0].kind {
+            StmtKind::UseDecl(u) => {
+                assert_eq!(u.module, "Foo");
+                assert!(u.version.is_none());
+                let imports = u.imports.as_ref().expect("expected imports");
+                assert_eq!(imports.len(), 1);
+                assert!(matches!(&imports[0].kind, ExprKind::QwList(_)));
+            }
+            other => panic!("expected UseDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_use_with_version_and_imports() {
+        let prog = parse("use Foo 1.23 qw(bar baz);");
+        match &prog.statements[0].kind {
+            StmtKind::UseDecl(u) => {
+                assert_eq!(u.module, "Foo");
+                assert_eq!(u.version.as_deref(), Some("1.23"));
+                assert!(u.imports.is_some());
+            }
+            other => panic!("expected UseDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_use_perl_version() {
+        let prog = parse("use 5.020;");
+        match &prog.statements[0].kind {
+            StmtKind::UseDecl(u) => {
+                assert_eq!(u.module, "5.02"); // 5.020 → 5.02 in float form
+                assert!(u.version.is_none());
+                assert!(u.imports.is_none());
+            }
+            other => panic!("expected UseDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_use_with_list_imports() {
+        let prog = parse("use Foo 'bar', 'baz';");
+        match &prog.statements[0].kind {
+            StmtKind::UseDecl(u) => {
+                assert_eq!(u.module, "Foo");
+                let imports = u.imports.as_ref().expect("expected imports");
+                assert_eq!(imports.len(), 2);
+            }
             other => panic!("expected UseDecl, got {other:?}"),
         }
     }
