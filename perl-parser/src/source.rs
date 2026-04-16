@@ -116,6 +116,10 @@ struct HeredocContext {
 pub(crate) struct LexerSource {
     /// The complete source buffer.
     src: Bytes,
+    /// Name of the source — used for `__FILE__` resolution and
+    /// diagnostic messages.  Defaults to `"(script)"` when the
+    /// caller doesn't supply one (e.g., `Parser::new(src)`).
+    filename: String,
     /// Current byte position for reading the next line.
     cursor: usize,
     /// Next line number to assign (1-based).
@@ -150,13 +154,22 @@ struct RawLine {
 }
 
 impl LexerSource {
-    /// Create a new `LexerSource` from a byte slice.
+    /// Create a new `LexerSource` from a byte slice, using the
+    /// default placeholder filename `"(script)"`.
     ///
     /// The bytes are copied into a `Bytes` buffer once.  All subsequent
     /// line slicing is zero-copy.
     pub fn new(src: &[u8]) -> Self {
+        Self::with_filename(src, "(script)")
+    }
+
+    /// Create a new `LexerSource` with a specific filename.  The
+    /// filename is surfaced via [`Self::filename`] and used for
+    /// `__FILE__` resolution.
+    pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
         LexerSource {
             src: Bytes::copy_from_slice(src),
+            filename: filename.into(),
             cursor: 0,
             line_number: 1,
             heredoc_stack: Vec::new(),
@@ -169,11 +182,13 @@ impl LexerSource {
     }
 
     /// Create a new `LexerSource` from an existing `Bytes` buffer.
-    /// Zero-copy — just a refcount bump.
+    /// Zero-copy — just a refcount bump.  Uses the default
+    /// placeholder filename.
     #[allow(dead_code)]
     pub fn from_bytes(src: Bytes) -> Self {
         LexerSource {
             src,
+            filename: "(script)".into(),
             cursor: 0,
             line_number: 1,
             heredoc_stack: Vec::new(),
@@ -198,10 +213,10 @@ impl LexerSource {
     }
 
     /// Name of the source file being lexed, for `__FILE__`
-    /// resolution.  Currently a static placeholder; a follow-up
-    /// will plumb the real filename from the caller of `Parser::new`.
+    /// resolution and diagnostics.  Defaults to `"(script)"`
+    /// when the caller used [`Self::new`] without a filename.
     pub fn filename(&self) -> &str {
-        "(script)"
+        &self.filename
     }
 
     /// Raw slice of the source buffer.  For rare operations that need

@@ -114,7 +114,19 @@ impl Parser {
     // ── Construction ──────────────────────────────────────────
 
     pub fn new(src: &[u8]) -> Result<Self, ParseError> {
-        let lexer = Lexer::new(src);
+        Self::from_lexer(Lexer::new(src))
+    }
+
+    /// Construct a parser that reports `filename` for `__FILE__`
+    /// resolution and in diagnostic messages.  Prefer this over
+    /// [`Self::new`] when the source comes from a named file.
+    pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Result<Self, ParseError> {
+        Self::from_lexer(Lexer::with_filename(src, filename))
+    }
+
+    /// Shared core: all constructors funnel through here so
+    /// field initialization stays in one place.
+    fn from_lexer(lexer: Lexer) -> Result<Self, ParseError> {
         Ok(Parser {
             lexer,
             current: None,
@@ -5850,12 +5862,24 @@ sub outer ($x) { 1 }
 
     #[test]
     fn source_file_captured_at_lex_time() {
+        // Default filename placeholder when constructed via
+        // `parse(src)` / `Parser::new(src)`.
         let e = parse_expr_stmt("__FILE__;");
         match e.kind {
-            ExprKind::SourceFile(path) => {
-                // Placeholder static value until filename is plumbed.
-                assert_eq!(path, "(script)");
-            }
+            ExprKind::SourceFile(path) => assert_eq!(path, "(script)"),
+            other => panic!("expected SourceFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_file_uses_custom_filename() {
+        // `Parser::with_filename` / `parse_with_filename` plumbs
+        // the filename through to `LexerSource::filename()`,
+        // which `__FILE__` reads at lex time.
+        let prog = crate::parse_with_filename(b"__FILE__;", "my_script.pl").expect("parse should succeed");
+        let expr = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("expression statement");
+        match expr.kind {
+            ExprKind::SourceFile(path) => assert_eq!(path, "my_script.pl"),
             other => panic!("expected SourceFile, got {other:?}"),
         }
     }

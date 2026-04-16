@@ -31,3 +31,10 @@ pub fn parse(src: &[u8]) -> Result<Program, ParseError> {
     let mut p = parser::Parser::new(src)?;
     p.parse_program()
 }
+
+/// Parse Perl source into an AST, recording `filename` for
+/// `__FILE__` resolution and in diagnostic messages.
+pub fn parse_with_filename(src: &[u8], filename: impl Into<String>) -> Result<Program, ParseError> {
+    let mut p = parser::Parser::with_filename(src, filename)?;
+    p.parse_program()
+}

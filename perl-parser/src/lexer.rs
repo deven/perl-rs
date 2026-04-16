@@ -106,6 +106,13 @@ impl Lexer {
         Lexer { source: LexerSource::new(src), current_line: None, context_stack: Vec::new(), pending_error: None, format_state: None }
     }
 
+    /// Construct with an explicit filename (used for `__FILE__`
+    /// and diagnostic messages).  Equivalent to `Lexer::new` when
+    /// the caller doesn't care about filename reporting.
+    pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
+        Lexer { source: LexerSource::with_filename(src, filename), current_line: None, context_stack: Vec::new(), pending_error: None, format_state: None }
+    }
+
     /// Global byte position in the original source.
     pub fn pos(&self) -> usize {
         match &self.current_line {
