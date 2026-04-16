@@ -296,7 +296,7 @@ impl LexerSource {
     /// taken from the Option (setting it to None) and saved internally
     /// for restoration when the terminator is found.
     pub fn start_indented_heredoc(&mut self, tag: Bytes, current_line: &mut Option<LexerLine>) -> Result<(), ParseError> {
-        let line = current_line.take().expect("start_indented_heredoc: must have current line");
+        let line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_indented_heredoc called without a current line", Span::DUMMY))?;
         let prev_indent = self.required_indent.clone();
 
         // Scan ahead for the terminator to determine indentation.
@@ -314,11 +314,12 @@ impl LexerSource {
     /// The current line is taken from the Option (setting it to None)
     /// and saved internally for restoration when the terminator is
     /// found.  Does not change the required indentation.
-    pub fn start_heredoc(&mut self, tag: Bytes, current_line: &mut Option<LexerLine>) {
-        let line = current_line.take().expect("start_heredoc: must have current line");
+    pub fn start_heredoc(&mut self, tag: Bytes, current_line: &mut Option<LexerLine>) -> Result<(), ParseError> {
+        let line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_heredoc called without a current line", Span::DUMMY))?;
         let prev_indent = self.required_indent.clone();
 
         self.heredoc_stack.push(HeredocContext { tag, saved_line: line, prev_indent });
+        Ok(())
     }
 
     /// Begin processing a substitution replacement body.
@@ -330,7 +331,7 @@ impl LexerSource {
     ///
     /// Returns the captured flags (or None if no flags).
     pub fn start_subst_body(&mut self, delim: u8, current_line: &mut Option<LexerLine>) -> Result<Option<String>, ParseError> {
-        let mut line = current_line.take().expect("start_subst_body: must have current line");
+        let mut line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_subst_body called without a current line", Span::DUMMY))?;
 
         let (open, close) = matching_delimiter(delim);
         let mut body_lines: VecDeque<LexerLine> = VecDeque::new();
@@ -516,6 +517,7 @@ impl LexerSource {
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -683,7 +685,7 @@ mod tests {
             terminated: decl.terminated,
             pos: 13, // pointing at ` . "suffix";`
         });
-        source.start_heredoc(Bytes::from_static(b"END"), &mut current_line);
+        source.start_heredoc(Bytes::from_static(b"END"), &mut current_line).unwrap();
         assert!(current_line.is_none());
 
         // Next line: heredoc body.
@@ -710,7 +712,7 @@ mod tests {
         let decl = source.next_line(false).unwrap().unwrap();
 
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5 });
-        source.start_heredoc(Bytes::from_static(b"END"), &mut current);
+        source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         // Immediate terminator → None.
         assert!(source.next_line(false).unwrap().is_none());
@@ -723,7 +725,7 @@ mod tests {
         let decl = source.next_line(false).unwrap().unwrap();
 
         let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5 });
-        source.start_heredoc(Bytes::from_static(b"END"), &mut current);
+        source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         // Read body lines.
         source.next_line(false).unwrap().unwrap(); // hello
@@ -755,7 +757,7 @@ mod tests {
             terminated: decl.terminated,
             pos: 4, // after "<<A"
         });
-        source.start_heredoc(Bytes::from_static(b"A"), &mut current);
+        source.start_heredoc(Bytes::from_static(b"A"), &mut current).unwrap();
 
         // A's body.
         let body_a = source.next_line(false).unwrap().unwrap();
@@ -776,7 +778,7 @@ mod tests {
             terminated: remainder.terminated,
             pos: 10, // after ", <<B"
         });
-        source.start_heredoc(Bytes::from_static(b"B"), &mut current);
+        source.start_heredoc(Bytes::from_static(b"B"), &mut current).unwrap();
 
         // B's body.
         let body_b = source.next_line(false).unwrap().unwrap();
@@ -885,7 +887,7 @@ mod tests {
             terminated: l1.terminated,
             pos: 14, // after "prefix <<INNER"
         });
-        source.start_heredoc(Bytes::from_static(b"INNER"), &mut current);
+        source.start_heredoc(Bytes::from_static(b"INNER"), &mut current).unwrap();
 
         // INNER body (outer indent still stripped).
         let inner_body = source.next_line(false).unwrap().unwrap();

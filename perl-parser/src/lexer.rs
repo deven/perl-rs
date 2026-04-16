@@ -1,16 +1,18 @@
-//! Lexer — context-sensitive tokenizer.
+//! Lexer — tokenizer.
 //!
-//! The lexer and parser are inseparable: the lexer reads `self.expect`
-//! (set by the parser) to resolve ambiguities like `/` (regex vs division)
-//! and `{` (block vs hash).
+//! The lexer returns unambiguous tokens; where Perl syntax is
+//! context-sensitive (e.g. `<<` meaning heredoc vs shift-left,
+//! `%` meaning hash-sigil vs modulo), the parser invokes specific
+//! hook methods (e.g. `lex_heredoc_after_shift_left`,
+//! `lex_hash_var_after_percent`) to drive the disambiguation.
 //!
-//! This module implements the core tokenization loop.  Quote-like sublexing,
-//! heredocs, and regex scanning are handled by helper methods.
+//! This module implements the core tokenization loop.  Quote-like
+//! sublexing, heredocs, and regex scanning are handled by helper
+//! methods.
 
 use bytes::Bytes;
 
 use crate::error::ParseError;
-use crate::expect::Expect;
 use crate::keyword;
 use crate::source::{LexerLine, LexerSource};
 use crate::span::Span;
@@ -40,12 +42,13 @@ struct LexContext {
     regex: bool,
 }
 
-/// Lexer state, embedded in the `Parser` struct (not standalone).
+/// Lexer state, owned by the `Parser`.
 ///
-/// The lexer operates on lines delivered by `LexerSource`.  It reads
-/// the `expect` field to resolve context-sensitive ambiguities.
-/// The context stack tracks sublexing modes (interpolating strings,
-/// regex patterns, heredocs).
+/// The lexer operates on lines delivered by `LexerSource`.  The
+/// context stack tracks sublexing modes (interpolating strings,
+/// regex patterns, heredocs).  Context-sensitive disambiguation
+/// (e.g. heredoc vs shift-left for `<<`) is driven by the parser
+/// via explicit hook methods.
 ///
 /// CRLF normalization is handled by `LexerSource` at the line level.
 pub(crate) struct Lexer {
@@ -269,10 +272,10 @@ impl Lexer {
 
     // ── Main tokenization entry point ─────────────────────────
 
-    /// Lex the next token.  Uses `expect` to resolve ambiguities.
-    /// When inside a sublexing context (interpolating string, etc.),
-    /// dispatches to the appropriate sub-lexer instead.
-    pub fn lex_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
+    /// Lex the next token.  When inside a sublexing context
+    /// (interpolating string, etc.), dispatches to the appropriate
+    /// sub-lexer instead.
+    pub fn lex_token(&mut self) -> Result<Spanned, ParseError> {
         // Surface any deferred error from auto-loading in peek_byte.
         if let Some(e) = self.pending_error.take() {
             return Err(e);
@@ -282,7 +285,7 @@ impl Lexer {
         match self.context_stack.last() {
             Some(ctx) if ctx.expr_depth > 0 => {
                 // Normal code lexing inside ${expr} or @{expr}.
-                let result = self.lex_normal_token(expect)?;
+                let result = self.lex_normal_token()?;
                 // Track brace depth to find the closing }.
                 match &result.token {
                     Token::LeftBrace => {
@@ -306,11 +309,11 @@ impl Lexer {
             None => {}
         }
 
-        self.lex_normal_token(expect)
+        self.lex_normal_token()
     }
 
     /// Lex a token in normal (code) mode.
-    fn lex_normal_token(&mut self, expect: &Expect) -> Result<Spanned, ParseError> {
+    fn lex_normal_token(&mut self) -> Result<Spanned, ParseError> {
         self.skip_ws_and_comments()?;
 
         let start = self.span_pos();
@@ -327,12 +330,12 @@ impl Lexer {
             b'0'..=b'9' => self.lex_number()?,
 
             // ── Sigils → variables ────────────────────────────
-            b'$' => self.lex_dollar(expect)?,
+            b'$' => self.lex_dollar()?,
             b'@' => self.lex_at()?,
             b'%' => self.lex_percent()?,
 
             // ── Identifiers and keywords ──────────────────────
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_word(expect)?,
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_word()?,
 
             // ── Strings ───────────────────────────────────────
             b'\'' => self.lex_single_quoted_string()?,
@@ -572,7 +575,7 @@ impl Lexer {
 
     // ── Variables ($, @, %) ───────────────────────────────────
 
-    fn lex_dollar(&mut self, _expect: &Expect) -> Result<Token, ParseError> {
+    fn lex_dollar(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip $
 
         // $# — array length
@@ -926,19 +929,8 @@ impl Lexer {
         String::from_utf8_lossy(self.line_slice(start)).into_owned()
     }
 
-    fn lex_word(&mut self, expect: &Expect) -> Result<Token, ParseError> {
+    fn lex_word(&mut self) -> Result<Token, ParseError> {
         let name = self.scan_ident();
-
-        // After -> (Ref position), all words are identifiers — no keyword
-        // lookup.  `$obj->method`, `$obj->keys`, `$obj->print` are all
-        // method calls, not keywords.
-        if *expect == Expect::Deref {
-            return Ok(Token::Ident(name));
-        }
-
-        // Check for `=>` after bareword (fat comma autoquotes)
-        // We don't consume the `=>` — just recognize the word as a string
-        // when `=>` follows.  Actually the parser should handle this.
 
         // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or,
         // xor, not) are always emitted as Ident(name).  The parser
@@ -1766,7 +1758,7 @@ impl Lexer {
         // serving heredoc body lines on subsequent next_line() calls.
         match kind {
             HeredocKind::Interpolating => {
-                self.source.start_heredoc(tag_bytes, &mut self.current_line);
+                self.source.start_heredoc(tag_bytes, &mut self.current_line)?;
                 self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
                 Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
             }
@@ -1776,7 +1768,7 @@ impl Lexer {
                 Ok(Token::QuoteBegin(QuoteKind::Heredoc, 0))
             }
             HeredocKind::Literal => {
-                self.source.start_heredoc(tag_bytes, &mut self.current_line);
+                self.source.start_heredoc(tag_bytes, &mut self.current_line)?;
                 self.collect_heredoc_literal(&tag, false)
             }
             HeredocKind::IndentedLiteral => {
@@ -1939,44 +1931,45 @@ fn hex_digit(b: u8) -> u8 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     fn lex_all(src: &str) -> Vec<Token> {
         let mut lexer = Lexer::new(src.as_bytes());
-        let mut expect = Expect::Statement;
+        let mut term_context = true; // start of statement is term context
         let mut tokens = Vec::new();
         loop {
-            let mut spanned = lexer.lex_token(&expect).unwrap();
+            let mut spanned = lexer.lex_token().unwrap();
             if matches!(spanned.token, Token::Eof) {
                 break;
             }
             // In term context, ShiftLeft may introduce a heredoc —
             // mimic what the parser does by calling the heredoc hook.
-            if matches!(spanned.token, Token::ShiftLeft) && expect.expecting_term() {
+            if matches!(spanned.token, Token::ShiftLeft) && term_context {
                 if let Some(tok) = lexer.lex_heredoc_after_shift_left().unwrap() {
                     spanned.token = tok;
                 }
             }
             // In term context, Percent may introduce a hash variable.
-            if matches!(spanned.token, Token::Percent) && expect.expecting_term() {
+            if matches!(spanned.token, Token::Percent) && term_context {
                 if let Some(tok) = lexer.lex_hash_var_after_percent().unwrap() {
                     spanned.token = tok;
                 }
             }
             // In term context, Minus may introduce a filetest operator.
-            if matches!(spanned.token, Token::Minus) && expect.expecting_term() {
+            if matches!(spanned.token, Token::Minus) && term_context {
                 if let Some(tok) = lexer.lex_filetest_after_minus() {
                     spanned.token = tok;
                 }
             }
             // In term context, NumLt may introduce a readline/glob.
-            if matches!(spanned.token, Token::NumLt) && expect.expecting_term() {
+            if matches!(spanned.token, Token::NumLt) && term_context {
                 if let Some(tok) = lexer.lex_readline_after_lt() {
                     spanned.token = tok;
                 }
             }
-            // Simple expectation update: after a term, expect operator.
+            // Update term/operator state based on the token.
             match &spanned.token {
                 Token::IntLit(_)
                 | Token::FloatLit(_)
@@ -2001,14 +1994,9 @@ mod tests {
                 | Token::SpecialArrayVar(_)
                 | Token::SpecialHashVar(_)
                 | Token::Arrow => {
-                    // Arrow: toke.c's TOKEN(ARROW) doesn't change PL_expect,
-                    // so it inherits XOPERATOR from the preceding term.
-                    expect = Expect::Operator;
+                    term_context = false;
                 }
-                Token::Semi | Token::LeftBrace => {
-                    expect = Expect::Statement;
-                }
-                // Sub-tokens inside strings/regex don't affect expect.
+                // Sub-tokens inside strings/regex don't change context.
                 Token::QuoteBegin(_, _)
                 | Token::RegexBegin(_, _)
                 | Token::SubstBegin(_)
@@ -2020,7 +2008,7 @@ mod tests {
                 | Token::RegexCodeStart
                 | Token::RegexCondCodeStart => {}
                 _ => {
-                    expect = Expect::Term;
+                    term_context = true;
                 }
             }
             tokens.push(spanned.token);
@@ -2055,17 +2043,16 @@ mod tests {
         // heredoc is unterminated — matching Perl's behavior.
         let src = b"<<END;\nhello\rEND\n";
         let mut lexer = Lexer::new(src);
-        let expect = Expect::Statement;
         // Consume ShiftLeft, then call the heredoc hook.
-        let tok = lexer.lex_token(&expect).unwrap();
+        let tok = lexer.lex_token().unwrap();
         assert_eq!(tok.token, Token::ShiftLeft);
         let heredoc_tok = lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
         assert_eq!(heredoc_tok, Token::QuoteBegin(QuoteKind::Heredoc, 0));
         // Body line "hello\rEND\n" is not a terminator — returned as content.
-        let tok = lexer.lex_token(&expect).unwrap();
+        let tok = lexer.lex_token().unwrap();
         assert!(matches!(tok.token, Token::ConstSegment(_)));
         // Next call surfaces the deferred unterminated heredoc error.
-        let result = lexer.lex_token(&expect);
+        let result = lexer.lex_token();
         assert!(result.is_err(), "expected unterminated heredoc error");
     }
 
@@ -2076,14 +2063,13 @@ mod tests {
         // Body line with wrong indentation should error.
         let src = "<<~END;\n    hello\n  bad indent\n    END\n";
         let mut lexer = Lexer::new(src.as_bytes());
-        let expect = Expect::Statement;
         // Consume ShiftLeft, then call the heredoc hook.
-        lexer.lex_token(&expect).unwrap();
+        lexer.lex_token().unwrap();
         lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
         // Consume tokens until we hit the error.
         let mut got_error = false;
         for _ in 0..20 {
-            match lexer.lex_token(&expect) {
+            match lexer.lex_token() {
                 Err(e) => {
                     assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
                     got_error = true;
@@ -2101,12 +2087,11 @@ mod tests {
         // Terminator uses tab+spaces, body line uses only spaces — mismatch.
         let src = "<<~END;\n\t  hello\n    wrong\n\t  END\n";
         let mut lexer = Lexer::new(src.as_bytes());
-        let expect = Expect::Statement;
-        lexer.lex_token(&expect).unwrap();
+        lexer.lex_token().unwrap();
         lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
         let mut got_error = false;
         for _ in 0..20 {
-            match lexer.lex_token(&expect) {
+            match lexer.lex_token() {
                 Err(e) => {
                     assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
                     got_error = true;
@@ -2390,7 +2375,7 @@ mod tests {
 
     #[test]
     fn lex_interp_after_string() {
-        // Verify expect state is correct after a string (operator position).
+        // Verify . (concat) is lexed as operator after a string.
         let tokens = lex_all(r#""hello" . "world""#);
         assert!(tokens.contains(&Token::Dot));
     }

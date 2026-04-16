@@ -9,9 +9,10 @@
 //! assert_eq!(program.statements.len(), 2);
 //! ```
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod ast;
 pub mod error;
-pub mod expect;
 pub mod keyword;
 pub mod source;
 pub mod span;
