@@ -1844,9 +1844,14 @@ impl Parser {
             let is_optional = i >= proto.required;
 
             if self.at_args_end()? {
-                // No more input — break unless the slot is required
-                // (in which case we also break, silently; a later
-                // semantic pass could error).
+                // No more input.  The `_` slot is special: when
+                // omitted, it defaults to the global default variable
+                // ($_), regardless of required/optional status.  All
+                // other slots simply stop; a later semantic pass can
+                // validate required-arg counts.
+                if matches!(slot, ProtoSlot::DefaultedScalar) {
+                    args.push(Expr { kind: ExprKind::DefaultVar, span: self.peek_span() });
+                }
                 let _ = is_optional;
                 break;
             }
@@ -1879,8 +1884,10 @@ impl Parser {
                     break;
                 }
                 _ => {
-                    // Scalar-ish slot: one expression at comma-plus-1
-                    // precedence so a comma terminates this arg.
+                    // Scalar-ish slot (including `_`, which only
+                    // differs when omitted — handled above).  One
+                    // expression at comma-plus-1 precedence so a
+                    // comma terminates this arg.
                     let arg = self.parse_expr(PREC_COMMA + 1)?;
                     args.push(arg);
                     if i + 1 < proto.slots.len() {
@@ -7517,6 +7524,55 @@ mod tests {
                 other => panic!("expected FuncCall(Foo::bar, []), got {other:?}"),
             },
             other => panic!("expected BinOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_underscore_with_arg_takes_it() {
+        // sub foo (_); foo $x;
+        // `_` slot with an arg supplied behaves like `$`.
+        let e = parse_call_with_proto("sub foo (_); foo $x;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)), "expected ScalarVar, got {:?}", args[0].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_underscore_without_arg_inserts_default_var() {
+        // sub foo (_); foo;
+        // `_` slot with no arg → parser inserts DefaultVar.
+        let e = parse_call_with_proto("sub foo (_); foo;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 1, "_-slot should default to DefaultVar when omitted");
+                assert!(matches!(args[0].kind, ExprKind::DefaultVar), "expected DefaultVar, got {:?}", args[0].kind);
+            }
+            other => panic!("expected FuncCall with DefaultVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_underscore_distinct_from_explicit_dollar_underscore() {
+        // sub foo (_); foo $_;
+        // Explicit $_ should be ScalarVar("_"), NOT DefaultVar.
+        // This pins down the distinction: the parser inserts
+        // DefaultVar only when the arg is omitted.
+        let e = parse_call_with_proto("sub foo (_); foo $_;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 1);
+                // Note: $_ may be represented as SpecialVar or
+                // ScalarVar depending on the lexer; either is fine,
+                // as long as it's NOT DefaultVar.
+                assert!(!matches!(args[0].kind, ExprKind::DefaultVar), "explicit $_ should not become DefaultVar");
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
         }
     }
 
