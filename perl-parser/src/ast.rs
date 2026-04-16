@@ -314,8 +314,15 @@ impl Interpolated {
 #[derive(Clone, Debug)]
 pub enum InterpPart {
     Const(String),
-    ScalarInterp(String),
-    ArrayInterp(String),
+    /// `$var`, `$var[0]`, `$var->{k}`, `$var->[0]{k}`, etc.
+    /// Wraps the full subscripted expression — not just a name —
+    /// so chained subscripts (`$h->{k}[0]->{x}`) are parsed
+    /// into real AST rather than stringified literally.
+    ScalarInterp(Box<Expr>),
+    /// `@var`, `@var[1..3]`, `@var{'a','b'}` — whole-array or
+    /// slice interpolation.  Like `ScalarInterp`, holds the
+    /// full expression.
+    ArrayInterp(Box<Expr>),
     ExprInterp(Box<Expr>),
     /// `(?{code})` — raw text for stringification + parsed code.
     RegexCode(String, Box<Expr>),

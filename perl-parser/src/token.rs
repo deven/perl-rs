@@ -344,6 +344,8 @@ pub enum Token {
     /// Literal segment inside a quote.
     ConstSegment(String),
     /// `$name` or `${name}` interpolation inside a quote.
+    /// Emitted when the sigil+name isn't followed by a subscript
+    /// starter — the simple case.
     InterpScalar(String),
     /// `@name` interpolation inside a quote (array in string).
     InterpArray(String),
@@ -352,6 +354,20 @@ pub enum Token {
     InterpScalarExprStart,
     /// `@{expr}` expression interpolation — lexer switches to normal code mode.
     InterpArrayExprStart,
+    /// `$name` followed by one or more subscripts inside a quote
+    /// (e.g. `"$h->{key}"`, `"$a[0]"`, `"$h->{k}[0]"`).  Carries
+    /// the variable name.  The lexer then emits normal code
+    /// tokens for the subscript chain, terminated by
+    /// `InterpChainEnd`.
+    InterpScalarChainStart(String),
+    /// `@name` followed by a subscript — array slice or chained
+    /// subscript interpolation (e.g. `"@a[1..3]"`, `"@a{'k'}"`).
+    InterpArrayChainStart(String),
+    /// End marker for a subscript chain started by either of
+    /// the `ChainStart` tokens above.  Emitted when the lexer
+    /// determines the chain is complete (closing bracket at
+    /// depth 0 with no continuation).
+    InterpChainEnd,
 
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.

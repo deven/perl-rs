@@ -23,7 +23,16 @@ use crate::token::*;
 /// When `expr_depth > 0`, the lexer is in expression-parsing mode
 /// inside `${expr}` or `@{expr}`.  When `expr_depth == 0`, the
 /// lexer is in body-scanning mode (string/regex content).
-#[derive(Clone, Debug)]
+///
+/// When `chain_active` is set, the lexer is producing normal code
+/// tokens for a subscript chain that follows `$name` or `@name`
+/// inside a string (e.g. `"$h->{k}[0]"`).  `chain_depth` tracks
+/// `[`/`{` nesting within the chain; the chain ends when a closing
+/// bracket returns depth to 0 and no continuation (`[`, `{`, `->[`,
+/// `->{`) follows.  `chain_end_pending` is set between tokens when
+/// the probe has detected end-of-chain — the next `lex_token` call
+/// emits `InterpChainEnd` and clears the chain state.
+#[derive(Clone, Debug, Default)]
 struct LexContext {
     /// Opening delimiter byte.  `None` for heredocs (end signaled
     /// by LexerSource).
@@ -40,6 +49,21 @@ struct LexContext {
     raw: bool,
     /// Whether to detect `(?{...})` code blocks (regex mode).
     regex: bool,
+    /// Inside a subscript chain (see type-level doc).
+    chain_active: bool,
+    /// Bracket/brace nesting inside the chain.
+    chain_depth: u32,
+    /// Chain end detected; emit `InterpChainEnd` on the next call.
+    chain_end_pending: bool,
+}
+
+impl LexContext {
+    /// Convenience for the common string/regex push pattern:
+    /// opening delimiter plus the three behavior flags.  Chain
+    /// fields default to false/0.
+    fn new(delim: Option<u8>, interpolating: bool, raw: bool, regex: bool) -> Self {
+        LexContext { delim, interpolating, raw, regex, ..Default::default() }
+    }
 }
 
 /// Format sublexing state.  Orthogonal to `context_stack` because
@@ -547,6 +571,39 @@ impl Lexer {
         Ok(())
     }
 
+    /// Skip whitespace and `#` comments only — **not** POD.
+    /// For use when the lexer is inside a quote-operator's
+    /// delimiter-finding scan: per Perl, POD is suspended
+    /// until the delimiter is found, so
+    ///
+    /// ```perl
+    /// $_ = qq
+    ///
+    /// =pod
+    ///
+    /// testing
+    ///
+    /// =;
+    /// ```
+    ///
+    /// is a qq-string with body `"pod\n\ntesting\n\n"`, not a
+    /// pod block.  `=pod` at column 0 would start a pod block
+    /// in normal code context, but once we've committed to a
+    /// quote op waiting for its delimiter, the `=` is just a
+    /// candidate delimiter byte.
+    fn skip_ws_and_comments_no_pod(&mut self) -> Result<(), ParseError> {
+        loop {
+            match self.peek_byte(false) {
+                Some(b' ') | Some(b'\t') | Some(b'\n') => self.skip(1),
+                Some(b'#') => {
+                    self.current_line = None;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
     /// Skip a pod block: everything from `=word` to `=cut\n`.
     /// Matches Perl 5's behavior: `=cut` must be at start of line,
     /// followed by a non-alphabetic character (or EOF).
@@ -590,6 +647,55 @@ impl Lexer {
 
         // If inside a sublexing context, dispatch there.
         match self.context_stack.last() {
+            // Chain-end bookkeeping runs BEFORE chain_active /
+            // expr_depth dispatch: when the previous call
+            // finished the last subscript, we leave a marker
+            // and emit `InterpChainEnd` here before switching
+            // back to body-scanning mode.
+            Some(ctx) if ctx.chain_end_pending => {
+                let span_pos = self.span_pos();
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.chain_end_pending = false;
+                    ctx.chain_active = false;
+                    ctx.chain_depth = 0;
+                }
+                return Ok(Spanned { token: Token::InterpChainEnd, span: Span::new(span_pos, span_pos) });
+            }
+            Some(ctx) if ctx.chain_active => {
+                // Subscript chain — code-mode lexing with
+                // bracket/brace tracking.  When a closing
+                // bracket drops chain_depth to 0, probe for a
+                // continuer; if none, mark chain_end_pending so
+                // the next call emits InterpChainEnd.
+                let result = self.lex_normal_token()?;
+                let closed_to_zero = match &result.token {
+                    Token::LeftBrace | Token::LeftBracket => {
+                        if let Some(ctx) = self.context_stack.last_mut() {
+                            ctx.chain_depth += 1;
+                        }
+                        false
+                    }
+                    Token::RightBrace | Token::RightBracket => {
+                        if let Some(ctx) = self.context_stack.last_mut() {
+                            // Saturating in case of malformed
+                            // input — we'd rather bail to body
+                            // mode than underflow.
+                            ctx.chain_depth = ctx.chain_depth.saturating_sub(1);
+                            ctx.chain_depth == 0
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if closed_to_zero {
+                    let cont = self.peek_chain_starter();
+                    if let Some(ctx) = self.context_stack.last_mut() {
+                        ctx.chain_end_pending = !cont;
+                    }
+                }
+                return Ok(result);
+            }
             Some(ctx) if ctx.expr_depth > 0 => {
                 // Normal code lexing inside ${expr} or @{expr}.
                 let result = self.lex_normal_token()?;
@@ -648,12 +754,12 @@ impl Lexer {
             b'\'' => self.lex_single_quoted_string()?,
             b'"' => {
                 self.skip(1); // skip opening "
-                self.context_stack.push(LexContext { delim: Some(b'"'), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+                self.context_stack.push(LexContext::new(Some(b'"'), true, false, false));
                 Token::QuoteSublexBegin(QuoteKind::Double, b'"')
             }
             b'`' => {
                 self.skip(1); // skip opening `
-                self.context_stack.push(LexContext { delim: Some(b'`'), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+                self.context_stack.push(LexContext::new(Some(b'`'), true, false, false));
                 Token::QuoteSublexBegin(QuoteKind::Backtick, b'`')
             }
 
@@ -1266,18 +1372,73 @@ impl Lexer {
         // recognizes them as operators in operator context via
         // peek_op_info and token_to_binop.
 
-        // q// qq// qw// qr// m// s/// tr/// y///
-        match name.as_str() {
-            "q" if self.at_quote_delimiter() => return self.lex_q_string(),
-            "qq" if self.at_quote_delimiter() => return self.lex_qq_string(),
-            "qw" if self.at_quote_delimiter() => return self.lex_qw(),
-            "qr" if self.at_quote_delimiter() => return self.lex_qr(),
-            "m" if self.at_quote_delimiter() => return self.lex_m(),
-            "s" if self.at_quote_delimiter() => return self.lex_s(),
-            "tr" if self.at_quote_delimiter() => return self.lex_tr(),
-            "y" if self.at_quote_delimiter() => return self.lex_tr(),
-            "qx" if self.at_quote_delimiter() => return self.lex_qx(),
-            _ => {}
+        // q// qq// qw// qr// m// s/// tr/// y/// qx//
+        //
+        // Two-phase delimiter recognition, with a fat-comma
+        // lookahead checked at each phase:
+        //
+        //   Phase A (adjacent): no whitespace has been skipped.
+        //   scan_ident's contract guarantees the current byte
+        //   isn't alphanumeric/underscore, so `at_quote_delimiter`
+        //   can apply the strict rule (reject word chars as a
+        //   defensive guard).  Special-case `=`: peek ahead one
+        //   byte — if it's `>`, this is `=>` and we autoquote
+        //   the keyword as a bareword.
+        //
+        //   Phase B (after whitespace skip): if the adjacent byte
+        //   was whitespace/newline/comment, skip through it
+        //   (possibly across lines) and re-decide.  After the
+        //   skip, the delimiter CAN be alphanumeric — `q xabcx`
+        //   is a q-string with `x` as delim — so the strict
+        //   `at_quote_delimiter` no longer applies; any non-EOF
+        //   byte works.  Re-check for `=>` here too, since the
+        //   fat comma could live past any amount of whitespace
+        //   (`q\n=>\n1` autoquotes `q`).
+        //
+        // Outside these two phases the keyword falls through to
+        // the Keyword/Ident dispatch at the end of lex_word.
+        let is_quote_kw = matches!(name.as_str(), "q" | "qq" | "qw" | "qr" | "m" | "s" | "tr" | "y" | "qx");
+        if is_quote_kw {
+            // Phase A: adjacent byte.
+            let immediate = self.peek_byte(false);
+            let is_ws_like = matches!(immediate, Some(b' ' | b'\t' | b'\n' | b'#') | None);
+            let adjacent_ok = if is_ws_like {
+                false
+            } else if immediate == Some(b'=') {
+                // Disambiguate `=` delim vs `=>` autoquote.
+                if self.peek_byte_at(1) == Some(b'>') {
+                    if name == "qw" {
+                        return Ok(Token::Keyword(Keyword::Qw));
+                    }
+                    return Ok(Token::Ident(name));
+                }
+                true
+            } else {
+                self.at_quote_delimiter()
+            };
+            if adjacent_ok {
+                return self.dispatch_quote_op(&name);
+            }
+            // Phase B: skip whitespace/comments and re-decide.
+            // Use the no-pod variant: per Perl, `=pod` at col 0
+            // inside a quote-op delim scan is NOT a pod block —
+            // it's a candidate delimiter byte for the keyword.
+            if is_ws_like {
+                self.skip_ws_and_comments_no_pod()?;
+            }
+            // Re-check for `=>` past the whitespace.
+            if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
+                if name == "qw" {
+                    return Ok(Token::Keyword(Keyword::Qw));
+                }
+                return Ok(Token::Ident(name));
+            }
+            // Any non-EOF byte is a valid post-whitespace
+            // delimiter — including alphanumeric (`q\nxabcx`).
+            if self.peek_byte(false).is_some() {
+                return self.dispatch_quote_op(&name);
+            }
+            // EOF — fall through.
         }
 
         // Special tokens
@@ -1334,11 +1495,115 @@ impl Lexer {
         Ok(Token::Ident(name))
     }
 
+    /// Dispatch to the quote-op specific lexer given the
+    /// keyword name.  Cursor must be positioned at the
+    /// delimiter byte (or on whitespace that `read_quote_delimiter`
+    /// will skip).  Panics on unknown names; call only for
+    /// names that matched `is_quote_kw`.
+    fn dispatch_quote_op(&mut self, name: &str) -> Result<Token, ParseError> {
+        match name {
+            "q" => self.lex_q_string(),
+            "qq" => self.lex_qq_string(),
+            "qw" => self.lex_qw(),
+            "qr" => self.lex_qr(),
+            "m" => self.lex_m(),
+            "s" => self.lex_s(),
+            "tr" | "y" => self.lex_tr(),
+            "qx" => self.lex_qx(),
+            _ => unreachable!("dispatch_quote_op called with non-quote keyword: {name}"),
+        }
+    }
+
+    /// Is the next byte a valid opener for a quote-like operator
+    /// (`q{...}`, `m/.../`, `tr[...][...]`, etc.)?
+    ///
+    /// Perl accepts almost any non-word ASCII byte as an
+    /// *unpaired* quote delimiter — including the closers
+    /// `)`, `]`, `}`, `>` when used as bare delimiters.
+    /// `q}foo}`, `m>foo>`, `s]foo]bar]` are all valid.
+    /// Paired usage (`q{foo}`, `q<foo>`) is special-cased by
+    /// `read_quote_delimiter`, but that's orthogonal to this
+    /// predicate.
+    ///
+    /// The context-sensitive cases — `$h{q}` (autoquoted hash
+    /// key) and `q => 1` (fat-comma autoquote) — are handled
+    /// elsewhere: the former by a parser-driven API
+    /// (`try_autoquoted_bareword_subscript`), the latter by a
+    /// fat-comma lookahead at the lex_word dispatch site.
     fn at_quote_delimiter(&self) -> bool {
         match self.peek_byte_at(0) {
             Some(b) => b != b'\n' && !b.is_ascii_alphanumeric() && b != b'_',
             None => false,
         }
+    }
+
+    /// Parser-driven API: try to consume an autoquoted bareword
+    /// followed immediately by `}`.  Used inside `$h{...}`
+    /// hash-subscript bodies to preempt the lexer's quote-
+    /// operator recognition — per Perl, `q}foo}` is a valid
+    /// q-string, but `$h{q}` autoquotes `q` to a string literal.
+    /// Only the parser knows the subscript context.
+    ///
+    /// The close delimiter is always `}` (hash subscript); a
+    /// parameter would invite misuse — array subscripts have
+    /// integer/range semantics, not autoquoting, and fat-comma
+    /// autoquoting is handled by a different mechanism in
+    /// `lex_word`.
+    ///
+    /// On success: consumes leading whitespace and the
+    /// identifier, leaves the cursor positioned at (or just
+    /// before) the `}` byte, and returns `Some((name, span))`.
+    /// On failure (no identifier, or identifier not followed
+    /// by `}`): the cursor is unchanged and returns `None`.
+    ///
+    /// The parser MUST call this before any `peek_token` in
+    /// the subscript body — once `peek_token` commits the
+    /// lexer, it may already have consumed `q}foo}` as a
+    /// q-string.
+    ///
+    /// Supports simple identifiers only (`foo`, `_bar`, `q`);
+    /// qualified names (`Foo::Bar`) and sigiled expressions
+    /// fall through to the general `parse_expr` path.  Line-
+    /// local: multi-line subscripts `$h{\n  foo\n}` are
+    /// uncommon and would require more machinery.
+    pub fn try_autoquoted_bareword_subscript(&mut self) -> Option<(String, Span)> {
+        let line = self.current_line.as_ref()?;
+        let r = line.remaining();
+        // Skip leading whitespace.
+        let mut i = 0;
+        while i < r.len() && matches!(r[i], b' ' | b'\t') {
+            i += 1;
+        }
+        // Identifier start.
+        let first = *r.get(i)?;
+        if !(first == b'_' || first.is_ascii_alphabetic()) {
+            return None;
+        }
+        let ident_start = i;
+        while i < r.len() && (r[i] == b'_' || r[i].is_ascii_alphanumeric()) {
+            i += 1;
+        }
+        let ident_end = i;
+        // Skip trailing whitespace before the expected `}`.
+        let mut j = i;
+        while j < r.len() && matches!(r[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if r.get(j).copied() != Some(b'}') {
+            return None;
+        }
+        // Commit.  Consume leading ws + identifier; leave
+        // trailing ws (if any) for the next lex call to skip
+        // naturally when producing the `}` token.
+        let name_bytes = &r[ident_start..ident_end];
+        let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+        let offset = line.offset;
+        let pos = line.pos;
+        let start_global = (offset + pos + ident_start) as u32;
+        let end_global = (offset + pos + ident_end) as u32;
+        let mline = self.current_line.as_mut()?;
+        mline.pos += ident_end;
+        Some((name, Span::new(start_global, end_global)))
     }
 
     // ── Strings ───────────────────────────────────────────────
@@ -1547,10 +1812,24 @@ impl Lexer {
     /// - `true`: raw passthrough (`\delim`→delim, else pass through).
     pub fn lex_body_str(&mut self, delim: u8, raw: bool) -> Result<String, ParseError> {
         let spanned = self.lex_body(Some(delim), 0, false, false, raw)?;
-        match spanned.token {
-            Token::ConstSegment(s) => Ok(s),
+        let s = match spanned.token {
+            Token::ConstSegment(s) => s,
             _ => unreachable!("lex_body in non-interpolating mode should return ConstSegment"),
+        };
+        // `lex_body` only auto-consumes the closing delimiter when
+        // the context stack is empty — its incremental-sublex
+        // protocol leaves the delim in place so the next
+        // `lex_token` call can emit `SublexEnd`.  When we're
+        // called from inside a sublex context (e.g. a single-
+        // quoted subscript key inside a `"..."` interpolation),
+        // that leaves the delim un-consumed, which would cause
+        // the caller to re-lex it as the start of a new string.
+        // Consume it here so `lex_body_str` always leaves the
+        // cursor past the closer, regardless of outer context.
+        if self.peek_byte(false) == Some(delim) {
+            self.skip(1);
         }
+        Ok(s)
     }
 
     /// Process a backslash escape inside a double-quoted string.
@@ -1677,6 +1956,16 @@ impl Lexer {
         // $name form — must start with alpha or _
         if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
             let name = self.scan_ident();
+            // Check for subscript chain: [idx], {key}, ->[idx], ->{key}.
+            // Only start a chain if a valid continuer is actually
+            // present; a bare `->` (with nothing useful after) is
+            // treated as literal text.
+            if self.peek_chain_starter() {
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.chain_active = true;
+                }
+                return Ok(Spanned { token: Token::InterpScalarChainStart(name), span: Span::new(start, self.span_pos()) });
+            }
             return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
         }
 
@@ -1700,11 +1989,30 @@ impl Lexer {
         // @name form
         if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
             let name = self.scan_ident();
+            // Chain detection same as the scalar case: `@a[1..3]`,
+            // `@a{'k1','k2'}`, `@a->[...]` / `@a->{...}`.  The
+            // semantics for arrays are slice-oriented but the
+            // lexical shape is the same.
+            if self.peek_chain_starter() {
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.chain_active = true;
+                }
+                return Ok(Spanned { token: Token::InterpArrayChainStart(name), span: Span::new(start, self.span_pos()) });
+            }
             return Ok(Spanned { token: Token::InterpArray(name), span: Span::new(start, self.span_pos()) });
         }
 
         // Bare @ not followed by a name — treat as literal
         Ok(Spanned { token: Token::ConstSegment("@".into()), span: Span::new(start, self.span_pos()) })
+    }
+
+    /// Is the next raw-byte sequence a valid subscript chain
+    /// starter?  Returns true for `[`, `{`, `->[`, or `->{`.
+    /// Used both at chain entry (after `$name`/`@name`) and at
+    /// chain continuation (after a closing bracket at depth 0).
+    fn peek_chain_starter(&self) -> bool {
+        let r = self.remaining();
+        matches!(r.first(), Some(b'[') | Some(b'{')) || (r.len() >= 3 && r[0] == b'-' && r[1] == b'>' && matches!(r[2], b'[' | b'{'))
     }
 
     // ── q// qq// qw// ─────────────────────────────────────────
@@ -1717,13 +2025,13 @@ impl Lexer {
 
     fn lex_qq_string(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+        self.context_stack.push(LexContext::new(Some(delim), true, false, false));
         Ok(Token::QuoteSublexBegin(QuoteKind::Double, delim))
     }
 
     fn lex_qx(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+        self.context_stack.push(LexContext::new(Some(delim), true, false, false));
         Ok(Token::QuoteSublexBegin(QuoteKind::Backtick, delim))
     }
 
@@ -1741,14 +2049,14 @@ impl Lexer {
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: delim != b'\'', raw: true, regex: true });
+        self.context_stack.push(LexContext::new(Some(delim), delim != b'\'', true, true));
         Ok(Token::RegexSublexBegin(RegexKind::Match, delim))
     }
 
     /// `qr/pattern/flags` or `qr{pattern}flags`
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: delim != b'\'', raw: true, regex: true });
+        self.context_stack.push(LexContext::new(Some(delim), delim != b'\'', true, true));
         Ok(Token::RegexSublexBegin(RegexKind::Qr, delim))
     }
 
@@ -1761,7 +2069,7 @@ impl Lexer {
         // The parser will collect body tokens until SublexEnd,
         // then call start_subst_replacement to set up the
         // replacement body.
-        self.context_stack.push(LexContext { delim: Some(delim), depth: 0, expr_depth: 0, interpolating: delim != b'\'', raw: true, regex: true });
+        self.context_stack.push(LexContext::new(Some(delim), delim != b'\'', true, true));
 
         Ok(Token::SubstSublexBegin(delim))
     }
@@ -1785,7 +2093,7 @@ impl Lexer {
         // by start_subst_body, not at a delimiter byte.
         // With /e: raw scan (code, parser will reparse).
         // Without /e: interpolating string.
-        self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: !has_eval, raw: has_eval, regex: false });
+        self.context_stack.push(LexContext::new(None, !has_eval, has_eval, false));
 
         Ok(flags)
     }
@@ -1811,13 +2119,17 @@ impl Lexer {
         // only if the current byte IS whitespace (or the line is exhausted).
         // `m#foo#` uses `#` as the delimiter — it's not a comment.
         // `m /foo/` skips the space and uses `/`.
+        //
+        // Uses the no-pod skipper: inside a quote op's delimiter
+        // scan, `=pod` at column 0 is a candidate delimiter byte,
+        // not a pod block.  See `skip_ws_and_comments_no_pod`.
         match self.peek_byte(false) {
             Some(b) if b == b' ' || b == b'\t' => {
-                self.skip_ws_and_comments()?;
+                self.skip_ws_and_comments_no_pod()?;
             }
             None => {
                 // End of line — need to cross to next line.
-                self.skip_ws_and_comments()?;
+                self.skip_ws_and_comments_no_pod()?;
             }
             _ => {}
         }
@@ -2099,12 +2411,12 @@ impl Lexer {
         match kind {
             HeredocKind::Interpolating => {
                 self.source.start_heredoc(tag_bytes, &mut self.current_line)?;
-                self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+                self.context_stack.push(LexContext::new(None, true, false, false));
                 Ok(Token::QuoteSublexBegin(QuoteKind::Heredoc, 0))
             }
             HeredocKind::Indented => {
                 self.source.start_indented_heredoc(tag_bytes, &mut self.current_line)?;
-                self.context_stack.push(LexContext { delim: None, depth: 0, expr_depth: 0, interpolating: true, raw: false, regex: false });
+                self.context_stack.push(LexContext::new(None, true, false, false));
                 Ok(Token::QuoteSublexBegin(QuoteKind::Heredoc, 0))
             }
             HeredocKind::Literal => {
@@ -3933,5 +4245,560 @@ mod tests {
     fn lex_ctrl_z_eof() {
         let tokens = lex_all("1;\x1amore stuff");
         assert!(tokens.contains(&Token::DataEnd(DataEndMarker::CtrlZ)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Quote-operator delimiter handling.
+    //
+    // Per Perl, any non-word ASCII byte — INCLUDING the closers
+    // `)`, `]`, `}`, `>` — is a valid unpaired quote-operator
+    // delimiter.  `q}foo}`, `m>foo>`, `s]a]b]` etc. are real
+    // quote operators and should lex as such.
+    //
+    // The context-sensitive exceptions are:
+    //   1. `q => 1` — fat-comma lookahead suppresses the quote
+    //      op so the parser can autoquote `q` as a bareword.
+    //   2. `$h{q}` — parser-driven autoquoting via
+    //      `try_autoquoted_bareword_subscript` takes precedence
+    //      before the lexer gets to interpret `q`.
+    //
+    // Tests for (1) live here (token-level).  Tests for (2)
+    // live in parser.rs (they require parser context to set up).
+    // ═══════════════════════════════════════════════════════════
+
+    // ── Closers ARE valid unpaired delimiters ────────────────
+
+    #[test]
+    fn quote_op_q_with_rbrace_delim() {
+        // `q}foo}` is a q-string with body "foo".
+        let tokens = lex_all("q}foo};");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "foo"), "expected StrLit(foo), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_q_with_rparen_delim() {
+        let tokens = lex_all("q)foo);");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "foo"), "expected StrLit(foo), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_q_with_rbracket_delim() {
+        let tokens = lex_all("q]foo];");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "foo"), "expected StrLit(foo), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_q_with_gt_delim() {
+        // `q>foo>` — `>` as unpaired delimiter.
+        let tokens = lex_all("q>foo>;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "foo"), "expected StrLit(foo), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_q_with_equals_delim() {
+        // `q=foo=` — `=` as delimiter.  No fat comma to trigger
+        // autoquoting.
+        let tokens = lex_all("q=foo=;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "foo"), "expected StrLit(foo), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_y_with_rbrace_delim() {
+        // `y}abc}xyz}` — transliteration with `}` as delimiter.
+        // Shouldn't error out as unterminated.
+        let tokens = lex_all("y}abc}xyz};");
+        // tr/y produces a Subst-like token tree; exact shape
+        // depends on the implementation.  The key thing is no
+        // error, and the first token is NOT a lone Ident("y").
+        assert!(!matches!(tokens[0], Token::Ident(ref s) if s == "y"), "y should be a quote op here, got Ident(y): {tokens:?}");
+    }
+
+    // ── Fat-comma lookahead suppresses quote-op recognition ──
+
+    /// For each keyword, `KEYWORD => 1` must NOT start a quote
+    /// op — the lexer should emit the keyword as an ordinary
+    /// identifier (or Keyword for `qw`) so the parser's
+    /// fat-comma autoquote fires.
+    fn assert_kw_before_fat_comma_is_bareword(src: &str, expected_name: &str) {
+        let tokens = lex_all(src);
+        assert!(tokens.len() >= 3, "expected at least 3 tokens for {src:?}, got {tokens:?}");
+        let is_bareword = matches!(&tokens[0], Token::Ident(s) if s == expected_name)
+            || matches!(&tokens[0], Token::Keyword(kw) if {
+                let n: &str = (*kw).into();
+                n == expected_name
+            });
+        assert!(is_bareword, "expected bareword `{expected_name}` for {src:?}, got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma), "expected FatComma second for {src:?}, got {:?}", tokens[1]);
+    }
+
+    #[test]
+    fn fat_comma_lookahead_q() {
+        assert_kw_before_fat_comma_is_bareword("q => 1;", "q");
+    }
+    #[test]
+    fn fat_comma_lookahead_qq() {
+        assert_kw_before_fat_comma_is_bareword("qq => 1;", "qq");
+    }
+    #[test]
+    fn fat_comma_lookahead_qw() {
+        assert_kw_before_fat_comma_is_bareword("qw => 1;", "qw");
+    }
+    #[test]
+    fn fat_comma_lookahead_qr() {
+        assert_kw_before_fat_comma_is_bareword("qr => 1;", "qr");
+    }
+    #[test]
+    fn fat_comma_lookahead_m() {
+        assert_kw_before_fat_comma_is_bareword("m => 1;", "m");
+    }
+    #[test]
+    fn fat_comma_lookahead_s() {
+        assert_kw_before_fat_comma_is_bareword("s => 1;", "s");
+    }
+    #[test]
+    fn fat_comma_lookahead_tr() {
+        assert_kw_before_fat_comma_is_bareword("tr => 1;", "tr");
+    }
+    #[test]
+    fn fat_comma_lookahead_y() {
+        assert_kw_before_fat_comma_is_bareword("y => 1;", "y");
+    }
+
+    /// No-whitespace form: `q=>1` — Perl's `=>` is recognized
+    /// as a single token before `q=...=` interpretation, so
+    /// this also autoquotes.
+    #[test]
+    fn fat_comma_lookahead_no_ws_q() {
+        let tokens = lex_all("q=>1;");
+        assert!(matches!(tokens[0], Token::Ident(ref s) if s == "q"), "expected Ident(q), got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma));
+    }
+
+    #[test]
+    fn fat_comma_lookahead_no_ws_y() {
+        let tokens = lex_all("y=>1;");
+        assert!(matches!(tokens[0], Token::Ident(ref s) if s == "y"), "expected Ident(y), got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma));
+    }
+
+    /// Negative: `q=foo=` (bare `=` without `>`) must still be
+    /// a q-string.  Fat-comma lookahead must not false-positive
+    /// on bare `=`.
+    #[test]
+    fn fat_comma_lookahead_bare_equals_is_still_quote_op() {
+        let tokens = lex_all("q=foo=;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "foo"), "bare `=` must still be a delimiter, got {:?}", tokens[0]);
+    }
+
+    // ── Multi-line fat-comma lookahead ───────────────────────
+    //
+    // The lookahead spans lines: `q\n=>\n1` must autoquote
+    // even though the keyword and `=>` are on different lines.
+    // Perl behaves this way because whitespace between a quote
+    // keyword and its delimiter can span lines anyway — if
+    // we're about to consume that whitespace to find a delim,
+    // we can check for `=>` at the same time.
+
+    #[test]
+    fn fat_comma_lookahead_q_across_newline() {
+        let tokens = lex_all("q\n  => 1;");
+        assert!(matches!(tokens[0], Token::Ident(ref s) if s == "q"), "expected Ident(q) across newline, got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma));
+    }
+
+    #[test]
+    fn fat_comma_lookahead_y_across_newline() {
+        let tokens = lex_all("y\n=>\n1;");
+        assert!(matches!(tokens[0], Token::Ident(ref s) if s == "y"), "expected Ident(y) across newlines, got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma));
+    }
+
+    #[test]
+    fn fat_comma_lookahead_skips_comment_to_find_arrow() {
+        // Comment between the keyword and `=>` counts as
+        // whitespace-like for this lookahead, matching what the
+        // quote-op delim scan would do anyway.
+        let tokens = lex_all("m # comment\n => 1;");
+        assert!(matches!(tokens[0], Token::Ident(ref s) if s == "m"), "expected Ident(m) past comment, got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma));
+    }
+
+    // ── Alphanumeric delimiter after whitespace ──────────────
+    //
+    // When the keyword is followed by whitespace, an
+    // alphanumeric byte IS a valid quote-op delimiter — Perl
+    // parses `q xabcx` as a q-string with `x` as delim, body
+    // "abc".  This contrasts with the no-whitespace case where
+    // scan_ident would have consumed the alphanumeric as part
+    // of the identifier itself.
+    //
+    // The counter-test guards against a regression where the
+    // post-ws lookahead for `=>` accidentally disqualifies all
+    // alphanumeric delimiters.
+
+    #[test]
+    fn quote_op_alnum_delim_after_newline_is_quote_string() {
+        // `q\nxabcx` — newline is whitespace; `x` after the
+        // newline is a valid delimiter.
+        let tokens = lex_all("q\nxabcx;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "abc"), "expected StrLit(abc) from q\\nxabcx, got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_alnum_delim_after_space_is_quote_string() {
+        // `q xabcx` — single space; same principle.
+        let tokens = lex_all("q xabcx;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "abc"), "expected StrLit(abc) from `q xabcx`, got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_q_across_newline_then_fat_comma_autoquotes() {
+        // Paired with the test above: `q\n=>` must still
+        // autoquote, so the lookahead isn't defeated by the
+        // relaxed post-ws delimiter rule.
+        let tokens = lex_all("q\n=>1;");
+        assert!(matches!(tokens[0], Token::Ident(ref s) if s == "q"), "expected Ident(q) from q\\n=>, got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma));
+    }
+
+    #[test]
+    fn quote_op_m_alnum_delim_after_ws() {
+        // `m xabcx` — match operator with `x` as delim.
+        // The exact token shape for `m` is implementation-
+        // specific (m-sublex vs. a single Regex token); the
+        // critical assertion is that it's NOT a lone Ident("m").
+        let tokens = lex_all("m xabcx;");
+        assert!(!matches!(tokens[0], Token::Ident(ref s) if s == "m"), "m should be a match op here, got Ident(m): {tokens:?}");
+    }
+
+    // ── `=` delimiter × whitespace, across every quote kw ────
+    //
+    // The Phase A/B logic applies uniformly to all nine quote-
+    // like operators — q, qq, qw, qr, m, s, tr, y, qx.  The
+    // critical disambiguation (`=` is a delimiter, `=>` is a
+    // fat comma) must behave the same for every keyword.  The
+    // shape of the resulting token differs (q/qq → StrLit-ish,
+    // m/qr → regex, s/tr/y → subst/trans, qw → word list), but
+    // the invariant we verify here is weaker and uniform:
+    // the first token is NOT a bare `Ident(keyword)` (and not
+    // `Keyword(Qw)` for `qw`), which would indicate autoquote.
+    //
+    // `s`, `tr`, `y` need three delimiters, so we use
+    // `{kw}{ws}=a=b=` for them and `{kw}{ws}=test=` for the rest.
+    //
+    // POD interaction: `=word` at column 0 starts a POD block
+    // (this is Perl, not a bug in our skip_ws_and_comments).
+    // The cross-newline variant therefore indents the
+    // continuation line by a space, putting `=` at column 1
+    // where POD extraction no longer fires.  The in-line (space)
+    // variant is naturally safe since the `=` is never at col 0.
+
+    fn src_equals_delim(kw: &str, ws: &str) -> String {
+        match kw {
+            "s" | "tr" | "y" => format!("{kw}{ws}=a=b=;"),
+            _ => format!("{kw}{ws}=test=;"),
+        }
+    }
+
+    /// First token is NOT a plain Ident/Keyword form of `name`
+    /// — i.e. the keyword was NOT autoquoted and DID start a
+    /// quote op.  (The specific token kind depends on the
+    /// keyword; we don't pin it down here.)
+    fn assert_not_autoquoted(tokens: &[Token], name: &str, src: &str) {
+        let autoquoted_ident = matches!(&tokens[0], Token::Ident(s) if s == name);
+        let autoquoted_qw = name == "qw" && matches!(&tokens[0], Token::Keyword(Keyword::Qw));
+        assert!(!autoquoted_ident && !autoquoted_qw, "{name} should be a quote op for {src:?}, got autoquoted first token: {:?}", tokens[0]);
+    }
+
+    // `=` delim across newline — nine tests, one per keyword.
+
+    #[test]
+    fn quote_op_equals_delim_across_newline_q() {
+        let src = src_equals_delim("q", "\n");
+        let tokens = lex_all(&src);
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "test"), "expected StrLit(test), got {:?} for {src:?}", tokens[0]);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_qq() {
+        let src = src_equals_delim("qq", "\n");
+        assert_not_autoquoted(&lex_all(&src), "qq", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_qw() {
+        let src = src_equals_delim("qw", "\n");
+        assert_not_autoquoted(&lex_all(&src), "qw", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_qr() {
+        let src = src_equals_delim("qr", "\n");
+        assert_not_autoquoted(&lex_all(&src), "qr", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_m() {
+        let src = src_equals_delim("m", "\n");
+        assert_not_autoquoted(&lex_all(&src), "m", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_s() {
+        let src = src_equals_delim("s", "\n");
+        assert_not_autoquoted(&lex_all(&src), "s", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_tr() {
+        let src = src_equals_delim("tr", "\n");
+        assert_not_autoquoted(&lex_all(&src), "tr", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_y() {
+        let src = src_equals_delim("y", "\n");
+        assert_not_autoquoted(&lex_all(&src), "y", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_across_newline_qx() {
+        let src = src_equals_delim("qx", "\n");
+        assert_not_autoquoted(&lex_all(&src), "qx", &src);
+    }
+
+    // `=` delim after space — nine tests, one per keyword.
+
+    #[test]
+    fn quote_op_equals_delim_after_space_q() {
+        let src = src_equals_delim("q", " ");
+        let tokens = lex_all(&src);
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "test"), "expected StrLit(test), got {:?} for {src:?}", tokens[0]);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_qq() {
+        let src = src_equals_delim("qq", " ");
+        assert_not_autoquoted(&lex_all(&src), "qq", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_qw() {
+        let src = src_equals_delim("qw", " ");
+        assert_not_autoquoted(&lex_all(&src), "qw", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_qr() {
+        let src = src_equals_delim("qr", " ");
+        assert_not_autoquoted(&lex_all(&src), "qr", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_m() {
+        let src = src_equals_delim("m", " ");
+        assert_not_autoquoted(&lex_all(&src), "m", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_s() {
+        let src = src_equals_delim("s", " ");
+        assert_not_autoquoted(&lex_all(&src), "s", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_tr() {
+        let src = src_equals_delim("tr", " ");
+        assert_not_autoquoted(&lex_all(&src), "tr", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_y() {
+        let src = src_equals_delim("y", " ");
+        assert_not_autoquoted(&lex_all(&src), "y", &src);
+    }
+    #[test]
+    fn quote_op_equals_delim_after_space_qx() {
+        let src = src_equals_delim("qx", " ");
+        assert_not_autoquoted(&lex_all(&src), "qx", &src);
+    }
+
+    // Alphanumeric delim across newline — nine tests, one per keyword.
+
+    fn src_alnum_delim(kw: &str) -> String {
+        match kw {
+            "s" | "tr" | "y" => format!("{kw}\nxaxbx;"),
+            _ => format!("{kw}\nxabcx;"),
+        }
+    }
+
+    #[test]
+    fn quote_op_alnum_delim_across_newline_q() {
+        let src = src_alnum_delim("q");
+        let tokens = lex_all(&src);
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "abc"), "expected StrLit(abc), got {:?} for {src:?}", tokens[0]);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_qq() {
+        let src = src_alnum_delim("qq");
+        assert_not_autoquoted(&lex_all(&src), "qq", &src);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_qw() {
+        let src = src_alnum_delim("qw");
+        assert_not_autoquoted(&lex_all(&src), "qw", &src);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_qr() {
+        let src = src_alnum_delim("qr");
+        assert_not_autoquoted(&lex_all(&src), "qr", &src);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_m() {
+        let src = src_alnum_delim("m");
+        assert_not_autoquoted(&lex_all(&src), "m", &src);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_s() {
+        let src = src_alnum_delim("s");
+        assert_not_autoquoted(&lex_all(&src), "s", &src);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_tr() {
+        let src = src_alnum_delim("tr");
+        assert_not_autoquoted(&lex_all(&src), "tr", &src);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_y() {
+        let src = src_alnum_delim("y");
+        assert_not_autoquoted(&lex_all(&src), "y", &src);
+    }
+    #[test]
+    fn quote_op_alnum_delim_across_newline_qx() {
+        let src = src_alnum_delim("qx");
+        assert_not_autoquoted(&lex_all(&src), "qx", &src);
+    }
+
+    // Fat-comma after newline — paired counter-tests to the
+    // equals-delim-across-newline set above.  Same whitespace
+    // lead-in, `>` appended, opposite outcome.
+
+    fn assert_autoquoted_via_fat_comma(src: &str, name: &str) {
+        let tokens = lex_all(src);
+        let is_bareword = matches!(&tokens[0], Token::Ident(s) if s == name)
+            || matches!(&tokens[0], Token::Keyword(kw) if {
+                let n: &str = (*kw).into();
+                n == name
+            });
+        assert!(is_bareword, "expected bareword `{name}` for {src:?}, got {:?}", tokens[0]);
+        assert!(matches!(tokens[1], Token::FatComma), "expected FatComma second for {src:?}, got {:?}", tokens[1]);
+    }
+
+    #[test]
+    fn fat_comma_across_newline_q() {
+        assert_autoquoted_via_fat_comma("q\n=>1;", "q");
+    }
+    #[test]
+    fn fat_comma_across_newline_qq() {
+        assert_autoquoted_via_fat_comma("qq\n=>1;", "qq");
+    }
+    #[test]
+    fn fat_comma_across_newline_qw() {
+        assert_autoquoted_via_fat_comma("qw\n=>1;", "qw");
+    }
+    #[test]
+    fn fat_comma_across_newline_qr() {
+        assert_autoquoted_via_fat_comma("qr\n=>1;", "qr");
+    }
+    #[test]
+    fn fat_comma_across_newline_m() {
+        assert_autoquoted_via_fat_comma("m\n=>1;", "m");
+    }
+    #[test]
+    fn fat_comma_across_newline_s() {
+        assert_autoquoted_via_fat_comma("s\n=>1;", "s");
+    }
+    #[test]
+    fn fat_comma_across_newline_tr() {
+        assert_autoquoted_via_fat_comma("tr\n=>1;", "tr");
+    }
+    #[test]
+    fn fat_comma_across_newline_y() {
+        assert_autoquoted_via_fat_comma("y\n=>1;", "y");
+    }
+    #[test]
+    fn fat_comma_across_newline_qx() {
+        assert_autoquoted_via_fat_comma("qx\n=>1;", "qx");
+    }
+
+    // ── POD-interaction corner cases ─────────────────────────
+    //
+    // Perl's POD extraction does NOT fire inside a quote-op's
+    // delimiter-finding scan.  `qq\n=pod\n\ntesting\n\n=` is a
+    // qq-string with body `"pod\n\ntesting\n\n"`, not a pod
+    // block followed by broken code.  This matches real Perl:
+    //
+    // ```perl
+    // $_ = qq
+    //
+    // =pod
+    //
+    // testing
+    //
+    // =;
+    // print "$_\n";  # → "pod\n\ntesting\n\n"
+    // ```
+    //
+    // The lexer achieves this by using `skip_ws_and_comments_no_pod`
+    // for the delim-search whitespace skip.  Outside that context,
+    // `=word` at col 0 still starts a pod block as usual.
+
+    #[test]
+    fn pod_not_triggered_in_delim_scan_qq() {
+        // The exact scenario from the Perl debugger output: qq
+        // followed by blank lines, then `=pod` at col 0, blank
+        // lines, `testing`, blank lines, and the closing `=`.
+        // Body is everything between the two `=` delimiters.
+        let src = "qq\n\n=pod\n\ntesting\n\n=;";
+        let tokens = lex_all(src);
+        // Body starts with "pod" (the `=` is the delim, not
+        // part of the body).  qq interpolates but the body here
+        // has no variables, so we expect a plain StrLit or an
+        // InterpolatedString whose constant part is "pod\n\ntesting\n\n".
+        // Assert the first token isn't an Ident("qq") autoquote.
+        assert!(!matches!(tokens[0], Token::Ident(ref s) if s == "qq"), "qq should be a quote op, not autoquoted; got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn pod_not_triggered_in_delim_scan_q_equals_letter() {
+        // Simpler form: `q\n=test=` — `=` on line 2 followed by
+        // letter `t`.  Would be POD in normal code, but here
+        // we're scanning for the q-delim, so POD is suspended
+        // and `=` is the delimiter.
+        let tokens = lex_all("q\n=test=;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "test"), "expected StrLit(test), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn pod_still_fires_outside_delim_scan() {
+        // Regression guard: POD recognition must still work in
+        // normal top-level code.  `1;\n=pod\n...\n=cut\n2;` —
+        // the `=pod` block is skipped, leaving IntLit(1), Semi,
+        // IntLit(2), Semi.
+        let tokens = lex_all("1;\n=pod\n\ntext\n\n=cut\n2;");
+        assert!(matches!(tokens[0], Token::IntLit(1)));
+        assert!(matches!(tokens[1], Token::Semi));
+        assert!(matches!(tokens[2], Token::IntLit(2)));
+        assert!(matches!(tokens[3], Token::Semi));
+    }
+
+    #[test]
+    fn comment_skipped_in_delim_scan() {
+        // Counterpoint to the POD tests: `#` comments ARE
+        // skipped during the delim scan — unlike POD.  From a
+        // real Perl trace:
+        //
+        // ```perl
+        // $_ = qq
+        //
+        // # testing
+        //
+        // =swd;fkjasfd;klj\n=;
+        // print;               # prints "swd;fkjasfd;klj\n"
+        // ```
+        //
+        // qq keyword → skip whitespace + `# testing` comment →
+        // find `=` delimiter → body "swd;fkjasfd;klj\n".  The
+        // assertion here is just that `qq` isn't emitted as a
+        // bare Ident, i.e. the delim scan successfully crossed
+        // both the blank lines and the comment.
+        let src = "qq\n\n# testing\n\n=swd;fkjasfd;klj\\n=;";
+        let tokens = lex_all(src);
+        assert!(!matches!(tokens[0], Token::Ident(ref s) if s == "qq"), "qq should be a quote op after comment skip; got {:?}", tokens[0]);
     }
 }

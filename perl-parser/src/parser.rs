@@ -2797,8 +2797,31 @@ impl Parser {
     /// Handles bareword autoquoting: `$hash{key}` → StringLit("key"),
     /// `$hash{-key}` → StringLit("-key").
     fn parse_hash_subscript_key(&mut self) -> Result<Expr, ParseError> {
-        // Bareword autoquoting ($hash{key}) handled by parse_ident_term (RightBrace check).
-        // -bareword autoquoting ($hash{-key}) handled by parse_term Minus handler.
+        // Parser-driven bareword autoquoting for `$h{ident}`.
+        //
+        // The parser knows it's inside a hash-subscript body;
+        // the lexer doesn't.  Per Perl, `q}foo}` at expression
+        // position is a valid q-string, but `$h{q}` autoquotes
+        // `q` to a string literal.  To make that context
+        // distinction, call the lexer's try_autoquoted_bareword
+        // API *before* any peek_token in this function — once
+        // peek_token commits the lexer, it may have already
+        // consumed `q}...}` as a q-string.
+        //
+        // Callers (maybe_postfix_subscript, the ArrowDeref
+        // hash-elem branch) consume `{` via next_token before
+        // calling here, so the parser's one-token cache is
+        // empty at entry.  This is the only moment where the
+        // raw source bytes past `{` haven't yet been touched
+        // by the lexer.
+        debug_assert!(self.current.is_none(), "parse_hash_subscript_key: one-token cache must be empty to try bareword lookahead");
+        if let Some((name, span)) = self.lexer.try_autoquoted_bareword_subscript() {
+            return Ok(Expr { kind: ExprKind::StringLit(name), span });
+        }
+        // Other autoquoting rules — bareword followed by `=>` or
+        // `}` (when not a quote op), `-bareword` — are handled
+        // inside parse_expr via parse_ident_term and the
+        // Minus-prefix bareword path.
         self.parse_expr(PREC_LOW)
     }
 
@@ -2845,12 +2868,82 @@ impl Parser {
                     parts.push(InterpPart::Const(s));
                 }
                 Token::InterpScalar(name) => {
+                    let span = self.peek_span();
                     self.next_token()?;
-                    parts.push(InterpPart::ScalarInterp(name));
+                    let expr = Expr { kind: ExprKind::ScalarVar(name), span };
+                    parts.push(InterpPart::ScalarInterp(Box::new(expr)));
                 }
                 Token::InterpArray(name) => {
+                    let span = self.peek_span();
                     self.next_token()?;
-                    parts.push(InterpPart::ArrayInterp(name));
+                    let expr = Expr { kind: ExprKind::ArrayVar(name), span };
+                    parts.push(InterpPart::ArrayInterp(Box::new(expr)));
+                }
+                Token::InterpScalarChainStart(name) => {
+                    // Build the initial ScalarVar term, then apply
+                    // the same two-layer chain-parsing pipeline
+                    // that normal code uses:
+                    //
+                    //   1. `maybe_postfix_subscript` consumes bare
+                    //      `[...]`/`{...}` (e.g., `$h{k}`, `$a[0]`).
+                    //      The Pratt operator loop doesn't handle
+                    //      these because `[` and `{` aren't
+                    //      operators.
+                    //   2. `parse_expr_continuation` runs the Pratt
+                    //      loop for `->`, which picks up
+                    //      `->{...}` / `->[...]` chains.
+                    //
+                    // The chain terminates at the `InterpChainEnd`
+                    // token, which `peek_op_info` doesn't match.
+                    let span = self.peek_span();
+                    self.next_token()?;
+                    let initial = Expr { kind: ExprKind::ScalarVar(name), span };
+                    let after_subscripts = self.maybe_postfix_subscript(initial)?;
+                    let expr = self.parse_expr_continuation(after_subscripts, PREC_LOW)?;
+                    self.expect_token(&Token::InterpChainEnd)?;
+                    parts.push(InterpPart::ScalarInterp(Box::new(expr)));
+                }
+                Token::InterpArrayChainStart(name) => {
+                    // `@name[...]` / `@name{...}` inside a string
+                    // is a slice, not an element access.  Parse
+                    // the subscript as a comma-separated list and
+                    // wrap in ArraySlice/HashSlice — mirroring the
+                    // ArrayVar prefix path.
+                    //
+                    // Chained subscripts off an array slice aren't
+                    // a common form; we handle exactly one level
+                    // of subscript and require InterpChainEnd
+                    // immediately after.
+                    let span = self.peek_span();
+                    self.next_token()?;
+                    let recv = Expr { kind: ExprKind::ArrayVar(name), span };
+                    let expr = if self.eat(&Token::LeftBracket)? {
+                        let mut indices = Vec::new();
+                        while !self.at(&Token::RightBracket)? && !self.at_eof()? {
+                            indices.push(self.parse_expr(PREC_COMMA + 1)?);
+                            if !self.eat(&Token::Comma)? {
+                                break;
+                            }
+                        }
+                        let end = self.peek_span();
+                        self.expect_token(&Token::RightBracket)?;
+                        Expr { span: span.merge(end), kind: ExprKind::ArraySlice(Box::new(recv), indices) }
+                    } else if self.eat(&Token::LeftBrace)? {
+                        let mut keys = Vec::new();
+                        while !self.at(&Token::RightBrace)? && !self.at_eof()? {
+                            keys.push(self.parse_expr(PREC_COMMA + 1)?);
+                            if !self.eat(&Token::Comma)? {
+                                break;
+                            }
+                        }
+                        let end = self.peek_span();
+                        self.expect_token(&Token::RightBrace)?;
+                        Expr { span: span.merge(end), kind: ExprKind::HashSlice(Box::new(recv), keys) }
+                    } else {
+                        return Err(ParseError::new("expected [ or { after @name in string", self.peek_span()));
+                    };
+                    self.expect_token(&Token::InterpChainEnd)?;
+                    parts.push(InterpPart::ArrayInterp(Box::new(expr)));
                 }
                 Token::InterpScalarExprStart | Token::InterpArrayExprStart => {
                     self.next_token()?;
@@ -3829,7 +3922,7 @@ mod tests {
             ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert_eq!(parts.len(), 3);
                 assert!(matches!(&parts[0], InterpPart::Const(s) if s == "Hello, "));
-                assert!(matches!(&parts[1], InterpPart::ScalarInterp(s) if s == "name"));
+                assert_eq!(scalar_interp_name(&parts[1]), Some("name"));
                 assert!(matches!(&parts[2], InterpPart::Const(s) if s == "!"));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
@@ -3842,9 +3935,9 @@ mod tests {
         match &e.kind {
             ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert_eq!(parts.len(), 3);
-                assert!(matches!(&parts[0], InterpPart::ScalarInterp(s) if s == "x"));
+                assert_eq!(scalar_interp_name(&parts[0]), Some("x"));
                 assert!(matches!(&parts[1], InterpPart::Const(s) if s == " and "));
-                assert!(matches!(&parts[2], InterpPart::ScalarInterp(s) if s == "y"));
+                assert_eq!(scalar_interp_name(&parts[2]), Some("y"));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -3857,9 +3950,51 @@ mod tests {
             ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert_eq!(parts.len(), 2);
                 assert!(matches!(&parts[0], InterpPart::Const(s) if s == "items: "));
-                assert!(matches!(&parts[1], InterpPart::ArrayInterp(s) if s == "list"));
+                assert_eq!(array_interp_name(&parts[1]), Some("list"));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    /// Extract the variable name from a simple scalar-interp
+    /// (one that wraps a bare ScalarVar with no subscripts).
+    /// Returns None if the part isn't a ScalarInterp or the inner
+    /// expr isn't a bare variable.
+    fn scalar_interp_name(p: &InterpPart) -> Option<&str> {
+        match p {
+            InterpPart::ScalarInterp(expr) => match &expr.kind {
+                ExprKind::ScalarVar(n) => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Extract the variable name from a simple array-interp.
+    fn array_interp_name(p: &InterpPart) -> Option<&str> {
+        match p {
+            InterpPart::ArrayInterp(expr) => match &expr.kind {
+                ExprKind::ArrayVar(n) => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Pull the inner expression out of a ScalarInterp for tests
+    /// that need to inspect the subscript structure.
+    fn scalar_interp_expr(p: &InterpPart) -> &Expr {
+        match p {
+            InterpPart::ScalarInterp(e) => e,
+            other => panic!("expected ScalarInterp, got {other:?}"),
+        }
+    }
+
+    /// Pull the inner expression out of an ArrayInterp.
+    fn array_interp_expr(p: &InterpPart) -> &Expr {
+        match p {
+            InterpPart::ArrayInterp(e) => e,
+            other => panic!("expected ArrayInterp, got {other:?}"),
         }
     }
 
@@ -3898,6 +4033,516 @@ mod tests {
                 assert!(matches!(args[0].kind, ExprKind::InterpolatedString(_)));
             }
             other => panic!("expected print with InterpolatedString arg, got {other:?}"),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Subscript-chain interpolation inside strings.
+    //
+    // All of these should parse the subscript into real AST
+    // nodes inside a `ScalarInterp(Box<Expr>)` / `ArrayInterp(...)`
+    // part — not be swallowed into a `Const` segment.
+    // ═══════════════════════════════════════════════════════════
+
+    /// Pull the `parts` out of an interpolated-string expression.
+    fn interp_parts(src: &str) -> Vec<InterpPart> {
+        let e = parse_expr_str(src);
+        match e.kind {
+            ExprKind::InterpolatedString(Interpolated(parts)) => parts,
+            // Some single-subscript strings collapse via merge
+            // into a non-interpolated StringLit in degenerate
+            // cases — callers pass non-degenerate sources.
+            other => panic!("expected InterpolatedString, got {other:?} for {src:?}"),
+        }
+    }
+
+    /// For string-level asserts: the N-th part should be a
+    /// scalar-interp wrapping an expression whose pretty-printed
+    /// outline matches a given structural check.
+    fn scalar_part(parts: &[InterpPart], n: usize) -> &Expr {
+        scalar_interp_expr(&parts[n])
+    }
+
+    fn array_part(parts: &[InterpPart], n: usize) -> &Expr {
+        array_interp_expr(&parts[n])
+    }
+
+    // ── Basic subscript forms ─────────────────────────────────
+
+    #[test]
+    fn interp_hash_elem_arrow() {
+        // "$h->{key}" — classic bugged case.  Must parse as a
+        // ScalarInterp wrapping ArrowDeref(ScalarVar(h), HashElem(key)).
+        let parts = interp_parts(r#""$h->{key}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrowDeref(recv, ArrowTarget::HashElem(k)) => {
+                assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "h"));
+                // Key is a bareword (autoquoted by the subscript
+                // rule in the parser).
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "key"));
+            }
+            other => panic!("expected ArrowDeref hash-elem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_array_elem_arrow() {
+        // "$a->[0]"
+        let parts = interp_parts(r#""$a->[0]";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrowDeref(recv, ArrowTarget::ArrayElem(i)) => {
+                assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "a"));
+                assert!(matches!(i.kind, ExprKind::IntLit(0)));
+            }
+            other => panic!("expected ArrowDeref array-elem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_hash_elem_direct() {
+        // "$h{key}" — no arrow.  In Perl this is still a hash
+        // element access because `$h{...}` is equivalent to
+        // `${h}{...}`.  Parses as HashElem(ScalarVar(h), key).
+        let parts = interp_parts(r#""$h{key}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::HashElem(recv, k) => {
+                assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "h"));
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "key"));
+            }
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_array_elem_direct() {
+        // "$a[3]"
+        let parts = interp_parts(r#""$a[3]";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrayElem(recv, i) => {
+                assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "a"));
+                assert!(matches!(i.kind, ExprKind::IntLit(3)));
+            }
+            other => panic!("expected ArrayElem, got {other:?}"),
+        }
+    }
+
+    // ── Chained subscripts ────────────────────────────────────
+
+    #[test]
+    fn interp_chain_two_hash_levels() {
+        // "$h->{a}{b}" — arrow before first, implicit between.
+        // Hash elem wrapped in hash elem.
+        let parts = interp_parts(r#""$h->{a}{b}";"#);
+        let e = scalar_part(&parts, 0);
+        // Outer: HashElem(ArrowDeref(..., HashElem(h, a)), b)
+        match &e.kind {
+            ExprKind::HashElem(inner, k2) => {
+                assert!(matches!(k2.kind, ExprKind::StringLit(ref s) if s == "b"));
+                match &inner.kind {
+                    ExprKind::ArrowDeref(recv, ArrowTarget::HashElem(k1)) => {
+                        assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "h"));
+                        assert!(matches!(k1.kind, ExprKind::StringLit(ref s) if s == "a"));
+                    }
+                    other => panic!("expected inner ArrowDeref, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_chain_hash_then_array() {
+        // "$h->{k}[0]"
+        let parts = interp_parts(r#""$h->{k}[0]";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrayElem(inner, i) => {
+                assert!(matches!(i.kind, ExprKind::IntLit(0)));
+                assert!(matches!(inner.kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))));
+            }
+            other => panic!("expected ArrayElem wrapping ArrowDeref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_chain_array_then_hash() {
+        // "$a[0]{k}"
+        let parts = interp_parts(r#""$a[0]{k}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::HashElem(inner, k) => {
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "k"));
+                match &inner.kind {
+                    ExprKind::ArrayElem(recv, i) => {
+                        assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "a"));
+                        assert!(matches!(i.kind, ExprKind::IntLit(0)));
+                    }
+                    other => panic!("expected inner ArrayElem, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_chain_three_levels() {
+        // "$h->{a}->{b}->{c}" — three arrow-hashes.
+        let parts = interp_parts(r#""$h->{a}->{b}->{c}";"#);
+        let e = scalar_part(&parts, 0);
+        // Triple-nested ArrowDeref(HashElem).
+        fn unwrap_hash_arrow(expr: &Expr) -> (&Expr, &Expr) {
+            match &expr.kind {
+                ExprKind::ArrowDeref(recv, ArrowTarget::HashElem(k)) => (recv, k),
+                other => panic!("expected ArrowDeref hash, got {other:?}"),
+            }
+        }
+        let (mid, k3) = unwrap_hash_arrow(e);
+        assert!(matches!(k3.kind, ExprKind::StringLit(ref s) if s == "c"));
+        let (innermost, k2) = unwrap_hash_arrow(mid);
+        assert!(matches!(k2.kind, ExprKind::StringLit(ref s) if s == "b"));
+        let (leaf, k1) = unwrap_hash_arrow(innermost);
+        assert!(matches!(k1.kind, ExprKind::StringLit(ref s) if s == "a"));
+        assert!(matches!(leaf.kind, ExprKind::ScalarVar(ref n) if n == "h"));
+    }
+
+    #[test]
+    fn interp_chain_arrow_then_implicit() {
+        // "$h->{a}[0]{b}" — arrow, array, hash.
+        let parts = interp_parts(r#""$h->{a}[0]{b}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::HashElem(ae, k) => {
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "b"));
+                match &ae.kind {
+                    ExprKind::ArrayElem(ad, i) => {
+                        assert!(matches!(i.kind, ExprKind::IntLit(0)));
+                        assert!(matches!(ad.kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))));
+                    }
+                    other => panic!("expected ArrayElem, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer HashElem, got {other:?}"),
+        }
+    }
+
+    // ── Subscripts with expression keys/indices ───────────────
+
+    #[test]
+    fn interp_hash_subscript_expr_key() {
+        // "$h->{$k}" — key is a scalar variable, not bareword.
+        let parts = interp_parts(r#""$h->{$k}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(k)) => {
+                assert!(matches!(k.kind, ExprKind::ScalarVar(ref n) if n == "k"));
+            }
+            other => panic!("expected ArrowDeref hash-elem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_array_subscript_expr_index() {
+        // "$a[$i]" — index is $i.
+        let parts = interp_parts(r#""$a[$i]";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrayElem(_, i) => {
+                assert!(matches!(i.kind, ExprKind::ScalarVar(ref n) if n == "i"));
+            }
+            other => panic!("expected ArrayElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_array_subscript_arith_expr() {
+        // "$a[$i + 1]"
+        let parts = interp_parts(r#""$a[$i + 1]";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrayElem(_, i) => {
+                assert!(matches!(i.kind, ExprKind::BinOp(BinOp::Add, _, _)));
+            }
+            other => panic!("expected ArrayElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_hash_subscript_string_key() {
+        // "$h{'literal'}" — explicit single-quoted key.
+        let parts = interp_parts(r#""$h{'literal'}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::HashElem(_, k) => {
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "literal"));
+            }
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    // ── Array-interp chains ──────────────────────────────────
+
+    #[test]
+    fn interp_array_slice_range() {
+        // "@a[1..3]" — array slice with a range index.
+        let parts = interp_parts(r#""@a[1..3]";"#);
+        let e = array_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArraySlice(recv, indices) => {
+                assert!(matches!(recv.kind, ExprKind::ArrayVar(ref n) if n == "a"));
+                assert_eq!(indices.len(), 1);
+                assert!(matches!(indices[0].kind, ExprKind::Range(_, _)));
+            }
+            other => panic!("expected ArraySlice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_hash_slice_list() {
+        // "@h{'k1','k2'}" — hash slice with two keys.
+        let parts = interp_parts(r#""@h{'k1','k2'}";"#);
+        let e = array_part(&parts, 0);
+        match &e.kind {
+            ExprKind::HashSlice(recv, keys) => {
+                assert!(matches!(recv.kind, ExprKind::ArrayVar(ref n) if n == "h"));
+                assert_eq!(keys.len(), 2);
+                assert!(matches!(keys[0].kind, ExprKind::StringLit(ref s) if s == "k1"));
+                assert!(matches!(keys[1].kind, ExprKind::StringLit(ref s) if s == "k2"));
+            }
+            other => panic!("expected HashSlice, got {other:?}"),
+        }
+    }
+
+    // ── Mixed with literal text ──────────────────────────────
+
+    #[test]
+    fn interp_chain_mid_string() {
+        // "a $h->{key} b" — subscript in the middle.
+        let parts = interp_parts(r#""a $h->{key} b";"#);
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], InterpPart::Const(s) if s == "a "));
+        // Middle is the chain.
+        let e = scalar_part(&parts, 1);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))));
+        assert!(matches!(&parts[2], InterpPart::Const(s) if s == " b"));
+    }
+
+    #[test]
+    fn interp_two_chains_one_string() {
+        // "$h->{k} and $a[0]"
+        let parts = interp_parts(r#""$h->{k} and $a[0]";"#);
+        assert_eq!(parts.len(), 3);
+        let e0 = scalar_part(&parts, 0);
+        assert!(matches!(e0.kind, ExprKind::ArrowDeref(_, _)));
+        assert!(matches!(&parts[1], InterpPart::Const(s) if s == " and "));
+        let e2 = scalar_part(&parts, 2);
+        assert!(matches!(e2.kind, ExprKind::ArrayElem(_, _)));
+    }
+
+    // ── Negative cases (no chain) ────────────────────────────
+
+    #[test]
+    fn interp_bare_arrow_is_literal() {
+        // "$a->" — bare arrow with nothing after.  Lexer must not
+        // start a chain; the `->` stays literal text.
+        let parts = interp_parts(r#""$a->";"#);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(scalar_interp_name(&parts[0]), Some("a"));
+        assert!(matches!(&parts[1], InterpPart::Const(s) if s == "->"));
+    }
+
+    #[test]
+    fn interp_bare_arrow_then_ident_is_literal() {
+        // "$a->foo" — method-call shape is NOT interpolated in
+        // strings (per perlop).  `$a` interpolates; `->foo`
+        // renders literally.
+        let parts = interp_parts(r#""$a->foo";"#);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(scalar_interp_name(&parts[0]), Some("a"));
+        assert!(matches!(&parts[1], InterpPart::Const(s) if s == "->foo"));
+    }
+
+    #[test]
+    fn interp_plain_scalar_no_subscript() {
+        // Simple "$name" shouldn't start a chain.  Still uses the
+        // new ScalarInterp(Box<Expr>) wrapper around a bare
+        // ScalarVar.
+        let parts = interp_parts(r#""Hello $name!";"#);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(scalar_interp_name(&parts[1]), Some("name"));
+    }
+
+    #[test]
+    fn interp_trailing_literal_bracket() {
+        // "$a [0]" — space before `[` means it's NOT a subscript.
+        // The literal `[` and `]` stay as ConstSegment.
+        let parts = interp_parts(r#""$a [0]";"#);
+        // Parts: ScalarInterp(a), Const(" [0]").
+        assert_eq!(parts.len(), 2);
+        assert_eq!(scalar_interp_name(&parts[0]), Some("a"));
+        assert!(matches!(&parts[1], InterpPart::Const(s) if s == " [0]"));
+    }
+
+    // ── Escaped sigils ───────────────────────────────────────
+
+    #[test]
+    fn interp_escaped_dollar_before_subscript_bracket() {
+        // "\$a[0]" — escaped `$`; whole thing is literal.
+        let e = parse_expr_str(r#""\$a[0]";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "$a[0]"),
+            other => panic!("expected StringLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_escaped_arrow_after_var() {
+        // `"\$a->{x}"` — escaped $ makes the whole thing literal.
+        let e = parse_expr_str(r#""\$a->{x}";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "$a->{x}"),
+            other => panic!("expected StringLit, got {other:?}"),
+        }
+    }
+
+    // ── Nested braces inside subscript expression ────────────
+
+    #[test]
+    fn interp_subscript_with_nested_braces() {
+        // `"$h->{$x}{y}"` — two nested subscripts, with `y` as
+        // a bareword hash key in the inner-most subscript.
+        //
+        // `y}` is a lexer edge case: `y` is one of the quote
+        // keywords (alias for `tr`), so at_quote_delimiter must
+        // reject the closing `}` that follows.  Tests below
+        // cover every quote keyword × every closing delimiter
+        // combination; this one spot-checks the interaction with
+        // subscript-chain interpolation specifically.
+        let parts = interp_parts(r#""$h->{$x}{y}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::HashElem(inner, k) => {
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "y"));
+                match &inner.kind {
+                    ExprKind::ArrowDeref(_, ArrowTarget::HashElem(k1)) => {
+                        assert!(matches!(k1.kind, ExprKind::ScalarVar(ref n) if n == "x"));
+                    }
+                    other => panic!("expected ArrowDeref hash-elem, got {other:?}"),
+                }
+            }
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_subscript_with_func_call() {
+        // "$h->{foo()}" — key is a function call.
+        let parts = interp_parts(r#""$h->{foo()}";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(k)) => {
+                assert!(matches!(k.kind, ExprKind::FuncCall(_, _)));
+            }
+            other => panic!("expected ArrowDeref hash-elem, got {other:?}"),
+        }
+    }
+
+    // ── In qq// ──────────────────────────────────────────────
+
+    #[test]
+    fn interp_qq_with_subscript() {
+        // qq{...} uses `{}` as delimiter; the `{key}` inside is
+        // still recognized as a hash subscript.
+        let e = parse_expr_str("qq{$h->{key}};");
+        match &e.kind {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
+                assert_eq!(parts.len(), 1);
+                let inner = scalar_part(parts, 0);
+                assert!(matches!(inner.kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))));
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    // ── Concatenation-style interpolation context ────────────
+
+    #[test]
+    fn interp_chain_then_concat() {
+        // Interpolated string concatenated with another.  The
+        // chain in the first one must still be parsed correctly.
+        let e = parse_expr_str(r#""$h->{key}" . "plain";"#);
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Concat, left, _) => {
+                if let ExprKind::InterpolatedString(Interpolated(parts)) = &left.kind {
+                    assert_eq!(parts.len(), 1);
+                    assert!(matches!(scalar_part(parts, 0).kind, ExprKind::ArrowDeref(_, _)));
+                } else {
+                    panic!("left should be InterpolatedString");
+                }
+            }
+            other => panic!("expected Concat, got {other:?}"),
+        }
+    }
+
+    // ── @name chain forms ────────────────────────────────────
+
+    #[test]
+    fn interp_array_chain_in_mid_string() {
+        // "list: @a[0..2] done"
+        let parts = interp_parts(r#""list: @a[0..2] done";"#);
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], InterpPart::Const(s) if s == "list: "));
+        let e = array_part(&parts, 1);
+        match &e.kind {
+            ExprKind::ArraySlice(recv, indices) => {
+                assert!(matches!(recv.kind, ExprKind::ArrayVar(ref n) if n == "a"));
+                assert_eq!(indices.len(), 1);
+                assert!(matches!(indices[0].kind, ExprKind::Range(_, _)));
+            }
+            other => panic!("expected ArraySlice, got {other:?}"),
+        }
+        assert!(matches!(&parts[2], InterpPart::Const(s) if s == " done"));
+    }
+
+    // ── ${name}-expression form interaction ──────────────────
+
+    #[test]
+    fn interp_braced_name_then_literal_subscript() {
+        // "${name}[0]" — `${name}` is explicit braced form.
+        // The `[0]` after the `}` is literal text (per Perl
+        // behavior: ${name}[0] interpolates only $name).
+        let parts = interp_parts(r#""${name}[0]";"#);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(scalar_interp_name(&parts[0]), Some("name"));
+        assert!(matches!(&parts[1], InterpPart::Const(s) if s == "[0]"));
+    }
+
+    // ── Regex interpolation (shares the same scanner) ────────
+
+    #[test]
+    fn regex_interp_subscript() {
+        // m/$h->{key}/ — regex bodies use the same interp
+        // machinery; chains should work there too.
+        let e = parse_expr_str(r#"m/$h->{key}/;"#);
+        match &e.kind {
+            ExprKind::Regex(_, pat, _) => {
+                let parts = &pat.0;
+                // Expect at least one ScalarInterp with the chain.
+                let has_chain = parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        InterpPart::ScalarInterp(expr) if matches!(
+                            expr.kind,
+                            ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))
+                        )
+                    )
+                });
+                assert!(has_chain, "expected arrow-hash chain in regex parts: {parts:?}");
+            }
+            other => panic!("expected Regex, got {other:?}"),
         }
     }
 
@@ -8102,7 +8747,7 @@ my $y = 1;
                 assert!(pat.as_plain_string().is_none(), "expected interpolated pattern");
                 assert!(pat.0.len() >= 2);
                 assert!(matches!(&pat.0[0], InterpPart::Const(s) if s == "foo"));
-                assert!(matches!(&pat.0[1], InterpPart::ScalarInterp(s) if s == "bar"));
+                assert_eq!(scalar_interp_name(&pat.0[1]), Some("bar"));
             }
             other => panic!("expected Regex, got {other:?}"),
         }
@@ -8220,6 +8865,152 @@ my $y = 1;
     }
 
     // ═══════════════════════════════════════════════════════════
+    // Quote-keyword autoquoting.
+    //
+    // The 8 Perl quote-like operators — `q`, `qq`, `qw`, `qr`,
+    // `m`, `s`, `tr`, `y` — are recognized as operators only
+    // when followed by a *valid* opening delimiter (see
+    // `at_quote_delimiter` in the lexer).  When not followed by
+    // a valid opener — including when followed by `=>` (fat
+    // comma), `}` (hash-subscript close), or any of the
+    // closing paired delimiters `)`, `]`, `}`, `>` — they must
+    // NOT start a quote op and must instead be treated as
+    // ordinary barewords (autoquoted to string literals in the
+    // appropriate contexts).
+    //
+    // (`qx` — the backtick-equivalent — has the same lexical
+    // shape but is omitted from this set to match Perl's common
+    // "8 quote operators" terminology.)
+    // ═══════════════════════════════════════════════════════════
+
+    // ── Autoquote in fat-comma context ────────────────────────
+
+    /// Parse `(KEYWORD => 1);` and return the first list element.
+    /// Handles the outer Paren wrapping produced by the `(...)`.
+    fn parse_kw_fat_comma(src: &str) -> Expr {
+        let mut e = parse_expr_str(src);
+        // Unwrap a single-level Paren — `(k => v)` parses as
+        // Paren(List([k, v])) rather than bare List.
+        if let ExprKind::Paren(inner) = e.kind {
+            e = *inner;
+        }
+        match e.kind {
+            ExprKind::List(mut items) => {
+                assert!(!items.is_empty(), "expected non-empty list for {src:?}");
+                items.remove(0)
+            }
+            other => panic!("expected List, got {other:?} for {src:?}"),
+        }
+    }
+
+    #[test]
+    fn autoquote_q_fat_comma() {
+        let first = parse_kw_fat_comma("(q => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "q"), "expected StringLit(q), got {:?}", first.kind);
+    }
+
+    #[test]
+    fn autoquote_qq_fat_comma() {
+        let first = parse_kw_fat_comma("(qq => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "qq"), "expected StringLit(qq), got {:?}", first.kind);
+    }
+
+    #[test]
+    fn autoquote_qw_fat_comma() {
+        let first = parse_kw_fat_comma("(qw => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "qw"), "expected StringLit(qw), got {:?}", first.kind);
+    }
+
+    #[test]
+    fn autoquote_qr_fat_comma() {
+        let first = parse_kw_fat_comma("(qr => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "qr"), "expected StringLit(qr), got {:?}", first.kind);
+    }
+
+    #[test]
+    fn autoquote_m_fat_comma() {
+        let first = parse_kw_fat_comma("(m => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "m"), "expected StringLit(m), got {:?}", first.kind);
+    }
+
+    #[test]
+    fn autoquote_s_fat_comma() {
+        let first = parse_kw_fat_comma("(s => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "s"), "expected StringLit(s), got {:?}", first.kind);
+    }
+
+    #[test]
+    fn autoquote_tr_fat_comma() {
+        let first = parse_kw_fat_comma("(tr => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "tr"), "expected StringLit(tr), got {:?}", first.kind);
+    }
+
+    #[test]
+    fn autoquote_y_fat_comma() {
+        let first = parse_kw_fat_comma("(y => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "y"), "expected StringLit(y), got {:?}", first.kind);
+    }
+
+    // ── Autoquote in hash-subscript context ───────────────────
+
+    /// Parse `$h{KEYWORD}` and return the subscript key expression.
+    fn parse_kw_hash_key(src: &str) -> Expr {
+        let e = parse_expr_str(src);
+        match e.kind {
+            ExprKind::HashElem(_, key) => *key,
+            other => panic!("expected HashElem, got {other:?} for {src:?}"),
+        }
+    }
+
+    #[test]
+    fn autoquote_q_hash_key() {
+        let key = parse_kw_hash_key("$h{q};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "q"), "expected StringLit(q), got {:?}", key.kind);
+    }
+
+    #[test]
+    fn autoquote_qq_hash_key() {
+        let key = parse_kw_hash_key("$h{qq};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "qq"), "expected StringLit(qq), got {:?}", key.kind);
+    }
+
+    #[test]
+    fn autoquote_qw_hash_key() {
+        let key = parse_kw_hash_key("$h{qw};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "qw"), "expected StringLit(qw), got {:?}", key.kind);
+    }
+
+    #[test]
+    fn autoquote_qr_hash_key() {
+        let key = parse_kw_hash_key("$h{qr};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "qr"), "expected StringLit(qr), got {:?}", key.kind);
+    }
+
+    #[test]
+    fn autoquote_m_hash_key() {
+        let key = parse_kw_hash_key("$h{m};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "m"), "expected StringLit(m), got {:?}", key.kind);
+    }
+
+    #[test]
+    fn autoquote_s_hash_key() {
+        let key = parse_kw_hash_key("$h{s};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "s"), "expected StringLit(s), got {:?}", key.kind);
+    }
+
+    #[test]
+    fn autoquote_tr_hash_key() {
+        let key = parse_kw_hash_key("$h{tr};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "tr"), "expected StringLit(tr), got {:?}", key.kind);
+    }
+
+    #[test]
+    fn autoquote_y_hash_key() {
+        let key = parse_kw_hash_key("$h{y};");
+        assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "y"), "expected StringLit(y), got {:?}", key.kind);
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // NEW TESTS — known gaps (ignored until implemented)
     // ═══════════════════════════════════════════════════════════
 
@@ -8290,7 +9081,7 @@ my $y = 1;
         let e = parse_expr_str(r#""${name}s";"#);
         match &e.kind {
             ExprKind::InterpolatedString(Interpolated(parts)) => {
-                assert!(matches!(&parts[0], InterpPart::ScalarInterp(s) if s == "name"), "expected ScalarInterp(name), got {:?}", parts[0]);
+                assert_eq!(scalar_interp_name(&parts[0]), Some("name"), "expected ScalarInterp(name), got {:?}", parts[0]);
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
