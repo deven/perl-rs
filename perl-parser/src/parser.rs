@@ -528,15 +528,27 @@ impl Parser {
 
     fn parse_single_var_decl(&mut self) -> Result<VarDecl, ParseError> {
         let span = self.peek_span();
+
+        // `my \$x` / `my \@a` / `my \%h` — reference declaration
+        // (declared_refs, 5.26+).  Only honored when the feature
+        // is active; otherwise `\` would be an unexpected token
+        // here.
+        let is_ref = if self.pragmas.features.contains(Features::DECLARED_REFS) && matches!(self.peek_token(), Token::Backslash) {
+            self.next_token()?;
+            true
+        } else {
+            false
+        };
+
         match self.next_token()?.token {
-            Token::ScalarVar(name) => Ok(VarDecl { sigil: Sigil::Scalar, name, span }),
-            Token::ArrayVar(name) => Ok(VarDecl { sigil: Sigil::Array, name, span }),
-            Token::HashVar(name) => Ok(VarDecl { sigil: Sigil::Hash, name, span }),
+            Token::ScalarVar(name) => Ok(VarDecl { sigil: Sigil::Scalar, name, span, is_ref }),
+            Token::ArrayVar(name) => Ok(VarDecl { sigil: Sigil::Array, name, span, is_ref }),
+            Token::HashVar(name) => Ok(VarDecl { sigil: Sigil::Hash, name, span, is_ref }),
             Token::Percent => {
                 // my %hash — lexer emitted Percent; read the hash name.
                 match self.lexer.lex_hash_var_after_percent()? {
-                    Some(Token::HashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span }),
-                    Some(Token::SpecialHashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span }),
+                    Some(Token::HashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, is_ref }),
+                    Some(Token::SpecialHashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, is_ref }),
                     _ => Err(ParseError::new("expected hash variable name after %", span)),
                 }
             }
@@ -949,7 +961,7 @@ impl Parser {
                 Token::ScalarVar(n) => n,
                 _ => unreachable!(),
             };
-            Some(VarDecl { sigil: Sigil::Scalar, name, span })
+            Some(VarDecl { sigil: Sigil::Scalar, name, span, is_ref: false })
         } else {
             None
         };
@@ -2900,6 +2912,31 @@ impl Parser {
         }
     }
 
+    /// Is `expr` a valid left-hand side of an aliasing assignment,
+    /// per the `refaliasing` feature?
+    ///
+    /// Accepts `\$x`, `\@a`, `\%h`, `\&f`, `\*g`, parenthesized
+    /// forms, and lists of those (including `my`-declarations that
+    /// themselves contain ref-wrapped variables).  The base
+    /// lvalues (ScalarVar, ArrayVar, etc.) are NOT accepted here —
+    /// plain `$x = 1` goes through `is_valid_lvalue` alone.
+    fn is_ref_alias_target(expr: &Expr) -> bool {
+        match &expr.kind {
+            // The canonical aliasing form: `\<variable>`.
+            ExprKind::Ref(inner) => Self::is_valid_lvalue(inner),
+            // Parenthesized aliasing: `(\$x) = ...`.
+            ExprKind::Paren(inner) => Self::is_ref_alias_target(inner),
+            // List: `(\$x, \@y) = ...`.  Mixed lists (some ref,
+            // some not) are syntactically valid — semantics is
+            // a later concern.
+            ExprKind::List(items) => items.iter().any(Self::is_ref_alias_target),
+            // `my \$x = ...` — the Decl already carries the
+            // `is_ref` flag on each VarDecl.
+            ExprKind::Decl(_, vars) => vars.iter().any(|v| v.is_ref),
+            _ => false,
+        }
+    }
+
     fn parse_operator(&mut self, left: Expr, info: OpInfo) -> Result<Expr, ParseError> {
         let op_spanned = self.next_token()?;
         let right_prec = info.right_prec();
@@ -2932,7 +2969,13 @@ impl Parser {
 
             // Assignment
             Token::Assign(op) => {
-                if !Self::is_valid_lvalue(&left) {
+                // `refaliasing` (5.22+) extends lvalue-ness to
+                // include `\$x`, `\@a`, `\%h`, and lists of those.
+                // We accept `Ref(...)` as an assignment target
+                // only when the feature is active; the
+                // ++/-- lvalue checks below are unaffected.
+                let refalias_ok = self.pragmas.features.contains(Features::REFALIASING) && Self::is_ref_alias_target(&left);
+                if !Self::is_valid_lvalue(&left) && !refalias_ok {
                     return Err(ParseError::new("invalid assignment target", left.span));
                 }
                 let right = self.parse_expr(right_prec)?;
@@ -5772,6 +5815,166 @@ sub outer ($x) { 1 }
         // The :5.16 bundle includes current_sub.
         let e = parse_expr_stmt("use v5.16; __SUB__;");
         assert!(matches!(e.kind, ExprKind::CurrentSub));
+    }
+
+    // ── Refaliasing / declared_refs (5.22+ / 5.26+) ───────────
+
+    #[test]
+    fn refalias_requires_feature() {
+        // Without `refaliasing`, `\$a = \$b` is a parse error
+        // (Ref is not a valid lvalue).
+        let src = "\\$a = \\$b;";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => panic!("parser construction failed"),
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), "refaliasing without feature should fail");
+    }
+
+    #[test]
+    fn refalias_with_feature_scalar() {
+        let e = parse_expr_stmt("use feature 'refaliasing'; no warnings 'experimental::refaliasing'; \\$a = \\$b;");
+        match e.kind {
+            ExprKind::Assign(AssignOp::Eq, lhs, rhs) => {
+                assert!(matches!(lhs.kind, ExprKind::Ref(_)));
+                assert!(matches!(rhs.kind, ExprKind::Ref(_)));
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refalias_with_feature_array() {
+        let e = parse_expr_stmt("use feature 'refaliasing'; no warnings 'experimental::refaliasing'; \\@a = \\@b;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+    }
+
+    #[test]
+    fn refalias_with_feature_hash() {
+        let e = parse_expr_stmt("use feature 'refaliasing'; no warnings 'experimental::refaliasing'; \\%a = \\%b;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+    }
+
+    #[test]
+    fn refalias_list_form() {
+        let e = parse_expr_stmt("use feature 'refaliasing'; no warnings 'experimental::refaliasing'; (\\$a, \\$b) = (\\$c, \\$d);");
+        match e.kind {
+            ExprKind::Assign(AssignOp::Eq, lhs, _) => {
+                // LHS should be a list / paren containing Refs.
+                match &lhs.kind {
+                    ExprKind::Paren(inner) => match &inner.kind {
+                        ExprKind::List(items) => {
+                            assert_eq!(items.len(), 2);
+                            assert!(items.iter().all(|e| matches!(e.kind, ExprKind::Ref(_))));
+                        }
+                        other => panic!("expected List inside Paren, got {other:?}"),
+                    },
+                    ExprKind::List(items) => {
+                        assert!(items.iter().all(|e| matches!(e.kind, ExprKind::Ref(_))));
+                    }
+                    other => panic!("expected List/Paren on LHS, got {other:?}"),
+                }
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    // ── declared_refs (5.26+) ──
+
+    #[test]
+    fn declared_refs_requires_feature() {
+        // `my \$x` without feature → ParseError at the `\`.
+        let src = "my \\$x = \\$y;";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => panic!("parser construction failed"),
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), "declared_refs without feature should fail");
+    }
+
+    #[test]
+    fn declared_refs_scalar() {
+        let e = parse_expr_stmt(
+            "use feature 'declared_refs'; use feature 'refaliasing'; \
+             no warnings 'experimental::refaliasing'; no warnings 'experimental::declared_refs'; \
+             my \\$x = \\$y;",
+        );
+        match e.kind {
+            ExprKind::Assign(AssignOp::Eq, lhs, _) => match lhs.kind {
+                ExprKind::Decl(DeclScope::My, vars) => {
+                    assert_eq!(vars.len(), 1);
+                    assert_eq!(vars[0].name, "x");
+                    assert_eq!(vars[0].sigil, Sigil::Scalar);
+                    assert!(vars[0].is_ref, "expected is_ref=true for `my \\$x`");
+                }
+                other => panic!("expected Decl on LHS, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_refs_list_mixed() {
+        // `my (\$a, \@b)` — two ref-declared vars.
+        let e = parse_expr_stmt(
+            "use feature 'declared_refs'; use feature 'refaliasing'; \
+             no warnings 'experimental::refaliasing'; no warnings 'experimental::declared_refs'; \
+             my (\\$a, \\@b) = (\\$c, \\@d);",
+        );
+        match e.kind {
+            ExprKind::Assign(AssignOp::Eq, lhs, _) => match lhs.kind {
+                ExprKind::Decl(DeclScope::My, vars) => {
+                    assert_eq!(vars.len(), 2);
+                    assert!(vars[0].is_ref && vars[1].is_ref);
+                    assert_eq!(vars[0].sigil, Sigil::Scalar);
+                    assert_eq!(vars[1].sigil, Sigil::Array);
+                }
+                other => panic!("expected Decl on LHS, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_refs_partial() {
+        // Mixing ref and non-ref in one decl: `my (\$a, $b)` — the
+        // parser accepts this (semantic validation is a later pass).
+        let e = parse_expr_stmt(
+            "use feature 'declared_refs'; use feature 'refaliasing'; \
+             no warnings 'experimental::refaliasing'; no warnings 'experimental::declared_refs'; \
+             my (\\$a, $b) = (\\$c, 42);",
+        );
+        match e.kind {
+            ExprKind::Assign(AssignOp::Eq, lhs, _) => match lhs.kind {
+                ExprKind::Decl(DeclScope::My, vars) => {
+                    assert_eq!(vars.len(), 2);
+                    assert!(vars[0].is_ref);
+                    assert!(!vars[1].is_ref);
+                }
+                other => panic!("expected Decl on LHS, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_refs_via_v5_36() {
+        // `use v5.36` enables both refaliasing and declared_refs
+        // via the bundle.
+        // Actually, checking perlfeature: :5.36 does NOT include
+        // refaliasing/declared_refs (those are still experimental
+        // as of 5.36).  So this test expects a parse error.
+        // Using a feature-on path with explicit `use feature` in
+        // other tests above covers the positive case.
+        let src = "use v5.36; my \\$x = \\$y;";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => panic!("parser construction failed"),
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), ":5.36 bundle does not include declared_refs (experimental)");
     }
 
     // ── format tests ──────────────────────────────────────────

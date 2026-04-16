@@ -478,6 +478,11 @@ pub struct VarDecl {
     pub sigil: Sigil,
     pub name: String,
     pub span: Span,
+    /// Reference-declaration form: `my \$x` binds `$x` as an alias
+    /// (via the `declared_refs` feature, 5.26+).  The RHS of the
+    /// enclosing assignment must be a matching reference.  When
+    /// `false`, this is a normal copy-initialized variable.
+    pub is_ref: bool,
 }
 
 /// Subroutine declaration.
