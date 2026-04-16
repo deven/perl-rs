@@ -968,14 +968,113 @@ impl Parser {
         // Expect '='
         self.expect_token(&Token::Assign(AssignOp::Eq))?;
 
-        // Consume body lines until a line containing just '.'
-        // We scan raw bytes since format bodies are not normal Perl code.
-        let body_start = self.lexer.current_pos();
-        self.lexer.skip_format_body();
-        let body_end = self.lexer.current_pos();
-        let body = String::from_utf8_lossy(self.lexer.slice(body_start, body_end)).into_owned();
+        // Hand off to the lexer's format sublex mode.  The next
+        // token will be FormatSublexBegin; the body ends at
+        // SublexEnd (emitted for the `.` terminator).
+        //
+        // Careful: do NOT call `peek_span` here — that would invoke
+        // the lexer and potentially tokenize into the first body
+        // line, which `start_format` would then discard when it
+        // drops `current_line`.  Build the begin span from `start`
+        // and the current (pre-body) lexer position instead.
+        let here = self.lexer.pos() as u32;
+        let begin_span = start.merge(Span::new(here, here));
+        self.lexer.start_format(name.clone(), begin_span);
+        // Clear any cached current-token so the Parser re-fetches.
+        self.current = None;
 
-        Ok(StmtKind::FormatDecl(FormatDecl { name, body, span: start.merge(self.peek_span()) }))
+        // Consume the FormatSublexBegin.
+        let begin = self.next_token()?;
+        if !matches!(begin.token, Token::FormatSublexBegin(_)) {
+            return Err(ParseError::new(format!("expected FormatSublexBegin, got {:?}", begin.token), begin.span));
+        }
+
+        // Read format lines until SublexEnd.
+        let mut lines = Vec::new();
+        loop {
+            let tok = self.next_token()?;
+            match tok.token {
+                Token::SublexEnd => break,
+                Token::FormatComment(text) => {
+                    lines.push(FormatLine::Comment { text, span: tok.span });
+                }
+                Token::FormatBlankLine => {
+                    lines.push(FormatLine::Blank { span: tok.span });
+                }
+                Token::FormatLiteralLine(repeat, text) => {
+                    lines.push(FormatLine::Literal { repeat, text, span: tok.span });
+                }
+                Token::FormatPictureBegin(repeat) => {
+                    lines.push(self.parse_format_picture(repeat, tok.span)?);
+                }
+                other => {
+                    return Err(ParseError::new(format!("unexpected token in format body: {other:?}"), tok.span));
+                }
+            }
+        }
+
+        Ok(StmtKind::FormatDecl(FormatDecl { name, lines, span: start.merge(self.peek_span()) }))
+    }
+
+    /// Parse a picture line after `FormatPictureBegin(repeat)` has
+    /// been consumed.  Consumes tokens until `FormatPictureEnd`,
+    /// then the following `FormatArgsBegin` / expressions /
+    /// `FormatArgsEnd` group, and assembles a `FormatLine::Picture`.
+    fn parse_format_picture(&mut self, repeat: RepeatKind, begin_span: Span) -> Result<FormatLine, ParseError> {
+        let mut parts = Vec::new();
+        loop {
+            let tok = self.next_token()?;
+            match tok.token {
+                Token::FormatPictureEnd => break,
+                Token::FormatLiteral(text) => {
+                    parts.push(FormatPart::Literal(text));
+                }
+                Token::FormatField(kind) => {
+                    parts.push(FormatPart::Field(FormatField { kind, span: tok.span }));
+                }
+                other => {
+                    return Err(ParseError::new(format!("unexpected token in picture line: {other:?}"), tok.span));
+                }
+            }
+        }
+
+        // Expect FormatArgsBegin.
+        let args_begin = self.next_token()?;
+        if !matches!(args_begin.token, Token::FormatArgsBegin) {
+            return Err(ParseError::new(format!("expected FormatArgsBegin, got {:?}", args_begin.token), args_begin.span));
+        }
+
+        // Peek: if `{` is the first args token, consume it and
+        // switch the lexer to braced mode.
+        let braced = matches!(self.peek_token(), Token::LeftBrace);
+        if braced {
+            self.next_token()?; // consume `{`
+            self.lexer.format_args_enter_braced();
+            // Clear any cached token — the mode switch may affect
+            // how the next token is produced.
+            self.current = None;
+        }
+
+        // Parse comma-separated expressions until FormatArgsEnd.
+        let mut args = Vec::new();
+        while !matches!(self.peek_token(), Token::FormatArgsEnd) {
+            // Defensive: surface EOF / unexpected termination.
+            if matches!(self.peek_token(), Token::Eof) {
+                return Err(ParseError::new("unexpected EOF inside format arguments".to_string(), self.peek_span()));
+            }
+            let expr = self.parse_expr(PREC_COMMA + 1)?;
+            args.push(expr);
+            if !self.eat(&Token::Comma)? {
+                break;
+            }
+        }
+        // Consume FormatArgsEnd.
+        let end = self.next_token()?;
+        if !matches!(end.token, Token::FormatArgsEnd) {
+            return Err(ParseError::new(format!("expected FormatArgsEnd, got {:?}", end.token), end.span));
+        }
+
+        Ok(FormatLine::Picture { repeat, parts, args, span: begin_span.merge(end.span) })
     }
 
     // ── class / field / method (5.38+ Corinna) ────────────────
@@ -4570,26 +4669,523 @@ mod tests {
 
     // ── format tests ──────────────────────────────────────────
 
-    #[test]
-    fn parse_format_decl() {
-        let prog = parse("format STDOUT =\n@<<<< @>>>>\n$name, $value\n.\n");
+    /// Convenience: parse a single format declaration, panic on any
+    /// other top-level statement shape.
+    fn parse_fmt(src: &str) -> FormatDecl {
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 1, "expected one top-level stmt, got {}", prog.statements.len());
         match &prog.statements[0].kind {
-            StmtKind::FormatDecl(f) => {
-                assert_eq!(f.name, "STDOUT");
-                assert!(f.body.contains("@<<<<"));
-            }
+            StmtKind::FormatDecl(f) => f.clone(),
             other => panic!("expected FormatDecl, got {other:?}"),
         }
     }
 
+    // ── Boundary / naming ──
+
     #[test]
-    fn parse_format_default_name() {
-        let prog = parse("format =\ntest\n.\n");
-        match &prog.statements[0].kind {
-            StmtKind::FormatDecl(f) => {
-                assert_eq!(f.name, "STDOUT");
+    fn format_default_name_is_stdout() {
+        let f = parse_fmt("format =\n.\n");
+        assert_eq!(f.name, "STDOUT");
+        assert!(f.lines.is_empty(), "empty body → no lines");
+    }
+
+    #[test]
+    fn format_named() {
+        let f = parse_fmt("format MyFmt =\n.\n");
+        assert_eq!(f.name, "MyFmt");
+    }
+
+    #[test]
+    fn format_empty_body() {
+        // `.` immediately on the next line → zero lines.
+        let f = parse_fmt("format X =\n.\n");
+        assert!(f.lines.is_empty());
+    }
+
+    #[test]
+    fn format_terminator_with_trailing_ws() {
+        // `. \t\r` on the terminator line still terminates.
+        let f = parse_fmt("format X =\nhello\n. \t\n");
+        assert_eq!(f.lines.len(), 1);
+    }
+
+    #[test]
+    fn format_indented_dot_does_not_terminate() {
+        // A `.` not in column 0 is just literal content.
+        let f = parse_fmt("format X =\n hello\n .\n.\n");
+        // Two content lines (one " hello", one " ."), then the real `.` terminates.
+        assert_eq!(f.lines.len(), 2);
+        match &f.lines[1] {
+            FormatLine::Literal { text, .. } => assert_eq!(text, " ."),
+            other => panic!("expected Literal, got {other:?}"),
+        }
+    }
+
+    // ── Line classification ──
+
+    #[test]
+    fn format_comment_line() {
+        let f = parse_fmt("format X =\n# some comment\n.\n");
+        assert_eq!(f.lines.len(), 1);
+        match &f.lines[0] {
+            FormatLine::Comment { text, .. } => assert_eq!(text, " some comment"),
+            other => panic!("expected Comment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_blank_line() {
+        let f = parse_fmt("format X =\n\n.\n");
+        assert_eq!(f.lines.len(), 1);
+        assert!(matches!(f.lines[0], FormatLine::Blank { .. }));
+    }
+
+    #[test]
+    fn format_whitespace_only_line_is_blank() {
+        let f = parse_fmt("format X =\n   \t\n.\n");
+        assert!(matches!(f.lines[0], FormatLine::Blank { .. }));
+    }
+
+    #[test]
+    fn format_literal_line_no_fields() {
+        let f = parse_fmt("format X =\nhello world\n.\n");
+        match &f.lines[0] {
+            FormatLine::Literal { repeat, text, .. } => {
+                assert!(matches!(repeat, RepeatKind::None));
+                assert_eq!(text, "hello world");
             }
-            other => panic!("expected FormatDecl, got {other:?}"),
+            other => panic!("expected Literal, got {other:?}"),
+        }
+    }
+
+    // ── Tilde handling ──
+
+    #[test]
+    fn format_single_tilde_on_literal_line() {
+        // ~ on a fieldless line → repeat=Suppress, ~ replaced with space.
+        let f = parse_fmt("format X =\n~hello\n.\n");
+        match &f.lines[0] {
+            FormatLine::Literal { repeat, text, .. } => {
+                assert!(matches!(repeat, RepeatKind::Suppress));
+                assert_eq!(text, " hello", "tilde should be replaced with space");
+            }
+            other => panic!("expected Literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_double_tilde_on_literal_line() {
+        let f = parse_fmt("format X =\n~~hello\n.\n");
+        match &f.lines[0] {
+            FormatLine::Literal { repeat, text, .. } => {
+                assert!(matches!(repeat, RepeatKind::Repeat));
+                assert_eq!(text, "  hello");
+            }
+            other => panic!("expected Literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_tilde_mid_line_sets_suppress() {
+        // ~ anywhere on the line, not just at the start.
+        let f = parse_fmt("format X =\nhello ~ world\n.\n");
+        match &f.lines[0] {
+            FormatLine::Literal { repeat, text, .. } => {
+                assert!(matches!(repeat, RepeatKind::Suppress));
+                assert_eq!(text, "hello   world");
+            }
+            other => panic!("expected Literal, got {other:?}"),
+        }
+    }
+
+    // ── Field: text justifications ──
+
+    #[test]
+    fn format_field_left_justify() {
+        let f = parse_fmt("format X =\n@<<<\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, args, .. } => {
+                assert_eq!(parts.len(), 1);
+                assert_eq!(args.len(), 1);
+                match &parts[0] {
+                    FormatPart::Field(FormatField { kind: FieldKind::LeftJustify { width, truncate_ellipsis }, .. }) => {
+                        assert_eq!(*width, 4);
+                        assert!(!truncate_ellipsis);
+                    }
+                    other => panic!("expected LeftJustify, got {other:?}"),
+                }
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_right_justify() {
+        let f = parse_fmt("format X =\n@>>>>>\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::RightJustify { width: 6, truncate_ellipsis: false }, .. })));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_center() {
+        let f = parse_fmt("format X =\n@||||\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::Center { width: 5, truncate_ellipsis: false }, .. })));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_left_with_ellipsis() {
+        let f = parse_fmt("format X =\n@<<<<...\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::LeftJustify { width: 5, truncate_ellipsis: true }, .. })));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_fill_left() {
+        let f = parse_fmt("format X =\n^<<<<\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::FillLeft { width: 5, truncate_ellipsis: false }, .. })));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_fill_with_ellipsis() {
+        let f = parse_fmt("format X =\n^<<<<...\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::FillLeft { width: 5, truncate_ellipsis: true }, .. })));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    // ── Field: multi-line ──
+
+    #[test]
+    fn format_field_multi_line_at_star() {
+        let f = parse_fmt("format X =\n@*\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::MultiLine, .. })));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_fill_multi_line_caret_star() {
+        let f = parse_fmt("format X =\n^*\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::FillMultiLine, .. })));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    // ── Field: numeric ──
+
+    #[test]
+    fn format_field_numeric_integer() {
+        let f = parse_fmt("format X =\n@####\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => match &parts[0] {
+                FormatPart::Field(FormatField { kind: FieldKind::Numeric { integer_digits, decimal_digits, leading_zeros, caret }, .. }) => {
+                    assert_eq!(*integer_digits, 4);
+                    assert!(decimal_digits.is_none());
+                    assert!(!leading_zeros);
+                    assert!(!caret);
+                }
+                other => panic!("expected Numeric, got {other:?}"),
+            },
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_numeric_with_decimal() {
+        let f = parse_fmt("format X =\n@###.##\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => match &parts[0] {
+                FormatPart::Field(FormatField { kind: FieldKind::Numeric { integer_digits, decimal_digits, .. }, .. }) => {
+                    assert_eq!(*integer_digits, 3);
+                    assert_eq!(*decimal_digits, Some(2));
+                }
+                other => panic!("expected Numeric, got {other:?}"),
+            },
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_numeric_leading_zeros() {
+        let f = parse_fmt("format X =\n@0###\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                match &parts[0] {
+                    FormatPart::Field(FormatField { kind: FieldKind::Numeric { integer_digits, leading_zeros, .. }, .. }) => {
+                        assert_eq!(*integer_digits, 4); // 0 + 3 #s
+                        assert!(*leading_zeros);
+                    }
+                    other => panic!("expected Numeric, got {other:?}"),
+                }
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_numeric_caret() {
+        let f = parse_fmt("format X =\n^####\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => match &parts[0] {
+                FormatPart::Field(FormatField { kind: FieldKind::Numeric { caret, integer_digits, .. }, .. }) => {
+                    assert!(*caret);
+                    assert_eq!(*integer_digits, 4);
+                }
+                other => panic!("expected Numeric, got {other:?}"),
+            },
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_field_numeric_decimal_only() {
+        // @.### — no integer digits, three decimal.
+        let f = parse_fmt("format X =\n@.###\n$x\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => match &parts[0] {
+                FormatPart::Field(FormatField { kind: FieldKind::Numeric { integer_digits, decimal_digits, .. }, .. }) => {
+                    assert_eq!(*integer_digits, 0);
+                    assert_eq!(*decimal_digits, Some(3));
+                }
+                other => panic!("expected Numeric, got {other:?}"),
+            },
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    // ── Mixed picture lines ──
+
+    #[test]
+    fn format_multiple_fields_with_literals() {
+        let f = parse_fmt("format X =\n@<<< = @>>>\n$k, $v\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, args, .. } => {
+                assert_eq!(parts.len(), 3);
+                assert!(matches!(&parts[0], FormatPart::Field(_)));
+                assert!(matches!(&parts[1], FormatPart::Literal(s) if s == " = "));
+                assert!(matches!(&parts[2], FormatPart::Field(_)));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_literal_prefix_before_field() {
+        let f = parse_fmt("format X =\nName: @<<<<<\n$name\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], FormatPart::Literal(s) if s == "Name: "));
+                assert!(matches!(&parts[1], FormatPart::Field(_)));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    // ── Args: expressions ──
+
+    #[test]
+    fn format_args_multiple_scalars() {
+        let f = parse_fmt("format X =\n@<<< @<<< @<<<\n$a, $b, $c\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { args, .. } => {
+                assert_eq!(args.len(), 3);
+                for a in args {
+                    assert!(matches!(a.kind, ExprKind::ScalarVar(_)));
+                }
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_args_expression() {
+        // Args are real Perl expressions, not just var refs.
+        let f = parse_fmt("format X =\n@###\n$a + $b\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { args, .. } => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    // ── Args: braced multi-line form ──
+
+    #[test]
+    fn format_args_braced_single_line() {
+        let f = parse_fmt("format X =\n@<<< @<<<\n{ $a, $b }\n.\n");
+        match &f.lines[0] {
+            FormatLine::Picture { args, .. } => {
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_args_braced_multi_line() {
+        // Classic perlform example: args spread across many lines.
+        let src = "\
+format X =
+@<< @<< @<<
+{
+  1,
+  2,
+  3,
+}
+.
+";
+        let f = parse_fmt(src);
+        match &f.lines[0] {
+            FormatLine::Picture { args, .. } => {
+                assert_eq!(args.len(), 3);
+                assert!(args.iter().all(|a| matches!(a.kind, ExprKind::IntLit(_))));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_args_braced_with_qw() {
+        // qw(...) in braced args yields multiple list elements.
+        let src = "\
+format X =
+@<< @<< @<<
+{
+  qw[a b c],
+}
+.
+";
+        let f = parse_fmt(src);
+        match &f.lines[0] {
+            FormatLine::Picture { args, .. } => {
+                // qw counts as one expr here (a QwList node); runtime
+                // flattens it.  Parser sees one argument.
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    // ── Multi-line format body structure ──
+
+    #[test]
+    fn format_multiple_lines_mixed() {
+        let src = "\
+format X =
+# header comment
+Header text
+@<<< @###
+$name, $n
+.
+";
+        let f = parse_fmt(src);
+        assert_eq!(f.lines.len(), 3);
+        assert!(matches!(f.lines[0], FormatLine::Comment { .. }));
+        assert!(matches!(f.lines[1], FormatLine::Literal { .. }));
+        assert!(matches!(f.lines[2], FormatLine::Picture { .. }));
+    }
+
+    #[test]
+    fn format_two_pictures_back_to_back() {
+        let src = "\
+format X =
+@<<<
+$a
+@>>>
+$b
+.
+";
+        let f = parse_fmt(src);
+        assert_eq!(f.lines.len(), 2);
+        match &f.lines[0] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::LeftJustify { .. }, .. })));
+            }
+            _ => panic!(),
+        }
+        match &f.lines[1] {
+            FormatLine::Picture { parts, .. } => {
+                assert!(matches!(parts[0], FormatPart::Field(FormatField { kind: FieldKind::RightJustify { .. }, .. })));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn format_repeat_kind_on_picture_line() {
+        let src = "\
+format X =
+~~ ^<<<
+$long
+.
+";
+        let f = parse_fmt(src);
+        match &f.lines[0] {
+            FormatLine::Picture { repeat, .. } => {
+                assert!(matches!(repeat, RepeatKind::Repeat));
+            }
+            other => panic!("expected Picture, got {other:?}"),
+        }
+    }
+
+    // ── Format followed by more top-level code ──
+
+    #[test]
+    fn format_followed_by_statement() {
+        let src = "\
+format X =
+@<<<
+$x
+.
+my $y = 1;
+";
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 2);
+        assert!(matches!(prog.statements[0].kind, StmtKind::FormatDecl(_)));
+        assert!(matches!(prog.statements[1].kind, StmtKind::Expr(_)));
+    }
+
+    // ── Rejection: `@` or `^` not followed by valid pad chars ──
+
+    #[test]
+    fn format_bare_at_is_literal() {
+        // `I have an @ here.` — the lone `@` isn't a field start,
+        // so the whole line parses as Literal.
+        let f = parse_fmt("format X =\nI have an @ here.\n.\n");
+        match &f.lines[0] {
+            FormatLine::Literal { text, .. } => assert_eq!(text, "I have an @ here."),
+            other => panic!("expected Literal, got {other:?}"),
         }
     }
 

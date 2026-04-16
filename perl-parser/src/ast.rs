@@ -4,7 +4,7 @@
 //! lowering, and tooling.  It is the public output of `perl-parser`.
 
 use crate::span::Span;
-use crate::token::{AssignOp, DataEndMarker, RegexKind};
+use crate::token::{AssignOp, DataEndMarker, FieldKind, RegexKind, RepeatKind};
 
 /// A complete Perl program.
 #[derive(Clone, Debug)]
@@ -551,10 +551,57 @@ pub struct TryStmt {
 }
 
 /// `format NAME = ... .`
+///
+/// `lines` captures every source line of the body in order,
+/// classified into one of the four `FormatLine` variants.  Picture
+/// lines are already paired with their argument expressions.
 #[derive(Clone, Debug)]
 pub struct FormatDecl {
     pub name: String,
-    pub body: String,
+    pub lines: Vec<FormatLine>,
+    pub span: Span,
+}
+
+/// One line of a format body.
+#[derive(Clone, Debug)]
+pub enum FormatLine {
+    /// `# ...` — comment, not rendered.  Stored without the leading
+    /// `#` or surrounding whitespace; the full source is available
+    /// via `span`.
+    Comment { text: String, span: Span },
+
+    /// Empty or whitespace-only line; renders as a blank line of
+    /// output.
+    Blank { span: Span },
+
+    /// A picture line containing no field specifiers.  The text is
+    /// stored with any `~`/`~~` characters already replaced with
+    /// spaces (so the output width matches the source layout); the
+    /// `repeat` field records the original repeat behavior.
+    Literal { repeat: RepeatKind, text: String, span: Span },
+
+    /// A picture line containing at least one field.  Arguments come
+    /// from the source line immediately following the picture: one
+    /// expression per field in order.  When the argument line begins
+    /// with `{`, expressions may span multiple source lines until
+    /// the matching `}`.
+    Picture { repeat: RepeatKind, parts: Vec<FormatPart>, args: Vec<Expr>, span: Span },
+}
+
+/// One piece of a picture line.  Literals and fields interleave in
+/// source order.
+#[derive(Clone, Debug)]
+pub enum FormatPart {
+    /// Run of literal text (tildes already normalized to spaces).
+    Literal(String),
+    /// Field specifier.
+    Field(FormatField),
+}
+
+/// A single picture-line field specifier.
+#[derive(Clone, Copy, Debug)]
+pub struct FormatField {
+    pub kind: FieldKind,
     pub span: Span,
 }
 

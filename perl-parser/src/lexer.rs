@@ -42,6 +42,43 @@ struct LexContext {
     regex: bool,
 }
 
+/// Format sublexing state.  Orthogonal to `context_stack` because
+/// format mode is line-oriented rather than delimiter-oriented.
+///
+/// A picture line is tokenized in one pass (tildes normalized to
+/// spaces, then fields and literals extracted) and the resulting
+/// tokens are queued for the lexer to drain.  Argument lines run
+/// in one of two sub-modes: line-terminated (the default) or
+/// brace-matched (entered via `format_args_enter_braced`).
+struct FormatState {
+    /// Pre-tokenized spans queued for emission.  Drained before
+    /// reading more lines.
+    queue: std::collections::VecDeque<Spanned>,
+    mode: FormatMode,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FormatMode {
+    /// Read and classify the next line.  Default mode.
+    Body,
+    /// Emit normal code tokens until a newline at depth 0.
+    /// Entered after emitting `FormatArgsBegin` when no `{` is
+    /// consumed.
+    ArgsLine,
+    /// Emit normal code tokens until `}` brings `depth` to 0.
+    /// Entered after the parser consumes the opening `{` and calls
+    /// `format_args_enter_braced`.  `depth` starts at 1.
+    ArgsBraced { depth: u32 },
+    /// Pending FormatArgsBegin — next `lex_token` call emits it and
+    /// transitions to `ArgsLine` (or the parser may call
+    /// `format_args_enter_braced` first).
+    PendingArgsBegin,
+    /// Format body has been terminated by `.`; the SublexEnd has
+    /// been queued.  After it's drained, the format state is torn
+    /// down.
+    Finished,
+}
+
 /// Lexer state, owned by the `Parser`.
 ///
 /// The lexer operates on lines delivered by `LexerSource`.  The
@@ -58,11 +95,15 @@ pub(crate) struct Lexer {
     /// Deferred error from auto-loading in `peek_byte`.
     /// Surfaced on the next call to `lex_token`.
     pending_error: Option<ParseError>,
+    /// Active format sublex state, if we're inside a format body.
+    /// `Some` between `start_format` and the `.` terminator's
+    /// `SublexEnd`.
+    format_state: Option<FormatState>,
 }
 
 impl Lexer {
     pub fn new(src: &[u8]) -> Self {
-        Lexer { source: LexerSource::new(src), current_line: None, context_stack: Vec::new(), pending_error: None }
+        Lexer { source: LexerSource::new(src), current_line: None, context_stack: Vec::new(), pending_error: None, format_state: None }
     }
 
     /// Global byte position in the original source.
@@ -209,20 +250,272 @@ impl Lexer {
         self.source.src_slice(start, end)
     }
 
-    /// Skip a format body: everything until a line containing just `.`
-    /// (optionally followed by whitespace).
-    pub fn skip_format_body(&mut self) {
-        // Skip the rest of the current line (after `=`).
+    // ── Format sublexing ──────────────────────────────────────
+    //
+    // Format bodies are line-oriented: each line is either a
+    // comment (`#` in column 0), blank, a literal line (no field
+    // specifiers), or a picture line (one or more `@`/`^` fields)
+    // followed by an argument line (expressions to fill the
+    // fields).  The body is terminated by a line containing only
+    // `.` (optionally followed by whitespace or `\r`).
+    //
+    // Tokens are pre-tokenized by line when the line is read, and
+    // drained from a queue on subsequent `lex_token` calls.  This
+    // lets us classify a line once and emit a clean stream.
+
+    /// Enter format-body sublexing.  Called by the parser after it
+    /// has consumed `format [NAME] =`.  The first token returned
+    /// by the next `lex_token` call will be `FormatSublexBegin`.
+    ///
+    /// `name` is the format name (empty string defaults to STDOUT
+    /// at the parser level before this is called).  `begin_span`
+    /// is the span of the `format` keyword through the `=`.
+    pub fn start_format(&mut self, name: String, begin_span: Span) {
+        // Drop the rest of the `=` line — the format body starts
+        // on the next source line.
         self.current_line = None;
-        loop {
-            match self.source.next_line(false) {
-                Ok(Some(line)) => {
-                    // Terminator: '.' at start of line, optionally followed by ws.
-                    if line.line.first() == Some(&b'.') && line.line[1..].iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r') {
-                        return;
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(Spanned { token: Token::FormatSublexBegin(name), span: begin_span });
+        self.format_state = Some(FormatState { queue, mode: FormatMode::Body });
+    }
+
+    /// Called by the parser when it consumes `{` as the first
+    /// token of an argument line, to switch from line-terminated
+    /// to brace-matched argument mode.  Must be called while the
+    /// lexer is in `ArgsLine` mode.
+    pub fn format_args_enter_braced(&mut self) {
+        if let Some(state) = &mut self.format_state {
+            state.mode = FormatMode::ArgsBraced { depth: 1 };
+        }
+    }
+
+    /// Lex the next token while in format sublex mode.
+    fn lex_format_token(&mut self) -> Result<Spanned, ParseError> {
+        // Drain queue first.
+        if let Some(state) = &mut self.format_state
+            && let Some(tok) = state.queue.pop_front()
+        {
+            // If the drained token was SublexEnd (Finished mode),
+            // tear down format state so subsequent calls are
+            // normal.
+            if matches!(tok.token, Token::SublexEnd) && matches!(state.mode, FormatMode::Finished) {
+                self.format_state = None;
+            }
+            return Ok(tok);
+        }
+
+        // Queue is empty — decide what to do based on mode.
+        let mode = match &self.format_state {
+            Some(s) => s.mode,
+            None => unreachable!("lex_format_token called with no format state"),
+        };
+        match mode {
+            FormatMode::Body => self.format_read_line(),
+            FormatMode::PendingArgsBegin => {
+                let pos = self.span_pos();
+                let span = Span::new(pos, pos);
+                if let Some(state) = &mut self.format_state {
+                    state.mode = FormatMode::ArgsLine;
+                }
+                Ok(Spanned { token: Token::FormatArgsBegin, span })
+            }
+            FormatMode::ArgsLine => self.format_lex_args_line(),
+            FormatMode::ArgsBraced { .. } => self.format_lex_args_braced(),
+            FormatMode::Finished => unreachable!("Finished mode with empty queue"),
+        }
+    }
+
+    /// Read the next source line and classify it, enqueuing the
+    /// appropriate tokens.
+    fn format_read_line(&mut self) -> Result<Spanned, ParseError> {
+        // Ensure any in-progress line is dropped; we read raw lines.
+        self.current_line = None;
+        let line = match self.source.next_line(false) {
+            Ok(Some(l)) => l,
+            Ok(None) | Err(_) => {
+                // EOF inside a format — emit SublexEnd and finish.
+                let pos = self.span_pos();
+                let span = Span::new(pos, pos);
+                if let Some(state) = &mut self.format_state {
+                    state.mode = FormatMode::Finished;
+                }
+                self.format_state = None; // tear down immediately
+                return Ok(Spanned { token: Token::SublexEnd, span });
+            }
+        };
+        let offset = line.offset;
+        let bytes = line.line.clone();
+        // Drop the consumed line from source-tracking state.
+        self.current_line = None;
+
+        let offset_u32 = offset as u32;
+        let line_end_u32 = (offset + bytes.len()) as u32;
+
+        // Classify: terminator, comment, blank, or picture.
+        if is_format_terminator(&bytes) {
+            let span = Span::new(offset_u32, line_end_u32);
+            if let Some(state) = &mut self.format_state {
+                state.mode = FormatMode::Finished;
+            }
+            self.format_state = None;
+            return Ok(Spanned { token: Token::SublexEnd, span });
+        }
+
+        if bytes.first() == Some(&b'#') {
+            // Comment line — strip leading `#` and trailing newline/CR.
+            let text_bytes = strip_line_ending(&bytes[1..]);
+            let text = String::from_utf8_lossy(text_bytes).into_owned();
+            let span = Span::new(offset_u32, line_end_u32);
+            return Ok(Spanned { token: Token::FormatComment(text), span });
+        }
+
+        let stripped = strip_line_ending(&bytes);
+        if stripped.iter().all(|&b| b == b' ' || b == b'\t') {
+            let span = Span::new(offset_u32, line_end_u32);
+            return Ok(Spanned { token: Token::FormatBlankLine, span });
+        }
+
+        // Tokenize as a picture/literal line.
+        self.format_tokenize_picture_line(offset, &bytes, stripped)
+    }
+
+    /// Tokenize one non-comment non-blank non-terminator line.
+    /// `offset` is the byte offset of the start of the line in the
+    /// source; `raw_bytes` is the full line including line ending;
+    /// `content` is the same with the line ending stripped.
+    fn format_tokenize_picture_line(&mut self, offset: usize, raw_bytes: &[u8], content: &[u8]) -> Result<Spanned, ParseError> {
+        // Determine RepeatKind by counting tildes, then replace
+        // all `~` with spaces (they don't belong to fields).
+        let repeat = classify_repeat(content);
+        let normalized: Vec<u8> = content.iter().map(|&b| if b == b'~' { b' ' } else { b }).collect();
+
+        let offset_u32 = offset as u32;
+        let raw_end_u32 = (offset + raw_bytes.len()) as u32;
+
+        // Scan for fields.  We walk byte-by-byte, collecting
+        // literal runs interspersed with fields.
+        let mut parts: Vec<(Token, Span)> = Vec::new();
+        let mut i = 0;
+        let mut literal_start = 0;
+        let mut has_fields = false;
+        while i < normalized.len() {
+            let b = normalized[i];
+            if b == b'@' || b == b'^' {
+                // Try to parse a field starting here.
+                if let Some((kind, consumed)) = parse_field(&normalized, i) {
+                    // Flush any pending literal.
+                    if literal_start < i {
+                        let lit: String = String::from_utf8_lossy(&normalized[literal_start..i]).into_owned();
+                        let span = Span::new((offset + literal_start) as u32, (offset + i) as u32);
+                        parts.push((Token::FormatLiteral(lit), span));
+                    }
+                    let field_span = Span::new((offset + i) as u32, (offset + i + consumed) as u32);
+                    parts.push((Token::FormatField(kind), field_span));
+                    has_fields = true;
+                    i += consumed;
+                    literal_start = i;
+                    continue;
+                }
+                // `@` or `^` not followed by valid pad chars: pass
+                // through as literal text.
+            }
+            i += 1;
+        }
+        // Trailing literal run.
+        if literal_start < normalized.len() {
+            let lit: String = String::from_utf8_lossy(&normalized[literal_start..]).into_owned();
+            let span = Span::new((offset + literal_start) as u32, (offset + normalized.len()) as u32);
+            parts.push((Token::FormatLiteral(lit), span));
+        }
+
+        let line_span = Span::new(offset_u32, raw_end_u32);
+
+        if !has_fields {
+            // No fields — emit a single FormatLiteralLine.
+            let text: String = String::from_utf8_lossy(&normalized).into_owned();
+            return Ok(Spanned { token: Token::FormatLiteralLine(repeat, text), span: line_span });
+        }
+
+        // Has fields.  Emit PictureBegin, all parts, PictureEnd;
+        // then set mode so PendingArgsBegin fires next.
+        let first = Spanned { token: Token::FormatPictureBegin(repeat), span: line_span };
+        if let Some(state) = &mut self.format_state {
+            for (tok, span) in parts {
+                state.queue.push_back(Spanned { token: tok, span });
+            }
+            let end_pos = (offset + content.len()) as u32;
+            let end_span = Span::new(end_pos, end_pos);
+            state.queue.push_back(Spanned { token: Token::FormatPictureEnd, span: end_span });
+            state.mode = FormatMode::PendingArgsBegin;
+        }
+        Ok(first)
+    }
+
+    /// Lex a token in argument-line mode.  Returns `FormatArgsEnd`
+    /// when the current line ends; otherwise delegates to normal
+    /// tokenization.
+    fn format_lex_args_line(&mut self) -> Result<Spanned, ParseError> {
+        // Skip in-line whitespace but NOT newlines — a newline
+        // terminates this args line.
+        self.format_skip_inline_ws();
+        // If at end of current source line, or at EOF, end args.
+        if self.peek_byte(false).is_none_or(|b| b == b'\n') {
+            let pos_start = self.span_pos();
+            // Consume the newline (if any) so we're positioned on
+            // the next line for further format scanning.
+            if self.peek_byte(false) == Some(b'\n') {
+                self.skip(1);
+            }
+            if let Some(state) = &mut self.format_state {
+                state.mode = FormatMode::Body;
+            }
+            let pos_end = self.span_pos();
+            return Ok(Spanned { token: Token::FormatArgsEnd, span: Span::new(pos_start, pos_end) });
+        }
+        // Normal code token.
+        self.lex_normal_token()
+    }
+
+    /// Lex a token in braced argument mode.  Tracks `{`/`}` depth
+    /// and emits `FormatArgsEnd` when a `}` brings depth to 0
+    /// (swallowing that `}`).
+    fn format_lex_args_braced(&mut self) -> Result<Spanned, ParseError> {
+        // In braced mode, newlines inside the expression are just
+        // whitespace, so ordinary tokenization (which skips all ws)
+        // is correct.  We just need to intercept the `}` that
+        // closes the args.
+        let tok = self.lex_normal_token()?;
+        match &tok.token {
+            Token::LeftBrace => {
+                if let Some(FormatState { mode: FormatMode::ArgsBraced { depth }, .. }) = &mut self.format_state {
+                    *depth += 1;
+                }
+                Ok(tok)
+            }
+            Token::RightBrace => {
+                if let Some(state) = &mut self.format_state
+                    && let FormatMode::ArgsBraced { depth } = &mut state.mode
+                {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        // Closing `}` — swallow and emit FormatArgsEnd.
+                        state.mode = FormatMode::Body;
+                        return Ok(Spanned { token: Token::FormatArgsEnd, span: tok.span });
                     }
                 }
-                _ => return, // EOF
+                Ok(tok)
+            }
+            _ => Ok(tok),
+        }
+    }
+
+    /// Skip space/tab characters but not newlines.
+    fn format_skip_inline_ws(&mut self) {
+        while let Some(b) = self.peek_byte(false) {
+            if b == b' ' || b == b'\t' {
+                self.skip(1);
+            } else {
+                break;
             }
         }
     }
@@ -278,6 +571,14 @@ impl Lexer {
         // Surface any deferred error from auto-loading in peek_byte.
         if let Some(e) = self.pending_error.take() {
             return Err(e);
+        }
+
+        // Format sublex takes priority over the LexContext stack —
+        // format state is orthogonal (line-oriented, not delimiter-
+        // oriented) and `context_stack` is unused during format
+        // mode.
+        if self.format_state.is_some() {
+            return self.lex_format_token();
         }
 
         // If inside a sublexing context, dispatch there.
@@ -1922,6 +2223,160 @@ fn hex_digit(b: u8) -> u8 {
         b'a'..=b'f' => b - b'a' + 10,
         b'A'..=b'F' => b - b'A' + 10,
         _ => 0,
+    }
+}
+
+// ── Format-body helpers ───────────────────────────────────────
+
+/// True if `bytes` is a format terminator line: column-0 `.`
+/// optionally followed by whitespace and/or a line ending.
+fn is_format_terminator(bytes: &[u8]) -> bool {
+    if bytes.first() != Some(&b'.') {
+        return false;
+    }
+    bytes[1..].iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
+}
+
+/// Strip a trailing `\n` and optional preceding `\r` from a line.
+fn strip_line_ending(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// Classify a picture line's repeat behavior by counting tildes.
+fn classify_repeat(bytes: &[u8]) -> RepeatKind {
+    let mut saw_single = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'~' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'~' {
+                return RepeatKind::Repeat;
+            }
+            saw_single = true;
+        }
+        i += 1;
+    }
+    if saw_single { RepeatKind::Suppress } else { RepeatKind::None }
+}
+
+/// Try to parse a field specifier starting at `bytes[start]`, which
+/// must be `@` or `^`.  Returns `(FieldKind, consumed_bytes)` on
+/// success, or `None` if the characters don't form a valid field
+/// (in which case the `@` or `^` should be treated as literal).
+///
+/// Supported forms (with optional `...` truncation suffix on the
+/// three text-justify and three fill-justify variants):
+///   @*  ^*                             — multi-line
+///   @<<<  @>>>  @|||                   — text, justified
+///   ^<<<  ^>>>  ^|||                   — fill-mode, justified
+///   @####[.##]  @0###[.##]             — numeric
+///   ^####[.##]  ^0###[.##]             — special numeric (undef → blank)
+fn parse_field(bytes: &[u8], start: usize) -> Option<(FieldKind, usize)> {
+    debug_assert!(bytes[start] == b'@' || bytes[start] == b'^');
+    let caret = bytes[start] == b'^';
+    let after = start + 1;
+    if after >= bytes.len() {
+        return None;
+    }
+
+    // `@*` / `^*`
+    if bytes[after] == b'*' {
+        let kind = if caret { FieldKind::FillMultiLine } else { FieldKind::MultiLine };
+        return Some((kind, 2));
+    }
+
+    let c = bytes[after];
+    match c {
+        b'<' | b'>' | b'|' => {
+            // Text field: count pad characters of the same kind.
+            let pad = c;
+            let mut i = after;
+            while i < bytes.len() && bytes[i] == pad {
+                i += 1;
+            }
+            // Optional `...` truncation suffix.
+            let mut truncate_ellipsis = false;
+            if i + 2 < bytes.len() && &bytes[i..i + 3] == b"..." {
+                truncate_ellipsis = true;
+                i += 3;
+            }
+            // Width counts from `@`/`^` through the pad chars only
+            // (not the ellipsis, which just annotates the field).
+            let width = (i - start - if truncate_ellipsis { 3 } else { 0 }) as u32;
+            let kind = match (caret, pad) {
+                (false, b'<') => FieldKind::LeftJustify { width, truncate_ellipsis },
+                (false, b'>') => FieldKind::RightJustify { width, truncate_ellipsis },
+                (false, b'|') => FieldKind::Center { width, truncate_ellipsis },
+                (true, b'<') => FieldKind::FillLeft { width, truncate_ellipsis },
+                (true, b'>') => FieldKind::FillRight { width, truncate_ellipsis },
+                (true, b'|') => FieldKind::FillCenter { width, truncate_ellipsis },
+                _ => unreachable!(),
+            };
+            Some((kind, i - start))
+        }
+        b'#' | b'0' => {
+            // Numeric field: `####`, `0###`, `####.##`, `0###.##`,
+            // or (rare) `.####`.  Leading `0` only counts if
+            // immediately followed by `#` (or `.`); otherwise it's
+            // not a numeric start.
+            let leading_zeros = c == b'0';
+            let mut i = after;
+            if leading_zeros {
+                // `@0###`: consume the `0`, require at least one
+                // `#` or `.` to follow.
+                if i + 1 >= bytes.len() || (bytes[i + 1] != b'#' && bytes[i + 1] != b'.') {
+                    return None;
+                }
+                i += 1;
+            }
+            // Integer `#`s.
+            let int_start = i;
+            while i < bytes.len() && bytes[i] == b'#' {
+                i += 1;
+            }
+            let integer_digits = (i - int_start + if leading_zeros { 1 } else { 0 }) as u32;
+            // Optional `.` followed by decimal `#`s.
+            let mut decimal_digits: Option<u32> = None;
+            if i < bytes.len() && bytes[i] == b'.' {
+                let dot_pos = i;
+                i += 1;
+                let dec_start = i;
+                while i < bytes.len() && bytes[i] == b'#' {
+                    i += 1;
+                }
+                if i == dec_start {
+                    // `.` with no trailing `#`s: not part of the
+                    // field.  Back up to before the dot.
+                    i = dot_pos;
+                } else {
+                    decimal_digits = Some((i - dec_start) as u32);
+                }
+            }
+            // Must have at least one digit somewhere.
+            if integer_digits == 0 && decimal_digits.is_none() {
+                return None;
+            }
+            Some((FieldKind::Numeric { integer_digits, decimal_digits, leading_zeros, caret }, i - start))
+        }
+        b'.' => {
+            // `@.###` — no integer digits, decimals only.
+            let mut i = after + 1;
+            let dec_start = i;
+            while i < bytes.len() && bytes[i] == b'#' {
+                i += 1;
+            }
+            if i == dec_start {
+                return None;
+            }
+            Some((FieldKind::Numeric { integer_digits: 0, decimal_digits: Some((i - dec_start) as u32), leading_zeros: false, caret }, i - start))
+        }
+        _ => None,
     }
 }
 
