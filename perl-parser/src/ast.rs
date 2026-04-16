@@ -333,8 +333,8 @@ pub enum BinOp {
     BitAnd,
     BitOr,
     BitXor,
-    ShiftL,
-    ShiftR,
+    ShiftLeft,
+    ShiftRight,
     // Binding
     Binding,
     NotBinding,

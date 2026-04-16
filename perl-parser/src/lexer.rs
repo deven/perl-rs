@@ -1627,53 +1627,15 @@ impl Lexer {
         self.skip(1); // consume first <
         match self.peek_byte(false) {
             Some(b'<') => {
-                // Could be heredoc (in term position) or left shift.
-                if expect.expecting_term() {
-                    // Check for heredoc tag after <<
-                    let saved = self.line_pos(); // position of second <
-                    self.skip(1); // skip second <
-
-                    // <<~ for indented heredocs
-                    let indented = self.peek_byte(false) == Some(b'~');
-                    if indented {
-                        self.skip(1);
-                    }
-
-                    // Skip optional whitespace between << and tag
-                    while self.peek_byte(false) == Some(b' ') || self.peek_byte(false) == Some(b'\t') {
-                        self.skip(1);
-                    }
-
-                    match self.peek_byte(false) {
-                        // Quoted tags: <<"TAG" or <<'TAG'
-                        Some(b'"') | Some(b'\'') => {
-                            return self.lex_heredoc(indented);
-                        }
-                        // Bare tag: <<IDENT or <<~IDENT
-                        Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
-                            return self.lex_heredoc(indented);
-                        }
-                        _ => {
-                            // Not a heredoc — rewind to after first <, re-parse as <<
-                            if let Some(line) = self.current_line.as_mut() {
-                                line.pos = saved + 1;
-                            }
-                            if self.peek_byte(false) == Some(b'=') {
-                                self.skip(1);
-                                return Ok(Token::Assign(AssignOp::ShiftLeftEq));
-                            }
-                            return Ok(Token::ShiftL);
-                        }
-                    }
-                } else {
-                    // Operator position: left shift
+                // Always return ShiftLeft / ShiftLeftEq.  The parser
+                // handles heredoc detection in term position by
+                // calling lex_heredoc_after_shift_left.
+                self.skip(1);
+                if self.peek_byte(false) == Some(b'=') {
                     self.skip(1);
-                    if self.peek_byte(false) == Some(b'=') {
-                        self.skip(1);
-                        Ok(Token::Assign(AssignOp::ShiftLeftEq))
-                    } else {
-                        Ok(Token::ShiftL)
-                    }
+                    Ok(Token::Assign(AssignOp::ShiftLeftEq))
+                } else {
+                    Ok(Token::ShiftLeft)
                 }
             }
             Some(b'=') => {
@@ -1713,6 +1675,40 @@ impl Lexer {
                     }
                 }
                 Ok(Token::NumLt)
+            }
+        }
+    }
+
+    /// Called by the parser after consuming a `ShiftLeft` token in
+    /// term position.  Attempts to read a heredoc tag (with optional
+    /// `~` prefix) and start the heredoc body.  Returns the token
+    /// produced (`QuoteBegin` for interpolating, `HeredocLit` for
+    /// literal), or rewinds and returns `None` if no valid tag follows
+    /// — the parser should then treat the `ShiftLeft` as a shift.
+    pub fn lex_heredoc_after_shift_left(&mut self) -> Result<Option<Token>, ParseError> {
+        let saved = self.line_pos();
+
+        // <<~ for indented heredocs
+        let indented = self.peek_byte(false) == Some(b'~');
+        if indented {
+            self.skip(1);
+        }
+
+        // Skip optional whitespace between << and tag.
+        while self.peek_byte(false) == Some(b' ') || self.peek_byte(false) == Some(b'\t') {
+            self.skip(1);
+        }
+
+        match self.peek_byte(false) {
+            Some(b'"') | Some(b'\'') => Ok(Some(self.lex_heredoc(indented)?)),
+            Some(b) if b == b'_' || b.is_ascii_alphabetic() => Ok(Some(self.lex_heredoc(indented)?)),
+            _ => {
+                // No valid tag — rewind to just after << so the
+                // parser can proceed with a normal shift-left.
+                if let Some(line) = self.current_line.as_mut() {
+                    line.pos = saved;
+                }
+                Ok(None)
             }
         }
     }
@@ -1820,7 +1816,7 @@ impl Lexer {
                     self.skip(1);
                     Token::Assign(AssignOp::ShiftRightEq)
                 } else {
-                    Token::ShiftR
+                    Token::ShiftRight
                 }
             }
             Some(b'=') => {
@@ -1942,9 +1938,16 @@ mod tests {
         let mut expect = Expect::Statement;
         let mut tokens = Vec::new();
         loop {
-            let spanned = lexer.lex_token(&expect).unwrap();
+            let mut spanned = lexer.lex_token(&expect).unwrap();
             if matches!(spanned.token, Token::Eof) {
                 break;
+            }
+            // In term context, ShiftLeft may introduce a heredoc —
+            // mimic what the parser does by calling the heredoc hook.
+            if matches!(spanned.token, Token::ShiftLeft) && expect.expecting_term() {
+                if let Some(tok) = lexer.lex_heredoc_after_shift_left().unwrap() {
+                    spanned.token = tok;
+                }
             }
             // Simple expectation update: after a term, expect operator.
             match &spanned.token {
@@ -2026,9 +2029,11 @@ mod tests {
         let src = b"<<END;\nhello\rEND\n";
         let mut lexer = Lexer::new(src);
         let expect = Expect::Statement;
-        // Consume QuoteBegin.
+        // Consume ShiftLeft, then call the heredoc hook.
         let tok = lexer.lex_token(&expect).unwrap();
-        assert_eq!(tok.token, Token::QuoteBegin(QuoteKind::Heredoc, 0));
+        assert_eq!(tok.token, Token::ShiftLeft);
+        let heredoc_tok = lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
+        assert_eq!(heredoc_tok, Token::QuoteBegin(QuoteKind::Heredoc, 0));
         // Body line "hello\rEND\n" is not a terminator — returned as content.
         let tok = lexer.lex_token(&expect).unwrap();
         assert!(matches!(tok.token, Token::ConstSegment(_)));
@@ -2045,8 +2050,9 @@ mod tests {
         let src = "<<~END;\n    hello\n  bad indent\n    END\n";
         let mut lexer = Lexer::new(src.as_bytes());
         let expect = Expect::Statement;
-        // Consume QuoteBegin.
+        // Consume ShiftLeft, then call the heredoc hook.
         lexer.lex_token(&expect).unwrap();
+        lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
         // Consume tokens until we hit the error.
         let mut got_error = false;
         for _ in 0..20 {
@@ -2070,6 +2076,7 @@ mod tests {
         let mut lexer = Lexer::new(src.as_bytes());
         let expect = Expect::Statement;
         lexer.lex_token(&expect).unwrap();
+        lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
         let mut got_error = false;
         for _ in 0..20 {
             match lexer.lex_token(&expect) {

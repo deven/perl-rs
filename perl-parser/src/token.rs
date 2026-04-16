@@ -293,12 +293,12 @@ pub enum Token {
     Not,       // not (low precedence, also keyword)
 
     // ── Operators — bitwise ───────────────────────────────────
-    BitAnd, // &
-    BitOr,  // |
-    BitXor, // ^
-    Tilde,  // ~ (complement)
-    ShiftL, // <<
-    ShiftR, // >>
+    BitAnd,     // &
+    BitOr,      // |
+    BitXor,     // ^
+    Tilde,      // ~ (complement)
+    ShiftLeft,  // <<
+    ShiftRight, // >>
 
     // ── Operators — binding ───────────────────────────────────
     Binding,    // =~
