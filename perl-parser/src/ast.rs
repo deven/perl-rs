@@ -421,9 +421,12 @@ pub enum ArrowTarget {
     KvSliceKeys(Box<Expr>),
     /// `$obj->$method(args)` dynamic method dispatch.
     DynMethod(Box<Expr>, Vec<Expr>),
-    // Note: `$ref->$#*` (postfix last-index) is not yet supported;
-    // it requires coordinated lexer/parser work because `$#*`
-    // doesn't tokenize cleanly under the current lexer rules.
+    /// `$ref->$#*` — postfix last-index of an array reference,
+    /// equivalent to `$#{$ref}`.  Requires coordinated lexer
+    /// handling: the sequence `$#*` after `->` is consumed as a
+    /// unit because the lexer otherwise treats the `#` as the
+    /// start of a comment.
+    LastIndex,
 }
 
 /// Sigil for dereference operations.

@@ -3138,10 +3138,16 @@ impl Parser {
             }
             Token::Dollar => {
                 self.next_token()?;
-                if self.eat(&Token::Star)? {
+                // `->$#*` — postderef last-index.  The lexer
+                // would otherwise tokenize the `#` as a comment
+                // start, so we peek+consume the two raw bytes
+                // here before the next token is lexed.
+                if self.lexer.try_consume_hash_star() {
+                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::LastIndex) })
+                } else if self.eat(&Token::Star)? {
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefScalar) })
                 } else {
-                    Err(ParseError::new("expected * after ->$", self.peek_span()))
+                    Err(ParseError::new("expected * or #* after ->$", self.peek_span()))
                 }
             }
             Token::Percent => {
@@ -5581,6 +5587,44 @@ sub outer ($x) { 1 }
     fn postderef_deref_scalar() {
         let e = parse_expr_stmt("$r->$*;");
         assert!(matches!(arrow_target(&e), ArrowTarget::DerefScalar));
+    }
+
+    #[test]
+    fn postderef_last_index() {
+        // `->$#*` — equivalent to `$#{$ref}`.  Requires lexer
+        // byte-level disambiguation because `#` would otherwise
+        // begin a comment.
+        let e = parse_expr_stmt("$r->$#*;");
+        assert!(matches!(arrow_target(&e), ArrowTarget::LastIndex));
+    }
+
+    #[test]
+    fn postderef_last_index_in_expr() {
+        // Embed in a larger expression to verify the parser
+        // continues past the LastIndex properly.
+        let e = parse_expr_stmt("my $n = $r->$#*;");
+        match e.kind {
+            ExprKind::Assign(_, _, rhs) => {
+                assert!(matches!(arrow_target(&rhs), ArrowTarget::LastIndex));
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_dollar_not_hashstar_still_fails() {
+        // `->$foo` (Dollar + named ScalarVar) is not postderef.
+        // The lexer greedily combines `$foo` into ScalarVar —
+        // which is handled as dynamic method dispatch in another
+        // arm.  We just verify `->$` followed by something
+        // neither `*` nor `#*` doesn't crash.
+        let src = "$r->$;";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => panic!("parser construction failed"),
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), "->$ with trailing semicolon is a parse error");
     }
 
     #[test]
