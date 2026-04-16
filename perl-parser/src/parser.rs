@@ -1534,14 +1534,12 @@ impl Parser {
 
             // Regex, substitution, transliteration
             Token::RegexBegin(kind, _delim) => {
-                // Collect body tokens until QuoteEnd.
-                let body = self.parse_interpolated_string(span)?;
-                // Flags are adjacent to the closing delimiter.
+                let pattern = self.parse_interpolated()?;
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(kind, Box::new(body), flags), span })
+                Ok(Expr { kind: ExprKind::Regex(kind, pattern, flags), span })
             }
             // // in term position is an empty regex, not defined-or.
             Token::DefinedOr => {
@@ -1549,8 +1547,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                let pat = Expr { kind: ExprKind::StringLit(String::new()), span };
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Box::new(pat), flags), span })
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![]), flags), span })
             }
             // / in term position is a regex, not division.
             Token::Slash => {
@@ -1559,8 +1556,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                let pat = Expr { kind: ExprKind::StringLit(pattern), span };
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Box::new(pat), flags), span })
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span })
             }
             // /= in term position: = is the first character of the
             // regex pattern, not a division-assignment operator.
@@ -1571,16 +1567,11 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                let pat = Expr { kind: ExprKind::StringLit(pattern), span };
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Box::new(pat), flags), span })
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span })
             }
             Token::SubstBegin(delim) => {
                 // Collect pattern body tokens until QuoteEnd.
-                let pat_expr = self.parse_interpolated_string(span)?;
-                let pattern = match pat_expr.kind {
-                    ExprKind::StringLit(s) => s,
-                    _ => return Err(ParseError::new("regex interpolation not yet supported", span)),
-                };
+                let pattern = self.parse_interpolated()?;
 
                 // Set up the replacement body (virtual EOF, flags).
                 let flags = self.lexer.start_subst_replacement(delim)?;
@@ -1589,7 +1580,7 @@ impl Parser {
                 }
                 let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
 
-                let repl = if has_eval {
+                let replacement = if has_eval {
                     // With /e: body is raw bytes in a single ConstSegment.
                     // Reparse as code.
                     let raw = match self.peek_token().clone() {
@@ -1603,16 +1594,17 @@ impl Parser {
                     self.expect_token(&Token::QuoteEnd)?;
                     let repl_src = format!("{};", raw);
                     let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
-                    match prog.statements.into_iter().next() {
+                    let expr = match prog.statements.into_iter().next() {
                         Some(Statement { kind: StmtKind::Expr(expr), .. }) => expr,
                         _ => Expr { kind: ExprKind::StringLit(raw), span },
-                    }
+                    };
+                    Interpolated(vec![InterpPart::ExprInterp(Box::new(expr))])
                 } else {
                     // Without /e: body is an interpolated string.
-                    self.parse_interpolated_string(span)?
+                    self.parse_interpolated()?
                 };
                 let end = self.peek_span();
-                Ok(Expr { kind: ExprKind::Subst(pattern, Box::new(repl), flags), span: span.merge(end) })
+                Ok(Expr { kind: ExprKind::Subst(pattern, replacement, flags), span: span.merge(end) })
             }
             Token::TranslitLit(from, to, flags) => {
                 if let Some(ref f) = flags {
@@ -2170,76 +2162,51 @@ impl Parser {
 
     // ── Interpolated string assembly ──────────────────────────
 
-    /// Collect sub-tokens after a `QuoteBegin` into an AST node.
-    /// Produces `StringLit` if no interpolation, `InterpolatedString` otherwise.
-    fn parse_interpolated_string(&mut self, start_span: Span) -> Result<Expr, ParseError> {
-        let mut parts: Vec<StringPart> = Vec::new();
-        let mut has_interp = false;
+    /// Collect sub-tokens after a `QuoteBegin`/`RegexBegin`/`SubstBegin`
+    /// into an `Interpolated`.  The caller decides how to wrap it
+    /// in an AST node.
+    fn parse_interpolated(&mut self) -> Result<Interpolated, ParseError> {
+        let mut parts: Vec<InterpPart> = Vec::new();
 
         loop {
             match self.peek_token().clone() {
                 Token::QuoteEnd => {
-                    let end = self.peek_span();
                     self.next_token()?;
-                    let span = start_span.merge(end);
-
-                    // Optimize: if no interpolation, collapse to a plain string.
-                    if !has_interp {
-                        let s: String = parts
-                            .into_iter()
-                            .map(|p| match p {
-                                StringPart::Const(s) => s,
-                                _ => unreachable!(),
-                            })
-                            .collect();
-                        return Ok(Expr { kind: ExprKind::StringLit(s), span });
-                    }
-
-                    // Merge adjacent Const segments.
-                    let merged = merge_string_parts(parts);
-                    return Ok(Expr { kind: ExprKind::InterpolatedString(merged), span });
+                    let merged = merge_interp_parts(parts);
+                    return Ok(Interpolated(merged));
                 }
                 Token::ConstSegment(s) => {
                     self.next_token()?;
-                    parts.push(StringPart::Const(s));
+                    parts.push(InterpPart::Const(s));
                 }
                 Token::InterpScalar(name) => {
                     self.next_token()?;
-                    has_interp = true;
-                    parts.push(StringPart::ScalarInterp(name));
+                    parts.push(InterpPart::ScalarInterp(name));
                 }
                 Token::InterpArray(name) => {
                     self.next_token()?;
-                    has_interp = true;
-                    parts.push(StringPart::ArrayInterp(name));
+                    parts.push(InterpPart::ArrayInterp(name));
                 }
                 Token::InterpScalarExprStart | Token::InterpArrayExprStart => {
                     self.next_token()?;
-                    has_interp = true;
-                    // The lexer pushed ExprInString context — normal code
-                    // lexing until the closing }.  Parse the expression,
-                    // then consume the } (which pops the context).
                     self.expect = Expect::Term;
                     let expr = self.parse_expr(PREC_LOW)?;
                     self.expect_token(&Token::RightBrace)?;
-                    parts.push(StringPart::ExprInterp(Box::new(expr)));
+                    parts.push(InterpPart::ExprInterp(Box::new(expr)));
                 }
                 tok @ (Token::RegexCodeStart | Token::RegexCondCodeStart) => {
                     let is_cond = matches!(tok, Token::RegexCondCodeStart);
                     let code_start = self.peek_span().end as usize;
                     self.next_token()?;
-                    has_interp = true;
-                    // Regex code block — normal code lexing until }.
                     self.expect = Expect::Term;
                     let expr = self.parse_expr(PREC_LOW)?;
                     let code_end = self.peek_span().start as usize;
-                    // Capture raw text between (?{ and }.
                     let raw = String::from_utf8_lossy(self.lexer.slice(code_start, code_end)).into_owned();
                     self.expect_token(&Token::RightBrace)?;
                     if is_cond {
-                        parts.push(StringPart::RegexCondCode(raw, Box::new(expr)));
+                        parts.push(InterpPart::RegexCondCode(raw, Box::new(expr)));
                     } else {
-                        parts.push(StringPart::RegexCode(raw, Box::new(expr)));
+                        parts.push(InterpPart::RegexCode(raw, Box::new(expr)));
                     }
                 }
                 Token::Eof => {
@@ -2250,6 +2217,14 @@ impl Parser {
                 }
             }
         }
+    }
+
+    /// Parse an interpolated string body into an Expr.
+    /// Returns `StringLit` for plain strings, `InterpolatedString` for
+    /// strings with interpolation.
+    fn parse_interpolated_string(&mut self, span: Span) -> Result<Expr, ParseError> {
+        let interp = self.parse_interpolated()?;
+        Ok(interp_to_expr(interp, span))
     }
 
     // ── Operator parsing ──────────────────────────────────────
@@ -2551,12 +2526,12 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
     }
 }
 
-/// Merge adjacent `Const` segments in an interpolated string.
-fn merge_string_parts(parts: Vec<StringPart>) -> Vec<StringPart> {
-    let mut merged: Vec<StringPart> = Vec::new();
+/// Merge adjacent `Const` segments in an interpolated value.
+fn merge_interp_parts(parts: Vec<InterpPart>) -> Vec<InterpPart> {
+    let mut merged: Vec<InterpPart> = Vec::new();
     for part in parts {
-        if let StringPart::Const(s) = &part {
-            if let Some(StringPart::Const(prev)) = merged.last_mut() {
+        if let InterpPart::Const(s) = &part {
+            if let Some(InterpPart::Const(prev)) = merged.last_mut() {
                 prev.push_str(s);
                 continue;
             }
@@ -2564,6 +2539,12 @@ fn merge_string_parts(parts: Vec<StringPart>) -> Vec<StringPart> {
         merged.push(part);
     }
     merged
+}
+
+/// Convert an `Interpolated` into an `Expr`.
+/// Returns `StringLit` for plain strings, `InterpolatedString` otherwise.
+fn interp_to_expr(interp: Interpolated, span: Span) -> Expr {
+    if let Some(s) = interp.as_plain_string() { Expr { kind: ExprKind::StringLit(s), span } } else { Expr { kind: ExprKind::InterpolatedString(interp), span } }
 }
 
 #[cfg(test)]
@@ -2585,11 +2566,20 @@ mod tests {
         }
     }
 
-    /// Extract the pattern string from a regex pattern expression.
-    fn pat_str(pat: &Expr) -> &str {
-        match &pat.kind {
-            ExprKind::StringLit(s) => s.as_str(),
-            other => panic!("expected StringLit pattern, got {other:?}"),
+    /// Extract the pattern string from an `Interpolated` value.
+    fn pat_str(interp: &Interpolated) -> &str {
+        match interp.as_plain_string() {
+            Some(ref _s) => {
+                // as_plain_string returns owned; match on parts directly.
+                if interp.0.is_empty() {
+                    return "";
+                }
+                match &interp.0[0] {
+                    InterpPart::Const(s) => s.as_str(),
+                    other => panic!("expected Const part, got {other:?}"),
+                }
+            }
+            None => panic!("expected plain string pattern, got {:?}", interp.0),
         }
     }
 
@@ -2860,11 +2850,11 @@ mod tests {
     fn parse_interp_string() {
         let e = parse_expr_str(r#""Hello, $name!";"#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert_eq!(parts.len(), 3);
-                assert!(matches!(&parts[0], StringPart::Const(s) if s == "Hello, "));
-                assert!(matches!(&parts[1], StringPart::ScalarInterp(s) if s == "name"));
-                assert!(matches!(&parts[2], StringPart::Const(s) if s == "!"));
+                assert!(matches!(&parts[0], InterpPart::Const(s) if s == "Hello, "));
+                assert!(matches!(&parts[1], InterpPart::ScalarInterp(s) if s == "name"));
+                assert!(matches!(&parts[2], InterpPart::Const(s) if s == "!"));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -2874,11 +2864,11 @@ mod tests {
     fn parse_interp_multiple_vars() {
         let e = parse_expr_str(r#""$x and $y";"#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert_eq!(parts.len(), 3);
-                assert!(matches!(&parts[0], StringPart::ScalarInterp(s) if s == "x"));
-                assert!(matches!(&parts[1], StringPart::Const(s) if s == " and "));
-                assert!(matches!(&parts[2], StringPart::ScalarInterp(s) if s == "y"));
+                assert!(matches!(&parts[0], InterpPart::ScalarInterp(s) if s == "x"));
+                assert!(matches!(&parts[1], InterpPart::Const(s) if s == " and "));
+                assert!(matches!(&parts[2], InterpPart::ScalarInterp(s) if s == "y"));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -2888,10 +2878,10 @@ mod tests {
     fn parse_interp_array() {
         let e = parse_expr_str(r#""items: @list""#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert_eq!(parts.len(), 2);
-                assert!(matches!(&parts[0], StringPart::Const(s) if s == "items: "));
-                assert!(matches!(&parts[1], StringPart::ArrayInterp(s) if s == "list"));
+                assert!(matches!(&parts[0], InterpPart::Const(s) if s == "items: "));
+                assert!(matches!(&parts[1], InterpPart::ArrayInterp(s) if s == "list"));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -3173,12 +3163,9 @@ mod tests {
         let e = parse_expr_str("s/foo/bar/g;");
         match &e.kind {
             ExprKind::Subst(pat, repl, flags) => {
-                assert_eq!(pat, "foo");
+                assert_eq!(pat_str(pat), "foo");
                 assert_eq!(flags.as_deref(), Some("g"));
-                match &repl.kind {
-                    ExprKind::StringLit(s) => assert_eq!(s, "bar"),
-                    other => panic!("expected StringLit replacement, got {other:?}"),
-                }
+                assert_eq!(pat_str(repl), "bar");
             }
             other => panic!("expected Subst, got {other:?}"),
         }
@@ -3189,12 +3176,9 @@ mod tests {
         let e = parse_expr_str("s/old/new/;");
         match &e.kind {
             ExprKind::Subst(pat, repl, flags) => {
-                assert_eq!(pat, "old");
+                assert_eq!(pat_str(pat), "old");
                 assert!(flags.is_none());
-                match &repl.kind {
-                    ExprKind::StringLit(s) => assert_eq!(s, "new"),
-                    other => panic!("expected StringLit replacement, got {other:?}"),
-                }
+                assert_eq!(pat_str(repl), "new");
             }
             other => panic!("expected Subst, got {other:?}"),
         }
@@ -3205,12 +3189,9 @@ mod tests {
         let e = parse_expr_str("s{foo}{bar}g;");
         match &e.kind {
             ExprKind::Subst(pat, repl, flags) => {
-                assert_eq!(pat, "foo");
+                assert_eq!(pat_str(pat), "foo");
                 assert_eq!(flags.as_deref(), Some("g"));
-                match &repl.kind {
-                    ExprKind::StringLit(s) => assert_eq!(s, "bar"),
-                    other => panic!("expected StringLit replacement, got {other:?}"),
-                }
+                assert_eq!(pat_str(repl), "bar");
             }
             other => panic!("expected Subst, got {other:?}"),
         }
@@ -4399,10 +4380,10 @@ mod tests {
         let src = "<<END;\nHello $name!\nEND\n";
         let prog = parse(src);
         match &prog.statements[0].kind {
-            StmtKind::Expr(Expr { kind: ExprKind::InterpolatedString(parts), .. }) => {
+            StmtKind::Expr(Expr { kind: ExprKind::InterpolatedString(Interpolated(parts)), .. }) => {
                 assert!(parts.len() >= 3); // "Hello ", $name, "!\n"
-                assert!(matches!(parts[0], StringPart::Const(_)));
-                assert!(matches!(parts[1], StringPart::ScalarInterp(_)));
+                assert!(matches!(parts[0], InterpPart::Const(_)));
+                assert!(matches!(parts[1], InterpPart::ScalarInterp(_)));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -5537,6 +5518,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_regex_with_interp() {
+        // m/foo$bar/ should produce an Interpolated pattern, not plain string.
+        let e = parse_expr_str("m/foo$bar/;");
+        match &e.kind {
+            ExprKind::Regex(_, pat, _) => {
+                assert!(pat.as_plain_string().is_none(), "expected interpolated pattern");
+                assert!(pat.0.len() >= 2);
+                assert!(matches!(&pat.0[0], InterpPart::Const(s) if s == "foo"));
+                assert!(matches!(&pat.0[1], InterpPart::ScalarInterp(s) if s == "bar"));
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_regex_literal_no_interp() {
+        // m'foo$bar' should NOT interpolate — pattern is plain string.
+        let e = parse_expr_str("m'foo$bar';");
+        match &e.kind {
+            ExprKind::Regex(_, pat, _) => {
+                assert_eq!(pat_str(&pat), "foo$bar");
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_regex_literal_with_code_block() {
+        // m'...' still recognizes (?{...}) code blocks.
+        let e = parse_expr_str("m'foo(?{ 1 })bar';");
+        match &e.kind {
+            ExprKind::Regex(_, pat, _) => {
+                assert!(pat.as_plain_string().is_none(), "expected interpolated pattern with code block");
+                assert!(pat.0.iter().any(|p| matches!(p, InterpPart::RegexCode(_, _))));
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_tr_with_flags() {
         let e = parse_expr_str("tr/a-z/A-Z/cs;");
         match &e.kind {
@@ -5631,7 +5652,7 @@ mod tests {
         let e = parse_expr_str("s/foo/uc($&)/e;");
         match &e.kind {
             ExprKind::Subst(_, repl, _) => {
-                assert!(!matches!(repl.kind, ExprKind::StringLit(_)), "expected non-literal replacement for /e, got {repl:?}");
+                assert!(repl.as_plain_string().is_none(), "expected non-literal replacement for /e, got {repl:?}");
             }
             other => panic!("expected Subst, got {other:?}"),
         }
@@ -5642,8 +5663,8 @@ mod tests {
         // "${\ $ref}" — scalar expression interpolation.
         let e = parse_expr_str(r#""${\ $ref}";"#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
-                assert!(parts.iter().any(|p| matches!(p, StringPart::ExprInterp(_))), "expected ExprInterp, got {parts:?}");
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
+                assert!(parts.iter().any(|p| matches!(p, InterpPart::ExprInterp(_))), "expected ExprInterp, got {parts:?}");
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -5654,10 +5675,10 @@ mod tests {
         // "${\ $x + 1}" — expression with arithmetic.
         let e = parse_expr_str(r#""val: ${\ $x + 1}";"#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert_eq!(parts.len(), 2);
-                assert!(matches!(&parts[0], StringPart::Const(s) if s == "val: "));
-                assert!(matches!(&parts[1], StringPart::ExprInterp(_)));
+                assert!(matches!(&parts[0], InterpPart::Const(s) if s == "val: "));
+                assert!(matches!(&parts[1], InterpPart::ExprInterp(_)));
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -5668,8 +5689,8 @@ mod tests {
         // "@{[ 1, 2, 3 ]}" — array expression interpolation.
         let e = parse_expr_str(r#""@{[ 1, 2, 3 ]}";"#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
-                assert!(parts.iter().any(|p| matches!(p, StringPart::ExprInterp(_))), "expected ExprInterp, got {parts:?}");
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
+                assert!(parts.iter().any(|p| matches!(p, InterpPart::ExprInterp(_))), "expected ExprInterp, got {parts:?}");
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
@@ -5680,7 +5701,7 @@ mod tests {
         // Mixing expression interpolation with plain text and simple vars.
         let e = parse_expr_str(r#""Hello ${\ uc($name)}, you have @{[ $n + 1 ]} items";"#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
                 assert!(parts.len() >= 4, "expected at least 4 parts, got {}", parts.len());
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
@@ -5692,8 +5713,8 @@ mod tests {
         // "${name}" — simple braced variable, NOT expression interpolation.
         let e = parse_expr_str(r#""${name}s";"#);
         match &e.kind {
-            ExprKind::InterpolatedString(parts) => {
-                assert!(matches!(&parts[0], StringPart::ScalarInterp(s) if s == "name"), "expected ScalarInterp(name), got {:?}", parts[0]);
+            ExprKind::InterpolatedString(Interpolated(parts)) => {
+                assert!(matches!(&parts[0], InterpPart::ScalarInterp(s) if s == "name"), "expected ScalarInterp(name), got {:?}", parts[0]);
             }
             other => panic!("expected InterpolatedString, got {other:?}"),
         }
