@@ -1209,6 +1209,28 @@ impl Lexer {
         }
     }
 
+    /// Called by the parser after consuming a `->` then `$` when
+    /// probing for the postderef last-index form `->$#*`.
+    ///
+    /// Checks whether the next two raw bytes are `#*`.  If so,
+    /// consumes both and returns `true`; otherwise returns
+    /// `false` and leaves the cursor unchanged.
+    ///
+    /// Needed because the lexer would otherwise tokenize `#` as
+    /// the start of a comment, eating the rest of the line and
+    /// losing the trailing `*`.  The parser calls this before
+    /// asking for the next token so the byte-level disambiguation
+    /// happens outside the normal tokenization path.
+    pub fn try_consume_hash_star(&mut self) -> bool {
+        let r = self.remaining();
+        if r.len() >= 2 && r[0] == b'#' && r[1] == b'*' {
+            self.skip(2);
+            true
+        } else {
+            false
+        }
+    }
+
     // ── Identifiers ───────────────────────────────────────────
 
     fn scan_ident(&mut self) -> String {
