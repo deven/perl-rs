@@ -16,6 +16,7 @@ pub mod error;
 pub mod keyword;
 pub mod source;
 pub mod span;
+pub mod symbols;
 pub mod token;
 
 pub(crate) mod lexer;
