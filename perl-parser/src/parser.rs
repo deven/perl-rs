@@ -1128,7 +1128,7 @@ impl Parser {
             Token::StrLit(s) => Ok(Expr { kind: ExprKind::StringLit(s), span }),
 
             // Interpolating string: collect sub-tokens into AST.
-            Token::QuoteBegin(_, _) => self.parse_interpolated_string(span),
+            Token::QuoteSublexBegin(_, _) => self.parse_interpolated_string(span),
 
             // << in term position: try heredoc.  The lexer emitted
             // ShiftLeft; we ask it to attempt heredoc detection.
@@ -1136,7 +1136,7 @@ impl Parser {
             // (shift-left is not a valid term).
             Token::ShiftLeft => {
                 match self.lexer.lex_heredoc_after_shift_left()? {
-                    Some(Token::QuoteBegin(kind, delim)) => {
+                    Some(Token::QuoteSublexBegin(kind, delim)) => {
                         let body_span = self.peek_span();
                         self.parse_interpolated_string(body_span.merge(span)).map(|mut e| {
                             // Preserve the << span as the start.
@@ -1498,7 +1498,7 @@ impl Parser {
             Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
 
             // Regex, substitution, transliteration
-            Token::RegexBegin(kind, _delim) => {
+            Token::RegexSublexBegin(kind, _delim) => {
                 let pattern = self.parse_interpolated()?;
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
@@ -1534,8 +1534,8 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span })
             }
-            Token::SubstBegin(delim) => {
-                // Collect pattern body tokens until QuoteEnd.
+            Token::SubstSublexBegin(delim) => {
+                // Collect pattern body tokens until SublexEnd.
                 let pattern = self.parse_interpolated()?;
 
                 // Set up the replacement body (virtual EOF, flags).
@@ -1553,10 +1553,10 @@ impl Parser {
                             self.next_token()?;
                             s
                         }
-                        Token::QuoteEnd => String::new(),
+                        Token::SublexEnd => String::new(),
                         other => return Err(ParseError::new(format!("unexpected token in s///e: {other:?}"), self.peek_span())),
                     };
-                    self.expect_token(&Token::QuoteEnd)?;
+                    self.expect_token(&Token::SublexEnd)?;
                     let repl_src = format!("{};", raw);
                     let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
                     let expr = match prog.statements.into_iter().next() {
@@ -1580,7 +1580,7 @@ impl Parser {
 
             // Heredoc (body already collected by lexer).
             // Literal heredocs (body collected by lexer as raw string).
-            // Interpolating heredocs come through QuoteBegin → tokens → QuoteEnd.
+            // Interpolating heredocs come through QuoteSublexBegin → tokens → SublexEnd.
             Token::HeredocLit(_kind, _tag, body) => Ok(Expr { kind: ExprKind::StringLit(body), span }),
 
             // sort/map/grep with optional block
@@ -1971,7 +1971,7 @@ impl Parser {
             };
             let next_is_term = matches!(
                 self.peek_token(),
-                Token::QuoteBegin(_, _)
+                Token::QuoteSublexBegin(_, _)
                     | Token::StrLit(_)
                     | Token::IntLit(_)
                     | Token::FloatLit(_)
@@ -1984,8 +1984,8 @@ impl Parser {
                     | Token::Ident(_)
                     | Token::LeftParen
                     | Token::LeftBracket
-                    | Token::RegexBegin(_, _)
-                    | Token::SubstBegin(_)
+                    | Token::RegexSublexBegin(_, _)
+                    | Token::SubstSublexBegin(_)
                     | Token::HeredocLit(_, _, _)
                     | Token::QwList(_)
                     | Token::Backslash
@@ -2127,7 +2127,7 @@ impl Parser {
 
     // ── Interpolated string assembly ──────────────────────────
 
-    /// Collect sub-tokens after a `QuoteBegin`/`RegexBegin`/`SubstBegin`
+    /// Collect sub-tokens after a `QuoteSublexBegin`/`RegexSublexBegin`/`SubstSublexBegin`
     /// into an `Interpolated`.  The caller decides how to wrap it
     /// in an AST node.
     fn parse_interpolated(&mut self) -> Result<Interpolated, ParseError> {
@@ -2135,7 +2135,7 @@ impl Parser {
 
         loop {
             match self.peek_token().clone() {
-                Token::QuoteEnd => {
+                Token::SublexEnd => {
                     self.next_token()?;
                     let merged = merge_interp_parts(parts);
                     return Ok(Interpolated(merged));
