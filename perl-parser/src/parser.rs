@@ -2985,13 +2985,30 @@ impl Parser {
                     })
                 }
             }
-            // Postfix dereference: ->@*, ->%*, ->$*, ->@[...], ->@{...}
+            // Postfix dereference: ->@*, ->%*, ->$*, ->&*, ->**,
+            // plus slice forms ->@[...], ->@{...}, ->%[...], ->%{...}.
+            //
+            // The trailing `*` forms are whole-container derefs.
+            // The `[...]` and `{...}` forms after `@` or `%`
+            // produce slices (array of values or kv list).
             Token::At => {
                 self.next_token()?;
                 if self.eat(&Token::Star)? {
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefArray) })
+                } else if self.at(&Token::LeftBracket)? {
+                    self.next_token()?;
+                    let idx = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RightBracket)?;
+                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArraySliceIndices(Box::new(idx))) })
+                } else if self.at(&Token::LeftBrace)? {
+                    self.next_token()?;
+                    let key = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RightBrace)?;
+                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArraySliceKeys(Box::new(key))) })
                 } else {
-                    Err(ParseError::new("expected * after ->@", self.peek_span()))
+                    Err(ParseError::new("expected *, [indices], or {keys} after ->@", self.peek_span()))
                 }
             }
             Token::Dollar => {
@@ -3006,9 +3023,37 @@ impl Parser {
                 self.next_token()?;
                 if self.eat(&Token::Star)? {
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefHash) })
+                } else if self.at(&Token::LeftBracket)? {
+                    self.next_token()?;
+                    let idx = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RightBracket)?;
+                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::KvSliceIndices(Box::new(idx))) })
+                } else if self.at(&Token::LeftBrace)? {
+                    self.next_token()?;
+                    let key = self.parse_expr(PREC_LOW)?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RightBrace)?;
+                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::KvSliceKeys(Box::new(key))) })
                 } else {
-                    Err(ParseError::new("expected * after ->%", self.peek_span()))
+                    Err(ParseError::new("expected *, [indices], or {keys} after ->%", self.peek_span()))
                 }
+            }
+            // `->&*` — code-ref deref.  The lexer emits `BitAnd`
+            // for a bare `&` in expression position.
+            Token::BitAnd => {
+                self.next_token()?;
+                if self.eat(&Token::Star)? {
+                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefCode) })
+                } else {
+                    Err(ParseError::new("expected * after ->&", self.peek_span()))
+                }
+            }
+            // `->**` — glob deref.  Two consecutive `*`s; the
+            // lexer emits `Power` (`**`) for that pair.
+            Token::Power => {
+                self.next_token()?;
+                Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefGlob) })
             }
             other => Err(ParseError::new(format!("expected method name or subscript after ->, got {other:?}"), self.peek_span())),
         }
@@ -5365,6 +5410,115 @@ sub outer ($x) { 1 }
                 walk_expr(r, found);
             }
             _ => {}
+        }
+    }
+
+    // ── postderef tests ───────────────────────────────────────
+
+    /// Convenience: parse one expression statement, returning the
+    /// inner expression.
+    fn parse_expr_stmt(src: &str) -> Expr {
+        let prog = parse(src);
+        for stmt in &prog.statements {
+            if let StmtKind::Expr(e) = &stmt.kind {
+                return e.clone();
+            }
+        }
+        panic!("no expression in program; statements: {:#?}", prog.statements);
+    }
+
+    /// Helper: walk the outermost arrow-deref off a parsed expr,
+    /// returning the ArrowTarget.  Panics if the expression isn't
+    /// an ArrowDeref.
+    fn arrow_target(e: &Expr) -> &ArrowTarget {
+        match &e.kind {
+            ExprKind::ArrowDeref(_, target) => target,
+            other => panic!("expected ArrowDeref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_deref_array() {
+        let e = parse_expr_stmt("$r->@*;");
+        assert!(matches!(arrow_target(&e), ArrowTarget::DerefArray));
+    }
+
+    #[test]
+    fn postderef_deref_hash() {
+        let e = parse_expr_stmt("$r->%*;");
+        assert!(matches!(arrow_target(&e), ArrowTarget::DerefHash));
+    }
+
+    #[test]
+    fn postderef_deref_scalar() {
+        let e = parse_expr_stmt("$r->$*;");
+        assert!(matches!(arrow_target(&e), ArrowTarget::DerefScalar));
+    }
+
+    #[test]
+    fn postderef_deref_code() {
+        let e = parse_expr_stmt("$r->&*;");
+        assert!(matches!(arrow_target(&e), ArrowTarget::DerefCode));
+    }
+
+    #[test]
+    fn postderef_deref_glob() {
+        // `->**` — lexer emits Token::Power for `**`.
+        let e = parse_expr_stmt("$r->**;");
+        assert!(matches!(arrow_target(&e), ArrowTarget::DerefGlob));
+    }
+
+    #[test]
+    fn postderef_array_slice_indices() {
+        let e = parse_expr_stmt("$r->@[0, 1, 2];");
+        match arrow_target(&e) {
+            ArrowTarget::ArraySliceIndices(_) => {}
+            other => panic!("expected ArraySliceIndices, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_array_slice_keys() {
+        let e = parse_expr_stmt(r#"$r->@{"a", "b"};"#);
+        match arrow_target(&e) {
+            ArrowTarget::ArraySliceKeys(_) => {}
+            other => panic!("expected ArraySliceKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_kv_slice_indices() {
+        let e = parse_expr_stmt("$r->%[0, 1];");
+        match arrow_target(&e) {
+            ArrowTarget::KvSliceIndices(_) => {}
+            other => panic!("expected KvSliceIndices, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_kv_slice_keys() {
+        let e = parse_expr_stmt(r#"$r->%{"a", "b"};"#);
+        match arrow_target(&e) {
+            ArrowTarget::KvSliceKeys(_) => {}
+            other => panic!("expected KvSliceKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_chained_on_complex_expr() {
+        // Chain off a method call result.
+        let e = parse_expr_stmt("$obj->method->@*;");
+        assert!(matches!(arrow_target(&e), ArrowTarget::DerefArray));
+    }
+
+    #[test]
+    fn postderef_nested_slice() {
+        // `->@[0]->[1]` — slice followed by subscript chain.
+        // (Not semantically useful but should parse.)
+        let e = parse_expr_stmt("$r->@[0];");
+        match arrow_target(&e) {
+            ArrowTarget::ArraySliceIndices(_) => {}
+            other => panic!("expected ArraySliceIndices, got {other:?}"),
         }
     }
 
