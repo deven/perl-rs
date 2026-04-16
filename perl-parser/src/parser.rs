@@ -9213,6 +9213,238 @@ my $y = 1;
     }
 
     // ═══════════════════════════════════════════════════════════
+    // Audit-driven gap-filling tests.
+    //
+    // The previous commits added many tests by phase, but the
+    // audit I committed to in the interpolation masking
+    // postmortem turned up several genuinely shallow ones and a
+    // few real gaps.  These fill the worst of them.  Structured
+    // by the phase they belong to.
+    // ═══════════════════════════════════════════════════════════
+
+    // ── Phase 3: postderef slice content verification ────────
+    //
+    // The original postderef slice tests checked only the
+    // ArrowTarget variant, not the index/key contents.  A
+    // regression that parsed `$r->@[0, 1, 2]` as
+    // `ArraySliceIndices(IntLit(0))` (dropping the rest) would
+    // slip through.  Tests below verify the inner expression.
+
+    #[test]
+    fn postderef_array_slice_indices_content() {
+        let e = parse_expr_stmt("$r->@[0, 1, 2];");
+        match arrow_target(&e) {
+            ArrowTarget::ArraySliceIndices(idx) => {
+                // Index expr is a comma-list of three ints.
+                match &idx.kind {
+                    ExprKind::List(items) => {
+                        assert_eq!(items.len(), 3);
+                        assert!(matches!(items[0].kind, ExprKind::IntLit(0)));
+                        assert!(matches!(items[1].kind, ExprKind::IntLit(1)));
+                        assert!(matches!(items[2].kind, ExprKind::IntLit(2)));
+                    }
+                    ExprKind::IntLit(n) => panic!("single IntLit({n}) — expected 3-element List; would mean slice dropped items"),
+                    other => panic!("expected List of 3, got {other:?}"),
+                }
+            }
+            other => panic!("expected ArraySliceIndices, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_array_slice_keys_content() {
+        let e = parse_expr_stmt(r#"$r->@{"a", "b", "c"};"#);
+        match arrow_target(&e) {
+            ArrowTarget::ArraySliceKeys(keys) => match &keys.kind {
+                ExprKind::List(items) => {
+                    assert_eq!(items.len(), 3);
+                    for (i, want) in ["a", "b", "c"].iter().enumerate() {
+                        assert!(
+                            matches!(items[i].kind, ExprKind::StringLit(ref s) if s == want),
+                            "item {i}: expected StringLit({want}), got {:?}",
+                            items[i].kind
+                        );
+                    }
+                }
+                other => panic!("expected List of 3 strings, got {other:?}"),
+            },
+            other => panic!("expected ArraySliceKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_kv_slice_indices_content() {
+        let e = parse_expr_stmt("$r->%[0, 1];");
+        match arrow_target(&e) {
+            ArrowTarget::KvSliceIndices(idx) => match &idx.kind {
+                ExprKind::List(items) => {
+                    assert_eq!(items.len(), 2);
+                    assert!(matches!(items[0].kind, ExprKind::IntLit(0)));
+                    assert!(matches!(items[1].kind, ExprKind::IntLit(1)));
+                }
+                other => panic!("expected List of 2 ints, got {other:?}"),
+            },
+            other => panic!("expected KvSliceIndices, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postderef_nested_actually_nested() {
+        // Original `postderef_nested_slice` test claimed to
+        // cover chaining but only had one level.  This one
+        // actually chains: slice followed by arrow-array-elem.
+        let e = parse_expr_stmt("$r->@[0, 1]->[0];");
+        // Outer is ArrowDeref(_, ArrayElem(0)); inner is
+        // ArrowDeref($r, ArraySliceIndices([0, 1])).
+        match &e.kind {
+            ExprKind::ArrowDeref(inner, ArrowTarget::ArrayElem(idx)) => {
+                assert!(matches!(idx.kind, ExprKind::IntLit(0)));
+                assert!(matches!(inner.kind, ExprKind::ArrowDeref(_, ArrowTarget::ArraySliceIndices(_))));
+            }
+            other => panic!("expected ArrowDeref(slice, ArrayElem(0)), got {other:?}"),
+        }
+    }
+
+    // ── Phase 4: fc as named unary actually IS one ──────────
+    //
+    // `fc_requires_feature` was weak: it asserted parsing
+    // didn't error and the name was "fc" — but that's true
+    // regardless of whether fc was recognized as a named unary
+    // or fell back to a generic FuncCall.  Counter-test: with
+    // the feature on AND no parens, `fc` must bind as a
+    // named-unary operator (precedence boundary: tighter than
+    // `+`, looser than `*`).
+
+    #[test]
+    fn fc_named_unary_precedence() {
+        // `fc $x . $y` — named-unary operators parse their
+        // argument at NAMED_UNARY precedence, which is BELOW
+        // concat.  So the entire `$x . $y` is the argument:
+        // `fc($x . $y)`, NOT `fc($x) . $y`.
+        let e = parse_expr_stmt("use feature 'fc'; fc $x . $y;");
+        match e.kind {
+            ExprKind::FuncCall(ref name, ref args) if name == "fc" => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Concat, _, _)), "argument should be the whole Concat expr, got {:?}", args[0].kind);
+            }
+            other => panic!("expected FuncCall(fc, [Concat(...)]), got {other:?}"),
+        }
+    }
+
+    // ── Phase 5b: reactivation tests for each gated keyword ──
+    //
+    // The original downgrade tests only checked `try` reactivates
+    // when its feature is on.  Add the same check for each of
+    // the seven keywords whose downgrade was implemented: each
+    // should parse as its real keyword form when the feature is
+    // active.
+
+    #[test]
+    fn catch_reactivates_with_try_feature() {
+        let prog = parse("use feature 'try'; try { 1; } catch ($e) { 2; }");
+        // Try stmt captured with a catch clause.
+        let try_stmt = prog.statements.iter().find_map(|s| match &s.kind {
+            StmtKind::Try(t) => Some(t),
+            _ => None,
+        });
+        assert!(try_stmt.is_some(), "Try stmt must exist with feature active");
+        // And the Try must have a catch clause with var $e.
+        let try_ = try_stmt.unwrap();
+        assert!(try_.catch_block.is_some(), "catch clause must be attached");
+    }
+
+    #[test]
+    fn defer_reactivates_with_feature() {
+        let prog = parse("use feature 'defer'; defer { 1; }");
+        assert!(prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Defer(_))), "Defer must parse with feature active");
+    }
+
+    #[test]
+    fn given_when_reactivate_with_switch_feature() {
+        let prog = parse(
+            "use feature 'switch'; no warnings 'experimental::smartmatch'; \
+             given ($x) { when (1) { 'one' } default { 'other' } }",
+        );
+        assert!(prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Given(_, _))), "Given must parse with switch feature");
+    }
+
+    #[test]
+    fn class_reactivates_with_feature() {
+        let prog = parse("use feature 'class'; no warnings 'experimental::class'; class Foo { }");
+        assert!(prog.statements.iter().any(|s| matches!(s.kind, StmtKind::ClassDecl(_))), "Class decl must parse with class feature");
+    }
+
+    // ── Compile-time tokens in contexts ──────────────────────
+    //
+    // The original tests covered top-level __SUB__ / __PACKAGE__
+    // but not nested contexts.
+
+    #[test]
+    fn current_sub_inside_named_sub() {
+        // __SUB__ inside a sub body — the token is lex-time so
+        // context doesn't affect its form; verify it parses.
+        let prog = parse("use feature 'current_sub'; sub f { __SUB__ }");
+        let sub = prog
+            .statements
+            .iter()
+            .find_map(|s| match &s.kind {
+                StmtKind::SubDecl(sd) if sd.name == "f" => Some(sd),
+                _ => None,
+            })
+            .expect("sub f");
+        // Body contains a CurrentSub expression somewhere.
+        let body_has_current_sub = sub.body.statements.iter().any(|s| match &s.kind {
+            StmtKind::Expr(e) => matches!(e.kind, ExprKind::CurrentSub),
+            _ => false,
+        });
+        assert!(body_has_current_sub, "expected CurrentSub inside sub f body");
+    }
+
+    #[test]
+    fn current_package_after_nested_package_decl() {
+        // After `package Foo; package Bar;`, __PACKAGE__ gives
+        // "Bar".  Tests the parser state-tracking on successive
+        // package declarations.
+        let prog = parse("package Foo;\npackage Bar;\n__PACKAGE__;\n");
+        let e = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("expression statement");
+        match e.kind {
+            ExprKind::CurrentPackage(name) => assert_eq!(name, "Bar"),
+            other => panic!("expected CurrentPackage(Bar), got {other:?}"),
+        }
+    }
+
+    // ── Signatures: negative cases ───────────────────────────
+
+    #[test]
+    #[ignore = "parser does not yet enforce 'slurpy must be last parameter' — \
+        accepting `sub f (@rest, $x)` without error.  Needs a validation \
+        pass in parse_signature that rejects params after a slurpy."]
+    fn sig_slurpy_array_before_scalar_is_error() {
+        // `@rest` must be the last named parameter — a scalar
+        // after it is invalid.  The parser should reject.
+        let src = "use feature 'signatures'; sub f (@rest, $x) { }";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => panic!("parser construction failed"),
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), "slurpy array before scalar should error");
+    }
+
+    #[test]
+    #[ignore = "parser does not yet enforce 'only one slurpy allowed' — \
+        accepting `sub f (@a, %h)` without error.  Same fix as above."]
+    fn sig_two_slurpies_is_error() {
+        let src = "use feature 'signatures'; sub f (@a, %h) { }";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => panic!("parser construction failed"),
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), "two slurpies should error");
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // NEW TESTS — known gaps (ignored until implemented)
     // ═══════════════════════════════════════════════════════════
 
