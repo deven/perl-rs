@@ -926,6 +926,9 @@ impl Lexer {
     }
 
     fn lex_word(&mut self) -> Result<Token, ParseError> {
+        // Remember the column at which this word starts — needed
+        // for __END__/__DATA__ which are only special at column 0.
+        let word_start = self.line_pos();
         let name = self.scan_ident();
 
         // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or,
@@ -952,7 +955,10 @@ impl Lexer {
             "__FILE__" | "__LINE__" | "__PACKAGE__" | "__SUB__" => {
                 return Ok(Token::Ident(name));
             }
-            "__END__" | "__DATA__" => {
+            // __END__ / __DATA__ are only recognized at column 0 —
+            // matching Perl's behavior.  When indented or preceded
+            // by other tokens on the line, they're just barewords.
+            "__END__" | "__DATA__" if word_start == 0 => {
                 let marker = if name == "__END__" { DataEndMarker::End } else { DataEndMarker::Data };
                 return Ok(Token::DataEnd(marker));
             }
@@ -3387,6 +3393,31 @@ mod tests {
     fn lex_data_token() {
         let tokens = lex_all("1;\n__DATA__\nstuff");
         assert!(tokens.contains(&Token::DataEnd(DataEndMarker::Data)));
+    }
+
+    #[test]
+    fn lex_end_not_at_column_0_is_bareword() {
+        // Indented __END__ is a bareword, not end-of-source.
+        let tokens = lex_all("1;\n  __END__\nstuff\n");
+        assert!(!tokens.contains(&Token::DataEnd(DataEndMarker::End)));
+        assert!(tokens.contains(&Token::Ident("__END__".into())));
+        // Code after the pseudo-__END__ is still lexed as code.
+        assert!(tokens.contains(&Token::Ident("stuff".into())));
+    }
+
+    #[test]
+    fn lex_end_after_other_token_is_bareword() {
+        // __END__ after another token on the same line is not special.
+        let tokens = lex_all("my $x = __END__;\n");
+        assert!(!tokens.contains(&Token::DataEnd(DataEndMarker::End)));
+        assert!(tokens.contains(&Token::Ident("__END__".into())));
+    }
+
+    #[test]
+    fn lex_data_not_at_column_0_is_bareword() {
+        let tokens = lex_all("foo __DATA__\nbar\n");
+        assert!(!tokens.contains(&Token::DataEnd(DataEndMarker::Data)));
+        assert!(tokens.contains(&Token::Ident("__DATA__".into())));
     }
 
     #[test]
