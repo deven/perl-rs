@@ -382,14 +382,30 @@ pub enum ArrowTarget {
     ArrayElem(Box<Expr>),
     HashElem(Box<Expr>),
     MethodCall(String, Vec<Expr>),
-    /// `$ref->@*` postfix deref.
+    /// `$ref->@*` — whole-array postfix deref.
     DerefArray,
-    /// `$ref->%*` postfix deref.
+    /// `$ref->%*` — whole-hash postfix deref.
     DerefHash,
-    /// `$ref->$*` postfix deref.
+    /// `$ref->$*` — scalar postfix deref.
     DerefScalar,
+    /// `$ref->&*` — code postfix deref.
+    DerefCode,
+    /// `$ref->**` — glob postfix deref.
+    DerefGlob,
+    /// `$ref->@[indices]` — array slice by positions.
+    ArraySliceIndices(Box<Expr>),
+    /// `$ref->@{keys}` — slice of hash returning values as array.
+    ArraySliceKeys(Box<Expr>),
+    /// `$ref->%[indices]` — key/value pairs from an array
+    /// (indices paired with values).
+    KvSliceIndices(Box<Expr>),
+    /// `$ref->%{keys}` — key/value pairs from a hash.
+    KvSliceKeys(Box<Expr>),
     /// `$obj->$method(args)` dynamic method dispatch.
     DynMethod(Box<Expr>, Vec<Expr>),
+    // Note: `$ref->$#*` (postfix last-index) is not yet supported;
+    // it requires coordinated lexer/parser work because `$#*`
+    // doesn't tokenize cleanly under the current lexer rules.
 }
 
 /// Sigil for dereference operations.
