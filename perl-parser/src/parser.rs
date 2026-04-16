@@ -7644,6 +7644,82 @@ mod tests {
         }
     }
 
+    // ── Prototype bypass cases ─────────────────────────────────
+    //
+    // Two syntactic forms bypass prototype-driven argument parsing:
+    //   1. Parens form: foo(args) — args are parens-delimited, so
+    //      the parser takes a generic comma-separated list without
+    //      consulting the prototype.  (Perl may still validate arg
+    //      counts at compile time; that's a semantic-pass concern,
+    //      not a parsing concern.)
+    //   2. Ampersand form: &foo(args) — goes through the code-ref
+    //      prefix path, completely bypassing parse_ident_term and
+    //      therefore the symbol-table lookup.
+
+    #[test]
+    fn proto_parens_form_parses_generic_list() {
+        // sub foo ($); foo($a + $b, $c);
+        // Without parens, `$` proto would consume only `$a + $b`
+        // and leave `$c` in the outer comma list.  With parens,
+        // the args are delimited, so we get both.
+        let e = parse_call_with_proto("sub foo ($); foo($a + $b, $c);");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2, "parens form should parse both args regardless of $ proto");
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)));
+                assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_parens_form_ignores_empty_proto() {
+        // sub foo (); foo(1, 2);
+        // Parens form takes the args; Perl would report "Too many
+        // arguments" at compile time but we don't validate yet.
+        let e = parse_call_with_proto("sub foo (); foo(1, 2);");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected FuncCall with 2 args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_ampersand_call_bypasses_empty_proto() {
+        // sub foo (); &foo(1, 2);
+        // &foo() completely bypasses prototype parsing.  Without
+        // the &, `foo(1, 2)` would still work via parens (see test
+        // above), but the &-form is the canonical bypass.
+        let e = parse_call_with_proto("sub foo (); &foo(1, 2);");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2, "&foo(...) bypasses empty proto");
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_ampersand_no_parens_bypasses_proto() {
+        // sub foo ($); &foo;
+        // &foo with no parens calls with current @_ (inherited);
+        // prototype is not consulted.
+        let e = parse_call_with_proto("sub foo ($); &foo;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 0, "&foo with no parens inherits @_");
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
     #[test]
     fn hard_parses_heredoc_basic() {
         parse("print <<EOF;\nhello\nEOF\n");
