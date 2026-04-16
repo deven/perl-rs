@@ -9,6 +9,7 @@ use crate::error::ParseError;
 use crate::keyword;
 use crate::lexer::Lexer;
 use crate::span::Span;
+use crate::symbols::{SubPrototype, SymbolTable};
 use crate::token::Keyword;
 use crate::token::*;
 
@@ -84,6 +85,14 @@ pub struct Parser {
     /// Stored lexer error — surfaced by next_token().
     lexer_error: Option<ParseError>,
     depth: ParseDepth,
+    /// Symbol table of all packages, subs, and imports seen so far.
+    /// Populated as sub declarations and (eventually) `use`
+    /// statements are parsed; consulted at call sites for
+    /// prototype-aware argument parsing.
+    symbols: SymbolTable,
+    /// Name of the package currently being parsed.  Updated by
+    /// `package Name;` and the block form `package Name { ... }`.
+    current_package: std::sync::Arc<str>,
 }
 
 impl Parser {
@@ -91,7 +100,13 @@ impl Parser {
 
     pub fn new(src: &[u8]) -> Result<Self, ParseError> {
         let lexer = Lexer::new(src);
-        Ok(Parser { lexer, current: None, lexer_error: None, depth: 0 })
+        Ok(Parser { lexer, current: None, lexer_error: None, depth: 0, symbols: SymbolTable::new(), current_package: std::sync::Arc::from("main") })
+    }
+
+    /// Read-only access to the accumulated symbol table.
+    /// Primarily for tests and future cross-pass consumers.
+    pub fn symbols(&self) -> &SymbolTable {
+        &self.symbols
     }
 
     // ── Token access ──────────────────────────────────────────
@@ -503,18 +518,48 @@ impl Parser {
 
     /// Parse the body of a named sub declaration after `sub` has
     /// already been consumed.  `start` is the span of the `sub` keyword.
+    ///
+    /// Registers the sub (with its prototype, if any) in the symbol
+    /// table before returning, so subsequent call sites can consult
+    /// it for prototype-driven argument parsing.
     fn parse_sub_decl_body(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(name) => name,
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
         };
 
-        let prototype = self.parse_prototype()?;
+        let prototype_raw = self.parse_prototype()?;
+
+        // Parse prototype string into structured form.  Invalid
+        // prototypes become a parse error with the reported position
+        // relative to the prototype body.
+        let prototype_parsed = match &prototype_raw {
+            Some(raw) => Some(SubPrototype::parse(raw).map_err(|e| ParseError::new(format!("invalid prototype: {}", e.message), start))?),
+            None => None,
+        };
 
         let attributes = self.parse_attributes()?;
+
+        // Forward declaration: `sub name PROTO ATTRS;` with no body.
+        if self.eat(&Token::Semi)? {
+            let attr_names: Vec<String> = attributes.iter().map(|a| a.name.clone()).collect();
+            self.symbols.entry(&self.current_package.clone()).declare_sub(&name, prototype_parsed, attr_names, true);
+            // Represent as a SubDecl with an empty body for now; an
+            // optional `body: None` variant would be cleaner, but
+            // that's a separate AST change.
+            let span = start.merge(self.peek_span());
+            let body = Block { statements: Vec::new(), span };
+            return Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, params: None, body, span }));
+        }
+
         let body = self.parse_block()?;
 
-        Ok(StmtKind::SubDecl(SubDecl { name, prototype, attributes, params: None, body, span: start.merge(self.peek_span()) }))
+        // Register the full definition, replacing any prior forward
+        // declaration of the same name.
+        let attr_names: Vec<String> = attributes.iter().map(|a| a.name.clone()).collect();
+        self.symbols.entry(&self.current_package.clone()).declare_sub(&name, prototype_parsed, attr_names, false);
+
+        Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, params: None, body, span: start.merge(self.peek_span()) }))
     }
 
     /// Parse an optional prototype: `($$)`, `(\@\%)`, etc.
@@ -750,10 +795,22 @@ impl Parser {
             None
         };
 
+        // Ensure the package exists in the symbol table, even if
+        // empty — so later references to it resolve correctly.
+        let _ = self.symbols.entry(&name);
+
         let block = if self.at(&Token::LeftBrace)? {
-            Some(self.parse_block()?)
+            // Block form: `package Name { ... }` — switch packages
+            // for the duration of the block, then restore.
+            let saved = std::mem::replace(&mut self.current_package, std::sync::Arc::from(name.as_str()));
+            let block = self.parse_block()?;
+            self.current_package = saved;
+            Some(block)
         } else {
+            // Statement form: `package Name;` — switch packages for
+            // everything that follows in this compilation unit.
             self.eat(&Token::Semi)?;
+            self.current_package = std::sync::Arc::from(name.as_str());
             None
         };
 
