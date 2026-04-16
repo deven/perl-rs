@@ -1863,15 +1863,21 @@ impl Parser {
 
             match slot {
                 ProtoSlot::Block => {
-                    if !self.at(&Token::LeftBrace)? {
-                        // Block slot expected a `{`.  For now, stop
-                        // parsing args here; a stricter implementation
-                        // would error if required.
-                        break;
-                    }
-                    let block = self.parse_block()?;
-                    let span = block.span;
-                    args.push(Expr { kind: ExprKind::AnonSub(None, None, block), span });
+                    // `&` slot accepts either:
+                    //   - A literal block `{ ... }` (wrapped as an
+                    //     anonymous sub).  This is the initial-slot
+                    //     form that drives map/grep-style syntax.
+                    //   - A code reference expression: `\&name`,
+                    //     `$coderef`, `sub { ... }`, etc.  Parsed at
+                    //     named-unary precedence, like a scalar slot.
+                    let arg = if self.at(&Token::LeftBrace)? {
+                        let block = self.parse_block()?;
+                        let span = block.span;
+                        Expr { kind: ExprKind::AnonSub(None, None, block), span }
+                    } else {
+                        self.parse_expr(PREC_NAMED_UNARY)?
+                    };
+                    args.push(arg);
                     // Optional comma between slots.
                     if i + 1 < proto.slots.len() {
                         self.eat(&Token::Comma)?;
@@ -7828,6 +7834,76 @@ mod tests {
             ExprKind::FuncCall(_, args) => {
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected top-level Add, got {:?}", args[0].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    // ── & slot accepting code references ────────────────────────
+    //
+    // A `&` prototype slot accepts either a literal block (wrapped
+    // as an anonymous sub) or any code-reference expression —
+    // `\&name`, `$coderef`, `sub { ... }`, etc.
+
+    #[test]
+    fn proto_amp_slot_accepts_backslash_sub_ref() {
+        // sub foo (&@); foo \&bar, @list;
+        // `\&bar` is a reference-to-sub expression.
+        let e = parse_call_with_proto("sub foo (&@); foo \\&bar, @list;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+                // First arg is a ref-take around something naming `bar`.
+                assert!(matches!(args[0].kind, ExprKind::Ref(_)), "expected Ref(...), got {:?}", args[0].kind);
+                assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)), "expected @list, got {:?}", args[1].kind);
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_amp_slot_accepts_scalar_coderef() {
+        // sub foo (&@); foo $cref, @list;
+        // Scalar holding a coderef.
+        let e = parse_call_with_proto("sub foo (&@); foo $cref, @list;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)), "expected ScalarVar, got {:?}", args[0].kind);
+                assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_amp_slot_accepts_anonymous_sub() {
+        // sub foo (&@); foo sub { 1 }, @list;
+        // Anonymous sub expression in the & slot.
+        let e = parse_call_with_proto("sub foo (&@); foo sub { 1 }, @list;");
+        match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "foo");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)), "expected AnonSub, got {:?}", args[0].kind);
+                assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
+            }
+            other => panic!("expected FuncCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_amp_slot_block_still_works() {
+        // sub foo (&@); foo { $x * 2 } @list;
+        // Regression: literal block form still wraps as AnonSub.
+        let e = parse_call_with_proto("sub foo (&@); foo { $x * 2 } @list;");
+        match &e.kind {
+            ExprKind::FuncCall(_, args) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
         }
