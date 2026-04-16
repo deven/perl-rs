@@ -1177,6 +1177,28 @@ impl Parser {
             // Interpolating string: collect sub-tokens into AST.
             Token::QuoteBegin(_, _) => self.parse_interpolated_string(span),
 
+            // << in term position: try heredoc.  The lexer emitted
+            // ShiftLeft; we ask it to attempt heredoc detection.
+            // If it can't find a valid tag, that's a parse error
+            // (shift-left is not a valid term).
+            Token::ShiftLeft => {
+                match self.lexer.lex_heredoc_after_shift_left()? {
+                    Some(Token::QuoteBegin(kind, delim)) => {
+                        let body_span = self.peek_span();
+                        self.parse_interpolated_string(body_span.merge(span)).map(|mut e| {
+                            // Preserve the << span as the start.
+                            e.span = span.merge(e.span);
+                            // kind/delim unused — the Heredoc QuoteKind is implicit.
+                            let _ = (kind, delim);
+                            e
+                        })
+                    }
+                    Some(Token::HeredocLit(_kind, _tag, body)) => Ok(Expr { kind: ExprKind::StringLit(body), span }),
+                    Some(other) => unreachable!("unexpected heredoc token: {other:?}"),
+                    None => Err(ParseError::new("expected heredoc tag after <<", span)),
+                }
+            }
+
             Token::ScalarVar(name) => {
                 let expr = Expr { kind: ExprKind::ScalarVar(name), span };
                 self.maybe_postfix_subscript(expr)
@@ -2241,7 +2263,7 @@ impl Parser {
             Token::StrEq | Token::StrNe | Token::StrCmp => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
             Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non }),
             Token::StrLt | Token::StrGt | Token::StrLe | Token::StrGe => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non }),
-            Token::ShiftL | Token::ShiftR => Some(OpInfo { prec: PREC_SHIFT, assoc: Assoc::Left }),
+            Token::ShiftLeft | Token::ShiftRight => Some(OpInfo { prec: PREC_SHIFT, assoc: Assoc::Left }),
             Token::Plus => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
             Token::Minus => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
             Token::Dot => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
@@ -2516,8 +2538,8 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::BitAnd => Ok(BinOp::BitAnd),
         Token::BitOr => Ok(BinOp::BitOr),
         Token::BitXor => Ok(BinOp::BitXor),
-        Token::ShiftL => Ok(BinOp::ShiftL),
-        Token::ShiftR => Ok(BinOp::ShiftR),
+        Token::ShiftLeft => Ok(BinOp::ShiftLeft),
+        Token::ShiftRight => Ok(BinOp::ShiftRight),
         Token::Binding => Ok(BinOp::Binding),
         Token::NotBinding => Ok(BinOp::NotBinding),
         Token::Keyword(Keyword::And) => Ok(BinOp::LowAnd),
@@ -4414,6 +4436,153 @@ mod tests {
         }
     }
 
+    // ── Heredoc nesting torture tests ─────────────────────────
+
+    #[test]
+    fn parse_heredoc_two_stacked() {
+        // Two heredocs on one line, bodies consumed in order.
+        let src = "print <<A, <<B;\nbody A\nA\nbody B\nB\nafter\n";
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 2);
+        // First statement: print with two heredoc args.
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _, args), .. }) => {
+                assert_eq!(name, "print");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0].kind, ExprKind::StringLit(s) if s == "body A\n"));
+                assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "body B\n"));
+            }
+            other => panic!("expected print with 2 heredoc args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_three_stacked() {
+        // Three heredocs on one line.
+        let src = "print <<A, <<B, <<C;\nA-body\nA\nB-body\nB\nC-body\nC\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, _, args), .. }) => {
+                assert_eq!(args.len(), 3);
+                assert!(matches!(&args[0].kind, ExprKind::StringLit(s) if s == "A-body\n"));
+                assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "B-body\n"));
+                assert!(matches!(&args[2].kind, ExprKind::StringLit(s) if s == "C-body\n"));
+            }
+            other => panic!("expected print with 3 heredoc args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_stacked_mixed_quoting() {
+        // Mix of <<TAG, <<'TAG', and <<"TAG".
+        let src = "print <<A, <<'B', <<\"C\";\nA: $x\nA\nB: $x\nB\nC: $x\nC\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, _, args), .. }) => {
+                assert_eq!(args.len(), 3);
+                // <<A interpolates (A's body has $x).
+                assert!(matches!(&args[0].kind, ExprKind::InterpolatedString(_)));
+                // <<'B' does not interpolate.
+                assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "B: $x\n"));
+                // <<"C" interpolates.
+                assert!(matches!(&args[2].kind, ExprKind::InterpolatedString(_)));
+            }
+            other => panic!("expected print with 3 mixed heredocs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_stacked_with_trailing_code() {
+        // Bodies on separate lines, then more code after.
+        let src = "my @a = (<<X, <<Y);\nX-body\nX\nY-body\nY\nmy $z = 1;\n";
+        let prog = parse(src);
+        assert_eq!(prog.statements.len(), 2);
+        match &prog.statements[0].kind {
+            StmtKind::My(vars, Some(_)) => assert_eq!(vars[0].name, "a"),
+            other => panic!("expected My @a, got {other:?}"),
+        }
+        match &prog.statements[1].kind {
+            StmtKind::My(vars, Some(_)) => assert_eq!(vars[0].name, "z"),
+            other => panic!("expected My $z, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_indented_stacked() {
+        // <<~A and <<~B stacked, indentation stripped from each.
+        let src = "print <<~A, <<~B;\n    A-body\n    A\n        B-body\n        B\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, _, args), .. }) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0].kind, ExprKind::StringLit(s) if s == "A-body\n"));
+                assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "B-body\n"));
+            }
+            other => panic!("expected print with 2 indented heredocs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_mixed_indented_non_indented() {
+        // <<A followed by <<~B: one plain, one indented.
+        let src = "print <<A, <<~B;\nplain-body\nA\n    indented-body\n    B\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, _, args), .. }) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0].kind, ExprKind::StringLit(s) if s == "plain-body\n"));
+                assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "indented-body\n"));
+            }
+            other => panic!("expected print with mixed heredocs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_same_tag_name() {
+        // Two heredocs with the same tag name.  The first body
+        // terminates at the first occurrence of the tag, then
+        // the second heredoc begins with a new body.
+        let src = "print <<END, <<END;\nfirst\nEND\nsecond\nEND\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, _, args), .. }) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0].kind, ExprKind::StringLit(s) if s == "first\n"));
+                assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "second\n"));
+            }
+            other => panic!("expected print with 2 same-tag heredocs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_with_concat_then_heredoc() {
+        // <<A . <<B — concatenation of two heredoc strings.
+        let src = "my $x = <<A . <<B;\nalpha\nA\nbeta\nB\n";
+        let prog = parse(src);
+        match &prog.statements[0].kind {
+            StmtKind::My(_, Some(init)) => {
+                // Should be a Concat of two StringLits.
+                match &init.kind {
+                    ExprKind::BinOp(BinOp::Concat, left, right) => {
+                        assert!(matches!(&left.kind, ExprKind::StringLit(s) if s == "alpha\n"));
+                        assert!(matches!(&right.kind, ExprKind::StringLit(s) if s == "beta\n"));
+                    }
+                    other => panic!("expected Concat, got {other:?}"),
+                }
+            }
+            other => panic!("expected My, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_unterminated_gives_error() {
+        // Heredoc tag with no terminator line → parse error.
+        let src = "my $x = <<END;\nbody line\nbody line 2\n";
+        let mut parser = Parser::new(src.as_bytes()).unwrap();
+        let result = parser.parse_program();
+        assert!(result.is_err(), "expected error for unterminated heredoc");
+    }
+
     // ── Dynamic method dispatch tests ─────────────────────────
 
     #[test]
@@ -4976,13 +5145,13 @@ mod tests {
     #[test]
     fn parse_shift_l() {
         let e = parse_expr_str("$a << 2;");
-        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::ShiftL, _, _)));
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::ShiftLeft, _, _)));
     }
 
     #[test]
     fn parse_shift_r() {
         let e = parse_expr_str("$a >> 2;");
-        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::ShiftR, _, _)));
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::ShiftRight, _, _)));
     }
 
     #[test]
