@@ -686,6 +686,12 @@ impl Lexer {
                             false
                         }
                     }
+                    // Postderef forms `->@*`, `->%*`, `->$*`,
+                    // `->&*` end with `Star`; `->**` ends with
+                    // `Power`.  At depth 0 these complete the
+                    // postderef — probe for continuation just
+                    // like a closing bracket would.
+                    Token::Star | Token::Power => self.context_stack.last().is_some_and(|ctx| ctx.chain_depth == 0),
                     _ => false,
                 };
                 if closed_to_zero {
@@ -2007,12 +2013,25 @@ impl Lexer {
     }
 
     /// Is the next raw-byte sequence a valid subscript chain
-    /// starter?  Returns true for `[`, `{`, `->[`, or `->{`.
-    /// Used both at chain entry (after `$name`/`@name`) and at
-    /// chain continuation (after a closing bracket at depth 0).
+    /// starter?  Returns true for `[`, `{`, `->[`, `->{`, and
+    /// the postderef forms `->@*`, `->%*`, `->$*`, `->&*`,
+    /// `->**`.  Used both at chain entry (after `$name`/`@name`)
+    /// and at chain continuation (after a closing bracket at
+    /// depth 0).
     fn peek_chain_starter(&self) -> bool {
         let r = self.remaining();
-        matches!(r.first(), Some(b'[') | Some(b'{')) || (r.len() >= 3 && r[0] == b'-' && r[1] == b'>' && matches!(r[2], b'[' | b'{'))
+        matches!(r.first(), Some(b'[') | Some(b'{'))
+            || (r.len() >= 3
+                && r[0] == b'-'
+                && r[1] == b'>'
+                && (
+                    // Subscript forms: ->[idx], ->{key}.
+                    matches!(r[2], b'[' | b'{')
+                    // Postderef forms: ->@*, ->%*, ->$*, ->&*, ->**.
+                    || (r.len() >= 4
+                        && matches!(r[2], b'@' | b'%' | b'$' | b'&' | b'*')
+                        && r[3] == b'*')
+                ))
     }
 
     // ── q// qq// qw// ─────────────────────────────────────────

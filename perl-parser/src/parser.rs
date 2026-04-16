@@ -721,11 +721,38 @@ impl Parser {
         let start_span = open.span;
 
         let mut params = Vec::new();
+        // Track the span of the first slurpy parameter (if any)
+        // so we can reject anything that follows it.
+        let mut slurpy_span: Option<Span> = None;
+
         loop {
             if self.at(&Token::RightParen)? {
                 break;
             }
-            params.push(self.parse_sig_param()?);
+            let param = self.parse_sig_param()?;
+
+            // Reject params after a slurpy.
+            if let Some(sp) = slurpy_span {
+                let offending = match &param {
+                    SigParam::Scalar { span, .. } => *span,
+                    SigParam::SlurpyArray { span, .. } => *span,
+                    SigParam::SlurpyHash { span, .. } => *span,
+                    SigParam::AnonScalar { span } => *span,
+                    SigParam::AnonArray { span } => *span,
+                    SigParam::AnonHash { span } => *span,
+                };
+                return Err(ParseError::new(format!("parameter after slurpy (slurpy at byte {})", sp.start), offending));
+            }
+
+            // Record if this param is a slurpy.
+            match &param {
+                SigParam::SlurpyArray { span, .. } | SigParam::SlurpyHash { span, .. } | SigParam::AnonArray { span } | SigParam::AnonHash { span } => {
+                    slurpy_span = Some(*span);
+                }
+                _ => {}
+            }
+
+            params.push(param);
             if !self.eat(&Token::Comma)? {
                 break;
             }
@@ -4729,23 +4756,54 @@ mod tests {
     // run them and show the real failures.
 
     #[test]
-    #[ignore = "postderef_qq in strings: `\"$ref->@*\"`, `\"$ref->%*\"` etc. \
-        should interpolate the full dereference.  Current chain mode \
-        recognizes `->[` and `->{` but not `->@*` / `->%*`.  Needs \
-        extending peek_chain_starter and the chain-mode dispatch to \
-        recognize the postderef forms (feature-gated on postderef_qq)."]
     fn interp_postderef_qq_array() {
+        // `"$ref->@*"` — postderef array form inside a string.
+        // Requires peek_chain_starter to recognize `->@*` and
+        // the chain dispatch to end on `Star` at depth 0.
         let parts = interp_parts(r#""$ref->@*";"#);
         let e = scalar_part(&parts, 0);
         assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefArray)), "expected ArrowDeref(_, DerefArray), got {:?}", e.kind);
     }
 
     #[test]
-    #[ignore = "postderef_qq hash form: same gap as above."]
     fn interp_postderef_qq_hash() {
+        // `"$ref->%*"` — postderef hash form.
         let parts = interp_parts(r#""$ref->%*";"#);
         let e = scalar_part(&parts, 0);
         assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefHash)), "expected ArrowDeref(_, DerefHash), got {:?}", e.kind);
+    }
+
+    #[test]
+    fn interp_postderef_qq_scalar() {
+        // `"$ref->$*"` — postderef scalar form.
+        let parts = interp_parts(r#""$ref->$*";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefScalar)), "expected ArrowDeref(_, DerefScalar), got {:?}", e.kind);
+    }
+
+    #[test]
+    fn interp_postderef_qq_chained_after_subscript() {
+        // `"$h->{key}->@*"` — subscript then postderef in one chain.
+        let parts = interp_parts(r#""$h->{key}->@*";"#);
+        let e = scalar_part(&parts, 0);
+        match &e.kind {
+            ExprKind::ArrowDeref(inner, ArrowTarget::DerefArray) => {
+                // Inner: ArrowDeref(ScalarVar(h), HashElem(key)).
+                assert!(matches!(inner.kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))), "inner should be hash-elem deref, got {:?}", inner.kind);
+            }
+            other => panic!("expected ArrowDeref(_, DerefArray), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_postderef_qq_with_surrounding_text() {
+        // `"values: $ref->@* end"` — postderef mid-string.
+        let parts = interp_parts(r#""values: $ref->@* end";"#);
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], InterpPart::Const(s) if s == "values: "));
+        let e = scalar_part(&parts, 1);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefArray)));
+        assert!(matches!(&parts[2], InterpPart::Const(s) if s == " end"));
     }
 
     // ── Regex / substitution / transliteration tests ──────────
@@ -6324,13 +6382,33 @@ mod tests {
 
     #[test]
     fn sig_anonymous_placeholders() {
-        // `$`, `@`, `%` without names — accept-and-discard.
-        let s = parse_sub("use feature 'signatures'; sub f ($, @, %) { }");
+        // Anonymous scalars — `$` without names — accept-and-discard.
+        // Only scalars here; slurpy forms (`@`, `%`) must be last
+        // and only one is allowed, so they get their own tests.
+        let s = parse_sub("use feature 'signatures'; sub f ($, $, $) { }");
         let sig = s.signature.expect("signature present");
         assert_eq!(sig.params.len(), 3);
+        assert!(sig.params.iter().all(|p| matches!(p, SigParam::AnonScalar { .. })));
+    }
+
+    #[test]
+    fn sig_anonymous_slurpy_array() {
+        // Bare `@` at the end — anonymous slurpy array.
+        let s = parse_sub("use feature 'signatures'; sub f ($, @) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 2);
         assert!(matches!(sig.params[0], SigParam::AnonScalar { .. }));
         assert!(matches!(sig.params[1], SigParam::AnonArray { .. }));
-        assert!(matches!(sig.params[2], SigParam::AnonHash { .. }));
+    }
+
+    #[test]
+    fn sig_anonymous_slurpy_hash() {
+        // Bare `%` at the end — anonymous slurpy hash.
+        let s = parse_sub("use feature 'signatures'; sub f ($, %) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 2);
+        assert!(matches!(sig.params[0], SigParam::AnonScalar { .. }));
+        assert!(matches!(sig.params[1], SigParam::AnonHash { .. }));
     }
 
     #[test]
@@ -9552,9 +9630,6 @@ OUTER\n";
     // ── Signatures: negative cases ───────────────────────────
 
     #[test]
-    #[ignore = "parser does not yet enforce 'slurpy must be last parameter' — \
-        accepting `sub f (@rest, $x)` without error.  Needs a validation \
-        pass in parse_signature that rejects params after a slurpy."]
     fn sig_slurpy_array_before_scalar_is_error() {
         // `@rest` must be the last named parameter — a scalar
         // after it is invalid.  The parser should reject.
@@ -9568,8 +9643,6 @@ OUTER\n";
     }
 
     #[test]
-    #[ignore = "parser does not yet enforce 'only one slurpy allowed' — \
-        accepting `sub f (@a, %h)` without error.  Same fix as above."]
     fn sig_two_slurpies_is_error() {
         let src = "use feature 'signatures'; sub f (@a, %h) { }";
         let mut p = match Parser::new(src.as_bytes()) {
