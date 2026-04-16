@@ -115,7 +115,9 @@ pub enum ExprKind {
     QwList(Vec<String>),
     Undef,
     /// Regex literal: `m/.../flags`, `/.../flags`, or `qr/.../flags`.
-    Regex(RegexKind, String, Option<String>),
+    /// Pattern is an expression: `StringLit` for simple patterns,
+    /// `InterpolatedString` for patterns with code blocks.
+    Regex(RegexKind, Box<Expr>, Option<String>),
 
     // ── Variables ─────────────────────────────────────────────
     ScalarVar(String),
@@ -267,6 +269,10 @@ pub enum StringPart {
     ScalarInterp(String),
     ArrayInterp(String),
     ExprInterp(Box<Expr>),
+    /// `(?{code})` — raw text for stringification + parsed code.
+    RegexCode(String, Box<Expr>),
+    /// `(??{code})` — postponed regex code block.
+    RegexCondCode(String, Box<Expr>),
 }
 
 /// Binary operators.

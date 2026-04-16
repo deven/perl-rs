@@ -1044,7 +1044,7 @@ impl Lexer {
     /// - `raw`: passthrough (backslash prevents delimiter
     ///   matching but both bytes are kept).  For `m//`, `tr//`.
     /// - `regex`: detect `(?{...})` code blocks (future).
-    fn lex_body(&mut self, delim: Option<u8>, depth: u32, interpolating: bool, _regex: bool, raw: bool) -> Result<Spanned, ParseError> {
+    fn lex_body(&mut self, delim: Option<u8>, depth: u32, interpolating: bool, regex: bool, raw: bool) -> Result<Spanned, ParseError> {
         // Compute open/close from the delimiter.
         // None means heredoc (no delimiter — end signaled by LexerSource).
         let (open, close) = match delim {
@@ -1092,6 +1092,28 @@ impl Lexer {
             }
         }
 
+        // Regex code blocks: (?{...}) and (??{...}).
+        if regex && b == b'(' {
+            if self.peek_byte_at(1) == Some(b'?') {
+                if self.peek_byte_at(2) == Some(b'{') {
+                    // (?{ — consume 3 bytes, enter code mode.
+                    self.skip(3);
+                    if let Some(ctx) = self.context_stack.last_mut() {
+                        ctx.expr_depth = 1;
+                    }
+                    return Ok(Spanned { token: Token::RegexCodeStart, span: Span::new(start, self.span_pos()) });
+                }
+                if self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{') {
+                    // (??{ — consume 4 bytes, enter code mode.
+                    self.skip(4);
+                    if let Some(ctx) = self.context_stack.last_mut() {
+                        ctx.expr_depth = 1;
+                    }
+                    return Ok(Spanned { token: Token::RegexCondCodeStart, span: Span::new(start, self.span_pos()) });
+                }
+            }
+        }
+
         // Scan a ConstSegment: everything until we hit the closing
         // delimiter (or $/@/end-of-line in interpolating mode).
         let mut s = String::new();
@@ -1118,6 +1140,15 @@ impl Lexer {
                     break;
                 }
                 Some(b'$') | Some(b'@') if interpolating => break,
+                // Regex code block lookahead: break so fast dispatch
+                // handles it on the next call.
+                Some(b'(')
+                    if regex
+                        && self.peek_byte_at(1) == Some(b'?')
+                        && (self.peek_byte_at(2) == Some(b'{') || (self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{'))) =>
+                {
+                    break;
+                }
                 Some(b'\\') => {
                     self.skip(1);
                     if raw {
@@ -1954,7 +1985,9 @@ mod tests {
                 | Token::InterpScalar(_)
                 | Token::InterpArray(_)
                 | Token::InterpScalarExprStart
-                | Token::InterpArrayExprStart => {}
+                | Token::InterpArrayExprStart
+                | Token::RegexCodeStart
+                | Token::RegexCondCodeStart => {}
                 _ => {
                     expect = Expect::Term;
                 }
@@ -3118,6 +3151,81 @@ mod tests {
         // Bare / is always Slash from the lexer.
         let tokens = lex_all("/foo/imsxg");
         assert_eq!(tokens, vec![Token::Slash, Token::Ident("foo".into()), Token::Slash, Token::Ident("imsxg".into())]);
+    }
+
+    #[test]
+    fn lex_regex_code_block() {
+        let tokens = lex_all("m/foo(?{ $x })bar/");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::RegexBegin(RegexKind::Match, b'/'),
+                Token::ConstSegment("foo".into()),
+                Token::RegexCodeStart,
+                Token::ScalarVar("x".into()),
+                Token::RightBrace,
+                Token::ConstSegment(")bar".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_regex_cond_code_block() {
+        let tokens = lex_all("m/foo(??{ $x })bar/");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::RegexBegin(RegexKind::Match, b'/'),
+                Token::ConstSegment("foo".into()),
+                Token::RegexCondCodeStart,
+                Token::ScalarVar("x".into()),
+                Token::RightBrace,
+                Token::ConstSegment(")bar".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_regex_code_block_paired_delim() {
+        // The whole point: (?{...}) with paired braces.
+        // Without code mode, the } inside the string would
+        // close the m{} prematurely.
+        let tokens = lex_all("m{foo(?{ 1 })bar}");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::RegexBegin(RegexKind::Match, b'{'),
+                Token::ConstSegment("foo".into()),
+                Token::RegexCodeStart,
+                Token::IntLit(1),
+                Token::RightBrace,
+                Token::ConstSegment(")bar".into()),
+                Token::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_code_block_not_in_string() {
+        // (?{ in a double-quoted string is literal, not a code block.
+        let tokens = lex_all(r#""foo(?{bar})""#);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("foo(?{bar})".into()), Token::QuoteEnd,]);
+    }
+
+    #[test]
+    fn lex_code_block_not_in_single_quoted() {
+        // (?{ in a single-quoted string is literal.
+        let tokens = lex_all("q/foo(?{bar})/");
+        assert_eq!(tokens, vec![Token::StrLit("foo(?{bar})".into())]);
+    }
+
+    #[test]
+    fn lex_cond_code_block_not_in_string() {
+        // (??{ in a double-quoted string is literal.
+        let tokens = lex_all(r#""foo(??{bar})""#);
+        assert_eq!(tokens, vec![Token::QuoteBegin(QuoteKind::Double, b'"'), Token::ConstSegment("foo(??{bar})".into()), Token::QuoteEnd,]);
     }
 
     #[test]

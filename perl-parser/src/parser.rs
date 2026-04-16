@@ -1536,41 +1536,34 @@ impl Parser {
             Token::RegexBegin(kind, _delim) => {
                 // Collect body tokens until QuoteEnd.
                 let body = self.parse_interpolated_string(span)?;
-                let pattern = match body.kind {
-                    ExprKind::StringLit(s) => s,
-                    _ => return Err(ParseError::new("regex interpolation not yet supported", span)),
-                };
                 // Flags are adjacent to the closing delimiter.
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(kind, pattern, flags), span })
+                Ok(Expr { kind: ExprKind::Regex(kind, Box::new(body), flags), span })
             }
             // // in term position is an empty regex, not defined-or.
-            // The lexer always returns DefinedOr for //; the parser converts
-            // here.  Flags are scanned directly from the lexer position —
-            // they must be adjacent to the // with no whitespace.
             Token::DefinedOr => {
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, String::new(), flags), span })
+                let pat = Expr { kind: ExprKind::StringLit(String::new()), span };
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Box::new(pat), flags), span })
             }
             // / in term position is a regex, not division.
-            // The lexer returned Slash; the parser scans the body.
             Token::Slash => {
                 let pattern = self.lexer.lex_body_str(b'/', true)?;
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, pattern, flags), span })
+                let pat = Expr { kind: ExprKind::StringLit(pattern), span };
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Box::new(pat), flags), span })
             }
             // /= in term position: = is the first character of the
             // regex pattern, not a division-assignment operator.
-            // Rewind past the = so the body scanner includes it.
             Token::Assign(AssignOp::DivEq) => {
                 self.lexer.rewind(1);
                 let pattern = self.lexer.lex_body_str(b'/', true)?;
@@ -1578,7 +1571,8 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, pattern, flags), span })
+                let pat = Expr { kind: ExprKind::StringLit(pattern), span };
+                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Box::new(pat), flags), span })
             }
             Token::SubstBegin(delim) => {
                 // Collect pattern body tokens until QuoteEnd.
@@ -2230,6 +2224,24 @@ impl Parser {
                     self.expect_token(&Token::RightBrace)?;
                     parts.push(StringPart::ExprInterp(Box::new(expr)));
                 }
+                tok @ (Token::RegexCodeStart | Token::RegexCondCodeStart) => {
+                    let is_cond = matches!(tok, Token::RegexCondCodeStart);
+                    let code_start = self.peek_span().end as usize;
+                    self.next_token()?;
+                    has_interp = true;
+                    // Regex code block — normal code lexing until }.
+                    self.expect = Expect::Term;
+                    let expr = self.parse_expr(PREC_LOW)?;
+                    let code_end = self.peek_span().start as usize;
+                    // Capture raw text between (?{ and }.
+                    let raw = String::from_utf8_lossy(self.lexer.slice(code_start, code_end)).into_owned();
+                    self.expect_token(&Token::RightBrace)?;
+                    if is_cond {
+                        parts.push(StringPart::RegexCondCode(raw, Box::new(expr)));
+                    } else {
+                        parts.push(StringPart::RegexCode(raw, Box::new(expr)));
+                    }
+                }
                 Token::Eof => {
                     return Err(ParseError::new("unterminated interpolated string", self.peek_span()));
                 }
@@ -2570,6 +2582,14 @@ mod tests {
             StmtKind::Expr(e) => e.clone(),
             StmtKind::My(_, Some(e)) => e.clone(),
             other => panic!("expected expression, got {other:?}"),
+        }
+    }
+
+    /// Extract the pattern string from a regex pattern expression.
+    fn pat_str(pat: &Expr) -> &str {
+        match &pat.kind {
+            ExprKind::StringLit(s) => s.as_str(),
+            other => panic!("expected StringLit pattern, got {other:?}"),
         }
     }
 
@@ -2922,7 +2942,7 @@ mod tests {
         let e = parse_expr_str("/foo/i;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat, "foo");
+                assert_eq!(pat_str(&pat), "foo");
                 assert_eq!(flags.as_deref(), Some("i"));
             }
             other => panic!("expected Regex, got {other:?}"),
@@ -2947,7 +2967,7 @@ mod tests {
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat, "");
+                    assert_eq!(pat_str(&pat), "");
                     assert!(flags.is_none());
                 }
                 other => panic!("expected empty Regex, got {other:?}"),
@@ -2962,7 +2982,7 @@ mod tests {
         let e = parse_expr_str("//;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat, "");
+                assert_eq!(pat_str(&pat), "");
                 assert!(flags.is_none());
             }
             other => panic!("expected empty Regex, got {other:?}"),
@@ -2976,7 +2996,7 @@ mod tests {
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat, "");
+                    assert_eq!(pat_str(&pat), "");
                     assert_eq!(flags.as_deref(), Some("gi"));
                 }
                 other => panic!("expected empty Regex with flags, got {other:?}"),
@@ -2991,7 +3011,7 @@ mod tests {
         let e = parse_expr_str("//gi;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat, "");
+                assert_eq!(pat_str(&pat), "");
                 assert_eq!(flags.as_deref(), Some("gi"));
             }
             other => panic!("expected empty Regex with flags, got {other:?}"),
@@ -3033,7 +3053,7 @@ mod tests {
         match &e.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat, "");
+                    assert_eq!(pat_str(&pat), "");
                     assert_eq!(flags.as_deref(), Some("gi"));
                 }
                 other => panic!("expected Regex, got {other:?}"),
@@ -3045,7 +3065,7 @@ mod tests {
         match &e2.kind {
             ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
                 ExprKind::Regex(_, pat, flags) => {
-                    assert_eq!(pat, "");
+                    assert_eq!(pat_str(&pat), "");
                     assert!(flags.is_none());
                 }
                 other => panic!("expected Regex with empty flags, got {other:?}"),
@@ -5500,7 +5520,7 @@ mod tests {
         let e = parse_expr_str("/foo/imsxg;");
         match &e.kind {
             ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat, "foo");
+                assert_eq!(pat_str(&pat), "foo");
                 assert_eq!(flags.as_deref(), Some("imsxg"));
             }
             other => panic!("expected Regex with flags, got {other:?}"),
@@ -5511,7 +5531,7 @@ mod tests {
     fn parse_qr_regex() {
         let e = parse_expr_str("qr/\\d+/;");
         match &e.kind {
-            ExprKind::Regex(_, pat, _) => assert_eq!(pat, "\\d+"),
+            ExprKind::Regex(_, pat, _) => assert_eq!(pat_str(&pat), "\\d+"),
             other => panic!("expected Regex (qr), got {other:?}"),
         }
     }

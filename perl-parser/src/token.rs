@@ -369,6 +369,12 @@ pub enum Token {
     RegexBody(String),
     /// Regex flags (imsx etc.).
     RegexFlags(String),
+    /// `(?{` — embedded code block in a regex pattern.
+    /// Lexer switches to normal code mode until `}`.
+    RegexCodeStart,
+    /// `(??{` — postponed regex code block.
+    /// Lexer switches to normal code mode until `}`.
+    RegexCondCodeStart,
 
     // ── Substitution / transliteration ──────────────────────────
     /// Start of a substitution.  The delimiter byte is carried so
