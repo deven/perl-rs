@@ -380,6 +380,45 @@ pub enum Token {
     /// Fields: kind, tag, body.
     HeredocLit(HeredocKind, String, String),
 
+    // ── Format sub-tokens ─────────────────────────────────────
+    /// Opens a `format NAME = ... .` body.  `name` is the format
+    /// name (defaults to `STDOUT` when omitted at the call site).
+    /// The sublex context ends with `SublexEnd` at the `.` terminator.
+    FormatSublexBegin(String),
+    /// `# ...` — comment line inside a format (column-0 `#`).
+    FormatComment(String),
+    /// Whitespace-only line inside a format.
+    FormatBlankLine,
+    /// A picture line containing no field specifiers.  Emitted
+    /// instead of the `FormatPictureBegin` / … / `FormatPictureEnd`
+    /// stream when the line has only literal text (tildes
+    /// normalized to spaces).
+    FormatLiteralLine(RepeatKind, String),
+    /// Start of a picture line that contains one or more fields.
+    /// Followed by alternating `FormatLiteral` and `FormatField`
+    /// tokens, then `FormatPictureEnd`, then `FormatArgsBegin`.
+    FormatPictureBegin(RepeatKind),
+    /// Literal run of text between or around fields inside a
+    /// picture line.  Tildes have already been replaced with
+    /// spaces; the `RepeatKind` is on the enclosing
+    /// `FormatPictureBegin`.
+    FormatLiteral(String),
+    /// One field specifier in a picture line.
+    FormatField(FieldKind),
+    /// Closes a picture line.  Always followed by `FormatArgsBegin`.
+    FormatPictureEnd,
+    /// Start of the argument line following a picture.  The lexer
+    /// emits normal code tokens until `FormatArgsEnd`.  Two modes:
+    ///   * Line mode (default): newline terminates the args.
+    ///   * Braced mode: if the parser sees a `{` as the first
+    ///     token and calls `lexer.format_args_enter_braced()`,
+    ///     matching `}` terminates instead (expressions may span
+    ///     multiple lines).
+    FormatArgsBegin,
+    /// Closes the argument line.  Next token resumes format body
+    /// scanning.
+    FormatArgsEnd,
+
     // ── Special ───────────────────────────────────────────────
     /// `qw/.../` — list of words.
     QwList(Vec<String>),
@@ -441,6 +480,59 @@ pub enum HeredocKind {
     Indented,
     /// `<<~'TAG'` — indented literal.
     IndentedLiteral,
+}
+
+/// Repeat behavior on a format picture line, controlled by `~` or
+/// `~~` characters anywhere in the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepeatKind {
+    /// No `~` on the line.
+    None,
+    /// At least one `~` on the line: suppress the line if all
+    /// fields produce empty output.
+    Suppress,
+    /// `~~` anywhere on the line: repeat the line until all fields
+    /// are exhausted (become undef).
+    Repeat,
+}
+
+/// One field specifier in a format picture line.
+///
+/// See `perlform` for details.  Widths are in source columns and
+/// include the leading `@` or `^` character.  `u32` matches Perl's
+/// internal representation (C `int`), which has been empirically
+/// verified to support fields wider than 65535.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    /// `@<<<<` — text, left-justified.  `truncate_ellipsis` is set
+    /// when the field ends with `...` (shown in output when the
+    /// value was truncated).
+    LeftJustify { width: u32, truncate_ellipsis: bool },
+    /// `@>>>>` — text, right-justified.
+    RightJustify { width: u32, truncate_ellipsis: bool },
+    /// `@||||` — text, centered.
+    Center { width: u32, truncate_ellipsis: bool },
+
+    /// `^<<<<` — fill mode, left-justified (word-wraps, chops the
+    /// source scalar).
+    FillLeft { width: u32, truncate_ellipsis: bool },
+    /// `^>>>>` — fill mode, right-justified.
+    FillRight { width: u32, truncate_ellipsis: bool },
+    /// `^||||` — fill mode, centered.
+    FillCenter { width: u32, truncate_ellipsis: bool },
+
+    /// `@*` — variable-width multi-line field.
+    MultiLine,
+    /// `^*` — variable-width, one line at a time; chops the source
+    /// scalar.
+    FillMultiLine,
+
+    /// `@####` (integer) or `@####.##` (with fractional part).
+    /// `leading_zeros` is set when the first `#` was written as `0`
+    /// (pad with zeros instead of spaces).  `caret` is set for
+    /// `^###` — blanks the field when the value is undef instead
+    /// of rendering as 0.
+    Numeric { integer_digits: u32, decimal_digits: Option<u32>, leading_zeros: bool, caret: bool },
 }
 
 impl Token {
