@@ -74,6 +74,7 @@ pub enum Keyword {
     Next,
     Redo,
     Goto,
+    Dump,
 
     // ── Special values ────────────────────────────────────────
     Undef,
@@ -200,6 +201,7 @@ pub enum AssignOp {
     AndEq,          // &&=
     OrEq,           // ||=
     DefinedOrEq,    // //=
+    LogicalXorEq,   // ^^=
     BitAndEq,       // &=
     BitOrEq,        // |=
     BitXorEq,       // ^=
@@ -281,10 +283,11 @@ pub enum Token {
     Spaceship, // <=>
 
     // ── Operators — logical ───────────────────────────────────
-    AndAnd,    // &&
-    OrOr,      // ||
-    DefinedOr, // //  (defined-or)
-    Bang,      // !
+    AndAnd,     // &&
+    OrOr,       // ||
+    DefinedOr,  // //  (defined-or)
+    LogicalXor, // ^^  (logical xor)
+    Bang,       // !
 
     // ── Operators — bitwise ───────────────────────────────────
     BitAnd, // &
@@ -469,7 +472,8 @@ pub enum Token {
     /// Yada yada yada (`...` as a statement).
     YadaYada,
     /// `<STDIN>`, `<$fh>`, `<*.txt>` — readline or glob.
-    Readline(String),
+    /// The bool is `true` for `<<>>` (safe double diamond, 3-arg open).
+    Readline(String, bool),
 }
 
 /// Which marker triggered logical end-of-script.
@@ -610,7 +614,7 @@ impl Token {
                 | Token::SubstSublexBegin(_)
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
-                | Token::Readline(_)
+                | Token::Readline(_, _)
                 | Token::QwList(_)
                 | Token::Dollar
                 | Token::At
@@ -652,5 +656,57 @@ impl std::fmt::Display for Token {
             Token::Keyword(kw) => write!(f, "{kw:?}"),
             _ => write!(f, "{self:?}"),
         }
+    }
+}
+
+// ── Case-modification flags ─────────────────────────────────────
+//
+// Tracks the active `\L`/`\U`/`\F`/`\Q` state inside interpolating
+// strings.  Stored as bitflags for cheap copy/combine.  The lexer
+// maintains a stack of these (each entry is the cumulative flags
+// at that nesting level); `\l`/`\u` one-shots are tracked
+// separately but have their own flag bits so they can be attached
+// to interpolation tokens for the parser.
+
+use std::ops::{BitOr, BitOrAssign};
+
+/// Bitflag set of case-modification modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaseMod(u8);
+
+impl CaseMod {
+    pub const EMPTY: CaseMod = CaseMod(0);
+
+    /// `\L` — lowercase until `\E`.
+    pub const LOWER: CaseMod = CaseMod(1 << 0);
+    /// `\U` — uppercase until `\E`.
+    pub const UPPER: CaseMod = CaseMod(1 << 1);
+    /// `\F` — foldcase until `\E`.
+    pub const FOLD: CaseMod = CaseMod(1 << 2);
+    /// `\Q` — quotemeta until `\E`.
+    pub const QUOTEMETA: CaseMod = CaseMod(1 << 3);
+    /// `\l` — lowercase next character only (one-shot).
+    pub const LCFIRST: CaseMod = CaseMod(1 << 4);
+    /// `\u` — titlecase next character only (one-shot).
+    pub const UCFIRST: CaseMod = CaseMod(1 << 5);
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    pub const fn contains(self, other: CaseMod) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+impl BitOr for CaseMod {
+    type Output = CaseMod;
+    fn bitor(self, rhs: CaseMod) -> CaseMod {
+        CaseMod(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for CaseMod {
+    fn bitor_assign(&mut self, rhs: CaseMod) {
+        self.0 |= rhs.0;
     }
 }

@@ -129,11 +129,29 @@ pub(crate) struct Lexer {
     /// decide whether to accept multi-byte UTF-8 identifiers
     /// and whether high bytes outside strings are errors.
     pub(crate) utf8_mode: bool,
+    /// Stacked cumulative case-modification flags.  Each `\L`/`\U`/
+    /// `\F`/`\Q` pushes the current flags ORed with the new mode;
+    /// `\E` pops, reverting to the enclosing flags.
+    case_mod_stack: Vec<CaseMod>,
+    /// `\l` pending — lowercase the very next character only.
+    case_mod_lcfirst: bool,
+    /// `\u` pending — titlecase the very next character only.
+    case_mod_ucfirst: bool,
 }
 
 impl Lexer {
     pub fn new(src: &[u8]) -> Self {
-        Lexer { source: LexerSource::new(src), current_line: None, context_stack: Vec::new(), pending_error: None, format_state: None, utf8_mode: false }
+        Lexer {
+            source: LexerSource::new(src),
+            current_line: None,
+            context_stack: Vec::new(),
+            pending_error: None,
+            format_state: None,
+            utf8_mode: false,
+            case_mod_stack: Vec::new(),
+            case_mod_lcfirst: false,
+            case_mod_ucfirst: false,
+        }
     }
 
     /// Construct with an explicit filename (used for `__FILE__`
@@ -147,6 +165,9 @@ impl Lexer {
             pending_error: None,
             format_state: None,
             utf8_mode: false,
+            case_mod_stack: Vec::new(),
+            case_mod_lcfirst: false,
+            case_mod_ucfirst: false,
         }
     }
 
@@ -164,6 +185,102 @@ impl Lexer {
     /// letter check happens inside `scan_ident`).
     fn is_ident_start(&self, b: u8) -> bool {
         b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)
+    }
+
+    /// Push a character to `s` with the active case modification
+    /// applied.  One-shot modes (`\l`/`\u`) override persistent
+    /// case modes for one character, then clear.
+    fn push_case_mod(&mut self, s: &mut String, c: char) {
+        let flags = self.case_mod_stack.last().copied().unwrap_or(CaseMod::EMPTY);
+        if flags.is_empty() && !self.case_mod_lcfirst && !self.case_mod_ucfirst {
+            s.push(c);
+            return;
+        }
+
+        // Step 1: case transformation.
+        // One-shot overrides persistent mode for this character.
+        if self.case_mod_lcfirst {
+            self.case_mod_lcfirst = false;
+            let lc: String = c.to_lowercase().collect();
+            if flags.contains(CaseMod::QUOTEMETA) {
+                Self::push_quotemeta(s, &lc);
+            } else {
+                s.push_str(&lc);
+            }
+            return;
+        }
+        if self.case_mod_ucfirst {
+            self.case_mod_ucfirst = false;
+            let uc: String = c.to_uppercase().collect();
+            if flags.contains(CaseMod::QUOTEMETA) {
+                Self::push_quotemeta(s, &uc);
+            } else {
+                s.push_str(&uc);
+            }
+            return;
+        }
+
+        // Persistent case mode.
+        if flags.contains(CaseMod::UPPER) {
+            let uc: String = c.to_uppercase().collect();
+            if flags.contains(CaseMod::QUOTEMETA) {
+                Self::push_quotemeta(s, &uc);
+            } else {
+                s.push_str(&uc);
+            }
+            return;
+        }
+        if flags.contains(CaseMod::LOWER) || flags.contains(CaseMod::FOLD) {
+            let lc: String = c.to_lowercase().collect();
+            if flags.contains(CaseMod::QUOTEMETA) {
+                Self::push_quotemeta(s, &lc);
+            } else {
+                s.push_str(&lc);
+            }
+            return;
+        }
+
+        // Quotemeta only (no case change).
+        if flags.contains(CaseMod::QUOTEMETA) {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                s.push(c);
+            } else {
+                s.push('\\');
+                s.push(c);
+            }
+            return;
+        }
+
+        s.push(c);
+    }
+
+    /// Apply quotemeta escaping to a (possibly multi-char) string.
+    fn push_quotemeta(s: &mut String, text: &str) {
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                s.push(ch);
+            } else {
+                s.push('\\');
+                s.push(ch);
+            }
+        }
+    }
+
+    /// Snapshot the active case-modification state for an interpolated
+    /// expression.  Returns the cumulative flags including any pending
+    /// one-shot.  Clears the one-shot flags (they apply to this
+    /// interpolation only).
+    pub(crate) fn take_interp_case_mod(&mut self) -> CaseMod {
+        let mut flags = self.case_mod_stack.last().copied().unwrap_or(CaseMod::EMPTY);
+        if self.case_mod_lcfirst {
+            flags |= CaseMod::LCFIRST;
+            self.case_mod_lcfirst = false;
+        }
+        if self.case_mod_ucfirst {
+            flags |= CaseMod::UCFIRST;
+            self.case_mod_ucfirst = false;
+        }
+        flags
     }
 
     // ── Byte access (auto-loading) ──────────────────────────
@@ -804,7 +921,15 @@ impl Lexer {
             b'|' => self.lex_pipe(),
             b'^' => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'.') {
+                if self.peek_byte(false) == Some(b'^') {
+                    self.skip(1);
+                    if self.peek_byte(false) == Some(b'=') {
+                        self.skip(1);
+                        Token::Assign(AssignOp::LogicalXorEq)
+                    } else {
+                        Token::LogicalXor
+                    }
+                } else if self.peek_byte(false) == Some(b'.') {
                     self.skip(1);
                     if self.peek_byte(false) == Some(b'=') {
                         self.skip(1);
@@ -1779,6 +1904,9 @@ impl Lexer {
                 if close.is_none() {
                     // Heredoc or subst body finished (virtual EOF).
                     self.context_stack.pop();
+                    self.case_mod_stack.clear();
+                    self.case_mod_lcfirst = false;
+                    self.case_mod_ucfirst = false;
                     return Ok(Spanned { token: Token::SublexEnd, span: Span::new(pos, pos) });
                 }
                 return Err(ParseError::new("unterminated string", Span::new(pos, pos)));
@@ -1798,6 +1926,9 @@ impl Lexer {
         {
             self.skip(1);
             self.context_stack.pop();
+            self.case_mod_stack.clear();
+            self.case_mod_lcfirst = false;
+            self.case_mod_ucfirst = false;
             return Ok(Spanned { token: Token::SublexEnd, span: Span::new(start, self.span_pos()) });
         }
         if interpolating {
@@ -1905,16 +2036,16 @@ impl Lexer {
                 Some(b) if Some(b) == open => {
                     current_depth += 1;
                     self.skip(1);
-                    s.push(b as char);
+                    self.push_case_mod(&mut s, b as char);
                 }
                 Some(b) if Some(b) == close && current_depth > 0 => {
                     current_depth -= 1;
                     self.skip(1);
-                    s.push(b as char);
+                    self.push_case_mod(&mut s, b as char);
                 }
                 Some(b) => {
                     self.skip(1);
-                    s.push(b as char);
+                    self.push_case_mod(&mut s, b as char);
                 }
             }
         }
@@ -2082,6 +2213,108 @@ impl Lexer {
                     s.push('\\');
                     s.push('N');
                 }
+            }
+            Some(b'o') => {
+                // \o{NNN} — octal escape with braces.
+                self.skip(1);
+                if self.peek_byte(false) == Some(b'{') {
+                    self.skip(1);
+                    let mut n = 0u32;
+                    while let Some(b) = self.peek_byte(false) {
+                        if b == b'}' {
+                            self.skip(1);
+                            break;
+                        }
+                        if (b'0'..=b'7').contains(&b) {
+                            self.skip(1);
+                            n = n * 8 + (b - b'0') as u32;
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(c) = char::from_u32(n) {
+                        s.push(c);
+                    }
+                } else {
+                    // Bare \o without braces — literal.
+                    s.push('\\');
+                    s.push('o');
+                }
+            }
+            Some(b'c') => {
+                // \cX — control character.  The character following
+                // \c is XORed with 0x40 to produce the control char.
+                self.skip(1);
+                if let Some(next) = self.peek_byte(false) {
+                    self.skip(1);
+                    let ctrl = (next.to_ascii_uppercase()) ^ 0x40;
+                    s.push(ctrl as char);
+                } else {
+                    s.push('\\');
+                    s.push('c');
+                }
+            }
+            Some(b'1'..=b'7') => {
+                // \NNN — octal escape (1–3 digits, no braces).
+                // Note: \0 is handled separately above.
+                let mut n = 0u32;
+                for _ in 0..3 {
+                    if let Some(b) = self.peek_byte(false) {
+                        if (b'0'..=b'7').contains(&b) {
+                            self.skip(1);
+                            n = n * 8 + (b - b'0') as u32;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if let Some(c) = char::from_u32(n) {
+                    s.push(c);
+                }
+            }
+            // Case-modification escapes.  These affect subsequent
+            // characters until \E.  For now we consume the markers
+            // and apply the transformations inline.
+            Some(b'l') => {
+                // \l — lowercase next character only.
+                self.skip(1);
+                self.case_mod_lcfirst = true;
+                self.case_mod_ucfirst = false; // \l overrides pending \u
+            }
+            Some(b'u') => {
+                // \u — titlecase next character only.
+                self.skip(1);
+                self.case_mod_ucfirst = true;
+                self.case_mod_lcfirst = false; // \u overrides pending \l
+            }
+            Some(b'L') => {
+                // \L — lowercase until \E.  Cumulative with enclosing flags.
+                self.skip(1);
+                let cur = self.case_mod_stack.last().copied().unwrap_or(CaseMod::EMPTY);
+                self.case_mod_stack.push(cur | CaseMod::LOWER);
+            }
+            Some(b'U') => {
+                // \U — uppercase until \E.  Cumulative with enclosing flags.
+                self.skip(1);
+                let cur = self.case_mod_stack.last().copied().unwrap_or(CaseMod::EMPTY);
+                self.case_mod_stack.push(cur | CaseMod::UPPER);
+            }
+            Some(b'F') => {
+                // \F — foldcase until \E.  Cumulative with enclosing flags.
+                self.skip(1);
+                let cur = self.case_mod_stack.last().copied().unwrap_or(CaseMod::EMPTY);
+                self.case_mod_stack.push(cur | CaseMod::FOLD);
+            }
+            Some(b'Q') => {
+                // \Q — quotemeta until \E.  Cumulative with enclosing flags.
+                self.skip(1);
+                let cur = self.case_mod_stack.last().copied().unwrap_or(CaseMod::EMPTY);
+                self.case_mod_stack.push(cur | CaseMod::QUOTEMETA);
+            }
+            Some(b'E') => {
+                // \E — pop, reverting to enclosing flags.
+                self.skip(1);
+                self.case_mod_stack.pop();
             }
             _ => s.push('\\'),
         }
@@ -2523,7 +2756,7 @@ impl Lexer {
             content.push(b as char);
         }
         if found_close {
-            Some(Token::Readline(content))
+            Some(Token::Readline(content, false))
         } else {
             // Not a readline — rewind.
             if let Some(line) = self.current_line.as_mut() {
@@ -2541,6 +2774,23 @@ impl Lexer {
     /// — the parser should then treat the `ShiftLeft` as a shift.
     pub fn lex_heredoc_after_shift_left(&mut self) -> Result<Option<Token>, ParseError> {
         let saved = self.line_pos();
+
+        // `<<>>` — double diamond (safe version of <>).
+        // Must check before heredoc tag parsing since `>` is not
+        // a valid tag character.
+        if self.peek_byte(false) == Some(b'>') {
+            self.skip(1);
+            if self.peek_byte(false) == Some(b'>') {
+                self.skip(1);
+                return Ok(Some(Token::Readline(String::new(), true)));
+            }
+            // Single `>` after `<<` — not a valid heredoc or diamond.
+            // Rewind.
+            if let Some(line) = self.current_line.as_mut() {
+                line.pos = saved;
+            }
+            return Ok(None);
+        }
 
         // <<~ for indented heredocs
         let indented = self.peek_byte(false) == Some(b'~');
@@ -3025,7 +3275,7 @@ mod tests {
                 | Token::SublexEnd
                 | Token::TranslitLit(_, _, _)
                 | Token::HeredocLit(_, _, _)
-                | Token::Readline(_)
+                | Token::Readline(_, _)
                 | Token::GlobVar(_)
                 | Token::QwList(_)
                 | Token::SpecialArrayVar(_)
@@ -4413,19 +4663,19 @@ mod tests {
     #[test]
     fn lex_readline_stdin() {
         let tokens = lex_all("<STDIN>");
-        assert_eq!(tokens, vec![Token::Readline("STDIN".into())]);
+        assert_eq!(tokens, vec![Token::Readline("STDIN".into(), false)]);
     }
 
     #[test]
     fn lex_readline_diamond() {
         let tokens = lex_all("<>");
-        assert_eq!(tokens, vec![Token::Readline("".into())]);
+        assert_eq!(tokens, vec![Token::Readline("".into(), false)]);
     }
 
     #[test]
     fn lex_glob_wildcard() {
         let tokens = lex_all("<*.txt>");
-        assert_eq!(tokens, vec![Token::Readline("*.txt".into())]);
+        assert_eq!(tokens, vec![Token::Readline("*.txt".into(), false)]);
     }
 
     // ── DataEnd tokens ────────────────────────────────────────

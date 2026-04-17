@@ -1650,14 +1650,14 @@ impl Parser {
                     Some(Token::QuoteSublexBegin(kind, delim)) => {
                         let body_span = self.peek_span();
                         self.parse_interpolated_string(body_span.merge(span)).map(|mut e| {
-                            // Preserve the << span as the start.
                             e.span = span.merge(e.span);
-                            // kind/delim unused — the Heredoc QuoteKind is implicit.
                             let _ = (kind, delim);
                             e
                         })
                     }
                     Some(Token::HeredocLit(_kind, _tag, body)) => Ok(Expr { kind: ExprKind::StringLit(body), span }),
+                    // <<>> double diamond — safe version of <>.
+                    Some(Token::Readline(content, safe)) => Self::readline_expr(content, safe, span),
                     Some(other) => unreachable!("unexpected heredoc token: {other:?}"),
                     None => Err(ParseError::new("expected heredoc tag after <<", span)),
                 }
@@ -2137,6 +2137,17 @@ impl Parser {
                 let end = span.merge(arg.span);
                 Ok(Expr { kind: ExprKind::FuncCall("goto".into(), vec![arg]), span: end })
             }
+            Token::Keyword(Keyword::Dump) => {
+                // `dump LABEL` — same precedence as goto.
+                // Deprecated; mostly used to create core dumps.
+                if self.at_eof()? || self.at(&Token::Semi)? {
+                    Ok(Expr { kind: ExprKind::FuncCall("dump".into(), vec![]), span })
+                } else {
+                    let arg = self.parse_expr(PREC_COMMA)?;
+                    let end = span.merge(arg.span);
+                    Ok(Expr { kind: ExprKind::FuncCall("dump".into(), vec![arg]), span: end })
+                }
+            }
 
             // Filetest operators: -e, -f, -d, etc. (lexed as single token)
             Token::Filetest(test_byte) => self.parse_filetest(test_byte, span),
@@ -2145,15 +2156,15 @@ impl Parser {
             Token::DotDotDot => Ok(Expr { kind: ExprKind::YadaYada, span }),
 
             // Readline / diamond: <STDIN>, <>, <$fh>, <*.txt>
-            Token::Readline(content) => Self::readline_expr(content, span),
+            Token::Readline(content, safe) => Self::readline_expr(content, safe, span),
 
             // < in term position: try readline.  The lexer emitted NumLt;
             // we ask it to attempt readline scanning.  If not a readline,
             // that's a parse error (less-than is not a valid term).
             Token::NumLt => {
-                if let Some(Token::Readline(content)) = self.lexer.lex_readline_after_lt() {
+                if let Some(Token::Readline(content, safe)) = self.lexer.lex_readline_after_lt() {
                     let end = self.peek_span();
-                    Self::readline_expr(content, span.merge(end))
+                    Self::readline_expr(content, safe, span.merge(end))
                 } else {
                     Err(ParseError::new("expected readline or glob after <", span))
                 }
@@ -2525,9 +2536,11 @@ impl Parser {
     /// path and the explicit Filetest token arm.
     /// Build an Expr from readline content: `<>` is readline/ARGV,
     /// `<*.txt>` (with wildcards) is glob, otherwise `<FH>` is readline.
-    fn readline_expr(content: String, span: Span) -> Result<Expr, ParseError> {
+    fn readline_expr(content: String, safe: bool, span: Span) -> Result<Expr, ParseError> {
         if content.is_empty() {
-            Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![]), span })
+            // `<>` (safe=false) or `<<>>` (safe=true).
+            let name = if safe { "readline_safe" } else { "readline" };
+            Ok(Expr { kind: ExprKind::FuncCall(name.into(), vec![]), span })
         } else if content.contains('*') || content.contains('?') {
             Ok(Expr { kind: ExprKind::FuncCall("glob".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
         } else {
@@ -2941,52 +2954,32 @@ impl Parser {
                 Token::InterpScalar(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
-                    let expr = Expr { kind: ExprKind::ScalarVar(name), span };
+                    let cm = self.lexer.take_interp_case_mod();
+                    let expr = apply_case_mod_wrap(Expr { kind: ExprKind::ScalarVar(name), span }, cm);
                     parts.push(InterpPart::ScalarInterp(Box::new(expr)));
                 }
                 Token::InterpArray(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
-                    let expr = Expr { kind: ExprKind::ArrayVar(name), span };
+                    let cm = self.lexer.take_interp_case_mod();
+                    let expr = apply_case_mod_wrap(Expr { kind: ExprKind::ArrayVar(name), span }, cm);
                     parts.push(InterpPart::ArrayInterp(Box::new(expr)));
                 }
                 Token::InterpScalarChainStart(name) => {
-                    // Build the initial ScalarVar term, then apply
-                    // the same two-layer chain-parsing pipeline
-                    // that normal code uses:
-                    //
-                    //   1. `maybe_postfix_subscript` consumes bare
-                    //      `[...]`/`{...}` (e.g., `$h{k}`, `$a[0]`).
-                    //      The Pratt operator loop doesn't handle
-                    //      these because `[` and `{` aren't
-                    //      operators.
-                    //   2. `parse_expr_continuation` runs the Pratt
-                    //      loop for `->`, which picks up
-                    //      `->{...}` / `->[...]` chains.
-                    //
-                    // The chain terminates at the `InterpChainEnd`
-                    // token, which `peek_op_info` doesn't match.
                     let span = self.peek_span();
                     self.next_token()?;
+                    let cm = self.lexer.take_interp_case_mod();
                     let initial = Expr { kind: ExprKind::ScalarVar(name), span };
                     let after_subscripts = self.maybe_postfix_subscript(initial)?;
                     let expr = self.parse_expr_continuation(after_subscripts, PREC_LOW)?;
                     self.expect_token(&Token::InterpChainEnd)?;
+                    let expr = apply_case_mod_wrap(expr, cm);
                     parts.push(InterpPart::ScalarInterp(Box::new(expr)));
                 }
                 Token::InterpArrayChainStart(name) => {
-                    // `@name[...]` / `@name{...}` inside a string
-                    // is a slice, not an element access.  Parse
-                    // the subscript as a comma-separated list and
-                    // wrap in ArraySlice/HashSlice — mirroring the
-                    // ArrayVar prefix path.
-                    //
-                    // Chained subscripts off an array slice aren't
-                    // a common form; we handle exactly one level
-                    // of subscript and require InterpChainEnd
-                    // immediately after.
                     let span = self.peek_span();
                     self.next_token()?;
+                    let cm = self.lexer.take_interp_case_mod();
                     let recv = Expr { kind: ExprKind::ArrayVar(name), span };
                     let expr = if self.eat(&Token::LeftBracket)? {
                         let mut indices = Vec::new();
@@ -3014,12 +3007,15 @@ impl Parser {
                         return Err(ParseError::new("expected [ or { after @name in string", self.peek_span()));
                     };
                     self.expect_token(&Token::InterpChainEnd)?;
+                    let expr = apply_case_mod_wrap(expr, cm);
                     parts.push(InterpPart::ArrayInterp(Box::new(expr)));
                 }
                 Token::InterpScalarExprStart | Token::InterpArrayExprStart => {
                     self.next_token()?;
+                    let cm = self.lexer.take_interp_case_mod();
                     let expr = self.parse_expr(PREC_LOW)?;
                     self.expect_token(&Token::RightBrace)?;
+                    let expr = apply_case_mod_wrap(expr, cm);
                     parts.push(InterpPart::ExprInterp(Box::new(expr)));
                 }
                 tok @ (Token::RegexCodeStart | Token::RegexCondCodeStart) => {
@@ -3066,6 +3062,7 @@ impl Parser {
         match self.peek_token() {
             Token::OrOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::DefinedOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
+            Token::LogicalXor => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::AndAnd => Some(OpInfo { prec: PREC_AND, assoc: Assoc::Left }),
             Token::BitOr => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
             Token::BitXor => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
@@ -3240,9 +3237,35 @@ impl Parser {
             token => {
                 let binop = token_to_binop(&token)?;
                 let right = self.parse_expr(right_prec)?;
-                Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
+
+                // Chained comparisons: `$x < $y <= $z` produces
+                // ChainedCmp([<, <=], [x, y, z]).  Only operators
+                // in the same chain group can chain together.
+                let group = chain_group(&binop);
+                if group.is_some() && self.peek_chain_continues(group) {
+                    let mut ops = vec![binop];
+                    let start_span = left.span;
+                    let mut operands = vec![left, right];
+                    while self.peek_chain_continues(group) {
+                        let next_tok = self.next_token()?;
+                        let next_op = token_to_binop(&next_tok.token)?;
+                        ops.push(next_op);
+                        operands.push(self.parse_expr(right_prec)?);
+                    }
+                    let end_span = operands.last().map_or(start_span, |e| e.span);
+                    let span = start_span.merge(end_span);
+                    Ok(Expr { span, kind: ExprKind::ChainedCmp(ops, operands) })
+                } else {
+                    Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
+                }
             }
         }
+    }
+
+    /// Check whether the next token continues a chained comparison
+    /// in the given chain group.
+    fn peek_chain_continues(&mut self, group: Option<u8>) -> bool {
+        group.is_some() && token_chain_group(self.peek_token()) == group
     }
 
     fn parse_arrow_rhs(&mut self, left: Expr) -> Result<Expr, ParseError> {
@@ -3548,6 +3571,7 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::AndAnd => Ok(BinOp::And),
         Token::OrOr => Ok(BinOp::Or),
         Token::DefinedOr => Ok(BinOp::DefinedOr),
+        Token::LogicalXor => Ok(BinOp::LogicalXor),
         Token::BitAnd => Ok(BinOp::BitAnd),
         Token::BitOr => Ok(BinOp::BitOr),
         Token::BitXor => Ok(BinOp::BitXor),
@@ -3579,15 +3603,77 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
     }
 }
 
+/// Returns a chain-group identifier for operators that participate
+/// in chained comparisons, or `None` for non-chainable ops.
+///
+/// Group 1: relational (`< > <= >= lt gt le ge`) — chain with each other.
+/// Group 2: equality (`== != eq ne`) — chain with each other.
+/// `<=>`, `cmp`, and `~~` are non-associative and do NOT chain.
+fn chain_group(op: &BinOp) -> Option<u8> {
+    match op {
+        BinOp::NumLt | BinOp::NumGt | BinOp::NumLe | BinOp::NumGe | BinOp::StrLt | BinOp::StrGt | BinOp::StrLe | BinOp::StrGe => Some(1),
+        BinOp::NumEq | BinOp::NumNe | BinOp::StrEq | BinOp::StrNe => Some(2),
+        _ => None,
+    }
+}
+
+/// Check whether a token would produce a chainable BinOp in the
+/// given chain group.
+fn token_chain_group(token: &Token) -> Option<u8> {
+    match token {
+        Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe => Some(1),
+        Token::Keyword(Keyword::Lt) | Token::Keyword(Keyword::Gt) | Token::Keyword(Keyword::Le) | Token::Keyword(Keyword::Ge) => Some(1),
+        Token::NumEq | Token::NumNe => Some(2),
+        Token::Keyword(Keyword::Eq) | Token::Keyword(Keyword::Ne) => Some(2),
+        _ => None,
+    }
+}
+
+/// Wrap an interpolated expression in case-modification function
+/// calls based on the active `CaseMod` flags.
+///
+/// `\U$x` → `uc($x)`, `\l$x` → `lcfirst($x)`,
+/// `\Q\U$x\E\E` → `quotemeta(uc($x))`.
+fn apply_case_mod_wrap(mut expr: Expr, flags: CaseMod) -> Expr {
+    if flags.is_empty() {
+        return expr;
+    }
+    let span = expr.span;
+
+    // One-shot overrides persistent case mode.
+    if flags.contains(CaseMod::LCFIRST) {
+        expr = Expr { kind: ExprKind::FuncCall("lcfirst".into(), vec![expr]), span };
+    } else if flags.contains(CaseMod::UCFIRST) {
+        expr = Expr { kind: ExprKind::FuncCall("ucfirst".into(), vec![expr]), span };
+    } else if flags.contains(CaseMod::UPPER) {
+        expr = Expr { kind: ExprKind::FuncCall("uc".into(), vec![expr]), span };
+    } else if flags.contains(CaseMod::LOWER) || flags.contains(CaseMod::FOLD) {
+        expr = Expr { kind: ExprKind::FuncCall("lc".into(), vec![expr]), span };
+    }
+
+    // Quotemeta wraps outermost (applied last, after case).
+    if flags.contains(CaseMod::QUOTEMETA) {
+        expr = Expr { kind: ExprKind::FuncCall("quotemeta".into(), vec![expr]), span };
+    }
+
+    expr
+}
+
 /// Merge adjacent `Const` segments in an interpolated value.
 fn merge_interp_parts(parts: Vec<InterpPart>) -> Vec<InterpPart> {
     let mut merged: Vec<InterpPart> = Vec::new();
     for part in parts {
-        if let InterpPart::Const(s) = &part
-            && let Some(InterpPart::Const(prev)) = merged.last_mut()
-        {
-            prev.push_str(s);
-            continue;
+        // Skip empty constant segments (produced when a case-mod
+        // escape like `\l` immediately precedes an interpolation
+        // with no intervening literal characters).
+        if let InterpPart::Const(s) = &part {
+            if s.is_empty() {
+                continue;
+            }
+            if let Some(InterpPart::Const(prev)) = merged.last_mut() {
+                prev.push_str(s);
+                continue;
+            }
         }
         merged.push(part);
     }
@@ -10541,23 +10627,21 @@ OUTER\n";
 
     #[test]
     fn allow_chained_lt() {
-        // $a < $b < $c — chained comparison, valid since 5.32.
+        // $a < $b < $c — chained comparison (5.32+).
         let e = parse_expr_str("$a < $b < $c;");
-        // Parses as ($a < $b) < $c (left-assoc); desugaring to
-        // $a < $b && $b < $c is a compiler concern.
-        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::NumLt, _, _)));
+        assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
     }
 
     #[test]
     fn allow_chained_eq() {
         let e = parse_expr_str("$a == $b == $c;");
-        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::NumEq, _, _)));
+        assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
     }
 
     #[test]
     fn allow_chained_str_cmp() {
         let e = parse_expr_str("$a eq $b eq $c;");
-        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::StrEq, _, _)));
+        assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
     }
 
     #[test]
@@ -12801,5 +12885,307 @@ OUTER\n";
     fn line_directive_no_filename() {
         let prog = parse("# line 42\nmy $x = 1;");
         assert!(!prog.statements.is_empty(), "should parse past line directive without filename");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // perlop gap-probing tests.
+    // ═══════════════════════════════════════════════════════════
+
+    // ── ^^ logical XOR operator ──────────────────────────────
+
+    #[test]
+    fn logical_xor_operator() {
+        // `^^` — logical XOR, between `||` and `//` in precedence.
+        let e = parse_expr_str("$a ^^ $b;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::LogicalXor, _, _)), "expected LogicalXor, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn logical_xor_precedence() {
+        // `^^` is lower than `||` but same level.
+        // `$a || $b ^^ $c` → `($a || $b) ^^ $c`.
+        let e = parse_expr_str("$a || $b ^^ $c;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::LogicalXor, lhs, _) => {
+                assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Or, _, _)), "|| should bind tighter than ^^");
+            }
+            other => panic!("expected LogicalXor at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logical_xor_assign() {
+        // `^^=` assignment operator.
+        let e = parse_expr_str("$a ^^= $b;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::LogicalXorEq, _, _)), "expected ^^= assign, got {:?}", e.kind);
+    }
+
+    // ── <<>> double diamond operator ─────────────────────────
+
+    #[test]
+    fn double_diamond_operator() {
+        // `<<>>` — safe diamond, uses 3-arg open.
+        let prog = parse("while (<<>>) { print; }");
+        assert!(!prog.statements.is_empty(), "should parse <<>> in while condition");
+    }
+
+    // ── m?PATTERN? match-once ────────────────────────────────
+
+    #[test]
+    fn match_once_question_mark() {
+        // `m?pattern?` — matches only once between reset() calls.
+        let e = parse_expr_str("m?foo?;");
+        match &e.kind {
+            ExprKind::Regex(_, _, _) => {}
+            other => panic!("expected Regex from m??, got {other:?}"),
+        }
+    }
+
+    // ── Chained comparisons ──────────────────────────────────
+
+    #[test]
+    fn chained_relational() {
+        // `$x < $y <= $z` → ChainedCmp([NumLt, NumLe], [x, y, z]).
+        let e = parse_expr_str("$x < $y <= $z;");
+        match &e.kind {
+            ExprKind::ChainedCmp(ops, operands) => {
+                assert_eq!(ops.len(), 2, "two operators");
+                assert_eq!(operands.len(), 3, "three operands");
+                assert_eq!(ops[0], BinOp::NumLt);
+                assert_eq!(ops[1], BinOp::NumLe);
+            }
+            other => panic!("expected ChainedCmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chained_equality() {
+        // `$a == $b != $c` → ChainedCmp([NumEq, NumNe], [a, b, c]).
+        let e = parse_expr_str("$a == $b != $c;");
+        match &e.kind {
+            ExprKind::ChainedCmp(ops, operands) => {
+                assert_eq!(ops.len(), 2);
+                assert_eq!(operands.len(), 3);
+                assert_eq!(ops[0], BinOp::NumEq);
+                assert_eq!(ops[1], BinOp::NumNe);
+            }
+            other => panic!("expected ChainedCmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chained_string_relational() {
+        // `$a lt $b le $c gt $d` — four operands, three ops.
+        let e = parse_expr_str("$a lt $b le $c gt $d;");
+        match &e.kind {
+            ExprKind::ChainedCmp(ops, operands) => {
+                assert_eq!(ops.len(), 3);
+                assert_eq!(operands.len(), 4);
+            }
+            other => panic!("expected ChainedCmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_chained_spaceship() {
+        // `<=>` is non-associative — should NOT produce ChainedCmp.
+        let e = parse_expr_str("$a <=> $b;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Spaceship, _, _)), "spaceship should be plain BinOp");
+    }
+
+    #[test]
+    fn simple_comparison_stays_binop() {
+        // A single comparison should remain BinOp, not ChainedCmp.
+        let e = parse_expr_str("$x < $y;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::NumLt, _, _)), "single < should be plain BinOp");
+    }
+
+    // ── Existing escape sequences (verify) ───────────────────
+
+    #[test]
+    fn octal_brace_escape() {
+        // `\o{101}` → 'A' (octal 101 = decimal 65).
+        let e = parse_expr_str(r#""\o{101}";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "A"),
+            other => panic!("expected 'A', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_char_escape() {
+        // `\cA` → chr(1), `\c[` → chr(27) (ESC).
+        let e = parse_expr_str(r#""\c[";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => {
+                assert_eq!(s.len(), 1);
+                assert_eq!(s.chars().next().unwrap(), '\x1B');
+            }
+            other => panic!("expected ESC char, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_uppercase() {
+        // `"\Ufoo\E"` → "FOO"
+        let e = parse_expr_str(r#""\Ufoo\E";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "FOO"),
+            other => panic!("expected StringLit(FOO), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_lowercase() {
+        // `"\LFOO\E"` → "foo"
+        let e = parse_expr_str(r#""\LFOO\E";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "foo"),
+            other => panic!("expected StringLit(foo), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_lower_next() {
+        // `"\lFOO"` → "fOO" (only first char lowercased)
+        let e = parse_expr_str(r#""\lFOO";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "fOO"),
+            other => panic!("expected StringLit(fOO), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_upper_next() {
+        // `"\ufoo"` → "Foo" (only first char uppercased)
+        let e = parse_expr_str(r#""\ufoo";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "Foo"),
+            other => panic!("expected StringLit(Foo), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_quotemeta() {
+        // `"\Qfoo.bar\E"` → "foo\\.bar"
+        let e = parse_expr_str(r#""\Qfoo.bar\E";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "foo\\.bar"),
+            other => panic!("expected quotemeta'd string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_stacking() {
+        // `"\Q'\Ufoo\Ebar'\E"` → `\\'FOObar\\'`
+        // \Q quotemeta, then \U uppercase stacks on top.
+        // \E pops \U, \E pops \Q.
+        let e = parse_expr_str(r#""\Q'\Ufoo\Ebar'\E";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "\\'FOObar\\'"),
+            other => panic!("expected stacked case-mod result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_foldcase() {
+        // `"\FFOO\E"` → "foo" (foldcase ≈ lowercase for ASCII)
+        let e = parse_expr_str(r#""\FFOO\E";"#);
+        match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "foo"),
+            other => panic!("expected StringLit(foo), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_interp_uppercase() {
+        // `"\Utest$x\E"` → InterpolatedString with:
+        //   Const("TEST"), ScalarInterp(uc($x))
+        let e = parse_expr_str(r#""\Utest$x\E";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(interp) => {
+                // First part: constant "TEST" (uppercased at lex time).
+                assert!(matches!(&interp.0[0], InterpPart::Const(s) if s == "TEST"), "first part should be Const(TEST), got {:?}", interp.0[0]);
+                // Second part: $x wrapped in uc().
+                match &interp.0[1] {
+                    InterpPart::ScalarInterp(expr) => {
+                        assert!(matches!(&expr.kind, ExprKind::FuncCall(name, _) if name == "uc"), "interp should be uc($x), got {:?}", expr.kind);
+                    }
+                    other => panic!("expected ScalarInterp, got {other:?}"),
+                }
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_interp_lcfirst() {
+        // `"\l$X"` → ScalarInterp(lcfirst($X))
+        let e = parse_expr_str(r#""\l$X";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(interp) => match &interp.0[0] {
+                InterpPart::ScalarInterp(expr) => {
+                    assert!(matches!(&expr.kind, ExprKind::FuncCall(name, _) if name == "lcfirst"), "interp should be lcfirst($X), got {:?}", expr.kind);
+                }
+                other => panic!("expected ScalarInterp, got {other:?}"),
+            },
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_interp_quotemeta_upper() {
+        // `"\Q\U$x\E\E"` → ScalarInterp(quotemeta(uc($x)))
+        let e = parse_expr_str(r#""\Q\U$x\E\E";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(interp) => {
+                match &interp.0[0] {
+                    InterpPart::ScalarInterp(expr) => {
+                        // Outermost should be quotemeta.
+                        match &expr.kind {
+                            ExprKind::FuncCall(name, args) if name == "quotemeta" => {
+                                // Inner should be uc.
+                                assert!(matches!(&args[0].kind, ExprKind::FuncCall(n, _) if n == "uc"), "inner should be uc, got {:?}", args[0].kind);
+                            }
+                            other => panic!("expected quotemeta(uc($x)), got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ScalarInterp, got {other:?}"),
+                }
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_mod_no_wrap_after_end() {
+        // `"\Ufoo\E$x"` — \E ends the case mod, so $x should NOT be wrapped.
+        let e = parse_expr_str(r#""\Ufoo\E$x";"#);
+        match &e.kind {
+            ExprKind::InterpolatedString(interp) => {
+                assert!(matches!(&interp.0[0], InterpPart::Const(s) if s == "FOO"));
+                match &interp.0[1] {
+                    InterpPart::ScalarInterp(expr) => {
+                        assert!(matches!(&expr.kind, ExprKind::ScalarVar(_)), "$x should be plain ScalarVar after \\E, got {:?}", expr.kind);
+                    }
+                    other => panic!("expected ScalarInterp, got {other:?}"),
+                }
+            }
+            other => panic!("expected InterpolatedString, got {other:?}"),
+        }
+    }
+
+    // ── dump keyword ─────────────────────────────────────────
+
+    #[test]
+    fn dump_keyword() {
+        let prog = parse("dump;");
+        assert!(!prog.statements.is_empty(), "should parse bare dump");
+    }
+
+    #[test]
+    fn dump_with_label() {
+        let prog = parse("dump RESTART;");
+        assert!(!prog.statements.is_empty(), "should parse dump LABEL");
     }
 }

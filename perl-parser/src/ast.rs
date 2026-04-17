@@ -148,6 +148,11 @@ pub enum ExprKind {
 
     // ── Binary operations ─────────────────────────────────────
     BinOp(BinOp, Box<Expr>, Box<Expr>),
+    /// Chained comparison: `$x < $y <= $z` → ops [<, <=],
+    /// operands [x, y, z].  Semantics: each adjacent pair is
+    /// compared, results implicitly ANDed, interior operands
+    /// evaluated at most once.  `operands.len() == ops.len() + 1`.
+    ChainedCmp(Vec<BinOp>, Vec<Expr>),
 
     // ── Unary operations ──────────────────────────────────────
     UnaryOp(UnaryOp, Box<Expr>),
@@ -368,6 +373,8 @@ pub enum BinOp {
     And,
     Or,
     DefinedOr,
+    /// `^^` — logical exclusive or.
+    LogicalXor,
     LowAnd,
     LowOr,
     LowXor,
