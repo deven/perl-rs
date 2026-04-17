@@ -62,7 +62,8 @@ pub enum StmtKind {
     Labeled(String, Box<Statement>),
 
     /// A bare block `{ ... }`.
-    Block(Block),
+    /// A bare block `{ ... }` with optional `continue` block.
+    Block(Block, Option<Block>),
 
     /// `BEGIN { ... }`, `END { ... }`, etc.
     Phaser(PhaserKind, Block),
@@ -472,6 +473,7 @@ pub enum PostfixKind {
     Until,
     For,
     Foreach,
+    When,
 }
 
 /// Phaser block kind.
@@ -629,9 +631,12 @@ pub struct ForStmt {
 }
 
 /// `for/foreach VAR (LIST) { ... }`.
+/// When `vars` is empty, the loop uses implicit `$_`.
+/// When `vars` has one element, it's `for my $x (LIST)`.
+/// When `vars` has multiple elements, it's `for my ($x, $y) (LIST)` (5.36+).
 #[derive(Clone, Debug)]
 pub struct ForEachStmt {
-    pub var: Option<VarDecl>,
+    pub vars: Vec<VarDecl>,
     pub list: Expr,
     pub body: Block,
     pub continue_block: Option<Block>,

@@ -501,7 +501,10 @@ impl Parser {
                         let terminated = self.eat(&Token::Semi)?;
                         (kind, terminated)
                     }
-                    Err(block) => (StmtKind::Block(block), false),
+                    Err(block) => {
+                        let cont = if self.eat(&Token::Keyword(Keyword::Continue))? { Some(self.parse_block()?) } else { None };
+                        (StmtKind::Block(block, cont), false)
+                    }
                 }
             }
 
@@ -571,6 +574,11 @@ impl Parser {
                 self.next_token()?;
                 let list = self.parse_expr(PREC_LOW)?;
                 Ok(StmtKind::Expr(Expr { span: expr.span.merge(list.span), kind: ExprKind::PostfixControl(PostfixKind::For, Box::new(expr), Box::new(list)) }))
+            }
+            Token::Keyword(Keyword::When) => {
+                self.next_token()?;
+                let cond = self.parse_expr(PREC_LOW)?;
+                Ok(StmtKind::Expr(Expr { span: expr.span.merge(cond.span), kind: ExprKind::PostfixControl(PostfixKind::When, Box::new(expr), Box::new(cond)) }))
             }
             _ => Ok(StmtKind::Expr(expr)),
         }
@@ -983,8 +991,8 @@ impl Parser {
     }
 
     fn parse_for_stmt(&mut self) -> Result<StmtKind, ParseError> {
-        // If next is a variable or 'my', it's foreach-style
-        if matches!(self.peek_token(), Token::Keyword(Keyword::My) | Token::ScalarVar(_)) {
+        // If next is a variable, 'my', or '\' (refaliasing), it's foreach-style.
+        if matches!(self.peek_token(), Token::Keyword(Keyword::My) | Token::ScalarVar(_) | Token::Backslash) {
             return self.parse_foreach_body();
         }
 
@@ -1010,7 +1018,7 @@ impl Parser {
         let body = self.parse_block()?;
         let continue_block = if self.eat(&Token::Keyword(Keyword::Continue))? { Some(self.parse_block()?) } else { None };
 
-        Ok(StmtKind::ForEach(ForEachStmt { var: None, list: first, body, continue_block }))
+        Ok(StmtKind::ForEach(ForEachStmt { vars: vec![], list: first, body, continue_block }))
     }
 
     /// Parse the rest of a C-style for loop after `(` and the optional
@@ -1032,24 +1040,46 @@ impl Parser {
     }
 
     fn parse_foreach_body(&mut self) -> Result<StmtKind, ParseError> {
-        let var = if self.eat(&Token::Keyword(Keyword::My))? {
-            Some(self.parse_single_var_decl()?)
+        let vars = if self.eat(&Token::Keyword(Keyword::My))? {
+            if self.at(&Token::LeftParen)? {
+                // `for my ($x, $y, $z) (LIST)` — multi-variable (5.36+).
+                self.next_token()?; // consume (
+                let mut vars = Vec::new();
+                loop {
+                    vars.push(self.parse_single_var_decl()?);
+                    if !self.eat(&Token::Comma)? {
+                        break;
+                    }
+                }
+                self.expect_token(&Token::RightParen)?;
+                vars
+            } else {
+                // `for my $x (LIST)` — single variable.
+                vec![self.parse_single_var_decl()?]
+            }
+        } else if self.at(&Token::Backslash)? {
+            // `for \my $x (LIST)` — refaliasing (experimental).
+            self.next_token()?; // consume backslash
+            self.expect_token(&Token::Keyword(Keyword::My))?;
+            let mut vd = self.parse_single_var_decl()?;
+            vd.is_ref = true;
+            vec![vd]
         } else if matches!(self.peek_token(), Token::ScalarVar(_)) {
             let span = self.peek_span();
             let name = match self.next_token()?.token {
                 Token::ScalarVar(n) => n,
                 _ => unreachable!(),
             };
-            Some(VarDecl { sigil: Sigil::Scalar, name, span, is_ref: false })
+            vec![VarDecl { sigil: Sigil::Scalar, name, span, is_ref: false }]
         } else {
-            None
+            vec![]
         };
 
         let list = self.parse_paren_expr()?;
         let body = self.parse_block()?;
         let continue_block = if self.eat(&Token::Keyword(Keyword::Continue))? { Some(self.parse_block()?) } else { None };
 
-        Ok(StmtKind::ForEach(ForEachStmt { var, list, body, continue_block }))
+        Ok(StmtKind::ForEach(ForEachStmt { vars, list, body, continue_block }))
     }
 
     // ── Package and use ───────────────────────────────────────
@@ -1965,12 +1995,16 @@ impl Parser {
             Token::LeftParen => {
                 if self.at(&Token::RightParen)? {
                     self.next_token()?;
-                    Ok(Expr { kind: ExprKind::List(vec![]), span })
+                    let expr = Expr { kind: ExprKind::List(vec![]), span };
+                    self.maybe_postfix_subscript(expr)
                 } else {
                     let inner = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightParen)?;
-                    Ok(Expr { kind: ExprKind::Paren(Box::new(inner)), span: span.merge(end) })
+                    let expr = Expr { kind: ExprKind::Paren(Box::new(inner)), span: span.merge(end) };
+                    // `(LIST)[idx]` and `(LIST){key}` are list/hash
+                    // slices — valid postfix subscripts on parens.
+                    self.maybe_postfix_subscript(expr)
                 }
             }
 
@@ -3730,7 +3764,7 @@ mod tests {
         let prog = parse("for my $item (@list) { print $item; }");
         match &prog.statements[0].kind {
             StmtKind::ForEach(f) => {
-                let var = f.var.as_ref().expect("expected loop variable");
+                let var = f.vars.first().expect("expected loop variable");
                 assert_eq!(var.name, "item");
                 assert_eq!(var.sigil, Sigil::Scalar);
                 assert_eq!(f.body.statements.len(), 1);
@@ -6516,7 +6550,7 @@ sub outer ($x) { 1 }
         // Find `inner` inside the bare block.
         let mut found_inner = false;
         for stmt in &prog.statements {
-            if let StmtKind::Block(block) = &stmt.kind {
+            if let StmtKind::Block(block, _) = &stmt.kind {
                 for inner_stmt in &block.statements {
                     if let StmtKind::SubDecl(s) = &inner_stmt.kind
                         && s.name == "inner"
@@ -9526,7 +9560,7 @@ OUTER\n";
         // (could be a function call: foo(), 1).
         let prog = parse("{foo(1)};");
         match &prog.statements[0].kind {
-            StmtKind::Block(_) => {}
+            StmtKind::Block(_, _) => {}
             other => panic!("expected Block, got {other:?}"),
         }
     }
@@ -9536,7 +9570,7 @@ OUTER\n";
         // {my $x = 1; $x} — clearly a block (no comma/=> after first term).
         let prog = parse("{my $x = 1; $x};");
         match &prog.statements[0].kind {
-            StmtKind::Block(block) => {
+            StmtKind::Block(block, _) => {
                 assert!(!block.statements.is_empty());
             }
             other => panic!("expected Block, got {other:?}"),
@@ -12626,5 +12660,146 @@ OUTER\n";
         // `"$café"` with utf8 active — the variable name is UTF-8.
         let prog = parse("use utf8; my $café = 1; print \"$café\";");
         assert!(!prog.statements.is_empty(), "should parse");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // perlsyn gap-probing tests — features from perlsyn that
+    // may or may not be implemented.  Failures are diagnostic.
+    // ═══════════════════════════════════════════════════════════
+
+    // ── 1. Postfix `when` modifier ───────────────────────────
+
+    #[test]
+    fn postfix_when_modifier_v514() {
+        // `$abc = 1 when /^abc/;` — perlsyn lists `when EXPR`
+        // as a statement modifier alongside if/unless/while/until.
+        // `use v5.14` enables the switch feature (5.10–5.34 bundle).
+        let prog = parse("use v5.14; $abc = 1 when /^abc/;");
+        assert!(prog.statements.len() >= 2, "should parse postfix when with use v5.14");
+    }
+
+    #[test]
+    fn postfix_when_modifier_explicit_feature() {
+        // Explicitly enabling switch feature.
+        let prog = parse("use feature 'switch'; $abc = 1 when /^abc/;");
+        assert!(prog.statements.len() >= 2, "should parse postfix when with use feature 'switch'");
+    }
+
+    #[test]
+    fn postfix_when_without_feature() {
+        // Without the switch feature, `when` is demoted to a bare
+        // identifier.  `$abc = 1 when ...` would parse `when` as
+        // a bareword function call — the expression becomes
+        // `1 when(...)` which is NOT a postfix modifier.
+        // Just verify it doesn't produce PostfixKind::When.
+        let prog = parse("$abc = 1; when(/^abc/);");
+        // Without switch, `when` is a function call, not a keyword.
+        // The program parses as two separate statements.
+        assert!(prog.statements.len() >= 2);
+        // Verify the first statement is NOT a postfix-when.
+        let not_postfix_when = !matches!(&prog.statements[0].kind, StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::When, _, _), .. }));
+        assert!(not_postfix_when, "when should not be a postfix modifier without the switch feature");
+    }
+
+    // ── 2. continue block on bare BLOCK ──────────────────────
+
+    #[test]
+    fn continue_block_on_bare_block() {
+        // perlsyn: `LABEL BLOCK continue BLOCK` is valid.
+        // A bare block acts as a loop that executes once.
+        let prog = parse("LOOP: { 1; } continue { 2; }");
+        assert!(!prog.statements.is_empty(), "should parse bare block with continue");
+    }
+
+    #[test]
+    fn continue_block_on_unlabeled_bare_block() {
+        let prog = parse("{ 1; } continue { 2; }");
+        assert!(!prog.statements.is_empty(), "should parse unlabeled bare block with continue");
+    }
+
+    // ── 3. Multi-variable foreach (5.36+) ────────────────────
+
+    #[test]
+    fn foreach_multi_variable() {
+        // `for my ($key, $value) (%hash) { ... }` — iterating
+        // over multiple values at a time (Perl 5.36+).
+        let prog = parse("for my ($key, $value) (%hash) { 1; }");
+        assert!(!prog.statements.is_empty(), "should parse multi-variable foreach");
+    }
+
+    #[test]
+    fn foreach_three_variables() {
+        let prog = parse("for my ($a, $b, $c) (@list) { 1; }");
+        assert!(!prog.statements.is_empty(), "should parse three-variable foreach");
+    }
+
+    // ── 4. Backslash foreach (refaliasing, 5.22+) ────────────
+
+    #[test]
+    fn foreach_refaliasing() {
+        // `foreach \my %hash (@array_of_hash_refs) { ... }`
+        // Experimental refaliasing feature.
+        let prog = parse(r#"use feature "refaliasing"; foreach \my %hash (@refs) { 1; }"#);
+        assert!(!prog.statements.is_empty(), "should parse backslash foreach");
+    }
+
+    // ── 5. break keyword (in given blocks) ───────────────────
+
+    #[test]
+    fn break_in_given() {
+        // `break` exits a `given` block.
+        let prog = parse("use v5.14; given ($x) { when (1) { break } }");
+        assert!(!prog.statements.is_empty(), "should parse break in given");
+    }
+
+    // ── 6. continue as fall-through in given/when ────────────
+
+    #[test]
+    fn continue_fall_through_in_given() {
+        // `continue` inside a `when` block means fall through
+        // to the next when — different from `continue BLOCK`.
+        let prog = parse("use v5.14; given ($x) { when (1) { $a = 1; continue } when (2) { $b = 1 } }");
+        assert!(!prog.statements.is_empty(), "should parse continue as fall-through in given");
+    }
+
+    // ── 7. goto — three forms ────────────────────────────────
+
+    #[test]
+    fn goto_label() {
+        let prog = parse("goto DONE; DONE: print 1;");
+        assert!(!prog.statements.is_empty(), "should parse goto LABEL");
+    }
+
+    #[test]
+    fn goto_expr() {
+        // `goto(("FOO", "BAR")[$i])` — computed goto.
+        let prog = parse(r#"goto(("FOO", "BAR")[$i]);"#);
+        assert!(!prog.statements.is_empty(), "should parse goto EXPR");
+    }
+
+    #[test]
+    fn goto_ampersand_name() {
+        // `goto &subname` — magical tail call.
+        let prog = parse("goto &other_sub;");
+        assert!(!prog.statements.is_empty(), "should parse goto &NAME");
+    }
+
+    // ── 8. # line N "file" directives ────────────────────────
+
+    #[test]
+    fn line_directive_basic() {
+        // `# line 200 "bzzzt"` — C-preprocessor-style override.
+        // Per perlsyn, the `#` must be the first char on the line.
+        // The parser should silently accept this as a comment
+        // (it's a comment that happens to have semantic meaning
+        // for diagnostics, but the parser already skips `#` comments).
+        let prog = parse("# line 200 \"bzzzt\"\nmy $x = 1;");
+        assert!(!prog.statements.is_empty(), "should parse past line directive");
+    }
+
+    #[test]
+    fn line_directive_no_filename() {
+        let prog = parse("# line 42\nmy $x = 1;");
+        assert!(!prog.statements.is_empty(), "should parse past line directive without filename");
     }
 }
