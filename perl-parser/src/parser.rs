@@ -4782,6 +4782,19 @@ mod tests {
     }
 
     #[test]
+    fn interp_postderef_qq_last_index() {
+        // `"$ref->$#*"` — postderef last-index in a string.
+        // The `#` would normally start a comment in code mode;
+        // this works because the parser's `try_consume_hash_star`
+        // consumes the raw `#*` bytes between lex_token calls,
+        // and (in chain mode) sets `chain_end_pending` so the
+        // chain terminates cleanly.
+        let parts = interp_parts(r#""$ref->$#*";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::LastIndex)), "expected ArrowDeref(_, LastIndex), got {:?}", e.kind);
+    }
+
+    #[test]
     fn interp_postderef_qq_chained_after_subscript() {
         // `"$h->{key}->@*"` — subscript then postderef in one chain.
         let parts = interp_parts(r#""$h->{key}->@*";"#);
@@ -8063,6 +8076,423 @@ OUTER\n";
     }
 
     // ── Dynamic method dispatch tests ─────────────────────────
+
+    // ═══════════════════════════════════════════════════════════
+    // Gap-probing tests — things I'm not sure the parser
+    // handles.  Written to match Perl's actual behavior.
+    // Failures are diagnostic: they tell us what to fix.
+    // ═══════════════════════════════════════════════════════════
+
+    // ── Postderef_qq: remaining forms ────────────────────────
+
+    #[test]
+    fn interp_postderef_qq_code() {
+        // `->&*` — code deref inside string.
+        let parts = interp_parts(r#""$ref->&*";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefCode)), "expected DerefCode, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn interp_postderef_qq_glob() {
+        // `->**` — glob deref inside string.  Lexer emits
+        // Token::Power for `**`.
+        let parts = interp_parts(r#""$ref->**";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefGlob)), "expected DerefGlob, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn interp_postderef_qq_array_slice() {
+        // `->@[0,1]` — array slice inside string.
+        let parts = interp_parts(r#""$ref->@[0,1]";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::ArraySliceIndices(_))), "expected ArraySliceIndices, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn interp_postderef_qq_hash_slice() {
+        // `->@{"a","b"}` — hash slice (values) inside string.
+        let parts = interp_parts(r#""$ref->@{'a','b'}";"#);
+        let e = scalar_part(&parts, 0);
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::ArraySliceKeys(_))), "expected ArraySliceKeys, got {:?}", e.kind);
+    }
+
+    // ── Indented heredoc edge cases ──────────────────────────
+
+    #[test]
+    fn heredoc_indented_tabs() {
+        // <<~END with tab indentation.
+        let src = "my $x = <<~END;\n\tindented with tab\n\tEND\n";
+        let prog = parse(src);
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "indented with tab\n"), "expected stripped tab indent, got {:?}", init.kind);
+    }
+
+    #[test]
+    fn heredoc_indented_empty_body() {
+        // <<~END with terminator immediately — empty body.
+        let src = "my $x = <<~END;\n    END\n";
+        let prog = parse(src);
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s.is_empty()), "expected empty string, got {:?}", init.kind);
+    }
+
+    #[test]
+    fn heredoc_indented_blank_lines_preserved() {
+        // Blank lines in <<~ body should be preserved as
+        // empty lines (they don't need indentation).
+        let src = "my $x = <<~END;\n    line1\n\n    line2\n    END\n";
+        let prog = parse(src);
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "line1\n\nline2\n"), "expected blank line preserved, got {:?}", init.kind);
+    }
+
+    #[test]
+    fn heredoc_traditional_empty_body() {
+        // Regular <<END with tag on the very next line.
+        let src = "my $x = <<END;\nEND\n";
+        let prog = parse(src);
+        let init = decl_init(&prog.statements[0]);
+        assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s.is_empty()), "expected empty heredoc body, got {:?}", init.kind);
+    }
+
+    // ── Substitution delimiter variations ────────────────────
+
+    #[test]
+    fn subst_paren_delimiters() {
+        let e = parse_expr_str("s(foo)(bar);");
+        match &e.kind {
+            ExprKind::Subst(pat, repl, _) => {
+                assert_eq!(pat_str(pat), "foo");
+                assert_eq!(pat_str(repl), "bar");
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subst_bracket_delimiters() {
+        let e = parse_expr_str("s[foo][bar];");
+        match &e.kind {
+            ExprKind::Subst(pat, repl, _) => {
+                assert_eq!(pat_str(pat), "foo");
+                assert_eq!(pat_str(repl), "bar");
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subst_mixed_paired_delimiters() {
+        // s{pattern}(replacement) — different paired delims.
+        let e = parse_expr_str("s{foo}(bar);");
+        match &e.kind {
+            ExprKind::Subst(pat, repl, _) => {
+                assert_eq!(pat_str(pat), "foo");
+                assert_eq!(pat_str(repl), "bar");
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subst_paired_pattern_unpaired_replacement() {
+        // s{pattern}/replacement/ — paired then unpaired.
+        let e = parse_expr_str("s{foo}/bar/;");
+        match &e.kind {
+            ExprKind::Subst(pat, repl, _) => {
+                assert_eq!(pat_str(pat), "foo");
+                assert_eq!(pat_str(repl), "bar");
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subst_angle_delimiters() {
+        // s<foo><bar> — angle brackets as paired delimiters.
+        let e = parse_expr_str("s<foo><bar>;");
+        match &e.kind {
+            ExprKind::Subst(pat, repl, _) => {
+                assert_eq!(pat_str(pat), "foo");
+                assert_eq!(pat_str(repl), "bar");
+            }
+            other => panic!("expected Subst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tr_paired_delimiters() {
+        // tr{a-z}{A-Z} — paired braces for tr.
+        let e = parse_expr_str("tr{a-z}{A-Z};");
+        match &e.kind {
+            ExprKind::Translit(from, to, _) => {
+                assert_eq!(from, "a-z");
+                assert_eq!(to, "A-Z");
+            }
+            other => panic!("expected Translit, got {other:?}"),
+        }
+    }
+
+    // ── Empty / minimal quote forms ──────────────────────────
+
+    #[test]
+    fn empty_qw() {
+        // `qw()` — empty word list.
+        let e = parse_expr_str("qw();");
+        match &e.kind {
+            ExprKind::QwList(words) => assert!(words.is_empty()),
+            other => panic!("expected empty QwList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_qw() {
+        let e = parse_expr_str("qw(hello);");
+        match &e.kind {
+            ExprKind::QwList(words) => {
+                assert_eq!(words.len(), 1);
+                assert_eq!(words[0], "hello");
+            }
+            other => panic!("expected QwList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_q_string() {
+        let e = parse_expr_str("q{};");
+        assert!(matches!(e.kind, ExprKind::StringLit(ref s) if s.is_empty()), "expected empty StringLit, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn empty_interpolated_string() {
+        let e = parse_expr_str("\"\";");
+        assert!(matches!(e.kind, ExprKind::StringLit(ref s) if s.is_empty()), "expected empty StringLit, got {:?}", e.kind);
+    }
+
+    // ── Hash key edge cases ──────────────────────────────────
+
+    #[test]
+    fn negative_bareword_hash_key() {
+        // `$h{-key}` — the `-key` form is common in Perl.
+        // Parses as HashElem with StringLit("-key").
+        let e = parse_expr_str("$h{-key};");
+        match &e.kind {
+            ExprKind::HashElem(_, k) => {
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "-key"), "expected StringLit(-key), got {:?}", k.kind);
+            }
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_hash_key() {
+        // `$h{42}` — numeric key, not autoquoted.
+        let e = parse_expr_str("$h{42};");
+        match &e.kind {
+            ExprKind::HashElem(_, k) => {
+                assert!(matches!(k.kind, ExprKind::IntLit(42)), "expected IntLit(42), got {:?}", k.kind);
+            }
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    // ── Special variable forms ───────────────────────────────
+
+    #[test]
+    fn local_list_separator() {
+        // `local $" = ","` — localizing the list separator.
+        let prog = parse(r#"local $" = ",";"#);
+        assert!(!prog.statements.is_empty(), "should parse local $\" assignment");
+    }
+
+    #[test]
+    fn special_var_in_interpolation() {
+        // `"v$^V"` — $^V (Perl version) in a string.
+        let parts = interp_parts(r#""v$^V";"#);
+        assert!(parts.len() >= 2, "expected at least const + var");
+    }
+
+    // ── Control flow edge cases ──────────────────────────────
+
+    #[test]
+    fn nested_ternary() {
+        let e = parse_expr_str("$a ? $b ? 1 : 2 : 3;");
+        // Right-associative: `$a ? ($b ? 1 : 2) : 3`.
+        match &e.kind {
+            ExprKind::Ternary(_, then_expr, else_expr) => {
+                assert!(matches!(then_expr.kind, ExprKind::Ternary(_, _, _)), "inner then should be another ternary");
+                assert!(matches!(else_expr.kind, ExprKind::IntLit(3)));
+            }
+            other => panic!("expected nested Ternary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unless_block() {
+        let prog = parse("unless ($x) { 1; }");
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn until_loop() {
+        let prog = parse("until ($done) { do_work(); }");
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn chained_method_calls() {
+        let e = parse_expr_str("$obj->method1->method2->method3;");
+        // Outer: MethodCall(MethodCall(MethodCall($obj, "method1", []),
+        //        "method2", []), "method3", []).
+        // Note: `->method` produces MethodCall, not ArrowDeref.
+        fn depth(e: &Expr) -> usize {
+            match &e.kind {
+                ExprKind::MethodCall(inner, _, _) => 1 + depth(inner),
+                ExprKind::ArrowDeref(inner, _) => 1 + depth(inner),
+                _ => 0,
+            }
+        }
+        assert_eq!(depth(&e), 3, "expected 3 levels of method chain");
+    }
+
+    // ── String operator precedence ───────────────────────────
+
+    #[test]
+    fn concat_and_repeat() {
+        // `"a" . "b" x 3` — `x` binds tighter than `.`.
+        // Parses as `"a" . ("b" x 3)`.
+        let e = parse_expr_str(r#""a" . "b" x 3;"#);
+        match &e.kind {
+            ExprKind::BinOp(BinOp::Concat, _, rhs) => {
+                assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Repeat, _, _)), "rhs of concat should be repeat, got {:?}", rhs.kind);
+            }
+            other => panic!("expected Concat, got {other:?}"),
+        }
+    }
+
+    // ── Defined-or forms ─────────────────────────────────────
+
+    #[test]
+    fn defined_or_assign() {
+        let e = parse_expr_str("$x //= 42;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::DefinedOrEq, _, _)), "expected //= assignment, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn chained_defined_or() {
+        // `$a // $b // $c` — left-associative.
+        let e = parse_expr_str("$a // $b // $c;");
+        match &e.kind {
+            ExprKind::BinOp(BinOp::DefinedOr, lhs, _) => {
+                assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)), "inner should also be DefinedOr");
+            }
+            other => panic!("expected chained DefinedOr, got {other:?}"),
+        }
+    }
+
+    // ── do "filename" vs do { block } ────────────────────────
+
+    #[test]
+    fn do_file() {
+        // `do "config.pl"` — loads and executes a file.
+        let e = parse_expr_str(r#"do "config.pl";"#);
+        match &e.kind {
+            ExprKind::DoExpr(path) => {
+                assert!(matches!(path.kind, ExprKind::StringLit(ref s) if s == "config.pl"));
+            }
+            other => panic!("expected DoExpr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn do_block_vs_do_file() {
+        // `do { 1 }` vs `do "file"` — both valid.
+        let block = parse_expr_str("do { 1 };");
+        assert!(matches!(block.kind, ExprKind::DoBlock(_)));
+        let file = parse_expr_str(r#"do "file";"#);
+        assert!(matches!(file.kind, ExprKind::DoExpr(_)));
+    }
+
+    // ── require ──────────────────────────────────────────────
+
+    #[test]
+    fn require_module() {
+        let prog = parse("require Foo::Bar;");
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn require_version() {
+        let prog = parse("require 5.036;");
+        assert!(!prog.statements.is_empty());
+    }
+
+    // ── __DATA__ section ─────────────────────────────────────
+
+    #[test]
+    fn data_section() {
+        let src = "my $x = 1;\n__DATA__\nThis is data.\nMore data.\n";
+        let prog = parse(src);
+        // Should have at least 2 statements: my decl and DataEnd.
+        assert!(prog.statements.len() >= 2);
+        let has_data_end = prog.statements.iter().any(|s| matches!(s.kind, StmtKind::DataEnd(_, _)));
+        assert!(has_data_end, "expected DataEnd statement");
+    }
+
+    // ── Regex edge cases ─────────────────────────────────────
+
+    #[test]
+    fn regex_many_flags() {
+        let e = parse_expr_str("/foo/msixpn;");
+        match &e.kind {
+            ExprKind::Regex(_, _, flags) => {
+                let f = flags.as_deref().unwrap_or("");
+                assert!(f.contains('m') && f.contains('s') && f.contains('i') && f.contains('x'), "expected msixpn flags, got {f:?}");
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_character_class() {
+        let e = parse_expr_str(r#"/[a-z\d\s]+/;"#);
+        match &e.kind {
+            ExprKind::Regex(_, pat, _) => {
+                let s = pat_str(pat);
+                assert!(s.contains("[a-z") && s.contains("]"), "expected char class in pattern, got {s:?}");
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    // ── Print to filehandle ──────────────────────────────────
+
+    #[test]
+    fn print_to_stderr() {
+        let prog = parse(r#"print STDERR "error\n";"#);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(Expr { kind: ExprKind::PrintOp(_, fh, _), .. }) => {
+                assert!(fh.is_some(), "expected filehandle");
+            }
+            other => panic!("expected PrintOp with filehandle, got {other:?}"),
+        }
+    }
+
+    // ── Fat comma autoquoting edge case ──────────────────────
+
+    #[test]
+    fn fat_comma_numeric_key() {
+        // `123 => "val"` — numbers are NOT autoquoted.
+        let e = parse_expr_str("123 => 'val';");
+        match &e.kind {
+            ExprKind::List(items) => {
+                assert!(matches!(items[0].kind, ExprKind::IntLit(123)), "numeric key should stay IntLit, got {:?}", items[0].kind);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_dynamic_method() {

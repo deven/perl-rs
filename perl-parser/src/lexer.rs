@@ -1344,6 +1344,21 @@ impl Lexer {
         let r = self.remaining();
         if r.len() >= 2 && r[0] == b'#' && r[1] == b'*' {
             self.skip(2);
+            // When inside a subscript-chain in a string body,
+            // the `#*` completes a `->$#*` postderef last-index.
+            // Probe for continuation and mark chain_end_pending
+            // so the next lex_token emits InterpChainEnd — just
+            // like a closing bracket at depth 0 would.  Without
+            // this, the next lex_token call in chain mode would
+            // route to lex_normal_token and misinterpret the
+            // string-body bytes (e.g. `"`) as code tokens.
+            let in_chain = self.context_stack.last().is_some_and(|ctx| ctx.chain_active && ctx.chain_depth == 0);
+            if in_chain {
+                let cont = self.peek_chain_starter();
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.chain_end_pending = !cont;
+                }
+            }
             true
         } else {
             false
@@ -1827,12 +1842,16 @@ impl Lexer {
         // protocol leaves the delim in place so the next
         // `lex_token` call can emit `SublexEnd`.  When we're
         // called from inside a sublex context (e.g. a single-
-        // quoted subscript key inside a `"..."` interpolation),
-        // that leaves the delim un-consumed, which would cause
-        // the caller to re-lex it as the start of a new string.
-        // Consume it here so `lex_body_str` always leaves the
-        // cursor past the closer, regardless of outer context.
-        if self.peek_byte(false) == Some(delim) {
+        // quoted subscript key inside a `"..."` interpolation,
+        // or the second half of `tr{from}{to}`), that leaves the
+        // delim un-consumed.  Consume it here so `lex_body_str`
+        // always leaves the cursor past the closer.
+        //
+        // Use `matching_delimiter` to get the CLOSING byte —
+        // for paired delimiters like `{`, the close is `}`, not
+        // `{` itself.
+        let (_, close) = matching_delimiter(delim);
+        if self.peek_byte(false) == Some(close) {
             self.skip(1);
         }
         Ok(s)
@@ -1975,6 +1994,18 @@ impl Lexer {
             return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
         }
 
+        // $^X — caret variable (single uppercase letter after ^).
+        // Perl interpolates these in strings: `"v$^V"` gives
+        // the Perl version string.
+        if self.peek_byte(false) == Some(b'^')
+            && let Some(next) = self.peek_byte_at(1)
+            && (next.is_ascii_alphabetic() || next == b'[' || next == b']')
+        {
+            self.skip(2); // skip ^ and the character
+            let name = format!("^{}", next as char);
+            return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
+        }
+
         // Bare $ not followed by a name — treat as literal
         Ok(Spanned { token: Token::ConstSegment("$".into()), span: Span::new(start, self.span_pos()) })
     }
@@ -2020,18 +2051,26 @@ impl Lexer {
     /// depth 0).
     fn peek_chain_starter(&self) -> bool {
         let r = self.remaining();
+        // Direct subscript: [idx] or {key}.
         matches!(r.first(), Some(b'[') | Some(b'{'))
-            || (r.len() >= 3
-                && r[0] == b'-'
-                && r[1] == b'>'
-                && (
-                    // Subscript forms: ->[idx], ->{key}.
-                    matches!(r[2], b'[' | b'{')
-                    // Postderef forms: ->@*, ->%*, ->$*, ->&*, ->**.
+            || (r.len() >= 3 && r[0] == b'-' && r[1] == b'>' && {
+                let c = r[2];
+                // Subscript forms: ->[idx], ->{key}.
+                matches!(c, b'[' | b'{')
+                    // Postderef whole: ->@*, ->%*, ->$*, ->&*, ->**.
                     || (r.len() >= 4
-                        && matches!(r[2], b'@' | b'%' | b'$' | b'&' | b'*')
+                        && matches!(c, b'@' | b'%' | b'$' | b'&' | b'*')
                         && r[3] == b'*')
-                ))
+                    // Postderef slices: ->@[, ->@{, ->%[, ->%{.
+                    || (r.len() >= 4
+                        && matches!(c, b'@' | b'%')
+                        && matches!(r[3], b'[' | b'{'))
+                    // Postderef last-index: ->$#*.
+                    || (r.len() >= 5
+                        && c == b'$'
+                        && r[3] == b'#'
+                        && r[4] == b'*')
+            })
     }
 
     // ── q// qq// qw// ─────────────────────────────────────────
