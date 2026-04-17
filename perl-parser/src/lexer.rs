@@ -783,7 +783,15 @@ impl Lexer {
             b'|' => self.lex_pipe(),
             b'^' => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte(false) == Some(b'.') {
+                    self.skip(1);
+                    if self.peek_byte(false) == Some(b'=') {
+                        self.skip(1);
+                        Token::Assign(AssignOp::StringBitXorEq)
+                    } else {
+                        Token::StringBitXor
+                    }
+                } else if self.peek_byte(false) == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::BitXorEq)
                 } else {
@@ -792,7 +800,15 @@ impl Lexer {
             }
             b'~' => {
                 self.skip(1);
-                Token::Tilde
+                if self.peek_byte(false) == Some(b'~') {
+                    self.skip(1);
+                    Token::SmartMatch
+                } else if self.peek_byte(false) == Some(b'.') {
+                    self.skip(1);
+                    Token::StringBitNot
+                } else {
+                    Token::Tilde
+                }
             }
             b'\\' => {
                 self.skip(1);
@@ -1946,6 +1962,40 @@ impl Lexer {
                     s.push(val as char);
                 }
             }
+            Some(b'N') => {
+                // \N{...} — Unicode named or codepoint escape.
+                self.skip(1);
+                if self.peek_byte(false) == Some(b'{') {
+                    self.skip(1);
+                    // Collect everything up to the closing `}`.
+                    let mut name = String::new();
+                    while let Some(b) = self.peek_byte(false) {
+                        if b == b'}' {
+                            self.skip(1);
+                            break;
+                        }
+                        self.skip(1);
+                        name.push(b as char);
+                    }
+                    if let Some(hex) = name.strip_prefix("U+") {
+                        // \N{U+XXXX} — hex codepoint, self-contained.
+                        let n = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
+                        s.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
+                    } else {
+                        // \N{CHARNAME} — requires `use charnames` to
+                        // resolve at compile time.  The parser doesn't
+                        // have the charnames database; emit a Unicode
+                        // replacement character as a placeholder.  A
+                        // future compilation pass can resolve the name
+                        // from the AST if needed.
+                        s.push('\u{FFFD}');
+                    }
+                } else {
+                    // Bare \N without braces — literal.
+                    s.push('\\');
+                    s.push('N');
+                }
+            }
             _ => s.push('\\'),
         }
     }
@@ -2411,7 +2461,7 @@ impl Lexer {
         }
 
         match self.peek_byte(false) {
-            Some(b'"') | Some(b'\'') => Ok(Some(self.lex_heredoc(indented)?)),
+            Some(b'"') | Some(b'\'') | Some(b'\\') => Ok(Some(self.lex_heredoc(indented)?)),
             Some(b) if b == b'_' || b.is_ascii_alphabetic() => Ok(Some(self.lex_heredoc(indented)?)),
             _ => {
                 // No valid tag — rewind to just after << so the
@@ -2443,6 +2493,19 @@ impl Lexer {
                 self.skip(1);
                 let tag = self.scan_heredoc_tag(b'"')?;
                 let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
+                (k, tag)
+            }
+            Some(b'\\') => {
+                // <<\TAG — backslash form, equivalent to <<'TAG'.
+                // Per perlop: "a backslashed bareword following the
+                // << means the same thing as a single-quoted string."
+                self.skip(1); // skip backslash
+                let tag_start = self.line_pos();
+                while self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
+                    self.skip(1);
+                }
+                let tag = String::from_utf8_lossy(self.line_slice(tag_start)).into_owned();
+                let k = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
                 (k, tag)
             }
             _ => {
@@ -2579,6 +2642,15 @@ impl Lexer {
                     Token::AndAnd
                 }
             }
+            Some(b'.') => {
+                self.skip(1);
+                if self.peek_byte(false) == Some(b'=') {
+                    self.skip(1);
+                    Token::Assign(AssignOp::StringBitAndEq)
+                } else {
+                    Token::StringBitAnd
+                }
+            }
             Some(b'=') => {
                 self.skip(1);
                 Token::Assign(AssignOp::BitAndEq)
@@ -2597,6 +2669,15 @@ impl Lexer {
                     Token::Assign(AssignOp::OrEq)
                 } else {
                     Token::OrOr
+                }
+            }
+            Some(b'.') => {
+                self.skip(1);
+                if self.peek_byte(false) == Some(b'=') {
+                    self.skip(1);
+                    Token::Assign(AssignOp::StringBitOrEq)
+                } else {
+                    Token::StringBitOr
                 }
             }
             Some(b'=') => {

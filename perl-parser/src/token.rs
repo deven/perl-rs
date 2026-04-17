@@ -189,26 +189,29 @@ pub enum Keyword {
 /// Assignment operator variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignOp {
-    Eq,           // =
-    AddEq,        // +=
-    SubEq,        // -=
-    MulEq,        // *=
-    DivEq,        // /=
-    ModEq,        // %=
-    PowEq,        // **=
-    ConcatEq,     // .=
-    AndEq,        // &&=
-    OrEq,         // ||=
-    DefinedOrEq,  // //=
-    BitAndEq,     // &=
-    BitOrEq,      // |=
-    BitXorEq,     // ^=
-    ShiftLeftEq,  // <<=
-    ShiftRightEq, // >>=
-    RepeatEq,     // x=
-    BandEq,       // &.=   (string bitand)
-    BorEq,        // |.=   (string bitor)
-    BxorEq,       // ^.=   (string bitxor)
+    Eq,             // =
+    AddEq,          // +=
+    SubEq,          // -=
+    MulEq,          // *=
+    DivEq,          // /=
+    ModEq,          // %=
+    PowEq,          // **=
+    ConcatEq,       // .=
+    AndEq,          // &&=
+    OrEq,           // ||=
+    DefinedOrEq,    // //=
+    BitAndEq,       // &=
+    BitOrEq,        // |=
+    BitXorEq,       // ^=
+    StringBitAndEq, // &.=
+    StringBitOrEq,  // |.=
+    StringBitXorEq, // ^.=
+    ShiftLeftEq,    // <<=
+    ShiftRightEq,   // >>=
+    RepeatEq,       // x=
+    BandEq,         // &.=   (string bitand)
+    BorEq,          // |.=   (string bitor)
+    BxorEq,         // ^.=   (string bitxor)
 }
 
 /// Tokens emitted by the lexer.
@@ -284,12 +287,18 @@ pub enum Token {
     Bang,      // !
 
     // ── Operators — bitwise ───────────────────────────────────
-    BitAnd,     // &
-    BitOr,      // |
-    BitXor,     // ^
-    Tilde,      // ~ (complement)
-    ShiftLeft,  // <<
-    ShiftRight, // >>
+    BitAnd, // &
+    BitOr,  // |
+    BitXor, // ^
+    // String-bitwise (feature 'bitwise')
+    StringBitAnd, // &.
+    StringBitOr,  // |.
+    StringBitXor, // ^.
+    StringBitNot, // ~.
+    Tilde,        // ~ (complement)
+    SmartMatch,   // ~~ (smartmatch, experimental)
+    ShiftLeft,    // <<
+    ShiftRight,   // >>
 
     // ── Operators — binding ───────────────────────────────────
     Binding,    // =~

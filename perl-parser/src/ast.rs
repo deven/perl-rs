@@ -361,6 +361,8 @@ pub enum BinOp {
     StrCmp,
     /// `isa` — class-instance test (feature-gated).
     Isa,
+    /// `~~` — smartmatch (experimental, feature-gated).
+    SmartMatch,
     // Logical
     And,
     Or,
@@ -372,6 +374,12 @@ pub enum BinOp {
     BitAnd,
     BitOr,
     BitXor,
+    /// `&.` — string-bitwise AND (feature 'bitwise').
+    StringBitAnd,
+    /// `|.` — string-bitwise OR.
+    StringBitOr,
+    /// `^.` — string-bitwise XOR.
+    StringBitXor,
     ShiftLeft,
     ShiftRight,
     // Binding
@@ -386,6 +394,7 @@ pub enum UnaryOp {
     NumPositive,  // +  (forces numeric context)
     LogNot,       // !
     BitNot,       // ~
+    StringBitNot, // ~. (feature 'bitwise')
     Ref,          // \
     Not,          // not (low precedence)
     Defined,      // defined
