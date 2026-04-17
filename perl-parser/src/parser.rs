@@ -1174,6 +1174,10 @@ impl Parser {
         // runtime module loading to take effect.
         apply_pragma(&mut self.pragmas, &module, is_no, imports.as_ref());
 
+        // Sync shared UTF-8 flag — the lexer reads this to
+        // decide whether to accept multi-byte identifiers.
+        self.lexer.utf8_mode = self.pragmas.utf8;
+
         Ok(StmtKind::UseDecl(UseDecl { is_no, module, version, imports, span: start.merge(self.peek_span()) }))
     }
 
@@ -1549,6 +1553,8 @@ impl Parser {
             })(this);
 
             this.pragmas = saved_pragmas;
+            // Sync shared UTF-8 flag with the restored state.
+            this.lexer.utf8_mode = this.pragmas.utf8;
             result
         })
     }
@@ -12536,5 +12542,89 @@ OUTER\n";
             }
             other => panic!("expected FuncCall(CORE::length), got {other:?}"),
         }
+    }
+
+    // ── UTF-8 identifiers under `use utf8` ───────────────────
+
+    #[test]
+    fn utf8_scalar_variable() {
+        // `use utf8; my $café = 1;` — UTF-8 identifier.
+        let prog = parse("use utf8; my $café = 1;");
+        assert!(prog.statements.len() >= 2, "should parse use + decl");
+    }
+
+    #[test]
+    fn utf8_sub_name() {
+        let prog = parse("use utf8; sub naïve { 1 }");
+        assert!(
+            prog.statements.iter().any(|s| matches!(
+                &s.kind,
+                StmtKind::SubDecl(sd) if sd.name == "naïve"
+            )),
+            "expected sub named naïve"
+        );
+    }
+
+    #[test]
+    fn utf8_bareword_fat_comma() {
+        // `café => 1` with utf8 active — autoquoted.
+        let prog = parse("use utf8; my %h = (café => 1);");
+        assert!(!prog.statements.is_empty(), "should parse");
+    }
+
+    #[test]
+    fn utf8_hash_key_autoquote() {
+        // `$h{café}` — bareword autoquoted inside hash subscript.
+        let prog = parse("use utf8; $h{café};");
+        let expr = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("expression statement");
+        match &expr.kind {
+            ExprKind::HashElem(_, k) => {
+                assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "café"), "expected StringLit(café), got {:?}", k.kind);
+            }
+            other => panic!("expected HashElem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf8_error_without_pragma() {
+        // Without `use utf8`, bytes ≥ 0x80 are rejected.
+        let src = "my $café = 1;";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => return, // construction error is also acceptable
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), "high bytes without use utf8 should error");
+    }
+
+    #[test]
+    fn utf8_lexical_scoping() {
+        // `use utf8` is lexically scoped: inside a `no utf8`
+        // block, UTF-8 identifiers are rejected again.
+        let src = "use utf8; my $café = 1; { no utf8; my $x = 1; }";
+        let prog = parse(src);
+        // The program parses — $café is in utf8 scope,
+        // $x is in no-utf8 scope (ASCII only, fine).
+        assert!(prog.statements.len() >= 2);
+    }
+
+    #[test]
+    fn utf8_lexical_scoping_error_in_block() {
+        // After `no utf8` inside a block, UTF-8 identifiers
+        // should error — matching Perl's behavior.
+        let src = "use utf8; { no utf8; my $café = 1; }";
+        let mut p = match Parser::new(src.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let result = p.parse_program();
+        assert!(result.is_err(), "UTF-8 identifier after `no utf8` inside block should error");
+    }
+
+    #[test]
+    fn utf8_in_string_interpolation() {
+        // `"$café"` with utf8 active — the variable name is UTF-8.
+        let prog = parse("use utf8; my $café = 1; print \"$café\";");
+        assert!(!prog.statements.is_empty(), "should parse");
     }
 }

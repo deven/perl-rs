@@ -123,18 +123,31 @@ pub(crate) struct Lexer {
     /// `Some` between `start_format` and the `.` terminator's
     /// `SublexEnd`.
     format_state: Option<FormatState>,
+    /// Whether `use utf8` is active.  Written by the parser
+    /// when processing `use utf8` / `no utf8` and when restoring
+    /// pragma state at block boundaries.  Read by the lexer to
+    /// decide whether to accept multi-byte UTF-8 identifiers
+    /// and whether high bytes outside strings are errors.
+    pub(crate) utf8_mode: bool,
 }
 
 impl Lexer {
     pub fn new(src: &[u8]) -> Self {
-        Lexer { source: LexerSource::new(src), current_line: None, context_stack: Vec::new(), pending_error: None, format_state: None }
+        Lexer { source: LexerSource::new(src), current_line: None, context_stack: Vec::new(), pending_error: None, format_state: None, utf8_mode: false }
     }
 
     /// Construct with an explicit filename (used for `__FILE__`
     /// and diagnostic messages).  Equivalent to `Lexer::new` when
     /// the caller doesn't care about filename reporting.
     pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
-        Lexer { source: LexerSource::with_filename(src, filename), current_line: None, context_stack: Vec::new(), pending_error: None, format_state: None }
+        Lexer {
+            source: LexerSource::with_filename(src, filename),
+            current_line: None,
+            context_stack: Vec::new(),
+            pending_error: None,
+            format_state: None,
+            utf8_mode: false,
+        }
     }
 
     /// Global byte position in the original source.
@@ -143,6 +156,14 @@ impl Lexer {
             Some(line) => line.offset + line.pos,
             None => self.source.cursor(),
         }
+    }
+
+    /// Is byte `b` a valid identifier-start character?  In ASCII
+    /// mode: `[a-zA-Z_]`.  In UTF-8 mode: also accepts lead
+    /// bytes ≥ 0x80 (the full multi-byte decode and Unicode
+    /// letter check happens inside `scan_ident`).
+    fn is_ident_start(&self, b: u8) -> bool {
+        b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)
     }
 
     // ── Byte access (auto-loading) ──────────────────────────
@@ -866,8 +887,20 @@ impl Lexer {
             }
 
             other => {
-                self.skip(1);
-                return Err(ParseError::new(format!("unexpected byte 0x{:02x} ('{}')", other, other as char), Span::new(start, self.span_pos())));
+                if other >= 0x80 {
+                    if self.utf8_mode {
+                        // UTF-8 lead byte in identifier position.
+                        // Route to lex_word which calls scan_ident
+                        // with UTF-8 decoding.
+                        self.lex_word()?
+                    } else {
+                        self.skip(1);
+                        return Err(ParseError::new(format!("Unrecognized character \\x{other:02X}"), Span::new(start, self.span_pos())));
+                    }
+                } else {
+                    self.skip(1);
+                    return Err(ParseError::new(format!("unexpected byte 0x{other:02x} ('{}')", other as char), Span::new(start, self.span_pos())));
+                }
             }
         };
 
@@ -1014,7 +1047,8 @@ impl Lexer {
         self.skip(1); // skip $
 
         // $# — array length
-        if self.peek_byte(false) == Some(b'#') && self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+        let after_hash = self.peek_byte_at(1);
+        if self.peek_byte(false) == Some(b'#') && after_hash.is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
             self.skip(1); // skip #
             let name = self.scan_ident();
             return Ok(Token::ArrayLen(name));
@@ -1034,6 +1068,14 @@ impl Lexer {
             Some(b) if b.is_ascii_alphabetic() => {
                 let name = self.scan_ident();
                 return Ok(Token::ScalarVar(name));
+            }
+            Some(b) if self.utf8_mode && b >= 0x80 => {
+                // UTF-8 lead byte — attempt to scan a Unicode identifier.
+                let name = self.scan_ident();
+                if !name.is_empty() {
+                    return Ok(Token::ScalarVar(name));
+                }
+                // Not a valid identifier — fall through to Dollar.
             }
             Some(b'{') => {
                 // ${^Foo} — demarcated caret variable
@@ -1391,6 +1433,24 @@ impl Lexer {
             } else if b == b':' && self.peek_byte_at(1) == Some(b':') {
                 // Package separator Foo::Bar
                 self.skip(2);
+            } else if self.utf8_mode && b >= 0x80 {
+                // UTF-8 continuation: decode a multi-byte character
+                // and accept it if it's a Unicode letter or digit
+                // (approximating XID_Continue).
+                let r = self.remaining();
+                let decoded = std::str::from_utf8(r).map(|s| s.chars().next()).unwrap_or_else(|e| {
+                    let v = e.valid_up_to();
+                    if v > 0 { std::str::from_utf8(&r[..v]).ok().and_then(|s| s.chars().next()) } else { None }
+                });
+                if let Some(ch) = decoded {
+                    if ch.is_alphanumeric() {
+                        self.skip(ch.len_utf8());
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
@@ -1604,6 +1664,7 @@ impl Lexer {
     /// local: multi-line subscripts `$h{\n  foo\n}` are
     /// uncommon and would require more machinery.
     pub fn try_autoquoted_bareword_subscript(&mut self) -> Option<(String, Span)> {
+        let utf8 = self.utf8_mode;
         let line = self.current_line.as_ref()?;
         let r = line.remaining();
         // Skip leading whitespace.
@@ -1613,12 +1674,38 @@ impl Lexer {
         }
         // Identifier start.
         let first = *r.get(i)?;
-        if !(first == b'_' || first.is_ascii_alphabetic()) {
+        if first == b'_' || first.is_ascii_alphabetic() {
+            // ASCII start — proceed.
+        } else if utf8 && first >= 0x80 {
+            // UTF-8 lead byte — decode and check.
+            let tail = &r[i..];
+            let s = std::str::from_utf8(tail).ok()?;
+            let ch = s.chars().next()?;
+            if !ch.is_alphabetic() {
+                return None;
+            }
+        } else {
             return None;
         }
         let ident_start = i;
-        while i < r.len() && (r[i] == b'_' || r[i].is_ascii_alphanumeric()) {
-            i += 1;
+        // Scan identifier body.
+        while i < r.len() {
+            let b = r[i];
+            if b == b'_' || b.is_ascii_alphanumeric() {
+                i += 1;
+            } else if utf8 && b >= 0x80 {
+                let tail = &r[i..];
+                if let Ok(s) = std::str::from_utf8(tail)
+                    && let Some(ch) = s.chars().next()
+                    && ch.is_alphanumeric()
+                {
+                    i += ch.len_utf8();
+                    continue;
+                }
+                break;
+            } else {
+                break;
+            }
         }
         let ident_end = i;
         // Skip trailing whitespace before the expected `}`.
@@ -2008,7 +2095,9 @@ impl Lexer {
         if self.peek_byte(false) == Some(b'{') {
             self.skip(1); // skip {
             // Simple identifier: ${name}
-            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+            let next_byte = self.peek_byte(false);
+            let is_ident = next_byte.is_some_and(|b| self.is_ident_start(b));
+            if is_ident {
                 let saved_pos = self.line_pos();
                 let name = self.scan_ident();
                 if self.peek_byte(false) == Some(b'}') {
@@ -2028,8 +2117,10 @@ impl Lexer {
             return Ok(Spanned { token: Token::InterpScalarExprStart, span: Span::new(start, self.span_pos()) });
         }
 
-        // $name form — must start with alpha or _
-        if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+        // $name form — must start with alpha, _ or (in UTF-8 mode) a Unicode letter.
+        let next_byte = self.peek_byte(false);
+        let is_name = next_byte.is_some_and(|b| self.is_ident_start(b));
+        if is_name {
             let name = self.scan_ident();
             // Check for subscript chain: [idx], {key}, ->[idx], ->{key}.
             // Only start a chain if a valid continuer is actually
@@ -2074,7 +2165,9 @@ impl Lexer {
         }
 
         // @name form
-        if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
+        let next_byte = self.peek_byte(false);
+        let is_name = next_byte.is_some_and(|b| self.is_ident_start(b));
+        if is_name {
             let name = self.scan_ident();
             // Chain detection same as the scalar case: `@a[1..3]`,
             // `@a{'k1','k2'}`, `@a->[...]` / `@a->{...}`.  The
