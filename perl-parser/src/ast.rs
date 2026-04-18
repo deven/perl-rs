@@ -204,6 +204,9 @@ pub enum ExprKind {
     /// the paren-form; without, prototype comes before attrs.
     AnonSub(Option<String>, Vec<Attribute>, Option<Signature>, Block),
 
+    /// `method { ... }` — anonymous method (5.38+ Corinna).
+    AnonMethod(Vec<Attribute>, Option<Signature>, Block),
+
     // ── Calls ─────────────────────────────────────────────────
     /// Named function call: `foo(...)` or `foo ...`.
     FuncCall(String, Vec<Expr>),
@@ -272,6 +275,11 @@ pub enum ExprKind {
     /// feature is active; otherwise the token falls through as
     /// a bareword.
     CurrentSub,
+    /// `__CLASS__` — name of the class being constructed during
+    /// field initializers and ADJUST blocks (5.38+, Corinna).
+    /// Resolved at runtime (may differ from the compile-time
+    /// class if a subclass inherits the field).
+    CurrentClass,
 
     // ── Placeholder for incremental development ───────────────
     /// `...` — yada yada yada (unimplemented placeholder).
@@ -497,6 +505,8 @@ pub enum PhaserKind {
     Init,
     Check,
     Unitcheck,
+    /// `ADJUST { ... }` — runs during object construction (5.38+, Corinna).
+    Adjust,
 }
 
 /// A block of statements.
@@ -733,12 +743,14 @@ pub struct FormatField {
     pub span: Span,
 }
 
-/// `class Name :attrs { ... }` (5.38+ Corinna).
+/// `class Name VERSION :attrs { ... }` (5.38+ Corinna).
 #[derive(Clone, Debug)]
 pub struct ClassDecl {
     pub name: String,
+    pub version: Option<String>,
     pub attributes: Vec<Attribute>,
-    pub body: Block,
+    /// `None` for statement form (`class Foo;`).
+    pub body: Option<Block>,
     pub span: Span,
 }
 
@@ -747,6 +759,7 @@ pub struct ClassDecl {
 pub struct FieldDecl {
     pub var: VarDecl,
     pub attributes: Vec<Attribute>,
-    pub default: Option<Expr>,
+    /// Default expression with operator kind (`=`, `//=`, `||=`).
+    pub default: Option<(SigDefaultKind, Expr)>,
     pub span: Span,
 }

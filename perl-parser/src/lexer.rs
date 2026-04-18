@@ -1932,6 +1932,7 @@ impl Lexer {
             }
             "__PACKAGE__" => return Ok(Token::CurrentPackage),
             "__SUB__" => return Ok(Token::CurrentSub),
+            "__CLASS__" => return Ok(Token::CurrentClass),
             // __END__ / __DATA__ are only recognized at column 0 —
             // matching Perl's behavior.  When indented or preceded
             // by other tokens on the line, they're just barewords.
@@ -3553,7 +3554,12 @@ mod tests {
                 | Token::QwList(_)
                 | Token::SpecialArrayVar(_)
                 | Token::SpecialHashVar(_)
-                | Token::Arrow => {
+                | Token::Arrow
+                | Token::SourceFile(_)
+                | Token::SourceLine(_)
+                | Token::CurrentPackage
+                | Token::CurrentSub
+                | Token::CurrentClass => {
                     term_context = false;
                 }
                 // Sub-tokens inside strings/regex don't change context.

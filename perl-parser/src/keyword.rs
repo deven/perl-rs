@@ -122,6 +122,7 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "INIT" => Some(Keyword::INIT),
         "CHECK" => Some(Keyword::CHECK),
         "UNITCHECK" => Some(Keyword::UNITCHECK),
+        "ADJUST" => Some(Keyword::ADJUST),
         "given" => Some(Keyword::Given),
         "when" => Some(Keyword::When),
         "default" => Some(Keyword::Default),
@@ -272,6 +273,7 @@ impl From<Keyword> for &'static str {
             Keyword::INIT => "INIT",
             Keyword::CHECK => "CHECK",
             Keyword::UNITCHECK => "UNITCHECK",
+            Keyword::ADJUST => "ADJUST",
             Keyword::Given => "given",
             Keyword::When => "when",
             Keyword::Default => "default",
@@ -438,6 +440,7 @@ pub fn is_statement_keyword(kw: Keyword) -> bool {
             | Keyword::INIT
             | Keyword::CHECK
             | Keyword::UNITCHECK
+            | Keyword::ADJUST
             | Keyword::Given
             | Keyword::When
             | Keyword::Default
