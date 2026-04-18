@@ -219,6 +219,16 @@ impl LexerSource {
         &self.filename
     }
 
+    /// Override the line number for `# line N` directives.
+    pub fn set_line_number(&mut self, n: usize) {
+        self.line_number = n;
+    }
+
+    /// Override the filename for `# line N "file"` directives.
+    pub fn set_filename(&mut self, name: String) {
+        self.filename = name;
+    }
+
     /// Raw slice of the source buffer.  For rare operations that need
     /// access to the underlying bytes (e.g. format body extraction).
     pub fn src_slice(&self, start: usize, end: usize) -> &[u8] {
