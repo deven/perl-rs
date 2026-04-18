@@ -13638,4 +13638,13 @@ OUTER\n";
         assert_eq!(vars[0].attributes.len(), 1);
         assert_eq!(vars[0].attributes[0].name, "Shared");
     }
+
+    // ── perldata: whitespace between sigil and name ──────────
+
+    #[test]
+    fn percent_space_name() {
+        // `% hash` ≡ `%hash` — whitespace between % and name.
+        let prog = parse("my % hash = (a => 1);");
+        assert!(!prog.statements.is_empty(), "should parse % hash with space");
+    }
 }

@@ -1112,9 +1112,47 @@ impl Lexer {
         self.scan_digits();
 
         if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+            // Before committing to float: check if this is a v-string
+            // without the `v` prefix.  If there are 2+ dots (e.g.
+            // 102.111.111), it's a v-string per perldata.
+            let saved_pos = self.line_pos();
+            self.skip(1); // skip first '.'
+            self.scan_digits();
+            if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+                // Two dots — v-string without v prefix.
+                // Collect the rest: .digits(.digits)*
+                let mut vstr = self.line_slice_str(start)?.to_string();
+                while self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+                    vstr.push('.');
+                    self.skip(1);
+                    let seg_start = self.line_pos();
+                    while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+                        self.skip(1);
+                    }
+                    vstr.push_str(self.line_slice_str(seg_start)?);
+                }
+                return Ok(Token::VersionLit(vstr));
+            }
+            // Not a v-string — rewind and parse as float.
+            if let Some(line) = self.current_line.as_mut() {
+                line.pos = saved_pos;
+            }
+
             // Float
             self.skip(1); // skip '.'
+            let frac_start = self.line_pos();
             self.scan_digits();
+
+            // Legacy octal float: 07.65p2 — starts with 0, has p exponent.
+            if (self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P')) && self.line_slice_str(start)?.starts_with('0') {
+                let int_s = self.line_slice_str(start)?.split('.').next().unwrap_or("0").replace('_', "");
+                let frac_s = self.line_slice_str(frac_start)?.replace('_', "");
+                let exp = self.scan_p_exponent();
+                let int_val = u64::from_str_radix(&int_s, 8).unwrap_or(0) as f64;
+                let frac_val = if frac_s.is_empty() { 0.0 } else { u64::from_str_radix(&frac_s, 8).unwrap_or(0) as f64 / 8f64.powi(frac_s.len() as i32) };
+                return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
+            }
+
             self.scan_exponent();
             let s = self.line_slice_str(start)?;
             let s = s.replace('_', "");
@@ -1332,6 +1370,20 @@ impl Lexer {
 
     fn lex_dollar(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip $
+
+        // Per perldata: "It is legal, but not recommended, to separate
+        // a variable's sigil from its name by space and/or tab characters."
+        // Only whitespace triggers this — `$#` is ArrayLen, not a comment.
+        // Once inside the skip, skip_ws_and_comments_no_pod handles any
+        // comments encountered along the way (e.g. `$  # comment\n x`).
+        if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
+            self.skip_ws_and_comments_no_pod()?;
+            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
+                let name = self.scan_ident();
+                return Ok(Token::ScalarVar(name));
+            }
+            return Ok(Token::Dollar);
+        }
 
         // $# — array length
         let after_hash = self.peek_byte_at(1);
@@ -1580,6 +1632,17 @@ impl Lexer {
 
     fn lex_at(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip @
+
+        // Whitespace between sigil and name.
+        if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
+            self.skip_ws_and_comments_no_pod()?;
+            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
+                let name = self.scan_ident();
+                return Ok(Token::ArrayVar(name));
+            }
+            return Ok(Token::At);
+        }
+
         match self.peek_byte(false) {
             Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
                 // @{^CAPTURE} etc.
@@ -1634,6 +1697,16 @@ impl Lexer {
     /// followed by a valid hash name (in which case `%` is an
     /// invalid standalone term).
     pub fn lex_hash_var_after_percent(&mut self) -> Result<Option<Token>, ParseError> {
+        // Whitespace between sigil and name.
+        if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
+            self.skip_ws_and_comments_no_pod()?;
+            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
+                let name = self.scan_ident();
+                return Ok(Some(Token::HashVar(name)));
+            }
+            return Ok(None);
+        }
+
         match self.peek_byte(false) {
             Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
                 // %{^CAPTURE} etc.
@@ -5513,5 +5586,60 @@ mod tests {
             Token::FloatLit(v) => assert_eq!(v, 30.0),
             ref other => panic!("expected FloatLit(30.0), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lex_legacy_octal_float() {
+        // 07.4p2 = 7.5 * 4 = 30.0 (legacy octal without 0o prefix)
+        let tokens = lex_all("07.4p2;");
+        match tokens[0] {
+            Token::FloatLit(v) => assert_eq!(v, 30.0),
+            ref other => panic!("expected FloatLit(30.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_vstring_no_v_prefix() {
+        // 102.111.111 — v-string without v prefix (2+ dots).
+        let tokens = lex_all("102.111.111;");
+        match &tokens[0] {
+            Token::VersionLit(s) => assert_eq!(s, "102.111.111"),
+            other => panic!("expected VersionLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_float_one_dot_not_vstring() {
+        // 102.111 — only one dot, should be a float, NOT a v-string.
+        let tokens = lex_all("102.111;");
+        assert!(matches!(tokens[0], Token::FloatLit(_)), "one-dot number should be float, got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_dollar_space_name() {
+        // `$ foo` ≡ `$foo` per perldata.
+        let tokens = lex_all("$ foo;");
+        assert!(matches!(&tokens[0], Token::ScalarVar(n) if n == "foo"), "$ foo should be ScalarVar(foo), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_at_space_name() {
+        // `@ bar` ≡ `@bar`.
+        let tokens = lex_all("@ bar;");
+        assert!(matches!(&tokens[0], Token::ArrayVar(n) if n == "bar"), "@ bar should be ArrayVar(bar), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_dollar_space_no_ident() {
+        // `$ {` — space followed by non-ident should still be bare Dollar.
+        let tokens = lex_all("$ {foo};");
+        assert!(matches!(tokens[0], Token::Dollar), "$ {{ should be Dollar, got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_dollar_comment_then_name() {
+        // `$ # comment\nx` ≡ `$x` — comment between sigil and name.
+        let tokens = lex_all("$ # comment\nx;");
+        assert!(matches!(&tokens[0], Token::ScalarVar(n) if n == "x"), "$ # comment\\nx should be ScalarVar(x), got {:?}", tokens[0]);
     }
 }
