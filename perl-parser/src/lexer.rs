@@ -380,6 +380,62 @@ impl Lexer {
         }
     }
 
+    /// Check for a `# line N "file"` directive and apply it.
+    /// Called when `#` is at column 0.  Updates the source's
+    /// line number (and optionally filename) so that `__LINE__`
+    /// and `__FILE__` reflect the override on subsequent lines.
+    fn try_line_directive(&mut self) {
+        let bytes = match &self.current_line {
+            Some(line) => &line.line[..],
+            None => return,
+        };
+
+        // Pattern: `#` optional-spaces `line` spaces DIGITS optional-spaces optional("FILENAME")
+        let rest = &bytes[1..]; // skip #
+        let rest = Self::trim_ascii_start(rest);
+        if !rest.starts_with(b"line") {
+            return;
+        }
+        let rest = &rest[4..];
+        // Must have whitespace after "line"
+        if rest.is_empty() || !rest[0].is_ascii_whitespace() {
+            return;
+        }
+        let rest = Self::trim_ascii_start(rest);
+
+        // Parse digits
+        let digit_end = rest.iter().position(|b| !b.is_ascii_digit()).unwrap_or(rest.len());
+        if digit_end == 0 {
+            return;
+        }
+        let line_num: usize = match std::str::from_utf8(&rest[..digit_end]) {
+            Ok(s) => match s.parse() {
+                Ok(n) => n,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+
+        // Apply line number — the NEXT line will be this number.
+        self.source.set_line_number(line_num);
+
+        // Optional filename
+        let rest = Self::trim_ascii_start(&rest[digit_end..]);
+        if rest.starts_with(b"\"") {
+            let rest = &rest[1..];
+            if let Some(end_quote) = rest.iter().position(|&b| b == b'"')
+                && let Ok(filename) = std::str::from_utf8(&rest[..end_quote])
+            {
+                self.source.set_filename(filename.to_string());
+            }
+        }
+    }
+
+    fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
+        let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+        &bytes[start..]
+    }
+
     /// Byte slice from line-local `start` to current cursor position.
     fn line_slice(&self, start: usize) -> &[u8] {
         match &self.current_line {
@@ -697,6 +753,10 @@ impl Lexer {
             match self.peek_byte(false) {
                 Some(b' ') | Some(b'\t') | Some(b'\n') => self.skip(1),
                 Some(b'#') => {
+                    // Check for `# line N "file"` directive at column 0.
+                    if self.line_pos() == 0 {
+                        self.try_line_directive();
+                    }
                     // Comment — drop entire line.
                     self.current_line = None;
                 }
@@ -1106,6 +1166,28 @@ impl Lexer {
         }
     }
 
+    /// Scan a `p`/`P` power-of-2 exponent for hex/octal/binary floats.
+    /// Assumes the cursor is on `p` or `P`.  Returns the signed exponent.
+    fn scan_p_exponent(&mut self) -> i32 {
+        self.skip(1); // skip p/P
+        let neg = if self.peek_byte(false) == Some(b'-') {
+            self.skip(1);
+            true
+        } else {
+            if self.peek_byte(false) == Some(b'+') {
+                self.skip(1);
+            }
+            false
+        };
+        let exp_start = self.line_pos();
+        while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+            self.skip(1);
+        }
+        let exp_s = std::str::from_utf8(self.line_slice(exp_start)).unwrap_or("0");
+        let exp: i32 = exp_s.parse().unwrap_or(0);
+        if neg { -exp } else { exp }
+    }
+
     fn lex_hex(&mut self) -> Result<Token, ParseError> {
         let start = self.line_pos();
         self.skip(2); // skip 0x
@@ -1117,8 +1199,42 @@ impl Lexer {
                 break;
             }
         }
-        let s = self.line_slice_str(hex_start)?.replace('_', "");
-        let n = i64::from_str_radix(&s, 16).map_err(|_| ParseError::new("invalid hex literal", self.span_from(start)))?;
+        let int_str = self.line_slice_str(hex_start)?.replace('_', "");
+
+        // Check for hex float: 0xHH.HHpEE
+        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_hexdigit()) {
+            self.skip(1); // skip '.'
+            let frac_start = self.line_pos();
+            while let Some(b) = self.peek_byte(false) {
+                if b.is_ascii_hexdigit() || b == b'_' {
+                    self.skip(1);
+                } else {
+                    break;
+                }
+            }
+            let frac_str = self.line_slice_str(frac_start)?.replace('_', "");
+
+            // 'p' or 'P' exponent is required for hex float
+            if self.peek_byte(false) != Some(b'p') && self.peek_byte(false) != Some(b'P') {
+                return Err(ParseError::new("hex float requires 'p' exponent", self.span_from(start)));
+            }
+            let exp = self.scan_p_exponent();
+
+            let int_val = u64::from_str_radix(&int_str, 16).unwrap_or(0) as f64;
+            let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 16).unwrap_or(0) as f64 / 16f64.powi(frac_str.len() as i32) };
+            let val = (int_val + frac_val) * 2f64.powi(exp);
+            return Ok(Token::FloatLit(val));
+        }
+
+        // Check for hex float without fraction: 0xHHpEE
+        if self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P') {
+            let exp = self.scan_p_exponent();
+            let int_val = u64::from_str_radix(&int_str, 16).unwrap_or(0) as f64;
+            let val = int_val * 2f64.powi(exp);
+            return Ok(Token::FloatLit(val));
+        }
+
+        let n = i64::from_str_radix(&int_str, 16).map_err(|_| ParseError::new("invalid hex literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
 
@@ -1139,8 +1255,31 @@ impl Lexer {
         {
             return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), self.span_from(start)));
         }
-        let s = self.line_slice_str(bin_start)?.replace('_', "");
-        let n = i64::from_str_radix(&s, 2).map_err(|_| ParseError::new("invalid binary literal", self.span_from(start)))?;
+        let bin_str = self.line_slice_str(bin_start)?.replace('_', "");
+
+        // Check for binary float: 0b101.01p-1
+        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b == b'0' || b == b'1') {
+            self.skip(1);
+            let frac_start = self.line_pos();
+            while self.peek_byte(false).is_some_and(|b| b == b'0' || b == b'1' || b == b'_') {
+                self.skip(1);
+            }
+            let frac_str = self.line_slice_str(frac_start)?.replace('_', "");
+            if self.peek_byte(false) != Some(b'p') && self.peek_byte(false) != Some(b'P') {
+                return Err(ParseError::new("binary float requires 'p' exponent", self.span_from(start)));
+            }
+            let exp = self.scan_p_exponent();
+            let int_val = u64::from_str_radix(&bin_str, 2).unwrap_or(0) as f64;
+            let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 2).unwrap_or(0) as f64 / 2f64.powi(frac_str.len() as i32) };
+            return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
+        }
+        if self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P') {
+            let exp = self.scan_p_exponent();
+            let int_val = u64::from_str_radix(&bin_str, 2).unwrap_or(0) as f64;
+            return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
+        }
+
+        let n = i64::from_str_radix(&bin_str, 2).map_err(|_| ParseError::new("invalid binary literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
 
@@ -1161,8 +1300,31 @@ impl Lexer {
         {
             return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), self.span_from(start)));
         }
-        let s = self.line_slice_str(oct_start)?.replace('_', "");
-        let n = i64::from_str_radix(&s, 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
+        let oct_str = self.line_slice_str(oct_start)?.replace('_', "");
+
+        // Check for octal float: 0o7.65p2
+        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| (b'0'..=b'7').contains(&b)) {
+            self.skip(1);
+            let frac_start = self.line_pos();
+            while self.peek_byte(false).is_some_and(|b| (b'0'..=b'7').contains(&b) || b == b'_') {
+                self.skip(1);
+            }
+            let frac_str = self.line_slice_str(frac_start)?.replace('_', "");
+            if self.peek_byte(false) != Some(b'p') && self.peek_byte(false) != Some(b'P') {
+                return Err(ParseError::new("octal float requires 'p' exponent", self.span_from(start)));
+            }
+            let exp = self.scan_p_exponent();
+            let int_val = u64::from_str_radix(&oct_str, 8).unwrap_or(0) as f64;
+            let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 8).unwrap_or(0) as f64 / 8f64.powi(frac_str.len() as i32) };
+            return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
+        }
+        if self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P') {
+            let exp = self.scan_p_exponent();
+            let int_val = u64::from_str_radix(&oct_str, 8).unwrap_or(0) as f64;
+            return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
+        }
+
+        let n = i64::from_str_radix(&oct_str, 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
         Ok(Token::IntLit(n))
     }
 
@@ -5311,5 +5473,45 @@ mod tests {
         // `x =>` should autoquote x, not produce RepeatEq.
         let tokens = lex_all("x => 1;");
         assert!(!tokens.contains(&Token::Assign(AssignOp::RepeatEq)), "x => should NOT produce RepeatEq; got {:?}", tokens);
+    }
+
+    #[test]
+    fn lex_hex_float() {
+        // 0xA.8p1 = 10.5 * 2 = 21.0 (exactly representable)
+        let tokens = lex_all("0xA.8p1;");
+        match tokens[0] {
+            Token::FloatLit(v) => assert_eq!(v, 21.0, "0xA.8p1 should be 21.0, got {v}"),
+            ref other => panic!("expected FloatLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_hex_float_no_fraction() {
+        // 0x1p10 = 1024.0
+        let tokens = lex_all("0x1p10;");
+        match tokens[0] {
+            Token::FloatLit(v) => assert_eq!(v, 1024.0),
+            ref other => panic!("expected FloatLit(1024.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_binary_float() {
+        // 0b101.01p2 = 5.25 * 4 = 21.0
+        let tokens = lex_all("0b101.01p2;");
+        match tokens[0] {
+            Token::FloatLit(v) => assert_eq!(v, 21.0),
+            ref other => panic!("expected FloatLit(21.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_octal_float() {
+        // 0o7.4p2 = 7.5 * 4 = 30.0
+        let tokens = lex_all("0o7.4p2;");
+        match tokens[0] {
+            Token::FloatLit(v) => assert_eq!(v, 30.0),
+            ref other => panic!("expected FloatLit(30.0), got {other:?}"),
+        }
     }
 }

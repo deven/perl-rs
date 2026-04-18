@@ -1703,8 +1703,24 @@ impl Parser {
                     Ok(Expr { kind: ExprKind::ArrayVar(name), span })
                 }
             }
-            Token::HashVar(name) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
-            Token::GlobVar(name) => Ok(Expr { kind: ExprKind::GlobVar(name), span }),
+            Token::HashVar(name) => {
+                // %hash{keys} → kv hash slice; %hash[indices] → kv array slice (5.20+)
+                let recv = Expr { kind: ExprKind::HashVar(name), span };
+                self.maybe_kv_slice(recv, span)
+            }
+            Token::GlobVar(name) => {
+                let expr = Expr { kind: ExprKind::GlobVar(name), span };
+                // *foo{THING} — typeglob slot access
+                if self.at(&Token::LeftBrace)? {
+                    self.next_token()?;
+                    let key = self.parse_hash_subscript_key()?;
+                    let end = self.peek_span();
+                    self.expect_token(&Token::RightBrace)?;
+                    Ok(Expr { span: span.merge(end), kind: ExprKind::ArrowDeref(Box::new(expr), ArrowTarget::HashElem(Box::new(key))) })
+                } else {
+                    Ok(expr)
+                }
+            }
             Token::ArrayLen(name) => Ok(Expr { kind: ExprKind::ArrayLen(name), span }),
             Token::SpecialVar(name) => {
                 let expr = Expr { kind: ExprKind::SpecialVar(name), span };
@@ -1717,7 +1733,10 @@ impl Parser {
             // fall through to hash-deref (%$ref, %{expr}).
             Token::Percent => {
                 match self.lexer.lex_hash_var_after_percent()? {
-                    Some(Token::HashVar(name)) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
+                    Some(Token::HashVar(name)) => {
+                        let recv = Expr { kind: ExprKind::HashVar(name), span };
+                        self.maybe_kv_slice(recv, span)
+                    }
                     Some(Token::SpecialHashVar(name)) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
                     Some(other) => unreachable!("unexpected hash token: {other:?}"),
                     None => {
@@ -1823,7 +1842,17 @@ impl Parser {
                         Token::Ident(s) => s,
                         _ => unreachable!(),
                     };
-                    Ok(Expr { kind: ExprKind::GlobVar(name), span: span.merge(name_span) })
+                    let expr = Expr { kind: ExprKind::GlobVar(name), span: span.merge(name_span) };
+                    // *foo{THING} — typeglob slot access
+                    if self.at(&Token::LeftBrace)? {
+                        self.next_token()?;
+                        let key = self.parse_hash_subscript_key()?;
+                        let end = self.peek_span();
+                        self.expect_token(&Token::RightBrace)?;
+                        Ok(Expr { span: span.merge(end), kind: ExprKind::ArrowDeref(Box::new(expr), ArrowTarget::HashElem(Box::new(key))) })
+                    } else {
+                        Ok(expr)
+                    }
                 } else {
                     let operand = self.parse_deref_operand()?;
                     Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Glob, Box::new(operand)) })
@@ -2913,6 +2942,38 @@ impl Parser {
         // inside parse_expr via parse_ident_term and the
         // Minus-prefix bareword path.
         self.parse_expr(PREC_LOW)
+    }
+
+    /// Check for `%hash{keys}` (kv hash slice) or `%array[indices]`
+    /// (kv array slice) subscripts on a hash-sigil variable (5.20+).
+    fn maybe_kv_slice(&mut self, recv: Expr, span: Span) -> Result<Expr, ParseError> {
+        if self.at(&Token::LeftBracket)? {
+            self.next_token()?;
+            let mut indices = Vec::new();
+            while !self.at(&Token::RightBracket)? && !self.at_eof()? {
+                indices.push(self.parse_expr(PREC_COMMA + 1)?);
+                if !self.eat(&Token::Comma)? {
+                    break;
+                }
+            }
+            let end = self.peek_span();
+            self.expect_token(&Token::RightBracket)?;
+            Ok(Expr { span: span.merge(end), kind: ExprKind::KvArraySlice(Box::new(recv), indices) })
+        } else if self.at(&Token::LeftBrace)? {
+            self.next_token()?;
+            let mut keys = Vec::new();
+            while !self.at(&Token::RightBrace)? && !self.at_eof()? {
+                keys.push(self.parse_expr(PREC_COMMA + 1)?);
+                if !self.eat(&Token::Comma)? {
+                    break;
+                }
+            }
+            let end = self.peek_span();
+            self.expect_token(&Token::RightBrace)?;
+            Ok(Expr { span: span.merge(end), kind: ExprKind::KvHashSlice(Box::new(recv), keys) })
+        } else {
+            Ok(recv)
+        }
     }
 
     fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
@@ -12902,20 +12963,56 @@ OUTER\n";
     // ── 8. # line N "file" directives ────────────────────────
 
     #[test]
-    fn line_directive_basic() {
-        // `# line 200 "bzzzt"` — C-preprocessor-style override.
-        // Per perlsyn, the `#` must be the first char on the line.
-        // The parser should silently accept this as a comment
-        // (it's a comment that happens to have semantic meaning
-        // for diagnostics, but the parser already skips `#` comments).
-        let prog = parse("# line 200 \"bzzzt\"\nmy $x = 1;");
-        assert!(!prog.statements.is_empty(), "should parse past line directive");
+    fn line_directive_sets_line_number() {
+        // `# line 200 "bzzzt"` overrides __LINE__ on the next line.
+        let prog = parse("# line 200 \"bzzzt\"\n__LINE__;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::SourceLine(n) => assert_eq!(*n, 200, "__LINE__ should be 200 after # line 200"),
+                other => panic!("expected SourceLine, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        }
     }
 
     #[test]
-    fn line_directive_no_filename() {
-        let prog = parse("# line 42\nmy $x = 1;");
-        assert!(!prog.statements.is_empty(), "should parse past line directive without filename");
+    fn line_directive_sets_filename() {
+        // `# line 200 "bzzzt"` overrides __FILE__.
+        let prog = parse("# line 200 \"bzzzt\"\n__FILE__;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::SourceFile(path) => assert_eq!(path, "bzzzt", "__FILE__ should be 'bzzzt' after # line 200 \"bzzzt\""),
+                other => panic!("expected SourceFile, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_directive_number_only() {
+        // `# line 42` without filename — only line number changes.
+        let prog = parse("# line 42\n__LINE__;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::SourceLine(n) => assert_eq!(*n, 42),
+                other => panic!("expected SourceLine, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_directive_not_at_column_zero() {
+        // Leading whitespace — `#` is NOT at column 0, so it's
+        // just a regular comment, not a directive.
+        let prog = parse("  # line 200\n__LINE__;");
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::SourceLine(n) => assert_ne!(*n, 200, "indented # line should NOT be a directive"),
+                other => panic!("expected SourceLine, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -13355,5 +13452,50 @@ OUTER\n";
         // `->&*` should still work as code postfix deref.
         let e = parse_expr_str("$ref->&*;");
         assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefCode)), "expected DerefCode, got {:?}", e.kind);
+    }
+
+    // ── perldata: KV slices (5.20+) ──────────────────────────
+
+    #[test]
+    fn kv_hash_slice() {
+        // %hash{'foo','bar'} → key/value hash slice.
+        let e = parse_expr_str("%hash{'foo','bar'};");
+        match &e.kind {
+            ExprKind::KvHashSlice(_, keys) => assert_eq!(keys.len(), 2),
+            other => panic!("expected KvHashSlice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_array_slice() {
+        // %array[1,2,3] → index/value array slice.
+        let e = parse_expr_str("%array[1,2,3];");
+        match &e.kind {
+            ExprKind::KvArraySlice(_, indices) => assert_eq!(indices.len(), 3),
+            other => panic!("expected KvArraySlice, got {other:?}"),
+        }
+    }
+
+    // ── perldata: *foo{THING} typeglob access ────────────────
+
+    #[test]
+    fn glob_thing_access() {
+        // *foo{SCALAR} → typeglob slot access.
+        let e = parse_expr_str("*foo{SCALAR};");
+        match &e.kind {
+            ExprKind::ArrowDeref(recv, ArrowTarget::HashElem(key)) => {
+                assert!(matches!(recv.kind, ExprKind::GlobVar(ref n) if n == "foo"));
+                assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "SCALAR"));
+            }
+            other => panic!("expected ArrowDeref(GlobVar, HashElem), got {other:?}"),
+        }
+    }
+
+    // ── perldata: hex/octal/binary float ─────────────────────
+
+    #[test]
+    fn hex_float_expr() {
+        let e = parse_expr_str("0x1p10;");
+        assert!(matches!(e.kind, ExprKind::FloatLit(v) if v == 1024.0), "expected FloatLit(1024.0), got {:?}", e.kind);
     }
 }

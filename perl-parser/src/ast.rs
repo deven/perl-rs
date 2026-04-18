@@ -179,6 +179,10 @@ pub enum ExprKind {
     ArraySlice(Box<Expr>, Vec<Expr>),
     /// `@hash{$k1, $k2}` — hash slice.
     HashSlice(Box<Expr>, Vec<Expr>),
+    /// `%array[$idx1, $idx2]` — index/value array slice (5.20+).
+    KvArraySlice(Box<Expr>, Vec<Expr>),
+    /// `%hash{$k1, $k2}` — key/value hash slice (5.20+).
+    KvHashSlice(Box<Expr>, Vec<Expr>),
 
     // ── Dereference ───────────────────────────────────────────
     /// `$$ref`, `@$ref`, `%$ref`.
