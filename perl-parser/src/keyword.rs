@@ -60,6 +60,8 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "sort" => Some(Keyword::Sort),
         "map" => Some(Keyword::Map),
         "grep" => Some(Keyword::Grep),
+        "any" => Some(Keyword::Any),
+        "all" => Some(Keyword::All),
         "join" => Some(Keyword::Join),
         "split" => Some(Keyword::Split),
         "sprintf" => Some(Keyword::Sprintf),
@@ -211,6 +213,8 @@ impl From<Keyword> for &'static str {
             Keyword::Sort => "sort",
             Keyword::Map => "map",
             Keyword::Grep => "grep",
+            Keyword::Any => "any",
+            Keyword::All => "all",
             Keyword::Join => "join",
             Keyword::Split => "split",
             Keyword::Sprintf => "sprintf",
@@ -407,7 +411,7 @@ pub fn is_list_op(kw: Keyword) -> bool {
 /// Is this keyword a block-list operator (sort/map/grep)?
 /// These take an optional block as the first argument.
 pub fn is_block_list_op(kw: Keyword) -> bool {
-    matches!(kw, Keyword::Sort | Keyword::Map | Keyword::Grep)
+    matches!(kw, Keyword::Sort | Keyword::Map | Keyword::Grep | Keyword::Any | Keyword::All)
 }
 
 /// Is this keyword a print-like operator?

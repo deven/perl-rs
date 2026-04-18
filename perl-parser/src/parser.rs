@@ -202,6 +202,8 @@ impl Parser {
             Keyword::Defer => Features::DEFER,
             Keyword::Given | Keyword::When | Keyword::Default => Features::SWITCH,
             Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST => Features::CLASS,
+            Keyword::Any => Features::KEYWORD_ANY,
+            Keyword::All => Features::KEYWORD_ALL,
             _ => return,
         };
         if self.pragmas.features.contains(needed) {
@@ -13892,5 +13894,32 @@ OUTER\n";
             }
             other => panic!("expected MethodDecl, got {other:?}"),
         }
+    }
+
+    // ── perlexperiment: any/all operators ────────────────────
+
+    #[test]
+    fn any_block_list() {
+        let prog = parse("use feature 'any'; any { $_ > 0 } @nums;");
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn all_block_list() {
+        let prog = parse("use feature 'all'; all { defined $_ } @items;");
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn any_without_feature_is_bareword() {
+        // Without `use feature 'any'`, `any` is a regular identifier.
+        let e = parse_expr_str("any();");
+        assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "any"), "without feature, any() should be a regular call, got {:?}", e.kind);
+    }
+
+    #[test]
+    fn all_without_feature_is_bareword() {
+        let e = parse_expr_str("all();");
+        assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "all"), "without feature, all() should be a regular call, got {:?}", e.kind);
     }
 }

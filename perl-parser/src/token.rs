@@ -162,6 +162,10 @@ pub enum Keyword {
     Exec,
     Qw,
 
+    // ── List-processing (block-first) ──────────────────────
+    Any,
+    All,
+
     // ── Phaser blocks ─────────────────────────────────────────
     BEGIN,
     END,

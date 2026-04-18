@@ -224,6 +224,8 @@ pub fn resolve_feature_name(name: &str) -> Option<Features> {
         "lexical_subs" => Features::LEXICAL_SUBS,
         "keyword_any" => Features::KEYWORD_ANY,
         "keyword_all" => Features::KEYWORD_ALL,
+        "any" => Features::KEYWORD_ANY,
+        "all" => Features::KEYWORD_ALL,
         _ => return None,
     })
 }
