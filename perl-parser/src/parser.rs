@@ -13647,4 +13647,13 @@ OUTER\n";
         let prog = parse("my % hash = (a => 1);");
         assert!(!prog.statements.is_empty(), "should parse % hash with space");
     }
+
+    // ── perlvar: special variable gaps ──────────────────────
+
+    #[test]
+    fn percent_caret_h() {
+        // `%^H` — hints hash, caret hash variable.
+        let e = parse_expr_str("%^H;");
+        assert!(matches!(e.kind, ExprKind::SpecialHashVar(ref n) if n == "^H"), "expected SpecialHashVar(^H), got {:?}", e.kind);
+    }
 }
