@@ -54,10 +54,11 @@ use std::collections::HashMap;
 ///
 /// Container types (`Array`, `Hash`) and code/regex are always `Arc`-wrapped
 /// because they have shared identity from creation.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum Value {
     // ── Compact scalar variants (no heap allocation) ──────────
     /// Undefined value.
+    #[default]
     Undef,
 
     /// Integer — just an i64, no SV overhead.
@@ -332,10 +333,11 @@ impl Value {
     /// and the result is exact.  Division by zero is a fatal error
     /// in Perl; here we return `Inf` or `NaN` as Rust does.
     pub fn div(&self, other: &Value) -> Value {
-        if let (Value::Int(a), Value::Int(b)) = (self, other) {
-            if *b != 0 && *a % *b == 0 {
-                return Value::Int(*a / *b);
-            }
+        if let (Value::Int(a), Value::Int(b)) = (self, other)
+            && *b != 0
+            && *a % *b == 0
+        {
+            return Value::Int(*a / *b);
         }
         Value::Float(self.coerce_to_num() / other.coerce_to_num())
     }
@@ -645,12 +647,6 @@ impl fmt::Display for Value {
     }
 }
 
-impl Default for Value {
-    fn default() -> Self {
-        Value::Undef
-    }
-}
-
 // Convenience From impls for creating Values from Rust types.
 
 impl From<i64> for Value {
@@ -720,9 +716,9 @@ mod tests {
 
     #[test]
     fn float_value() {
-        let v = Value::from(3.14f64);
+        let v = Value::from(3.125f64);
         assert!(v.is_defined());
-        assert!((v.as_num().unwrap() - 3.14).abs() < 1e-10);
+        assert!((v.as_num().unwrap() - 3.125).abs() < 1e-10);
         assert_eq!(v.as_int(), Some(3)); // truncation
     }
 
@@ -926,7 +922,7 @@ mod tests {
 
     #[test]
     fn stringify_float() {
-        assert_eq!(format!("{}", Value::Float(3.14)), "3.14");
+        assert_eq!(format!("{}", Value::Float(3.125)), "3.125");
         assert_eq!(format!("{}", Value::Float(0.0)), "0");
         assert_eq!(format!("{}", Value::Float(-2.5)), "-2.5");
         assert_eq!(format!("{}", Value::Float(1000.0)), "1000");
@@ -1006,8 +1002,8 @@ mod tests {
         assert!(buf.is_empty());
 
         buf.clear();
-        Value::Float(3.14).write_bytes_to(&mut buf);
-        assert_eq!(&buf, b"3.14");
+        Value::Float(3.125).write_bytes_to(&mut buf);
+        assert_eq!(&buf, b"3.125");
     }
 
     // ── Coercion tests ────────────────────────────────────────
@@ -1023,7 +1019,7 @@ mod tests {
         assert_eq!(Value::from("42").coerce_to_int(), 42);
         assert_eq!(Value::from("42abc").coerce_to_int(), 42);
         assert_eq!(Value::from("abc").coerce_to_int(), 0);
-        assert!((Value::from("3.14").coerce_to_num() - 3.14).abs() < 1e-10);
+        assert!((Value::from("3.125").coerce_to_num() - 3.125).abs() < 1e-10);
     }
 
     #[test]
@@ -1124,7 +1120,7 @@ mod tests {
 
     #[test]
     fn negate_float() {
-        assert!((Value::Float(3.14).negate().as_num().unwrap() + 3.14).abs() < 1e-10);
+        assert!((Value::Float(3.125).negate().as_num().unwrap() + 3.125).abs() < 1e-10);
     }
 
     #[test]

@@ -21,9 +21,10 @@ pub const SLOT_INLINE_MAX: usize = 24;
 ///
 /// Note that `None` means "no string cache", not "empty string".
 /// An empty string is `Inline { len: 0, .. }` with STR_VALID set.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum PerlStringSlot {
     /// No string representation cached.
+    #[default]
     None,
 
     /// Inline short string (up to [`SLOT_INLINE_MAX`] bytes).
@@ -48,7 +49,8 @@ impl PerlStringSlot {
     }
 
     /// Set the cache from raw bytes.  Uses `Inline` if it fits.
-    pub fn set_bytes(&mut self, bytes: &[u8]) {
+    pub fn set_bytes(&mut self, bytes: impl AsRef<[u8]>) {
+        let bytes = bytes.as_ref();
         if bytes.len() <= SLOT_INLINE_MAX {
             let mut buf = [0u8; SLOT_INLINE_MAX];
             buf[..bytes.len()].copy_from_slice(bytes);
@@ -120,6 +122,11 @@ impl PerlStringSlot {
         }
     }
 
+    /// Whether the cached string is empty (zero bytes or no cache).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Convert the cached value to a `PerlString`.
     /// Returns `None` if no string is cached.
     pub fn to_perl_string(&self) -> Option<PerlString> {
@@ -136,12 +143,6 @@ impl PerlStringSlot {
 }
 
 // ── Trait impls ───────────────────────────────────────────────────
-
-impl Default for PerlStringSlot {
-    fn default() -> Self {
-        PerlStringSlot::None
-    }
-}
 
 impl fmt::Debug for PerlStringSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -206,7 +207,7 @@ mod tests {
     #[test]
     fn set_bytes_no_utf8() {
         let mut slot = PerlStringSlot::None;
-        slot.set_bytes(&[0xff, 0xfe]);
+        slot.set_bytes([0xff, 0xfe]);
         assert!(slot.is_some());
         assert!(!slot.is_utf8());
         assert_eq!(slot.as_str(), None);

@@ -1,12 +1,22 @@
-//! Heap-allocated Perl string — `Vec<u8>` + UTF-8 flag.
+//! Heap-allocated Perl string — `Bytes` + UTF-8 flag.
+//!
+//! The underlying buffer uses [`bytes::Bytes`], giving O(1) cloning
+//! (reference-count bump) and O(1) slicing.  Short strings that live
+//! inside a `Value::SmallStr` or `PerlStringSlot::Inline` never reach
+//! this type — only strings that need heap allocation go through here.
 
 use std::fmt;
+
+use bytes::{Bytes, BytesMut};
 
 /// A Perl string: an octet sequence with an optional UTF-8 flag.
 ///
 /// Unlike Rust's `String`, a `PerlString` can hold arbitrary bytes.
 /// The `is_utf8` flag indicates whether the bytes are valid UTF-8,
 /// enabling zero-cost conversion to `&str` when set.
+///
+/// Cloning a `PerlString` is O(1) — it bumps the reference count on
+/// the underlying `Bytes` buffer rather than copying the data.
 ///
 /// # Invariant
 ///
@@ -15,7 +25,7 @@ use std::fmt;
 /// (typically by clearing the flag when the result might not be UTF-8).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PerlString {
-    buf: Vec<u8>,
+    buf: Bytes,
     is_utf8: bool,
 }
 
@@ -24,17 +34,21 @@ impl PerlString {
 
     /// Create an empty Perl string (no UTF-8 flag).
     pub fn new() -> Self {
-        PerlString { buf: Vec::new(), is_utf8: false }
+        PerlString { buf: Bytes::new(), is_utf8: false }
     }
 
     /// Create a Perl string from a Rust `&str`.  The UTF-8 flag is set.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
-        PerlString { buf: s.as_bytes().to_vec(), is_utf8: true }
+        PerlString { buf: Bytes::from(s.as_bytes().to_vec()), is_utf8: true }
     }
 
     /// Create a Perl string from raw bytes.  The UTF-8 flag is NOT set.
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        PerlString { buf: bytes, is_utf8: false }
+    ///
+    /// Accepts anything convertible to `Bytes`: `Vec<u8>`, `&'static [u8]`,
+    /// `Bytes`, etc.
+    pub fn from_bytes(bytes: impl Into<Bytes>) -> Self {
+        PerlString { buf: bytes.into(), is_utf8: false }
     }
 
     /// Create a Perl string from raw bytes with an explicit UTF-8 flag.
@@ -42,15 +56,16 @@ impl PerlString {
     /// # Safety
     ///
     /// If `is_utf8` is `true`, the caller MUST ensure `bytes` is valid UTF-8.
-    pub unsafe fn from_bytes_utf8_unchecked(bytes: Vec<u8>, is_utf8: bool) -> Self {
-        PerlString { buf: bytes, is_utf8 }
+    pub unsafe fn from_bytes_utf8_unchecked(bytes: impl Into<Bytes>, is_utf8: bool) -> Self {
+        PerlString { buf: bytes.into(), is_utf8 }
     }
 
     /// Create a Perl string from raw bytes, checking UTF-8 validity.
     /// Sets the flag if the bytes are valid UTF-8.
-    pub fn from_bytes_detect_utf8(bytes: Vec<u8>) -> Self {
-        let is_utf8 = std::str::from_utf8(&bytes).is_ok();
-        PerlString { buf: bytes, is_utf8 }
+    pub fn from_bytes_detect_utf8(bytes: impl Into<Bytes>) -> Self {
+        let buf: Bytes = bytes.into();
+        let is_utf8 = std::str::from_utf8(&buf).is_ok();
+        PerlString { buf, is_utf8 }
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -70,6 +85,15 @@ impl PerlString {
     /// Byte slice view — always available regardless of UTF-8 flag.
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Shared `Bytes` handle — O(1) reference-count bump.
+    ///
+    /// Use this when you need an owned handle to the buffer without
+    /// consuming the `PerlString` (e.g., passing to another thread,
+    /// storing alongside the original, or zero-copy slicing).
+    pub fn bytes(&self) -> Bytes {
+        self.buf.clone()
     }
 
     /// Whether the UTF-8 flag is set.
@@ -92,36 +116,47 @@ impl PerlString {
     /// Append bytes from a `&str`.  Preserves UTF-8 flag if already set
     /// (appending valid UTF-8 to valid UTF-8 is valid UTF-8).
     pub fn push_str(&mut self, s: &str) {
-        self.buf.extend_from_slice(s.as_bytes());
+        let mut new_buf = BytesMut::with_capacity(self.buf.len() + s.len());
+        new_buf.extend_from_slice(&self.buf);
+        new_buf.extend_from_slice(s.as_bytes());
+        self.buf = new_buf.freeze();
         // If we were already UTF-8, appending a &str keeps us UTF-8.
         // If we weren't, appending UTF-8 doesn't make us UTF-8.
     }
 
     /// Append raw bytes.  Clears the UTF-8 flag (we can't guarantee
     /// the result is valid UTF-8).
-    pub fn push_bytes(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
+    pub fn push_bytes(&mut self, bytes: impl AsRef<[u8]>) {
+        let bytes = bytes.as_ref();
+        let mut new_buf = BytesMut::with_capacity(self.buf.len() + bytes.len());
+        new_buf.extend_from_slice(&self.buf);
+        new_buf.extend_from_slice(bytes);
+        self.buf = new_buf.freeze();
         self.is_utf8 = false;
     }
 
     /// Append another PerlString.  UTF-8 flag is set only if both are UTF-8.
     pub fn push_perl_string(&mut self, other: &PerlString) {
-        self.buf.extend_from_slice(&other.buf);
+        let mut new_buf = BytesMut::with_capacity(self.buf.len() + other.buf.len());
+        new_buf.extend_from_slice(&self.buf);
+        new_buf.extend_from_slice(&other.buf);
+        self.buf = new_buf.freeze();
         self.is_utf8 = self.is_utf8 && other.is_utf8;
     }
 
-    /// Clear the string contents but keep the allocated buffer.
+    /// Clear the string contents.
     pub fn clear(&mut self) {
-        self.buf.clear();
+        self.buf = Bytes::new();
         // An empty string is trivially valid UTF-8, but we preserve
         // the flag state for consistency with Perl 5 behavior.
     }
 
-    /// Truncate to `len` bytes.  Clears UTF-8 flag if truncation might
-    /// split a multi-byte character.
+    /// Truncate to `len` bytes.  Uses zero-copy slicing on the
+    /// underlying `Bytes` buffer.  Clears UTF-8 flag if truncation
+    /// might split a multi-byte character.
     pub fn truncate(&mut self, len: usize) {
         if len < self.buf.len() {
-            self.buf.truncate(len);
+            self.buf = self.buf.slice(..len);
             if self.is_utf8 {
                 // Check if we split a multi-byte sequence.
                 if std::str::from_utf8(&self.buf).is_err() {
@@ -153,8 +188,9 @@ impl PerlString {
 
     // ── Conversion ────────────────────────────────────────────────
 
-    /// Consume the PerlString and return the underlying byte vector.
-    pub fn into_bytes(self) -> Vec<u8> {
+    /// Consume the PerlString and return the underlying `Bytes` buffer.
+    /// This is O(1) — no data is copied.
+    pub fn into_bytes(self) -> Bytes {
         self.buf
     }
 
@@ -163,11 +199,11 @@ impl PerlString {
     pub fn into_string(self) -> Result<String, Self> {
         if self.is_utf8 {
             // SAFETY: is_utf8 flag guarantees valid UTF-8.
-            Ok(unsafe { String::from_utf8_unchecked(self.buf) })
+            Ok(unsafe { String::from_utf8_unchecked(self.buf.to_vec()) })
         } else {
-            match String::from_utf8(self.buf) {
+            match String::from_utf8(self.buf.to_vec()) {
                 Ok(s) => Ok(s),
-                Err(e) => Err(PerlString { buf: e.into_bytes(), is_utf8: false }),
+                Err(e) => Err(PerlString { buf: Bytes::from(e.into_bytes()), is_utf8: false }),
             }
         }
     }
@@ -184,7 +220,7 @@ impl PerlString {
             return 0;
         }
         // Fast path: try the whole trimmed string
-        if let Some(s) = std::str::from_utf8(s).ok() {
+        if let Ok(s) = std::str::from_utf8(s) {
             if let Ok(n) = s.parse::<i64>() {
                 return n;
             }
@@ -201,7 +237,7 @@ impl PerlString {
         if s.is_empty() {
             return 0.0;
         }
-        if let Some(s) = std::str::from_utf8(s).ok() {
+        if let Ok(s) = std::str::from_utf8(s) {
             if let Ok(n) = s.parse::<f64>() {
                 return n;
             }
@@ -230,10 +266,10 @@ fn perl_atoi(s: &str) -> i64 {
         return 0;
     }
 
-    let (negative, s) = if s.starts_with('-') {
-        (true, &s[1..])
-    } else if s.starts_with('+') {
-        (false, &s[1..])
+    let (negative, s) = if let Some(s) = s.strip_prefix('-') {
+        (true, s)
+    } else if let Some(s) = s.strip_prefix('+') {
+        (false, s)
     } else {
         (false, s)
     };
@@ -249,7 +285,7 @@ fn perl_atoi(s: &str) -> i64 {
         return if negative { -val } else { val };
     }
 
-    // Octal
+    // Binary
     if s.starts_with("0b") || s.starts_with("0B") {
         let bin = &s[2..];
         let end = bin.find(|c: char| c != '0' && c != '1').unwrap_or(bin.len());
@@ -260,8 +296,7 @@ fn perl_atoi(s: &str) -> i64 {
         return if negative { -val } else { val };
     }
 
-    // Decimal (with leading 0 still decimal in numeric context, unlike Perl's
-    // oct() function — Perl's implicit numeric conversion treats "010" as 10)
+    // Decimal
     let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     if end == 0 {
         return 0;
@@ -273,14 +308,8 @@ fn perl_atoi(s: &str) -> i64 {
 /// Parse as much of the leading portion of `s` as a valid float.
 /// Returns 0.0 if no leading numeric content.
 fn perl_atof(s: &str) -> f64 {
-    let s = s.trim_start();
-    if s.is_empty() {
-        return 0.0;
-    }
-
-    // Find the longest prefix that looks like a float
-    let mut end = 0;
     let bytes = s.as_bytes();
+    let mut end = 0;
 
     // Optional sign
     if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
@@ -328,7 +357,7 @@ impl Default for PerlString {
 
 impl fmt::Debug for PerlString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(s) = self.as_str() { write!(f, "PerlString({:?}, utf8)", s) } else { write!(f, "PerlString({:?}, bytes)", self.buf) }
+        if let Some(s) = self.as_str() { write!(f, "PerlString({:?}, utf8)", s) } else { write!(f, "PerlString({:?}, bytes)", self.as_bytes()) }
     }
 }
 
@@ -351,7 +380,7 @@ impl From<&str> for PerlString {
 
 impl From<String> for PerlString {
     fn from(s: String) -> Self {
-        PerlString { buf: s.into_bytes(), is_utf8: true }
+        PerlString { buf: Bytes::from(s.into_bytes()), is_utf8: true }
     }
 }
 
@@ -404,7 +433,7 @@ mod tests {
     #[test]
     fn push_bytes_clears_utf8() {
         let mut s = PerlString::from_str("hello");
-        s.push_bytes(&[0xff]);
+        s.push_bytes([0xff]);
         assert!(!s.is_utf8());
         assert_eq!(s.as_str(), None);
     }
@@ -478,7 +507,7 @@ mod tests {
 
     #[test]
     fn parse_nv_basic() {
-        assert!((PerlString::from_str("3.14").parse_nv() - 3.14).abs() < 1e-10);
+        assert!((PerlString::from_str("3.125").parse_nv() - 3.125).abs() < 1e-10);
         assert!((PerlString::from_str("-2.5").parse_nv() - (-2.5)).abs() < 1e-10);
         assert!((PerlString::from_str("1e3").parse_nv() - 1000.0).abs() < 1e-10);
         assert!((PerlString::from_str("  42.5abc").parse_nv() - 42.5).abs() < 1e-10);
@@ -539,5 +568,49 @@ mod tests {
         // This is intentional — internal representation equality,
         // not Perl-level equality (which is handled by the runtime).
         assert_ne!(a, c);
+    }
+
+    // ── Bytes-specific tests ──────────────────────────────────
+
+    #[test]
+    fn clone_is_shared() {
+        let a = PerlString::from_str("hello world, this is a longer string");
+        let b = a.clone();
+        // Both should point to the same underlying buffer.
+        assert_eq!(a.as_bytes().as_ptr(), b.as_bytes().as_ptr());
+    }
+
+    #[test]
+    fn bytes_returns_shared_handle() {
+        let s = PerlString::from_str("hello");
+        let b = s.bytes();
+        assert_eq!(&b[..], b"hello");
+        // Original is still usable.
+        assert_eq!(s.as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn into_bytes_returns_bytes() {
+        let s = PerlString::from_str("hello");
+        let b: Bytes = s.into_bytes();
+        assert_eq!(&b[..], b"hello");
+    }
+
+    #[test]
+    fn truncate_is_zero_copy() {
+        let s = PerlString::from_str("hello world");
+        let original_ptr = s.as_bytes().as_ptr();
+        let mut t = s.clone();
+        t.truncate(5);
+        // After truncation, the pointer should still reference
+        // the same underlying allocation.
+        assert_eq!(t.as_bytes().as_ptr(), original_ptr);
+        assert_eq!(t.as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn from_bytes_accepts_static_slice() {
+        let s = PerlString::from_bytes(&b"static"[..]);
+        assert_eq!(s.as_bytes(), b"static");
     }
 }

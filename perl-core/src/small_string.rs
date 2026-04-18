@@ -37,6 +37,7 @@ impl SmallString {
     /// Create a `SmallString` from a `&str`.
     ///
     /// Returns `None` if the string exceeds [`SMALL_STRING_MAX`] bytes.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         Self::from_bytes_with_flag(s.as_bytes(), true)
     }
@@ -44,7 +45,7 @@ impl SmallString {
     /// Create a `SmallString` from raw bytes (UTF-8 flag NOT set).
     ///
     /// Returns `None` if the slice exceeds [`SMALL_STRING_MAX`] bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Option<Self> {
         Self::from_bytes_with_flag(bytes, false)
     }
 
@@ -55,7 +56,8 @@ impl SmallString {
     /// # Safety (logical)
     ///
     /// If `is_utf8` is `true`, the caller must ensure `bytes` is valid UTF-8.
-    pub fn from_bytes_with_flag(bytes: &[u8], is_utf8: bool) -> Option<Self> {
+    pub fn from_bytes_with_flag(bytes: impl AsRef<[u8]>, is_utf8: bool) -> Option<Self> {
+        let bytes = bytes.as_ref();
         if bytes.len() > SMALL_STRING_MAX {
             return None;
         }
@@ -184,7 +186,7 @@ mod tests {
 
     #[test]
     fn from_bytes() {
-        let s = SmallString::from_bytes(&[0xff, 0xfe]).unwrap();
+        let s = SmallString::from_bytes([0xff, 0xfe]).unwrap();
         assert!(!s.is_utf8());
         assert_eq!(s.as_bytes(), &[0xff, 0xfe]);
         assert_eq!(s.as_str(), None);
@@ -205,7 +207,7 @@ mod tests {
         assert!(ps.is_utf8());
         assert_eq!(ps.as_str(), Some("hello"));
 
-        let ss = SmallString::from_bytes(&[0xff]).unwrap();
+        let ss = SmallString::from_bytes([0xff]).unwrap();
         let ps = ss.to_perl_string();
         assert!(!ps.is_utf8());
     }

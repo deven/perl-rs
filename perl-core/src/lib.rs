@@ -41,3 +41,8 @@ pub use scalar::Scalar;
 pub use small_string::{SMALL_STRING_MAX, SmallString};
 pub use string_slot::{PerlStringSlot, SLOT_INLINE_MAX};
 pub use value::{Av, Hv, Sv, Value};
+
+// Re-export `Bytes` so downstream crates can use the type returned
+// by `PerlString::into_bytes()` and `PerlString::bytes()` without
+// adding a separate `bytes` dependency.
+pub use bytes::Bytes;

@@ -98,6 +98,7 @@ impl Scalar {
     }
 
     /// Create a scalar from a string.  STR_VALID is set.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let mut bytes = PerlStringSlot::None;
         bytes.set_str(s);
@@ -304,7 +305,7 @@ impl Scalar {
     }
 
     /// Set the string value from raw bytes.  Sets STR_VALID, clears UTF8 + INT_VALID + NUM_VALID.
-    pub fn set_bytes(&mut self, bytes: &[u8]) {
+    pub fn set_bytes(&mut self, bytes: impl AsRef<[u8]>) {
         self.bytes.set_bytes(bytes);
         self.flags.insert(ScalarFlags::STR_VALID);
         self.flags.remove(ScalarFlags::INT_VALID | ScalarFlags::NUM_VALID | ScalarFlags::UTF8);
@@ -451,9 +452,9 @@ mod tests {
 
     #[test]
     fn from_num() {
-        let mut sv = Scalar::from_num(3.14);
+        let mut sv = Scalar::from_num(3.125);
         assert!(sv.flags().contains(ScalarFlags::NUM_VALID));
-        assert!((sv.get_num() - 3.14).abs() < 1e-10);
+        assert!((sv.get_num() - 3.125).abs() < 1e-10);
     }
 
     #[test]
@@ -592,7 +593,7 @@ mod tests {
 
     #[test]
     fn nonzero_float_is_true() {
-        let sv = Scalar::from_num(3.14);
+        let sv = Scalar::from_num(3.125);
         assert!(sv.is_true());
 
         let sv = Scalar::from_num(-0.001);
@@ -672,9 +673,9 @@ mod tests {
 
     #[test]
     fn stringify_nv() {
-        let mut sv = Scalar::from_num(3.14);
+        let mut sv = Scalar::from_num(3.125);
         let ps = sv.stringify();
-        assert_eq!(ps.as_str(), Some("3.14"));
+        assert_eq!(ps.as_str(), Some("3.125"));
     }
 
     #[test]
