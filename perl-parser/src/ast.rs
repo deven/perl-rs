@@ -110,6 +110,8 @@ pub enum ExprKind {
     IntLit(i64),
     FloatLit(f64),
     StringLit(String),
+    /// Version object literal: `v5.36.0`, `v5.26`.
+    VersionLit(String),
     /// Interpolated string: sequence of constant and interpolated parts.
     InterpolatedString(Interpolated),
     /// `qw/.../`.
@@ -193,10 +195,10 @@ pub enum ExprKind {
     AnonHash(Vec<Expr>),
     /// `sub { ... }` — anonymous sub.  Fields: prototype (raw
     /// bytes), signature (parsed 5.20+ signatures syntax), body.
-    /// Prototype and signature are mutually exclusive per-call-site;
-    /// the `signatures` feature in scope at parse time picks which
-    /// form the parentheses were parsed as.
-    AnonSub(Option<String>, Option<Signature>, Block),
+    /// Prototype, attributes, and signature are parsed per the
+    /// `signatures` feature: with signatures, attrs come before
+    /// the paren-form; without, prototype comes before attrs.
+    AnonSub(Option<String>, Vec<Attribute>, Option<Signature>, Block),
 
     // ── Calls ─────────────────────────────────────────────────
     /// Named function call: `foo(...)` or `foo ...`.

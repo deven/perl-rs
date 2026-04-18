@@ -589,6 +589,7 @@ impl Token {
             Token::IntLit(_)
                 | Token::FloatLit(_)
                 | Token::StrLit(_)
+                | Token::VersionLit(_)
                 | Token::Ident(_)
                 | Token::ScalarVar(_)
                 | Token::ArrayVar(_)
@@ -632,6 +633,7 @@ impl std::fmt::Display for Token {
             Token::IntLit(n) => write!(f, "{n}"),
             Token::FloatLit(n) => write!(f, "{n}"),
             Token::StrLit(s) => write!(f, "'{s}'"),
+            Token::VersionLit(s) => write!(f, "{s}"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::ScalarVar(s) => write!(f, "${s}"),
             Token::ArrayVar(s) => write!(f, "@{s}"),

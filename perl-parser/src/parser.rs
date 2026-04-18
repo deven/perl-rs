@@ -927,20 +927,25 @@ impl Parser {
         }
     }
 
-    /// Parse an anonymous sub expression: `sub { ... }` or `sub ($x) { ... }`.
+    /// Parse an anonymous sub expression: `sub { ... }`, `sub ($x) { ... }`,
+    /// `sub :lvalue { ... }`, `sub ($) :lvalue { ... }`, etc.
     fn parse_anon_sub(&mut self, span: Span) -> Result<Expr, ParseError> {
         let signatures_active = self.pragmas.features.contains(Features::SIGNATURES);
-        let (prototype, signature) = if signatures_active {
+        let (prototype, attributes, signature) = if signatures_active {
+            // With signatures: attributes before signature.
+            let attrs = self.parse_attributes()?;
             let sig = self.parse_signature()?;
-            (None, sig)
+            (None, attrs, sig)
         } else {
+            // Without signatures: prototype before attributes.
             let proto = self.parse_prototype()?;
-            (proto, None)
+            let attrs = self.parse_attributes()?;
+            (proto, attrs, None)
         };
 
         let body = self.parse_block()?;
 
-        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonSub(prototype, signature, body) })
+        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonSub(prototype, attributes, signature, body) })
     }
 
     // ── Control flow statements ───────────────────────────────
@@ -1143,22 +1148,22 @@ impl Parser {
                 self.eat(&Token::Semi)?;
                 return Ok(StmtKind::UseDecl(UseDecl { is_no, module: format!("{n}"), version: None, imports: None, span: start.merge(self.peek_span()) }));
             }
-            Token::StrLit(n) => {
-                // v-string: `use v5.36;` — arrives as StrLit starting "v".
-                if !is_no
-                    && n.starts_with('v')
-                    && let Some((maj, min)) = parse_v_string_version(&n)
-                {
+            Token::VersionLit(n) => {
+                // v-string: `use v5.36;` — arrives as VersionLit.
+                if !is_no && let Some((maj, min)) = parse_v_string_version(&n) {
                     self.pragmas.features.apply_version_bundle(maj, min);
                 }
                 n
             }
+            Token::StrLit(n) => n,
+            // Keywords can be module names: `use if`, `use open`, etc.
+            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
             other => return Err(ParseError::new(format!("expected module name or version, got {other:?}"), start)),
         };
 
         // Optional version after the module name: `use Module 1.23;`
         // or `use Module v5.26;`.  Versions are either numeric literals or
-        // v-string StrLit tokens; anything else starts the import list.
+        // v-string VersionLit tokens; anything else starts the import list.
         let version = match self.peek_token() {
             Token::IntLit(_) | Token::FloatLit(_) => {
                 let tok = self.next_token()?;
@@ -1168,11 +1173,11 @@ impl Parser {
                     _ => unreachable!(),
                 })
             }
-            // v-string literal like v5.26.0 — lexed as StrLit.
-            Token::StrLit(s) if s.starts_with('v') && s.len() > 1 && s.as_bytes()[1].is_ascii_digit() => {
+            // v-string literal like v5.26.0.
+            Token::VersionLit(_) => {
                 let tok = self.next_token()?;
                 Some(match tok.token {
-                    Token::StrLit(s) => s,
+                    Token::VersionLit(s) => s,
                     _ => unreachable!(),
                 })
             }
@@ -1637,6 +1642,7 @@ impl Parser {
             Token::IntLit(n) => Ok(Expr { kind: ExprKind::IntLit(n), span }),
             Token::FloatLit(n) => Ok(Expr { kind: ExprKind::FloatLit(n), span }),
             Token::StrLit(s) => Ok(Expr { kind: ExprKind::StringLit(s), span }),
+            Token::VersionLit(s) => Ok(Expr { kind: ExprKind::VersionLit(s), span }),
 
             // Interpolating string: collect sub-tokens into AST.
             Token::QuoteSublexBegin(_, _) => self.parse_interpolated_string(span),
@@ -2381,7 +2387,7 @@ impl Parser {
                     let arg = if i == 0 && self.at(&Token::LeftBrace)? {
                         let block = self.parse_block()?;
                         let span = block.span;
-                        Expr { kind: ExprKind::AnonSub(None, None, block), span }
+                        Expr { kind: ExprKind::AnonSub(None, vec![], None, block), span }
                     } else {
                         self.parse_expr(PREC_NAMED_UNARY)?
                     };
@@ -2655,7 +2661,7 @@ impl Parser {
             // Check for block as first arg inside parens
             if self.at(&Token::LeftBrace)? {
                 let block = self.parse_block()?;
-                args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
+                args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, vec![], None, block) });
                 self.eat(&Token::Comma)?;
             }
             while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -2674,7 +2680,7 @@ impl Parser {
         // Check for block or sub name as first arg
         if self.at(&Token::LeftBrace)? {
             let block = self.parse_block()?;
-            args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, None, block) });
+            args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, vec![], None, block) });
         } else if kw == Keyword::Sort {
             // sort can also take a sub name: sort subname @list
             if let Token::Ident(_) = self.peek_token() {
@@ -5306,7 +5312,7 @@ mod tests {
     fn parse_anon_sub() {
         let e = parse_expr_str("sub { 42; };");
         match &e.kind {
-            ExprKind::AnonSub(proto, _, body) => {
+            ExprKind::AnonSub(proto, _, _, body) => {
                 assert!(proto.is_none());
                 assert_eq!(body.statements.len(), 1);
             }
@@ -5318,7 +5324,7 @@ mod tests {
     fn parse_anon_sub_with_proto() {
         let e = parse_expr_str("sub ($x) { $x + 1; };");
         match &e.kind {
-            ExprKind::AnonSub(proto, _, _) => {
+            ExprKind::AnonSub(proto, _, _, _) => {
                 assert!(proto.is_some());
             }
             other => panic!("expected AnonSub, got {other:?}"),
@@ -5329,7 +5335,7 @@ mod tests {
     fn parse_anon_sub_as_arg() {
         let prog = parse("my $f = sub { 1; };");
         let init = decl_init(&prog.statements[0]);
-        assert!(matches!(init.kind, ExprKind::AnonSub(_, _, _)));
+        assert!(matches!(init.kind, ExprKind::AnonSub(..)));
     }
 
     // ── Phaser block tests ────────────────────────────────────
@@ -5470,7 +5476,7 @@ mod tests {
             ExprKind::ListOp(name, args) => {
                 assert_eq!(name, "sort");
                 assert!(args.len() >= 2); // block + @list
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
             }
             other => panic!("expected sort ListOp, got {other:?}"),
         }
@@ -5482,7 +5488,7 @@ mod tests {
         match &e.kind {
             ExprKind::ListOp(name, args) => {
                 assert_eq!(name, "map");
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
             }
             other => panic!("expected map ListOp, got {other:?}"),
         }
@@ -5494,7 +5500,7 @@ mod tests {
         match &e.kind {
             ExprKind::ListOp(name, args) => {
                 assert_eq!(name, "grep");
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
             }
             other => panic!("expected grep ListOp, got {other:?}"),
         }
@@ -6265,8 +6271,8 @@ mod tests {
     fn parse_vstring_as_expr() {
         let e = parse_expr_str("v5.26;");
         match &e.kind {
-            ExprKind::StringLit(s) => assert_eq!(s, "v5.26"),
-            other => panic!("expected StringLit(\"v5.26\"), got {other:?}"),
+            ExprKind::VersionLit(s) => assert_eq!(s, "v5.26"),
+            other => panic!("expected VersionLit(\"v5.26\"), got {other:?}"),
         }
     }
 
@@ -6274,8 +6280,8 @@ mod tests {
     fn parse_vstring_no_dots() {
         let e = parse_expr_str("v5;");
         match &e.kind {
-            ExprKind::StringLit(s) => assert_eq!(s, "v5"),
-            other => panic!("expected StringLit(\"v5\"), got {other:?}"),
+            ExprKind::VersionLit(s) => assert_eq!(s, "v5"),
+            other => panic!("expected VersionLit(\"v5\"), got {other:?}"),
         }
     }
 
@@ -6674,7 +6680,7 @@ sub outer ($x) { 1 }
 
     fn walk_expr(expr: &Expr, found: &mut bool) {
         match &expr.kind {
-            ExprKind::AnonSub(_, Some(sig), _) => {
+            ExprKind::AnonSub(_, _, Some(sig), _) => {
                 assert_eq!(sig.params.len(), 1);
                 *found = true;
             }
@@ -10903,7 +10909,7 @@ OUTER\n";
             ExprKind::ListOp(name, args) => {
                 assert_eq!(name, "map");
                 // First arg is the block (as AnonSub).
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)), "expected AnonSub block, got {:?}", args[0].kind);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)), "expected AnonSub block, got {:?}", args[0].kind);
             }
             other => panic!("expected map ListOp, got {other:?}"),
         }
@@ -10918,7 +10924,7 @@ OUTER\n";
                 assert_eq!(name, "map");
                 // Outer: AnonSub wrapping the block.
                 let body = match &args[0].kind {
-                    ExprKind::AnonSub(_, _, block) => block,
+                    ExprKind::AnonSub(_, _, _, block) => block,
                     other => panic!("expected AnonSub, got {other:?}"),
                 };
                 // Block body's single statement is an AnonHash expression.
@@ -10944,7 +10950,7 @@ OUTER\n";
         // `sub { { a => 1 } }` — anon sub whose body is a hash expression.
         let e = parse_expr_str("sub { { a => 1 } };");
         match &e.kind {
-            ExprKind::AnonSub(_, _, block) => {
+            ExprKind::AnonSub(_, _, _, block) => {
                 assert_eq!(block.statements.len(), 1);
                 match &block.statements[0].kind {
                     StmtKind::Expr(Expr { kind: ExprKind::AnonHash(_), .. }) => {}
@@ -11261,7 +11267,7 @@ OUTER\n";
             ExprKind::ListOp(name, args) => {
                 assert_eq!(name, "map");
                 let block = match &args[0].kind {
-                    ExprKind::AnonSub(_, _, b) => b,
+                    ExprKind::AnonSub(_, _, _, b) => b,
                     other => panic!("expected AnonSub, got {other:?}"),
                 };
                 assert_eq!(block.statements.len(), 1);
@@ -11655,7 +11661,7 @@ OUTER\n";
             ExprKind::FuncCall(name, args) => {
                 assert_eq!(name, "foo");
                 assert_eq!(args.len(), 2, "&@-proto should take block + list = 2 args");
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)), "arg 1 should be AnonSub (block), got {:?}", args[0].kind);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)), "arg 1 should be AnonSub (block), got {:?}", args[0].kind);
                 assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)), "arg 2 should be @list, got {:?}", args[1].kind);
             }
             other => panic!("expected FuncCall, got {other:?}"),
@@ -12080,7 +12086,7 @@ OUTER\n";
             ExprKind::FuncCall(name, args) => {
                 assert_eq!(name, "foo");
                 assert_eq!(args.len(), 2);
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)), "expected AnonSub, got {:?}", args[0].kind);
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)), "expected AnonSub, got {:?}", args[0].kind);
                 assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
@@ -12095,7 +12101,7 @@ OUTER\n";
         match &e.kind {
             ExprKind::FuncCall(_, args) => {
                 assert_eq!(args.len(), 2);
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
                 assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
@@ -12313,7 +12319,7 @@ OUTER\n";
         match &e.kind {
             ExprKind::FuncCall(_, args) => {
                 assert_eq!(args.len(), 2);
-                assert!(matches!(args[1].kind, ExprKind::AnonSub(_, _, _)), "expected AnonSub, got {:?}", args[1].kind);
+                assert!(matches!(args[1].kind, ExprKind::AnonSub(..)), "expected AnonSub, got {:?}", args[1].kind);
             }
             other => panic!("expected FuncCall, got {other:?}"),
         }
@@ -12341,7 +12347,7 @@ OUTER\n";
         match &e.kind {
             ExprKind::FuncCall(_, args) => {
                 assert_eq!(args.len(), 1);
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
         }
@@ -12355,7 +12361,7 @@ OUTER\n";
         match &e.kind {
             ExprKind::FuncCall(_, args) => {
                 assert_eq!(args.len(), 2);
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
                 assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
@@ -12415,7 +12421,7 @@ OUTER\n";
         match &e.kind {
             ExprKind::FuncCall(_, args) => {
                 assert_eq!(args.len(), 2);
-                assert!(matches!(args[0].kind, ExprKind::AnonSub(_, _, _)));
+                assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
                 assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
             }
             other => panic!("expected FuncCall, got {other:?}"),
@@ -13187,5 +13193,91 @@ OUTER\n";
     fn dump_with_label() {
         let prog = parse("dump RESTART;");
         assert!(!prog.statements.is_empty(), "should parse dump LABEL");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Remaining audit gaps — probing tests
+    // ═══════════════════════════════════════════════════════════
+
+    // ── M9. x= compound assignment ───────────────────────────
+
+    #[test]
+    fn repeat_assign() {
+        // `$str x= 3` — compound repeat-assignment.
+        let e = parse_expr_str("$str x= 3;");
+        assert!(matches!(e.kind, ExprKind::Assign(AssignOp::RepeatEq, _, _)), "expected RepeatEq assign, got {:?}", e.kind);
+    }
+
+    // ── H11. v-strings as dedicated AST node ─────────────────
+
+    #[test]
+    fn vstring_produces_version_lit() {
+        // `v5.36.0` should produce VersionLit.
+        let e = parse_expr_str("v5.36.0;");
+        match &e.kind {
+            ExprKind::VersionLit(s) => assert_eq!(s, "v5.36.0"),
+            other => panic!("expected VersionLit(\"v5.36.0\"), got {other:?}"),
+        }
+    }
+
+    // ── L8. <<\"\" empty heredoc tag ──────────────────────────
+
+    #[test]
+    fn heredoc_empty_tag_double_quoted() {
+        // `<<""` — empty string as terminator, body ends at empty line.
+        let prog = parse("print <<\"\";\nhello\nworld\n\n");
+        assert!(!prog.statements.is_empty(), "should parse <<\"\" empty tag heredoc");
+    }
+
+    #[test]
+    fn heredoc_empty_tag_single_quoted() {
+        let prog = parse("print <<'';\nhello\n$not_interp\n\n");
+        assert!(!prog.statements.is_empty(), "should parse <<'' empty tag heredoc");
+    }
+
+    #[test]
+    fn heredoc_indented_empty_tag() {
+        // `<<~""` with indented body.
+        let prog = parse("print <<~\"\";\n  hello\n  world\n  \n");
+        assert!(!prog.statements.is_empty(), "should parse <<~\"\" indented empty tag heredoc");
+    }
+
+    // ── M14. Anonymous sub with prototype AND attributes ─────
+
+    #[test]
+    fn sub_proto_then_attrs() {
+        // `sub ($) :lvalue { 1 }` — prototype before attributes.
+        let prog = parse("my $f = sub ($) :lvalue { 1; };");
+        assert!(!prog.statements.is_empty(), "should parse sub with proto then attrs");
+    }
+
+    #[test]
+    fn sub_attrs_then_sig() {
+        // With signatures active: `sub :lvalue ($x) { }`.
+        let prog = parse("use feature 'signatures'; my $f = sub :lvalue ($x) { 1; };");
+        assert!(!prog.statements.is_empty(), "should parse sub with attrs then sig");
+    }
+
+    // ── L3. use if — conditional use pragma ──────────────────
+
+    #[test]
+    fn use_if_conditional() {
+        // `use if $cond, "Module"` — the `if` module.
+        let prog = parse("use if $^O eq 'MSWin32', 'Win32';");
+        assert!(!prog.statements.is_empty(), "should parse use if");
+    }
+
+    // ── L4. use Module qw(imports) ───────────────────────────
+
+    #[test]
+    fn use_module_with_qw_imports() {
+        let prog = parse("use POSIX qw(setlocale LC_ALL);");
+        assert!(!prog.statements.is_empty(), "should parse use with qw import list");
+    }
+
+    #[test]
+    fn use_module_with_list_imports() {
+        let prog = parse("use File::Basename 'dirname', 'basename';");
+        assert!(!prog.statements.is_empty(), "should parse use with string import list");
     }
 }
