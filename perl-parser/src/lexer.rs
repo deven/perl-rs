@@ -1705,7 +1705,16 @@ impl Lexer {
                     break;
                 }
             }
-            return Ok(Token::StrLit(vstr));
+            return Ok(Token::VersionLit(vstr));
+        }
+
+        // `x=` compound assignment: when the identifier is exactly "x"
+        // and the immediately next byte (no whitespace — scan_ident
+        // stopped at a non-ident char) is `=` not followed by `>`
+        // (which would be `x =>`, a fat comma), emit RepeatEq.
+        if name == "x" && self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) != Some(b'>') {
+            self.skip(1); // consume =
+            return Ok(Token::Assign(AssignOp::RepeatEq));
         }
 
         // Keywords
@@ -2820,8 +2829,6 @@ impl Lexer {
     /// Lex a heredoc tag and start body processing via LexerSource.
     /// Position is after `<<` (and optional `~`), at the tag start.
     fn lex_heredoc(&mut self, indented: bool) -> Result<Token, ParseError> {
-        let start = self.line_pos();
-
         // Determine quoting style and extract tag.
         let (kind, tag) = match self.peek_byte(false) {
             Some(b'\'') => {
@@ -2863,9 +2870,8 @@ impl Lexer {
             }
         };
 
-        if tag.is_empty() {
-            return Err(ParseError::new("empty heredoc tag", self.span_from(start)));
-        }
+        // Empty tag is valid for quoted forms: <<""  and <<''
+        // produce a heredoc terminated by an empty line.
 
         let tag_bytes = Bytes::from(tag.as_bytes().to_vec());
 
@@ -5282,5 +5288,27 @@ mod tests {
         let src = "qq\n\n# testing\n\n=swd;fkjasfd;klj\\n=;";
         let tokens = lex_all(src);
         assert!(!matches!(tokens[0], Token::Ident(ref s) if s == "qq"), "qq should be a quote op after comment skip; got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_repeat_assign_adjacent() {
+        // `x=` adjacent → single RepeatEq token.
+        let tokens = lex_all("$s x= 3;");
+        assert!(tokens.contains(&Token::Assign(AssignOp::RepeatEq)), "x= should produce RepeatEq; got {:?}", tokens);
+    }
+
+    #[test]
+    fn lex_repeat_assign_with_space() {
+        // `x =` with space → Ident("x") then Assign(Eq), NOT RepeatEq.
+        let tokens = lex_all("$s x = 3;");
+        assert!(!tokens.contains(&Token::Assign(AssignOp::RepeatEq)), "x = (with space) should NOT produce RepeatEq; got {:?}", tokens);
+        assert!(tokens.contains(&Token::Ident("x".into())), "x should be Ident; got {:?}", tokens);
+    }
+
+    #[test]
+    fn lex_x_fat_comma_not_repeat_assign() {
+        // `x =>` should autoquote x, not produce RepeatEq.
+        let tokens = lex_all("x => 1;");
+        assert!(!tokens.contains(&Token::Assign(AssignOp::RepeatEq)), "x => should NOT produce RepeatEq; got {:?}", tokens);
     }
 }
