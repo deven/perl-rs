@@ -417,13 +417,31 @@ impl Parser {
                                 Keyword::State => DeclScope::State,
                                 _ => unreachable!(),
                             };
-                            let expr = self.with_descent(|this| {
-                                let initial = this.parse_decl_expr(scope, kw_span)?;
-                                this.parse_expr_continuation(initial, PREC_LOW)
-                            })?;
-                            let kind = self.maybe_postfix_control(expr)?;
-                            let terminated = self.eat(&Token::Semi)?;
-                            (kind, terminated)
+                            // `my sub foo { }`, `state sub foo { }`, `our sub foo { }`
+                            if self.eat(&Token::Keyword(Keyword::Sub))? {
+                                if matches!(self.peek_token(), Token::Ident(_)) {
+                                    let (kind, _) = (self.parse_sub_decl_body(kw_span)?, false);
+                                    // Patch the scope onto the SubDecl.
+                                    let kind = match kind {
+                                        StmtKind::SubDecl(mut sd) => {
+                                            sd.scope = Some(scope);
+                                            StmtKind::SubDecl(sd)
+                                        }
+                                        other => other,
+                                    };
+                                    (kind, false)
+                                } else {
+                                    return Err(ParseError::new("expected sub name after my/our/state sub", self.peek_span()));
+                                }
+                            } else {
+                                let expr = self.with_descent(|this| {
+                                    let initial = this.parse_decl_expr(scope, kw_span)?;
+                                    this.parse_expr_continuation(initial, PREC_LOW)
+                                })?;
+                                let kind = self.maybe_postfix_control(expr)?;
+                                let terminated = self.eat(&Token::Semi)?;
+                                (kind, terminated)
+                            }
                         }
                         Keyword::Sub => {
                             if matches!(self.peek_token(), Token::Ident(_)) {
@@ -601,14 +619,14 @@ impl Parser {
         };
 
         match self.next_token()?.token {
-            Token::ScalarVar(name) => Ok(VarDecl { sigil: Sigil::Scalar, name, span, is_ref }),
-            Token::ArrayVar(name) => Ok(VarDecl { sigil: Sigil::Array, name, span, is_ref }),
-            Token::HashVar(name) => Ok(VarDecl { sigil: Sigil::Hash, name, span, is_ref }),
+            Token::ScalarVar(name) => Ok(VarDecl { sigil: Sigil::Scalar, name, span, attributes: vec![], is_ref }),
+            Token::ArrayVar(name) => Ok(VarDecl { sigil: Sigil::Array, name, span, attributes: vec![], is_ref }),
+            Token::HashVar(name) => Ok(VarDecl { sigil: Sigil::Hash, name, span, attributes: vec![], is_ref }),
             Token::Percent => {
                 // my %hash — lexer emitted Percent; read the hash name.
                 match self.lexer.lex_hash_var_after_percent()? {
-                    Some(Token::HashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, is_ref }),
-                    Some(Token::SpecialHashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, is_ref }),
+                    Some(Token::HashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, attributes: vec![], is_ref }),
+                    Some(Token::SpecialHashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, attributes: vec![], is_ref }),
                     _ => Err(ParseError::new("expected hash variable name after %", span)),
                 }
             }
@@ -675,7 +693,7 @@ impl Parser {
             // that's a separate AST change.
             let span = start.merge(self.peek_span());
             let body = Block { statements: Vec::new(), span };
-            return Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, signature, body, span }));
+            return Ok(StmtKind::SubDecl(SubDecl { name, scope: None, prototype: prototype_raw, attributes, signature, body, span }));
         }
 
         let body = self.parse_block()?;
@@ -685,7 +703,7 @@ impl Parser {
         let attr_names: Vec<String> = attributes.iter().map(|a| a.name.clone()).collect();
         self.symbols.entry(&self.current_package.clone()).declare_sub(&name, prototype_parsed, attr_names, false);
 
-        Ok(StmtKind::SubDecl(SubDecl { name, prototype: prototype_raw, attributes, signature, body, span: start.merge(self.peek_span()) }))
+        Ok(StmtKind::SubDecl(SubDecl { name, scope: None, prototype: prototype_raw, attributes, signature, body, span: start.merge(self.peek_span()) }))
     }
 
     /// Parse an optional prototype: `($$)`, `(\@\%)`, etc.
@@ -745,7 +763,7 @@ impl Parser {
                     SigParam::Scalar { span, .. } => *span,
                     SigParam::SlurpyArray { span, .. } => *span,
                     SigParam::SlurpyHash { span, .. } => *span,
-                    SigParam::AnonScalar { span } => *span,
+                    SigParam::AnonScalar { span, .. } => *span,
                     SigParam::AnonArray { span } => *span,
                     SigParam::AnonHash { span } => *span,
                 };
@@ -791,10 +809,10 @@ impl Parser {
     ///   a `Dollar` + synthetic delimiter.
     fn parse_sig_param(&mut self) -> Result<SigParam, ParseError> {
         // Intercept `SpecialVar(c)` where `c` is a signature
-        // separator — splits into anon scalar + delimiter.
+        // separator or `=` — splits into anon scalar + delimiter.
         if let Token::SpecialVar(name) = self.peek_token()
             && name.len() == 1
-            && matches!(name.as_bytes()[0], b',' | b')')
+            && matches!(name.as_bytes()[0], b',' | b')' | b'=')
         {
             let tok = self.next_token()?;
             let span = tok.span;
@@ -802,6 +820,16 @@ impl Parser {
                 Token::SpecialVar(n) => n.as_bytes()[0],
                 _ => unreachable!(),
             };
+            if delim_byte == b'=' {
+                // `$=` — nameless optional.  Check for default expr.
+                if self.at(&Token::RightParen)? || self.at(&Token::Comma)? {
+                    // `$=)` or `$=,` — no default expression.
+                    return Ok(SigParam::AnonScalar { default: Some((SigDefaultKind::Eq, Expr { kind: ExprKind::Undef, span })), span });
+                }
+                // `$ = expr` — has default expression.
+                let default_expr = self.parse_expr(PREC_COMMA + 1)?;
+                return Ok(SigParam::AnonScalar { default: Some((SigDefaultKind::Eq, default_expr)), span: span.merge(self.peek_span()) });
+            }
             let delim_tok = match delim_byte {
                 b',' => Token::Comma,
                 b')' => Token::RightParen,
@@ -810,18 +838,22 @@ impl Parser {
             // Push the delimiter into the lookahead cache so the
             // outer loop in parse_signature sees it next.
             self.current = Some(Spanned { token: delim_tok, span });
-            return Ok(SigParam::AnonScalar { span });
+            return Ok(SigParam::AnonScalar { default: None, span });
         }
 
         let tok = self.next_token()?;
         let span = tok.span;
         match tok.token {
             Token::ScalarVar(name) => {
-                let default = if self.eat(&Token::Assign(AssignOp::Eq))? { Some(self.parse_expr(PREC_COMMA + 1)?) } else { None };
+                let default = self.parse_sig_default()?;
                 Ok(SigParam::Scalar { name, default, span: span.merge(self.peek_span()) })
             }
             Token::ArrayVar(name) => Ok(SigParam::SlurpyArray { name, span }),
-            Token::Dollar => Ok(SigParam::AnonScalar { span }),
+            Token::Dollar => {
+                // Bare `$` — anonymous scalar.  May have a default.
+                let default = self.parse_sig_default()?;
+                Ok(SigParam::AnonScalar { default, span: span.merge(self.peek_span()) })
+            }
             Token::At => Ok(SigParam::AnonArray { span }),
             Token::Percent => {
                 // Either anon hash placeholder or named slurpy
@@ -837,6 +869,21 @@ impl Parser {
             }
             other => Err(ParseError::new(format!("expected signature parameter, got {other:?}"), span)),
         }
+    }
+
+    /// Parse an optional default value in a signature: `= expr`, `//= expr`, `||= expr`.
+    fn parse_sig_default(&mut self) -> Result<Option<(SigDefaultKind, Expr)>, ParseError> {
+        let kind = if self.eat(&Token::Assign(AssignOp::Eq))? {
+            SigDefaultKind::Eq
+        } else if self.eat(&Token::Assign(AssignOp::DefinedOrEq))? {
+            SigDefaultKind::DefinedOr
+        } else if self.eat(&Token::Assign(AssignOp::OrEq))? {
+            SigDefaultKind::LogicalOr
+        } else {
+            return Ok(None);
+        };
+        let expr = self.parse_expr(PREC_COMMA + 1)?;
+        Ok(Some((kind, expr)))
     }
 
     fn parse_attributes(&mut self) -> Result<Vec<Attribute>, ParseError> {
@@ -920,7 +967,12 @@ impl Parser {
             Ok(Expr { kind: ExprKind::Decl(scope, vars), span: span.merge(end) })
         } else {
             // Single variable: my $x, my @arr, my %hash
-            let var = self.parse_single_var_decl()?;
+            // Optional attributes: my $x : Foo
+            let mut var = self.parse_single_var_decl()?;
+            let attrs = self.parse_attributes()?;
+            if !attrs.is_empty() {
+                var.attributes = attrs;
+            }
             let end = var.span;
             vars.push(var);
             Ok(Expr { kind: ExprKind::Decl(scope, vars), span: span.merge(end) })
@@ -1075,7 +1127,7 @@ impl Parser {
                 Token::ScalarVar(n) => n,
                 _ => unreachable!(),
             };
-            vec![VarDecl { sigil: Sigil::Scalar, name, span, is_ref: false }]
+            vec![VarDecl { sigil: Sigil::Scalar, name, span, attributes: vec![], is_ref: false }]
         } else {
             vec![]
         };
@@ -1435,7 +1487,7 @@ impl Parser {
 
         let body = self.parse_block()?;
 
-        Ok(StmtKind::MethodDecl(SubDecl { name, prototype, attributes, signature, body, span: start.merge(self.peek_span()) }))
+        Ok(StmtKind::MethodDecl(SubDecl { name, scope: None, prototype, attributes, signature, body, span: start.merge(self.peek_span()) }))
     }
 
     // ── Expression statements ─────────────────────────────────
@@ -6580,7 +6632,7 @@ mod tests {
         let s = parse_sub("use feature 'signatures'; sub f ($x = 42) { }");
         let sig = s.signature.expect("signature present");
         match &sig.params[0] {
-            SigParam::Scalar { name, default: Some(d), .. } => {
+            SigParam::Scalar { name, default: Some((_, d)), .. } => {
                 assert_eq!(name, "x");
                 assert!(matches!(d.kind, ExprKind::IntLit(42)));
             }
@@ -13497,5 +13549,93 @@ OUTER\n";
     fn hex_float_expr() {
         let e = parse_expr_str("0x1p10;");
         assert!(matches!(e.kind, ExprKind::FloatLit(v) if v == 1024.0), "expected FloatLit(1024.0), got {:?}", e.kind);
+    }
+
+    // ── perlsub: //= and ||= signature defaults (5.38+) ─────
+
+    #[test]
+    fn sig_defined_or_default() {
+        let s = parse_sub("use feature 'signatures'; sub f ($name //= \"world\") { }");
+        let sig = s.signature.expect("signature present");
+        match &sig.params[0] {
+            SigParam::Scalar { name, default: Some((kind, _)), .. } => {
+                assert_eq!(name, "name");
+                assert_eq!(*kind, SigDefaultKind::DefinedOr);
+            }
+            other => panic!("expected Scalar with //= default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_logical_or_default() {
+        let s = parse_sub("use feature 'signatures'; sub f ($x ||= 10) { }");
+        let sig = s.signature.expect("signature present");
+        match &sig.params[0] {
+            SigParam::Scalar { name, default: Some((kind, _)), .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(*kind, SigDefaultKind::LogicalOr);
+            }
+            other => panic!("expected Scalar with ||= default, got {other:?}"),
+        }
+    }
+
+    // ── perlsub: $= in signatures ───────────────────────────
+
+    #[test]
+    fn sig_anon_optional_no_default() {
+        let s = parse_sub("use feature 'signatures'; sub f ($thing, $=) { }");
+        let sig = s.signature.expect("signature present");
+        assert_eq!(sig.params.len(), 2);
+        assert!(matches!(sig.params[1], SigParam::AnonScalar { default: Some(_), .. }), "expected AnonScalar with default, got {:?}", sig.params[1]);
+    }
+
+    // ── perlsub: lexical subs ───────────────────────────────
+
+    #[test]
+    fn my_sub() {
+        let prog = parse("my sub foo { 42; }");
+        match &prog.statements[0].kind {
+            StmtKind::SubDecl(sd) => {
+                assert_eq!(sd.name, "foo");
+                assert_eq!(sd.scope, Some(DeclScope::My));
+            }
+            other => panic!("expected SubDecl(my), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_sub() {
+        let prog = parse("use feature 'state'; state sub bar { 1; }");
+        match &prog.statements[1].kind {
+            StmtKind::SubDecl(sd) => {
+                assert_eq!(sd.name, "bar");
+                assert_eq!(sd.scope, Some(DeclScope::State));
+            }
+            other => panic!("expected SubDecl(state), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn our_sub() {
+        let prog = parse("our sub baz { 1; }");
+        match &prog.statements[0].kind {
+            StmtKind::SubDecl(sd) => {
+                assert_eq!(sd.name, "baz");
+                assert_eq!(sd.scope, Some(DeclScope::Our));
+            }
+            other => panic!("expected SubDecl(our), got {other:?}"),
+        }
+    }
+
+    // ── perlsub: my with attributes ─────────────────────────
+
+    #[test]
+    fn my_var_with_attribute() {
+        let prog = parse("my $x : Shared = 1;");
+        let (scope, vars) = decl_vars(&prog.statements[0]);
+        assert_eq!(scope, DeclScope::My);
+        assert_eq!(vars[0].name, "x");
+        assert_eq!(vars[0].attributes.len(), 1);
+        assert_eq!(vars[0].attributes[0].name, "Shared");
     }
 }

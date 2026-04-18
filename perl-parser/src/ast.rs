@@ -512,6 +512,8 @@ pub struct VarDecl {
     pub sigil: Sigil,
     pub name: String,
     pub span: Span,
+    /// Attributes on the variable declaration: `my $x : Foo`.
+    pub attributes: Vec<Attribute>,
     /// Reference-declaration form: `my \$x` binds `$x` as an alias
     /// (via the `declared_refs` feature, 5.26+).  The RHS of the
     /// enclosing assignment must be a matching reference.  When
@@ -523,6 +525,9 @@ pub struct VarDecl {
 #[derive(Clone, Debug)]
 pub struct SubDecl {
     pub name: String,
+    /// Lexical scope for `my sub`, `state sub`, `our sub`.
+    /// `None` for regular package subs.
+    pub scope: Option<DeclScope>,
     /// Paren-form prototype from pre-signatures Perl (e.g. `($$)`,
     /// `(\@\%)`).  Stored as raw bytes.  Mutually exclusive with
     /// `signature` (the `signatures` feature controls which path
@@ -552,11 +557,9 @@ pub struct Signature {
 /// One parameter in a signature.
 #[derive(Clone, Debug)]
 pub enum SigParam {
-    /// `$name`, or `$name = DEFAULT`.  Positional.  When
-    /// `default` is `None`, the parameter is required; otherwise
-    /// it's optional and the expression evaluates at call time if
-    /// the caller didn't supply a value.
-    Scalar { name: String, default: Option<Expr>, span: Span },
+    /// `$name`, `$name = DEFAULT`, `$name //= DEFAULT`, `$name ||= DEFAULT`.
+    /// Positional.  When `default` is `None`, the parameter is required.
+    Scalar { name: String, default: Option<(SigDefaultKind, Expr)>, span: Span },
     /// `@name` — slurpy, captures all remaining positional
     /// arguments.  Must appear last if at all.
     SlurpyArray { name: String, span: Span },
@@ -564,13 +567,24 @@ pub enum SigParam {
     /// Must appear last if at all.
     SlurpyHash { name: String, span: Span },
     /// `$` — anonymous scalar placeholder; accepts a value without
-    /// binding it.
-    AnonScalar { span: Span },
+    /// binding it.  Optional `default` for `$ = expr` or `$=` forms.
+    AnonScalar { default: Option<(SigDefaultKind, Expr)>, span: Span },
     /// `@` — anonymous slurpy array (consumes remaining positional
     /// args without binding).
     AnonArray { span: Span },
     /// `%` — anonymous slurpy hash.
     AnonHash { span: Span },
+}
+
+/// The kind of default-value operator in a signature parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigDefaultKind {
+    /// `= expr` — use default when argument is not provided.
+    Eq,
+    /// `//= expr` — use default when argument is missing or undef (5.38+).
+    DefinedOr,
+    /// `||= expr` — use default when argument is missing or false (5.38+).
+    LogicalOr,
 }
 
 /// Attribute on a sub or variable.
