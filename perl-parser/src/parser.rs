@@ -3420,14 +3420,39 @@ impl Parser {
                     Err(ParseError::new("expected *, [indices], or {keys} after ->%", self.peek_span()))
                 }
             }
-            // `->&*` — code-ref deref.  The lexer emits `BitAnd`
-            // for a bare `&` in expression position.
+            // `->&*` — code-ref postfix deref.
+            // `->&method` or `->&method(args)` — lexical method
+            // invocation (resolved at compile time, not via package
+            // inheritance).  The `&` prefix in the name signals
+            // lexical resolution to the compiler.
             Token::BitAnd => {
                 self.next_token()?;
                 if self.eat(&Token::Star)? {
                     Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefCode) })
                 } else {
-                    Err(ParseError::new("expected * after ->&", self.peek_span()))
+                    // Lexical method: ->&name or ->&name(args)
+                    let method_name = match self.peek_token().clone() {
+                        Token::Ident(name) => name,
+                        Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+                        other => return Err(ParseError::new(format!("expected * or method name after ->&, got {other:?}"), self.peek_span())),
+                    };
+                    self.next_token()?;
+                    let name = format!("&{method_name}");
+                    if self.at(&Token::LeftParen)? {
+                        self.next_token()?;
+                        let mut args = Vec::new();
+                        while !self.at(&Token::RightParen)? && !self.at_eof()? {
+                            args.push(self.parse_expr(PREC_COMMA + 1)?);
+                            if !self.eat(&Token::Comma)? {
+                                break;
+                            }
+                        }
+                        let end = self.peek_span();
+                        self.expect_token(&Token::RightParen)?;
+                        Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), name, args) })
+                    } else {
+                        Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::MethodCall(Box::new(left), name, vec![]) })
+                    }
                 }
             }
             // `->**` — glob deref.  Two consecutive `*`s; the
@@ -13279,5 +13304,56 @@ OUTER\n";
     fn use_module_with_list_imports() {
         let prog = parse("use File::Basename 'dirname', 'basename';");
         assert!(!prog.statements.is_empty(), "should parse use with string import list");
+    }
+
+    // ── Backtick heredocs ────────────────────────────────────
+
+    #[test]
+    fn heredoc_backtick() {
+        // <<`EOC` — command heredoc (interpolated, then executed).
+        let prog = parse("my $out = <<`EOC`;\necho hello\nEOC\n");
+        assert!(!prog.statements.is_empty(), "should parse backtick heredoc");
+    }
+
+    #[test]
+    fn heredoc_backtick_indented() {
+        // <<~`EOC` — indented command heredoc.
+        let prog = parse("my $out = <<~`EOC`;\n  echo hello\n  EOC\n");
+        assert!(!prog.statements.is_empty(), "should parse indented backtick heredoc");
+    }
+
+    // ── Lexical method invocation (->&method) ────────────────
+
+    #[test]
+    fn arrow_lexical_method() {
+        // `$obj->&method` — lexical method invocation.
+        let e = parse_expr_str("$obj->&method;");
+        match &e.kind {
+            ExprKind::MethodCall(_, name, args) => {
+                assert_eq!(name, "&method");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected MethodCall(&method), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrow_lexical_method_with_args() {
+        // `$obj->&method(1, 2)` — with arguments.
+        let e = parse_expr_str("$obj->&method(1, 2);");
+        match &e.kind {
+            ExprKind::MethodCall(_, name, args) => {
+                assert_eq!(name, "&method");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected MethodCall(&method, 2 args), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrow_deref_code_still_works() {
+        // `->&*` should still work as code postfix deref.
+        let e = parse_expr_str("$ref->&*;");
+        assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefCode)), "expected DerefCode, got {:?}", e.kind);
     }
 }

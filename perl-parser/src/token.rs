@@ -211,9 +211,6 @@ pub enum AssignOp {
     ShiftLeftEq,    // <<=
     ShiftRightEq,   // >>=
     RepeatEq,       // x=
-    BandEq,         // &.=   (string bitand)
-    BorEq,          // |.=   (string bitor)
-    BxorEq,         // ^.=   (string bitxor)
 }
 
 /// Tokens emitted by the lexer.

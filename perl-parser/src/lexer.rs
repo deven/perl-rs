@@ -2813,7 +2813,7 @@ impl Lexer {
         }
 
         match self.peek_byte(false) {
-            Some(b'"') | Some(b'\'') | Some(b'\\') => Ok(Some(self.lex_heredoc(indented)?)),
+            Some(b'"') | Some(b'\'') | Some(b'\\') | Some(b'`') => Ok(Some(self.lex_heredoc(indented)?)),
             Some(b) if b == b'_' || b.is_ascii_alphabetic() => Ok(Some(self.lex_heredoc(indented)?)),
             _ => {
                 // No valid tag — rewind to just after << so the
@@ -2830,33 +2830,39 @@ impl Lexer {
     /// Position is after `<<` (and optional `~`), at the tag start.
     fn lex_heredoc(&mut self, indented: bool) -> Result<Token, ParseError> {
         // Determine quoting style and extract tag.
-        let (kind, tag) = match self.peek_byte(false) {
+        // `command` tracks backtick quoting (interpolated + executed).
+        let (kind, tag, command) = match self.peek_byte(false) {
             Some(b'\'') => {
                 // <<'TAG' — literal
                 self.skip(1);
                 let tag = self.scan_heredoc_tag(b'\'')?;
                 let k = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
-                (k, tag)
+                (k, tag, false)
             }
             Some(b'"') => {
                 // <<"TAG" — interpolating (explicit)
                 self.skip(1);
                 let tag = self.scan_heredoc_tag(b'"')?;
                 let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
-                (k, tag)
+                (k, tag, false)
+            }
+            Some(b'`') => {
+                // <<`TAG` — command (interpolated, then executed).
+                self.skip(1);
+                let tag = self.scan_heredoc_tag(b'`')?;
+                let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
+                (k, tag, true)
             }
             Some(b'\\') => {
                 // <<\TAG — backslash form, equivalent to <<'TAG'.
-                // Per perlop: "a backslashed bareword following the
-                // << means the same thing as a single-quoted string."
-                self.skip(1); // skip backslash
+                self.skip(1);
                 let tag_start = self.line_pos();
                 while self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
                     self.skip(1);
                 }
                 let tag = String::from_utf8_lossy(self.line_slice(tag_start)).into_owned();
                 let k = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
-                (k, tag)
+                (k, tag, false)
             }
             _ => {
                 // Bare identifier — interpolating
@@ -2866,28 +2872,23 @@ impl Lexer {
                 }
                 let tag = String::from_utf8_lossy(self.line_slice(tag_start)).into_owned();
                 let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
-                (k, tag)
+                (k, tag, false)
             }
         };
 
-        // Empty tag is valid for quoted forms: <<""  and <<''
-        // produce a heredoc terminated by an empty line.
-
         let tag_bytes = Bytes::from(tag.as_bytes().to_vec());
+        let quote_kind = if command { QuoteKind::Backtick } else { QuoteKind::Heredoc };
 
-        // Tell LexerSource to start the heredoc.  This takes the current
-        // line (with cursor at the rest-of-line position) and begins
-        // serving heredoc body lines on subsequent next_line() calls.
         match kind {
             HeredocKind::Interpolating => {
                 self.source.start_heredoc(tag_bytes, &mut self.current_line)?;
                 self.context_stack.push(LexContext::new(None, true, false, false));
-                Ok(Token::QuoteSublexBegin(QuoteKind::Heredoc, 0))
+                Ok(Token::QuoteSublexBegin(quote_kind, 0))
             }
             HeredocKind::Indented => {
                 self.source.start_indented_heredoc(tag_bytes, &mut self.current_line)?;
                 self.context_stack.push(LexContext::new(None, true, false, false));
-                Ok(Token::QuoteSublexBegin(QuoteKind::Heredoc, 0))
+                Ok(Token::QuoteSublexBegin(quote_kind, 0))
             }
             HeredocKind::Literal => {
                 self.source.start_heredoc(tag_bytes, &mut self.current_line)?;
