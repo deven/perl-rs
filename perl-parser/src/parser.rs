@@ -201,7 +201,7 @@ impl Parser {
             Keyword::Try | Keyword::Catch | Keyword::Finally => Features::TRY,
             Keyword::Defer => Features::DEFER,
             Keyword::Given | Keyword::When | Keyword::Default => Features::SWITCH,
-            Keyword::Class | Keyword::Field | Keyword::Method => Features::CLASS,
+            Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST => Features::CLASS,
             _ => return,
         };
         if self.pragmas.features.contains(needed) {
@@ -433,6 +433,17 @@ impl Parser {
                                 } else {
                                     return Err(ParseError::new("expected sub name after my/our/state sub", self.peek_span()));
                                 }
+                            // `my method foo { }`, `state method foo { }`
+                            } else if self.eat(&Token::Keyword(Keyword::Method))? {
+                                let kind = self.parse_method(kw_span)?;
+                                let kind = match kind {
+                                    StmtKind::MethodDecl(mut sd) => {
+                                        sd.scope = Some(scope);
+                                        StmtKind::MethodDecl(sd)
+                                    }
+                                    other => other,
+                                };
+                                (kind, false)
                             } else {
                                 let expr = self.with_descent(|this| {
                                     let initial = this.parse_decl_expr(scope, kw_span)?;
@@ -467,6 +478,7 @@ impl Parser {
                         Keyword::INIT => (self.parse_phaser(PhaserKind::Init)?, false),
                         Keyword::CHECK => (self.parse_phaser(PhaserKind::Check)?, false),
                         Keyword::UNITCHECK => (self.parse_phaser(PhaserKind::Unitcheck)?, false),
+                        Keyword::ADJUST => (self.parse_phaser(PhaserKind::Adjust)?, false),
 
                         // given/when/default
                         Keyword::Given => (self.parse_given()?, false),
@@ -492,8 +504,17 @@ impl Parser {
                         // field $var :attrs = default;
                         Keyword::Field => (self.parse_field(kw_span)?, false),
 
-                        // method name(params) { ... }
-                        Keyword::Method => (self.parse_method(kw_span)?, false),
+                        // method name(params) { ... } or method { ... }
+                        Keyword::Method => {
+                            if matches!(self.peek_token(), Token::Ident(_)) {
+                                (self.parse_method(kw_span)?, false)
+                            } else {
+                                let expr = self.parse_anon_method(kw_span)?;
+                                let kind = self.maybe_postfix_control(expr)?;
+                                let terminated = self.eat(&Token::Semi)?;
+                                (kind, terminated)
+                            }
+                        }
 
                         // Any other statement keyword not handled above.
                         _ => unreachable!("unhandled statement keyword: {kw:?}"),
@@ -1000,6 +1021,15 @@ impl Parser {
         Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonSub(prototype, attributes, signature, body) })
     }
 
+    fn parse_anon_method(&mut self, span: Span) -> Result<Expr, ParseError> {
+        // Methods always act as if signatures are in effect.
+        let attrs = self.parse_attributes()?;
+        let sig = self.parse_signature()?;
+        let body = self.parse_block()?;
+
+        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonMethod(attrs, sig, body) })
+    }
+
     // ── Control flow statements ───────────────────────────────
 
     fn parse_if_stmt(&mut self) -> Result<StmtKind, ParseError> {
@@ -1447,17 +1477,39 @@ impl Parser {
             other => return Err(ParseError::new(format!("expected class name, got {other:?}"), start)),
         };
 
-        let attributes = self.parse_attributes()?;
-        let body = self.parse_block()?;
+        // Optional version (like package).
+        let version = if matches!(self.peek_token(), Token::IntLit(_) | Token::FloatLit(_) | Token::VersionLit(_)) {
+            Some(format!("{}", self.next_token()?.token))
+        } else {
+            None
+        };
 
-        Ok(StmtKind::ClassDecl(ClassDecl { name, attributes, body, span: start.merge(self.peek_span()) }))
+        let attributes = self.parse_attributes()?;
+
+        // Block form or statement form (like package).
+        let body = if self.at(&Token::LeftBrace)? {
+            Some(self.parse_block()?)
+        } else {
+            self.eat(&Token::Semi)?;
+            None
+        };
+
+        Ok(StmtKind::ClassDecl(ClassDecl { name, version, attributes, body, span: start.merge(self.peek_span()) }))
     }
 
     fn parse_field(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let var = self.parse_single_var_decl()?;
         let attributes = self.parse_attributes()?;
 
-        let default = if self.eat(&Token::Assign(AssignOp::Eq))? { Some(self.parse_expr(PREC_COMMA)?) } else { None };
+        let default = if self.eat(&Token::Assign(AssignOp::Eq))? {
+            Some((SigDefaultKind::Eq, self.parse_expr(PREC_COMMA)?))
+        } else if self.eat(&Token::Assign(AssignOp::DefinedOrEq))? {
+            Some((SigDefaultKind::DefinedOr, self.parse_expr(PREC_COMMA)?))
+        } else if self.eat(&Token::Assign(AssignOp::OrEq))? {
+            Some((SigDefaultKind::LogicalOr, self.parse_expr(PREC_COMMA)?))
+        } else {
+            None
+        };
 
         self.eat(&Token::Semi)?;
 
@@ -1935,6 +1987,7 @@ impl Parser {
                     Ok(Expr { kind: ExprKind::Bareword("__SUB__".to_string()), span })
                 }
             }
+            Token::CurrentClass => Ok(Expr { kind: ExprKind::CurrentClass, span }),
 
             Token::Keyword(Keyword::Undef) => Ok(Expr { kind: ExprKind::Undef, span }),
             Token::Keyword(Keyword::Wantarray) => Ok(Expr { kind: ExprKind::Wantarray, span }),
@@ -2022,6 +2075,9 @@ impl Parser {
 
             // Anonymous sub: sub { ... } or sub ($x) { ... }
             Token::Keyword(Keyword::Sub) => self.parse_anon_sub(span),
+
+            // Anonymous method: method { ... } or method ($x) { ... }
+            Token::Keyword(Keyword::Method) => self.parse_anon_method(span),
 
             // eval BLOCK vs eval EXPR
             Token::Keyword(Keyword::Eval) => {
@@ -7952,7 +8008,7 @@ my $y = 1;
         let prog = parse_class_prog("class Foo { field $x; method greet { 1; } }");
         let c = find_class_decl(&prog);
         assert_eq!(c.name, "Foo");
-        assert!(c.body.statements.len() >= 2);
+        assert!(c.body.as_ref().unwrap().statements.len() >= 2);
     }
 
     #[test]
@@ -7968,7 +8024,7 @@ my $y = 1;
     fn parse_field_decl() {
         let prog = parse_class_prog("class Foo { field $x = 42; }");
         let c = find_class_decl(&prog);
-        match &c.body.statements[0].kind {
+        match &c.body.as_ref().unwrap().statements[0].kind {
             StmtKind::FieldDecl(f) => {
                 assert_eq!(f.var.name, "x");
                 assert!(f.default.is_some());
@@ -7981,7 +8037,7 @@ my $y = 1;
     fn parse_field_with_param() {
         let prog = parse_class_prog("class Foo { field $name :param; }");
         let c = find_class_decl(&prog);
-        match &c.body.statements[0].kind {
+        match &c.body.as_ref().unwrap().statements[0].kind {
             StmtKind::FieldDecl(f) => {
                 assert_eq!(f.attributes.len(), 1);
                 assert_eq!(f.attributes[0].name, "param");
@@ -7994,7 +8050,7 @@ my $y = 1;
     fn parse_method_decl() {
         let prog = parse_class_prog("class Foo { method greet() { 1; } }");
         let c = find_class_decl(&prog);
-        match &c.body.statements[0].kind {
+        match &c.body.as_ref().unwrap().statements[0].kind {
             StmtKind::MethodDecl(m) => {
                 assert_eq!(m.name, "greet");
             }
@@ -13735,6 +13791,106 @@ OUTER\n";
                 assert_eq!(code_parts[0], " $n ", "raw source mismatch");
             }
             other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    // ── perlclass audit ─────────────────────────────────────
+
+    #[test]
+    fn class_with_version() {
+        let prog = parse_class_prog("class Foo 1.234 { }");
+        let c = find_class_decl(&prog);
+        assert_eq!(c.name, "Foo");
+        assert_eq!(c.version.as_deref(), Some("1.234"));
+    }
+
+    #[test]
+    fn class_statement_form() {
+        // `class Foo;` — statement form with no block.
+        let prog = parse_class_prog("class Foo;");
+        let c = find_class_decl(&prog);
+        assert_eq!(c.name, "Foo");
+        assert!(c.body.is_none(), "statement form should have no body");
+    }
+
+    #[test]
+    fn class_version_and_attrs() {
+        let prog = parse_class_prog("class Bar 2.0 :isa(Foo) { }");
+        let c = find_class_decl(&prog);
+        assert_eq!(c.version.as_deref(), Some("2"));
+        assert_eq!(c.attributes[0].name, "isa");
+    }
+
+    #[test]
+    fn adjust_block() {
+        let prog = parse_class_prog("class Foo { ADJUST { 1; } }");
+        let c = find_class_decl(&prog);
+        let body = c.body.as_ref().unwrap();
+        match &body.statements[0].kind {
+            StmtKind::Phaser(PhaserKind::Adjust, _) => {}
+            other => panic!("expected Phaser(Adjust), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dunder_class() {
+        let prog = parse_class_prog("class Foo { field $x = __CLASS__->DEFAULT; }");
+        let c = find_class_decl(&prog);
+        let body = c.body.as_ref().unwrap();
+        match &body.statements[0].kind {
+            StmtKind::FieldDecl(f) => {
+                assert!(f.default.is_some(), "should have default");
+            }
+            other => panic!("expected FieldDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_defined_or_default() {
+        let prog = parse_class_prog("class Foo { field $x :param //= 42; }");
+        let c = find_class_decl(&prog);
+        let body = c.body.as_ref().unwrap();
+        match &body.statements[0].kind {
+            StmtKind::FieldDecl(f) => {
+                let (kind, _) = f.default.as_ref().unwrap();
+                assert_eq!(*kind, SigDefaultKind::DefinedOr);
+            }
+            other => panic!("expected FieldDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_logical_or_default() {
+        let prog = parse_class_prog("class Foo { field $x :param ||= 0; }");
+        let c = find_class_decl(&prog);
+        let body = c.body.as_ref().unwrap();
+        match &body.statements[0].kind {
+            StmtKind::FieldDecl(f) => {
+                let (kind, _) = f.default.as_ref().unwrap();
+                assert_eq!(*kind, SigDefaultKind::LogicalOr);
+            }
+            other => panic!("expected FieldDecl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anon_method() {
+        let prog = parse_class_prog("class Foo { method get { return method { 1; }; } }");
+        let c = find_class_decl(&prog);
+        assert!(c.body.is_some());
+    }
+
+    #[test]
+    fn lexical_method() {
+        let prog = parse_class_prog("class Foo { my method secret { 1; } }");
+        let c = find_class_decl(&prog);
+        let body = c.body.as_ref().unwrap();
+        match &body.statements[0].kind {
+            StmtKind::MethodDecl(m) => {
+                assert_eq!(m.name, "secret");
+                assert_eq!(m.scope, Some(DeclScope::My));
+            }
+            other => panic!("expected MethodDecl, got {other:?}"),
         }
     }
 }

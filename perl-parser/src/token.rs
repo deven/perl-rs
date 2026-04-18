@@ -168,6 +168,7 @@ pub enum Keyword {
     INIT,
     CHECK,
     UNITCHECK,
+    ADJUST,
 
     // ── Miscellaneous ─────────────────────────────────────────
     Tie,
@@ -421,6 +422,9 @@ pub enum Token {
     /// or falls back to treating it as a bareword.  No compile-time
     /// value — it's a runtime reference to the current sub.
     CurrentSub,
+    /// `__CLASS__` — marker.  Yields the name of the class being
+    /// constructed during field initializers and ADJUST blocks (5.38+).
+    CurrentClass,
 
     // ── Format sub-tokens ─────────────────────────────────────
     /// Opens a `format NAME = ... .` body.  `name` is the format
