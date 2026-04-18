@@ -1493,16 +1493,18 @@ impl Lexer {
                 return Ok(Token::SpecialVar("$".into()));
             }
             Some(b'^') => {
-                // $^X — caret variable (single character after ^)
+                // $^X — caret variable.  Per perlvar, the character
+                // after ^ can be any of [][A-Z^_?\a-z].
                 if let Some(next) = self.peek_byte_at(1)
-                    && (next.is_ascii_alphabetic() || next == b'[' || next == b']')
+                    && (next.is_ascii_alphabetic() || next == b'[' || next == b']' || next == b'^' || next == b'_' || next == b'?' || next == b'\\')
                 {
                     self.skip(2); // skip ^ and the character
                     let name = format!("^{}", next as char);
                     return Ok(Token::SpecialVar(name));
                 }
-                // Bare $^ — not a caret variable
-                return Ok(Token::Dollar);
+                // Bare $^ — format_top_name.
+                self.skip(1);
+                return Ok(Token::SpecialVar("^".into()));
             }
             Some(b'!') => {
                 self.skip(1);
@@ -1610,6 +1612,11 @@ impl Lexer {
                 // $= — page length (format)
                 self.skip(1);
                 return Ok(Token::SpecialVar("=".into()));
+            }
+            Some(b'[') => {
+                // $[ — array base (deprecated, always 0 in modern Perl)
+                self.skip(1);
+                return Ok(Token::SpecialVar("[".into()));
             }
             Some(b'~') => {
                 // $~ — format name
@@ -1737,6 +1744,18 @@ impl Lexer {
             Some(b'-') => {
                 self.skip(1);
                 Ok(Some(Token::SpecialHashVar("-".into())))
+            }
+            Some(b'^') => {
+                // %^H — caret hash variable (single char after ^).
+                if let Some(next) = self.peek_byte_at(1)
+                    && (next.is_ascii_alphabetic() || next == b'[' || next == b']' || next == b'^' || next == b'_' || next == b'?' || next == b'\\')
+                {
+                    self.skip(2);
+                    let name = format!("^{}", next as char);
+                    Ok(Some(Token::SpecialHashVar(name)))
+                } else {
+                    Ok(None)
+                }
             }
             Some(b) if b == b'_' || b.is_ascii_alphabetic() => {
                 let name = self.scan_ident();
@@ -2617,7 +2636,7 @@ impl Lexer {
         // the Perl version string.
         if self.peek_byte(false) == Some(b'^')
             && let Some(next) = self.peek_byte_at(1)
-            && (next.is_ascii_alphabetic() || next == b'[' || next == b']')
+            && (next.is_ascii_alphabetic() || next == b'[' || next == b']' || next == b'^' || next == b'_' || next == b'?' || next == b'\\')
         {
             self.skip(2); // skip ^ and the character
             let name = format!("^{}", next as char);
@@ -5641,5 +5660,33 @@ mod tests {
         // `$ # comment\nx` ≡ `$x` — comment between sigil and name.
         let tokens = lex_all("$ # comment\nx;");
         assert!(matches!(&tokens[0], Token::ScalarVar(n) if n == "x"), "$ # comment\\nx should be ScalarVar(x), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_bare_dollar_caret() {
+        // `$^` alone — format_top_name.
+        let tokens = lex_all("$^;");
+        assert!(matches!(&tokens[0], Token::SpecialVar(n) if n == "^"), "$^ should be SpecialVar(^), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_dollar_open_bracket() {
+        // `$[` — array base (deprecated).
+        let tokens = lex_all("$[;");
+        assert!(matches!(&tokens[0], Token::SpecialVar(n) if n == "["), "$[ should be SpecialVar([), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_caret_underscore() {
+        // `$^_` — reserved caret var with underscore.
+        let tokens = lex_all("$^_;");
+        assert!(matches!(&tokens[0], Token::SpecialVar(n) if n == "^_"), "$^_ should be SpecialVar(^_), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_percent_caret_h() {
+        // `%^H` — hints hash, caret hash variable.
+        let tokens = lex_all("%^H;");
+        assert!(matches!(&tokens[0], Token::SpecialHashVar(n) if n == "^H"), "%^H should be SpecialHashVar(^H), got {:?}", tokens[0]);
     }
 }
