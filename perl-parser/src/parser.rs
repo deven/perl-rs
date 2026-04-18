@@ -297,7 +297,7 @@ impl Parser {
     /// unrecognized modifier character.
     fn validate_regex_flags(flags: &str, span: Span) -> Result<(), ParseError> {
         for ch in flags.chars() {
-            if !"msixpgcadlun".contains(ch) {
+            if !"msixpogcadlun".contains(ch) {
                 return Err(ParseError::new(format!("Unknown regexp modifier \"/{ch}\""), span));
             }
         }
@@ -308,7 +308,7 @@ impl Parser {
     /// plus `e` (eval replacement) and `r` (non-destructive).
     fn validate_subst_flags(flags: &str, span: Span) -> Result<(), ParseError> {
         for ch in flags.chars() {
-            if !"msixpgcadluner".contains(ch) {
+            if !"msixpogcadluner".contains(ch) {
                 return Err(ParseError::new(format!("Unknown regexp modifier \"/{ch}\""), span));
             }
         }
@@ -13655,5 +13655,86 @@ OUTER\n";
         // `%^H` — hints hash, caret hash variable.
         let e = parse_expr_str("%^H;");
         assert!(matches!(e.kind, ExprKind::SpecialHashVar(ref n) if n == "^H"), "expected SpecialHashVar(^H), got {:?}", e.kind);
+    }
+
+    // ── perlre: /o flag ─────────────────────────────────────
+
+    #[test]
+    fn regex_o_flag() {
+        // /o — compile-once flag (no-op in modern Perl, but valid syntax).
+        let prog = parse("$x =~ /foo/o;");
+        assert!(!prog.statements.is_empty(), "should parse /o flag");
+    }
+
+    #[test]
+    fn subst_o_flag() {
+        let prog = parse("$x =~ s/foo/bar/og;");
+        assert!(!prog.statements.is_empty(), "should parse s///og flags");
+    }
+
+    // ── perlre: regex code block raw source capture ─────────
+
+    #[test]
+    fn regex_code_block_raw_source() {
+        // (?{code}) — verify both raw source and parsed expression.
+        let e = parse_expr_str("m/(?{ 1 + 2 })/;");
+        match &e.kind {
+            ExprKind::Regex(_, interp, _) => {
+                let code_parts: Vec<_> = interp
+                    .0
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::RegexCode(raw, expr) => Some((raw.as_str(), expr)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(code_parts.len(), 1, "expected one code block");
+                assert_eq!(code_parts[0].0, " 1 + 2 ", "raw source mismatch");
+                assert!(matches!(code_parts[0].1.kind, ExprKind::BinOp(BinOp::Add, _, _)), "parsed expr should be Add, got {:?}", code_parts[0].1.kind);
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_cond_code_block_raw_source() {
+        // (??{code}) — verify raw source capture.
+        let e = parse_expr_str("m/(??{ $re })/;");
+        match &e.kind {
+            ExprKind::Regex(_, interp, _) => {
+                let code_parts: Vec<_> = interp
+                    .0
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::RegexCondCode(raw, _) => Some(raw.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(code_parts.len(), 1, "expected one cond code block");
+                assert_eq!(code_parts[0], " $re ", "raw source mismatch");
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_optimistic_code_block_raw_source() {
+        // (*{code}) — optimistic code block, same structure as (?{}).
+        let e = parse_expr_str("m/(*{ $n })/;");
+        match &e.kind {
+            ExprKind::Regex(_, interp, _) => {
+                let code_parts: Vec<_> = interp
+                    .0
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::RegexCode(raw, _) => Some(raw.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(code_parts.len(), 1, "expected one code block");
+                assert_eq!(code_parts[0], " $n ", "raw source mismatch");
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
     }
 }

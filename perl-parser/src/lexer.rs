@@ -2203,23 +2203,34 @@ impl Lexer {
             }
         }
 
-        // Regex code blocks: (?{...}) and (??{...}).
-        if regex && b == b'(' && self.peek_byte_at(1) == Some(b'?') {
-            if self.peek_byte_at(2) == Some(b'{') {
-                // (?{ — consume 3 bytes, enter code mode.
+        // Regex code blocks: (?{...}), (??{...}), and (*{...}).
+        if regex && b == b'(' {
+            if self.peek_byte_at(1) == Some(b'?') {
+                if self.peek_byte_at(2) == Some(b'{') {
+                    // (?{ — consume 3 bytes, enter code mode.
+                    self.skip(3);
+                    if let Some(ctx) = self.context_stack.last_mut() {
+                        ctx.expr_depth = 1;
+                    }
+                    return Ok(Spanned { token: Token::RegexCodeStart, span: Span::new(start, self.span_pos()) });
+                }
+                if self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{') {
+                    // (??{ — consume 4 bytes, enter code mode.
+                    self.skip(4);
+                    if let Some(ctx) = self.context_stack.last_mut() {
+                        ctx.expr_depth = 1;
+                    }
+                    return Ok(Spanned { token: Token::RegexCondCodeStart, span: Span::new(start, self.span_pos()) });
+                }
+            }
+            if self.peek_byte_at(1) == Some(b'*') && self.peek_byte_at(2) == Some(b'{') {
+                // (*{ — optimistic code block (5.37.7+).
+                // Same as (?{...}) but doesn't disable optimizations.
                 self.skip(3);
                 if let Some(ctx) = self.context_stack.last_mut() {
                     ctx.expr_depth = 1;
                 }
                 return Ok(Spanned { token: Token::RegexCodeStart, span: Span::new(start, self.span_pos()) });
-            }
-            if self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{') {
-                // (??{ — consume 4 bytes, enter code mode.
-                self.skip(4);
-                if let Some(ctx) = self.context_stack.last_mut() {
-                    ctx.expr_depth = 1;
-                }
-                return Ok(Spanned { token: Token::RegexCondCodeStart, span: Span::new(start, self.span_pos()) });
             }
         }
 
@@ -2253,8 +2264,9 @@ impl Lexer {
                 // handles it on the next call.
                 Some(b'(')
                     if regex
-                        && self.peek_byte_at(1) == Some(b'?')
-                        && (self.peek_byte_at(2) == Some(b'{') || (self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{'))) =>
+                        && (self.peek_byte_at(1) == Some(b'?')
+                            && (self.peek_byte_at(2) == Some(b'{') || (self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{')))
+                            || self.peek_byte_at(1) == Some(b'*') && self.peek_byte_at(2) == Some(b'{')) =>
                 {
                     break;
                 }
@@ -5688,5 +5700,23 @@ mod tests {
         // `%^H` — hints hash, caret hash variable.
         let tokens = lex_all("%^H;");
         assert!(matches!(&tokens[0], Token::SpecialHashVar(n) if n == "^H"), "%^H should be SpecialHashVar(^H), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn lex_regex_optimistic_code_block() {
+        // (*{code}) — optimistic code block (5.37.7+).
+        let tokens = lex_all("m/foo(*{ $x })bar/");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::RegexSublexBegin(RegexKind::Match, b'/'),
+                Token::ConstSegment("foo".into()),
+                Token::RegexCodeStart,
+                Token::ScalarVar("x".into()),
+                Token::RightBrace,
+                Token::ConstSegment(")bar".into()),
+                Token::SublexEnd,
+            ]
+        );
     }
 }
