@@ -36,6 +36,10 @@ pub(crate) struct LexerLine {
     pub terminated: bool,
     /// Current scanning position within `line`.
     pub pos: usize,
+    /// Whether the line contains only ASCII bytes (all < 0x80).
+    /// Computed for free during newline scanning and used to skip
+    /// UTF-8 decoding and NFC normalization for all-ASCII lines.
+    pub ascii_only: bool,
 }
 
 impl LexerLine {
@@ -151,6 +155,7 @@ struct RawLine {
     offset: usize,
     content: Bytes,
     terminated: bool,
+    ascii_only: bool,
 }
 
 impl LexerSource {
@@ -400,6 +405,7 @@ impl LexerSource {
                     pos: if body_lines.is_empty() { line.pos } else { 0 },
                     terminated: false, // virtual EOF, no newline
                     number: line.number,
+                    ascii_only: line.ascii_only,
                 };
                 body_lines.push_back(truncated);
 
@@ -411,7 +417,14 @@ impl LexerSource {
                 let flags = if flag_end > pos + 1 { Some(String::from_utf8_lossy(&line.line[pos + 1..flag_end]).into_owned()) } else { None };
 
                 // Saved remainder: rest of the line after flags.
-                let saved = LexerLine { line: line.line.clone(), offset: line.offset, pos: flag_end, terminated: line.terminated, number: line.number };
+                let saved = LexerLine {
+                    line: line.line.clone(),
+                    offset: line.offset,
+                    pos: flag_end,
+                    terminated: line.terminated,
+                    number: line.number,
+                    ascii_only: line.ascii_only,
+                };
 
                 // Queue body lines and set up virtual EOF.
                 self.push_back(body_lines);
@@ -447,11 +460,17 @@ impl LexerSource {
         let number = self.line_number;
         self.line_number += 1;
 
-        // Find end of line (\n or EOF).
+        // Find end of line (\n or EOF), accumulating high-bit check.
         let mut end = start;
-        while end < self.src.len() && self.src[end] != b'\n' {
+        let mut bits_used: u8 = 0;
+        for &byte in &self.src.as_ref()[start..] {
+            if byte == b'\n' {
+                break;
+            }
+            bits_used |= byte;
             end += 1;
         }
+        let ascii_only = bits_used < 0x80;
 
         let terminated = end < self.src.len();
 
@@ -461,7 +480,7 @@ impl LexerSource {
         // Advance cursor past the \n (if present).
         self.cursor = if terminated { end + 1 } else { end };
 
-        Some(RawLine { number, offset: start, content: self.src.slice(start..content_end), terminated })
+        Some(RawLine { number, offset: start, content: self.src.slice(start..content_end), terminated, ascii_only })
     }
 
     /// Strip the required indent from a raw line.
@@ -485,7 +504,7 @@ impl LexerSource {
             (raw.content, 0)
         };
 
-        Ok(LexerLine { number: raw.number, offset: raw.offset + indent_len, line: content, terminated: raw.terminated, pos: 0 })
+        Ok(LexerLine { number: raw.number, offset: raw.offset + indent_len, line: content, terminated: raw.terminated, pos: 0, ascii_only: raw.ascii_only })
     }
 
     /// Scan ahead from the current cursor to find an indented heredoc
@@ -716,6 +735,7 @@ mod tests {
             line: decl.line.clone(),
             terminated: decl.terminated,
             pos: 13, // pointing at ` . "suffix";`
+            ascii_only: true,
         });
         source.start_heredoc(Bytes::from_static(b"END"), &mut current_line).unwrap();
         assert!(current_line.is_none());
@@ -743,7 +763,7 @@ mod tests {
         let mut source = LexerSource::new(src);
         let decl = source.next_line(false).unwrap().unwrap();
 
-        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5 });
+        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5, ascii_only: true });
         source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         // Immediate terminator → None.
@@ -756,7 +776,7 @@ mod tests {
         let mut source = LexerSource::new(src);
         let decl = source.next_line(false).unwrap().unwrap();
 
-        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5 });
+        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5, ascii_only: true });
         source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         // Read body lines.
@@ -788,6 +808,7 @@ mod tests {
             line: decl.line.clone(),
             terminated: decl.terminated,
             pos: 4, // after "<<A"
+            ascii_only: true,
         });
         source.start_heredoc(Bytes::from_static(b"A"), &mut current).unwrap();
 
@@ -809,6 +830,7 @@ mod tests {
             line: remainder.line,
             terminated: remainder.terminated,
             pos: 10, // after ", <<B"
+            ascii_only: true,
         });
         source.start_heredoc(Bytes::from_static(b"B"), &mut current).unwrap();
 
@@ -836,7 +858,7 @@ mod tests {
         let mut source = LexerSource::new(src);
         let decl = source.next_line(false).unwrap().unwrap();
 
-        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6 });
+        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6, ascii_only: true });
         source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         // Body lines with indent stripped.
@@ -861,7 +883,7 @@ mod tests {
         let mut source = LexerSource::new(src);
         let decl = source.next_line(false).unwrap().unwrap();
 
-        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6 });
+        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6, ascii_only: true });
         source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         let l1 = source.next_line(false).unwrap().unwrap();
@@ -880,7 +902,7 @@ mod tests {
         let mut source = LexerSource::new(src);
         let decl = source.next_line(false).unwrap().unwrap();
 
-        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6 });
+        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6, ascii_only: true });
         source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
 
         let l1 = source.next_line(false).unwrap().unwrap();
@@ -904,7 +926,7 @@ mod tests {
         let decl = source.next_line(false).unwrap().unwrap();
 
         // Start <<~OUTER
-        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 9 });
+        let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 9, ascii_only: true });
         source.start_indented_heredoc(Bytes::from_static(b"OUTER"), &mut current).unwrap();
 
         // First body line of OUTER (indent stripped).
@@ -918,6 +940,7 @@ mod tests {
             line: l1.line,
             terminated: l1.terminated,
             pos: 14, // after "prefix <<INNER"
+            ascii_only: true,
         });
         source.start_heredoc(Bytes::from_static(b"INNER"), &mut current).unwrap();
 
@@ -938,6 +961,123 @@ mod tests {
         assert_eq!(&l2.line[..], b"outer continues");
 
         // OUTER terminator → None.
+        assert!(source.next_line(false).unwrap().is_none());
+    }
+
+    // ── ascii_only flag ─────────────────────────────────────
+
+    #[test]
+    fn ascii_only_pure_ascii_line() {
+        let mut source = LexerSource::new(b"hello world\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(line.ascii_only, "pure ASCII line should have ascii_only = true");
+    }
+
+    #[test]
+    fn ascii_only_empty_line() {
+        let mut source = LexerSource::new(b"\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(line.ascii_only, "empty line should have ascii_only = true");
+    }
+
+    #[test]
+    fn ascii_only_with_high_bytes() {
+        let mut source = LexerSource::new("café\n".as_bytes());
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(!line.ascii_only, "line with UTF-8 should have ascii_only = false");
+    }
+
+    #[test]
+    fn ascii_only_high_byte_at_end() {
+        let mut source = LexerSource::new(b"hello\xff\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(!line.ascii_only, "line with high byte should have ascii_only = false");
+    }
+
+    #[test]
+    fn ascii_only_high_byte_at_start() {
+        let mut source = LexerSource::new(b"\x80rest\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(!line.ascii_only, "line starting with high byte should have ascii_only = false");
+    }
+
+    #[test]
+    fn ascii_only_multiline_mixed() {
+        let mut source = LexerSource::new("ascii\ncafé\nmore ascii\n".as_bytes());
+        let l1 = source.next_line(false).unwrap().unwrap();
+        assert!(l1.ascii_only, "first line is ASCII");
+        let l2 = source.next_line(false).unwrap().unwrap();
+        assert!(!l2.ascii_only, "second line has UTF-8");
+        let l3 = source.next_line(false).unwrap().unwrap();
+        assert!(l3.ascii_only, "third line is ASCII");
+    }
+
+    #[test]
+    fn ascii_only_unterminated_line() {
+        let mut source = LexerSource::new(b"no newline");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(line.ascii_only, "unterminated ASCII line should have ascii_only = true");
+    }
+
+    #[test]
+    fn ascii_only_unterminated_with_utf8() {
+        let mut source = LexerSource::new("no newline café".as_bytes());
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(!line.ascii_only, "unterminated UTF-8 line should have ascii_only = false");
+    }
+
+    #[test]
+    fn ascii_only_crlf_line() {
+        let mut source = LexerSource::new(b"hello\r\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(line.ascii_only, "CRLF line with ASCII content should have ascii_only = true");
+    }
+
+    #[test]
+    fn ascii_only_only_control_chars() {
+        // Control chars (0x01..0x1F) are all < 0x80.
+        let mut source = LexerSource::new(b"\x01\x1f\t\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(line.ascii_only, "control chars are ASCII");
+    }
+
+    #[test]
+    fn ascii_only_boundary_byte_0x7f() {
+        // 0x7F (DEL) is the highest ASCII byte.
+        let mut source = LexerSource::new(b"\x7f\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(line.ascii_only, "0x7F is still ASCII");
+    }
+
+    #[test]
+    fn ascii_only_boundary_byte_0x80() {
+        // 0x80 is the first non-ASCII byte.
+        let mut source = LexerSource::new(b"\x80\n");
+        let line = source.next_line(false).unwrap().unwrap();
+        assert!(!line.ascii_only, "0x80 is not ASCII");
+    }
+
+    #[test]
+    fn ascii_only_heredoc_body_lines() {
+        // Heredoc body lines should have correct ascii_only flags.
+        let mut source = LexerSource::new("<<END\nascii line\ncaf\u{00E9} line\nEND\n".as_bytes());
+        let decl = source.next_line(false).unwrap().unwrap();
+        assert!(decl.ascii_only, "declaration line is ASCII");
+
+        // Start heredoc.
+        let mut current =
+            Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5, ascii_only: decl.ascii_only });
+        source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
+
+        // First body line: ASCII.
+        let body1 = source.next_line(false).unwrap().unwrap();
+        assert!(body1.ascii_only, "first heredoc body line is ASCII");
+
+        // Second body line: has UTF-8.
+        let body2 = source.next_line(false).unwrap().unwrap();
+        assert!(!body2.ascii_only, "second heredoc body line has UTF-8");
+
+        // Terminator → None.
         assert!(source.next_line(false).unwrap().is_none());
     }
 }

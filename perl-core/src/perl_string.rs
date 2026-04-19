@@ -390,6 +390,12 @@ impl From<Vec<u8>> for PerlString {
     }
 }
 
+impl From<PerlString> for Bytes {
+    fn from(ps: PerlString) -> Self {
+        ps.buf
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]

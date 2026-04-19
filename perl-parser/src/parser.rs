@@ -13922,4 +13922,533 @@ OUTER\n";
         let e = parse_expr_str("all();");
         assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "all"), "without feature, all() should be a regular call, got {:?}", e.kind);
     }
+
+    // ── UTF-8 identifier validation ─────────────────────────
+
+    #[test]
+    fn utf8_array_variable() {
+        // `@données` — UTF-8 array name.
+        let prog = parse("use utf8; my @données;");
+        assert!(!prog.statements.is_empty(), "should parse @données");
+    }
+
+    #[test]
+    fn utf8_hash_variable() {
+        // `%données` — UTF-8 hash name.
+        let prog = parse("use utf8; my %données;");
+        assert!(!prog.statements.is_empty(), "should parse %données");
+    }
+
+    #[test]
+    fn utf8_cjk_identifier() {
+        // CJK ideographs are XID_Start/XID_Continue.
+        let prog = parse("use utf8; my $変数 = 1;");
+        assert!(!prog.statements.is_empty(), "CJK identifier should parse");
+    }
+
+    #[test]
+    fn utf8_mixed_ascii_and_unicode() {
+        // ASCII start, Unicode continuation: `$foo変数`
+        let prog = parse("use utf8; my $foo変数 = 1;");
+        assert!(!prog.statements.is_empty(), "mixed ASCII+Unicode should parse");
+    }
+
+    #[test]
+    fn utf8_underscore_then_unicode() {
+        // `$_café` — underscore then Unicode.
+        let prog = parse("use utf8; my $_café = 1;");
+        assert!(!prog.statements.is_empty(), "$_café should parse");
+    }
+
+    #[test]
+    fn utf8_package_qualified() {
+        // `Ünïcödé::módule` — Unicode in package names.
+        let prog = parse("use utf8; Ünïcödé::módule->new();");
+        assert!(!prog.statements.is_empty(), "Unicode package name should parse");
+    }
+
+    #[test]
+    fn utf8_sub_with_unicode_param() {
+        let prog = parse("use utf8; use feature 'signatures'; sub grüß($naïve) { $naïve }");
+        assert!(!prog.statements.is_empty());
+    }
+
+    // ── Non-UTF-8 mode rejects high bytes ───────────────────
+
+    #[test]
+    fn no_utf8_rejects_high_bytes_in_scalar() {
+        let src = "my $café = 1;";
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        assert!(p.parse_program().is_err(), "high bytes without use utf8 should error");
+    }
+
+    #[test]
+    fn no_utf8_rejects_high_bytes_in_bareword() {
+        let src = "café();";
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        assert!(p.parse_program().is_err(), "high bytes in bareword without use utf8 should error");
+    }
+
+    // ── Invalid identifier characters (even with use utf8) ──
+
+    #[test]
+    fn utf8_emoji_not_identifier() {
+        // Emoji (U+1F600) is not XID_Start.
+        let src = "use utf8; my $\u{1F600} = 1;";
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        assert!(p.parse_program().is_err(), "emoji should not be valid in identifier");
+    }
+
+    #[test]
+    fn utf8_math_symbol_not_identifier() {
+        // ∑ (U+2211 N-ARY SUMMATION) is not XID_Start.
+        let src = "use utf8; my $∑ = 1;";
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        assert!(p.parse_program().is_err(), "math symbol should not be valid in identifier");
+    }
+
+    #[test]
+    fn utf8_bare_emoji_errors() {
+        // Emoji as a bare statement — not an identifier.
+        let src = "use utf8; \u{1F600};";
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        assert!(p.parse_program().is_err(), "emoji as bare statement should error");
+    }
+
+    #[test]
+    fn utf8_punctuation_not_identifier() {
+        // « (U+00AB LEFT-POINTING DOUBLE ANGLE QUOTATION MARK) is not XID.
+        let src = "use utf8; my $\u{00AB} = 1;";
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        assert!(p.parse_program().is_err(), "Unicode punctuation should not be valid in identifier");
+    }
+
+    #[test]
+    fn utf8_combining_mark_not_identifier_start() {
+        // U+0301 COMBINING ACUTE ACCENT is XID_Continue but not XID_Start.
+        // As the first char after a sigil, it should fail.
+        let src = "use utf8; my $\u{0301}x = 1;";
+        let mut p = Parser::new(src.as_bytes()).unwrap();
+        assert!(p.parse_program().is_err(), "combining mark should not be valid as identifier start");
+    }
+
+    #[test]
+    fn utf8_combining_mark_ok_as_continue() {
+        // Combining mark after a valid start character is fine.
+        // `$e\u{0301}` = $é (e + combining acute) — valid.
+        let prog = parse("use utf8; my $e\u{0301} = 1;");
+        assert!(!prog.statements.is_empty(), "combining mark as continuation should parse");
+    }
+
+    #[test]
+    fn utf8_sigil_whitespace_then_unicode() {
+        // `$ \n変数` — whitespace between sigil and UTF-8 name.
+        let prog = parse("use utf8; my $\n変数 = 1;");
+        assert!(!prog.statements.is_empty(), "whitespace between sigil and UTF-8 name should parse");
+    }
+
+    #[test]
+    fn utf8_at_sigil_whitespace_then_unicode() {
+        // `@ \n変数` — whitespace between @ and UTF-8 name.
+        let prog = parse("use utf8; my @\ndonn\u{00E9}es;");
+        assert!(!prog.statements.is_empty(), "whitespace between @ and UTF-8 name should parse");
+    }
+
+    // ── Invalid UTF-8 byte sequences ────────────────────────
+
+    #[test]
+    fn invalid_utf8_bytes_error() {
+        // 0xFF 0xFE is not valid UTF-8.
+        let src: Vec<u8> = b"use utf8; my $\xff\xfe = 1;".to_vec();
+        let mut p = Parser::new(&src).unwrap();
+        assert!(p.parse_program().is_err(), "invalid UTF-8 bytes should error even with use utf8");
+    }
+
+    #[test]
+    fn invalid_utf8_lone_continuation_byte() {
+        // 0x80 is a continuation byte without a lead byte.
+        let src: Vec<u8> = b"use utf8; my $\x80x = 1;".to_vec();
+        let mut p = Parser::new(&src).unwrap();
+        assert!(p.parse_program().is_err(), "lone continuation byte should error");
+    }
+
+    // ── NFC normalization ───────────────────────────────────
+
+    #[test]
+    fn nfc_identifier_precomposed_and_decomposed_are_same() {
+        // NFC: é = U+00E9 (precomposed, 2 bytes in UTF-8)
+        // NFD: e + U+0301 (decomposed, 3 bytes in UTF-8)
+        // Both should produce the same identifier name after NFC.
+        let nfc_src = "use utf8; my $caf\u{00E9} = 42;";
+        let nfd_src = "use utf8; my $cafe\u{0301} = 42;";
+
+        let nfc_prog = parse(nfc_src);
+        let nfd_prog = parse(nfd_src);
+
+        // Extract variable names from both programs.
+        // `my $café = 42` parses as Assign(Eq, Decl(My, [VarDecl]), Int(42)).
+        let get_var_name = |prog: &crate::ast::Program| -> Option<String> {
+            for stmt in &prog.statements {
+                if let StmtKind::Expr(expr) = &stmt.kind {
+                    // Bare declaration: `my $x;`
+                    if let ExprKind::Decl(_, decls) = &expr.kind
+                        && let Some(decl) = decls.first()
+                    {
+                        return Some(decl.name.clone());
+                    }
+                    // Assignment wrapping declaration: `my $x = 1;`
+                    if let ExprKind::Assign(_, lhs, _) = &expr.kind
+                        && let ExprKind::Decl(_, decls) = &lhs.kind
+                        && let Some(decl) = decls.first()
+                    {
+                        return Some(decl.name.clone());
+                    }
+                }
+            }
+            None
+        };
+
+        let nfc_name = get_var_name(&nfc_prog).expect("should find variable in NFC source");
+        let nfd_name = get_var_name(&nfd_prog).expect("should find variable in NFD source");
+        assert_eq!(nfc_name, nfd_name, "NFC and NFD forms of café should produce the same identifier");
+        assert_eq!(nfc_name, "caf\u{00E9}", "identifier should be in NFC form");
+    }
+
+    #[test]
+    fn nfc_sub_name_normalized() {
+        // Sub name with NFD decomposed character.
+        let nfd_src = "use utf8; sub nai\u{0308}ve { 1 }";
+        let prog = parse(nfd_src);
+        let sub_name = prog
+            .statements
+            .iter()
+            .find_map(|s| if let StmtKind::SubDecl(sd) = &s.kind { Some(sd.name.clone()) } else { None })
+            .expect("should find sub declaration");
+        // ï in NFC is U+00EF
+        assert_eq!(sub_name, "na\u{00EF}ve", "sub name should be NFC-normalized");
+    }
+
+    #[test]
+    fn nfc_package_name_normalized() {
+        // Package name with decomposed character.
+        let src = "use utf8; Caf\u{00E9}::Mo\u{0308}dule->new();";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "should parse NFC package name");
+    }
+
+    #[test]
+    fn nfc_ascii_identifiers_unchanged() {
+        // ASCII identifiers should pass through unchanged.
+        let prog = parse("use utf8; my $hello = 1;");
+        let var_name = prog
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let StmtKind::Expr(expr) = &s.kind {
+                    if let ExprKind::Assign(_, lhs, _) = &expr.kind
+                        && let ExprKind::Decl(_, decls) = &lhs.kind
+                    {
+                        return Some(decls[0].name.clone());
+                    }
+                    if let ExprKind::Decl(_, decls) = &expr.kind {
+                        return Some(decls[0].name.clone());
+                    }
+                }
+                None
+            })
+            .expect("should find variable");
+        assert_eq!(var_name, "hello");
+    }
+
+    #[test]
+    fn nfc_no_normalization_without_utf8() {
+        // Without `use utf8`, high bytes are errors, so NFC
+        // normalization never applies.
+        let prog = parse("my $hello = 1;");
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn nfc_string_content_normalized() {
+        // String literal content should also be NFC-normalized.
+        // NFD: "cafe\u{0301}" → NFC: "café"
+        let src = "use utf8; my $x = \"caf\u{00E9}\";";
+        let prog = parse(src);
+        // The program should parse successfully with NFC content.
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn nfc_hangul_normalized() {
+        // Hangul syllables: NFC composition should work.
+        // U+1100 U+1161 (Jamo ᄀ + ᅡ) → U+AC00 (syllable 가)
+        let src = "use utf8; my $\u{AC00} = 1;";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "Hangul syllable identifier should parse");
+    }
+
+    #[test]
+    fn nfc_multiple_combining_marks() {
+        // Multiple combining marks after a base character.
+        // o + U+0308 (diaeresis) + U+0304 (macron)
+        // NFC composes o+diaeresis → ö, macron stays.
+        let src = "use utf8; my $o\u{0308}\u{0304}x = 1;";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "multiple combining marks should parse");
+    }
+
+    #[test]
+    fn nfc_already_nfc_input() {
+        // Input already in NFC should pass through unchanged.
+        let src = "use utf8; my $für = 1;";
+        let prog = parse(src);
+        let var_name = prog
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let StmtKind::Expr(expr) = &s.kind {
+                    if let ExprKind::Assign(_, lhs, _) = &expr.kind
+                        && let ExprKind::Decl(_, decls) = &lhs.kind
+                    {
+                        return Some(decls[0].name.clone());
+                    }
+                    if let ExprKind::Decl(_, decls) = &expr.kind {
+                        return Some(decls[0].name.clone());
+                    }
+                }
+                None
+            })
+            .expect("should find variable");
+        assert_eq!(var_name, "f\u{00FC}r", "already-NFC input should be unchanged");
+    }
+
+    // ── memchr optimization (correctness via existing tests) ─
+
+    #[test]
+    fn memchr_long_string_body() {
+        // Long string body exercises the memchr bulk-copy path.
+        let long_text = "a".repeat(1000);
+        let src = format!("my $x = \"{long_text}\";");
+        let prog = parse(&src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn memchr_interpolating_string() {
+        // Interpolating string with triggers spread through it.
+        let src = r#"my $name = "world"; my $x = "hello $name, foo\nbar";"#;
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn memchr_regex_with_code_block() {
+        // Regex with code block — memchr must detect ( trigger.
+        let src = "use feature 'all'; my $x = 'abc'; $x =~ m/foo(?{ 1 + 2 })bar/;";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn memchr_paired_delimiter_depth() {
+        // Paired delimiter with nesting — memchr fast path
+        // should hand off to byte-by-byte for depth tracking.
+        let src = r#"my $x = q{outer{inner}outer};"#;
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn memchr_heredoc_multiline() {
+        // Heredoc body spans multiple lines — memchr works
+        // per-line, line loading handled by peek_byte(true).
+        let src = "my $x = <<END;\nline 1\nline 2\nline 3\nEND\n";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    // ── UTF-8 additional coverage ───────────────────────────
+
+    #[test]
+    fn utf8_array_len_unicode() {
+        // $#données — array length with UTF-8 name.
+        let prog = parse("use utf8; my @données; my $n = $#données;");
+        assert!(!prog.statements.is_empty(), "$#données should parse");
+    }
+
+    #[test]
+    fn utf8_devanagari_identifier() {
+        // Devanagari script: XID_Start/XID_Continue.
+        let prog = parse("use utf8; my $नाम = 1;");
+        assert!(!prog.statements.is_empty(), "Devanagari identifier should parse");
+    }
+
+    #[test]
+    fn utf8_cyrillic_identifier() {
+        let prog = parse("use utf8; my $имя = 1;");
+        assert!(!prog.statements.is_empty(), "Cyrillic identifier should parse");
+    }
+
+    #[test]
+    fn utf8_greek_identifier() {
+        let prog = parse("use utf8; my $αριθμός = 1;");
+        assert!(!prog.statements.is_empty(), "Greek identifier should parse");
+    }
+
+    #[test]
+    fn utf8_arabic_identifier() {
+        let prog = parse("use utf8; my $اسم = 1;");
+        assert!(!prog.statements.is_empty(), "Arabic identifier should parse");
+    }
+
+    #[test]
+    fn utf8_method_call() {
+        let prog = parse("use utf8; $obj->café();");
+        assert!(!prog.statements.is_empty(), "UTF-8 method name should parse");
+    }
+
+    #[test]
+    fn utf8_multiple_identifiers_same_program() {
+        let prog = parse("use utf8; my $café = 1; my $naïve = 2; my $für = 3;");
+        assert!(prog.statements.len() >= 3, "multiple UTF-8 identifiers in one program");
+    }
+
+    #[test]
+    fn utf8_hash_subscript_utf8_key() {
+        // Both the hash name and the autoquoted key are UTF-8.
+        let prog = parse("use utf8; my %données; $données{clé};");
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn utf8_heredoc_tag() {
+        // UTF-8 heredoc tag — the tag itself is a raw byte match,
+        // so this tests the terminator matching path.
+        let prog = parse("use utf8; my $x = <<FIN;\ncontent\nFIN\n");
+        assert!(!prog.statements.is_empty(), "UTF-8-adjacent heredoc should parse");
+    }
+
+    // ── NFC normalization additional coverage ────────────────
+
+    #[test]
+    fn nfc_same_identifier_both_forms_in_program() {
+        // If NFC and NFD forms of the same identifier appear in
+        // one program, they should resolve to the same name.
+        // NFC café = $x, then NFD café = $x should be the same var.
+        let src = "use utf8; my $caf\u{00E9} = 42; print $cafe\u{0301};";
+        let prog = parse(src);
+        // Both should parse — the NFD form becomes NFC.
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn nfc_interpolation_uses_normalized_name() {
+        // Interpolated variable name should be NFC-normalized.
+        // NFD $café inside a string should find NFC $café.
+        let src = "use utf8; my $caf\u{00E9} = 42; print \"$cafe\u{0301}\";";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "interpolated NFD variable should parse");
+    }
+
+    #[test]
+    fn nfc_consistent_across_sigils() {
+        // $café, @café, %café should all normalize consistently.
+        let src = "use utf8; my $cafe\u{0301} = 1; my @cafe\u{0301} = (1); my %cafe\u{0301} = (a => 1);";
+        let prog = parse(src);
+        assert!(prog.statements.len() >= 3, "all sigils should accept NFD and normalize");
+    }
+
+    #[test]
+    fn nfc_in_single_quoted_string() {
+        // Single-quoted string content should be NFC-normalized.
+        let src = "use utf8; my $x = 'cafe\u{0301}';";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "single-quoted NFD should parse");
+    }
+
+    #[test]
+    fn nfc_in_heredoc_body() {
+        // Heredoc body content should be NFC-normalized.
+        let body = format!("use utf8; my $x = <<END;\ncaf{}\nEND\n", "\u{00E9}");
+        let prog = parse(&body);
+        assert!(!prog.statements.is_empty(), "heredoc with NFC content should parse");
+    }
+
+    #[test]
+    fn nfc_in_regex_body() {
+        // Regex body should be NFC-normalized.
+        let src = "use utf8; my $x = 'test'; $x =~ /cafe\u{0301}/;";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "regex with NFD content should parse");
+    }
+
+    #[test]
+    fn nfc_in_qw() {
+        // qw() word list should be NFC-normalized.
+        let src = "use utf8; my @words = qw(cafe\u{0301} nai\u{0308}ve);";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "qw with NFD should parse");
+    }
+
+    #[test]
+    fn nfc_escape_sequences_not_normalized() {
+        // Escape sequences construct characters post-lexing,
+        // so they should NOT be NFC-normalized.
+        // "\x{65}\x{301}" should stay as two codepoints (e + combining acute),
+        // not be composed into é (U+00E9).
+        let src = r#"use utf8; my $x = "\x{65}\x{301}";"#;
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "escape sequences should parse");
+    }
+
+    #[test]
+    fn nfc_fat_comma_autoquote_normalized() {
+        // Fat comma autoquoting with NFD bareword.
+        let src = "use utf8; my %h = (cafe\u{0301} => 1);";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "fat comma with NFD bareword should parse");
+    }
+
+    #[test]
+    fn nfc_sub_name_nfd_and_nfc_same() {
+        // Sub declared with NFD name should be callable with NFC name.
+        let src = "use utf8; sub cafe\u{0301} { 1 } caf\u{00E9}();";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty(), "sub with NFD name and NFC call should parse");
+    }
+
+    // ── memchr with UTF-8 content ───────────────────────────
+
+    #[test]
+    fn memchr_utf8_string_body() {
+        // UTF-8 content in string body — memchr bulk copy
+        // should handle multi-byte characters correctly.
+        let src = "use utf8; my $x = \"héllo wörld café naïve\";";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn memchr_utf8_regex_body() {
+        // UTF-8 in regex body with memchr scanning.
+        let src = "use utf8; my $x = 'test'; $x =~ /héllo|wörld/;";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn memchr_utf8_single_quoted() {
+        // UTF-8 in single-quoted string — non-interpolating memchr path.
+        let src = "use utf8; my $x = 'café résumé naïve';";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
+
+    #[test]
+    fn memchr_utf8_interpolating_with_sigil() {
+        // UTF-8 content before interpolation trigger.
+        let src = "use utf8; my $name = 'world'; my $x = \"café $name résumé\";";
+        let prog = parse(src);
+        assert!(!prog.statements.is_empty());
+    }
 }

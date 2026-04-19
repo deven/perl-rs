@@ -6,4 +6,7 @@ license.workspace = true
 description = "Perl lexer, Pratt parser, and AST"
 
 [dependencies]
-bytes = { workspace = true }
+bytes                 = { workspace = true }
+memchr                = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-xid           = { workspace = true }
