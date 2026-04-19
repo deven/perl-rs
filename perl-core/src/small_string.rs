@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use bytes::Bytes;
+
 use crate::PerlString;
 
 /// Maximum number of bytes in a `SmallString`.
@@ -152,6 +154,12 @@ impl TryFrom<&str> for SmallString {
 
     fn try_from(s: &str) -> Result<Self, ()> {
         SmallString::from_str(s).ok_or(())
+    }
+}
+
+impl From<SmallString> for Bytes {
+    fn from(ss: SmallString) -> Self {
+        Bytes::copy_from_slice(ss.as_bytes())
     }
 }
 

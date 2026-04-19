@@ -11,6 +11,9 @@
 //! methods.
 
 use bytes::Bytes;
+use memchr::{memchr, memchr2, memchr3};
+use unicode_normalization::UnicodeNormalization;
+use unicode_xid::UnicodeXID;
 
 use crate::error::ParseError;
 use crate::keyword;
@@ -185,6 +188,36 @@ impl Lexer {
     /// letter check happens inside `scan_ident`).
     fn is_ident_start(&self, b: u8) -> bool {
         b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)
+    }
+
+    /// Decode the UTF-8 character starting at the current position.
+    /// Returns `(char, byte_length)` on success, `None` for invalid
+    /// UTF-8 or empty remaining input.
+    fn peek_utf8_char(&self) -> Option<(char, usize)> {
+        let r = self.remaining();
+        if r.is_empty() || r[0] < 0x80 {
+            // ASCII or empty — caller should handle directly.
+            return None;
+        }
+        // Determine how many bytes this UTF-8 lead byte claims.
+        let len = match r[0] {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return None, // invalid lead byte
+        };
+        if r.len() < len {
+            return None;
+        }
+        std::str::from_utf8(&r[..len]).ok().and_then(|s| s.chars().next()).map(|c| (c, len))
+    }
+
+    /// NFC-normalize a string if UTF-8 mode is active and the string
+    /// contains non-ASCII bytes.  Returns the input unchanged for
+    /// ASCII-only strings or when UTF-8 mode is off.
+    #[inline]
+    fn nfc_normalize(&self, s: String) -> String {
+        if self.utf8_mode && s.bytes().any(|b| b >= 0x80) { s.nfc().collect() } else { s }
     }
 
     /// Push a character to `s` with the active case modification
@@ -1074,10 +1107,22 @@ impl Lexer {
             other => {
                 if other >= 0x80 {
                     if self.utf8_mode {
-                        // UTF-8 lead byte in identifier position.
-                        // Route to lex_word which calls scan_ident
-                        // with UTF-8 decoding.
-                        self.lex_word()?
+                        // UTF-8 lead byte — check if it decodes to
+                        // an XID_Start character before routing to
+                        // the identifier path.
+                        if let Some((ch, _)) = self.peek_utf8_char() {
+                            if UnicodeXID::is_xid_start(ch) {
+                                self.lex_word()?
+                            } else {
+                                let len = ch.len_utf8();
+                                self.skip(len);
+                                return Err(ParseError::new(format!("Unrecognized character U+{:04X}", ch as u32), Span::new(start, self.span_pos())));
+                            }
+                        } else {
+                            // Invalid UTF-8 sequence.
+                            self.skip(1);
+                            return Err(ParseError::new(format!("Invalid UTF-8 byte \\x{other:02X}"), Span::new(start, self.span_pos())));
+                        }
                     } else {
                         self.skip(1);
                         return Err(ParseError::new(format!("Unrecognized character \\x{other:02X}"), Span::new(start, self.span_pos())));
@@ -1380,7 +1425,9 @@ impl Lexer {
             self.skip_ws_and_comments_no_pod()?;
             if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
                 let name = self.scan_ident();
-                return Ok(Token::ScalarVar(name));
+                if !name.is_empty() {
+                    return Ok(Token::ScalarVar(name));
+                }
             }
             return Ok(Token::Dollar);
         }
@@ -1390,14 +1437,18 @@ impl Lexer {
         if self.peek_byte(false) == Some(b'#') && after_hash.is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
             self.skip(1); // skip #
             let name = self.scan_ident();
-            return Ok(Token::ArrayLen(name));
+            if !name.is_empty() {
+                return Ok(Token::ArrayLen(name));
+            }
+            // Not a valid identifier — rewind past the #.
+            self.rewind(1);
         }
 
         // Special variables: $$, $!, $@, $_, $0-$9, $/, $\, etc.
         match self.peek_byte(false) {
             Some(b'_') => {
-                // Could be $_ or $_[...] or $__ident
-                if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                // Could be $_ or $_[...] or $_ident or $_ünïcödé
+                if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || (self.utf8_mode && b >= 0x80)) {
                     let name = self.scan_ident();
                     return Ok(Token::ScalarVar(name));
                 }
@@ -1645,7 +1696,9 @@ impl Lexer {
             self.skip_ws_and_comments_no_pod()?;
             if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
                 let name = self.scan_ident();
-                return Ok(Token::ArrayVar(name));
+                if !name.is_empty() {
+                    return Ok(Token::ArrayVar(name));
+                }
             }
             return Ok(Token::At);
         }
@@ -1681,6 +1734,10 @@ impl Lexer {
                 let name = self.scan_ident();
                 Ok(Token::ArrayVar(name))
             }
+            Some(b) if self.utf8_mode && b >= 0x80 => {
+                let name = self.scan_ident();
+                if !name.is_empty() { Ok(Token::ArrayVar(name)) } else { Ok(Token::At) }
+            }
             _ => Ok(Token::At),
         }
     }
@@ -1709,7 +1766,9 @@ impl Lexer {
             self.skip_ws_and_comments_no_pod()?;
             if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
                 let name = self.scan_ident();
-                return Ok(Some(Token::HashVar(name)));
+                if !name.is_empty() {
+                    return Ok(Some(Token::HashVar(name)));
+                }
             }
             return Ok(None);
         }
@@ -1761,6 +1820,10 @@ impl Lexer {
                 let name = self.scan_ident();
                 Ok(Some(Token::HashVar(name)))
             }
+            Some(b) if self.utf8_mode && b >= 0x80 => {
+                let name = self.scan_ident();
+                if !name.is_empty() { Ok(Some(Token::HashVar(name))) } else { Ok(None) }
+            }
             _ => Ok(None),
         }
     }
@@ -1806,24 +1869,24 @@ impl Lexer {
 
     fn scan_ident(&mut self) -> String {
         let start = self.line_pos();
+        let mut first = true;
         while let Some(b) = self.peek_byte(false) {
             if b.is_ascii_alphanumeric() || b == b'_' {
                 self.skip(1);
+                first = false;
             } else if b == b':' && self.peek_byte_at(1) == Some(b':') {
                 // Package separator Foo::Bar
                 self.skip(2);
+                first = true; // next char starts a new segment
             } else if self.utf8_mode && b >= 0x80 {
-                // UTF-8 continuation: decode a multi-byte character
-                // and accept it if it's a Unicode letter or digit
-                // (approximating XID_Continue).
-                let r = self.remaining();
-                let decoded = std::str::from_utf8(r).map(|s| s.chars().next()).unwrap_or_else(|e| {
-                    let v = e.valid_up_to();
-                    if v > 0 { std::str::from_utf8(&r[..v]).ok().and_then(|s| s.chars().next()) } else { None }
-                });
-                if let Some(ch) = decoded {
-                    if ch.is_alphanumeric() {
-                        self.skip(ch.len_utf8());
+                // UTF-8 multi-byte character: decode and check
+                // XID_Start for the first character, XID_Continue
+                // for subsequent characters.
+                if let Some((ch, len)) = self.peek_utf8_char() {
+                    let ok = if first { UnicodeXID::is_xid_start(ch) } else { UnicodeXID::is_xid_continue(ch) };
+                    if ok {
+                        self.skip(len);
+                        first = false;
                     } else {
                         break;
                     }
@@ -1834,7 +1897,8 @@ impl Lexer {
                 break;
             }
         }
-        String::from_utf8_lossy(self.line_slice(start)).into_owned()
+        let name = String::from_utf8_lossy(self.line_slice(start)).into_owned();
+        self.nfc_normalize(name)
     }
 
     fn lex_word(&mut self) -> Result<Token, ParseError> {
@@ -2241,6 +2305,63 @@ impl Lexer {
         let mut current_depth = depth;
 
         loop {
+            // ── memchr fast path ──────────────────────────────────
+            // When no case mods are active and we have remaining
+            // bytes in the current line, use SIMD-optimized search
+            // to skip past safe bytes in bulk.
+            let no_case_mods = !self.case_mod_lcfirst && !self.case_mod_ucfirst && self.case_mod_stack.last().is_none_or(|f| f.is_empty());
+            if no_case_mods && current_depth == 0 {
+                let r = self.remaining();
+                if !r.is_empty() {
+                    // Find the next trigger byte using memchr.
+                    let trigger_pos = if regex {
+                        // Regex: $, @, \, close, (
+                        let sig = memchr3(b'$', b'@', b'\\', r);
+                        let delim = if let Some(c) = close { memchr2(c, b'(', r) } else { memchr(b'(', r) };
+                        match (sig, delim) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    } else if interpolating {
+                        // Interpolating: $, @, \, close
+                        let sig = memchr3(b'$', b'@', b'\\', r);
+                        let delim = close.and_then(|c| memchr(c, r));
+                        match (sig, delim) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    } else {
+                        // Non-interpolating: \, close
+                        if let Some(c) = close { memchr2(b'\\', c, r) } else { memchr(b'\\', r) }
+                    };
+
+                    // Also search for open delimiter (depth tracking).
+                    let trigger_pos = if let Some(o) = open
+                        && o != close.unwrap_or(0)
+                    {
+                        match (trigger_pos, memchr(o, r)) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    } else {
+                        trigger_pos
+                    };
+
+                    let safe_len = trigger_pos.unwrap_or(r.len());
+                    if safe_len > 0 {
+                        // Bulk-copy safe bytes.
+                        let safe = &r[..safe_len];
+                        match std::str::from_utf8(safe) {
+                            Ok(text) => s.push_str(text),
+                            Err(_) => s.push_str(&String::from_utf8_lossy(safe)),
+                        }
+                        self.skip(safe_len);
+                        continue;
+                    }
+                }
+            }
+
+            // ── Byte-by-byte fallback ─────────────────────────────
             match self.peek_byte(true) {
                 None => {
                     // EOF or virtual EOF (peeked).  For delimited
@@ -2331,6 +2452,10 @@ impl Lexer {
         if interpolating && let Some(ctx) = self.context_stack.last_mut() {
             ctx.depth = current_depth;
         }
+
+        // NFC-normalize raw source content (not escape-constructed
+        // content, which is already in the form the user specified).
+        let s = self.nfc_normalize(s);
 
         Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.span_pos()) })
     }
