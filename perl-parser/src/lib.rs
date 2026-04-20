@@ -17,7 +17,7 @@ pub mod keyword;
 pub mod pragma;
 pub mod source;
 pub mod span;
-pub mod symbols;
+pub mod symbol;
 pub mod token;
 
 pub(crate) mod lexer;
