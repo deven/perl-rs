@@ -740,7 +740,7 @@ impl Parser {
     fn parse_prototype(&mut self) -> Result<Option<String>, ParseError> {
         if self.at(&Token::LeftParen)? {
             self.next_token()?; // consume (
-            let proto = self.lexer.lex_body_str(b'(', true)?;
+            let proto = self.lexer.lex_body_str('(', true)?;
             Ok(Some(proto))
         } else {
             Ok(None)
@@ -937,7 +937,7 @@ impl Parser {
                 let value = if self.at(&Token::LeftParen)? {
                     self.next_token()?; // consume (
                     if name == "prototype" {
-                        Some(self.lexer.lex_body_str(b'(', true)?)
+                        Some(self.lexer.lex_body_str('(', true)?)
                     } else {
                         let mut args = String::new();
                         let mut depth = 1u32;
@@ -1300,7 +1300,8 @@ impl Parser {
 
         // Sync shared UTF-8 flag — the lexer reads this to
         // decide whether to accept multi-byte identifiers.
-        self.lexer.utf8_mode = self.pragmas.utf8;
+        self.lexer.set_utf8_mode(self.pragmas.utf8);
+        self.lexer.features = self.pragmas.features;
 
         Ok(StmtKind::UseDecl(UseDecl { is_no, module, version, imports, span: start.merge(self.peek_span()) }))
     }
@@ -1702,7 +1703,8 @@ impl Parser {
             this.pragmas = saved_pragmas;
             this.current_package = saved_package;
             // Sync shared UTF-8 flag with the restored state.
-            this.lexer.utf8_mode = this.pragmas.utf8;
+            this.lexer.set_utf8_mode(this.pragmas.utf8);
+            this.lexer.features = this.pragmas.features;
             result
         })
     }
@@ -2210,7 +2212,7 @@ impl Parser {
             }
             // / in term position is a regex, not division.
             Token::Slash => {
-                let pattern = self.lexer.lex_body_str(b'/', true)?;
+                let pattern = self.lexer.lex_body_str('/', true)?;
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
@@ -2221,7 +2223,7 @@ impl Parser {
             // regex pattern, not a division-assignment operator.
             Token::Assign(AssignOp::DivEq) => {
                 self.lexer.rewind(1);
-                let pattern = self.lexer.lex_body_str(b'/', true)?;
+                let pattern = self.lexer.lex_body_str('/', true)?;
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;

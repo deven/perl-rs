@@ -352,7 +352,7 @@ pub enum Token {
 
     // ── Quote/interpolation sub-tokens (§5.4) ─────────────────
     /// Start of a quote-like construct.  Contains quote type and delimiter.
-    QuoteSublexBegin(QuoteKind, u8),
+    QuoteSublexBegin(QuoteKind, char),
     /// End of a quote-like construct.
     SublexEnd,
     /// Literal segment inside a quote.
@@ -385,7 +385,7 @@ pub enum Token {
 
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.
-    RegexSublexBegin(RegexKind, u8),
+    RegexSublexBegin(RegexKind, char),
     /// `(?{` — embedded code block in a regex pattern.
     /// Lexer switches to normal code mode until `}`.
     RegexCodeStart,
@@ -394,10 +394,10 @@ pub enum Token {
     RegexCondCodeStart,
 
     // ── Substitution / transliteration ──────────────────────────
-    /// Start of a substitution.  The delimiter byte is carried so
+    /// Start of a substitution.  The delimiter char is carried so
     /// the parser can pass it back to `start_subst_replacement`.
     /// Pattern body tokens follow until SublexEnd.
-    SubstSublexBegin(u8),
+    SubstSublexBegin(char),
     /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
     TranslitLit(String, String, Option<String>),
 

@@ -123,7 +123,7 @@ fn lex_cr_only_not_treated_as_newline() {
     let tok = lexer.lex_token().unwrap();
     assert_eq!(tok.token, Token::ShiftLeft);
     let heredoc_tok = lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
-    assert_eq!(heredoc_tok, Token::QuoteSublexBegin(QuoteKind::Heredoc, 0));
+    assert_eq!(heredoc_tok, Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
     // Body line "hello\rEND\n" is not a terminator — returned as content.
     let tok = lexer.lex_token().unwrap();
     assert!(matches!(tok.token, Token::ConstSegment(_)));
@@ -185,7 +185,7 @@ fn lex_indented_heredoc_empty_line_ok() {
     // Empty lines (just \n) are allowed without indentation.
     let src = "<<~END;\n    hello\n\n    world\n    END\n";
     let tokens = lex_all(src);
-    assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, 0));
+    assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
     let body: String = tokens.iter().filter_map(|t| if let Token::ConstSegment(s) = t { Some(s.as_str()) } else { None }).collect();
     assert_eq!(body, "hello\n\nworld\n");
 }
@@ -212,7 +212,7 @@ fn lex_string_literals() {
 
     // Double-quoted: emits sub-token stream.
     let tokens = lex_all(r#""world\n""#);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::ConstSegment("world\n".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::ConstSegment("world\n".into()), Token::SublexEnd,]);
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn lex_print_hello() {
         tokens,
         vec![
             Token::Keyword(Keyword::Print),
-            Token::QuoteSublexBegin(QuoteKind::Double, b'"'),
+            Token::QuoteSublexBegin(QuoteKind::Double, '"'),
             Token::ConstSegment("Hello, world!\n".into()),
             Token::SublexEnd,
             Token::Semi,
@@ -368,7 +368,7 @@ fn lex_interp_scalar() {
     assert_eq!(
         tokens,
         vec![
-            Token::QuoteSublexBegin(QuoteKind::Double, b'"'),
+            Token::QuoteSublexBegin(QuoteKind::Double, '"'),
             Token::ConstSegment("Hello, ".into()),
             Token::InterpScalar("name".into()),
             Token::ConstSegment("!".into()),
@@ -382,7 +382,7 @@ fn lex_interp_braced() {
     let tokens = lex_all(r#""${name}bar""#);
     assert_eq!(
         tokens,
-        vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::InterpScalar("name".into()), Token::ConstSegment("bar".into()), Token::SublexEnd,]
+        vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::InterpScalar("name".into()), Token::ConstSegment("bar".into()), Token::SublexEnd,]
     );
 }
 
@@ -392,7 +392,7 @@ fn lex_interp_array() {
     assert_eq!(
         tokens,
         vec![
-            Token::QuoteSublexBegin(QuoteKind::Double, b'"'),
+            Token::QuoteSublexBegin(QuoteKind::Double, '"'),
             Token::ConstSegment("items: ".into()),
             Token::InterpArray("list".into()),
             Token::ConstSegment(".".into()),
@@ -404,14 +404,14 @@ fn lex_interp_array() {
 #[test]
 fn lex_interp_escaped_sigil() {
     let tokens = lex_all(r#""price: \$100""#);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::ConstSegment("price: $100".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::ConstSegment("price: $100".into()), Token::SublexEnd,]);
 }
 
 #[test]
 fn lex_interp_no_interpolation() {
     // A double-quoted string with no variables is still sub-tokens.
     let tokens = lex_all(r#""plain text""#);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::ConstSegment("plain text".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::ConstSegment("plain text".into()), Token::SublexEnd,]);
 }
 
 #[test]
@@ -420,7 +420,7 @@ fn lex_interp_multiple_vars() {
     assert_eq!(
         tokens,
         vec![
-            Token::QuoteSublexBegin(QuoteKind::Double, b'"'),
+            Token::QuoteSublexBegin(QuoteKind::Double, '"'),
             Token::InterpScalar("x".into()),
             Token::ConstSegment(" + ".into()),
             Token::InterpScalar("y".into()),
@@ -435,7 +435,7 @@ fn lex_qq_interp() {
     assert_eq!(
         tokens,
         vec![
-            Token::QuoteSublexBegin(QuoteKind::Double, b'{'),
+            Token::QuoteSublexBegin(QuoteKind::Double, '{'),
             Token::ConstSegment("Hello, ".into()),
             Token::InterpScalar("name".into()),
             Token::ConstSegment("!".into()),
@@ -447,7 +447,7 @@ fn lex_qq_interp() {
 #[test]
 fn lex_empty_string() {
     let tokens = lex_all(r#""""#);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::SublexEnd,]);
 }
 
 #[test]
@@ -476,25 +476,19 @@ fn lex_bare_regex_no_flags() {
 #[test]
 fn lex_m_regex() {
     let tokens = lex_all("m{foo}i");
-    assert_eq!(
-        tokens,
-        vec![Token::RegexSublexBegin(RegexKind::Match, b'{'), Token::ConstSegment("foo".into()), Token::SublexEnd, Token::Ident("i".into()),]
-    );
+    assert_eq!(tokens, vec![Token::RegexSublexBegin(RegexKind::Match, '{'), Token::ConstSegment("foo".into()), Token::SublexEnd, Token::Ident("i".into()),]);
 }
 
 #[test]
 fn lex_m_regex_slash() {
     let tokens = lex_all("m/bar/gx");
-    assert_eq!(
-        tokens,
-        vec![Token::RegexSublexBegin(RegexKind::Match, b'/'), Token::ConstSegment("bar".into()), Token::SublexEnd, Token::Ident("gx".into()),]
-    );
+    assert_eq!(tokens, vec![Token::RegexSublexBegin(RegexKind::Match, '/'), Token::ConstSegment("bar".into()), Token::SublexEnd, Token::Ident("gx".into()),]);
 }
 
 #[test]
 fn lex_qr_regex() {
     let tokens = lex_all("qr/\\d+/");
-    assert_eq!(tokens, vec![Token::RegexSublexBegin(RegexKind::Qr, b'/'), Token::ConstSegment("\\d+".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::RegexSublexBegin(RegexKind::Qr, '/'), Token::ConstSegment("\\d+".into()), Token::SublexEnd,]);
 }
 
 #[test]
@@ -502,7 +496,7 @@ fn lex_substitution() {
     // lex_all only tests the pattern side; the full pipeline
     // (replacement + flags) is tested by parser tests.
     let tokens = lex_all("s/foo/bar/g");
-    assert_eq!(tokens[0], Token::SubstSublexBegin(b'/'));
+    assert_eq!(tokens[0], Token::SubstSublexBegin('/'));
     assert_eq!(tokens[1], Token::ConstSegment("foo".into()));
     assert_eq!(tokens[2], Token::SublexEnd);
 }
@@ -510,7 +504,7 @@ fn lex_substitution() {
 #[test]
 fn lex_substitution_braces() {
     let tokens = lex_all("s{foo}{bar}g");
-    assert_eq!(tokens[0], Token::SubstSublexBegin(b'{'));
+    assert_eq!(tokens[0], Token::SubstSublexBegin('{'));
     assert_eq!(tokens[1], Token::ConstSegment("foo".into()));
     assert_eq!(tokens[2], Token::SublexEnd);
 }
@@ -548,14 +542,14 @@ fn lex_division_not_regex() {
 fn lex_heredoc_bare_tag() {
     let src = "<<END;\nHello, world!\nEND\n";
     let tokens = lex_all(src);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("Hello, world!\n".into()), Token::SublexEnd, Token::Semi,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::ConstSegment("Hello, world!\n".into()), Token::SublexEnd, Token::Semi,]);
 }
 
 #[test]
 fn lex_heredoc_double_quoted() {
     let src = "<<\"END\";\nHello!\nEND\n";
     let tokens = lex_all(src);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("Hello!\n".into()), Token::SublexEnd, Token::Semi,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::ConstSegment("Hello!\n".into()), Token::SublexEnd, Token::Semi,]);
 }
 
 #[test]
@@ -573,7 +567,7 @@ fn lex_heredoc_multiline_body() {
     // covering all lines, same as regular strings.
     assert_eq!(
         tokens,
-        vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("line 1\nline 2\nline 3\n".into()), Token::SublexEnd, Token::Semi,]
+        vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::ConstSegment("line 1\nline 2\nline 3\n".into()), Token::SublexEnd, Token::Semi,]
     );
 }
 
@@ -585,11 +579,11 @@ fn lex_heredoc_with_rest_of_line() {
     assert_eq!(
         tokens,
         vec![
-            Token::QuoteSublexBegin(QuoteKind::Heredoc, 0),
+            Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'),
             Token::ConstSegment("body\n".into()),
             Token::SublexEnd,
             Token::Dot,
-            Token::QuoteSublexBegin(QuoteKind::Double, b'"'),
+            Token::QuoteSublexBegin(QuoteKind::Double, '"'),
             Token::ConstSegment(" suffix".into()),
             Token::SublexEnd,
             Token::Semi,
@@ -601,7 +595,7 @@ fn lex_heredoc_with_rest_of_line() {
 fn lex_heredoc_indented() {
     let src = "<<~END;\n    hello\n    world\n    END\n";
     let tokens = lex_all(src);
-    assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, 0));
+    assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
     // Indent (4 spaces) should be stripped from each line.
     let body: String = tokens.iter().filter_map(|t| if let Token::ConstSegment(s) = t { Some(s.as_str()) } else { None }).collect();
     assert_eq!(body, "hello\nworld\n");
@@ -626,7 +620,7 @@ fn lex_heredoc_spliced_inside_q_string() {
     let tokens = lex_all(src);
 
     // First tokens: heredoc body
-    assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, 0));
+    assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
     // Collect heredoc body content.
     let mut i = 1;
     let mut body = String::new();
@@ -750,7 +744,7 @@ fn lex_single_quoted_escape_quote() {
 #[test]
 fn lex_double_quoted_tab_escape() {
     let tokens = lex_all(r#""\t""#);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::ConstSegment("\t".into()), Token::SublexEnd]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::ConstSegment("\t".into()), Token::SublexEnd]);
 }
 
 #[test]
@@ -764,7 +758,7 @@ fn lex_qq_pipe_delimiter() {
     let tokens = lex_all("qq|hello $name|");
     assert_eq!(
         tokens,
-        vec![Token::QuoteSublexBegin(QuoteKind::Double, b'|'), Token::ConstSegment("hello ".into()), Token::InterpScalar("name".into()), Token::SublexEnd,]
+        vec![Token::QuoteSublexBegin(QuoteKind::Double, '|'), Token::ConstSegment("hello ".into()), Token::InterpScalar("name".into()), Token::SublexEnd,]
     );
 }
 
@@ -804,14 +798,14 @@ fn lex_qw_literal_backslash_n() {
 #[test]
 fn lex_backtick_string() {
     let tokens = lex_all("`ls -la`");
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Backtick, b'`'), Token::ConstSegment("ls -la".into()), Token::SublexEnd]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Backtick, '`'), Token::ConstSegment("ls -la".into()), Token::SublexEnd]);
 }
 
 #[test]
 fn lex_heredoc_empty_body() {
     let src = "<<END;\nEND\n";
     let tokens = lex_all(src);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, 0), Token::SublexEnd, Token::Semi,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::SublexEnd, Token::Semi,]);
 }
 
 #[test]
@@ -849,7 +843,7 @@ fn lex_double_quoted_multiline_one_segment() {
     // A multiline double-quoted string without interpolation
     // should produce one ConstSegment covering all lines.
     let tokens = lex_all("\"line 1\nline 2\nline 3\"");
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::ConstSegment("line 1\nline 2\nline 3".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::ConstSegment("line 1\nline 2\nline 3".into()), Token::SublexEnd,]);
 }
 
 #[test]
@@ -861,7 +855,7 @@ fn lex_double_quoted_multiline_breaks_at_interp() {
     assert_eq!(
         tokens,
         vec![
-            Token::QuoteSublexBegin(QuoteKind::Double, b'"'),
+            Token::QuoteSublexBegin(QuoteKind::Double, '"'),
             Token::ConstSegment("line 1\nline 2\n".into()),
             Token::InterpScalar("x".into()),
             Token::ConstSegment("\nline 4".into()),
@@ -878,10 +872,7 @@ fn lex_heredoc_multiline_single_segment() {
     // consumed prematurely.
     let src = "<<END;\nline 1\nline 2\nEND\n";
     let tokens = lex_all(src);
-    assert_eq!(
-        tokens,
-        vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, 0), Token::ConstSegment("line 1\nline 2\n".into()), Token::SublexEnd, Token::Semi,]
-    );
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::ConstSegment("line 1\nline 2\n".into()), Token::SublexEnd, Token::Semi,]);
 }
 
 // ── Assignment operator tokens ────────────────────────────
@@ -1265,7 +1256,7 @@ fn lex_regex_code_block() {
     assert_eq!(
         tokens,
         vec![
-            Token::RegexSublexBegin(RegexKind::Match, b'/'),
+            Token::RegexSublexBegin(RegexKind::Match, '/'),
             Token::ConstSegment("foo".into()),
             Token::RegexCodeStart,
             Token::ScalarVar("x".into()),
@@ -1282,7 +1273,7 @@ fn lex_regex_cond_code_block() {
     assert_eq!(
         tokens,
         vec![
-            Token::RegexSublexBegin(RegexKind::Match, b'/'),
+            Token::RegexSublexBegin(RegexKind::Match, '/'),
             Token::ConstSegment("foo".into()),
             Token::RegexCondCodeStart,
             Token::ScalarVar("x".into()),
@@ -1302,7 +1293,7 @@ fn lex_regex_code_block_paired_delim() {
     assert_eq!(
         tokens,
         vec![
-            Token::RegexSublexBegin(RegexKind::Match, b'{'),
+            Token::RegexSublexBegin(RegexKind::Match, '{'),
             Token::ConstSegment("foo".into()),
             Token::RegexCodeStart,
             Token::IntLit(1),
@@ -1317,7 +1308,7 @@ fn lex_regex_code_block_paired_delim() {
 fn lex_code_block_not_in_string() {
     // (?{ in a double-quoted string is literal, not a code block.
     let tokens = lex_all(r#""foo(?{bar})""#);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::ConstSegment("foo(?{bar})".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::ConstSegment("foo(?{bar})".into()), Token::SublexEnd,]);
 }
 
 #[test]
@@ -1331,7 +1322,7 @@ fn lex_code_block_not_in_single_quoted() {
 fn lex_cond_code_block_not_in_string() {
     // (??{ in a double-quoted string is literal.
     let tokens = lex_all(r#""foo(??{bar})""#);
-    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, b'"'), Token::ConstSegment("foo(??{bar})".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Double, '"'), Token::ConstSegment("foo(??{bar})".into()), Token::SublexEnd,]);
 }
 
 // ── Regex interpolation ───────────────────────────────────
@@ -1342,7 +1333,7 @@ fn lex_regex_scalar_interp() {
     let tokens = lex_all("m/foo$bar/");
     assert_eq!(
         tokens,
-        vec![Token::RegexSublexBegin(RegexKind::Match, b'/'), Token::ConstSegment("foo".into()), Token::InterpScalar("bar".into()), Token::SublexEnd,]
+        vec![Token::RegexSublexBegin(RegexKind::Match, '/'), Token::ConstSegment("foo".into()), Token::InterpScalar("bar".into()), Token::SublexEnd,]
     );
 }
 
@@ -1352,7 +1343,7 @@ fn lex_regex_array_interp() {
     let tokens = lex_all("m/foo@arr/");
     assert_eq!(
         tokens,
-        vec![Token::RegexSublexBegin(RegexKind::Match, b'/'), Token::ConstSegment("foo".into()), Token::InterpArray("arr".into()), Token::SublexEnd,]
+        vec![Token::RegexSublexBegin(RegexKind::Match, '/'), Token::ConstSegment("foo".into()), Token::InterpArray("arr".into()), Token::SublexEnd,]
     );
 }
 
@@ -1363,7 +1354,7 @@ fn lex_regex_interp_and_code_block() {
     assert_eq!(
         tokens,
         vec![
-            Token::RegexSublexBegin(RegexKind::Match, b'/'),
+            Token::RegexSublexBegin(RegexKind::Match, '/'),
             Token::ConstSegment("foo".into()),
             Token::InterpScalar("bar".into()),
             Token::RegexCodeStart,
@@ -1379,7 +1370,7 @@ fn lex_regex_interp_and_code_block() {
 fn lex_regex_literal_no_interp() {
     // m'...' with single-quote delimiter: no $var interpolation.
     let tokens = lex_all("m'foo$bar'");
-    assert_eq!(tokens, vec![Token::RegexSublexBegin(RegexKind::Match, b'\''), Token::ConstSegment("foo$bar".into()), Token::SublexEnd,]);
+    assert_eq!(tokens, vec![Token::RegexSublexBegin(RegexKind::Match, '\''), Token::ConstSegment("foo$bar".into()), Token::SublexEnd,]);
 }
 
 #[test]
@@ -1389,7 +1380,7 @@ fn lex_regex_literal_with_code_block() {
     assert_eq!(
         tokens,
         vec![
-            Token::RegexSublexBegin(RegexKind::Match, b'\''),
+            Token::RegexSublexBegin(RegexKind::Match, '\''),
             Token::ConstSegment("foo".into()),
             Token::RegexCodeStart,
             Token::ScalarVar("x".into()),
@@ -1404,7 +1395,7 @@ fn lex_regex_literal_with_code_block() {
 fn lex_subst_pattern_interp() {
     // $var in s/// pattern triggers interpolation.
     let tokens = lex_all("s/foo$bar/baz/");
-    assert_eq!(tokens[0], Token::SubstSublexBegin(b'/'));
+    assert_eq!(tokens[0], Token::SubstSublexBegin('/'));
     assert_eq!(tokens[1], Token::ConstSegment("foo".into()));
     assert_eq!(tokens[2], Token::InterpScalar("bar".into()));
     // ConstSegment("") before SublexEnd for the empty segment
@@ -1415,7 +1406,7 @@ fn lex_subst_pattern_interp() {
 #[test]
 fn lex_substitution_global() {
     let tokens = lex_all("s/old/new/g");
-    assert_eq!(tokens[0], Token::SubstSublexBegin(b'/'));
+    assert_eq!(tokens[0], Token::SubstSublexBegin('/'));
     assert_eq!(tokens[1], Token::ConstSegment("old".into()));
     assert_eq!(tokens[2], Token::SublexEnd);
 }
@@ -2225,7 +2216,7 @@ fn lex_regex_optimistic_code_block() {
     assert_eq!(
         tokens,
         vec![
-            Token::RegexSublexBegin(RegexKind::Match, b'/'),
+            Token::RegexSublexBegin(RegexKind::Match, '/'),
             Token::ConstSegment("foo".into()),
             Token::RegexCodeStart,
             Token::ScalarVar("x".into()),
@@ -2317,4 +2308,108 @@ fn lex_empty_regex_flags_must_be_adjacent() {
     let tokens = lex_all("// i");
     assert!(tokens.iter().any(|t| matches!(t, Token::DefinedOr)));
     assert!(tokens.iter().any(|t| matches!(t, Token::Ident(s) if s == "i")));
+}
+
+// ── Unicode paired delimiter table ────────────────────────
+
+#[test]
+fn matching_delimiter_ascii_always_paired() {
+    // ASCII pairs work regardless of extra_paired flag.
+    assert_eq!(matching_delimiter('(', false), (Some('('), ')'));
+    assert_eq!(matching_delimiter('[', false), (Some('['), ']'));
+    assert_eq!(matching_delimiter('{', false), (Some('{'), '}'));
+    assert_eq!(matching_delimiter('<', false), (Some('<'), '>'));
+    assert_eq!(matching_delimiter('(', true), (Some('('), ')'));
+}
+
+#[test]
+fn matching_delimiter_non_paired_ascii() {
+    assert_eq!(matching_delimiter('/', false), (None, '/'));
+    assert_eq!(matching_delimiter('!', false), (None, '!'));
+    assert_eq!(matching_delimiter('#', false), (None, '#'));
+    assert_eq!(matching_delimiter('/', true), (None, '/'));
+}
+
+#[test]
+fn matching_delimiter_guillemets_with_feature() {
+    // « → » when extra_paired is on.
+    assert_eq!(matching_delimiter('\u{00AB}', true), (Some('\u{00AB}'), '\u{00BB}'));
+    // » → « (reverse pair).
+    assert_eq!(matching_delimiter('\u{00BB}', true), (Some('\u{00BB}'), '\u{00AB}'));
+}
+
+#[test]
+fn matching_delimiter_guillemets_without_feature() {
+    // Without the feature, Unicode chars are non-paired.
+    assert_eq!(matching_delimiter('\u{00AB}', false), (None, '\u{00AB}'));
+}
+
+#[test]
+fn matching_delimiter_cjk_brackets() {
+    // 「 → 」 (CJK corner brackets).
+    assert_eq!(matching_delimiter('\u{300C}', true), (Some('\u{300C}'), '\u{300D}'));
+    // 《 → 》 (CJK double angle brackets).
+    assert_eq!(matching_delimiter('\u{300A}', true), (Some('\u{300A}'), '\u{300B}'));
+}
+
+#[test]
+fn matching_delimiter_math_angle_brackets() {
+    // ⟨ → ⟩ (mathematical angle brackets).
+    assert_eq!(matching_delimiter('\u{27E8}', true), (Some('\u{27E8}'), '\u{27E9}'));
+    // ⟪ → ⟫ (mathematical double angle brackets).
+    assert_eq!(matching_delimiter('\u{27EA}', true), (Some('\u{27EA}'), '\u{27EB}'));
+}
+
+#[test]
+fn matching_delimiter_ornamental_brackets() {
+    // ❨ → ❩
+    assert_eq!(matching_delimiter('\u{2768}', true), (Some('\u{2768}'), '\u{2769}'));
+    // ❴ → ❵ (medium curly bracket ornament).
+    assert_eq!(matching_delimiter('\u{2774}', true), (Some('\u{2774}'), '\u{2775}'));
+}
+
+#[test]
+fn matching_delimiter_fullwidth_brackets() {
+    // （ → ）
+    assert_eq!(matching_delimiter('\u{FF08}', true), (Some('\u{FF08}'), '\u{FF09}'));
+    // ［ → ］
+    assert_eq!(matching_delimiter('\u{FF3B}', true), (Some('\u{FF3B}'), '\u{FF3D}'));
+}
+
+#[test]
+fn matching_delimiter_smp_musical_barlines() {
+    // 𝄃 → 𝄂 (4-byte UTF-8, SMP).
+    assert_eq!(matching_delimiter('\u{1D103}', true), (Some('\u{1D103}'), '\u{1D102}'));
+    // 𝄆 → 𝄇
+    assert_eq!(matching_delimiter('\u{1D106}', true), (Some('\u{1D106}'), '\u{1D107}'));
+}
+
+#[test]
+fn matching_delimiter_smp_pointing_hands() {
+    // 👉 → 👈 (emoji, 4-byte UTF-8).
+    assert_eq!(matching_delimiter('\u{1F449}', true), (Some('\u{1F449}'), '\u{1F448}'));
+}
+
+#[test]
+fn matching_delimiter_arrows() {
+    // → → ← (rightwards/leftwards arrow).
+    assert_eq!(matching_delimiter('\u{2192}', true), (Some('\u{2192}'), '\u{2190}'));
+    // ⇒ → ⇐ (double arrow).
+    assert_eq!(matching_delimiter('\u{21D2}', true), (Some('\u{21D2}'), '\u{21D0}'));
+}
+
+#[test]
+fn is_paired_reflects_feature_flag() {
+    assert!(is_paired('(', false));
+    assert!(is_paired('{', true));
+    assert!(!is_paired('/', false));
+    assert!(is_paired('\u{00AB}', true));
+    assert!(!is_paired('\u{00AB}', false));
+}
+
+#[test]
+fn matching_delimiter_table_size() {
+    // Verify the packed table constants have equal byte lengths.
+    assert_eq!(DELIM_OPEN.len(), DELIM_CLOSE.len());
+    assert_eq!(DELIM_OPEN.chars().count(), 321);
 }

@@ -36,7 +36,7 @@ fn collect_tokens(src: &str) -> Vec<Token> {
 /// without going through the full parser pragma machinery.
 fn collect_tokens_utf8(src: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(src.as_bytes());
-    lexer.utf8_mode = true;
+    lexer.set_utf8_mode(true);
     let mut tokens = Vec::new();
     loop {
         let spanned = lexer.lex_token().unwrap();
@@ -6491,11 +6491,7 @@ fn postderef_array_slice_keys_content() {
             ExprKind::List(items) => {
                 assert_eq!(items.len(), 3);
                 for (i, want) in ["a", "b", "c"].iter().enumerate() {
-                    assert!(
-                        matches!(items[i].kind, ExprKind::StringLit(ref s) if s == want),
-                        "item {i}: expected StringLit({want}), got {:?}",
-                        items[i].kind
-                    );
+                    assert!(matches!(items[i].kind, ExprKind::StringLit(ref s) if s == want), "item {i}: expected StringLit({want}), got {:?}", items[i].kind);
                 }
             }
             other => panic!("expected List of 3 strings, got {other:?}"),
@@ -7573,11 +7569,7 @@ fn hard_arrow_chained_method() {
     match &e.kind {
         ExprKind::MethodCall(target, name, _) => {
             assert_eq!(name, "method");
-            assert!(
-                matches!(target.kind, ExprKind::ArrowDeref(_, _) | ExprKind::HashElem(_, _)),
-                "expected arrow/hash deref target, got {:?}",
-                target.kind
-            );
+            assert!(matches!(target.kind, ExprKind::ArrowDeref(_, _) | ExprKind::HashElem(_, _)), "expected arrow/hash deref target, got {:?}", target.kind);
         }
         other => panic!("expected MethodCall, got {other:?}"),
     }
@@ -10337,11 +10329,8 @@ fn nfc_package_name_normalized() {
     // Package::Module with decomposed chars — verify NFC names.
     let src = "use utf8; package Caf\u{00E9}::Mo\u{0308}dule;";
     let prog = parse(src);
-    let pkg = prog
-        .statements
-        .iter()
-        .find_map(|s| if let StmtKind::PackageDecl(pd) = &s.kind { Some(pd) } else { None })
-        .expect("should find package declaration");
+    let pkg =
+        prog.statements.iter().find_map(|s| if let StmtKind::PackageDecl(pd) = &s.kind { Some(pd) } else { None }).expect("should find package declaration");
     // Mödule: o + U+0308 → ö (U+00F6) in NFC
     assert_eq!(pkg.name, "Caf\u{00E9}::M\u{00F6}dule", "package name should be NFC-normalized");
 }
@@ -10447,8 +10436,7 @@ fn memchr_heredoc_multiline_content() {
 fn utf8_array_len_unicode() {
     // $#données — verify the array-length name is exact.
     let tokens = collect_tokens_utf8("use utf8; my @données; my $n = $#données;");
-    let arraylen_name =
-        tokens.iter().find_map(|t| if let Token::ArrayLen(name) = t { Some(name.clone()) } else { None }).expect("should find ArrayLen token");
+    let arraylen_name = tokens.iter().find_map(|t| if let Token::ArrayLen(name) = t { Some(name.clone()) } else { None }).expect("should find ArrayLen token");
     assert_eq!(arraylen_name, "donn\u{00E9}es", "$#données should produce exact name");
 }
 
@@ -10913,14 +10901,10 @@ fn hard_block_vs_hash_in_map() {
                     || s.else_block.as_ref().is_some_and(block_contains_anon_hash)
             }
             StmtKind::While(s) => {
-                expr_contains_anon_hash(&s.condition)
-                    || block_contains_anon_hash(&s.body)
-                    || s.continue_block.as_ref().is_some_and(block_contains_anon_hash)
+                expr_contains_anon_hash(&s.condition) || block_contains_anon_hash(&s.body) || s.continue_block.as_ref().is_some_and(block_contains_anon_hash)
             }
             StmtKind::Until(s) => {
-                expr_contains_anon_hash(&s.condition)
-                    || block_contains_anon_hash(&s.body)
-                    || s.continue_block.as_ref().is_some_and(block_contains_anon_hash)
+                expr_contains_anon_hash(&s.condition) || block_contains_anon_hash(&s.body) || s.continue_block.as_ref().is_some_and(block_contains_anon_hash)
             }
             StmtKind::For(s) => {
                 s.init.as_ref().is_some_and(expr_contains_anon_hash)
@@ -11053,5 +11037,88 @@ fn hard_postfix_for_wraps_whole_print() {
             assert!(matches!(list.kind, ExprKind::ArrayVar(ref s) if s == "list"), "expected @list, got {:?}", list.kind);
         }
         other => panic!("expected PostfixControl(For, PrintOp, @list), got {other:?}"),
+    }
+}
+
+// ── Unicode paired delimiters ─────────────────────────────
+
+#[test]
+fn q_guillemets_paired() {
+    let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{00AB}hello\u{00BB};");
+    let name = first_decl_name(&prog);
+    assert_eq!(name, "x");
+    // Verify the string content.
+    match &prog.statements[2].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "hello"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn q_cjk_corner_brackets() {
+    let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{300C}test\u{300D};");
+    match &prog.statements[2].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "test"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn q_guillemets_nested() {
+    // q«foo«bar»baz» — inner « » increases/decreases depth.
+    let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{00AB}foo\u{00AB}bar\u{00BB}baz\u{00BB};");
+    match &prog.statements[2].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "foo\u{00AB}bar\u{00BB}baz"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn q_guillemets_without_feature_is_nonpaired() {
+    // Without the feature, « is a non-paired delimiter (same open/close).
+    let prog = parse("use utf8; my $x = q\u{00AB}hello\u{00AB};");
+    match &prog.statements[1].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "hello"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn qw_math_angle_brackets() {
+    // qw⟨a b c⟩
+    let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my @a = qw\u{27E8}alpha beta gamma\u{27E9};");
+    match &prog.statements[2].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::QwList(words) => assert_eq!(words, &["alpha", "beta", "gamma"]),
+                other => panic!("expected QwList, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
     }
 }

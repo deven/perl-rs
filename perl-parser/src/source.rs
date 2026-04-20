@@ -79,6 +79,7 @@ impl LexerLine {
     /// Consume the current byte and advance the cursor.
     /// Returns `b'\n'` at the end of a terminated line.
     /// Returns `None` only when truly exhausted.
+    #[cfg(test)]
     #[inline]
     pub fn advance_byte(&mut self) -> Option<u8> {
         if self.pos < self.line.len() {
@@ -372,10 +373,19 @@ impl LexerSource {
     /// line after the flags is saved for delivery after the EOF.
     ///
     /// Returns the captured flags (or None if no flags).
-    pub fn start_subst_body(&mut self, delim: u8, current_line: &mut Option<LexerLine>) -> Result<Option<String>, ParseError> {
+    pub fn start_subst_body(&mut self, delim: char, extra_paired: bool, current_line: &mut Option<LexerLine>) -> Result<Option<String>, ParseError> {
         let mut line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_subst_body called without a current line", Span::DUMMY))?;
 
-        let (open, close) = matching_delimiter(delim);
+        let (open, close) = matching_delimiter(delim, extra_paired);
+        let close_len = close.len_utf8();
+        let mut close_buf = [0u8; 4];
+        let close_bytes = close.encode_utf8(&mut close_buf);
+        let open_bytes = open.map(|o| {
+            let mut buf = [0u8; 4];
+            let len = o.len_utf8();
+            o.encode_utf8(&mut buf);
+            (buf, len)
+        });
         let mut body_lines: VecDeque<LexerLine> = VecDeque::new();
         let mut pos = line.pos;
         let mut depth = 0u32;
@@ -399,9 +409,15 @@ impl LexerSource {
             }
 
             let b = line.line[pos];
+            let rest = &line.line[pos..];
             if b == b'\\' {
-                pos += 2;
-            } else if b == close && depth == 0 {
+                // Skip escaped byte (or multi-byte delimiter after backslash).
+                if rest.len() > 1 && rest[1..].starts_with(close_bytes.as_bytes()) {
+                    pos += 1 + close_len;
+                } else {
+                    pos += 2;
+                }
+            } else if rest.starts_with(close_bytes.as_bytes()) && depth == 0 {
                 // Found closing delimiter at `pos`.
                 // Body content on this line: everything before `pos`.
                 let truncated = LexerLine {
@@ -415,11 +431,11 @@ impl LexerSource {
                 body_lines.push_back(truncated);
 
                 // Read flags starting after the delimiter.
-                let mut flag_end = pos + 1;
+                let mut flag_end = pos + close_len;
                 while flag_end < line.line.len() && (line.line[flag_end].is_ascii_alphanumeric() || line.line[flag_end] == b'_') {
                     flag_end += 1;
                 }
-                let flags = if flag_end > pos + 1 { Some(String::from_utf8_lossy(&line.line[pos + 1..flag_end]).into_owned()) } else { None };
+                let flags = if flag_end > pos + close_len { Some(String::from_utf8_lossy(&line.line[pos + close_len..flag_end]).into_owned()) } else { None };
 
                 // Saved remainder: rest of the line after flags.
                 let saved = LexerLine {
@@ -437,12 +453,14 @@ impl LexerSource {
                 self.subst_saved_line = Some(saved);
 
                 return Ok(flags);
-            } else if open == Some(b) {
+            } else if let Some((ref obuf, olen)) = open_bytes
+                && rest.starts_with(&obuf[..olen])
+            {
                 depth += 1;
-                pos += 1;
-            } else if b == close {
+                pos += olen;
+            } else if rest.starts_with(close_bytes.as_bytes()) {
                 depth -= 1;
-                pos += 1;
+                pos += close_len;
             } else {
                 pos += 1;
             }

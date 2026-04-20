@@ -17,6 +17,7 @@ use unicode_xid::UnicodeXID;
 
 use crate::error::ParseError;
 use crate::keyword;
+use crate::pragma::Features;
 use crate::source::{LexerLine, LexerSource};
 use crate::span::Span;
 use crate::token::*;
@@ -42,9 +43,9 @@ mod tests;
 /// emits `InterpChainEnd` and clears the chain state.
 #[derive(Clone, Debug, Default)]
 struct LexContext {
-    /// Opening delimiter byte.  `None` for heredocs (end signaled
+    /// Opening delimiter character.  `None` for heredocs (end signaled
     /// by LexerSource).
-    delim: Option<u8>,
+    delim: Option<char>,
     /// Delimiter nesting depth (for paired delimiters like `{}`).
     depth: u32,
     /// Brace depth inside `${expr}` or `@{expr}`.  When > 0,
@@ -69,7 +70,7 @@ impl LexContext {
     /// Convenience for the common string/regex push pattern:
     /// opening delimiter plus the three behavior flags.  Chain
     /// fields default to false/0.
-    fn new(delim: Option<u8>, interpolating: bool, raw: bool, regex: bool) -> Self {
+    fn new(delim: Option<char>, interpolating: bool, raw: bool, regex: bool) -> Self {
         LexContext { delim, interpolating, raw, regex, ..Default::default() }
     }
 }
@@ -133,10 +134,18 @@ pub(crate) struct Lexer {
     format_state: Option<FormatState>,
     /// Whether `use utf8` is active.  Written by the parser
     /// when processing `use utf8` / `no utf8` and when restoring
-    /// pragma state at block boundaries.  Read by the lexer to
-    /// decide whether to accept multi-byte UTF-8 identifiers
-    /// and whether high bytes outside strings are errors.
+    /// pragma state at block boundaries.  Read by the lexer for
+    /// error diagnostics on high bytes outside strings.
     pub(crate) utf8_mode: bool,
+    /// Fast-path composite: `utf8_mode && !current_line.ascii_only`.
+    /// When false, the current line is pure ASCII and all UTF-8
+    /// decoding, XID checks, and NFC normalization can be skipped.
+    /// Updated whenever `utf8_mode` changes or a new line is loaded.
+    pub(crate) effective_utf8: bool,
+    /// Feature flags synced from the parser's `Pragmas::features`.
+    /// Written by the parser when features change or when restoring
+    /// pragma state at block boundaries.
+    pub(crate) features: Features,
     /// Stacked cumulative case-modification flags.  Each `\L`/`\U`/
     /// `\F`/`\Q` pushes the current flags ORed with the new mode;
     /// `\E` pops, reverting to the enclosing flags.
@@ -156,6 +165,8 @@ impl Lexer {
             pending_error: None,
             format_state: None,
             utf8_mode: false,
+            effective_utf8: false,
+            features: Features::DEFAULT,
             case_mod_stack: Vec::new(),
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
@@ -173,6 +184,8 @@ impl Lexer {
             pending_error: None,
             format_state: None,
             utf8_mode: false,
+            effective_utf8: false,
+            features: Features::DEFAULT,
             case_mod_stack: Vec::new(),
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
@@ -192,7 +205,7 @@ impl Lexer {
     /// bytes ≥ 0x80 (the full multi-byte decode and Unicode
     /// letter check happens inside `scan_ident`).
     fn is_ident_start(&self, b: u8) -> bool {
-        b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)
+        b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)
     }
 
     /// Decode the UTF-8 character starting at the current position.
@@ -222,7 +235,7 @@ impl Lexer {
     /// ASCII-only strings or when UTF-8 mode is off.
     #[inline]
     fn nfc_normalize(&self, s: String) -> String {
-        if self.utf8_mode && s.bytes().any(|b| b >= 0x80) { s.nfc().collect() } else { s }
+        if self.effective_utf8 && s.bytes().any(|b| b >= 0x80) { s.nfc().collect() } else { s }
     }
 
     /// Push a character to `s` with the active case modification
@@ -344,7 +357,9 @@ impl Lexer {
         match self.source.next_line(peek_heredoc) {
             Ok(Some(new_line)) => {
                 let b = new_line.peek_byte();
+                let ascii = new_line.ascii_only;
                 self.current_line = Some(new_line);
+                self.effective_utf8 = self.utf8_mode && !ascii;
                 b
             }
             Ok(None) => None,
@@ -361,11 +376,13 @@ impl Lexer {
         self.current_line.as_ref()?.peek_byte_at(offset)
     }
 
-    /// Consume the current byte and advance.
-    /// Does NOT auto-load — the next `peek_byte` call will handle
-    /// loading if the line is exhausted.
-    fn advance_byte(&mut self) -> Option<u8> {
-        self.current_line.as_mut()?.advance_byte()
+    /// Set the UTF-8 pragma mode and recompute `effective_utf8`
+    /// based on the current line's `ascii_only` flag.  Called by
+    /// the parser when processing `use utf8` / `no utf8` and
+    /// when restoring pragma state at block boundaries.
+    pub(crate) fn set_utf8_mode(&mut self, on: bool) {
+        self.utf8_mode = on;
+        self.effective_utf8 = on && self.current_line.as_ref().is_some_and(|l| !l.ascii_only);
     }
 
     /// Remaining bytes in the current line (not including synthetic \n).
@@ -996,13 +1013,13 @@ impl Lexer {
             b'\'' => self.lex_single_quoted_string()?,
             b'"' => {
                 self.skip(1); // skip opening "
-                self.context_stack.push(LexContext::new(Some(b'"'), true, false, false));
-                Token::QuoteSublexBegin(QuoteKind::Double, b'"')
+                self.context_stack.push(LexContext::new(Some('"'), true, false, false));
+                Token::QuoteSublexBegin(QuoteKind::Double, '"')
             }
             b'`' => {
                 self.skip(1); // skip opening `
-                self.context_stack.push(LexContext::new(Some(b'`'), true, false, false));
-                Token::QuoteSublexBegin(QuoteKind::Backtick, b'`')
+                self.context_stack.push(LexContext::new(Some('`'), true, false, false));
+                Token::QuoteSublexBegin(QuoteKind::Backtick, '`')
             }
 
             // ── Operators and punctuation ─────────────────────
@@ -1428,7 +1445,7 @@ impl Lexer {
         // comments encountered along the way (e.g. `$  # comment\n x`).
         if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
             self.skip_ws_and_comments_no_pod()?;
-            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
+            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
                     return Ok(Token::ScalarVar(name));
@@ -1439,7 +1456,7 @@ impl Lexer {
 
         // $# — array length
         let after_hash = self.peek_byte_at(1);
-        if self.peek_byte(false) == Some(b'#') && after_hash.is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
+        if self.peek_byte(false) == Some(b'#') && after_hash.is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
             self.skip(1); // skip #
             let name = self.scan_ident();
             if !name.is_empty() {
@@ -1453,7 +1470,7 @@ impl Lexer {
         match self.peek_byte(false) {
             Some(b'_') => {
                 // Could be $_ or $_[...] or $_ident or $_ünïcödé
-                if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || (self.utf8_mode && b >= 0x80)) {
+                if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || (self.effective_utf8 && b >= 0x80)) {
                     let name = self.scan_ident();
                     return Ok(Token::ScalarVar(name));
                 }
@@ -1464,7 +1481,7 @@ impl Lexer {
                 let name = self.scan_ident();
                 return Ok(Token::ScalarVar(name));
             }
-            Some(b) if self.utf8_mode && b >= 0x80 => {
+            Some(b) if self.effective_utf8 && b >= 0x80 => {
                 // UTF-8 lead byte — attempt to scan a Unicode identifier.
                 let name = self.scan_ident();
                 if !name.is_empty() {
@@ -1699,7 +1716,7 @@ impl Lexer {
         // Whitespace between sigil and name.
         if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
             self.skip_ws_and_comments_no_pod()?;
-            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
+            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
                     return Ok(Token::ArrayVar(name));
@@ -1739,7 +1756,7 @@ impl Lexer {
                 let name = self.scan_ident();
                 Ok(Token::ArrayVar(name))
             }
-            Some(b) if self.utf8_mode && b >= 0x80 => {
+            Some(b) if self.effective_utf8 && b >= 0x80 => {
                 let name = self.scan_ident();
                 if !name.is_empty() { Ok(Token::ArrayVar(name)) } else { Ok(Token::At) }
             }
@@ -1769,7 +1786,7 @@ impl Lexer {
         // Whitespace between sigil and name.
         if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
             self.skip_ws_and_comments_no_pod()?;
-            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.utf8_mode && b >= 0x80)) {
+            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
                     return Ok(Some(Token::HashVar(name)));
@@ -1825,7 +1842,7 @@ impl Lexer {
                 let name = self.scan_ident();
                 Ok(Some(Token::HashVar(name)))
             }
-            Some(b) if self.utf8_mode && b >= 0x80 => {
+            Some(b) if self.effective_utf8 && b >= 0x80 => {
                 let name = self.scan_ident();
                 if !name.is_empty() { Ok(Some(Token::HashVar(name))) } else { Ok(None) }
             }
@@ -1883,7 +1900,7 @@ impl Lexer {
                 // Package separator Foo::Bar
                 self.skip(2);
                 first = true; // next char starts a new segment
-            } else if self.utf8_mode && b >= 0x80 {
+            } else if self.effective_utf8 && b >= 0x80 {
                 // UTF-8 multi-byte character: decode and check
                 // XID_Start for the first character, XID_Continue
                 // for subsequent characters.
@@ -2122,7 +2139,7 @@ impl Lexer {
     /// local: multi-line subscripts `$h{\n  foo\n}` are
     /// uncommon and would require more machinery.
     pub fn try_autoquoted_bareword_subscript(&mut self) -> Option<(String, Span)> {
-        let utf8 = self.utf8_mode;
+        let utf8 = self.effective_utf8;
         let line = self.current_line.as_ref()?;
         let r = line.remaining();
         // Skip leading whitespace.
@@ -2192,7 +2209,7 @@ impl Lexer {
 
     fn lex_single_quoted_string(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip opening '
-        let s = self.lex_body_str(b'\'', false)?;
+        let s = self.lex_body_str('\'', false)?;
         Ok(Token::StrLit(s))
     }
 
@@ -2217,12 +2234,13 @@ impl Lexer {
     /// - `raw`: passthrough (backslash prevents delimiter
     ///   matching but both bytes are kept).  For `m//`, `tr//`.
     /// - `regex`: detect `(?{...})` code blocks (future).
-    fn lex_body(&mut self, delim: Option<u8>, depth: u32, interpolating: bool, regex: bool, raw: bool) -> Result<Spanned, ParseError> {
+    fn lex_body(&mut self, delim: Option<char>, depth: u32, interpolating: bool, regex: bool, raw: bool) -> Result<Spanned, ParseError> {
         // Compute open/close from the delimiter.
         // None means heredoc (no delimiter — end signaled by LexerSource).
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
         let (open, close) = match delim {
             Some(d) => {
-                let (o, c) = matching_delimiter(d);
+                let (o, c) = matching_delimiter(d, extra);
                 (o, Some(c))
             }
             None => (None, None),
@@ -2252,17 +2270,20 @@ impl Lexer {
 
         // Fast dispatch for closing delimiter (incremental mode:
         // context on the stack → pop and return SublexEnd).
-        if let Some(c) = close
-            && b == c
+        if let Some(close_ch) = close
             && depth == 0
             && !self.context_stack.is_empty()
         {
-            self.skip(1);
-            self.context_stack.pop();
-            self.case_mod_stack.clear();
-            self.case_mod_lcfirst = false;
-            self.case_mod_ucfirst = false;
-            return Ok(Spanned { token: Token::SublexEnd, span: Span::new(start, self.span_pos()) });
+            let mut cbuf = [0u8; 4];
+            let close_bytes = close_ch.encode_utf8(&mut cbuf).as_bytes();
+            if self.remaining().starts_with(close_bytes) {
+                self.skip(close_ch.len_utf8());
+                self.context_stack.pop();
+                self.case_mod_stack.clear();
+                self.case_mod_lcfirst = false;
+                self.case_mod_ucfirst = false;
+                return Ok(Spanned { token: Token::SublexEnd, span: Span::new(start, self.span_pos()) });
+            }
         }
         if interpolating {
             if b == b'$' {
@@ -2318,11 +2339,26 @@ impl Lexer {
             if no_case_mods && current_depth == 0 {
                 let r = self.remaining();
                 if !r.is_empty() {
+                    // First UTF-8 byte of each delimiter char, for memchr triggers.
+                    // For multi-byte delimiters this may produce false positives
+                    // (other chars sharing the same lead byte), which is safe —
+                    // the byte-by-byte fallback verifies the full sequence.
+                    let close_byte = close.map(|c| {
+                        let mut b = [0u8; 4];
+                        c.encode_utf8(&mut b);
+                        b[0]
+                    });
+                    let open_byte = open.map(|c| {
+                        let mut b = [0u8; 4];
+                        c.encode_utf8(&mut b);
+                        b[0]
+                    });
+
                     // Find the next trigger byte using memchr.
                     let trigger_pos = if regex {
                         // Regex: $, @, \, close, (
                         let sig = memchr3(b'$', b'@', b'\\', r);
-                        let delim = if let Some(c) = close { memchr2(c, b'(', r) } else { memchr(b'(', r) };
+                        let delim = if let Some(c) = close_byte { memchr2(c, b'(', r) } else { memchr(b'(', r) };
                         match (sig, delim) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
@@ -2330,21 +2366,21 @@ impl Lexer {
                     } else if interpolating {
                         // Interpolating: $, @, \, close
                         let sig = memchr3(b'$', b'@', b'\\', r);
-                        let delim = close.and_then(|c| memchr(c, r));
+                        let delim = close_byte.and_then(|c| memchr(c, r));
                         match (sig, delim) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
                         }
                     } else {
                         // Non-interpolating: \, close
-                        if let Some(c) = close { memchr2(b'\\', c, r) } else { memchr(b'\\', r) }
+                        if let Some(c) = close_byte { memchr2(b'\\', c, r) } else { memchr(b'\\', r) }
                     };
 
                     // Also search for open delimiter (depth tracking).
-                    let trigger_pos = if let Some(o) = open
-                        && o != close.unwrap_or(0)
+                    let trigger_pos = if let Some(ob) = open_byte
+                        && ob != close_byte.unwrap_or(0)
                     {
-                        match (trigger_pos, memchr(o, r)) {
+                        match (trigger_pos, memchr(ob, r)) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
                         }
@@ -2361,7 +2397,7 @@ impl Lexer {
                         let safe = &r[..safe_len];
                         match std::str::from_utf8(safe) {
                             Ok(text) => {
-                                if self.utf8_mode && text.bytes().any(|b| b >= 0x80) {
+                                if self.effective_utf8 && text.bytes().any(|b| b >= 0x80) {
                                     let normalized: String = text.nfc().collect();
                                     s.push_str(&normalized);
                                 } else {
@@ -2377,85 +2413,122 @@ impl Lexer {
             }
 
             // ── Byte-by-byte fallback ─────────────────────────────
-            match self.peek_byte(true) {
-                None => {
-                    // EOF or virtual EOF (peeked).  For delimited
-                    // strings (close is Some), this means the closing
-                    // delimiter was not found — that's an error.
-                    if close.is_some() {
-                        return Err(ParseError::new("unterminated string", Span::new(start, self.span_pos())));
-                    }
-                    break;
+            let Some(b) = self.peek_byte(true) else {
+                // EOF or virtual EOF (peeked).  For delimited
+                // strings (close is Some), this means the closing
+                // delimiter was not found — that's an error.
+                if close.is_some() {
+                    return Err(ParseError::new("unterminated string", Span::new(start, self.span_pos())));
                 }
-                Some(b) if Some(b) == close && current_depth == 0 => {
-                    if self.context_stack.is_empty() {
-                        // lex_body_str mode: consume the closing delimiter.
-                        self.skip(1);
+                break;
+            };
+
+            // Check close delimiter (handles both ASCII and multi-byte).
+            if let Some(close_ch) = close {
+                let close_len = close_ch.len_utf8();
+                let mut cbuf = [0u8; 4];
+                let close_bytes = close_ch.encode_utf8(&mut cbuf).as_bytes();
+                if self.remaining().starts_with(close_bytes) {
+                    if current_depth == 0 {
+                        if self.context_stack.is_empty() {
+                            // lex_body_str mode: consume the closing delimiter.
+                            self.skip(close_len);
+                        }
+                        // Incremental mode: leave the delimiter for
+                        // the SublexEnd fast dispatch on the next call.
+                        break;
+                    } else {
+                        current_depth -= 1;
+                        self.skip(close_len);
+                        self.push_case_mod(&mut s, close_ch);
+                        continue;
                     }
-                    // Incremental mode: leave the delimiter for
-                    // the SublexEnd fast dispatch on the next call.
-                    break;
                 }
-                Some(b'$') | Some(b'@') if interpolating => break,
+            }
+
+            // Check open delimiter for nesting depth.
+            if let Some(open_ch) = open {
+                let open_len = open_ch.len_utf8();
+                let mut obuf = [0u8; 4];
+                let open_bytes = open_ch.encode_utf8(&mut obuf).as_bytes();
+                if self.remaining().starts_with(open_bytes) {
+                    current_depth += 1;
+                    self.skip(open_len);
+                    self.push_case_mod(&mut s, open_ch);
+                    continue;
+                }
+            }
+
+            match b {
+                b'$' | b'@' if interpolating => break,
                 // Regex code block lookahead: break so fast dispatch
                 // handles it on the next call.
-                Some(b'(')
-                    if regex
-                        && (self.peek_byte_at(1) == Some(b'?')
-                            && (self.peek_byte_at(2) == Some(b'{') || (self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{')))
-                            || self.peek_byte_at(1) == Some(b'*') && self.peek_byte_at(2) == Some(b'{')) =>
+                b'(' if regex
+                    && (self.peek_byte_at(1) == Some(b'?')
+                        && (self.peek_byte_at(2) == Some(b'{') || (self.peek_byte_at(2) == Some(b'?') && self.peek_byte_at(3) == Some(b'{')))
+                        || self.peek_byte_at(1) == Some(b'*') && self.peek_byte_at(2) == Some(b'{')) =>
                 {
                     break;
                 }
-                Some(b'\\') => {
+                b'\\' => {
                     self.skip(1);
                     if raw {
                         // Raw: backslash prevents delimiter matching.
                         // For \delim, consume the delimiter (backslash
                         // dropped).  For everything else, keep both.
-                        if let Some(next) = self.peek_byte(false) {
-                            if Some(next) == close || Some(next) == open {
-                                self.skip(1);
-                                s.push(next as char);
-                            } else {
-                                s.push('\\');
+                        if let Some(close_ch) = close {
+                            let mut cbuf = [0u8; 4];
+                            let close_bytes = close_ch.encode_utf8(&mut cbuf).as_bytes();
+                            if self.remaining().starts_with(close_bytes) {
+                                self.skip(close_ch.len_utf8());
+                                s.push(close_ch);
+                                continue;
                             }
-                        } else {
-                            s.push('\\');
                         }
+                        if let Some(open_ch) = open {
+                            let mut obuf = [0u8; 4];
+                            let open_bytes = open_ch.encode_utf8(&mut obuf).as_bytes();
+                            if self.remaining().starts_with(open_bytes) {
+                                self.skip(open_ch.len_utf8());
+                                s.push(open_ch);
+                                continue;
+                            }
+                        }
+                        s.push('\\');
                     } else if interpolating {
                         // Double-quote escapes.
                         self.process_escape(&mut s, close);
                     } else {
-                        // Literal (single-quote) escapes.
-                        match self.peek_byte(false) {
-                            Some(b'\\') => {
-                                self.skip(1);
-                                s.push('\\');
+                        // Literal (single-quote) escapes: \\ → \,
+                        // \close → close, \open → open.
+                        let mut matched = false;
+                        if self.peek_byte(false) == Some(b'\\') {
+                            self.skip(1);
+                            s.push('\\');
+                            matched = true;
+                        }
+                        if !matched && let Some(close_ch) = close {
+                            let mut cbuf = [0u8; 4];
+                            if self.remaining().starts_with(close_ch.encode_utf8(&mut cbuf).as_bytes()) {
+                                self.skip(close_ch.len_utf8());
+                                s.push(close_ch);
+                                matched = true;
                             }
-                            Some(b) if Some(b) == close => {
-                                self.skip(1);
-                                s.push(b as char);
+                        }
+                        if !matched && let Some(open_ch) = open {
+                            let mut obuf = [0u8; 4];
+                            if self.remaining().starts_with(open_ch.encode_utf8(&mut obuf).as_bytes()) {
+                                self.skip(open_ch.len_utf8());
+                                s.push(open_ch);
+                                matched = true;
                             }
-                            Some(b) if Some(b) == open => {
-                                self.skip(1);
-                                s.push(b as char);
-                            }
-                            _ => s.push('\\'),
+                        }
+                        if !matched {
+                            s.push('\\');
                         }
                     }
                 }
-                Some(b) if Some(b) == open => {
-                    current_depth += 1;
-                    self.skip(1);
-                    self.push_case_mod(&mut s, b as char);
-                }
-                Some(b) if Some(b) == close && current_depth > 0 => {
-                    current_depth -= 1;
-                    self.skip(1);
-                    self.push_case_mod(&mut s, b as char);
-                }
-                Some(b) => {
+                _ => {
                     self.skip(1);
                     self.push_case_mod(&mut s, b as char);
                 }
@@ -2477,7 +2550,7 @@ impl Lexer {
     /// `raw` selects escape handling:
     /// - `false`: single-quote escapes (`\\`→`\`, `\delim`→delim).
     /// - `true`: raw passthrough (`\delim`→delim, else pass through).
-    pub fn lex_body_str(&mut self, delim: u8, raw: bool) -> Result<String, ParseError> {
+    pub fn lex_body_str(&mut self, delim: char, raw: bool) -> Result<String, ParseError> {
         let spanned = self.lex_body(Some(delim), 0, false, false, raw)?;
         let s = match spanned.token {
             Token::ConstSegment(s) => s,
@@ -2493,19 +2566,22 @@ impl Lexer {
         // delim un-consumed.  Consume it here so `lex_body_str`
         // always leaves the cursor past the closer.
         //
-        // Use `matching_delimiter` to get the CLOSING byte —
+        // Use `matching_delimiter` to get the CLOSING char —
         // for paired delimiters like `{`, the close is `}`, not
         // `{` itself.
-        let (_, close) = matching_delimiter(delim);
-        if self.peek_byte(false) == Some(close) {
-            self.skip(1);
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        let (_, close) = matching_delimiter(delim, extra);
+        let mut cbuf = [0u8; 4];
+        let close_bytes = close.encode_utf8(&mut cbuf).as_bytes();
+        if self.remaining().starts_with(close_bytes) {
+            self.skip(close.len_utf8());
         }
         Ok(s)
     }
 
     /// Process a backslash escape inside a double-quoted string.
     /// The backslash has already been consumed.
-    fn process_escape(&mut self, s: &mut String, close: Option<u8>) {
+    fn process_escape(&mut self, s: &mut String, close: Option<char>) {
         match self.peek_byte(false) {
             Some(b'n') => {
                 self.skip(1);
@@ -2551,9 +2627,15 @@ impl Lexer {
                 self.skip(1);
                 s.push('\x1B');
             }
-            Some(b) if Some(b) == close => {
-                self.skip(1);
-                s.push(b as char);
+            Some(b)
+                if close.is_some_and(|c| {
+                    let mut buf = [0u8; 4];
+                    self.remaining().starts_with(c.encode_utf8(&mut buf).as_bytes())
+                }) =>
+            {
+                let close_ch = close.unwrap_or(b as char);
+                self.skip(close_ch.len_utf8());
+                s.push(close_ch);
             }
             Some(b'x') => {
                 self.skip(1);
@@ -2895,14 +2977,14 @@ impl Lexer {
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext::new(Some(delim), delim != b'\'', true, true));
+        self.context_stack.push(LexContext::new(Some(delim), delim != '\'', true, true));
         Ok(Token::RegexSublexBegin(RegexKind::Match, delim))
     }
 
     /// `qr/pattern/flags` or `qr{pattern}flags`
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext::new(Some(delim), delim != b'\'', true, true));
+        self.context_stack.push(LexContext::new(Some(delim), delim != '\'', true, true));
         Ok(Token::RegexSublexBegin(RegexKind::Qr, delim))
     }
 
@@ -2915,7 +2997,7 @@ impl Lexer {
         // The parser will collect body tokens until SublexEnd,
         // then call start_subst_replacement to set up the
         // replacement body.
-        self.context_stack.push(LexContext::new(Some(delim), delim != b'\'', true, true));
+        self.context_stack.push(LexContext::new(Some(delim), delim != '\'', true, true));
 
         Ok(Token::SubstSublexBegin(delim))
     }
@@ -2928,10 +3010,11 @@ impl Lexer {
     /// Scans ahead for flags via `start_subst_body`, then pushes
     /// the appropriate LexContext for the replacement body.
     /// Returns the captured flags.
-    pub fn start_subst_replacement(&mut self, pattern_delim: u8) -> Result<Option<String>, ParseError> {
-        let repl_delim = if is_paired(pattern_delim) { self.read_quote_delimiter()? } else { pattern_delim };
+    pub fn start_subst_replacement(&mut self, pattern_delim: char) -> Result<Option<String>, ParseError> {
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        let repl_delim = if is_paired(pattern_delim, extra) { self.read_quote_delimiter()? } else { pattern_delim };
 
-        let flags = self.source.start_subst_body(repl_delim, &mut self.current_line)?;
+        let flags = self.source.start_subst_body(repl_delim, extra, &mut self.current_line)?;
         let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
 
         // Push context for the replacement body.
@@ -2948,7 +3031,8 @@ impl Lexer {
     fn lex_tr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
         let from = self.lex_body_str(delim, true)?;
-        let to = if is_paired(delim) {
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        let to = if is_paired(delim, extra) {
             let delim2 = self.read_quote_delimiter()?;
             self.lex_body_str(delim2, true)?
         } else {
@@ -2958,9 +3042,11 @@ impl Lexer {
         Ok(Token::TranslitLit(from, to, flags))
     }
 
-    /// Read the delimiter byte for a quote-like construct.
+    /// Read the delimiter character for a quote-like construct.
     /// Skips whitespace first if the current byte is whitespace.
-    fn read_quote_delimiter(&mut self) -> Result<u8, ParseError> {
+    /// Returns a `char` — ASCII for single-byte delimiters,
+    /// or a decoded Unicode character for multi-byte UTF-8.
+    fn read_quote_delimiter(&mut self) -> Result<char, ParseError> {
         // Match toke.c's scan_str: skip whitespace before the delimiter
         // only if the current byte IS whitespace (or the line is exhausted).
         // `m#foo#` uses `#` as the delimiter — it's not a comment.
@@ -2979,7 +3065,19 @@ impl Lexer {
             }
             _ => {}
         }
-        self.advance_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))
+        let b = self.peek_byte(false).ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))?;
+        if b < 0x80 {
+            // ASCII delimiter — single byte.
+            self.skip(1);
+            Ok(b as char)
+        } else if let Some((ch, len)) = self.peek_utf8_char() {
+            // Multi-byte UTF-8 delimiter.
+            self.skip(len);
+            Ok(ch)
+        } else {
+            self.skip(1);
+            Err(ParseError::new(format!("invalid UTF-8 byte \\x{b:02X} in delimiter position"), Span::new(self.span_pos(), self.span_pos())))
+        }
     }
 
     // ── Operators ─────────────────────────────────────────────
@@ -3286,12 +3384,12 @@ impl Lexer {
             HeredocKind::Interpolating => {
                 self.source.start_heredoc(tag_bytes, &mut self.current_line)?;
                 self.context_stack.push(LexContext::new(None, true, false, false));
-                Ok(Token::QuoteSublexBegin(quote_kind, 0))
+                Ok(Token::QuoteSublexBegin(quote_kind, '\0'))
             }
             HeredocKind::Indented => {
                 self.source.start_indented_heredoc(tag_bytes, &mut self.current_line)?;
                 self.context_stack.push(LexContext::new(None, true, false, false));
-                Ok(Token::QuoteSublexBegin(quote_kind, 0))
+                Ok(Token::QuoteSublexBegin(quote_kind, '\0'))
             }
             HeredocKind::Literal => {
                 self.source.start_heredoc(tag_bytes, &mut self.current_line)?;
@@ -3445,19 +3543,48 @@ impl Lexer {
 /// Return the (open, close) delimiter pair for a given delimiter.
 /// For paired brackets, open is `Some(delim)` and close is the
 /// matching bracket.  For same-char delimiters, open is `None`.
-pub fn matching_delimiter(delim: u8) -> (Option<u8>, u8) {
-    match delim {
-        b'(' => (Some(b'('), b')'),
-        b'[' => (Some(b'['), b']'),
-        b'{' => (Some(b'{'), b'}'),
-        b'<' => (Some(b'<'), b'>'),
-        _ => (None, delim),
+/// Packed open delimiters (321 chars, 997 UTF-8 bytes).
+/// First 4 bytes are the standard ASCII pairs; the rest are Unicode
+/// (gated on `use feature 'extra_paired_delimiters'`).
+const DELIM_OPEN: &str = "(<[{\u{00AB}\u{00BB}\u{0F3A}\u{0F3C}\u{169B}\u{2018}\u{2019}\u{201C}\u{201D}\u{2035}\u{2036}\u{2037}\u{2039}\u{203A}\u{2045}\u{204D}\u{207D}\u{208D}\u{2192}\u{219B}\u{219D}\u{21A0}\u{21A3}\u{21A6}\u{21AA}\u{21AC}\u{21B1}\u{21B3}\u{21C0}\u{21C1}\u{21C9}\u{21CF}\u{21D2}\u{21DB}\u{21DD}\u{21E2}\u{21E5}\u{21E8}\u{21F4}\u{21F6}\u{21F8}\u{21FB}\u{21FE}\u{2208}\u{2209}\u{220A}\u{2264}\u{2266}\u{2268}\u{226A}\u{226E}\u{2270}\u{2272}\u{2274}\u{227A}\u{227C}\u{227E}\u{2280}\u{2282}\u{2284}\u{2286}\u{2288}\u{228A}\u{22A3}\u{22A6}\u{22A8}\u{22A9}\u{22B0}\u{22D0}\u{22D6}\u{22D8}\u{22DC}\u{22DE}\u{22E0}\u{22E6}\u{22E8}\u{22F2}\u{22F3}\u{22F4}\u{22F6}\u{22F7}\u{2308}\u{230A}\u{2326}\u{2329}\u{2348}\u{23E9}\u{23ED}\u{261B}\u{261E}\u{269E}\u{2768}\u{276A}\u{276C}\u{276E}\u{2770}\u{2772}\u{2774}\u{27C3}\u{27C5}\u{27C8}\u{27DE}\u{27E6}\u{27E8}\u{27EA}\u{27EC}\u{27EE}\u{27F4}\u{27F6}\u{27F9}\u{27FC}\u{27FE}\u{27FF}\u{2900}\u{2901}\u{2903}\u{2905}\u{2907}\u{290D}\u{290F}\u{2910}\u{2911}\u{2914}\u{2915}\u{2916}\u{2917}\u{2918}\u{291A}\u{291C}\u{291E}\u{2920}\u{2933}\u{2937}\u{2945}\u{2947}\u{2953}\u{2957}\u{295B}\u{295F}\u{2964}\u{296C}\u{296D}\u{2971}\u{2972}\u{2974}\u{2975}\u{2979}\u{2983}\u{2985}\u{2987}\u{2989}\u{298B}\u{298D}\u{298F}\u{2991}\u{2993}\u{2995}\u{2997}\u{29A8}\u{29AA}\u{29B3}\u{29C0}\u{29D8}\u{29DA}\u{29FC}\u{2A79}\u{2A7B}\u{2A7D}\u{2A7F}\u{2A81}\u{2A83}\u{2A85}\u{2A87}\u{2A89}\u{2A8D}\u{2A95}\u{2A97}\u{2A99}\u{2A9B}\u{2A9D}\u{2A9F}\u{2AA1}\u{2AA6}\u{2AA8}\u{2AAA}\u{2AAC}\u{2AAF}\u{2AB1}\u{2AB3}\u{2AB5}\u{2AB7}\u{2AB9}\u{2ABB}\u{2ABD}\u{2ABF}\u{2AC1}\u{2AC3}\u{2AC5}\u{2AC7}\u{2AC9}\u{2ACB}\u{2ACF}\u{2AD1}\u{2AD5}\u{2AE5}\u{2AF7}\u{2AF9}\u{2B46}\u{2B47}\u{2B48}\u{2B4C}\u{2B62}\u{2B6C}\u{2B72}\u{2B7C}\u{2B86}\u{2B8A}\u{2B95}\u{2B9A}\u{2B9E}\u{2BA1}\u{2BA3}\u{2BA9}\u{2BAB}\u{2BB1}\u{2BB3}\u{2BEE}\u{2E02}\u{2E03}\u{2E04}\u{2E05}\u{2E09}\u{2E0A}\u{2E0C}\u{2E0D}\u{2E11}\u{2E1C}\u{2E1D}\u{2E20}\u{2E21}\u{2E22}\u{2E24}\u{2E26}\u{2E28}\u{2E36}\u{2E42}\u{2E55}\u{2E57}\u{2E59}\u{2E5B}\u{3008}\u{300A}\u{300C}\u{300E}\u{3010}\u{3014}\u{3016}\u{3018}\u{301A}\u{301D}\u{A9C1}\u{FD3E}\u{FE59}\u{FE5B}\u{FE5D}\u{FE64}\u{FF08}\u{FF1C}\u{FF3B}\u{FF5B}\u{FF5F}\u{FF62}\u{FFEB}\u{1D103}\u{1D106}\u{1F449}\u{1F508}\u{1F509}\u{1F50A}\u{1F57B}\u{1F599}\u{1F59B}\u{1F59D}\u{1F5E6}\u{1F802}\u{1F806}\u{1F80A}\u{1F812}\u{1F816}\u{1F81A}\u{1F81E}\u{1F822}\u{1F826}\u{1F82A}\u{1F82E}\u{1F832}\u{1F836}\u{1F83A}\u{1F83E}\u{1F842}\u{1F846}\u{1F852}\u{1F862}\u{1F86A}\u{1F872}\u{1F87A}\u{1F882}\u{1F892}\u{1F896}\u{1F89A}\u{1F8A1}\u{1F8A3}\u{1F8A5}\u{1F8A7}\u{1F8A9}\u{1F8AB}\u{1F8B6}";
+
+/// Paired close delimiters at matching byte offsets.
+const DELIM_CLOSE: &str = ")>]}\u{00BB}\u{00AB}\u{0F3B}\u{0F3D}\u{169C}\u{2019}\u{2018}\u{201D}\u{201C}\u{2032}\u{2033}\u{2034}\u{203A}\u{2039}\u{2046}\u{204C}\u{207E}\u{208E}\u{2190}\u{219A}\u{219C}\u{219E}\u{21A2}\u{21A4}\u{21A9}\u{21AB}\u{21B0}\u{21B2}\u{21BC}\u{21BD}\u{21C7}\u{21CD}\u{21D0}\u{21DA}\u{21DC}\u{21E0}\u{21E4}\u{21E6}\u{2B30}\u{2B31}\u{21F7}\u{21FA}\u{21FD}\u{220B}\u{220C}\u{220D}\u{2265}\u{2267}\u{2269}\u{226B}\u{226F}\u{2271}\u{2273}\u{2275}\u{227B}\u{227D}\u{227F}\u{2281}\u{2283}\u{2285}\u{2287}\u{2289}\u{228B}\u{22A2}\u{2ADE}\u{2AE4}\u{2AE3}\u{22B1}\u{22D1}\u{22D7}\u{22D9}\u{22DD}\u{22DF}\u{22E1}\u{22E7}\u{22E9}\u{22FA}\u{22FB}\u{22FC}\u{22FD}\u{22FE}\u{2309}\u{230B}\u{232B}\u{232A}\u{2347}\u{23EA}\u{23EE}\u{261A}\u{261C}\u{269F}\u{2769}\u{276B}\u{276D}\u{276F}\u{2771}\u{2773}\u{2775}\u{27C4}\u{27C6}\u{27C9}\u{27DD}\u{27E7}\u{27E9}\u{27EB}\u{27ED}\u{27EF}\u{2B32}\u{27F5}\u{27F8}\u{27FB}\u{27FD}\u{2B33}\u{2B34}\u{2B35}\u{2902}\u{2B36}\u{2906}\u{290C}\u{290E}\u{2B37}\u{2B38}\u{2B39}\u{2B3A}\u{2B3B}\u{2B3C}\u{2B3D}\u{2919}\u{291B}\u{291D}\u{291F}\u{2B3F}\u{2936}\u{2946}\u{2B3E}\u{2952}\u{2956}\u{295A}\u{295E}\u{2962}\u{296A}\u{296B}\u{2B40}\u{2B41}\u{2B4B}\u{2B42}\u{297B}\u{2984}\u{2986}\u{2988}\u{298A}\u{298C}\u{2990}\u{298E}\u{2992}\u{2994}\u{2996}\u{2998}\u{29A9}\u{29AB}\u{29B4}\u{29C1}\u{29D9}\u{29DB}\u{29FD}\u{2A7A}\u{2A7C}\u{2A7E}\u{2A80}\u{2A82}\u{2A84}\u{2A86}\u{2A88}\u{2A8A}\u{2A8E}\u{2A96}\u{2A98}\u{2A9A}\u{2A9C}\u{2A9E}\u{2AA0}\u{2AA2}\u{2AA7}\u{2AA9}\u{2AAB}\u{2AAD}\u{2AB0}\u{2AB2}\u{2AB4}\u{2AB6}\u{2AB8}\u{2ABA}\u{2ABC}\u{2ABE}\u{2AC0}\u{2AC2}\u{2AC4}\u{2AC6}\u{2AC8}\u{2ACA}\u{2ACC}\u{2AD0}\u{2AD2}\u{2AD6}\u{22AB}\u{2AF8}\u{2AFA}\u{2B45}\u{2B49}\u{2B4A}\u{2973}\u{2B60}\u{2B6A}\u{2B70}\u{2B7A}\u{2B84}\u{2B88}\u{2B05}\u{2B98}\u{2B9C}\u{2BA0}\u{2BA2}\u{2BA8}\u{2BAA}\u{2BB0}\u{2BB2}\u{2BEC}\u{2E03}\u{2E02}\u{2E05}\u{2E04}\u{2E0A}\u{2E09}\u{2E0D}\u{2E0C}\u{2E10}\u{2E1D}\u{2E1C}\u{2E21}\u{2E20}\u{2E23}\u{2E25}\u{2E27}\u{2E29}\u{2E37}\u{201E}\u{2E56}\u{2E58}\u{2E5A}\u{2E5C}\u{3009}\u{300B}\u{300D}\u{300F}\u{3011}\u{3015}\u{3017}\u{3019}\u{301B}\u{301E}\u{A9C2}\u{FD3F}\u{FE5A}\u{FE5C}\u{FE5E}\u{FE65}\u{FF09}\u{FF1E}\u{FF3D}\u{FF5D}\u{FF60}\u{FF63}\u{FFE9}\u{1D102}\u{1D107}\u{1F448}\u{1F568}\u{1F569}\u{1F56A}\u{1F57D}\u{1F598}\u{1F59A}\u{1F59C}\u{1F5E7}\u{1F800}\u{1F804}\u{1F808}\u{1F810}\u{1F814}\u{1F818}\u{1F81C}\u{1F820}\u{1F824}\u{1F828}\u{1F82C}\u{1F830}\u{1F834}\u{1F838}\u{1F83C}\u{1F840}\u{1F844}\u{1F850}\u{1F860}\u{1F868}\u{1F870}\u{1F878}\u{1F880}\u{1F890}\u{1F894}\u{1F898}\u{1F8A0}\u{1F8A2}\u{1F8A6}\u{1F8A4}\u{1F8A8}\u{1F8AA}\u{1F8B4}";
+
+/// Byte offset past the four standard ASCII delimiter pairs.
+const DELIM_ASCII_END: usize = 4;
+
+/// Look up the matching close delimiter for `delim`.
+///
+/// Returns `(Some(open), close)` for paired delimiters or
+/// `(None, delim)` for non-paired (same char open and close).
+///
+/// ASCII pairs `()`, `[]`, `{}`, `<>` are always recognised.
+/// Unicode pairs require `extra_paired` (the
+/// `extra_paired_delimiters` feature flag).
+///
+/// Uses SIMD-optimized `memmem` on packed UTF-8 tables.
+pub fn matching_delimiter(delim: char, extra_paired: bool) -> (Option<char>, char) {
+    let limit = if extra_paired { DELIM_OPEN.len() } else { DELIM_ASCII_END };
+    let haystack = &DELIM_OPEN.as_bytes()[..limit];
+    let mut buf = [0u8; 4];
+    let needle = delim.encode_utf8(&mut buf);
+    if let Some(pos) = memchr::memmem::find(haystack, needle.as_bytes()) {
+        let close_bytes = &DELIM_CLOSE.as_bytes()[pos..];
+        // SAFETY: DELIM_CLOSE is a valid &str, and `pos` is a char
+        // boundary (same offset as a char boundary in DELIM_OPEN,
+        // and all pairs have the same UTF-8 byte length).
+        let close_str = std::str::from_utf8(close_bytes).unwrap_or("");
+        if let Some(close_ch) = close_str.chars().next() {
+            return (Some(delim), close_ch);
+        }
     }
+    (None, delim)
 }
 
 /// Whether a delimiter is a paired bracket.
-pub fn is_paired(delim: u8) -> bool {
-    matching_delimiter(delim).0.is_some()
+pub fn is_paired(delim: char, extra_paired: bool) -> bool {
+    matching_delimiter(delim, extra_paired).0.is_some()
 }
 
 fn hex_digit(b: u8) -> u8 {

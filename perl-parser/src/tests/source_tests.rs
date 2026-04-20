@@ -559,7 +559,7 @@ fn subst_body_virtual_eof_restores_remainder() {
 
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"bar/e + 1"), terminated: false, pos: 0, ascii_only: true });
 
-    let flags = source.start_subst_body(b'/', &mut current_line).unwrap();
+    let flags = source.start_subst_body('/', false, &mut current_line).unwrap();
     assert_eq!(flags.as_deref(), Some("e"));
 
     let body = source.next_line(false).unwrap().unwrap();
@@ -578,7 +578,7 @@ fn subst_body_captures_multiple_flags_and_restores_remainder() {
     let mut source = LexerSource::new(b"");
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"bar/msix + 1"), terminated: false, pos: 0, ascii_only: true });
 
-    let flags = source.start_subst_body(b'/', &mut current_line).unwrap();
+    let flags = source.start_subst_body('/', false, &mut current_line).unwrap();
     assert_eq!(flags.as_deref(), Some("msix"));
 
     let body = source.next_line(false).unwrap().unwrap();
@@ -595,7 +595,7 @@ fn subst_body_with_paired_delimiter_nesting() {
     let mut source = LexerSource::new(b"");
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"a{b}c}r"), terminated: false, pos: 0, ascii_only: true });
 
-    let flags = source.start_subst_body(b'{', &mut current_line).unwrap();
+    let flags = source.start_subst_body('{', false, &mut current_line).unwrap();
     assert_eq!(flags.as_deref(), Some("r"));
 
     let body = source.next_line(false).unwrap().unwrap();
@@ -609,7 +609,7 @@ fn subst_body_errors_on_eof() {
     let mut source = LexerSource::new(b"");
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"unterminated"), terminated: false, pos: 0, ascii_only: true });
 
-    let err = source.start_subst_body(b'/', &mut current_line).unwrap_err();
+    let err = source.start_subst_body('/', false, &mut current_line).unwrap_err();
     assert!(err.message.contains("unterminated substitution"));
 }
 
