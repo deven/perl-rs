@@ -14451,4 +14451,256 @@ OUTER\n";
         let prog = parse(src);
         assert!(!prog.statements.is_empty());
     }
+
+    // ── ChatGPT torture tests ───────────────────────────────
+
+    #[test]
+    fn autoquote_try_fat_comma() {
+        let first = parse_kw_fat_comma("(try => 1);");
+        assert!(matches!(first.kind, ExprKind::StringLit(ref s) if s == "try"));
+    }
+
+    #[test]
+    fn parse_defined_or_as_operator() {
+        let e = parse_expr_str("$x // $y;");
+        assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
+    }
+
+    #[test]
+    fn parse_qw_list_delimiter_weirdness() {
+        let e = parse_expr_str("qw[a\\] b\\ c];");
+        assert!(matches!(e.kind, ExprKind::QwList(_)));
+    }
+
+    #[test]
+    fn parse_regex_with_code_block() {
+        let e = parse_expr_str("/(?{ print 20 })/;");
+        assert!(matches!(e.kind, ExprKind::Regex(_, _, _)));
+    }
+
+    #[test]
+    fn parse_substitution_delimiter_switch() {
+        let e = parse_expr_str("s{c}/.../r;");
+        assert!(matches!(e.kind, ExprKind::Subst(_, _, _)));
+    }
+
+    #[test]
+    fn parse_substitution_replacement_multiline_body() {
+        let e = parse_expr_str("s/foo/bar\nbaz/e;");
+        assert!(matches!(e.kind, ExprKind::Subst(_, _, _)));
+    }
+
+    #[test]
+    fn parse_interpolated_scalar_chain() {
+        let e = parse_expr_str(r#""$h->{k}[0]""#);
+        assert!(matches!(e.kind, ExprKind::InterpolatedString(_)));
+    }
+
+    #[test]
+    fn parse_interpolated_expr_hole() {
+        let e = parse_expr_str(r#""value=${x + 1}""#);
+        assert!(matches!(e.kind, ExprKind::InterpolatedString(_)));
+    }
+
+    #[test]
+    fn signature_vs_prototype_switches_with_feature() {
+        let s1 = parse_sub("sub f ($$) { }");
+        assert!(s1.prototype.is_some());
+        assert!(s1.signature.is_none());
+
+        let s2 = parse_sub("use feature 'signatures'; sub f ($x, $y) { }");
+        assert!(s2.signature.is_some());
+    }
+
+    #[test]
+    fn declared_refs_only_when_feature_enabled() {
+        let msg = parse_fails("my \\$x;");
+        assert!(msg.contains("expected variable") || msg.contains("unexpected"));
+    }
+
+    #[test]
+    fn parse_source_file_line_package_tokens() {
+        let prog = crate::parse_with_filename(b"__FILE__; __LINE__; __PACKAGE__;", "t/foo.pl").unwrap();
+        assert_eq!(prog.statements.len(), 3);
+    }
+
+    #[test]
+    fn hard_empty_regex_from_defined_or_in_term_position() {
+        // `print //ms;` — the `//` is an empty regex with flags, not defined-or.
+        let e = parse_expr_stmt("print //ms;");
+        match &e.kind {
+            ExprKind::PrintOp(name, fh, args) => {
+                assert_eq!(name, "print");
+                assert!(fh.is_none());
+                assert_eq!(args.len(), 1);
+                assert!(matches!(
+                    args[0].kind,
+                    ExprKind::Regex(RegexKind::Match, Interpolated(_), Some(ref flags))
+                        if flags == "ms"
+                ));
+            }
+            other => panic!("expected PrintOp(print, _, [Regex(..., ms)]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_plus_wraps_anon_hash() {
+        // `+{ a => 1 }` — unary plus forces hash constructor.
+        let e = parse_expr_stmt("+{ a => 1 };");
+        match &e.kind {
+            ExprKind::UnaryOp(_, inner) => {
+                assert!(matches!(inner.kind, ExprKind::AnonHash(_)), "expected unary op wrapping AnonHash, got {:?}", inner.kind);
+            }
+            other => panic!("expected UnaryOp(_, AnonHash(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_block_vs_hash_in_map() {
+        // `map { { a => 1 } } @list` — outer braces are a block,
+        // inner braces are an anonymous hash.
+        let e = parse_expr_stmt("map { { a => 1 } } @list;");
+
+        fn block_contains_anon_hash(block: &Block) -> bool {
+            block.statements.iter().any(stmt_contains_anon_hash)
+        }
+
+        fn stmt_contains_anon_hash(stmt: &Statement) -> bool {
+            match &stmt.kind {
+                StmtKind::Expr(expr) => expr_contains_anon_hash(expr),
+                StmtKind::Block(block, _) => block_contains_anon_hash(block),
+                StmtKind::Labeled(_, inner) => stmt_contains_anon_hash(inner),
+                StmtKind::If(s) => {
+                    expr_contains_anon_hash(&s.condition)
+                        || block_contains_anon_hash(&s.then_block)
+                        || s.elsif_clauses.iter().any(|(cond, blk)| expr_contains_anon_hash(cond) || block_contains_anon_hash(blk))
+                        || s.else_block.as_ref().is_some_and(block_contains_anon_hash)
+                }
+                StmtKind::Unless(s) => {
+                    expr_contains_anon_hash(&s.condition)
+                        || block_contains_anon_hash(&s.then_block)
+                        || s.elsif_clauses.iter().any(|(cond, blk)| expr_contains_anon_hash(cond) || block_contains_anon_hash(blk))
+                        || s.else_block.as_ref().is_some_and(block_contains_anon_hash)
+                }
+                StmtKind::While(s) => {
+                    expr_contains_anon_hash(&s.condition)
+                        || block_contains_anon_hash(&s.body)
+                        || s.continue_block.as_ref().is_some_and(block_contains_anon_hash)
+                }
+                StmtKind::Until(s) => {
+                    expr_contains_anon_hash(&s.condition)
+                        || block_contains_anon_hash(&s.body)
+                        || s.continue_block.as_ref().is_some_and(block_contains_anon_hash)
+                }
+                StmtKind::For(s) => {
+                    s.init.as_ref().is_some_and(expr_contains_anon_hash)
+                        || s.condition.as_ref().is_some_and(expr_contains_anon_hash)
+                        || s.step.as_ref().is_some_and(expr_contains_anon_hash)
+                        || block_contains_anon_hash(&s.body)
+                }
+                StmtKind::ForEach(s) => expr_contains_anon_hash(&s.list) || block_contains_anon_hash(&s.body),
+                _ => false,
+            }
+        }
+
+        fn expr_contains_anon_hash(expr: &Expr) -> bool {
+            match &expr.kind {
+                ExprKind::AnonHash(_) => true,
+                ExprKind::AnonSub(_, _, _, body) => block_contains_anon_hash(body),
+                ExprKind::BinOp(_, l, r) | ExprKind::Assign(_, l, r) | ExprKind::Range(l, r) | ExprKind::FlipFlop(l, r) => {
+                    expr_contains_anon_hash(l) || expr_contains_anon_hash(r)
+                }
+                ExprKind::UnaryOp(_, inner)
+                | ExprKind::PostfixOp(_, inner)
+                | ExprKind::Ref(inner)
+                | ExprKind::DoExpr(inner)
+                | ExprKind::EvalExpr(inner)
+                | ExprKind::Local(inner) => expr_contains_anon_hash(inner),
+                ExprKind::Ternary(c, t, f) => expr_contains_anon_hash(c) || expr_contains_anon_hash(t) || expr_contains_anon_hash(f),
+                ExprKind::FuncCall(_, args) | ExprKind::ListOp(_, args) | ExprKind::List(args) | ExprKind::AnonArray(args) => {
+                    args.iter().any(expr_contains_anon_hash)
+                }
+                _ => false,
+            }
+        }
+
+        assert!(expr_contains_anon_hash(&e), "expected an AnonHash somewhere in {:?}", e.kind);
+    }
+
+    #[test]
+    fn current_package_restores_after_block_form_package() {
+        // `package Inner { ... }` — block-form package scopes
+        // and restores the outer package name.
+        let prog = parse(
+            "package Outer;\n\
+             package Inner { __PACKAGE__; }\n\
+             __PACKAGE__;\n",
+        );
+
+        let inner_pkg_stmt =
+            prog.statements.iter().find(|s| if let StmtKind::PackageDecl(pd) = &s.kind { pd.name == "Inner" } else { false }).expect("Inner package decl");
+        if let StmtKind::PackageDecl(ref pd) = inner_pkg_stmt.kind {
+            if let Some(ref body) = pd.block {
+                let inner_expr =
+                    body.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("inner __PACKAGE__ expr");
+                assert!(matches!(
+                    inner_expr.kind,
+                    ExprKind::CurrentPackage(ref s) if s == "Inner"
+                ));
+            } else {
+                panic!("expected block-form package");
+            }
+        }
+
+        let outer_expr =
+            prog.statements.iter().rev().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("outer __PACKAGE__ expr");
+
+        assert!(matches!(
+            outer_expr.kind,
+            ExprKind::CurrentPackage(ref s) if s == "Outer"
+        ));
+    }
+
+    #[test]
+    // Known bug: statement-form package inside bare block doesn't restore.
+    fn current_package_restores_after_statement_form_in_block() {
+        // `{ package Inner; __PACKAGE__; }` — statement-form package
+        // inside a bare block.  In Perl, the package name is scoped
+        // to the enclosing block and restored on exit.
+        let prog = parse(
+            "package Outer;\n\
+             { package Inner; __PACKAGE__; }\n\
+             __PACKAGE__;\n",
+        );
+
+        // __PACKAGE__ after the block should be "Outer".
+        let outer_expr =
+            prog.statements.iter().rev().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("outer __PACKAGE__ expr");
+
+        assert!(matches!(
+            outer_expr.kind,
+            ExprKind::CurrentPackage(ref s) if s == "Outer"
+        ));
+    }
+
+    #[test]
+    fn source_line_inside_block_uses_physical_line() {
+        let prog = parse("{\n__LINE__;\n}");
+        match &prog.statements[0].kind {
+            StmtKind::Block(block, _) => {
+                let inner = block.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("inner expr");
+                match inner.kind {
+                    ExprKind::SourceLine(n) => assert_eq!(n, 2),
+                    other => panic!("expected SourceLine(2), got {other:?}"),
+                }
+            }
+            other => panic!("expected top-level Block statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn downgraded_keyword_class_can_be_called_as_ident() {
+        let e = parse_expr_stmt("class($x);");
+        assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "class"));
+    }
 }

@@ -5850,4 +5850,87 @@ mod tests {
             ]
         );
     }
+
+    // ── Quote-op edge cases ─────────────────────────────────
+
+    #[test]
+    fn quote_op_q_with_comment_before_delimiter() {
+        // q # comment\nfoof — comment between q and delimiter.
+        // Delimiter is 'f', body is "oo".
+        let tokens = lex_all("q # comment\nfoof;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "oo"), "expected StrLit(\"oo\"), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_q_with_backslash_delimiter() {
+        let tokens = lex_all(r"q\foo\;");
+        assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "foo"), "expected StrLit(\"foo\"), got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn quote_op_qw_whitespace_is_not_escaped() {
+        // Backslash does NOT escape whitespace in qw().
+        let tokens = lex_all(r"qw[a\ b c]");
+        assert!(matches!(
+            &tokens[0],
+            Token::QwList(words)
+                if words == &vec![
+                    String::from("a\\"),
+                    String::from("b"),
+                    String::from("c"),
+                ]
+        ));
+    }
+
+    #[test]
+    fn quote_op_qw_delimiter_can_be_escaped_but_space_cannot() {
+        let tokens = lex_all(r"qw[a\] b\ c]");
+        assert!(matches!(
+            &tokens[0],
+            Token::QwList(words)
+                if words == &vec![
+                    String::from("a]"),
+                    String::from("b\\"),
+                    String::from("c"),
+                ]
+        ));
+    }
+
+    #[test]
+    fn quote_op_qr_with_alnum_delimiter_after_space() {
+        let tokens = lex_all("qr abcda;");
+        assert!(!matches!(tokens[0], Token::Ident(ref s) if s == "qr"), "qr should be recognized as a quote op here: {:?}", tokens);
+    }
+
+    // ── Interpolation chain tokens ──────────────────────────
+
+    #[test]
+    fn lex_interpolated_scalar_chain() {
+        let tokens = lex_all(r#""$h->{k}[0]""#);
+        assert!(tokens.iter().any(|t| matches!(t, Token::InterpScalarChainStart(_))));
+        assert!(tokens.iter().any(|t| matches!(t, Token::InterpChainEnd)));
+    }
+
+    #[test]
+    fn lex_interpolated_array_chain() {
+        let tokens = lex_all(r#""@a[1..3]""#);
+        assert!(tokens.iter().any(|t| matches!(t, Token::InterpArrayChainStart(_))));
+        assert!(tokens.iter().any(|t| matches!(t, Token::InterpChainEnd)));
+    }
+
+    // ── Defined-or vs regex ─────────────────────────────────
+
+    #[test]
+    fn lex_defined_or_stays_defined_or() {
+        let tokens = lex_all("$x // $y");
+        assert!(tokens.iter().any(|t| matches!(t, Token::DefinedOr)));
+    }
+
+    #[test]
+    fn lex_empty_regex_flags_must_be_adjacent() {
+        // `// i` — the space means `i` is a separate ident, not a flag.
+        let tokens = lex_all("// i");
+        assert!(tokens.iter().any(|t| matches!(t, Token::DefinedOr)));
+        assert!(tokens.iter().any(|t| matches!(t, Token::Ident(s) if s == "i")));
+    }
 }

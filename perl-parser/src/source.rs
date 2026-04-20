@@ -1080,4 +1080,122 @@ mod tests {
         // Terminator → None.
         assert!(source.next_line(false).unwrap().is_none());
     }
+
+    // ── ChatGPT torture tests ───────────────────────────────
+
+    #[test]
+    fn heredoc_terminator_at_eof_without_newline() {
+        let src = b"<<END\nbody\nEND";
+        let mut source = LexerSource::new(src);
+        let line = source.next_line(false).unwrap().unwrap();
+        source.start_heredoc(Bytes::from("END"), &mut Some(line)).unwrap();
+
+        let body = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&body.line[..], b"body");
+
+        // Terminator line at EOF still terminates.
+        assert!(matches!(source.next_line(false), Ok(None)));
+    }
+
+    #[test]
+    fn source_peeked_heredoc_terminator_stays_pending_until_consumed() {
+        let mut source = LexerSource::new(b"body\nEND\nrest\n");
+
+        let mut current_line = Some(LexerLine { number: 999, offset: 123, line: Bytes::from_static(b"saved"), terminated: false, pos: 0, ascii_only: true });
+
+        source.start_heredoc(Bytes::from_static(b"END"), &mut current_line).unwrap();
+
+        let body = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&body.line[..], b"body");
+
+        // Peek sees end-of-heredoc but does not consume it.
+        assert!(matches!(source.next_line(true), Ok(None)));
+        // Repeated peeks still see pending end.
+        assert!(matches!(source.next_line(true), Ok(None)));
+
+        // Consuming call now pops the heredoc and restores saved line.
+        assert!(matches!(source.next_line(false), Ok(None)));
+
+        let restored = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&restored.line[..], b"saved");
+
+        let rest = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&rest.line[..], b"rest");
+    }
+
+    #[test]
+    fn subst_body_virtual_eof_restores_remainder() {
+        let mut source = LexerSource::new(b"");
+
+        let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"bar/e + 1"), terminated: false, pos: 0, ascii_only: true });
+
+        let flags = source.start_subst_body(b'/', &mut current_line).unwrap();
+        assert_eq!(flags.as_deref(), Some("e"));
+
+        let body = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&body.line[body.pos..], b"bar");
+
+        // Virtual EOF after all body lines are delivered.
+        assert!(matches!(source.next_line(false), Ok(None)));
+
+        // Then the saved remainder appears.
+        let rest = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&rest.line[rest.pos..], b" + 1");
+    }
+
+    #[test]
+    fn subst_body_captures_multiple_flags_and_restores_remainder() {
+        let mut source = LexerSource::new(b"");
+        let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"bar/msix + 1"), terminated: false, pos: 0, ascii_only: true });
+
+        let flags = source.start_subst_body(b'/', &mut current_line).unwrap();
+        assert_eq!(flags.as_deref(), Some("msix"));
+
+        let body = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&body.line[body.pos..], b"bar");
+
+        assert!(matches!(source.next_line(false), Ok(None)));
+
+        let rest = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&rest.line[rest.pos..], b" + 1");
+    }
+
+    #[test]
+    fn subst_body_with_paired_delimiter_nesting() {
+        let mut source = LexerSource::new(b"");
+        let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"a{b}c}r"), terminated: false, pos: 0, ascii_only: true });
+
+        let flags = source.start_subst_body(b'{', &mut current_line).unwrap();
+        assert_eq!(flags.as_deref(), Some("r"));
+
+        let body = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&body.line[body.pos..], b"a{b}c");
+
+        assert!(matches!(source.next_line(false), Ok(None)));
+    }
+
+    #[test]
+    fn subst_body_errors_on_eof() {
+        let mut source = LexerSource::new(b"");
+        let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"unterminated"), terminated: false, pos: 0, ascii_only: true });
+
+        let err = source.start_subst_body(b'/', &mut current_line).unwrap_err();
+        assert!(err.message.contains("unterminated substitution"));
+    }
+
+    #[test]
+    fn indented_heredoc_errors_on_mismatched_indent_after_start() {
+        let mut source = LexerSource::new(b"  body\nEND\n");
+        let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"saved"), terminated: false, pos: 0, ascii_only: true });
+
+        // Terminator has no indent, so required indent becomes empty.
+        source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current_line).unwrap();
+
+        // First body line should still come through.
+        let body = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&body.line[..], b"  body");
+
+        // Terminator ends the heredoc.
+        assert!(matches!(source.next_line(false), Ok(None)));
+    }
 }
