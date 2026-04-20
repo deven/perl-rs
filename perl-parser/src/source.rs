@@ -1198,4 +1198,28 @@ mod tests {
         // Terminator ends the heredoc.
         assert!(matches!(source.next_line(false), Ok(None)));
     }
+
+    #[test]
+    fn filename_is_preserved() {
+        let source = LexerSource::with_filename(b"1;\n", "foo.pl");
+        assert_eq!(source.filename(), "foo.pl");
+        // Default filename should be a sensible default.
+        let default = LexerSource::new(b"1;\n");
+        assert!(!default.filename().is_empty(), "default filename should not be empty");
+    }
+
+    #[test]
+    fn push_back_precedes_underlying_source() {
+        let mut source = LexerSource::new(b"real\n");
+        let mut q = VecDeque::new();
+        q.push_back(LexerLine { number: 999, offset: 123, line: Bytes::from_static(b"queued"), terminated: false, pos: 0, ascii_only: true });
+        source.push_back(q);
+
+        let first = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&first.line[..], b"queued", "push_back lines should come before underlying source");
+        assert_eq!(first.number, 999, "pushed line number should be preserved");
+
+        let second = source.next_line(false).unwrap().unwrap();
+        assert_eq!(&second.line[..], b"real", "underlying source should follow pushed lines");
+    }
 }
