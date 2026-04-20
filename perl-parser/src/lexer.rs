@@ -1871,7 +1871,7 @@ impl Lexer {
         let start = self.line_pos();
         let mut first = true;
         while let Some(b) = self.peek_byte(false) {
-            if b.is_ascii_alphanumeric() || b == b'_' {
+            if b == b'_' || b.is_ascii_alphabetic() || (!first && b.is_ascii_digit()) {
                 self.skip(1);
                 first = false;
             } else if b == b':' && self.peek_byte_at(1) == Some(b':') {
@@ -2349,10 +2349,20 @@ impl Lexer {
 
                     let safe_len = trigger_pos.unwrap_or(r.len());
                     if safe_len > 0 {
-                        // Bulk-copy safe bytes.
+                        // Bulk-copy safe bytes, NFC-normalizing raw
+                        // source content immediately.  This ensures
+                        // escape-produced chars (pushed later) are
+                        // never mixed with raw bytes before NFC.
                         let safe = &r[..safe_len];
                         match std::str::from_utf8(safe) {
-                            Ok(text) => s.push_str(text),
+                            Ok(text) => {
+                                if self.utf8_mode && text.bytes().any(|b| b >= 0x80) {
+                                    let normalized: String = text.nfc().collect();
+                                    s.push_str(&normalized);
+                                } else {
+                                    s.push_str(text);
+                                }
+                            }
                             Err(_) => s.push_str(&String::from_utf8_lossy(safe)),
                         }
                         self.skip(safe_len);
@@ -2452,10 +2462,6 @@ impl Lexer {
         if interpolating && let Some(ctx) = self.context_stack.last_mut() {
             ctx.depth = current_depth;
         }
-
-        // NFC-normalize raw source content (not escape-constructed
-        // content, which is already in the form the user specified).
-        let s = self.nfc_normalize(s);
 
         Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.span_pos()) })
     }
