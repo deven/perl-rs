@@ -4799,6 +4799,139 @@ fn heredoc_tag_end_marker() {
     }
 }
 
+// ── Heredoc keyword tags ──────────────────────────────────
+// Perl treats barewords after << as heredoc tags, even if they
+// are keyword names.
+
+#[test]
+fn heredoc_keyword_tag_if() {
+    let prog = parse("my $x = <<if;\nhello\nif\n");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello\n"), "expected heredoc body, got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_keyword_tag_for() {
+    let prog = parse("my $x = <<for;\nhello\nfor\n");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello\n"), "expected heredoc body, got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_keyword_tag_sub() {
+    let prog = parse("my $x = <<sub;\nhello\nsub\n");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello\n"), "expected heredoc body, got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_keyword_tag_my() {
+    let prog = parse("my $x = <<my;\nhello\nmy\n");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello\n"), "expected heredoc body, got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_keyword_tag_use() {
+    let prog = parse("my $x = <<use;\nhello\nuse\n");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello\n"), "expected heredoc body, got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_keyword_tag_return() {
+    let prog = parse("my $x = <<return;\nhello\nreturn\n");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello\n"), "expected heredoc body, got {:?}", init.kind);
+}
+
+// ── POD and markers inside heredoc bodies ────────────────
+
+#[test]
+fn pod_inside_heredoc_is_literal() {
+    let src = "my $x = <<END;\nbefore\n=pod\nThis is not pod.\n=cut\nafter\nEND\n";
+    let prog = parse(src);
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => {
+            assert!(s.contains("=pod"), "=pod should be literal in heredoc body");
+            assert!(s.contains("=cut"), "=cut should be literal in heredoc body");
+            assert!(s.contains("before"));
+            assert!(s.contains("after"));
+        }
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn end_marker_inside_heredoc_is_literal() {
+    let src = "my $x = <<END;\nbefore\n__END__\nafter\nEND\n";
+    let prog = parse(src);
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => {
+            assert!(s.contains("__END__"), "__END__ should be literal in heredoc body");
+            assert!(s.contains("before"));
+            assert!(s.contains("after"));
+        }
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
+// ── Ternary with stacked heredocs ────────────────────────
+
+#[test]
+fn ternary_with_heredocs() {
+    // Both branches of ?: can be heredocs.  Bodies are queued
+    // in source order.
+    let src = "my $x = 1 ? <<A : <<B;\nfirst\nA\nsecond\nB\n";
+    let prog = parse(src);
+    assert!(!prog.statements.is_empty(), "should parse ternary with heredocs");
+}
+
+// ── Backslash heredoc edge cases ─────────────────────────
+
+#[test]
+fn heredoc_backslash_digit_tag() {
+    // <<\0 — backslash form with digit tag.
+    let src = "my $x = <<\\0;\nhello\n0\n";
+    let prog = parse(src);
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello\n"), "expected literal heredoc body, got {:?}", init.kind);
+}
+
+// ── Heredoc terminator exactness ─────────────────────────
+
+#[test]
+fn heredoc_terminator_must_be_exact_trailing_space() {
+    // "END " (trailing space) is not a terminator.
+    let src = "my $x = <<END;\nEND \nnot terminated yet\nEND\n";
+    let prog = parse(src);
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => {
+            assert!(s.contains("END "), "line with trailing space should be body content");
+            assert!(s.contains("not terminated yet"));
+        }
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn heredoc_terminator_must_be_exact_trailing_tab() {
+    // "END\t" (trailing tab) is not a terminator.
+    let src = "my $x = <<END;\nEND\t\nbody\nEND\n";
+    let prog = parse(src);
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => {
+            assert!(s.contains("END\t"), "line with trailing tab should be body content");
+            assert!(s.contains("body"));
+        }
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
 // ── Substitution delimiter variations ────────────────────
 
 #[test]
@@ -9671,6 +9804,38 @@ fn case_mod_no_wrap_after_end() {
     }
 }
 
+// ── Case mod additional coverage ─────────────────────────
+
+#[test]
+fn case_mod_uppercase_spans_const_segments() {
+    // "\Uabc def\E" — all literal chars uppercased.
+    let e = parse_expr_str(r#""\Uabc def\E";"#);
+    match &e.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "ABC DEF"),
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn case_mod_lcfirst_only_first() {
+    // "\lFOO" — only first char lowercased.
+    let e = parse_expr_str(r#""\lFOO";"#);
+    match &e.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "fOO"),
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn case_mod_ucfirst_only_first() {
+    // "\ufoo" — only first char uppercased.
+    let e = parse_expr_str(r#""\ufoo";"#);
+    match &e.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "Foo"),
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
 // ── dump keyword ─────────────────────────────────────────
 
 #[test]
@@ -11279,4 +11444,51 @@ fn tr_unicode_delimiters_paired() {
         "use utf8; use feature 'extra_paired_delimiters'; my $x = 'abc'; $x =~ tr\u{00AB}abc\u{00BB}\u{00AB}ABC\u{00BB};"
     );
     assert!(prog.statements.len() >= 3);
+}
+
+// ── Non-paired Unicode delimiters ─────────────────────────
+// Without extra_paired_delimiters, Unicode chars work as
+// non-paired (same open/close) delimiters.
+
+#[test]
+fn qq_unicode_non_paired_delimiter() {
+    // qq§hello§ — § (U+00A7) as non-paired delimiter.
+    let prog = parse("use utf8; my $x = qq\u{00A7}hello\u{00A7};");
+    match &prog.statements[1].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "hello"),
+                ExprKind::InterpolatedString(_) => {}
+                other => panic!("expected string, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn m_unicode_non_paired_delimiter() {
+    // m§pattern§ — § as regex delimiter.
+    let src = "use utf8; 'hello' =~ m\u{00A7}hell\u{00A7};";
+    let prog = parse(src);
+    assert!(!prog.statements.is_empty(), "should parse m§...§ without error");
+}
+
+// ── Heredoc with Unicode tag (quoted) ─────────────────────
+
+#[test]
+fn heredoc_quoted_with_unicode_tag() {
+    // <<"café" — heredoc tag contains non-ASCII in double quotes.
+    let src = "use utf8; my $x = <<\"caf\u{00E9}\";\nhello\ncaf\u{00E9}\n";
+    let prog = parse(src);
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "hello\n"),
+        ExprKind::InterpolatedString(parts) => {
+            let full: String = parts.0.iter().filter_map(|p| if let InterpPart::Const(s) = p { Some(s.as_str()) } else { None }).collect();
+            assert_eq!(full, "hello\n");
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
 }
