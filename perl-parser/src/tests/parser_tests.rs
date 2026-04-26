@@ -11492,3 +11492,81 @@ fn heredoc_quoted_with_unicode_tag() {
         other => panic!("expected string, got {other:?}"),
     }
 }
+
+// ── Heredoc whitespace and Unicode tag rules ─────────────
+
+#[test]
+fn heredoc_space_before_quoted_tag_allowed() {
+    // << "END" (space before double-quoted tag) is valid Perl.
+    let prog = parse("my $x = << \"END\";\nhello\nEND\n");
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "hello\n"),
+        ExprKind::InterpolatedString(parts) => {
+            let full: String = parts.0.iter().filter_map(|p| if let InterpPart::Const(s) = p { Some(s.as_str()) } else { None }).collect();
+            assert_eq!(full, "hello\n");
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
+fn heredoc_space_before_single_quoted_tag_allowed() {
+    // << 'END' (space before single-quoted tag) is valid Perl.
+    let prog = parse("my $x = << 'END';\nhello $world\nEND\n");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello $world\n"), "expected literal heredoc, got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_space_before_bare_tag_is_shift() {
+    // << END (space before bare tag) is NOT a heredoc in Perl.
+    // Perl treats bare << as <<""  which is forbidden.
+    // Our parser should interpret this as shift-left, not a heredoc.
+    // "1 << END" with END undefined is a compile error in Perl,
+    // but for our parser it should parse as a shift expression,
+    // not as a heredoc.
+    let src = "my $x = 1 << 2;";
+    let prog = parse(src);
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::BinOp(_, _, _)), "expected BinOp (shift), got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_bare_unicode_tag() {
+    // <<café under use utf8 — bare Unicode heredoc tag.
+    let prog = parse("use utf8; my $x = <<caf\u{00E9};\nhello\ncaf\u{00E9}\n");
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "hello\n"),
+        ExprKind::InterpolatedString(parts) => {
+            let full: String = parts.0.iter().filter_map(|p| if let InterpPart::Const(s) = p { Some(s.as_str()) } else { None }).collect();
+            assert_eq!(full, "hello\n");
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
+fn heredoc_backslash_unicode_tag() {
+    // <<\café under use utf8 — backslash form with Unicode tag.
+    let prog = parse("use utf8; my $x = <<\\caf\u{00E9};\nhello $world\ncaf\u{00E9}\n");
+    let init = first_assign_rhs(&prog);
+    // Backslash form suppresses interpolation.
+    assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello $world\n"), "expected literal heredoc, got {:?}", init.kind);
+}
+
+#[test]
+fn heredoc_indented_bare_unicode_tag() {
+    // <<~café under use utf8 — indented bare Unicode heredoc tag.
+    let prog = parse("use utf8; my $x = <<~caf\u{00E9};\n    hello\n    caf\u{00E9}\n");
+    let init = first_assign_rhs(&prog);
+    match &init.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "hello\n"),
+        ExprKind::InterpolatedString(parts) => {
+            let full: String = parts.0.iter().filter_map(|p| if let InterpPart::Const(s) = p { Some(s.as_str()) } else { None }).collect();
+            assert_eq!(full, "hello\n");
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}

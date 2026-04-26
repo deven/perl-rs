@@ -2530,13 +2530,10 @@ impl Lexer {
                 }
                 _ => {
                     if b >= 0x80 {
-                        // Multi-byte UTF-8: decode the full character
-                        // to avoid splitting lead/continuation bytes.
                         if let Some((ch, len)) = self.peek_utf8_char() {
                             self.skip(len);
                             self.push_case_mod(&mut s, ch);
                         } else {
-                            // Invalid UTF-8 — pass the raw byte through.
                             self.skip(1);
                             self.push_case_mod(&mut s, b as char);
                         }
@@ -3321,14 +3318,23 @@ impl Lexer {
             self.skip(1);
         }
 
-        // Skip optional whitespace between << and tag.
-        while self.peek_byte(false) == Some(b' ') || self.peek_byte(false) == Some(b'\t') {
-            self.skip(1);
+        // Whitespace between <<(~) and the tag is allowed before
+        // quoted tags but NOT before bare tags.  Perl treats
+        // `<< TAG` as `<<""` (empty tag) which is forbidden.
+        let had_whitespace = matches!(self.peek_byte(false), Some(b' ' | b'\t'));
+        if had_whitespace {
+            while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
+                self.skip(1);
+            }
         }
 
         match self.peek_byte(false) {
+            // Quoted tags: whitespace before them is fine.
             Some(b'"') | Some(b'\'') | Some(b'\\') | Some(b'`') => Ok(Some(self.lex_heredoc(indented)?)),
-            Some(b) if b == b'_' || b.is_ascii_alphanumeric() => Ok(Some(self.lex_heredoc(indented)?)),
+            // Bare tags: must be adjacent (no whitespace).
+            Some(b) if !had_whitespace && (b == b'_' || b.is_ascii_alphanumeric() || (self.effective_utf8 && b >= 0x80)) => {
+                Ok(Some(self.lex_heredoc(indented)?))
+            }
             _ => {
                 // No valid tag — rewind to just after << so the
                 // parser can proceed with a normal shift-left.
@@ -3371,8 +3377,20 @@ impl Lexer {
                 // <<\TAG — backslash form, equivalent to <<'TAG'.
                 self.skip(1);
                 let tag_start = self.line_pos();
-                while self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
-                    self.skip(1);
+                loop {
+                    match self.peek_byte(false) {
+                        Some(b) if b == b'_' || b.is_ascii_alphanumeric() => self.skip(1),
+                        Some(b) if self.effective_utf8 && b >= 0x80 => {
+                            if let Some((ch, len)) = self.peek_utf8_char()
+                                && UnicodeXID::is_xid_continue(ch)
+                            {
+                                self.skip(len);
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
                 }
                 let tag = String::from_utf8_lossy(self.line_slice(tag_start)).into_owned();
                 let k = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
@@ -3381,8 +3399,20 @@ impl Lexer {
             _ => {
                 // Bare identifier — interpolating
                 let tag_start = self.line_pos();
-                while self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
-                    self.skip(1);
+                loop {
+                    match self.peek_byte(false) {
+                        Some(b) if b == b'_' || b.is_ascii_alphanumeric() => self.skip(1),
+                        Some(b) if self.effective_utf8 && b >= 0x80 => {
+                            if let Some((ch, len)) = self.peek_utf8_char()
+                                && UnicodeXID::is_xid_continue(ch)
+                            {
+                                self.skip(len);
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
                 }
                 let tag = String::from_utf8_lossy(self.line_slice(tag_start)).into_owned();
                 let k = if indented { HeredocKind::Indented } else { HeredocKind::Interpolating };
