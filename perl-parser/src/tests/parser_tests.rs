@@ -4745,6 +4745,60 @@ fn heredoc_indented_backslash_form() {
     );
 }
 
+// ── Heredoc numeric and special tags ─────────────────────
+
+#[test]
+fn heredoc_numeric_bare_tag() {
+    // Perl accepts <<0 as a heredoc with tag "0".
+    // The gate in lex_heredoc_after_shift_left must accept
+    // digits, not just alphabetic + underscore.
+    let prog = parse("my $x = <<0;\nhello\n0\n");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "hello\n"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn heredoc_numeric_tag_42() {
+    // <<42 is also valid in Perl.
+    let prog = parse("my $x = <<42;\nworld\n42\n");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "world\n"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn heredoc_tag_end_marker() {
+    // <<__END__ is a valid heredoc tag — __END__ inside the
+    // body is literal text, and the terminator __END__ is
+    // matched by the heredoc machinery, not the data-end detector.
+    let prog = parse("my $x = <<__END__;\ncontent\n__END__\n");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "content\n"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
 // ── Substitution delimiter variations ────────────────────
 
 #[test]
@@ -10621,6 +10675,70 @@ fn nfc_sub_name_nfd_becomes_nfc() {
     assert_eq!(sub.name, "caf\u{00E9}", "sub name should be NFC-normalized");
 }
 
+// ── UTF-8 body content in strings ────────────────────────
+
+#[test]
+fn double_quoted_non_ascii_body_ascii_delim() {
+    // Non-ASCII content in a regular double-quoted string under
+    // use utf8.  The memchr fast path should bulk-copy the UTF-8
+    // correctly.
+    let prog = parse("use utf8; my $x = \"caf\u{00E9} \u{00A3}5\";");
+    match &prog.statements[1].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::InterpolatedString(parts) => {
+                    let full: String = parts.0.iter().filter_map(|p| if let InterpPart::Const(s) = p { Some(s.as_str()) } else { None }).collect();
+                    assert_eq!(full, "caf\u{00E9} \u{00A3}5");
+                }
+                ExprKind::StringLit(s) => assert_eq!(s, "caf\u{00E9} \u{00A3}5"),
+                other => panic!("expected string, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn q_braces_with_non_ascii_under_utf8() {
+    // Standard q{} with non-ASCII body under use utf8.
+    // No Unicode delimiters — tests the basic byte-by-byte
+    // fallback with ASCII delimiters.
+    let prog = parse("use utf8; my $x = q{caf\u{00E9}};");
+    match &prog.statements[1].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "caf\u{00E9}"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn case_mod_uppercase_non_ascii() {
+    // "\Ucafé\E" under use utf8 — the byte-by-byte fallback
+    // must decode multi-byte UTF-8 characters, not split them
+    // with skip(1) + b as char.
+    let prog = parse("use utf8; my $x = \"\\Ucaf\u{00E9}\\E\";");
+    match &prog.statements[1].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::InterpolatedString(parts) => {
+                    let full: String = parts.0.iter().filter_map(|p| if let InterpPart::Const(s) = p { Some(s.as_str()) } else { None }).collect();
+                    assert_eq!(full, "CAF\u{00C9}", "expected CAFÉ, got {full}");
+                }
+                ExprKind::StringLit(s) => assert_eq!(s, "CAF\u{00C9}", "expected CAFÉ, got {s}"),
+                other => panic!("expected string, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
 // ── Adversarial edge cases ──────────────────────────────
 
 #[test]
@@ -11121,4 +11239,44 @@ fn qw_math_angle_brackets() {
         },
         other => panic!("expected Expr, got {other:?}"),
     }
+}
+
+#[test]
+fn q_unicode_delim_body_with_shared_lead_byte() {
+    // « is U+00AB (0xC2 0xAB), » is U+00BB (0xC2 0xBB).
+    // £ is U+00A3 (0xC2 0xA3) — shares lead byte 0xC2 with both.
+    // Memchr triggers on 0xC2 inside the body, but the old
+    // byte-by-byte fallback did skip(1) + b as char, splitting
+    // the multi-byte £ into two garbled characters.
+    let prog = parse(
+        "use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{00AB}\u{00A3}\u{00BB};"
+    );
+    match &prog.statements[2].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "\u{00A3}"),
+                other => panic!("expected StringLit, got {other:?}"),
+            },
+            other => panic!("expected Assign, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn subst_unicode_delimiters_paired() {
+    // s«pattern»«replacement» with extra_paired_delimiters.
+    let prog = parse(
+        "use utf8; use feature 'extra_paired_delimiters'; my $x = 'hello'; $x =~ s\u{00AB}hell\u{00BB}\u{00AB}heaven\u{00BB};"
+    );
+    assert!(prog.statements.len() >= 3, "expected at least 3 statements");
+}
+
+#[test]
+fn tr_unicode_delimiters_paired() {
+    // tr«abc»«ABC» with extra_paired_delimiters.
+    let prog = parse(
+        "use utf8; use feature 'extra_paired_delimiters'; my $x = 'abc'; $x =~ tr\u{00AB}abc\u{00BB}\u{00AB}ABC\u{00BB};"
+    );
+    assert!(prog.statements.len() >= 3);
 }

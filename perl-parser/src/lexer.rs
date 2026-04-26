@@ -2529,8 +2529,21 @@ impl Lexer {
                     }
                 }
                 _ => {
-                    self.skip(1);
-                    self.push_case_mod(&mut s, b as char);
+                    if b >= 0x80 {
+                        // Multi-byte UTF-8: decode the full character
+                        // to avoid splitting lead/continuation bytes.
+                        if let Some((ch, len)) = self.peek_utf8_char() {
+                            self.skip(len);
+                            self.push_case_mod(&mut s, ch);
+                        } else {
+                            // Invalid UTF-8 — pass the raw byte through.
+                            self.skip(1);
+                            self.push_case_mod(&mut s, b as char);
+                        }
+                    } else {
+                        self.skip(1);
+                        self.push_case_mod(&mut s, b as char);
+                    }
                 }
             }
         }
@@ -3315,7 +3328,7 @@ impl Lexer {
 
         match self.peek_byte(false) {
             Some(b'"') | Some(b'\'') | Some(b'\\') | Some(b'`') => Ok(Some(self.lex_heredoc(indented)?)),
-            Some(b) if b == b'_' || b.is_ascii_alphabetic() => Ok(Some(self.lex_heredoc(indented)?)),
+            Some(b) if b == b'_' || b.is_ascii_alphanumeric() => Ok(Some(self.lex_heredoc(indented)?)),
             _ => {
                 // No valid tag — rewind to just after << so the
                 // parser can proceed with a normal shift-left.
