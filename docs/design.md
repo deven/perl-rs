@@ -1,19 +1,26 @@
-# Perl in Rust: Architecture and Design
+# PerlOxide: Architecture and Design
 
 ## 0. Why This Document Exists
 
-This is the master design for a new Perl implementation written in Rust,
-targeting high compatibility with Perl 5 and eventually offering improved
-concurrency, ahead-of-time compilation, and a cleaner extension story.
+This is the master design for **PerlOxide**, a new Perl implementation
+written in Rust, targeting high compatibility with Perl 5 and
+eventually offering improved concurrency, ahead-of-time compilation,
+and a cleaner extension story.
 
 The document focuses on the decisions that actually determine whether the
 project succeeds: value representation, memory management, the
-compile/execute interleaving that Perl demands, the lexer–parser feedback
-loop, the concurrency model, and a typed layer that bridges Perl and Rust
-seamlessly.  These are the places where a wrong early choice costs months.
+compile/execute interleaving that Perl demands, parser-driven
+disambiguation, the concurrency model, and a typed layer that bridges
+Perl and Rust seamlessly.  These are the places where a wrong early
+choice costs months.
 
 Throughout the document, "Perl" means Perl 5 unless otherwise qualified.
-"Raku" is mentioned only where architectural boundary decisions are needed.
+"Raku" is mentioned only where architectural boundary decisions are
+needed.
+
+The use of the name "PerlOxide" has been approved by The Perl and Raku
+Foundation under their trademark policy.  "Perl" is a trademark of
+The Perl Foundation.
 
 ---
 
@@ -3993,8 +4000,8 @@ semantics, `let`/`fn` for Rust semantics.
 
 Parsing is not a problem: `fn` is not a Perl 5 keyword, and in type
 position `<` unambiguously opens a type parameter list.  The
-lexer–parser feedback loop already designed for Perl's existing
-ambiguities handles both for free.
+parser-driven disambiguation already designed for Perl's existing
+ambiguities (§5.2) handles both for free.
 
 ### 14.3 `let`, `fn`, and Type Inference
 
@@ -6542,6 +6549,102 @@ also have its own Rust-level unit and integration tests that do not depend
 on the Perl test harness.  These are faster to run and easier to debug
 than end-to-end `.t` tests.
 
+### 20.4 Adversarial Testing Methodology
+
+Standard testing confirms that code works for intended inputs.
+Adversarial testing tries to prove that code fails for inputs it
+should handle — with full inside knowledge of the implementation's
+assumptions and blind spots.  This is especially important for an
+AI-assisted development process, where the AI that wrote the code
+has a natural tendency to produce tests that confirm the code
+rather than challenge it.
+
+**The two-hat protocol:**
+
+Development alternates between two distinct roles:
+
+1. **Author hat.**  Write the implementation.  Write tests that
+   exercise the intended behavior.  Iterate until tests pass.
+   Normal debugging during this phase is expected — an author
+   finding and fixing their own bugs while developing is routine,
+   not adversarial.
+
+2. **Adversary hat.**  Switch roles after the author declares the
+   code complete and tests green.  The adversary has full knowledge
+   of the implementation — every assumption, every fast path, every
+   boundary condition.  The goal is to construct inputs that break
+   the code despite the author's tests passing.
+
+Only failures discovered during the adversary phase earn recognition
+("gold stars").  Author-phase debugging doesn't count — it's normal
+development.  This distinction prevents inflating the adversarial
+count with bugs that were caught during implementation.
+
+**Rules for adversarial tests:**
+
+- **Never use `#[should_panic]` to mask failures.**  A test that
+  panics is a test that found a bug.  `should_panic` hides the bug
+  behind a green bar, creating false confidence.  Every adversarial
+  test must assert the correct output, not merely assert that the
+  code crashes in an expected way.
+
+- **Never write shallow "didn't crash" tests.**  `assert!(!result
+  .is_err())` proves nothing about correctness.  Adversarial tests
+  must verify specific output values against known-correct behavior
+  (typically verified by running the equivalent Perl code through
+  the real Perl interpreter).
+
+- **Exploit inside knowledge.**  The adversary knows which code
+  paths are fast-pathed, where character encoding boundaries lie,
+  which features interact with which subsystems, and where
+  assumptions were made during implementation.  A good adversarial
+  test targets the intersection of two features that were each
+  tested in isolation but never tested together.
+
+**Examples of adversarial findings:**
+
+The protocol has produced real bugs that would have shipped:
+
+- **UTF-8 lead byte collision.**  The `memchr` fast path for
+  Unicode delimiters (`«`/`»`) searches for the first UTF-8 byte
+  `0xC2`.  The character `£` (U+00A3 = `0xC2 0xA3`) shares that
+  lead byte.  When `memchr` triggered on `£` inside `q«£»`, the
+  byte-by-byte fallback did `skip(1)` on just the lead byte,
+  splitting the two-byte character into garbled output.
+
+- **Digit-start heredoc tags.**  The heredoc gate condition used
+  `is_ascii_alphabetic()`, rejecting `<<0` and `<<42` even though
+  Perl's `isWORDCHAR` accepts digits.  A one-character fix
+  (`is_ascii_alphanumeric`) that no amount of normal testing would
+  have surfaced, because nobody writes `<<0` in test cases.
+
+- **Unicode bare heredoc tags.**  The bare tag scanner and
+  backslash tag scanner were ASCII-only, truncating `<<café` to
+  `<<caf` under `use utf8`.  The gate condition, bare scanner,
+  and backslash scanner all needed `peek_utf8_char` +
+  `UnicodeXID::is_xid_continue` loops — a cross-subsystem blind
+  spot where heredoc handling and UTF-8 support had each been
+  tested independently but never together.
+
+**Why this matters for AI-assisted development:**
+
+When an AI generates code and tests, both outputs share the same
+assumptions and blind spots.  The AI naturally produces tests that
+confirm its own code works, because the same model that chose an
+implementation strategy also chooses what to test.  The adversarial
+hat protocol breaks this feedback loop by forcing a deliberate
+shift in objective: the same AI that wrote the code now tries to
+destroy it, with explicit instructions to exploit the very
+assumptions it made during implementation.
+
+The human's role is critical: setting quality standards, forcing
+architectural rethinks, verifying edge cases against the real Perl
+interpreter, and — most importantly — recognizing when the AI is
+producing superficially plausible tests that don't actually
+challenge the code.  The gold star system makes adversarial success
+visible and valued, counteracting the AI's default preference for
+producing passing tests.
+
 ---
 
 ## 21. Implementation Order
@@ -6639,14 +6742,14 @@ fn reference_identity() {
 ### 21.2 Lexer, parser, and AST (5-7 weeks)
 
 Build the lexer and parser together in the `perl-parser` crate.
-The lexer and parser are inseparable — the lexer requires parser
-feedback (expectation state) to tokenize correctly, and the parser
-calls into the lexer with explicit expectations.  Build them
-incrementally in lockstep:
+The lexer produces consistent, unambiguous tokens; the parser
+resolves semantic ambiguity through its control flow and calls
+specialized lexer methods for context-sensitive scanning.  Build
+them incrementally in lockstep:
 
-- Expectation state enum and token types
-- Main tokenizer loop dispatching on current character
+- Token types and main tokenizer loop
 - Pratt parser with precedence climbing
+- Parser-driven disambiguation (§5.2)
 - Sublexing for quote-like constructs (`q//`, `qq//`, heredocs)
 - Keyword table and keyword-specific parsing
 - AST node types
@@ -6759,7 +6862,7 @@ three independent leaf crates that have no cross-dependencies:
 | Crate | Type | Dependencies | Contents |
 |---|---|---|---|
 | `perl-core` | lib | `bytes` | Strings, values, scalars, flags, typed value trait, extension API |
-| `perl-parser` | lib | `bytes` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters |
+| `perl-parser` | lib | `bytes`, `memchr`, `unicode-xid`, `unicode-normalization` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters |
 | `perl-regex` | lib | none | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11) |
 | `perl-compiler` | lib | `perl-core`, `perl-parser` | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
 | `perl-runtime` | lib | `perl-compiler`, `perl-core`, `perl-regex` | Interpreter loop, `Executor` impl, call frames, symbol tables, builtins, magic, concurrency, bytecode save/load, CLI, REPL, debug |
@@ -6771,11 +6874,13 @@ Three leaf crates (`perl-core`, `perl-parser`, `perl-regex`) have no
 cross-dependencies.  Each is independently useful as a library:
 `perl-parser` for tools that need to parse Perl without executing it,
 `perl-regex` for Rust programs that want Perl-compatible regex, and
-`perl-core` for extensions that need the value types.  `perl-core` and
-`perl-parser` depend on the `bytes` crate for zero-copy
-reference-counted byte buffers (source slicing in the parser,
-copy-on-write semantics for Perl strings).  `perl-regex` remains
-dependency-free, operating on `&[u8]` and `&str` slices.
+`perl-core` for extensions that need the value types.  `perl-core`
+depends on the `bytes` crate for zero-copy reference-counted byte
+buffers.  `perl-parser` depends on `bytes` (source slicing), `memchr`
+(SIMD-optimized scanning and delimiter lookup), `unicode-xid`
+(Unicode identifier validation), and `unicode-normalization` (NFC
+normalization).  `perl-regex` remains dependency-free, operating on
+`&[u8]` and `&str` slices.
 
 `perl-compiler` contains the compilation pipeline: AST → HIR → IR →
 optimize.  It depends on `perl-parser` (for AST input) and
@@ -6867,17 +6972,28 @@ perl-parser/
         lib.rs           # Public API: "give me source, get an AST"
         source.rs        # LexerSource, LexerLine, CRLF normalization
         token.rs         # Token enum, spans
-        lexer.rs         # Tokenizer, sublexing
+        lexer.rs         # Tokenizer, sublexing, delimiter tables
         parser.rs        # Pratt parser, AST construction
         ast.rs           # AST node types
         keyword.rs       # Keyword table
-        expect.rs        # Expectation state
+        pragma.rs        # Feature flags, version bundles, Pragmas state
+        symbol.rs        # Symbol table, prototypes, imports
+        error.rs         # ParseError type
+        span.rs          # Source location spans
+        tests/           # Test modules (#[cfg(test)])
+            lexer_tests.rs
+            parser_tests.rs
+            source_tests.rs
+            pragma_tests.rs
+            symbol_tests.rs
 ```
 
-The lexer and parser are `pub(crate)` internals.  They share the
-`Expect` state on the `Parser` struct — the parser sets it, the
-lexer reads it when tokenizing the next token.  The crate boundary
-is at the AST level — downstream crates see only the AST.
+The lexer and parser are `pub(crate)` internals.  The lexer produces
+consistent unambiguous tokens; the parser resolves semantic ambiguity
+through its control flow and calls specialized lexer methods for
+context-sensitive scanning (see §5.2).  The parser syncs pragma and
+feature state to the lexer at pragma change points.  The crate
+boundary is at the AST level — downstream crates see only the AST.
 
 #### 22.1.5 Feature flags on `perl-runtime`:
 
@@ -6905,10 +7021,12 @@ jit = ["dep:cranelift-codegen", "dep:cranelift-frontend"]
 embeddable: a Rust application can depend on `perl-runtime` and
 invoke Perl without going through the CLI.
 
-**Published crate names** may differ from workspace names if the
-`perl-*` namespace on crates.io is unavailable.  Fallback names
-follow the pattern `perl5-core`, `perl5-parser`, `perl5-regex`, etc.
-Local workspace names remain `perl-*` regardless.
+**The project name is PerlOxide.**  The workspace and repository use
+`perl-*` crate names (`perl-core`, `perl-parser`, `perl-regex`,
+`perl-compiler`, `perl-runtime`, `perl`).  The GitHub organization
+is `perloxide` (https://github.com/perloxide/perloxide).  Crate
+directories sit at the top level of the repository, not under a
+`crates/` subdirectory.
 
 ### 22.2 Supporting Files
 
@@ -6985,9 +7103,13 @@ The key architectural decisions in this design:
    execution (`BEGIN`, `use`, `eval STRING`) is a first-class
    architectural constraint, not an afterthought.
 
-4. **Explicit lexer–parser feedback loop.**  `Expect` state, symbol
-   table queries, and prototype-guided parsing — the mechanisms that
-   make Perl's context-sensitive tokenization work.
+4. **Parser-driven disambiguation.**  The lexer produces consistent
+   unambiguous tokens; the parser resolves semantic ambiguity through
+   its own control flow.  No shared `Expect` state — the parser calls
+   specialized lexer methods for context-sensitive scanning, and the
+   Pratt parser's term-vs-operator position handles `/` (regex vs
+   division), `{` (block vs hash, via post-hoc reclassification),
+   and `<<` (heredoc vs shift-left).
 
 5. **Standalone regex crate** (`perl-regex`) designed as an
    independently publishable Rust library with a clean API, filling
@@ -7011,8 +7133,9 @@ The key architectural decisions in this design:
 
 8. **Six crates plus one binary** — three independent leaf crates
    (`perl-core`, `perl-parser`, `perl-regex`) with no
-   cross-dependencies.  `perl-core` and `perl-parser` depend on the
-   `bytes` crate for zero-copy reference-counted buffers; `perl-regex`
+   cross-dependencies.  `perl-core` depends on `bytes` for zero-copy
+   reference-counted buffers; `perl-parser` depends on `bytes`,
+   `memchr`, `unicode-xid`, and `unicode-normalization`; `perl-regex`
    is dependency-free.  A `perl-compiler` library (HIR, IR, lowering,
    optimization, `Executor` trait), a `perl-runtime` library
    (interpreter, builtins, bytecode save/load), and a thin `perl`
