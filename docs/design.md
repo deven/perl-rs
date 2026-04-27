@@ -1890,20 +1890,29 @@ Unicode identifier support and paired delimiter lookup.
 
 ### 6.3 Prototype-Guided Parsing
 
-When the parser encounters a known subroutine name, it should check the
-sub's prototype (if any) to determine how to parse the argument list.
-Prototypes change the parsing:
+When the parser encounters a known subroutine name, it checks the
+sub's prototype (if any) in the symbol table to determine how to
+parse the argument list.  Prototypes change the parsing:
 
 - `sub foo ($)` — expects one scalar argument
 - `sub foo (&@)` — first arg is a block, rest is a list
 - `sub foo ()` — takes no arguments, so `foo + 1` is `foo() + 1`
 - no prototype — standard list operator parsing
 
-This requires symbol table access from the parser, reinforcing the
-co-resident compiler/runtime architecture.  The prototype data
-structures exist (`SubPrototype`, `ProtoSlot` in the `symbol`
-module), but full prototype-guided argument list parsing is not yet
-implemented.
+The parser registers sub declarations (with prototypes) in the
+symbol table as they are parsed, so subsequent call sites can
+consult `parse_prototyped_call` for prototype-driven argument
+parsing.  The `SubPrototype` and `ProtoSlot` types in the `symbol`
+module represent parsed prototypes; the parser uses the slot
+sequence to decide how each argument position should be parsed
+(scalar context, block, slurpy list, etc.).
+
+Prototyped subs with a scalar-ish first slot (`$`, `_`, `+`,
+`\X`, `\[...]`) use `PREC_NAMED_UNARY` (30) for their argument
+precedence, sitting between `isa` and shift — so `foo $a < 1`
+parses as `foo($a) < 1`, while `foo $a << 1` parses as
+`foo($a << 1)`.  Subs with an empty prototype `()` consume no
+arguments at all.
 
 ### 6.4 Syntax Extension API (Planned)
 
