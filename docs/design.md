@@ -104,7 +104,7 @@ Values that need heap allocation use `Arc<RwLock<T>>` — Rust's
 standard shared-ownership, thread-safe pointer.  This replaces the
 arena-based allocation model that earlier drafts used.
 
-**Why `Arc<RwLock<T>>` instead of arenas:**
+#### 2.2.1 Why `Arc<RwLock<T>>` instead of arenas:
 
 The original rationale for arenas was borrow-checker friendliness
 with a per-interpreter `&mut Heap`.  With the shared heap design
@@ -125,7 +125,7 @@ reuse, fragmentation, bounds checking) without compensating benefit.
   Values can be shared, moved between data structures, and dropped
   independently.
 
-**Concrete types:**
+#### 2.2.2 Concrete types:
 
 ```rust
 type Sv = Arc<RwLock<Scalar>>;     // full scalar (multi-rep, magic, blessed)
@@ -184,7 +184,7 @@ Perl values are simple: just a number, just a string, just a
 reference.  Only values that need full Perl SV semantics are
 upgraded to `Scalar(Sv)`.
 
-**Upgrade from compact to full Scalar:**
+#### 2.2.3 Upgrade from compact to full Scalar:
 
 A compact value is upgraded to `Value::Scalar(Sv)` when any of
 these occur:
@@ -206,7 +206,7 @@ upgrade is not worth it, and identity (via `Arc` address) must be
 preserved — anything holding a reference to the `Sv` would break if
 the value reverted to a compact form.
 
-**Interaction with `\$x` references:**
+#### 2.2.4 Interaction with `\$x` references:
 
 ```perl
 my $x = 42;              # Value::Int(42) — compact, no allocation
@@ -263,7 +263,7 @@ Note that small-string optimization exists at two levels:
 (no `Arc`, no `Scalar` struct), and `PerlStringSlot::Inline` for
 the string cache inside a full `Scalar` (already behind `Arc`).
 
-**Flag discipline:**
+#### 2.3.1 Flag discipline:
 
 `ScalarFlags` separates cache-validity bits from orthogonal metadata:
 
@@ -314,7 +314,7 @@ providing Perl 5's copy-on-write (COW) string semantics:
 
 This maps directly to Perl 5's `SvPV_COW` mechanism.
 
-**String flags:**
+#### 2.3.2 String flags:
 
 A single `flags: u8` byte carries two independent concerns:
 
@@ -339,7 +339,7 @@ Perl's "extended UTF-8" can represent code points above U+10FFFF
 and surrogates that Rust rejects, and `Encode::_utf8_on()` sets
 the Perl flag without validation.
 
-**State transitions — scans only narrow, never re-widen:**
+#### 2.3.3 State transitions — scans only narrow, never re-widen:
 
 - `is_ascii()` scan: `111` → `000` or `100`; `011` → `000` or `001`
 - `as_str()` scan: `111` → `000` or `001` or `010`;
@@ -388,7 +388,7 @@ correct.  The lazy scan recovers the information if needed later.
 Smart preservation avoids unnecessary re-scanning for common
 operations like string concatenation and `chomp`.
 
-**`flags == 0` fast path:**
+#### 2.3.4 `flags == 0` fast path:
 
 When all bits are zero (`flags == 0`), the string is pure ASCII with
 no Perl UTF-8 flag — the overwhelmingly common case for typical Perl
@@ -397,7 +397,7 @@ multi-byte characters, no special semantics.  This is also the
 natural zero-initialized state for strings built from known-ASCII
 source bytes.
 
-**Construction policy:**
+#### 2.3.5 Construction policy:
 
 - `SmallString`: always scan for ASCII at construction (checking ≤38
   bytes for a high bit is nearly free).  From raw bytes: `000` (ASCII)
@@ -680,7 +680,7 @@ flag — Rust guarantees `Option<Box<T>>` is pointer-sized via niche
 optimization, and `None` is a null pointer.  The check compiles to a
 single `test`/`jz` instruction.
 
-**Reading a localizable global (hot path):**
+#### 3.3.1 Reading a localizable global (hot path):
 
 ```rust
 fn get_record_sep(&self) -> Value {
@@ -696,7 +696,7 @@ fn get_record_sep(&self) -> Value {
 Two operations: null pointer check, then either read `current` from
 the task-local cell or load the shared global.
 
-**`local $/ = undef` lifecycle:**
+#### 3.3.2 `local $/ = undef` lifecycle:
 
 The save stack records the previous task-local state, not the global
 value.  When the task-local cell returns to `None`, reads fall through
@@ -730,7 +730,7 @@ that are not currently `local`-ized.
 cell lazily — the first `local` on a given package global creates it.
 Most package globals are never `local`-ized.
 
-**Multi-task behavior — concurrent mutation is visible:**
+#### 3.3.3 Multi-task behavior — concurrent mutation is visible:
 
 The save stack never caches the shared global value, only previous
 task-local states.  This means if another task mutates the shared
@@ -991,7 +991,7 @@ and indentation stripping.  The lexer receives one line at a time and
 scans bytes within it, never dealing with line boundaries, newline
 encoding, or heredoc line reordering.
 
-**Why a source layer:**
+#### 5.4.1 Why a source layer:
 
 Without this abstraction, the lexer must juggle byte-level position
 pointers, CRLF normalization (either preprocessing via `Cow` or
@@ -1006,7 +1006,7 @@ general-purpose abstraction.  A future general `Source` type for
 other uses (e.g. error reporting, IDE integration) could underlie
 `LexerSource` as a wrapper.
 
-**Dependencies:**
+#### 5.4.2 Dependencies:
 
 `perl-parser` depends on the `bytes` crate.  `LexerSource` uses
 `Bytes` for zero-copy reference-counted slices of the source buffer.
@@ -1016,7 +1016,7 @@ all `Bytes` handles into the same underlying allocation — no copying.
 `&str` slices; the conversion from `Bytes` to `&[u8]` is free
 (`Bytes` derefs to `&[u8]`).
 
-**`LexerLine` — the lexer's working unit:**
+#### 5.4.3 `LexerLine` — the lexer's working unit:
 
 The lexer operates on a `LexerLine` that combines line metadata with
 a byte-scanning cursor.  All fields are `pub(crate)` — the lexer
@@ -1069,7 +1069,7 @@ restoring a line (e.g. for heredoc remainder) automatically preserves
 the cursor position within that line.  The lexer transparently
 resumes mid-line without any special-case logic.
 
-**`LexerSource` internal architecture:**
+#### 5.4.4 `LexerSource` internal architecture:
 
 `LexerSource` maintains a line queue (`VecDeque<LexerLine>`) and a
 push-back mechanism for line reordering.  When heredoc bodies or
@@ -1126,7 +1126,7 @@ impl LexerSource {
 }
 ```
 
-**Heredoc line sequencing:**
+#### 5.4.5 Heredoc line sequencing:
 
 When `start_heredoc` or `start_indented_heredoc` is called:
 
@@ -1146,7 +1146,7 @@ the lexer encounters `<<B` and calls `start_heredoc` again, which
 saves the new remainder (`);\n`) and queues B's body.  No special
 stacking logic in the lexer.
 
-**Substitution body partitioning:**
+#### 5.4.6 Substitution body partitioning:
 
 `s/pattern/replacement/flags` requires scanning ahead to find the
 replacement body's closing delimiter and extract flags before the
@@ -1165,7 +1165,7 @@ this:
 This is the same queue-and-save mechanism used for heredocs, extended
 to handle the delimited replacement body.
 
-**CRLF normalization and line termination:**
+#### 5.4.7 CRLF normalization and line termination:
 
 `LexerLine` is deliberately designed to exclude the line ending
 (LF or CRLF) from the `line` byte slice.  Instead, the `terminated`
@@ -1180,7 +1180,7 @@ ending.  This matches Perl's behavior.  No information is lost: the
 newline, and the lexer synthesizes a virtual `\n` byte at the end
 of terminated lines via `peek_byte`.
 
-**`# line` directive processing:**
+#### 5.4.8 `# line` directive processing:
 
 The lexer recognizes `# line N "file"` directives (when `#` is at
 column 0) via `try_line_directive()`, updating `LexerSource`'s line
@@ -1196,7 +1196,7 @@ skipping between sigil and identifier crosses line boundaries, and
 line boundary crossing triggers `next_line()`, which processes the
 directive.
 
-**How this simplifies the lexer:**
+#### 5.4.9 How this simplifies the lexer:
 
 The lexer's token-production loop never manages heredoc line ordering,
 CRLF normalization, indent stripping, substitution body partitioning,
@@ -1204,7 +1204,7 @@ or position save/restore.  These are fully encapsulated in
 `LexerSource`.  The lexer simply calls `peek_byte`, which auto-loads
 lines as needed through `next_line()`.
 
-**Zero-copy flow from source to runtime:**
+#### 5.4.10 Zero-copy flow from source to runtime:
 
 Because both the parser and the runtime use `Bytes`, literal values
 flow from source to runtime without copying.  A string literal like
@@ -1284,7 +1284,7 @@ substitution replacement bodies, where end-of-content is signaled by
 `LexerSource` returning `Ok(None)` from `next_line()` rather than by
 a delimiter byte in the content stream.
 
-**Incremental sublexing:**
+#### 5.5.1 Incremental sublexing:
 
 The lexer produces sub-tokens one at a time rather than scanning the
 entire body at once.  Each call to `lex_token()` re-enters `lex_body`
@@ -1295,7 +1295,7 @@ of expression interpolation — `${expr}` and `@{expr}` increment
 `expr_depth`, switching the lexer to normal code mode until the
 matching `}` decrements it back to 0.
 
-**Subscript chain tracking:**
+#### 5.5.2 Subscript chain tracking:
 
 Inside interpolating strings, `$name` followed by `->`, `[`, or `{`
 triggers a subscript chain: `"$h->{k}[0]"` should interpolate the
@@ -1306,7 +1306,7 @@ follows a closing bracket.  The chain emits normal code tokens
 bracketed by `InterpScalarExprStart` / `InterpChainEnd` (or the
 array equivalents).
 
-**Token stream for quote-like constructs:**
+#### 5.5.3 Token stream for quote-like constructs:
 
 Quote-like scanning produces a stream of sub-tokens:
 
@@ -1329,7 +1329,7 @@ Both `$name` and `${name}` (with a simple identifier) produce
 calls `parse_expr()` inline for expression interpolation — the same
 parser instance, with proper span tracking and error reporting.
 
-**Body scanner fast path:**
+#### 5.5.4 Body scanner fast path:
 
 The body scanner (`lex_body`) uses a `memchr`-based fast path for
 bulk copying of string content.  When no case modifications are
@@ -1353,7 +1353,7 @@ ordering, indentation, and save/restore.  The lexer's only heredoc
 awareness is recognizing `<<TAG` and framing the body as
 `QuoteSublexBegin` / content tokens / `SublexEnd`.
 
-**Basic flow:**
+#### 5.6.1 Basic flow:
 
 ```perl
 my $x = <<END . "suffix";
@@ -1385,7 +1385,7 @@ END
    `LexerLine` carries the cursor position, the lexer transparently
    resumes scanning mid-line.
 
-**Multiple heredocs on one line:**
+#### 5.6.2 Multiple heredocs on one line:
 
 ```perl
 my ($a, $b) = (<<A, <<B);
@@ -1409,7 +1409,7 @@ This falls out naturally from the save/restore mechanism:
 No special stacking logic in the lexer.  `LexerSource`'s line queue
 and push-back mechanism handle all the line sequencing.
 
-**Indented heredocs (`<<~`):**
+#### 5.6.3 Indented heredocs (`<<~`):
 
 ```perl
 my $x = <<~END;
@@ -1424,7 +1424,7 @@ the required indentation.  Subsequent body lines are delivered with
 the prefix stripped.  When the terminator is found, the previous
 required indentation (if any) is restored.
 
-**Heredoc tag forms:**
+#### 5.6.4 Heredoc tag forms:
 
 The lexer recognizes several heredoc tag forms:
 
@@ -1441,7 +1441,7 @@ The lexer recognizes several heredoc tag forms:
   Under `use utf8`, Unicode identifiers are accepted.
 - `<<~` prefix on any of the above — indented variant.
 
-**Nested heredocs with indentation:**
+#### 5.6.5 Nested heredocs with indentation:
 
 Expression interpolation in heredocs (`${...}`) increments
 `expr_depth`, switching the lexer to normal code mode.  If
@@ -1478,7 +1478,7 @@ bodies are consumed in source order — a `BEGIN` block inside a
 deeply nested heredoc body is encountered before code on the
 initiating line, matching Perl's compile-time execution order.
 
-**Literal heredocs:**
+#### 5.6.6 Literal heredocs:
 
 Literal heredocs (`<<'TAG'`, `<<\TAG`, `<<~'TAG'`) do not
 interpolate.  The lexer collects the body into a single
@@ -1486,7 +1486,7 @@ interpolate.  The lexer collects the body into a single
 interpolation breaks.  `LexerSource` manages the line sequencing
 identically.
 
-**Heredoc terminator matching:**
+#### 5.6.7 Heredoc terminator matching:
 
 A line matches the heredoc tag only if the entire line content
 (after any required indentation stripping) is an exact byte-for-byte
@@ -1518,7 +1518,7 @@ Under `use utf8`, Perl source is UTF-8 encoded and identifiers may
 use Unicode letters.  The lexer implements full Unicode identifier
 support with several optimizations.
 
-**Identifier scanning:**
+#### 5.8.1 Identifier scanning:
 
 `scan_ident` uses the `unicode-xid` crate for XID_Start and
 XID_Continue checks on non-ASCII characters.  ASCII characters
@@ -1529,7 +1529,7 @@ Bare heredoc tags, backslash heredoc tags, and the heredoc gate
 condition all accept Unicode identifiers under `use utf8`, matching
 Perl's `isWORDCHAR_utf8` behavior.
 
-**NFC normalization:**
+#### 5.8.2 NFC normalization:
 
 Identifiers are NFC-normalized at extraction time, so `café`
 (composed) and `café` (decomposed, `e` + combining acute) produce
@@ -1554,7 +1554,7 @@ from strict Perl compatibility.  A PerlOxide-specific pragma (name
 TBD) will be provided to disable such deviations for programs that
 require strict byte-for-byte Perl compatibility.
 
-**`effective_utf8` fast path:**
+#### 5.8.3 `effective_utf8` fast path:
 
 Most lines in typical Perl source are pure ASCII, even under
 `use utf8`.  The `effective_utf8` flag is a composite of
@@ -1577,7 +1577,7 @@ The parser syncs `utf8_mode` and the full `Features` bitflags to
 the lexer whenever pragmas change (at `use`/`no` declarations and
 at block exit when saved pragmas are restored).
 
-**Unicode paired delimiters:**
+#### 5.8.4 Unicode paired delimiters:
 
 Under `use feature 'extra_paired_delimiters'` (Perl 5.36+), all
 321 Unicode paired delimiter pairs from the `Bidi_Mirroring_Glyph`
@@ -1620,7 +1620,7 @@ Expression parsing uses precedence climbing (the Pratt algorithm)
 with clear naming that avoids the original paper's cryptic
 terminology.
 
-**Core components on `Parser`:**
+#### 6.1.1 Core components on `Parser`:
 
 `parse_expr(min_prec)` — the main entry point for expressions.
 Increments the recursion depth guard (`with_descent`), calls
@@ -1651,7 +1651,7 @@ returns `Option<OpInfo>`.  `None` means the token is not valid in
 operator position (the expression ends here).  `Some(info)` provides
 the precedence and associativity for the precedence comparison.
 
-**The expression loop:**
+#### 6.1.2 The expression loop:
 
 ```rust
 type Precedence = u8;
@@ -1701,7 +1701,7 @@ a token that might be a label, filehandle, or first term, it can
 pass the already-built expression into `parse_expr_continuation`
 instead of rewinding and re-parsing.
 
-**Nesting depth control:**
+#### 6.1.3 Nesting depth control:
 
 A `ParseDepth` counter (`u16`) is incremented on every recursive
 entry via `with_descent`.  If the counter would exceed `MAX_DEPTH`
@@ -1726,7 +1726,7 @@ where F: FnOnce(&mut Self) -> Result<T, ParseError> {
 }
 ```
 
-**Precedence and associativity table:**
+#### 6.1.4 Precedence and associativity table:
 
 Each infix operator has a single precedence number and an explicit
 associativity.  The left and right precedence values used by the
@@ -1815,7 +1815,7 @@ precedence that controls how tightly they bind to their operand.
 This is a separate lookup used inside `parse_term`, not part of the
 infix precedence table.
 
-**Layer separation:**
+#### 6.1.5 Layer separation:
 
 The parser operates on three cleanly separated layers:
 
@@ -1927,7 +1927,7 @@ The Perl 5 C implementation provides three mechanisms:
 The Rust implementation will provide all three, redesigned as
 trait-based APIs rather than global function pointers.
 
-**Keyword extension trait:**
+#### 6.4.1 Keyword extension trait:
 
 ```rust
 trait KeywordPlugin: Send + Sync {
@@ -1938,7 +1938,7 @@ trait KeywordPlugin: Send + Sync {
 }
 ```
 
-**Infix operator extension trait:**
+#### 6.4.2 Infix operator extension trait:
 
 ```rust
 trait InfixPlugin: Send + Sync {
@@ -2445,7 +2445,7 @@ should be independently publishable on crates.io and useful to any
 Rust program that needs regex features beyond what the `regex` crate
 provides.
 
-**Design principles:**
+#### 11.2.1 Design principles:
 
 1. **Clean Rust API first.**  The primary interface should feel native
    to Rust — `Regex::new()`, `.find()`, `.captures()`, iterators over
@@ -2568,7 +2568,7 @@ Pattern string
     ──► Executor (bytecode + input → match result)
 ```
 
-**Bytecode instructions:**
+#### 11.5.1 Bytecode instructions:
 
 ```text
 Literal(bytes), LiteralInsensitive(bytes),
@@ -2585,7 +2585,7 @@ Recurse(group), Call(subpattern),
 Match
 ```
 
-**Optimization opportunities:**
+#### 11.5.2 Optimization opportunities:
 
 - Literal prefix extraction for fast scan-ahead (like `memchr` before
   engaging the backtracking engine).
@@ -2685,7 +2685,7 @@ Analyzing what is truly tied to a specific interpreter thread reveals
 that *values* are almost never the bottleneck — *execution context*
 is.
 
-**Per-execution-context (not per-value):**
+#### 13.2.1 Per-execution-context (not per-value):
 
 - **Call stack and mortal stack** — each thread needs its own call
   stack and temporary value stack.  These are execution context.
@@ -2694,7 +2694,7 @@ is.
 - **The compiler** — `eval STRING` needs a compiler, which has its
   own lexer/parser state.
 
-**Per-OS-thread or per-process (not per-interpreter):**
+#### 13.2.2 Per-OS-thread or per-process (not per-interpreter):
 
 - **`$!` (errno)** — per-OS-thread in POSIX (tasks on the same OS
   thread share it, so the interpreter must save/restore errno across
@@ -2702,13 +2702,13 @@ is.
 - **`$$` (PID)**, **`$0` (process name)** — per-process.
 - **`%ENV`** — per-process environment.
 
-**Per-execution-context special variables:**
+#### 13.2.3 Per-execution-context special variables:
 
 - **`$@`** — current exception.
 - **`$_`** — current topic.
 - **`$/`, `$\`, `$"`** — IO formatting state.
 
-**Everything else is shared — including magic:**
+#### 13.2.4 Everything else is shared — including magic:
 
 - **Plain scalars, arrays, hashes** — just data on the shared heap.
 - **Blessed objects** — just data plus a stash name.
@@ -2876,7 +2876,7 @@ runtime decides whether to parallelize based on:
 - **Safety** — the callback must be safe to call from multiple
   threads simultaneously.
 
-**Safety analysis for parallelization:**
+#### 13.6.1 Safety analysis for parallelization:
 
 Typed closures (`fn`, `|args|`) are the easy case.  The compiler can
 prove at compile time that a typed closure touching only its arguments
@@ -2897,7 +2897,7 @@ Even the conservative approach covers the common case — map and grep
 blocks that transform data are typically pure functions of their
 input.
 
-**Beyond map/grep/sort:**
+#### 13.6.2 Beyond map/grep/sort:
 
 The same mechanism extends to:
 
@@ -2925,7 +2925,7 @@ The implementation runs on Tokio, providing two complementary async
 models that correspond naturally to the `my`/`sub` vs `let`/`fn`
 split.
 
-**Implicit async for Perl code (Go-style green threads).**
+#### 13.7.1 Implicit async for Perl code (Go-style green threads).
 
 Each interpreter is a lightweight execution context — call stack,
 mortal stack, special variables — running as a Tokio task.  When Perl
@@ -2964,7 +2964,7 @@ Existing Perl code gets concurrent IO without changing a line.  A
 web crawler, a parallel test harness, a concurrent database loader —
 written in standard Perl, running on Tokio.
 
-**No function coloring — same code, both contexts.**
+#### 13.7.2 No function coloring — same code, both contexts.
 
 The same `sub`, the same `fn`, the same module works identically
 whether called from a single-threaded script or from inside a `spawn`
@@ -3008,7 +3008,7 @@ freely call each other.  In this model there is one color.  Every
 function — `sub` or `fn` — is "potentially async" because the
 interpreter handles it transparently.
 
-**`async fn` is optional, not required.**
+#### 13.7.3 `async fn` is optional, not required.
 
 The `async` keyword on `fn` is available for when you *want* explicit
 control — composing futures, using `select!`, timing out, cancelling.
@@ -3031,7 +3031,7 @@ async fn fetch(url: &str) -> String { http::get(url).await? }
 runtime behavior through the interpreter's implicit yielding, and
 the same AOT variants through monomorphization.
 
-**Explicit async/await — when you want control.**
+#### 13.7.4 Explicit async/await — when you want control.
 
 `async fn` and `async` closures return futures that compose directly
 with Tokio's ecosystem.  `await` is explicit, giving the programmer
@@ -3070,7 +3070,7 @@ Because `async fn` is a registered keyword, this works on both the
 Rust runtime and on standard Perl 5 via `use Typed` (where `async`
 is handled by the keyword plugin).
 
-**Futures are lazy — `spawn` makes them eager.**
+#### 13.7.5 Futures are lazy — `spawn` makes them eager.
 
 Following Rust semantics, an `async fn` returns a future that does
 nothing until driven.  This is essential for composability — `join_all`
@@ -3099,7 +3099,7 @@ completion, yielding to Tokio at each `.await` point.  From the
 `sub`'s perspective this looks eager, but mechanistically the future
 is lazy and the interpreter is polling it.
 
-**The two models compose.**
+#### 13.7.6 The two models compose.
 
 Typed async and Perl-style green threads interoperate naturally:
 
@@ -3128,7 +3128,7 @@ the interpreter yields to Tokio while the future completes, and other
 green threads make progress.  When an `async fn` calls a `sub`, the
 sub runs synchronously within the current Tokio task.
 
-**The shared heap makes this seamless.**
+#### 13.7.7 The shared heap makes this seamless.
 
 No special data-passing mechanisms are needed for async code.  Futures
 capture values from the shared heap.  Spawned tasks access the same
@@ -3148,7 +3148,7 @@ async fn fetch_cached(url: &str) -> String {
 }
 ```
 
-**Implementation: the interpreter as an async state machine.**
+#### 13.7.8 Implementation: the interpreter as an async state machine.
 
 Internally, the interpreter's main execution loop is `async`.  Most
 IR operations execute synchronously.  Operations that might block
@@ -3185,7 +3185,7 @@ Each `spawn` creates a new Tokio task with its own `Interpreter`
 scheduler distributes tasks across OS threads.  The programmer never
 manages threads directly.
 
-**AOT compilation: sync/async monomorphization.**
+#### 13.7.9 AOT compilation: sync/async monomorphization.
 
 For ahead-of-time compilation, the async transparency extends
 naturally through monomorphization — the same approach Rust uses for
@@ -3266,7 +3266,7 @@ This means a library written in the language and compiled via AOT
 produces a Rust crate that is both sync and async, from one source,
 with no async runtime dependency for the sync variant.
 
-**Single-threaded compat mode.**
+#### 13.7.10 Single-threaded compat mode.
 
 In compat mode, the interpreter runs on a single-threaded Tokio
 runtime (`current_thread`), preserving Perl 5's sequential execution
@@ -3280,7 +3280,7 @@ The base async architecture (§13.7) provides green threads and
 async/await.  Several higher-level features build on it to address
 real-world concurrency patterns.
 
-**Structured concurrency.**
+#### 13.8.1 Structured concurrency.
 
 A bare `spawn` is fire-and-forget — if the spawned task panics or
 errors, no one notices.  Structured concurrency ensures that child
@@ -3320,7 +3320,7 @@ async fn fetch_all(urls: &[String]) -> Result<Vec<String>, Error> {
 }
 ```
 
-**Bounded concurrency.**
+#### 13.8.2 Bounded concurrency.
 
 Spawning 10,000 IO tasks is fine for lightweight requests, but
 unbounded concurrency can overwhelm databases, APIs, or file
@@ -3343,7 +3343,7 @@ Internally this uses a Tokio `Semaphore`.  The `:concurrent` or
 `:limit` adverb sets the semaphore capacity.  Each spawned task
 acquires a permit before starting and releases it on completion.
 
-**Async streams and iterators.**
+#### 13.8.3 Async streams and iterators.
 
 Data arriving over time — lines from a file, HTTP response chunks,
 database result rows, WebSocket messages — maps naturally to async
@@ -3380,7 +3380,7 @@ async fn process_stream(stream: Stream<String>) -> Vec<Parsed> {
 }
 ```
 
-**Cancellation and timeouts.**
+#### 13.8.4 Cancellation and timeouts.
 
 Perl 5 has no concept of cancelling work in progress.  Tokio does —
 dropping a future or task handle cancels it at the next `.await`
@@ -3417,7 +3417,7 @@ cancelling it at the next yield point.  For `sub`-based code, the
 interpreter checks a cancellation flag at each yield point (IO
 operations, loop iterations) and throws a timeout exception.
 
-**Select — first to complete wins.**
+#### 13.8.5 Select — first to complete wins.
 
 Multiple concurrent operations can race, with the first to complete
 providing the result and the rest being cancelled:
@@ -3437,7 +3437,7 @@ let page = select! {
 };
 ```
 
-**Compatibility with existing event loop ecosystems.**
+#### 13.8.6 Compatibility with existing event loop ecosystems.
 
 AnyEvent, IO::Async, and Mojo::IOLoop are widely used in the Perl
 ecosystem.  Rather than requiring a full rewrite, a compatibility
@@ -3537,7 +3537,7 @@ The concurrency model supports three complementary message-passing
 primitives, drawing from Raku's well-designed concurrency layer and
 Perl's filehandle idioms.
 
-**The three primitives:**
+#### 13.10.1 The three primitives:
 
 | Primitive | Semantics | Analogy |
 |-----------|-----------|---------|
@@ -3548,7 +3548,7 @@ Perl's filehandle idioms.
 All three work with `react`/`whenever`, and channels additionally
 support Perl's filehandle syntax.
 
-**Channels — queues with filehandle syntax:**
+#### 13.10.2 Channels — queues with filehandle syntax:
 
 A channel is a thread-safe queue.  Each item sent is received by
 exactly one consumer (first come, first served).  This is the right
@@ -3628,7 +3628,7 @@ close $tx;
 while (my $result = <$rx>) { process($result) }
 ```
 
-**Supplies — broadcast streams:**
+#### 13.10.3 Supplies — broadcast streams:
 
 A supply is a stream that can have multiple subscribers.  Every
 subscriber receives every item.  This is the right primitive for
@@ -3671,7 +3671,7 @@ my $processed = $raw_supply
     ->batch(10);           # group into batches of 10
 ```
 
-**Pipelines — Unix pipes, in-process:**
+#### 13.10.4 Pipelines — Unix pipes, in-process:
 
 Concurrent stages connected by channels, with backpressure:
 
@@ -3689,7 +3689,7 @@ fills.  This is the Unix pipeline model — the idiom Perl was born
 from — brought in-process with type safety and structured
 concurrency.
 
-**`react`/`whenever` — unified event loop:**
+#### 13.10.5 `react`/`whenever` — unified event loop:
 
 Borrowed from Raku, `react`/`whenever` provides a declarative way to
 handle events from multiple async sources.  `whenever` is polymorphic
@@ -3728,7 +3728,7 @@ my $merged = supply {
 # $merged is a new supply that interleaves items from both sources
 ```
 
-**Select across channels:**
+#### 13.10.6 Select across channels:
 
 ```perl
 while (my ($which, $item) = select($rx1, $rx2)) {
@@ -3744,7 +3744,7 @@ in this design.  It enables concurrency that "just works" for the
 common case, but introduces implementation challenges that must be
 addressed honestly.
 
-**The cardinal invariant:**
+#### 13.11.1 The cardinal invariant:
 
 > The runtime must not execute user Perl code, magic callbacks,
 > overload methods, DESTROY, tied operations, or extension callbacks
@@ -3780,7 +3780,7 @@ programmer accepts deadlock risk, just as in Rust.
 The rest of this section discusses specific challenges and how this
 invariant applies to each.
 
-**Lock ordering and deadlock.**
+#### 13.11.2 Lock ordering and deadlock.
 
 Per-value `RwLock` is simple when operations touch one value at a
 time.  But compound operations — swapping two hash entries, sorting
@@ -3802,7 +3802,7 @@ Mitigations:
   back with a single lock.  This serializes compound writes but
   avoids multi-lock scenarios.
 
-**Reentrant magic.**
+#### 13.11.3 Reentrant magic.
 
 A tied hash's FETCH callback is arbitrary Perl code.  It might
 access other shared values, trigger more magic, or mutate the very
@@ -3820,7 +3820,7 @@ not multi-step transactions.  This is the same concurrency contract
 as concurrent method calls on a shared object in any language.  Perl
 5 doesn't guarantee transactional semantics for magic either.
 
-**`DESTROY` on arbitrary threads.**
+#### 13.11.4 `DESTROY` on arbitrary threads.
 
 When the last reference to an object is dropped, `DESTROY` runs.
 With atomic refcounting on a shared heap, the last `Arc::drop` could
@@ -3842,7 +3842,7 @@ that assumes `DESTROY` runs in the creator's context.  Mitigations:
   rather than running cleanup code, weak references (`weaken`)
   avoid the DESTROY timing issue entirely.
 
-**Symbol table mutation.**
+#### 13.11.5 Symbol table mutation.
 
 Package stashes (symbol tables) are mutable shared data.  Operations
 that mutate them include `require`, `use`, `eval "sub name { ... }"`,
@@ -3889,7 +3889,7 @@ compilation.  Compilation itself (which runs `BEGIN` blocks and is
 therefore user code) runs without any registry lock held — only the
 state transitions are locked.
 
-**Single-threaded fast path.**
+#### 13.11.6 Single-threaded fast path.
 
 The most common Perl programs are single-threaded.  They should not
 pay for concurrency they don't use.  Mitigations:
@@ -3909,7 +3909,7 @@ pay for concurrency they don't use.  Mitigations:
   locking entirely.  An atomic task counter allows the runtime to
   short-circuit to non-locking paths when concurrency is not active.
 
-**Why not per-interpreter heaps with explicit sharing?**
+#### 13.11.7 Why not per-interpreter heaps with explicit sharing?
 
 The alternative architecture — per-interpreter heaps for untyped
 values, explicit sharing for typed values — was the starting point
@@ -3998,7 +3998,7 @@ ambiguities handles both for free.
 
 ### 14.3 `let`, `fn`, and Type Inference
 
-**`let` for variables, `fn` for functions.**
+#### 14.3.1 `let` for variables, `fn` for functions.
 
 `let` and `fn` are the typed counterparts of `my` and `sub`.  Neither
 is a Perl 5 keyword, so both can be introduced with zero backward
@@ -4014,7 +4014,7 @@ let name: String = "hello";
 fn greet(who: &str) -> String { f"Hello, {who}!" }
 ```
 
-**Type inference.**
+#### 14.3.2 Type inference.
 
 Type annotations on `let` are optional when the compiler can infer
 the type from the initializer:
@@ -4036,7 +4036,7 @@ looks almost like `my $name = "hello"` but gives you immutability,
 type checking, and no coercion overhead — with the type inferred and
 a `$` alias for interpolation.
 
-**`fn` for typed functions.**
+#### 14.3.3 `fn` for typed functions.
 
 `fn` declares a function with Rust-style typed parameters, typed
 return, and value semantics.  No `@_`, no prototypes, no `wantarray`:
@@ -4064,7 +4064,7 @@ inference handles it).  This is deliberate: function signatures are
 the primary documentation for an API, and explicit return types
 make that documentation reliable.
 
-**`sub` stays Perl.**
+#### 14.3.4 `sub` stays Perl.
 
 `sub` retains its full Perl 5 semantics: `@_` argument passing,
 prototypes, wantarray, dynamic context.  It is not deprecated or
@@ -4084,7 +4084,7 @@ sub process_items {
 calls a `fn`, arguments are coerced from untyped to typed (with
 runtime checks where needed).
 
-**All four keywords coexist:**
+#### 14.3.5 All four keywords coexist:
 
 | Keyword | Semantics | Typed | Mutable | Args |
 |---------|-----------|-------|---------|------|
@@ -4095,7 +4095,7 @@ runtime checks where needed).
 
 ### 14.4 Sigils, Aliases, and Interpolation
 
-**Core rule: `let` always creates a sigil-less variable.**
+#### 14.4.1 Core rule: `let` always creates a sigil-less variable.
 
 Every `let` declaration creates a variable in the sigil-less namespace.
 A sigil-less namespace is new — it sits alongside Perl's existing
@@ -4135,7 +4135,7 @@ throughout.  Both are valid and natural.
 2. Creates `$foo` as a lexical alias in the scalar namespace, shadowing
    any `$foo` that might exist in an outer scope.
 
-**Shadowing.**
+#### 14.4.2 Shadowing.
 
 `let` follows Rust's shadowing semantics.  Redeclaring a name shadows
 the previous binding:
@@ -4172,7 +4172,7 @@ print $count;                  # typed i64 — the let's alias
 print count;                   # same value — sigil-less access
 ```
 
-**Coding style is a choice, not a mandate.**
+#### 14.4.3 Coding style is a choice, not a mandate.
 
 Some programmers will prefer the Perlish style, adding `$` to most
 declarations and using `$name` throughout:
@@ -4202,7 +4202,7 @@ for let i: i64 (0..max_retries) {
 
 Both are idiomatic and the project should not favor one over the other.
 
-**Future consideration: `@` and `%` aliases.**
+#### 14.4.4 Future consideration: `@` and `%` aliases.
 
 The same aliasing mechanism could extend to `@` and `%` sigils,
 allowing typed collections to also be accessible through familiar
@@ -4224,7 +4224,7 @@ interactions should be designed deliberately rather than assumed,
 so `@`/`%` aliases are noted here as a future direction rather than
 an initial commitment.
 
-**Name resolution rules:**
+#### 14.4.5 Name resolution rules:
 
 Sigil-less and sigiled lookups are independent:
 
@@ -4239,7 +4239,7 @@ There is no cross-namespace fallback.  `$foo` never finds a sigil-less
 `let foo` (without `$`), and bare `foo` never finds a `my $foo`.  This
 keeps resolution unambiguous and predictable.
 
-**Interpolation in strings.**
+#### 14.4.6 Interpolation in strings.
 
 Because the `$` alias puts typed variables into the scalar namespace,
 classic `"..."` string interpolation works without any new syntax:
@@ -4263,7 +4263,7 @@ let name: String = "world";     # no $ alias
 "Total: ${+count * 2}"         # expression interpolation
 ```
 
-**`${expr}` generalized expression interpolation.**
+#### 14.4.7 `${expr}` generalized expression interpolation.
 
 `${...}` in double-quoted strings is generalized to accept any
 expression when the content is not a bare identifier.  When it *is*
@@ -4288,7 +4288,7 @@ This replaces Perl's `${\expr}` and `@{[list]}` kludges:
 "Items: ${join(', ', map { uc } @items)}"
 ```
 
-**Format strings (`f"..."`) — optional convenience.**
+#### 14.4.8 Format strings (`f"..."`) — optional convenience.
 
 A format string quoting syntax provides the cleanest interpolation
 for sigil-less variables, following the precedent of Python f-strings
@@ -4317,7 +4317,7 @@ mechanism covers the common case, and `${+expr}` handles one-off
 sigil-less interpolation.  Format strings are most useful for code
 that is heavily sigil-less and does a lot of string formatting.
 
-**Summary of interpolation mechanisms:**
+#### 14.4.9 Summary of interpolation mechanisms:
 
 | String type | Sigiled `$foo` | Sigil-less `foo` | Expressions |
 |-------------|---------------|-----------------|-------------|
@@ -4364,7 +4364,7 @@ not the binding.
 The types available correspond directly to Rust types.  The initial
 set covers the most useful categories:
 
-**Primitive types:**
+#### 14.6.1 Primitive types:
 
 | Perl Syntax | Rust Type | Notes |
 |-------------|-----------|-------|
@@ -4374,7 +4374,7 @@ set covers the most useful categories:
 | `f32`, `f64` | same | Floating point |
 | `bool` | `bool` | True/false, no Perl truthiness |
 
-**String and byte types:**
+#### 14.6.2 String and byte types:
 
 | Perl Syntax | Rust Type | Notes |
 |-------------|-----------|-------|
@@ -4383,7 +4383,7 @@ set covers the most useful categories:
 | `Bytes` | `bytes::Bytes` | Immutable, refcounted, zero-copy slice |
 | `BytesMut` | `bytes::BytesMut` | Mutable byte buffer, Tokio-native |
 
-**Smart pointers and wrappers:**
+#### 14.6.3 Smart pointers and wrappers:
 
 | Perl Syntax | Rust Type | Notes |
 |-------------|-----------|-------|
@@ -4394,7 +4394,7 @@ set covers the most useful categories:
 | `Option<T>` | `Option<T>` | Nullable value (`undef` = `None`) |
 | `Result<T, E>` | `Result<T, E>` | Success-or-error value |
 
-**Collections:**
+#### 14.6.4 Collections:
 
 | Perl Syntax | Rust Type | Notes |
 |-------------|-----------|-------|
@@ -4403,7 +4403,7 @@ set covers the most useful categories:
 | `HashSet<T>` | `HashSet<T>` | Set |
 | `BTreeMap<K, V>` | `BTreeMap<K, V>` | Ordered map |
 
-**What is explicitly not exposed:**
+#### 14.6.5 What is explicitly not exposed:
 
 - Lifetime annotations (`'a`, `'static`) — borrows are restricted to
   `fn` parameters with a simple scope rule; no lifetimes needed (§14.9)
@@ -4441,7 +4441,7 @@ enforces:
 - A function with return type `String` cannot return `undef`.
 - A function with return type `Option<String>` can return `undef`.
 
-**Unwrapping and narrowing:**
+#### 14.7.1 Unwrapping and narrowing:
 
 `defined` narrows an `Option<T>` to `T` within its truthful branch,
 analogous to Rust's `if let Some(x)`:
@@ -4460,7 +4460,7 @@ let value: String = input.unwrap();             # panics if undef
 let value: String = input.expect("need input"); # panics with message
 ```
 
-**At the untyped boundary:**
+#### 14.7.2 At the untyped boundary:
 
 ```perl
 my $legacy = get_something();          # untyped, might be undef
@@ -4511,7 +4511,7 @@ my $text = eval { read_config("/etc/app.conf") };
 if ($@) { warn "Failed: $@\n" }
 ```
 
-**Auto-unwrap rules:**
+#### 14.8.1 Auto-unwrap rules:
 
 - Assigning a `Result<T, E>` to a `let T` variable: auto-unwraps.
   `Ok(v)` yields `v`; `Err(e)` throws `e` as an exception.
@@ -4528,7 +4528,7 @@ A caller gets to choose: handle it explicitly with `match`, propagate
 it with `?`, auto-unwrap it into an exception, or catch it with
 `eval`.
 
-**Bridge to Perl error model:**
+#### 14.8.2 Bridge to Perl error model:
 
 - `die` inside a function with a `Result` return type is caught and
   wrapped as `Err`.
@@ -4539,7 +4539,7 @@ it with `?`, auto-unwrap it into an exception, or catch it with
 
 Typed and untyped error handling compose naturally in all directions.
 
-**`result` returns `Result` — `eval` and `try` are unchanged:**
+#### 14.8.3 `result` returns `Result` — `eval` and `try` are unchanged:
 
 Perl's `eval { }` returns `undef` on exception and sets `$@`.  Code
 that relies on this idiom (`my $x = eval { might_die() }`) must
@@ -4581,7 +4581,7 @@ fn init() -> Result<Config, PerlException> {
 }
 ```
 
-**`try`/`catch`/`finally` — statement form:**
+#### 14.8.4 `try`/`catch`/`finally` — statement form:
 
 Structured exception handling for side-effectful code, following
 `Syntax::Keyword::Try`:
@@ -4592,7 +4592,7 @@ catch ($e) { handle($e) }
 finally { cleanup() }
 ```
 
-**Three mechanisms, three keywords, zero overlap:**
+#### 14.8.5 Three mechanisms, three keywords, zero overlap:
 
 | Mechanism | Returns | Sets `$@`? | Use case |
 |-----------|---------|-----------|----------|
@@ -4632,7 +4632,7 @@ boundaries where a simple scope rule suffices.  This is the pragmatic
 tradeoff: slightly more copying than Rust in some cases, vastly
 simpler for both the implementation and the programmer.
 
-**Clone on assign.**
+#### 14.9.1 Clone on assign.
 
 Assignment of typed values clones the data.  Both the original and
 the copy are fully independent:
@@ -4656,7 +4656,7 @@ For heap-allocated types (`String`, `Vec<T>`, `HashMap<K,V>`), this
 is a deep clone.  If profiling shows a clone is expensive on a hot
 path, the programmer can switch to `Arc` for shared ownership.
 
-**`\$x` creates `Arc` — Perl references as shared ownership.**
+#### 14.9.2 `\$x` creates `Arc` — Perl references as shared ownership.
 
 Taking a Perl-style reference of a typed value upgrades it to `Arc<T>`
 in place and returns another `Arc<T>`:
@@ -4687,7 +4687,7 @@ This maps directly to how `\$x` already works in Perl 5 — it creates
 a reference-counted shared pointer.  The typed version just uses
 `Arc` (atomic refcount, thread-safe) instead of Perl's SV refcount.
 
-**`\$x` enables sharing across threads:**
+#### 14.9.3 `\$x` enables sharing across threads:
 
 Because `Arc<T>` is `Send + Sync`, values that have been referenced
 can be shared across threads without serialization:
@@ -4703,7 +4703,7 @@ spawn move || {
 print $config;                    # still accessible in parent thread
 ```
 
-**Borrows are `fn` parameters only — the typed `@_`.**
+#### 14.9.4 Borrows are `fn` parameters only — the typed `@_`.
 
 In Perl 5, `@_` contains aliases to the caller's values.  `$_[0]`
 *is* the caller's variable — modify it and the caller sees the
@@ -4713,7 +4713,7 @@ change.  This is effectively a borrow.
 But `@_` aliasing also works when passing typed values to `sub` — the
 same mechanism applies in both cases.
 
-**`fn` parameters — explicit in the signature:**
+#### 14.9.5 `fn` parameters — explicit in the signature:
 
 ```perl
 fn word_count(text: &str) -> usize {
@@ -4730,7 +4730,7 @@ append_bang(&mut $msg);              # mutable borrow — explicit at call site
 print $msg;                          # "hello!"
 ```
 
-**`sub` with typed values — implicit `@_` borrows:**
+#### 14.9.6 `sub` with typed values — implicit `@_` borrows:
 
 When a typed value is passed to a `sub`, `@_` contains a borrow,
 not a clone.  By default, the borrow is immutable (`&T`):
@@ -4762,7 +4762,7 @@ mutation visible where it happens — in the caller's code, not hidden
 in the function body.  This mirrors Rust's `&mut x` at the call site,
 just spelled in a more Perlish way.
 
-**Perl-native `my` variables retain interior mutability:**
+#### 14.9.7 Perl-native `my` variables retain interior mutability:
 
 `my` variables live on the interpreter heap, which provides interior
 mutability.  `@_` aliasing with mutation works exactly as in Perl 5,
@@ -4778,7 +4778,7 @@ print $name;                         # "hello!" — standard Perl 5 behavior
 This means existing Perl code is completely unchanged.  The immutable-
 borrow default only applies to typed `let` values.
 
-**Summary of @_ aliasing by declaration type:**
+#### 14.9.8 Summary of @_ aliasing by declaration type:
 
 | Declaration | `@_` alias type | Mutable via `@_`? |
 |-------------|----------------|-------------------|
@@ -4787,7 +4787,7 @@ borrow default only applies to typed `let` values.
 | `let mut $x: T`, caller passes `$x` | `&T` | No |
 | `let mut $x: T`, caller passes `mut $x` | `&mut T` | Yes |
 
-**Borrows do not escape.**
+#### 14.9.9 Borrows do not escape.
 
 Whether created explicitly via `fn` signatures or implicitly via
 `@_`, borrows cannot outlive the function call.  The compiler
@@ -4813,7 +4813,7 @@ This is a simple syntactic rule.  No borrow checker, no dataflow
 analysis.  If you need a durable reference that outlives a function
 call, use `\$x` to create an `Arc`.
 
-**Summary of how values move around:**
+#### 14.9.10 Summary of how values move around:
 
 | Mechanism | Perl equivalent | What happens | Overhead | Escapes? |
 |-----------|----------------|--------------|----------|----------|
@@ -4825,7 +4825,7 @@ call, use `\$x` to create an `Arc`.
 | `\$x` | `\$x` in Perl 5 | Upgrade to Arc | One Arc alloc (first time) | Yes |
 | `Arc::clone` | multiple `\$x` | Refcount bump | Atomic increment | Yes |
 
-**Interaction between assignment and Arc:**
+#### 14.9.11 Interaction between assignment and Arc:
 
 Once a value has been upgraded to `Arc`, assignment clones the `Arc`
 (refcount bump), not the underlying data:
@@ -4845,7 +4845,7 @@ let $copy = $$r;            # explicit deref + clone — independent String
 When a value crosses between the typed and untyped worlds, explicit
 coercion rules apply:
 
-**Typed → untyped (always succeeds):**
+#### 14.10.1 Typed → untyped (always succeeds):
 
 ```perl
 let s: String = "hello";
@@ -4860,7 +4860,7 @@ my $z = o;                 # $z becomes undef
 
 These conversions are always valid and cheap.
 
-**Untyped → typed (may fail):**
+#### 14.10.2 Untyped → typed (may fail):
 
 ```perl
 my $raw = read_file("data.bin");       # PerlString, may not be valid UTF-8
@@ -4870,7 +4870,7 @@ let maybe: Option<String> = $raw;      # RUNTIME ERROR if not UTF-8 and not unde
 
 The compiler should warn statically about potentially-failing coercions.
 
-**Coercion cost matrix for strings:**
+#### 14.10.3 Coercion cost matrix for strings:
 
 | From | To | Cost |
 |------|----|------|
@@ -5068,7 +5068,7 @@ Instead of trying to AOT-compile all of Perl (which requires solving
 functions to native code.  That's tractable because they are already
 constrained to a Rust-compatible subset.
 
-**AOT compilation mode: emit Rust source code.**
+#### 14.14.1 AOT compilation mode: emit Rust source code.
 
 Rather than building a custom Cranelift or LLVM backend, the AOT
 compiler emits `.rs` files and lets `cargo` handle optimization,
@@ -5106,7 +5106,7 @@ The compilation pipeline:
   native binary / .so / .dylib
 ```
 
-**Typed code emits directly to Rust:**
+#### 14.14.2 Typed code emits directly to Rust:
 
 Fully typed code with `struct`, `enum`, `impl`, `trait`, `fn`, and
 `extern fn` maps 1:1 to Rust source.  The generated code is clean
@@ -5156,7 +5156,7 @@ pub fn create_user(name: &str, age: i64) -> User {
 }
 ```
 
-**Mixed typed/untyped code calls the runtime:**
+#### 14.14.3 Mixed typed/untyped code calls the runtime:
 
 Code that mixes `let`/`fn` with `my`/`sub` generates Rust code that
 depends on the `perl-runtime` crate for the untyped portions:
@@ -5179,7 +5179,7 @@ pub fn process_data(interp: &mut Interpreter, data: &[i64]) -> String {
 }
 ```
 
-**The generated crate structure:**
+#### 14.14.4 The generated crate structure:
 
 ```toml
 # generated/Cargo.toml
@@ -5198,7 +5198,7 @@ Dependencies are included only when needed.  A fully-typed library
 with only `extern fn` functions has no `perl-runtime` dependency at
 all — it's a pure Rust crate, publishable on crates.io.
 
-**Sync/async monomorphization in generated code:**
+#### 14.14.5 Sync/async monomorphization in generated code:
 
 As described in §13.7, functions that transitively reach IO get both
 sync and async variants emitted:
@@ -5214,7 +5214,7 @@ pub async fn fetch_page_async(url: &str) -> Result<String, Error> {
 }
 ```
 
-**Use cases for AOT-to-Rust:**
+#### 14.14.6 Use cases for AOT-to-Rust:
 
 - **Publish a Rust crate written in Perl syntax.**  `extern fn`
   public API, full Rust toolchain for distribution.
@@ -5241,7 +5241,7 @@ This is not an OOP system.  It does not participate in `bless`,
 model — typed data containers with associated functions — brought
 into Perl alongside `let` and `fn`.
 
-**`struct` — typed data containers:**
+#### 14.15.1 `struct` — typed data containers:
 
 ```perl
 struct User {
@@ -5260,7 +5260,7 @@ typos, no runtime "key doesn't exist" errors, no `Can't locate
 object method` surprises.  The compiler knows the layout at compile
 time.
 
-**`impl` — associated functions and methods:**
+#### 14.15.2 `impl` — associated functions and methods:
 
 ```perl
 impl User {
@@ -5286,7 +5286,7 @@ $user.set_email("alice@example.com");
 parameters (§14.9) — `&self` is a read-only borrow, `&mut self`
 is mutable.
 
-**`enum` — algebraic data types:**
+#### 14.15.3 `enum` — algebraic data types:
 
 ```perl
 enum Shape {
@@ -5318,7 +5318,7 @@ Enum variants can hold data (struct-like variants), be unit variants
 exhaustiveness checking — the compiler ensures every variant is
 handled.
 
-**`trait` — interfaces and generic programming:**
+#### 14.15.4 `trait` — interfaces and generic programming:
 
 ```perl
 trait Drawable {
@@ -5356,7 +5356,7 @@ Traits define a set of methods that types can implement.  This
 enables polymorphism without inheritance — a `Circle` and a
 `Rectangle` share no base class, but both satisfy `Drawable`.
 
-**Interaction with the rest of the design:**
+#### 14.15.5 Interaction with the rest of the design:
 
 - **Clone-on-assign (§14.9).**  `let $u2 = $user` clones the struct.
   For `Copy` types (fieldless enums, small structs with all-Copy
@@ -5373,7 +5373,7 @@ enables polymorphism without inheritance — a `Circle` and a
 - **`match` (§15.2).**  Enum matching with exhaustiveness checking
   works naturally.
 
-**Parallel to `bless`-based OOP, not a replacement:**
+#### 14.15.6 Parallel to `bless`-based OOP, not a replacement:
 
 `struct`/`impl` and `bless`/`@ISA` are parallel systems that do not
 interact:
@@ -5389,7 +5389,7 @@ doesn't participate in method resolution.  If someone wants to bridge
 the two worlds, they can write conversion methods — but the type
 system doesn't pretend they're the same thing.
 
-**Backward compatibility:**
+#### 14.15.7 Backward compatibility:
 
 `struct`, `enum`, `impl`, and `trait` are registered as keywords via
 `PL_keyword_plugin` in `use Typed`.  On standard Perl 5, a `struct`
@@ -5479,7 +5479,7 @@ Perl's `given`/`when` was experimental, poorly specified, and
 effectively removed.  Rust's `match` is well-defined, exhaustive,
 and works as an expression.
 
-**Basic matching:**
+#### 15.2.1 Basic matching:
 
 ```perl
 let label: &str = match status {
@@ -5491,7 +5491,7 @@ let label: &str = match status {
 };
 ```
 
-**Option and Result (exhaustiveness-checked):**
+#### 15.2.2 Option and Result (exhaustiveness-checked):
 
 ```perl
 let input: Option<String> = get_input();
@@ -5509,7 +5509,7 @@ match read_config("/etc/app.conf") {
 }
 ```
 
-**Guard clauses:**
+#### 15.2.3 Guard clauses:
 
 ```perl
 let category: &str = match age {
@@ -5521,7 +5521,7 @@ let category: &str = match age {
 };
 ```
 
-**Tuple and struct destructuring:**
+#### 15.2.4 Tuple and struct destructuring:
 
 ```perl
 match point {
@@ -5532,7 +5532,7 @@ match point {
 }
 ```
 
-**`match` on untyped values:**
+#### 15.2.5 `match` on untyped values:
 
 `match` should work on both typed and untyped values.  When matching
 an untyped `my $x`:
@@ -5557,7 +5557,7 @@ When matching a typed value, the compiler enforces exhaustiveness on
 closed types (`Option`, `Result`, future user-defined enums) and
 requires `_` for open types (integers, strings).
 
-**Statement vs expression form:**
+#### 15.2.6 Statement vs expression form:
 
 `match` is an expression — it returns a value.  It can also be used
 as a statement (where the return value is discarded).  Arms use `=>`
@@ -5585,7 +5585,7 @@ position (after `=`, `,`, `(`, or anywhere the parser expects an
 operand), there is no left operand, so `|` unambiguously opens a
 closure parameter list.
 
-**Basic syntax:**
+#### 15.3.1 Basic syntax:
 
 ```perl
 # Typed parameters, explicit return type
@@ -5602,7 +5602,7 @@ let hello = || print "hello\n";
 let doubled: Vec<i64> = numbers.iter().map(|x| x * 2).collect();
 ```
 
-**Capture semantics:**
+#### 15.3.2 Capture semantics:
 
 This is the key architectural difference from `sub { ... }`.  Perl
 anonymous subs capture the enclosing lexical pad by reference — the
@@ -5647,7 +5647,7 @@ print $$config;                  # fine — we still have our Arc
 
 `sub { ... }` continues to work as always for classic Perl closures.
 
-**When to use which:**
+#### 15.3.3 When to use which:
 
 | Syntax | Typed | Captures | `Send` | Portable to Perl 5 |
 |--------|-------|----------|--------|---------------------|
@@ -5658,7 +5658,7 @@ print $$config;                  # fine — we still have our Arc
 | `async \|x: T\| { ... }` | Yes | Clone | Yes | Yes (via `use Typed`) |
 | `\|x: T\| { ... }` (bare) | Yes | Reference | No | With proposed core change (§15.4) |
 
-**Keyword-triggered closure parsing:**
+#### 15.3.4 Keyword-triggered closure parsing:
 
 Bare `|args| expr` without a keyword prefix cannot be implemented on
 standard Perl 5 — `|` is the bitwise OR operator and neither the
@@ -5706,7 +5706,7 @@ prefix) are the one Rust syntax form that cannot be trivially
 implemented on standard Perl 5.  This section analyzes the problem
 in detail and proposes solutions.
 
-**Why keyword-prefixed forms work.**
+#### 15.4.1 Why keyword-prefixed forms work.
 
 `move |args| expr` and `async |args| expr` work on standard Perl 5
 because `move` and `async` are registered via `PL_keyword_plugin`.
@@ -5714,14 +5714,14 @@ When the lexer encounters the keyword, it calls the plugin, which
 takes over parsing entirely.  The plugin can then parse `|args| expr`
 freely — the standard parser never sees the `|`.
 
-**Why bare `|args|` is hard.**
+#### 15.4.2 Why bare `|args|` is hard.
 
 Without a keyword prefix, `|` hits the lexer's `yyl_verticalbar`
 function, which unconditionally emits a `BITOROP` token.  The parser
 then tries to parse it as an infix bitwise-or operator, expecting
 a left-hand operand that doesn't exist (it's in term position).
 
-**The near-miss: `PL_infix_plugin`.**
+#### 15.4.3 The near-miss: `PL_infix_plugin`.
 
 Perl 5.38 introduced `PL_infix_plugin`, which fires *before* the
 main `switch(*s)` dispatch in `yyl_try`.  The check at line 9659
@@ -5757,7 +5757,7 @@ if (PL_expect == XOPERATOR) {
 The infrastructure for context-dependent term/operator disambiguation
 exists.  It just isn't wired up to the infix plugin mechanism.
 
-**Proposed core change (preferred).**
+#### 15.4.4 Proposed core change (preferred).
 
 A small extension to `PL_infix_plugin` / `struct Perl_custom_infix`
 that adds a term-producing path.  Roughly 5-10 lines in `toke.c`:
@@ -5794,7 +5794,7 @@ This could be proposed to Paul Evans as an extension to
 `XS::Parse::Infix`, or directly to perl5-porters as a small
 enhancement to the `PL_infix_plugin` mechanism.
 
-**Alternative A: Buffer rewrite via `lex_unstuff` + `lex_stuff_pvn`.**
+#### 15.4.5 Alternative A: Buffer rewrite via `lex_unstuff` + `lex_stuff_pvn`.
 
 Without core changes, the most promising approach uses Perl's lexer
 buffer manipulation API.  When `PL_infix_plugin` detects `|` and
@@ -5820,7 +5820,7 @@ performed during lexing.  It must correctly handle nested `|` operators,
 multiline expressions, and heredocs.  It is viable as a proof of
 concept but may have edge cases.
 
-**Alternative B: Overriding `yyl_verticalbar` via XS.**
+#### 15.4.6 Alternative B: Overriding `yyl_verticalbar` via XS.
 
 The `yyl_verticalbar` function is `static` in `toke.c`, so it cannot
 be directly replaced.  However, using `Devel::CallChecker`-style XS
@@ -5830,7 +5830,7 @@ dispatch.  In practice, no clean API exists for this, so this approach
 requires modifying Perl's compiled C code at load time — fragile and
 non-portable.
 
-**Alternative C: Accept the limitation gracefully.**
+#### 15.4.7 Alternative C: Accept the limitation gracefully.
 
 The bare `|args|` form is a conciseness convenience, not a capability
 gap.  All the important closure forms are portable:
@@ -5845,7 +5845,7 @@ The only non-portable form is bare `|args|` for iterator chains like
 anonymous `fn` instead: `.map(fn($x) { $x * 2 })`.  This is slightly
 more verbose but semantically identical.
 
-**Recommendation.**
+#### 15.4.8 Recommendation.
 
 Pursue the proposed core change (it is small, clean, and broadly
 useful).  If it is accepted, bare `|args|` becomes portable on
@@ -5854,7 +5854,7 @@ Perl 5.38+ via `use Typed`.  If it is not accepted, alternative C
 form covers the use case adequately, and `move`/`async` closures
 already work.
 
-**Interaction with Perl builtins:**
+#### 15.4.9 Interaction with Perl builtins:
 
 Rust closures should work with Perl builtins that take code blocks:
 
@@ -5911,7 +5911,7 @@ The `use Typed` module would:
 
 The runtime behavior is Perl 5, but the compile-time checking is real.
 
-**`match` keyword and `Syntax::Keyword::Match`:**
+#### 16.1.1 `match` keyword and `Syntax::Keyword::Match`:
 
 `Syntax::Keyword::Match` (by Paul Evans) already registers `match` as
 a keyword, with syntax `match($expr : op) { case(val) { ... } }`.
@@ -5927,7 +5927,7 @@ the `: op` syntax), or accepting that `use Typed` and
 `use Syntax::Keyword::Match` are alternatives.  This should be
 resolved before the CPAN module is published.
 
-**Rust-style `|args| expr` closures — partially portable:**
+#### 16.1.2 Rust-style `|args| expr` closures — partially portable:
 
 Bare `|args| expr` without a keyword prefix cannot currently be
 implemented on standard Perl 5.  A small proposed extension to Perl's
@@ -5944,7 +5944,7 @@ concurrency-critical closure forms are fully portable.  Anonymous
 
 ### 16.2 What Each Keyword Compiles To
 
-**`let` declarations:**
+#### 16.2.1 `let` declarations:
 
 ```perl
 # Source:
@@ -5957,7 +5957,7 @@ Internals::SvREADONLY($name, 1);    # enforce immutability at runtime
 my $count = 0;                       # mutable — no READONLY flag
 ```
 
-**`fn` declarations:**
+#### 16.2.2 `fn` declarations:
 
 ```perl
 # Source:
@@ -5976,7 +5976,7 @@ sub greet {
 }
 ```
 
-**`match` expressions:**
+#### 16.2.3 `match` expressions:
 
 ```perl
 # Source:
@@ -5994,7 +5994,7 @@ do {
 }
 ```
 
-**Anonymous `fn` closures:**
+#### 16.2.4 Anonymous `fn` closures:
 
 ```perl
 # Source:
@@ -6009,7 +6009,7 @@ my $double = sub {
 Internals::SvREADONLY($double, 1);
 ```
 
-**`move` and `async` closures with `|args|` syntax:**
+#### 16.2.5 `move` and `async` closures with `|args|` syntax:
 
 ```perl
 # Source:
@@ -6029,7 +6029,7 @@ When triggered, the custom parser handles the `|...|` syntax — the
 standard Perl parser never sees the `|`.  Bare `|args| expr` without
 a keyword prefix remains Rust-runtime-only.
 
-**`Result` and `?` operator:**
+#### 16.2.6 `Result` and `?` operator:
 
 ```perl
 # Source:
@@ -6220,7 +6220,7 @@ debugging possible.  This section identifies the opportunities and
 goals without prescribing detailed solutions — the debugging
 experience is expected to evolve significantly during implementation.
 
-**What the architecture gives us:**
+#### 19.4.1 What the architecture gives us:
 
 - **Source spans on everything.**  Every IR instruction maps back to
   a source span (§19.1).  Breakpoints, step-through, and "show me
@@ -6238,7 +6238,7 @@ experience is expected to evolve significantly during implementation.
 - **Async-aware.**  The runtime knows about all active Tokio tasks,
   their states, and their call stacks.
 
-**Stack traces on exceptions by default:**
+#### 19.4.2 Stack traces on exceptions by default:
 
 Every `die` (and every `Err` auto-unwrap) should capture a stack
 trace for the current task automatically.  This is the single most
@@ -6264,7 +6264,7 @@ all tasks.  An all-task dump is a separate diagnostic operation
 available on request for deadlock investigation and overall system
 inspection.
 
-**All-task dump — on request, not by default:**
+#### 19.4.3 All-task dump — on request, not by default:
 
 For debugging hangs, deadlocks, or unexpected behavior across tasks,
 a full task dump shows every active interpreter's call stack and
@@ -6300,7 +6300,7 @@ generated async functions with `#[async_backtrace::framed]`
 automatically, enabling `taskdump_tree` for suspended tasks that are
 invisible to traditional stack traces.
 
-**Built-in value inspection:**
+#### 19.4.4 Built-in value inspection:
 
 A `debug()` builtin (or `dd()` — "data dump") should produce
 readable, structured output for any value type without requiring
@@ -6337,7 +6337,7 @@ it can be copy-pasted into code), handle circular references
 (printing `(circular ref)` or similar), and truncate very large
 structures with a configurable depth limit.
 
-**IDE integration via Debug Adapter Protocol (DAP):**
+#### 19.4.5 IDE integration via Debug Adapter Protocol (DAP):
 
 The Debug Adapter Protocol is the standard interface used by VS Code,
 Vim/Neovim (via plugins), Emacs, and other editors for debugger
@@ -6355,7 +6355,7 @@ needs a debug server that speaks DAP and can pause execution, inspect
 interpreter state, and resume.  This is a significant implementation
 effort but the architecture supports it cleanly.
 
-**Interactive REPL:**
+#### 19.4.6 Interactive REPL:
 
 Perl has never had a proper REPL.  `perl -de0` abuses the debugger
 as a substitute — no line editing, no history persistence, no syntax
@@ -6401,7 +6401,7 @@ perl> double(21)
 42
 ```
 
-**Introspection commands:**
+#### 19.4.7 Introspection commands:
 
 Prefixed with `:` to distinguish from Perl code:
 
@@ -6438,7 +6438,7 @@ perl> :time { slow_function() }
 Elapsed: 1.342s
 ```
 
-**REPL as a Tokio task:**
+#### 19.4.8 REPL as a Tokio task:
 
 The REPL itself runs as a Tokio task, meaning `spawn` works inside
 it — you can start background tasks from the REPL and interact
@@ -6459,7 +6459,7 @@ database connections, and other long-lived concurrent code
 interactively — a significant advantage for development and
 debugging.
 
-**Profiling hooks in the IR:**
+#### 19.4.9 Profiling hooks in the IR:
 
 Rather than bolting on profiling after the fact (as NYTProf does by
 hooking into the Perl interpreter at the C level), the IR can include
@@ -6479,7 +6479,7 @@ overhead.  When enabled, they feed into a profiling data structure
 that can be dumped to a file (compatible with speedscope, flamegraph,
 or a custom viewer) or streamed to a live monitoring tool.
 
-**Design principle:**
+#### 19.4.10 Design principle:
 
 The specifics of the debugging interface will evolve during
 implementation.  What the design document commits to is:
@@ -6507,14 +6507,14 @@ measured by how many upstream `.t` files pass.
 
 ### 20.2 Phased Test Progression
 
-**Phase 1: Lexer/parser foundations**
+#### 20.2.1 Phase 1: Lexer/parser foundations
 - `t/base/lex.t` — lexer basics
 - `t/base/cond.t` — conditionals
 - `t/base/if.t` — if/elsif/else
 - `t/base/pat.t` — basic patterns
 - `t/base/term.t` — basic terms
 
-**Phase 2: Core semantics**
+#### 20.2.2 Phase 2: Core semantics
 - `t/op/arith.t` — arithmetic
 - `t/op/string.t` — string operations
 - `t/op/cond.t` — conditional expressions
@@ -6522,7 +6522,7 @@ measured by how many upstream `.t` files pass.
 - `t/op/array.t`, `t/op/hash.t` — data structures
 - `t/op/sub.t`, `t/op/closure.t` — subroutines and closures
 
-**Phase 3: Advanced features**
+#### 20.2.3 Phase 3: Advanced features
 - `t/op/re_tests` — regex
 - `t/op/heredoc.t` — heredocs
 - `t/op/subst.t` — substitution
@@ -6530,7 +6530,7 @@ measured by how many upstream `.t` files pass.
 - `t/comp/use.t` — use/require
 - `t/op/tie.t` — tied variables
 
-**Phase 4: Module ecosystem**
+#### 20.2.4 Phase 4: Module ecosystem
 - Core module tests
 - Selected CPAN module tests
 - Smoker-style automated test runs
@@ -6550,14 +6550,14 @@ This is a recommended sequence of implementation work, ordered to
 maximize the ratio of "useful progress" to "infrastructure investment"
 at each step.
 
-### Step 1: Value model (2-3 weeks)
+### 21.1 Value model (2-3 weeks)
 
 **This is the foundation everything else stands on.**
 
 Build the `perl-core` crate first.  Every other crate depends on
 it, and design mistakes here are the most expensive to fix later.
 
-**Week 1: Strings and core value types**
+#### 21.1.1 Week 1: Strings and core value types
 
 1. `PerlString` — `Bytes` + `flags: u8` (Perl UTF-8 flag, Rust
    validity cache).  Methods: `as_str()`, `from_str()`, `as_bytes()`,
@@ -6573,7 +6573,7 @@ it, and design mistakes here are the most expensive to fix later.
 
 4. `PerlStringSlot` — the `None`/`Inline`/`Heap` enum.
 
-**Week 2: `Scalar`, `Value`, and coercion**
+#### 21.1.2 Week 2: `Scalar`, `Value`, and coercion
 
 5. `Scalar` — full struct with `int`, `num`, `bytes`, `reference`, `magic`,
    `stash`.  Coercion methods: `get_int()`, `get_num()`,
@@ -6590,7 +6590,7 @@ it, and design mistakes here are the most expensive to fix later.
    Basic operations: clone (Arc refcount bump), read through
    RwLock, write through RwLock.
 
-**Week 3: References, cycle collection, mortal stack**
+#### 21.1.3 Week 3: References, cycle collection, mortal stack
 
 8. Reference creation — `\$x` upgrades compact Value to
    `Scalar(Sv)`, returns `Ref(Sv)` pointing to the same Arc.
@@ -6636,7 +6636,7 @@ fn reference_identity() {
 }
 ```
 
-### Step 2: Lexer, parser, and AST (5-7 weeks)
+### 21.2 Lexer, parser, and AST (5-7 weeks)
 
 Build the lexer and parser together in the `perl-parser` crate.
 The lexer and parser are inseparable — the lexer requires parser
@@ -6655,48 +6655,48 @@ Target passing `t/base/lex.t` and parsing the `t/base/` test files.
 This is the hardest front-end component and should be done
 thoroughly.
 
-### Step 3: Minimal interpreter via AST walking (1-2 weeks)
+### 21.3 Minimal interpreter via AST walking (1-2 weeks)
 
 Build a quick-and-dirty AST-walking interpreter in `perl-runtime` —
 just enough to run `print`, basic arithmetic, string operations,
 conditionals, and loops.  This is throwaway scaffolding to get rapid
 feedback from the test suite.
 
-### Step 4: Compile-time execution (`BEGIN`, `use`) (1-2 weeks)
+### 21.4 Compile-time execution (`BEGIN`, `use`) (1-2 weeks)
 
 Implement the `Executor` trait (§22.1) and the
 compilation/execution interleaving so that `use strict`,
 `use warnings`, `use constant`, and simple `BEGIN` blocks work.
 This unblocks virtually all real Perl code.
 
-### Step 5: Lowering and IR (2-3 weeks)
+### 21.5 Lowering and IR (2-3 weeks)
 
 Build the HIR lowering and IR code generation in `perl-compiler`.
 Migrate the interpreter from AST walking to IR execution.  The AST
 walker can remain as a fallback during transition.
 
-### Step 6: Regex engine (3-4 weeks)
+### 21.6 Regex engine (3-4 weeks)
 
 Build the backtracking regex engine.  Target passing `t/base/pat.t`
 and then `t/op/re_tests`.
 
-### Step 7: Subroutines, closures, and packages (2-3 weeks)
+### 21.7 Subroutines, closures, and packages (2-3 weeks)
 
 Implement closure captures as `Vec<Value>` (not Perl 5-style pads),
 package declarations, method dispatch, and `@ISA`-based inheritance.
 
-### Step 8: Module loading (1-2 weeks)
+### 21.8 Module loading (1-2 weeks)
 
 Implement `require`, `use`, `do`, `@INC` search, and the standard
 import/export mechanisms.  Module registry for concurrent `require`
 (§13.11).
 
-### Step 9: Core builtins (ongoing)
+### 21.9 Core builtins (ongoing)
 
 Implement builtins incrementally, guided by which upstream tests are
 closest to passing.
 
-### Step 10: Concurrency (when core is stable)
+### 21.10 Concurrency (when core is stable)
 
 Implement per-value synchronization, `spawn`/`spawn blocking`/
 `spawn thread`, and Tokio integration.  The `Arc<RwLock<T>>` value
@@ -6704,14 +6704,14 @@ model is concurrent from day one; this step adds the multi-task
 execution paths, the Tokio event loop, and the cardinal invariant
 enforcement (§13.11).
 
-### Step 11: Typed layer (incremental, alongside other steps)
+### 21.11 Typed layer (incremental, alongside other steps)
 
 `let`/`fn` keyword registration and parsing can begin as soon as
 the parser exists (Step 2).  Type checking and typed IR generation
 build on Step 5.  `struct`/`enum`/`impl`/`trait` follow.  `extern fn`
 and AOT Rust codegen can proceed independently once the IR is stable.
 
-### Step 12: REPL (when interpreter is usable)
+### 21.12 REPL (when interpreter is usable)
 
 Build the REPL module in `perl-runtime` (behind the `repl` feature
 flag) on `reedline` once the interpreter can execute basic code
@@ -6765,7 +6765,7 @@ three independent leaf crates that have no cross-dependencies:
 | `perl-runtime` | lib | `perl-compiler`, `perl-core`, `perl-regex` | Interpreter loop, `Executor` impl, call frames, symbol tables, builtins, magic, concurrency, bytecode save/load, CLI, REPL, debug |
 | `perl` | bin | `perl-runtime` | Thin entry point: parses `std::env::args`, calls `perl_runtime::run`, exits |
 
-**Design rationale:**
+#### 22.1.1 Design rationale:
 
 Three leaf crates (`perl-core`, `perl-parser`, `perl-regex`) have no
 cross-dependencies.  Each is independently useful as a library:
@@ -6829,7 +6829,7 @@ interpreter loop — it's a runtime concern.  The flow:
 
 Same pattern as Python's `.pyc` files.
 
-**Internal module structure of `perl-compiler`:**
+#### 22.1.2 Internal module structure of `perl-compiler`:
 
 ```text
 perl-compiler/
@@ -6841,7 +6841,7 @@ perl-compiler/
         executor.rs      # Executor trait definition
 ```
 
-**Internal module structure of `perl-runtime`:**
+#### 22.1.3 Internal module structure of `perl-runtime`:
 
 ```text
 perl-runtime/
@@ -6859,7 +6859,7 @@ perl-runtime/
         debug/           # DAP server, profiling (behind feature flag)
 ```
 
-**Internal module structure of `perl-parser`:**
+#### 22.1.4 Internal module structure of `perl-parser`:
 
 ```text
 perl-parser/
@@ -6879,7 +6879,7 @@ The lexer and parser are `pub(crate)` internals.  They share the
 lexer reads it when tokenizing the next token.  The crate boundary
 is at the AST level — downstream crates see only the AST.
 
-**Feature flags on `perl-runtime`:**
+#### 22.1.5 Feature flags on `perl-runtime`:
 
 ```toml
 [features]
