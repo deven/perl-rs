@@ -856,158 +856,116 @@ phase."  The compiler is a runtime service.
 
 ### 5.1 The Central Difficulty
 
-Perl cannot be lexed context-free.  The lexer must know parser state to
-make fundamental tokenization decisions:
+Perl is traditionally considered impossible to lex without parser
+feedback.  The same character sequences have different meanings
+depending on context:
 
 | Situation | How it parses | Why |
 |-----------|---------------|-----|
 | `print (1+2)*3` | `print(1+2) * 3` or `print((1+2)*3)` | depends on whether `print` is known as a named unary |
-| `map { ... } @list` | block or hashref | parser expectation |
+| `map { ... } @list` | block or hashref | parser position in the grammar |
 | `$h{shift}` | hash subscript with bareword key | identifier after `{` in hash context |
 | `sub foo { ... }` | sub declaration | `sub` keyword triggers block-opening |
 | `Foo::Bar` | package name | `::` changes tokenization of preceding bareword |
-| `/regex/` vs `$x / $y` | regex or division | parser expectation state |
+| `/regex/` vs `$x / $y` | regex or division | term vs operator position |
 
-The lexer and parser are therefore not independent.  They share state
-through an explicit expectation mechanism, analogous to `PL_expect` and
-`PL_lex_state` in `toke.c`.  Both live in the `perl-parser` crate as
+Perl 5 solves this by coupling the lexer to the parser via shared
+mutable state (`PL_expect`), so the lexer pre-decides ambiguous
+tokens before the parser sees them.
+
+The PerlOxide lexer takes a different approach: it produces
+consistent, unambiguous tokens regardless of parser state.  A `/`
+is always `Token::Slash`.  A `{` is always `Token::LeftBrace`.  The
+**parser** resolves the semantic ambiguity based on its own
+position in the grammar — `Token::Slash` in `parse_term` means
+regex, in `peek_op_info` means division.  No shared disambiguation
+state exists between the lexer and parser.
+
+Both lexer and parser live in the `perl-parser` crate as
 `pub(crate)` modules — the crate boundary is at the AST level.
+The parser calls specialized lexer methods for context-sensitive
+scanning (heredoc initiation, prototype scanning, substitution
+body partitioning), but the lexer never reads parser disambiguation
+state — there is no `Expect` enum or term-vs-operator flag.  The
+lexer does read pragma and feature state (`utf8_mode`, `features`)
+that the parser syncs to it at pragma change points, since these
+affect lexical behavior (Unicode identifier acceptance, NFC
+normalization, paired delimiter availability).
 
-**Note:** The coupling between lexer and parser is real, but the
-*mechanism* for communicating context can be much simpler than Perl 5's
-approach.  Perl 5 uses a shared mutable state (`PL_expect`) because
-its LALR(1) parser cannot influence the lexer mid-production.  The
-recursive descent parser can call explicit lexer methods based on its
-current production, eliminating the shared state entirely.  See §5.2
-(Planned), §6.5, and §6.6.
+### 5.2 Parser-Driven Disambiguation
 
-### 5.2 Expectation-Based Tokenization
+Perl 5's `toke.c` uses a flat `PL_expect` enum with 11 states to
+communicate parser context to the lexer before each token is produced.
+This is necessary because the LALR(1) parser cannot backtrack and
+needs distinct token types for different syntactic roles of the same
+character.
 
-The parser maintains an `Expect` state, analogous to Perl 5's
-`PL_expect`, providing context from the parser so the lexer knows
-what to expect and can return different tokens accordingly.
-`PL_expect` is a flat enum with 11 states that conflate multiple
-concerns.  Some are represented by the `Expect` enum; others are
-dropped because the parser design does not require the lexer to
-know the context:
+The recursive descent parser eliminates this entirely.  There is no
+`Expect` enum, no shared state between the parser and lexer for
+disambiguation, and no re-lexing.  Instead, the parser resolves every
+ambiguous token by virtue of knowing where it is in the grammar:
 
-- **How does `/` tokenize?**  As a regex delimiter or as division.
-  Determined by whether the parser is expecting a term (regex) or
-  an operator (division) — the `Term` vs `Operator` distinction.
+**`/` (regex vs division).**  The Pratt expression parser calls
+`parse_term()` when expecting a value and `peek_op_info()` when
+looking for an infix operator.  `parse_term()` handles `Token::Slash`
+as a regex start (calling `self.lexer.lex_body_str('/', true)` to
+scan the pattern body).  `peek_op_info()` maps `Token::Slash` to
+`OpInfo { prec: PREC_MUL, assoc: Left }` (division).  The parser's
+own call stack determines which interpretation applies — no shared
+state needed.
 
-- **How does `{` tokenize?**  As a hash constructor, a statement
-  block, a block expression, or a block argument.  Determined by
-  the expect state: `Term` → hash, `Operator` → block,
-  `Statement` → byte-level heuristic, `Block(...)` → block.
+**`//` (defined-or vs empty regex).**  Same mechanism.  In
+`parse_term()`, `Token::DefinedOr` is treated as an empty regex
+(with optional flags like `//gi`).  In `peek_op_info()`, it's the
+defined-or operator.  List operators that prefer defined-or stop
+argument collection before `//`, matching `toke.c`'s UNIDOR behavior.
 
-- **What should follow `}`?**  After a block's closing brace, the
-  parser needs to know whether to expect a statement (`if` block),
-  an operator (`do` block), or a term (`sort` block argument).
-  Perl 5 encodes this as separate `PL_expect` variants (`XBLOCK`,
-  `XTERMBLOCK`, `XBLOCKTERM`).  C enums can't carry data, so each
-  combination requires its own variant.  Rust enums can, so this
-  collapses into `Block(ExpectNext)` where `ExpectNext` is
-  `Statement`, `Operator`, or `Term`.
+**`{` (block vs hash constructor).**  The parser always parses `{` as
+a block via `parse_block()`, then calls `try_reclassify_as_hash()` to
+check whether the block should be reinterpreted as a hash constructor.
+This avoids the need for a `BraceDisposition` state and the
+unreliable byte-level heuristics that `toke.c` uses.
 
-- **Are `:attributes` expected before this block?**  Perl 5 has
-  `XATTRBLOCK` and `XATTRTERM` as separate states.  Dropped — the
-  parser design does not require the lexer to identify attributes,
-  so `XATTRBLOCK` and `XBLOCK` are the same state.
+**`(` (prototype vs normal).**  After `sub name`, the parser
+explicitly calls `self.lexer.lex_body_str('(', true)` to scan the
+prototype as a raw string, bypassing normal tokenization.  No
+`Prototype` expect state needed.
 
-- **Is `//` defined-or or empty regex?**  Perl 5's `XTERMORDORDOR`
-  state (its self-described "evil hack").  Eliminated entirely —
-  the lexer always produces `Token::DefinedOr` for `//`.  The
-  parser converts it to an empty regex in term position (with
-  optional flag consumption, e.g. `//gi`).  Operators that prefer
-  defined-or (`shift`, `pop`, `getc`, `pos`, `readline`, `readlink`,
-  `undef`, `umask`) are identified by `prefers_defined_or()` and
-  stop consuming arguments before `//`.  File test operators treat
-  `//` as no-operand.  This matches toke.c's UNIDOR/FTST behavior.
+**`<<` (heredoc vs shift-left).**  The parser calls
+`self.lexer.lex_heredoc_after_shift_left()`, which inspects the
+following bytes to determine whether this is a heredoc initiator
+(returning the heredoc token) or a shift operator (returning `None`
+so the parser can proceed with shift-left parsing).
 
-- **Is this a prototype/signature context?**  After `sub name`,
-  a `(` should scan a raw prototype string rather than tokenize
-  normally.  This has no `PL_expect` equivalent — Perl 5 handles
-  it differently.  A `Prototype` variant handles this.
+**What follows `}`.**  The recursive descent call stack implicitly
+encodes this.  `parse_if_stmt` calls `parse_block` and regains
+control at statement level.  `parse_anon_sub` calls `parse_block`
+and returns to the Pratt loop in operator position.  No explicit
+`ExpectNext` state needed.
 
-```rust
-/// Lexer expectation state.
-enum Expect {
-    /// Expecting a term (value, prefix operator, keyword).
-    /// `/` starts a regex; `{` is a hash constructor.
-    Term,       // XTERM (XTERMORDORDOR folded in)
+The parser communicates with the lexer through explicit method calls
+rather than shared state.  The lexer exposes a rich set of methods
+that the parser invokes based on its current production:
 
-    /// Expecting an infix/postfix operator.
-    /// `/` is division; `{` is a block brace.
-    Operator,   // XOPERATOR
+- `lex_token()` — main token production
+- `lex_body_str(delim, raw)` — scan a delimited string body
+- `lex_heredoc_after_shift_left()` — heredoc detection and initiation
+- `lex_hash_var_after_percent()` — probe for hash variable vs bare `%`
+- `lex_readline_after_lt()` — probe for `<HANDLE>` vs less-than
+- `lex_filetest_after_minus()` — probe for `-f` etc. vs unary minus
+- `start_subst_replacement(delim)` — set up substitution replacement
+- `scan_adjacent_word_chars()` — scan flags after regex/subst closing
+- `try_autoquoted_bareword_subscript()` — probe for `$hash{bareword}`
+- `start_format(name, span)` — enter format body sublexing
+- `set_utf8_mode(bool)` — sync UTF-8 pragma state
+- `.features = ...` — sync feature flags from `Pragmas`
 
-    /// Start of a statement.  Like Term, but labels are allowed.
-    /// `/` starts a regex; `{` uses the byte-level heuristic.
-    Statement,  // XSTATE
-
-    /// Expecting `{` to open a block.
-    /// After `}`, the parser restores the given state.
-    Block(ExpectNext),  // XBLOCK | XATTRBLOCK | XATTRTERM | XTERMBLOCK | XBLOCKTERM
-
-    /// After a sigil for dereference.
-    /// `{` is a deref block, not a hash constructor.
-    Deref,      // XREF
-
-    /// After `->` for postfix dereference (`->@*`, `->$*`).
-    Postderef,  // XPOSTDEREF
-
-    /// After `sub name` — `(` scans a raw prototype string.
-    Prototype,  // no PL_expect equivalent
-}
-
-/// What to expect after a block's closing `}`.
-enum ExpectNext {
-    /// Block is a statement body (if/while/for/sub).
-    Statement,
-    /// Block produces a value (eval/do/anonymous sub).
-    Operator,
-    /// Block is a leading argument (sort/map/grep).
-    Term,
-}
-```
-
-**Planned: Eliminating `Expect` and `ExpectNext`.**  The `Expect` enum
-exists because the lexer must pre-decide ambiguous tokens (`{`, `/`,
-`(`) before the parser sees them.  This is inherited from Perl 5's
-LALR(1) architecture, where the parser cannot backtrack and needs
-distinct token types for different syntactic roles.
-
-The recursive descent parser has no such constraint.  Each ambiguous
-token can be resolved by the parser's own control flow:
-
-- **`/` (regex vs division):** The Pratt parser already knows whether
-  it is in term position (just called `parse_term`) or operator
-  position (in the `peek_op_info` loop).  The lexer can expose two
-  methods — `lex_term_token()` and `lex_operator_token()` — called
-  explicitly by the parser.  No shared `Expect` state needed.
-
-- **`{` (block vs hash):** Eliminated entirely — see §6.5.  The
-  parser always parses `{` as a block and reclassifies afterward.
-  `HashBrace` is deleted.
-
-- **`(` (prototype vs normal):** After `sub name`, the parser calls
-  a dedicated `lex_prototype()` method on the lexer.  No `Prototype`
-  expect state needed.
-
-- **`ExpectNext`:** The recursive descent call stack implicitly
-  encodes what follows `}`.  `parse_if` calls `parse_block` and
-  regains control at statement level.  `parse_anon_sub` calls
-  `parse_block` and returns to the Pratt loop in operator position.
-  No explicit state needed.
-
-The target architecture is a lexer with explicit mode methods driven
-by the parser's control flow, rather than a shared expect state that
-the parser sets and the lexer reads.  This eliminates the re-lex
-mechanism, checkpoint/restore in `ensure_current`, and the
-`lexer_equivalent` workaround entirely.  See §6.6 for the full plan.
+This approach is simpler, more testable, and eliminates entire classes
+of bugs related to stale or incorrect expectation state.
 
 ### 5.3 Symbol Table Feedback
 
-Beyond parser expectation, the lexer also needs symbol table access to
+Beyond parser control flow, the lexer also needs symbol table access to
 resolve:
 
 - Whether a bareword is a known subroutine (and its prototype)
@@ -1019,18 +977,19 @@ Prototype knowledge in particular affects not just lexical
 classification but also how the parser subsequently handles the
 argument list (see §6.3).
 
-This should be implemented as a callback or shared reference from the
-lexer to the symbol table, not by embedding the symbol table inside the
-lexer.
+The symbol table lives on the `Parser` struct and is accessible to
+the lexer through parser method calls in the sections where both
+cooperate (e.g. `lex_word` produces `Token::Ident`, and the parser
+then consults the symbol table to decide how to parse the arguments).
 
 ### 5.4 Source Layer (`LexerSource`)
 
 The lexer does not read source bytes directly.  A dedicated
 `LexerSource` type manages line-oriented source delivery, CRLF
-normalization, heredoc body sequencing, and indentation stripping.
-The lexer receives one line at a time and scans bytes within it,
-never dealing with line boundaries, newline encoding, or heredoc
-line reordering.
+normalization, heredoc body sequencing, substitution body partitioning,
+and indentation stripping.  The lexer receives one line at a time and
+scans bytes within it, never dealing with line boundaries, newline
+encoding, or heredoc line reordering.
 
 **Why a source layer:**
 
@@ -1077,147 +1036,173 @@ struct LexerLine {
     terminated: bool,
     /// Current scanning position within `line`.
     pos: usize,
+    /// Whether the line contains only ASCII bytes (all < 0x80).
+    /// Computed for free during newline scanning and used to skip
+    /// UTF-8 decoding and NFC normalization on all-ASCII lines.
+    /// See §5.8 for the `effective_utf8` optimization.
+    ascii_only: bool,
 }
 
 impl LexerLine {
     fn peek_byte(&self) -> Option<u8>;
     fn peek_byte_at(&self, offset: usize) -> Option<u8>;
-    fn advance_byte(&mut self) -> Option<u8>;
     fn remaining(&self) -> &[u8];       // borrowed view for comparisons
-    fn at_end(&self) -> bool;
-    fn slice(&self, start: usize, end: usize) -> Bytes;  // zero-copy
-    fn slice_since(&self, start: usize) -> Bytes;         // slice(start..pos)
 }
 ```
 
-The typical lexer scanning pattern:
-
-```rust
-let start = line.pos;
-while line.peek_byte().is_some_and(|b| b.is_ascii_alphanumeric()) {
-    line.advance_byte();
-}
-let name: Bytes = line.slice_since(start);
-```
-
-The resulting `Bytes` is a zero-copy reference-counted slice into
-the original source buffer — no allocation, no copy.  This `Bytes`
-handle flows through the token, the AST, and into the runtime
-`PerlString` as a cheap refcount bump at each stage.
+The typical lexer scanning pattern uses `peek_byte` for inspection
+and `skip(n)` on the `Lexer` to advance, rather than a combined
+`advance_byte` method.  This separates the concerns of looking at
+the current byte from consuming it, and naturally supports
+multi-byte UTF-8 characters where `skip(len)` advances past all
+bytes of a decoded character in one step.
 
 The lexer holds `Option<LexerLine>` as its current line.  When the
-line is exhausted (`at_end()`), the lexer sets it to `None`.  On
-the next token request, `None` triggers a call to
-`source.next_line()` to get the next line.
+line is exhausted, the lexer sets it to `None`.  On the next token
+request, the lexer's `peek_byte` method detects `None` and calls
+`source.next_line()` to fetch the next line — a single funnel point
+for all line loading.  This funnel also recomputes the
+`effective_utf8` flag (§5.8) on every line transition.
 
 Because `LexerLine` carries the scanning position, saving and
 restoring a line (e.g. for heredoc remainder) automatically preserves
 the cursor position within that line.  The lexer transparently
 resumes mid-line without any special-case logic.
 
-**`LexerSource` API:**
+**`LexerSource` internal architecture:**
+
+`LexerSource` maintains a line queue (`VecDeque<LexerLine>`) and a
+push-back mechanism for line reordering.  When heredoc bodies or
+substitution bodies need to be served before the continuation of the
+current line, the relevant lines are queued and the saved remainder
+is pushed back for delivery after the body is consumed.
 
 ```rust
 impl LexerSource {
-    /// Get the next line.  Returns `Ok(Some(line))` for content,
-    /// `Ok(None)` when a heredoc body is finished (the saved
-    /// remainder will be returned by the next call), or `Err` for
-    /// real errors (unterminated heredoc, indentation mismatch).
-    fn next_line(&mut self) -> Result<Option<LexerLine>, SourceError>;
+    /// Get the next line.  Serves queued lines (heredoc bodies,
+    /// substitution bodies) first, then reads from the source.
+    /// Returns `Ok(None)` for virtual EOF (heredoc/subst body
+    /// finished — the saved remainder follows on the next call).
+    /// `peek_heredoc` controls whether a found terminator is
+    /// consumed or merely peeked (used by `lex_body` to detect
+    /// end-of-body without consuming the signal).
+    fn next_line(&mut self, peek_heredoc: bool)
+        -> Result<Option<LexerLine>, ParseError>;
 
-    /// Begin processing an indented heredoc body.  Scans ahead to
-    /// find the terminator, sets the required indentation from its
-    /// whitespace prefix.  The current line is taken from the Option
-    /// (setting it to None) and saved internally for restoration
-    /// when the terminator is found.
-    fn start_indented_heredoc(
-        &mut self,
-        tag: Bytes,
-        current_line: &mut Option<LexerLine>,
-    ) -> Result<(), SourceError>;
-
-    /// Begin processing a non-indented heredoc body.  The current
-    /// line is taken from the Option (setting it to None) and saved
-    /// internally for restoration when the terminator is found.
-    /// Does not change the required indentation.
+    /// Begin processing a non-indented heredoc body.  Takes the
+    /// current line (saving its remainder for later), queues body
+    /// lines until the terminator is found.
     fn start_heredoc(
         &mut self,
         tag: Bytes,
         current_line: &mut Option<LexerLine>,
-    );
+    ) -> Result<(), ParseError>;
+
+    /// Begin processing an indented heredoc body (`<<~`).  Scans
+    /// ahead to find the terminator, extracts its whitespace prefix
+    /// as the required indentation, and strips that prefix from all
+    /// body lines.
+    fn start_indented_heredoc(
+        &mut self,
+        tag: Bytes,
+        current_line: &mut Option<LexerLine>,
+    ) -> Result<(), ParseError>;
+
+    /// Partition a substitution replacement body.  Scans forward
+    /// from the current position in the given line to find the
+    /// closing delimiter (tracking nesting depth for paired
+    /// delimiters), queues the body content as lines with a
+    /// virtual EOF, extracts flags, and saves the remainder.
+    fn start_subst_body(
+        &mut self,
+        delim: char,
+        extra_paired: bool,
+        current_line: &mut Option<LexerLine>,
+    ) -> Result<Option<String>, ParseError>;
+
+    /// Override line numbering for `# line` directives.
+    fn set_line_number(&mut self, n: usize);
+    fn set_filename(&mut self, name: String);
 }
 ```
 
-**Internal state:**
-
-`LexerSource` maintains a heredoc context stack:
-
-```rust
-struct HeredocContext {
-    tag: Bytes,
-    saved_line: LexerLine,
-    prev_indent: Option<Bytes>,
-}
-```
+**Heredoc line sequencing:**
 
 When `start_heredoc` or `start_indented_heredoc` is called:
 
-1. The current `LexerLine` (with its cursor position) is pushed onto
-   the stack along with the current `required_indent` and the tag.
-2. For indented heredocs, `LexerSource` scans ahead through upcoming
-   lines to find the terminator, extracts its full whitespace prefix,
-   and sets that as the new `required_indent`.  The scan validates
-   that the terminator starts with the current required indent (if
-   any) — this handles nested indented heredocs correctly.
-3. Subsequent `next_line()` calls serve body lines with the required
-   indent stripped.
+1. The current `LexerLine` (with its cursor position) is taken from
+   the lexer's `Option<LexerLine>` and saved internally.
+2. Subsequent source lines are read and queued as body lines until
+   the terminator is found.
+3. The terminator line itself is consumed (not delivered to the lexer).
+4. `next_line()` serves the queued body lines, then returns
+   `Ok(None)` to signal "body finished."
+5. On the following call, `next_line()` returns the saved remainder
+   line — the continuation of the original line after `<<TAG`.
 
-When `next_line()` encounters a line that matches the current
-heredoc tag (after indent stripping):
+For multiple heredocs on one line (`<<A, <<B`), this nests naturally:
+A's body is consumed, the saved remainder (`, <<B);\n`) is returned,
+the lexer encounters `<<B` and calls `start_heredoc` again, which
+saves the new remainder (`);\n`) and queues B's body.  No special
+stacking logic in the lexer.
 
-1. It returns `Ok(None)` to signal "heredoc finished."
-2. Internally, it pops the context stack, restoring `required_indent`
-   to the saved value.
-3. The saved `LexerLine` is queued so that the next `next_line()`
-   call returns it — transparently resuming the declaration line.
+**Substitution body partitioning:**
 
-**CRLF normalization:**
+`s/pattern/replacement/flags` requires scanning ahead to find the
+replacement body's closing delimiter and extract flags before the
+lexer processes the replacement content.  `start_subst_body` handles
+this:
 
-`LexerSource` strips `\r` immediately before `\n` when splitting
-lines.  The `line` field in `LexerLine` is a `Bytes` slice that ends
-before the `\r` (for CRLF) or before the `\n` (for LF).  Standalone
-`\r` not followed by `\n` is a literal byte in the content — not a
-line ending.  This matches Perl's behavior.  Because the stripping
-is done by adjusting slice boundaries rather than copying, it is
-zero-copy.
+1. Scans the current line (and subsequent lines if needed) for the
+   closing delimiter, tracking nesting depth for paired delimiters
+   like `s{pattern}{replacement}`.
+2. Partitions the line: body content is queued with a virtual EOF,
+   flags are captured, and the remainder after the flags is saved.
+3. The lexer processes the body lines normally, hitting the virtual
+   EOF when the body is exhausted.  The saved remainder is delivered
+   on the next `next_line()` call.
+
+This is the same queue-and-save mechanism used for heredocs, extended
+to handle the delimited replacement body.
+
+**CRLF normalization and line termination:**
+
+`LexerLine` is deliberately designed to exclude the line ending
+(LF or CRLF) from the `line` byte slice.  Instead, the `terminated`
+boolean records whether the line was followed by a newline in the
+source.  This design enables zero-copy slicing even when CRLF
+normalization is needed — the `line` field is simply a `Bytes` slice
+whose end boundary is set before the `\r` (for CRLF) or before the
+`\n` (for LF), with no data copied or modified.  Standalone `\r`
+not followed by `\n` is a literal byte in the content — not a line
+ending.  This matches Perl's behavior.  No information is lost: the
+`terminated` flag preserves whether the final line ended with a
+newline, and the lexer synthesizes a virtual `\n` byte at the end
+of terminated lines via `peek_byte`.
+
+**`# line` directive processing:**
+
+The lexer recognizes `# line N "file"` directives (when `#` is at
+column 0) via `try_line_directive()`, updating `LexerSource`'s line
+number and optional filename override.  These affect `__LINE__` and
+`__FILE__` resolution and diagnostic messages.  The directive is
+consumed as a comment — no token is emitted.
+
+Perl processes `# line` directives even in some surprising contexts,
+such as between a sigil and the identifier it prefixes (e.g.
+`$\n# line 100\nname` changes the line number while still resolving
+`$name`).  The lexer matches this behavior because whitespace
+skipping between sigil and identifier crosses line boundaries, and
+line boundary crossing triggers `next_line()`, which processes the
+directive.
 
 **How this simplifies the lexer:**
 
-With `LexerSource`, the lexer's main loop is:
-
-```rust
-loop {
-    if self.current_line.is_none() {
-        match self.source.next_line()? {
-            Some(line) => self.current_line = Some(line),
-            None => {
-                // Heredoc body finished — emit QuoteEnd.
-                // Next iteration gets the saved remainder line.
-                return Ok(Token::QuoteEnd);
-            }
-        }
-    }
-    let line = self.current_line.as_mut().unwrap();
-    // ... scan bytes from line, produce tokens ...
-    if line.at_end() {
-        self.current_line = None;
-    }
-}
-```
-
-The lexer never manages heredoc line ordering, CRLF normalization,
-indent stripping, or position save/restore.  These are fully
-encapsulated in `LexerSource`.
+The lexer's token-production loop never manages heredoc line ordering,
+CRLF normalization, indent stripping, substitution body partitioning,
+or position save/restore.  These are fully encapsulated in
+`LexerSource`.  The lexer simply calls `peek_byte`, which auto-loads
+lines as needed through `next_line()`.
 
 **Zero-copy flow from source to runtime:**
 
@@ -1241,71 +1226,124 @@ buffer.
 ### 5.5 Sublexing and the Context Stack
 
 Sublexing is the core architectural requirement.  The implementation
-uses an explicit context stack on the lexer.  This stack tracks the
-lexer's current mode within the line it is scanning — it does not
-manage source positioning or line sequencing (those are `LexerSource`
-concerns; see §5.4).
+uses an explicit context stack (`Vec<LexContext>`) on the `Lexer`
+struct.  This stack tracks the lexer's current mode within the line
+it is scanning — it does not manage source positioning or line
+sequencing (those are `LexerSource` concerns; see §5.4).
+
+Unlike the enum-based `LexMode` design considered early on,
+`LexContext` is a single struct with boolean flags that control
+behavior.  The combination of `interpolating`, `raw`, and `regex`
+covers all scanning modes:
 
 ```rust
-enum LexContext {
-    Interpolating {         // inside "...", qq//, heredoc body, etc.
-        open: Option<u8>,   // paired opener for depth tracking
-        close: Option<u8>,  // None for heredocs
-        depth: u32,         // nesting depth for paired delimiters
-        expr_depth: u32,    // >0 means inside ${expr} or @{expr}
-    },
-    Literal {               // inside '...', q//, literal heredoc body
-        open: Option<u8>,
-        close: Option<u8>,  // None for literal heredocs
-        depth: u32,
-    },
-    QuoteWords,             // inside qw//
-    RegexPattern,           // inside m//, qr//, or s///pattern
-    SubstReplacement,       // inside s///replacement
-    TranslitBody,           // inside tr/// or y///
-    Format,                 // inside format/write body
+struct LexContext {
+    /// Opening delimiter character.  `None` for heredocs (end
+    /// signaled by LexerSource returning `None` from `next_line`).
+    delim: Option<char>,
+    /// Delimiter nesting depth (for paired delimiters like `{}`).
+    depth: u32,
+    /// Brace depth inside `${expr}` or `@{expr}`.  When > 0,
+    /// the lexer produces normal code tokens.  When 0, it
+    /// produces string body tokens via `lex_body`.
+    expr_depth: u32,
+    /// Whether `$`/`@` trigger interpolation.
+    interpolating: bool,
+    /// Whether escapes pass through raw (regex, tr, prototypes).
+    raw: bool,
+    /// Whether to detect `(?{...})` code blocks (regex mode).
+    regex: bool,
+    /// Inside a subscript chain (e.g. `"$h->{k}[0]"`).
+    chain_active: bool,
+    /// Bracket/brace nesting inside the chain.
+    chain_depth: u32,
+    /// Chain end detected; emit `InterpChainEnd` on next call.
+    chain_end_pending: bool,
 }
 ```
 
-`Interpolating` and `Literal` each carry delimiter information.
-Heredoc bodies reuse these same variants with `close: None` — the
-byte scanning logic is identical to delimited strings.  The
-difference is how end-of-content is detected: for delimited strings,
-the scanner finds the closing delimiter; for heredocs,
-`source.next_line()` returns `None`, and the lexer handles this at
-the line-fetching level, outside the scanning mode.
+The behavior for each quote-like construct is determined by the flag
+combination passed to `LexContext::new(delim, interpolating, raw,
+regex)`:
 
-Expression interpolation (`${expr}` and `@{expr}`) is handled by
-the `expr_depth` field on `Interpolating`.  When `${` or `@{` is
-encountered, `expr_depth` is incremented.  While `expr_depth > 0`,
-the lexer produces normal code tokens (identifiers, operators, etc.)
-instead of string content — `{` increments and `}` decrements the
-depth.  When `}` decrements `expr_depth` to 0, the lexer resumes
-string scanning.  Nested strings inside expressions (e.g.
-`"${func("inner")}"`) push a new `Interpolating` context onto the
-stack, which pops back to the outer `Interpolating` (still with
-`expr_depth > 0`) when the inner string closes.
+| Construct | `interpolating` | `raw` | `regex` | `delim` |
+|-----------|-----------------|-------|---------|---------|
+| `"..."`, `qq//` | true | false | false | `Some('"')` or delimiter |
+| `'...'`, `q//` | false | false | false | `Some('\'')` or delimiter |
+| `` `...` ``, `qx//` | true | false | false | `` Some('`') `` or delimiter |
+| `m//`, `qr//` | `delim != '\''` | true | true | `Some(delim)` |
+| `s///` pattern | `delim != '\''` | true | true | `Some(delim)` |
+| `s///` replacement (no `/e`) | true | false | false | `None` (virtual EOF) |
+| `s///` replacement (`/e`) | false | true | false | `None` (virtual EOF) |
+| Heredoc (interpolating) | true | false | false | `None` |
+| Heredoc (literal) | false | false | false | `None` |
+
+Delimiter types are `char`, not `u8`, to support the Unicode paired
+delimiter table (§5.8).  `delim` is `None` for heredocs and
+substitution replacement bodies, where end-of-content is signaled by
+`LexerSource` returning `Ok(None)` from `next_line()` rather than by
+a delimiter byte in the content stream.
+
+**Incremental sublexing:**
+
+The lexer produces sub-tokens one at a time rather than scanning the
+entire body at once.  Each call to `lex_token()` re-enters `lex_body`
+via the context stack, produces one token (a `ConstSegment`, an
+`InterpScalar`, etc.), and returns.  The parser collects these tokens
+until `SublexEnd` is emitted.  This is important for correct handling
+of expression interpolation — `${expr}` and `@{expr}` increment
+`expr_depth`, switching the lexer to normal code mode until the
+matching `}` decrements it back to 0.
+
+**Subscript chain tracking:**
+
+Inside interpolating strings, `$name` followed by `->`, `[`, or `{`
+triggers a subscript chain: `"$h->{k}[0]"` should interpolate the
+full dereference expression, not just `$h`.  The `chain_active`,
+`chain_depth`, and `chain_end_pending` fields manage this — tracking
+bracket nesting within the chain and detecting when no continuation
+follows a closing bracket.  The chain emits normal code tokens
+bracketed by `InterpScalarExprStart` / `InterpChainEnd` (or the
+array equivalents).
+
+**Token stream for quote-like constructs:**
 
 Quote-like scanning produces a stream of sub-tokens:
 
 ```text
-QuoteBegin(qq, delimiter='|')
+QuoteSublexBegin(QuoteKind::Double, '"')
 ConstSegment("Hello, ")
-InterpScalar(name)
+InterpScalar("name")
 ConstSegment("! You have ")
-InterpScalarExprStart       # triggered by ${expr} — increments expr_depth
-  ... tokens for the expression ...
-RBrace                      # closing } decrements expr_depth to 0
+InterpScalarExprStart   # triggered by ${expr}
+  ... normal code tokens for the expression ...
+RightBrace              # closing } decrements expr_depth to 0
 ConstSegment(" messages.\n")
-QuoteEnd
+SublexEnd
 ```
 
 Both `$name` and `${name}` (with a simple identifier) produce
 `InterpScalar(name)`.  `${expr}` with operators or calls produces
 `InterpScalarExprStart`, followed by normal code tokens, followed by
-`RBrace`.  `@{expr}` uses `InterpArrayExprStart`.  The parser calls
-`parse_expr()` inline for expression interpolation — the same parser
-instance, with proper span tracking and error reporting.
+`RightBrace`.  `@{expr}` uses `InterpArrayExprStart`.  The parser
+calls `parse_expr()` inline for expression interpolation — the same
+parser instance, with proper span tracking and error reporting.
+
+**Body scanner fast path:**
+
+The body scanner (`lex_body`) uses a `memchr`-based fast path for
+bulk copying of string content.  When no case modifications are
+active and no nesting depth is in play, it searches for the next
+trigger byte (`$`, `@`, `\`, close delimiter, or open delimiter)
+using SIMD-optimized `memchr`, then bulk-copies everything before
+that trigger into the output string.  This avoids per-byte
+processing for the common case of long literal string segments.
+
+For Unicode paired delimiters, `memchr` searches for the first
+UTF-8 byte of the delimiter character.  This may produce false
+positives (other characters sharing the same lead byte), which are
+handled safely by the byte-by-byte fallback that verifies the full
+UTF-8 sequence.
 
 ### 5.6 Heredoc Handling
 
@@ -1313,7 +1351,7 @@ Heredocs are handled by the cooperation of `LexerSource` (§5.4) and
 the lexer's token-production loop.  The source layer manages all line
 ordering, indentation, and save/restore.  The lexer's only heredoc
 awareness is recognizing `<<TAG` and framing the body as
-`QuoteBegin` / content tokens / `QuoteEnd`.
+`QuoteSublexBegin` / content tokens / `SublexEnd`.
 
 **Basic flow:**
 
@@ -1324,21 +1362,23 @@ END
 ```
 
 1. The lexer encounters `<<END` while scanning a line.  It emits
-   `QuoteBegin(Heredoc, 0)`, pushes `Interpolating` (with
-   `close: None`) onto the context stack, and calls
+   `QuoteSublexBegin(QuoteKind::Heredoc, '\0')` (the `'\0'`
+   delimiter signals "heredoc, no delimiter byte"), pushes a
+   `LexContext` (with `delim: None`, `interpolating: true`) onto the
+   context stack, and calls
    `source.start_heredoc(tag, &mut self.current_line)`.  The method
    takes the `LexerLine` (with cursor pointing at ` . "suffix";`)
    and sets the lexer's current line to `None` in one step.
 
 2. The lexer's main loop calls `source.next_line()`, which returns
-   the first body line.  In `Interpolating` mode, the lexer
+   the first body line.  With `interpolating: true`, the lexer
    scans it for interpolation and produces `ConstSegment`,
    `InterpScalar`, etc. — the same token stream as `"..."` and
    `qq{}`.
 
 3. When `source.next_line()` returns `Ok(None)`, the terminator has
-   been found.  The lexer pops `Interpolating` from the
-   context stack and emits `QuoteEnd`.
+   been found.  The lexer pops `LexContext` from the context stack
+   and emits `SublexEnd`.
 
 4. On the next `source.next_line()` call, `LexerSource` returns the
    saved `LexerLine` — the remainder ` . "suffix";`.  Because
@@ -1359,15 +1399,15 @@ This falls out naturally from the save/restore mechanism:
 
 1. `<<A` saves the remainder `, <<B);` and starts A's body.
 2. A's terminator found → `source.next_line()` returns `None`.
-   Lexer emits `QuoteEnd`.
+   Lexer emits `SublexEnd`.
 3. Next `source.next_line()` returns the saved `, <<B);`.
 4. Lexer scans `, `, encounters `<<B`, saves `);\n`, starts B's body.
 5. B's terminator found → `source.next_line()` returns `None`.
-   Lexer emits `QuoteEnd`.
+   Lexer emits `SublexEnd`.
 6. Next `source.next_line()` returns `);`.
 
-No special stacking logic in the lexer.  `LexerSource`'s internal
-heredoc context stack handles all the line sequencing.
+No special stacking logic in the lexer.  `LexerSource`'s line queue
+and push-back mechanism handle all the line sequencing.
 
 **Indented heredocs (`<<~`):**
 
@@ -1383,6 +1423,23 @@ full whitespace prefix (`"    "` in this example), and sets that as
 the required indentation.  Subsequent body lines are delivered with
 the prefix stripped.  When the terminator is found, the previous
 required indentation (if any) is restored.
+
+**Heredoc tag forms:**
+
+The lexer recognizes several heredoc tag forms:
+
+- `<<TAG` — bare identifier, interpolating.  Under `use utf8`,
+  Unicode identifiers are accepted (XID_Start + XID_Continue).
+  Digit-start tags (`<<0`, `<<42`) are valid, matching Perl's
+  `isWORDCHAR`.  The tag must be immediately adjacent to `<<`
+  with no whitespace.
+- `<<"TAG"` — double-quoted, interpolating.  Whitespace between
+  `<<` and the opening quote is allowed.
+- `<<'TAG'` — single-quoted, literal (no interpolation).
+- `` <<`TAG` `` — backtick-quoted, interpolating + executed.
+- `<<\TAG` — backslash form, literal (equivalent to `<<'TAG'`).
+  Under `use utf8`, Unicode identifiers are accepted.
+- `<<~` prefix on any of the above — indented variant.
 
 **Nested heredocs with indentation:**
 
@@ -1413,41 +1470,34 @@ my $x = <<~OUTER;
 - After B, the expression completes.  The lexer is back in OUTER's
   body, continuing with the next body line.
 
-For nested indented heredocs (`<<~INNER` inside `<<~OUTER`),
-`LexerSource`'s terminator scan validates that the inner terminator
-starts with the current required indent and uses the full raw prefix
-as the new required indent.  On completion, the outer indent is
-restored from the context stack.
+This architecture correctly handles arbitrarily deep heredoc nesting,
+including the torture test case with 9+ heredocs at 4 levels of
+nesting with interleaved `BEGIN` blocks, `do` blocks, and mixed
+indented/non-indented heredocs.  The key property is that heredoc
+bodies are consumed in source order — a `BEGIN` block inside a
+deeply nested heredoc body is encountered before code on the
+initiating line, matching Perl's compile-time execution order.
 
 **Literal heredocs:**
 
-Literal heredocs (`<<'TAG'`, `<<~'TAG'`) do not interpolate.
-`LexerSource` still manages the line sequencing and indentation, but
-the lexer collects the body lines into a single string token
-(`HeredocLit`) rather than producing a sub-token stream.
+Literal heredocs (`<<'TAG'`, `<<\TAG`, `<<~'TAG'`) do not
+interpolate.  The lexer collects the body into a single
+`ConstSegment` token rather than producing a sub-token stream with
+interpolation breaks.  `LexerSource` manages the line sequencing
+identically.
 
-**Token stream for interpolating heredocs:**
+**Heredoc terminator matching:**
 
-Interpolating heredocs produce the same token stream as `"..."` and
-`qq{}` — unified under `parse_interpolated_string`:
-
-```text
-QuoteBegin(Heredoc, 0)
-ConstSegment("body line 1\nbody line 2\n")
-InterpScalar(name)
-ConstSegment(" more text\n")
-QuoteEnd
-```
-
-`ConstSegment` tokens span across line boundaries within the body —
-the lexer only breaks them for interpolation (`$`, `@`) or the
-terminator.
+A line matches the heredoc tag only if the entire line content
+(after any required indentation stripping) is an exact byte-for-byte
+match with the tag.  Trailing spaces, tabs, or any other content
+cause the line to be treated as body content, not a terminator.
 
 ### 5.7 Token Categories
 
-The lexer emits tokens that already reflect context-sensitive
-disambiguation (§5.2).  The parser consumes these directly — there
-is no separate adapter or token-mapping layer.
+The lexer emits tokens that reflect context-sensitive disambiguation
+where the lexer can resolve it, and defers to the parser for
+cases that require grammatical context (§5.2).
 
 Core token categories:
 
@@ -1461,6 +1511,99 @@ Core token categories:
 - Keywords (control flow, declaration, special forms)
 - Heredoc markers
 - Special tokens (end of input, format lines, `__END__`/`__DATA__`)
+
+### 5.8 Unicode Support
+
+Under `use utf8`, Perl source is UTF-8 encoded and identifiers may
+use Unicode letters.  The lexer implements full Unicode identifier
+support with several optimizations.
+
+**Identifier scanning:**
+
+`scan_ident` uses the `unicode-xid` crate for XID_Start and
+XID_Continue checks on non-ASCII characters.  ASCII characters
+use fast byte-range checks; UTF-8 multi-byte sequences are decoded
+via `peek_utf8_char()` only when the lead byte is >= 0x80.
+
+Bare heredoc tags, backslash heredoc tags, and the heredoc gate
+condition all accept Unicode identifiers under `use utf8`, matching
+Perl's `isWORDCHAR_utf8` behavior.
+
+**NFC normalization:**
+
+Identifiers are NFC-normalized at extraction time, so `café`
+(composed) and `café` (decomposed, `e` + combining acute) produce
+the same identifier name.  This applies to `scan_ident` output and
+to the raw source bytes in the `memchr` bulk-copy path.
+
+Escape-produced characters (`\x{65}\x{301}`) bypass NFC
+normalization — they are not source-level identifiers and should
+preserve the exact characters specified.
+
+Heredoc tags and terminator lines are both NFC-normalized, so a
+composed tag matches a decomposed terminator and vice versa.  This
+is a **deliberate deviation from Perl's behavior** — Perl does
+byte-exact terminator matching with no normalization, meaning a
+composed tag will not match a decomposed terminator even though they
+represent the same text.  PerlOxide normalizes both sides because
+the byte-exact behavior is a source of subtle bugs when editors or
+version control systems silently renormalize Unicode text.
+
+NFC normalization is one of several usability-motivated deviations
+from strict Perl compatibility.  A PerlOxide-specific pragma (name
+TBD) will be provided to disable such deviations for programs that
+require strict byte-for-byte Perl compatibility.
+
+**`effective_utf8` fast path:**
+
+Most lines in typical Perl source are pure ASCII, even under
+`use utf8`.  The `effective_utf8` flag is a composite of
+`utf8_mode && !current_line.ascii_only`, recomputed whenever a new
+line is loaded or the UTF-8 pragma changes.  When false, all UTF-8
+decoding, XID checks, and NFC normalization are skipped — the entire
+line uses the fast ASCII code path.
+
+The `ascii_only` flag on `LexerLine` is computed for free during
+newline scanning (a single pass over the line bytes that's needed
+anyway for line splitting).  The flag is specific to the current
+line, so a non-ASCII line within an otherwise-ASCII file correctly
+activates the UTF-8 code path for just that line.
+
+Update sites for `effective_utf8` (2 total):
+- `peek_byte` — the single line-loading funnel
+- `set_utf8_mode()` — called by the parser when pragmas change
+
+The parser syncs `utf8_mode` and the full `Features` bitflags to
+the lexer whenever pragmas change (at `use`/`no` declarations and
+at block exit when saved pragmas are restored).
+
+**Unicode paired delimiters:**
+
+Under `use feature 'extra_paired_delimiters'` (Perl 5.36+), all
+321 Unicode paired delimiter pairs from the `Bidi_Mirroring_Glyph`
+property are available for quote-like operators: `q«hello»`,
+`m⟨pattern⟩`, `s《from》《to》`, etc.
+
+The delimiter table is stored as two packed `&'static str` constants
+(`DELIM_OPEN` and `DELIM_CLOSE`, 997 UTF-8 bytes each) ordered with
+the four ASCII pairs first.  Lookup uses SIMD-optimized `memmem`
+(from the `memchr` crate) to search for the open delimiter's UTF-8
+encoding in the packed table.  The close delimiter is at the same
+byte offset in `DELIM_CLOSE` — this works because every open/close
+pair has the same UTF-8 byte length (a consequence of UTF-8 length
+being determined by codepoint range, and no pair crossing a range
+boundary).
+
+The `extra_paired_delimiters` feature flag controls how much of the
+table is searched: without the feature, only the first 4 bytes
+(ASCII pairs) are checked; with the feature, the full 997 bytes.
+ASCII pairs always work regardless of the feature flag.
+
+The `Features` bitflags are synced from the parser's `Pragmas` to
+the lexer's `features` field at pragma change points, making them
+available to `matching_delimiter()`, `is_paired()`, and all
+quote-like scanning functions without requiring the full `Pragmas`
+struct.
 
 ---
 
@@ -1477,13 +1620,23 @@ Expression parsing uses precedence climbing (the Pratt algorithm)
 with clear naming that avoids the original paper's cryptic
 terminology.
 
-**Three core components on `Parser`:**
+**Core components on `Parser`:**
+
+`parse_expr(min_prec)` — the main entry point for expressions.
+Increments the recursion depth guard (`with_descent`), calls
+`parse_term()` to get the initial left-hand side, then delegates to
+`parse_expr_continuation` for the operator loop.
+
+`parse_expr_continuation(left, min_prec)` — the Pratt operator loop.
+Separated from `parse_expr` so the parser can pass a pre-consumed
+left-hand side (e.g. when a consumed identifier turns out to be the
+first term of an expression rather than a label or filehandle).
 
 `parse_term` — called when the parser expects the start of an
 expression.  Dispatches on the current token via a match: literals
 return AST nodes directly, prefix operators recurse into
 `parse_expr`, keywords like `if` and `sub` call dedicated helper
-methods.  Complex arms call out to helpers (`parse_if`,
+methods.  Complex arms call out to helpers (`parse_if_stmt`,
 `parse_while`, `parse_sub_decl`, etc.) for readability.
 
 `parse_operator` — called when the parser has a left-hand expression
@@ -1498,10 +1651,6 @@ returns `Option<OpInfo>`.  `None` means the token is not valid in
 operator position (the expression ends here).  `Some(info)` provides
 the precedence and associativity for the precedence comparison.
 
-Parser position (term vs operator) is determined independently of
-plugin behavior.  Plugins only affect how tokens are interpreted
-within a given position — they cannot override the position itself.
-
 **The expression loop:**
 
 ```rust
@@ -1511,14 +1660,23 @@ fn parse_expr(
     &mut self,
     min_prec: Precedence,
 ) -> Result<Expr, ParseError> {
-    let mut left = self.parse_term()?;
+    self.with_descent(|this| {
+        let left = this.parse_term()?;
+        this.parse_expr_continuation(left, min_prec)
+    })
+}
 
-    while let Some(info) = self.peek_op_info()
-        && info.left_prec() >= min_prec
-    {
+fn parse_expr_continuation(
+    &mut self,
+    mut left: Expr,
+    min_prec: Precedence,
+) -> Result<Expr, ParseError> {
+    while let Some(info) = self.peek_op_info() {
+        if info.left_prec() < min_prec {
+            break;
+        }
         left = self.parse_operator(left, info)?;
     }
-
     Ok(left)
 }
 ```
@@ -1537,14 +1695,36 @@ so would silently break associativity.  This invariant ensures that
 precedence and associativity are enforced uniformly across all
 operators.
 
-**Nesting depth control (future):**
+The split into `parse_expr` and `parse_expr_continuation` enables
+the forward-only parsing pattern (§6.5): when the parser consumes
+a token that might be a label, filehandle, or first term, it can
+pass the already-built expression into `parse_expr_continuation`
+instead of rewinding and re-parsing.
 
-A nesting depth limit will be added to guard against adversarial
-input (deeply nested expressions, blocks within blocks).  This is
-not yet implemented — the current parser relies on Rust's stack
-depth.  The planned approach is a `descend()` check at each
-recursive entry point, with a configurable `max_depth` high enough
-to exceed Perl 5's actual limits (YYMAXDEPTH = 10,000).
+**Nesting depth control:**
+
+A `ParseDepth` counter (`u16`) is incremented on every recursive
+entry via `with_descent`.  If the counter would exceed `MAX_DEPTH`
+(10,000), the parser returns an error without recursing — this
+prevents stack overflow on adversarial input (deeply nested
+expressions, blocks within blocks).  `MAX_DEPTH` is set high enough
+to exceed Perl 5's actual limits (`YYMAXDEPTH = 10,000`).
+
+```rust
+pub type ParseDepth = u16;
+const MAX_DEPTH: ParseDepth = 10_000;
+
+fn with_descent<T, F>(&mut self, f: F) -> Result<T, ParseError>
+where F: FnOnce(&mut Self) -> Result<T, ParseError> {
+    if self.depth + 1 >= MAX_DEPTH {
+        return Err(ParseError::new("expression too deeply nested", ...));
+    }
+    self.depth += 1;
+    let result = f(self);
+    self.depth -= 1;
+    result
+}
+```
 
 **Precedence and associativity table:**
 
@@ -1565,11 +1745,11 @@ struct OpInfo {
 }
 
 impl OpInfo {
-    fn left_prec(&self) -> Precedence {
+    fn left_prec(self) -> Precedence {
         self.prec
     }
 
-    fn right_prec(&self) -> Precedence {
+    fn right_prec(self) -> Precedence {
         match self.assoc {
             Assoc::Left | Assoc::Non => self.prec + 1,
             Assoc::Right => self.prec,
@@ -1598,164 +1778,108 @@ Precedence values use even numbers so that `right_prec` (which adds
 1 for left/non-associative) fits cleanly:
 
 ```rust
-const PREC_LOW: Precedence = 0;       // statement boundary
-const PREC_OR_LOW: Precedence = 2;    // or
-const PREC_AND_LOW: Precedence = 4;   // and
-const PREC_NOT_LOW: Precedence = 6;   // not (prefix)
-const PREC_LIST: Precedence = 8;      // list operators
-const PREC_COMMA: Precedence = 10;    // , =>
-const PREC_ASSIGN: Precedence = 12;   // = += -= etc.
-const PREC_TERNARY: Precedence = 14;  // ?:
-const PREC_RANGE: Precedence = 16;    // .. ...
-const PREC_OR: Precedence = 18;       // || //
-const PREC_AND: Precedence = 20;      // &&
-const PREC_BIT_OR: Precedence = 22;   // | ^
-const PREC_BIT_AND: Precedence = 24;  // &
-const PREC_EQ: Precedence = 26;       // == != eq ne <=> cmp
-const PREC_REL: Precedence = 28;      // < > <= >= lt gt le ge
-const PREC_SHIFT: Precedence = 30;    // << >>
-const PREC_ADD: Precedence = 32;      // + - .
-const PREC_MUL: Precedence = 34;      // * / % x
-const PREC_BINDING: Precedence = 36;  // =~ !~
-const PREC_UNARY: Precedence = 38;    // ! ~ \ - + (prefix)
-const PREC_POW: Precedence = 40;      // **
-const PREC_INC: Precedence = 42;      // ++ -- (postfix)
-const PREC_ARROW: Precedence = 44;    // ->
-
-fn peek_op_info(&self) -> Option<OpInfo> {
-    match self.peek() {
-        Token::Keyword(Keyword::Or) => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
-        Token::Keyword(Keyword::And) => Some(OpInfo { prec: PREC_AND_LOW, assoc: Assoc::Left }),
-        Token::Comma | Token::FatComma => Some(OpInfo { prec: PREC_COMMA, assoc: Assoc::Left }),
-        Token::Assign(_) => Some(OpInfo { prec: PREC_ASSIGN, assoc: Assoc::Right }),
-        Token::Question => Some(OpInfo { prec: PREC_TERNARY, assoc: Assoc::Right }),
-        Token::DotDot | Token::DotDotDot => Some(OpInfo { prec: PREC_RANGE, assoc: Assoc::Non }),
-        Token::OrOr | Token::DefinedOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
-        Token::AndAnd => Some(OpInfo { prec: PREC_AND, assoc: Assoc::Left }),
-        Token::BitOr | Token::BitXor => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
-        Token::BitAnd => Some(OpInfo { prec: PREC_BIT_AND, assoc: Assoc::Left }),
-        Token::NumEq | Token::NumNe | Token::Spaceship
-            | Token::StrEq | Token::StrNe | Token::StrCmp
-            => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
-        Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe
-            | Token::StrLt | Token::StrGt | Token::StrLe | Token::StrGe
-            => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non }),
-        Token::ShiftL | Token::ShiftR => Some(OpInfo { prec: PREC_SHIFT, assoc: Assoc::Left }),
-        Token::Plus | Token::Minus | Token::Dot => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
-        Token::Star | Token::Slash | Token::Percent | Token::X
-            => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
-        Token::Binding | Token::NotBinding => Some(OpInfo { prec: PREC_BINDING, assoc: Assoc::Left }),
-        Token::Power => Some(OpInfo { prec: PREC_POW, assoc: Assoc::Right }),
-        Token::PlusPlus | Token::MinusMinus => Some(OpInfo { prec: PREC_INC, assoc: Assoc::Non }),
-        Token::Arrow => Some(OpInfo { prec: PREC_ARROW, assoc: Assoc::Left }),
-        _ => None,
-    }
-}
+const PREC_LOW: Precedence = 0;           // statement boundary
+const PREC_OR_LOW: Precedence = 2;        // or, xor
+const PREC_AND_LOW: Precedence = 4;       // and
+const PREC_NOT_LOW: Precedence = 6;       // not (prefix)
+const PREC_LIST: Precedence = 8;          // list operators
+const PREC_COMMA: Precedence = 10;        // , =>
+const PREC_ASSIGN: Precedence = 12;       // = += -= etc.
+const PREC_TERNARY: Precedence = 14;      // ?:
+const PREC_RANGE: Precedence = 16;        // .. ...
+const PREC_OR: Precedence = 18;           // || // ^^
+const PREC_AND: Precedence = 20;          // &&
+const PREC_BIT_OR: Precedence = 22;       // | ^ ~| ~^
+const PREC_BIT_AND: Precedence = 24;      // & ~&
+const PREC_EQ: Precedence = 26;           // == != eq ne <=> cmp ~~
+const PREC_REL: Precedence = 28;          // < > <= >= lt gt le ge
+const PREC_ISA: Precedence = 29;          // isa (feature-gated)
+const PREC_NAMED_UNARY: Precedence = 30;  // named unary operators
+const PREC_SHIFT: Precedence = 32;        // << >>
+const PREC_ADD: Precedence = 34;          // + - .
+const PREC_MUL: Precedence = 36;          // * / % x
+const PREC_BINDING: Precedence = 38;      // =~ !~
+const PREC_UNARY: Precedence = 40;        // ! ~ \ - + (prefix)
+const PREC_POW: Precedence = 42;          // **
+const PREC_INC: Precedence = 44;          // ++ -- (postfix)
+const PREC_ARROW: Precedence = 46;        // ->
 ```
+
+`PREC_ISA` (29, odd) sits between relational and shift, matching
+Perl 5.32+'s `isa` operator placement.  `PREC_NAMED_UNARY` (30)
+gives named unary operators (`defined`, `ref`, `chomp`, etc.)
+their correct precedence.
 
 Prefix operators do not have associativity — they have only a right
 precedence that controls how tightly they bind to their operand.
 This is a separate lookup used inside `parse_term`, not part of the
 infix precedence table.
 
-**Plugin integration:**
-
-Standard tokens are dispatched via match arms in `parse_term`,
-`parse_operator`, and `peek_op_info`.  User-defined syntax
-extensions (keyword plugins, infix plugins from §6.4) are handled
-as a fallthrough at the end of the match:
-
-```rust
-fn parse_term(&mut self) -> Result<Expr, ParseError> {
-    let spanned = self.advance()?;
-    match spanned.token {
-        Token::IntLit(n) => Ok(Expr { kind: ExprKind::IntLit(n), span: spanned.span }),
-        Token::Keyword(Keyword::If) => self.parse_if_expr(spanned.span),
-        // ... all standard tokens ...
-
-        // Plugin fallthrough
-        Token::Ident(name) => {
-            if let Some(plugin) = self.keyword_plugin(&name) {
-                plugin.parse(self.as_parser_context())
-            } else {
-                // ... standard bareword handling ...
-            }
-        }
-        _ => Err(ParseError::new("expected expression", spanned.span)),
-    }
-}
-```
-
-Plugins use trait objects for dynamic dispatch (`Box<dyn
-KeywordPlugin>`).  Standard tokens use static match arms.  The
-overhead of trait object dispatch applies only to plugin-defined
-syntax, not to the core language.
-
 **Layer separation:**
 
 The parser operates on three cleanly separated layers:
 
-1. **Tokenization** resolves context-sensitive lexical ambiguities
-   (regex vs division, block vs hash, bareword vs keyword) using the
-   `Expect` state.  The result is a token stream whose variants
-   already encode those decisions.
+1. **Tokenization** produces consistent, unambiguous tokens.  A `/`
+   is always `Token::Slash`, a `{` is always `Token::LeftBrace`.
+   The lexer does not pre-decide semantic meaning — it produces the
+   same token regardless of parser context.
 
 2. **Parser position** (term vs operator) determines which parse
-   method is called.  `parse_term` handles tokens at the start of
-   an expression.  `parse_operator` handles tokens after a left-hand
-   expression.  `peek_op_info` determines whether an operator
-   binds in the current context.
+   method is called and how each token is interpreted.  `parse_term`
+   handles tokens at the start of an expression (so `Token::Slash`
+   means regex).  `parse_operator` handles tokens after a left-hand
+   expression (so `Token::Slash` means division).  `peek_op_info`
+   determines whether an operator binds in the current context.
 
 3. **Construct-specific parsing** handles the interior of each
-   syntactic form.  `parse_if`, `parse_while`, `parse_sub_decl`,
+   syntactic form.  `parse_if_stmt`, `parse_while`, `parse_sub_decl`,
    and similar helpers are plain recursive descent, called from
    `parse_term` arms.  They call `parse_expr` for sub-expressions,
-   completing the mutual recursion.
+   completing the mutual recursion.  Some make decisions after
+   recursive calls return — for example, `try_reclassify_as_hash`
+   inspects a parsed block to determine whether it should be
+   reinterpreted as a hash constructor.  This post-hoc
+   reclassification is impossible in Perl 5's LALR(1) grammar,
+   which must decide before the production is entered.
 
-Lexical context determines which token variant is produced.
 Parser position determines which parse method is called.
-A parse method does not inspect lexer expectation state.
+A parse method does not inspect any shared lexer state — the parser's
+own call stack is the context.
 
-Although the parser is Pratt-style and token-directed in structure,
-parse dispatch is parser-owned.  Token variants encode lexical
-disambiguation; `Parser` methods interpret those variants by match
-dispatch in `parse_term`, `parse_operator`, and `peek_op_info`.
+### 6.2 Parser–Lexer Communication
 
-### 6.2 Parser–Lexer Feedback
+The parser communicates with the lexer exclusively through explicit
+method calls (see §5.2 for the full list).  There is no shared
+mutable state, no `Expect` enum, and no re-lexing.
 
-After consuming each token or completing a syntactic construct, the
-parser must update the `Expect` state (§5.2).  This is not optional.
-Examples:
+The primary lexer method is `lex_token()`, which the parser calls
+through `next_token()` (which wraps `lex_token` with one-token
+lookahead buffering).  For context-sensitive scanning, the parser
+calls specialized lexer methods directly:
 
-- After consuming a token classified as a named unary or list
-  operator (e.g., `print`, `die`, `chomp`): set to `Term`
-  (the next thing is an argument list, so `/` is a regex, not
-  division).
-- After completing a term or postfix expression: set to `Operator`.
-- After parsing a construct that requires a following block
-  (e.g., `if (expr)`, `while (expr)`, `for ...`): set to
-  `Block(Statement)`.
-- After parsing `sub name` (where a body may follow): set to
-  `Block(Operator)`.  Attributes are handled by the parser's call
-  structure, not the expectation state.
-- After consuming a sigil for dereference: set to `Deref`.
-- After consuming a filetest operator (`-f`): keep as `Term`.
-  The defined-or preference is handled by
-  `prefers_defined_or()` — no special expect state needed.
+- After seeing `<<` in `parse_term`, the parser calls
+  `lex_heredoc_after_shift_left()` which either returns a heredoc
+  token or `None` (indicating shift-left).
+- After `sub name`, the parser calls `lex_body_str('(', true)` to
+  scan a prototype as a raw string.
+- After collecting the pattern body of `s///`, the parser calls
+  `start_subst_replacement(delim)` to partition the replacement body.
+- After closing a regex or substitution, the parser calls
+  `scan_adjacent_word_chars()` to collect modifier flags.
+- In hash subscript context, the parser calls
+  `try_autoquoted_bareword_subscript()` to check for `$hash{word}`.
 
-Since the lexer and parser share the `Parser` struct, this is a
-field assignment (e.g., `self.expect = Expect::Term`) at the
-appropriate points in `parse_term`, `parse_operator`, and their
-helpers.  No cross-object communication is needed.
+The parser also syncs pragma and feature state to the lexer at
+pragma change points:
 
-**Planned: Replacing feedback with explicit mode calls.**  The
-`Expect`-based feedback loop is a vestige of Perl 5's LALR(1)
-architecture.  The planned forward-only parser design (§6.6)
-eliminates the shared `Expect` state entirely.  Instead of the parser
-setting `self.expect` and the lexer reading it, the parser calls the
-appropriate lexer method directly: `lex_term_token()` in term
-position, `lex_operator_token()` in operator position.  The call
-stack is the context.  See §5.2 (Planned) and §6.6 for details.
+```rust
+self.lexer.set_utf8_mode(self.pragmas.utf8);
+self.lexer.features = self.pragmas.features;
+```
+
+This happens at `use`/`no` declarations and at block exit when
+saved pragmas are restored.  The lexer reads these fields for
+Unicode identifier support and paired delimiter lookup.
 
 ### 6.3 Prototype-Guided Parsing
 
@@ -1769,9 +1893,12 @@ Prototypes change the parsing:
 - no prototype — standard list operator parsing
 
 This requires symbol table access from the parser, reinforcing the
-co-resident compiler/runtime architecture.
+co-resident compiler/runtime architecture.  The prototype data
+structures exist (`SubPrototype`, `ProtoSlot` in the `symbol`
+module), but full prototype-guided argument list parsing is not yet
+implemented.
 
-### 6.4 Syntax Extension API
+### 6.4 Syntax Extension API (Planned)
 
 Perl 5 modules like `Syntax::Keyword::Try`, `Syntax::Keyword::Match`,
 `Object::Pad`, `Syntax::Operator::ExistsOr`, and
@@ -1797,33 +1924,17 @@ The Perl 5 C implementation provides three mechanisms:
    `parse_arithexpr`, etc.  These let plugins manipulate the lexer
    buffer and recursively invoke the parser to parse sub-expressions.
 
-The Rust implementation should provide all three, redesigned as
+The Rust implementation will provide all three, redesigned as
 trait-based APIs rather than global function pointers.
 
 **Keyword extension trait:**
 
 ```rust
 trait KeywordPlugin: Send + Sync {
-    /// Called when the lexer encounters this keyword.
-    /// Returns None to decline, Some(expr/stmt) to handle.
     fn parse(
         &self,
         parser: &mut ParserContext,
     ) -> Option<PluginResult>;
-}
-
-enum PluginResult {
-    Expr(AstNode),    // produces a term (like PLUGEXPR)
-    Stmt(AstNode),    // produces a statement (like PLUGSTMT)
-}
-```
-
-Extensions register keywords at load time:
-
-```rust
-fn init(&self, compiler: &mut Compiler) {
-    compiler.register_keyword("try", Box::new(TryKeywordPlugin));
-    compiler.register_keyword("match", Box::new(MatchKeywordPlugin));
 }
 ```
 
@@ -1842,20 +1953,6 @@ trait InfixPlugin: Send + Sync {
         lhs: AstNode,
         rhs: AstNode,
     ) -> AstNode;
-
-    /// If true and the parser is in term position, this symbol
-    /// produces a term (closure, prefix construct) instead of
-    /// being an infix operator.  This fixes the Perl 5 limitation
-    /// that prevents bare |args| closures.
-    fn term_in_term_position(&self) -> bool { false }
-
-    /// Build the term AST when in term position.
-    /// Only called when `term_in_term_position()` returns true
-    /// and the parser is expecting a term.
-    fn build_term(
-        &self,
-        parser: &mut ParserContext,
-    ) -> Option<AstNode> { None }
 }
 ```
 
@@ -1864,170 +1961,77 @@ operators: look up the registered `OpInfo`, compute `right_prec()`
 from the precedence and associativity, parse both operands, and
 call the plugin's `build_op` with the results.  The plugin never
 touches precedence mechanics — the Pratt contract is enforced
-entirely by the core parser.  This makes it impossible for a plugin
-to accidentally break precedence or associativity.
-
-When a token has both built-in and plugin-defined behavior, the
-plugin takes precedence.  This allows plugins to override built-in
-operators (e.g., replacing `|` with a dual-mode version).  When
-multiple plugins register the same symbol, they are consulted in
-registration order; the first registered plugin for the symbol is
-used.
-
-`peek_op_info` consults both the built-in operator table and
-registered plugin operators, so plugin operators participate in
-precedence comparison on equal footing with built-ins.
-
-The `term_in_term_position` method is the key improvement over Perl 5.
-It lets a single symbol like `|` act as an infix operator in operator
-position and as a term-producing prefix in term position — exactly the
-`/` (division vs regex) pattern that Perl's own lexer already uses
-internally but does not expose to plugins.
-
-Note: the `|` closure example is an extension capability
-demonstration, not a claim about Perl core syntax.
+entirely by the core parser.
 
 Precedence and associativity are provided at registration time, not
 as a trait method — this makes operator metadata explicit at the
-registration point and decouples it from parse behavior:
+registration point and decouples it from parse behavior.
 
-```rust
-compiler.register_infix_operator(
-    "\\\\",    // the \\ symbol from ExistsOr
-    OpInfo { prec: 16, assoc: Assoc::Left },
-    Box::new(ExistsOrPlugin),
-);
+### 6.5 Forward-Only Parsing
 
-compiler.register_infix_operator(
-    "|",      // dual-mode: bitwise-or in op position, closure in term position
-    OpInfo { prec: 18, assoc: Assoc::Left },
-    Box::new(ClosureOrBitOrPlugin),
-);
-```
+The parser never backtracks.  Every ambiguity is resolved by
+consuming the current token and branching on what follows.  No
+checkpoints, no restore, no re-lex.
 
-**Parser context API:**
+The design evolved from an initial architecture that mirrored
+Perl 5's expectation state model (with improvements).  As the
+recursive descent parser matured, it became clear that the shared
+`Expect` state and re-lex machinery were unnecessary — the parser's
+own control flow could resolve every ambiguity that the lexer had
+been pre-deciding.  The expectation state was removed entirely,
+yielding a cleaner architecture where the lexer produces consistent
+tokens and the parser interprets them based on its grammatical
+position.
 
-The `ParserContext` passed to plugins provides the recursive descent
-API that plugins need to parse sub-expressions.  `ParserContext`
-manages `ParseDepth` internally — it calls `descend` on each
-recursive entry point, so plugins participate in the same nesting
-limit as the core parser without threading depth explicitly.
-`ParserContext` is a thin mutable façade over the active `Parser`,
-not a separate parser instance:
+**Consume-then-decide pattern.**  Every potentially ambiguous
+construct follows the same principle: consume the token, look at
+what follows, and branch.  When the consumed token turns out to be
+the first element of an expression rather than a special syntactic
+marker (label, filehandle, keyword), it is passed into
+`parse_expr_continuation` as a pre-consumed initial term.
 
-```rust
-impl ParserContext {
-    /// Parse a full expression (lowest precedence).
-    fn parse_full_expr(&mut self) -> Result<AstNode>;
+**Label vs expression statement.**  When `parse_statement` sees an
+identifier, it consumes it.  If the next token is `:`, it's a label
+— parse the labeled statement.  If not, it's the start of an
+expression — wrap it as an `Expr` and pass it to
+`parse_expr_continuation`.
 
-    /// Parse a term expression (highest precedence).
-    fn parse_term_expr(&mut self) -> Result<AstNode>;
+**Fat comma autoquoting.**  Keywords consumed in `parse_term` check
+whether the next token is `FatComma`.  If so, the keyword is
+autoquoted as a string literal.  No speculative peek needed.
 
-    /// Parse an expression at a given minimum precedence.
-    fn parse_expr_at(&mut self, min_prec: Precedence) -> Result<AstNode>;
+**C-style vs list-style `for`.**  After consuming `(` inside `for`,
+the parser parses the first expression.  If it is followed by `;`,
+this is C-style `for` — the expression becomes the initializer.  If
+followed by `)` or `,`, it is list-style — the expression is the
+first element of the iteration list.  The already-parsed expression
+is kept in both cases.
 
-    /// Parse a brace-delimited block.
-    fn parse_block(&mut self) -> Result<AstNode>;
+**Print filehandle detection.**  After `print` or `say`, the parser
+consumes the first token.  If it is a bareword followed by something
+that looks like a term (not `,` or `)` or `;`), it is treated as a
+filehandle.  If it is a scalar variable followed by a clear
+term-start, same treatment.  Otherwise, the consumed token is the
+first argument — passed into expression parsing as the initial term.
 
-    /// Parse a parenthesized parameter list.
-    fn parse_param_list(&mut self) -> Result<Vec<Param>>;
+**Named vs anonymous `sub`.**  After consuming `sub`, the parser
+checks the next token.  If it is an identifier, this is a named sub
+declaration.  If it is `{`, `(`, or `:`, it is an anonymous sub.
+Branch directly.
 
-    /// Check the current token without consuming it.
-    fn peek(&self) -> &Token;
+**Heredoc vs shift-left.**  The parser calls
+`lex_heredoc_after_shift_left()` on the lexer, which inspects the
+bytes after `<<` and either returns a heredoc token (consuming the
+tag) or `None` (the parser proceeds with shift-left).
 
-    /// Consume the current token.
-    fn advance(&mut self) -> Token;
-
-    /// Expect and consume a specific token, or error.
-    fn expect_token(&mut self, kind: TokenKind) -> Result<Token>;
-
-    /// Check whether the parser is in term or operator position.
-    fn expecting_term(&self) -> bool;
-
-    /// Access the lexer buffer for low-level manipulation
-    /// (equivalent to lex_stuff_pvn, lex_unstuff).
-    fn lexer_mut(&mut self) -> &mut LexerContext;
-
-    /// Access the symbol table for name resolution.
-    fn symbol_table(&self) -> &SymbolTable;
-}
-```
-
-**Precedence levels matching Perl 5:**
-
-Precedence levels are `u8` values with gaps for future insertion.
-Plugin operators register at a specific level from this table:
-
-```rust
-// Approximate mapping (illustrative, not final):
-//  2  or
-//  4  and
-//  6  not (prefix)
-//  8  comma, =>
-// 10  assignment (=, +=, etc.)
-// 12  ternary (?:)
-// 14  range (..)
-// 16  || //
-// 18  &&
-// 20  | (bitwise)
-// 22  & (bitwise)
-// 24  == != eq ne <=> cmp
-// 26  < > <= >= lt gt le ge
-// 28  << >>
-// 30  + -
-// 32  * / % x
-// 34  =~ !~
-// 36  ! ~ \ (prefix unary)
-// 38  **
-// 40  ++ -- (pre/postfix)
-// 42  -> (arrow)
-```
-
-Plugin slots for custom operators at specific levels:
-
-```rust
-compiler.register_infix_operator(
-    "\\\\",    // ExistsOr
-    OpInfo { prec: 16, assoc: Assoc::Left },  // same level as ||
-    Box::new(ExistsOrPlugin),
-);
-```
-
-**Advantages over Perl 5's mechanism:**
-
-- **Type-safe.**  Plugins implement traits with typed signatures,
-  not void-pointer callbacks.
-- **Composable.**  Multiple plugins can register for the same
-  keyword/operator with dispatch chains, rather than requiring manual
-  chaining of global function pointers.
-- **Term-aware infix.**  The `term_in_term_position` flag solves the
-  `|`-as-closure problem that Perl 5's `PL_infix_plugin` cannot
-  handle (see §15.4).
-- **No global mutable state.**  Plugin registrations live in the
-  compiler/interpreter instance, not in global variables.  This is
-  thread-safe by construction.
-- **Rich parser context.**  Plugins get a `ParserContext` with typed
-  methods for recursive parsing, rather than manipulating raw buffer
-  pointers.
-
-**Compatibility with Perl 5 plugin modules:**
-
-Existing Perl 5 `Syntax::*` modules are implemented in C/XS and
-cannot be loaded directly.  However, the Rust equivalents should be
-straightforward to write because the extension API provides the same
-capabilities (keyword registration, infix operators, recursive
-parsing) with a cleaner interface.  A compatibility guide mapping
-Perl 5 plugin API calls to Rust trait methods would assist module
-authors in porting their extensions.
-
-### 6.5 Brace Disambiguation
+### 6.6 Brace Disambiguation
 
 **The problem.** When the parser encounters `{` at statement level,
 it could be a block (`{ print 1; print 2 }`) or an anonymous hash
 constructor (`{ key => "value" }`).  In Perl 5, the LALR(1) parser
 requires a distinct token type before it can select a grammar
-production, so `toke.c` runs a ~170-line byte-level heuristic
-(`yyl_leftcurly`, lines 6400–6471) that scans ahead through the raw
+production, so `toke.c` runs a ~200-line byte-level heuristic
+(`yyl_leftcurly`, lines 6304–6507 in v5.42.2) that scans ahead through the raw
 source, manually skipping whitespace, comments, string literals,
 q-quotes with paired/unpaired delimiters, and barewords.  It then
 checks whether the first term is followed by `,` or `=>` to guess
@@ -2036,23 +2040,18 @@ current line reliably, and disagrees with programmer intent in edge
 cases (e.g. `{@pairs}` at statement level is classified as a block
 even when a hash constructor was intended).
 
-**The current implementation** mirrors Perl's approach: the lexer
-emits `HashBrace` or `LBrace` based on the heuristic, and the parser
-dispatches on the token.  This requires the `Expect` state, the
-re-lex mechanism, checkpoint/restore with heredoc stack management,
-and a cross-line raw source slice for the heuristic.
-
-**The planned approach: parse as block, reclassify.**  The recursive
+**The implementation: parse as block, reclassify.**  The recursive
 descent parser is not constrained by LALR(1) token-driven dispatch.
 The key insight is that hash constructor content is always valid as
 block content — a block containing a single expression statement.
 The converse is not true: multi-statement or keyword-bearing content
 cannot be a hash.  This asymmetry enables a simple strategy:
 
-1. The lexer always emits `LBrace` for `{`.  `HashBrace` is deleted.
+1. The lexer always emits `LeftBrace` for `{`.  There is no
+   `HashBrace` token — the lexer never pre-decides brace meaning.
 
 2. In term position (`$x = {`, `foo({`, after `,`, after `=>`),
-   `parse_term` sees `LBrace` and calls hash constructor parsing
+   `parse_term` sees `LeftBrace` and calls hash constructor parsing
    directly.  No heuristic needed — context is unambiguous.
 
 3. In block position (`if (...) {`, `sub name {`, `eval {`),
@@ -2060,157 +2059,43 @@ cannot be a hash.  This asymmetry enables a simple strategy:
 
 4. At statement level — the only ambiguous case — `parse_statement`
    always calls `parse_block`.  After the block is parsed, the
-   result is inspected:
+   result is inspected by `try_reclassify_as_hash`:
 
+   - Empty block → empty hash (`{}`).
    - Multiple statements → block.
    - Any statement terminated by a semicolon → block.
    - Any non-expression statement (`my`, `if`, `for`, labels, etc.)
      → block.
    - A single unterminated expression statement → candidate for
-     reclassification as a hash constructor.
+     reclassification.
 
-5. Reclassification of single-expression blocks uses token-level
-   heuristics on the parsed AST, which have strictly more information
-   than Perl's byte-level scan:
+5. Reclassification of single-expression blocks uses AST-level
+   heuristics, which have strictly more information than Perl's
+   byte-level scan:
 
    - Expression contains a top-level `=>` (fat comma) → hash.
-   - Expression is a comma-list where the first element is a string
-     literal, a q-quote, or a non-lowercase bareword → hash.
-   - Expression is a function call, complex expression, or lowercase
-     bareword followed by arguments → block.
+   - Expression ends with fat comma or `}` follows fat comma → hash.
+   - Otherwise → block.
 
-   These rules replicate Perl's behavior for all common cases.  Edge
-   cases where they differ are cases where Perl's byte heuristic was
-   guessing incorrectly and the token-level heuristic can be more
-   accurate.
+   These rules replicate Perl's behavior for all common cases.
 
-6. `parse_expr_statement` must track whether a semicolon was consumed,
+6. `parse_expr_statement` tracks whether a semicolon was consumed,
    since this is the primary signal distinguishing block from hash
    content.  The terminated/unterminated distinction is recorded and
    available to the reclassification logic.
 
 **The `+{...}` idiom.**  Perl programmers force hash constructor
 interpretation with `+{ ... }`, where the unary `+` is a no-op that
-places `{` in term position.  This works automatically in the
-architecture: `+` is a prefix operator, `parse_term` is called for
-its operand, sees `LBrace`, and parses as a hash constructor.  No
-special case needed.
+places `{` in term position.  This works automatically: `+` is a
+prefix operator, `parse_term` is called for its operand, sees
+`LeftBrace`, and parses as a hash constructor.  No special case
+needed.
 
 **Bug-for-bug compatibility.**  The reclassification heuristic is
 tuned to match Perl's behavior, not to be theoretically optimal.
 Cases like `{@pairs}` at statement level will be classified as a
 block, matching Perl, even though a human might intend a hash
 constructor.  The `+{@pairs}` workaround applies identically.
-
-This change eliminates `Token::HashBrace`, the `looks_like_hash_content`
-byte-level heuristic, the `skip_ws_bytes` helper, the cross-line raw
-source slice access, and the `{`-related re-lex path — the primary
-source of complexity in the checkpoint/restore mechanism.
-
-### 6.6 Forward-Only Parser Design
-
-**The problem.** The current parser uses speculative lookahead in
-several places: `ensure_current` re-lexes tokens when the `Expect`
-state changes, and helper methods like `is_fat_comma_after_keyword`,
-`is_label_ahead`, `is_named_sub_ahead`, `is_c_style_for`, and
-`try_parse_print_filehandle` use checkpoint/restore to peek at future
-tokens.  This requires saving and restoring the lexer's full state —
-current line position, source cursor, context stack depth, and
-heredoc stack depth.  The interaction between speculative lexing and
-heredoc state is particularly fragile: a speculative lex of `<<TAG`
-calls `start_heredoc` as a side effect, which must be undone on
-restore.
-
-**The target: consume then decide.**  Every speculative lookahead can
-be replaced by consuming the current token and branching on what
-follows.  The parser moves strictly forward.  No checkpoints, no
-restore, no re-lex.
-
-**Replacement for each current speculative lookahead:**
-
-1. **`ensure_current` re-lex (Expect mismatch).**  Eliminated
-   entirely by removing the `Expect` state.  The parser calls
-   explicit lexer methods (`lex_term_token`, `lex_operator_token`)
-   that always produce the correct token for the context.  No token
-   is ever lexed speculatively and discarded.
-
-2. **`is_fat_comma_after_keyword`.**  Currently the parser peeks the
-   keyword, speculatively lexes the next token, checks for `=>`, and
-   restores.  Replacement: consume the keyword in `parse_term`.  If
-   the next token is `FatComma`, autoquote the keyword as a string.
-   This already happens in `parse_term` — the statement-level check
-   in `parse_statement` can simply dispatch keywords through
-   `parse_expr_statement`, and `parse_term` handles the autoquoting.
-
-3. **`is_label_ahead`.**  Currently peeks the `Ident`, speculatively
-   lexes the next token, checks for `:`, and restores.  Replacement:
-   consume the `Ident`.  If the next token is `:`, it is a label —
-   parse the labeled statement.  If not, it is the start of an
-   expression — pass the already-consumed `Ident` into expression
-   parsing as the initial term.  This requires `parse_expr` to
-   accept an optional pre-consumed left-hand side.
-
-4. **`is_named_sub_ahead`.**  Currently peeks `sub`, speculatively
-   lexes the next token, checks for `Ident`, and restores.
-   Replacement: consume `sub`.  If the next token is an identifier,
-   it is a named sub declaration.  If it is `{` or `(`, it is an
-   anonymous sub.  Branch directly.
-
-5. **`try_parse_print_filehandle`.**  Currently peeks the first
-   argument token, speculatively lexes the second, checks whether
-   the combination looks like a filehandle, and restores.
-   Replacement: consume the first token.  If it is a bareword and
-   the next token is not `,`, treat it as a filehandle.  If it is
-   a scalar variable and the next token is a clear term-start
-   (string, variable, paren, keyword), treat it as a filehandle.
-   Otherwise, it is the first argument — pass it into expression
-   parsing as the initial term.
-
-6. **`is_c_style_for`.**  Currently lexes tokens inside `(...)`,
-   scanning for `;` at depth 0, then restores all of them.
-   Replacement: parse the first expression inside `(`.  If it is
-   followed by `;`, this is C-style `for`.  If followed by `)` or
-   `,`, it is list-style.  The first expression is kept — it
-   becomes the initializer (C-style) or the first element of the
-   iteration list.
-
-7. **Prototype re-lex for `(`.**  Currently the lexer re-lexes `(`
-   as a prototype scanner when `Expect` is `Prototype`.  Replacement:
-   after `sub name`, the parser calls `self.lexer.lex_prototype()`
-   explicitly.  The lexer provides a dedicated method rather than
-   using `Expect` to switch modes.
-
-**Common pattern.**  Every replacement follows the same principle:
-consume the token, look at what follows, and branch.  When the
-consumed token turns out to be the first element of an expression
-rather than a special syntactic marker (label, filehandle, keyword),
-it is passed into expression parsing as a pre-consumed initial term.
-This avoids rewinding and re-lexing.
-
-**Lexer API simplification.**  With `Expect` eliminated, the lexer
-exposes a small set of explicit mode methods:
-
-- `lex_term_token()` — lex a token in term position.  `/` starts a
-  regex, `<<` starts a heredoc, `{` returns `LBrace`.
-- `lex_operator_token()` — lex a token in operator position.  `/`
-  is division, `<<` is left shift, `{` returns `LBrace`.
-- `lex_interp_token()` — lex inside an interpolating string/heredoc.
-- `lex_prototype()` — scan a raw prototype string inside `(...)`.
-- `lex_regex()` — scan a regex pattern (if separated from the
-  general quote-like scanning).
-
-The parser calls whichever method is appropriate for its current
-production.  No shared mutable state.  No re-lex.  No checkpoints.
-
-**Implementation order.**  This is a multi-step refactoring:
-
-1. Eliminate `HashBrace` and the brace heuristic (§6.5).  This
-   removes the primary re-lex trigger.
-2. Convert each speculative lookahead to consume-then-decide, one at
-   a time, verifying test compatibility at each step.
-3. Once all lookaheads are removed, delete `Expect`, `ExpectNext`,
-   `LexerCheckpoint`, and the checkpoint/restore machinery.
-4. Split `next_token(expect)` into explicit mode methods.
 
 ---
 
