@@ -11413,9 +11413,7 @@ fn q_unicode_delim_body_with_shared_lead_byte() {
     // Memchr triggers on 0xC2 inside the body, but the old
     // byte-by-byte fallback did skip(1) + b as char, splitting
     // the multi-byte £ into two garbled characters.
-    let prog = parse(
-        "use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{00AB}\u{00A3}\u{00BB};"
-    );
+    let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{00AB}\u{00A3}\u{00BB};");
     match &prog.statements[2].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::Assign(_, _, rhs) => match &rhs.kind {
@@ -11431,18 +11429,14 @@ fn q_unicode_delim_body_with_shared_lead_byte() {
 #[test]
 fn subst_unicode_delimiters_paired() {
     // s«pattern»«replacement» with extra_paired_delimiters.
-    let prog = parse(
-        "use utf8; use feature 'extra_paired_delimiters'; my $x = 'hello'; $x =~ s\u{00AB}hell\u{00BB}\u{00AB}heaven\u{00BB};"
-    );
+    let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = 'hello'; $x =~ s\u{00AB}hell\u{00BB}\u{00AB}heaven\u{00BB};");
     assert!(prog.statements.len() >= 3, "expected at least 3 statements");
 }
 
 #[test]
 fn tr_unicode_delimiters_paired() {
     // tr«abc»«ABC» with extra_paired_delimiters.
-    let prog = parse(
-        "use utf8; use feature 'extra_paired_delimiters'; my $x = 'abc'; $x =~ tr\u{00AB}abc\u{00BB}\u{00AB}ABC\u{00BB};"
-    );
+    let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = 'abc'; $x =~ tr\u{00AB}abc\u{00BB}\u{00AB}ABC\u{00BB};");
     assert!(prog.statements.len() >= 3);
 }
 
@@ -11569,4 +11563,127 @@ fn heredoc_indented_bare_unicode_tag() {
         }
         other => panic!("expected string, got {other:?}"),
     }
+}
+
+// ── Apostrophe as package separator ───────────────────────
+
+#[test]
+fn apos_sub_declaration() {
+    // sub Foo'bar { 1 }
+    let prog = parse("sub Foo'bar { 1 }");
+    let sub = prog.statements.iter().find_map(|s| if let StmtKind::SubDecl(sd) = &s.kind { Some(sd) } else { None }).expect("should find sub declaration");
+    assert_eq!(sub.name, "Foo::bar", "sub name should be normalized to Foo::bar");
+}
+
+#[test]
+fn apos_package_declaration() {
+    // package Foo'Bar;
+    let prog = parse("package Foo'Bar;");
+    let pkg =
+        prog.statements.iter().find_map(|s| if let StmtKind::PackageDecl(pd) = &s.kind { Some(pd) } else { None }).expect("should find package declaration");
+    assert_eq!(pkg.name, "Foo::Bar", "package name should be normalized to Foo::Bar");
+}
+
+#[test]
+fn apos_fat_comma_autoquotes() {
+    // Foo'Bar => 1 — fat comma autoquotes as "Foo::Bar"
+    let prog = parse("my %h = (Foo'Bar => 1);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_hash_subscript_autoquoted() {
+    // $h{Foo'Bar} — autoquoted bareword key should be "Foo::Bar"
+    let prog = parse("my %h; $h{Foo'Bar};");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_method_call() {
+    // Foo'Bar->new()
+    let prog = parse("Foo'Bar->new();");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_use_module() {
+    // use Foo'Bar; — module name with apostrophe
+    let prog = parse("use Foo'Bar;");
+    let use_decl = prog.statements.iter().find_map(|s| if let StmtKind::UseDecl(ud) = &s.kind { Some(ud) } else { None }).expect("should find use declaration");
+    assert_eq!(use_decl.module, "Foo::Bar", "module name should be Foo::Bar");
+}
+
+#[test]
+fn apos_hash_var_via_parser() {
+    // %Foo'bar — hash variable via parser's lex_hash_var_after_percent
+    let prog = parse("my %x = %Foo'bar;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_disabled_by_v5_42() {
+    // use v5.42 disables apostrophe_as_package_separator.
+    // With the feature off, Foo'Bar is Foo (bareword) then 'Bar;'
+    // (unterminated string — no closing ').  The parse should fail.
+    let result = crate::parse(b"use v5.42; Foo'Bar;");
+    assert!(result.is_err(), "expected parse error with feature off");
+}
+
+#[test]
+fn apos_enabled_by_default() {
+    // Without use v5.x, apostrophe is enabled by default.
+    let prog = parse("sub Foo'bar { 1 }");
+    let sub = prog.statements.iter().find_map(|s| if let StmtKind::SubDecl(sd) = &s.kind { Some(sd) } else { None }).expect("should find sub");
+    assert_eq!(sub.name, "Foo::bar", "Foo'bar should be normalized to Foo::bar by default");
+}
+
+#[test]
+fn apos_re_enabled_after_v5_42() {
+    // use v5.42, then re-enable the feature.
+    let prog = parse("use v5.42; use feature 'apostrophe_as_package_separator'; sub Foo'bar { 1 }");
+    let sub =
+        prog.statements.iter().find_map(|s| if let StmtKind::SubDecl(sd) = &s.kind { Some(sd) } else { None }).expect("should find sub after re-enabling");
+    assert_eq!(sub.name, "Foo::bar");
+}
+
+#[test]
+fn apos_heredoc_tag_not_separator() {
+    // <<Foo'Bar — apostrophe starts a quoted tag, not a separator.
+    // Perl treats <<Foo as bare tag "Foo", then 'Bar' is a string.
+    let prog = parse("my $x = <<Foo . 'suffix';\nbody\nFoo\n");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_glob_after_star() {
+    // *Foo'bar — glob with apostrophe
+    let tokens = collect_tokens("*Foo'bar;");
+    assert!(tokens.iter().any(|t| matches!(t, Token::Ident(s) if s == "Foo::bar")), "expected Ident(Foo::bar) after *, got tokens: {:?}", tokens);
+}
+
+// ── Apostrophe + UTF-8 ───────────────────────────────────
+
+#[test]
+fn apos_with_utf8_identifier() {
+    // Foo'café under use utf8
+    let tokens = collect_tokens_utf8("use utf8; Foo'caf\u{00E9};");
+    assert!(tokens.iter().any(|t| matches!(t, Token::Ident(s) if s == "Foo::caf\u{00E9}")), "expected Ident(Foo::café) with UTF-8, got tokens: {:?}", tokens);
+}
+
+#[test]
+fn apos_dollar_utf8_after_apos() {
+    // $'café under use utf8
+    let tokens = collect_tokens_utf8("use utf8; $'caf\u{00E9};");
+    assert!(tokens.iter().any(|t| matches!(t, Token::ScalarVar(s) if s == "::caf\u{00E9}")), "expected ScalarVar(::café), got tokens: {:?}", tokens);
+}
+
+#[test]
+fn apos_interp_utf8_in_string() {
+    // "$Foo'café" under use utf8 in string interpolation
+    let tokens = collect_tokens_utf8("use utf8; \"$Foo'caf\u{00E9}\";");
+    assert!(
+        tokens.iter().any(|t| matches!(t, Token::InterpScalar(s) if s == "Foo::caf\u{00E9}")),
+        "expected InterpScalar(Foo::café), got tokens: {:?}",
+        tokens
+    );
 }

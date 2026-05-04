@@ -2413,3 +2413,140 @@ fn matching_delimiter_table_size() {
     assert_eq!(DELIM_OPEN.len(), DELIM_CLOSE.len());
     assert_eq!(DELIM_OPEN.chars().count(), 321);
 }
+
+// ── Apostrophe as package separator ───────────────────────
+
+#[test]
+fn apos_bareword_becomes_colons() {
+    // Foo'Bar → token Ident("Foo::Bar")
+    let tokens = lex_all("Foo'Bar;");
+    assert!(matches!(&tokens[0], Token::Ident(s) if s == "Foo::Bar"), "expected Ident(Foo::Bar), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_chained_becomes_colons() {
+    // A'B'C → Ident("A::B::C")
+    let tokens = lex_all("A'B'C;");
+    assert!(matches!(&tokens[0], Token::Ident(s) if s == "A::B::C"), "expected Ident(A::B::C), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_mixed_with_colons() {
+    // Foo::Bar'Baz → Ident("Foo::Bar::Baz")
+    let tokens = lex_all("Foo::Bar'Baz;");
+    assert!(matches!(&tokens[0], Token::Ident(s) if s == "Foo::Bar::Baz"), "expected Ident(Foo::Bar::Baz), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_scalar_var() {
+    // $Foo'bar → ScalarVar("Foo::bar")
+    let tokens = lex_all("$Foo'bar;");
+    assert!(matches!(&tokens[0], Token::ScalarVar(s) if s == "Foo::bar"), "expected ScalarVar(Foo::bar), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_array_var() {
+    // @Foo'bar → ArrayVar("Foo::bar")
+    let tokens = lex_all("@Foo'bar;");
+    assert!(matches!(&tokens[0], Token::ArrayVar(s) if s == "Foo::bar"), "expected ArrayVar(Foo::bar), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_dollar_ident_is_package_var() {
+    // $'x → ScalarVar("::x") (not POSTMATCH)
+    let tokens = lex_all("$'x;");
+    assert!(matches!(&tokens[0], Token::ScalarVar(s) if s == "::x"), "expected ScalarVar(::x), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_dollar_alone_is_postmatch() {
+    // $' alone (no identifier after) → SpecialVar("'") (POSTMATCH)
+    let tokens = lex_all("$';");
+    assert!(matches!(&tokens[0], Token::SpecialVar(s) if s == "'"), "expected SpecialVar('), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_dollar_digit_is_postmatch() {
+    // $'0 → SpecialVar("'") then IntLit(0) — digit is not isIDFIRST
+    let tokens = lex_all("$'0;");
+    assert!(matches!(&tokens[0], Token::SpecialVar(s) if s == "'"), "expected SpecialVar('), got {:?}", tokens[0]);
+    assert!(matches!(&tokens[1], Token::IntLit(0)), "expected IntLit(0), got {:?}", tokens[1]);
+}
+
+#[test]
+fn apos_dollar_underscore_is_package_var() {
+    // $'_ → ScalarVar("::_")
+    let tokens = lex_all("$'_;");
+    assert!(matches!(&tokens[0], Token::ScalarVar(s) if s == "::_"), "expected ScalarVar(::_), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_at_ident_is_package_var() {
+    // @'foo → ArrayVar("::foo")
+    let tokens = lex_all("@'foo;");
+    assert!(matches!(&tokens[0], Token::ArrayVar(s) if s == "::foo"), "expected ArrayVar(::foo), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_array_len() {
+    // $#Foo'bar → ArrayLen("Foo::bar")
+    let tokens = lex_all("$#Foo'bar;");
+    assert!(matches!(&tokens[0], Token::ArrayLen(s) if s == "Foo::bar"), "expected ArrayLen(Foo::bar), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_not_at_identifier_start() {
+    // Apostrophe must be between identifier segments, not at the start.
+    // 'hello' is a single-quoted string, not a package separator.
+    let tokens = lex_all("'hello';");
+    assert!(matches!(&tokens[0], Token::StrLit(s) if s == "hello"), "expected StrLit(hello), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_q_delimiter_not_separator() {
+    // q'hello' — apostrophe is a delimiter for q//, not a package separator.
+    let tokens = lex_all("q'hello';");
+    assert!(matches!(&tokens[0], Token::StrLit(s) if s == "hello"), "expected StrLit(hello), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_chained_scalar_var() {
+    // $A'B'C → ScalarVar("A::B::C")
+    let tokens = lex_all("$A'B'C;");
+    assert!(matches!(&tokens[0], Token::ScalarVar(s) if s == "A::B::C"), "expected ScalarVar(A::B::C), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_underscore_start_after_apos() {
+    // $_Priv'secret → ScalarVar("_Priv::secret")
+    let tokens = lex_all("$_Priv'secret;");
+    assert!(matches!(&tokens[0], Token::ScalarVar(s) if s == "_Priv::secret"), "expected ScalarVar(_Priv::secret), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_interp_scalar_in_string() {
+    // "$Foo'bar" should interpolate $Foo::bar
+    let tokens = lex_all("\"$Foo'bar\";");
+    assert!(tokens.iter().any(|t| matches!(t, Token::InterpScalar(s) if s == "Foo::bar")), "expected InterpScalar(Foo::bar), got tokens: {:?}", tokens);
+}
+
+#[test]
+fn apos_interp_dollar_ident_in_string() {
+    // "$'x" should interpolate $::x
+    let tokens = lex_all("\"$'x\";");
+    assert!(tokens.iter().any(|t| matches!(t, Token::InterpScalar(s) if s == "::x")), "expected InterpScalar(::x), got tokens: {:?}", tokens);
+}
+
+#[test]
+fn apos_interp_array_in_string() {
+    // "@Foo'bar" should interpolate @Foo::bar
+    let tokens = lex_all("\"@Foo'bar\";");
+    assert!(tokens.iter().any(|t| matches!(t, Token::InterpArray(s) if s == "Foo::bar")), "expected InterpArray(Foo::bar), got tokens: {:?}", tokens);
+}
+
+#[test]
+fn apos_interp_not_when_delimiter() {
+    // qq'hello' — apostrophe is the delimiter, not a package separator.
+    let tokens = lex_all("qq'hello';");
+    assert!(tokens.iter().any(|t| matches!(t, Token::ConstSegment(s) if s == "hello")), "expected ConstSegment(hello) for qq', got tokens: {:?}", tokens);
+}

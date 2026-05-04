@@ -1642,6 +1642,15 @@ impl Lexer {
                 return Ok(Token::SpecialVar("`".into()));
             }
             Some(b'\'') => {
+                // $'ident → $::ident when apostrophe_as_package_separator
+                // is enabled and an identifier-start follows.
+                if self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
+                    && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80))
+                {
+                    self.skip(1); // consume the apostrophe
+                    let rest = self.scan_ident();
+                    return Ok(Token::ScalarVar(format!("::{rest}")));
+                }
                 // $' — postmatch string
                 self.skip(1);
                 return Ok(Token::SpecialVar("'".into()));
@@ -1760,6 +1769,15 @@ impl Lexer {
                 let name = self.scan_ident();
                 if !name.is_empty() { Ok(Token::ArrayVar(name)) } else { Ok(Token::At) }
             }
+            // @'ident — apostrophe as package separator.
+            Some(b'\'')
+                if self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
+                    && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80)) =>
+            {
+                self.skip(1); // consume apostrophe
+                let rest = self.scan_ident();
+                Ok(Token::ArrayVar(format!("::{rest}")))
+            }
             _ => Ok(Token::At),
         }
     }
@@ -1846,6 +1864,15 @@ impl Lexer {
                 let name = self.scan_ident();
                 if !name.is_empty() { Ok(Some(Token::HashVar(name))) } else { Ok(None) }
             }
+            // %'ident — apostrophe as package separator.
+            Some(b'\'')
+                if self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
+                    && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80)) =>
+            {
+                self.skip(1); // consume apostrophe
+                let rest = self.scan_ident();
+                Ok(Some(Token::HashVar(format!("::{rest}"))))
+            }
             _ => Ok(None),
         }
     }
@@ -1900,6 +1927,23 @@ impl Lexer {
                 // Package separator Foo::Bar
                 self.skip(2);
                 first = true; // next char starts a new segment
+            } else if b == b'\''
+                && !first
+                && self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
+                && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80))
+            {
+                // Don't consume ' as a package separator if the identifier
+                // scanned so far is a quote-like keyword (q, qq, qw, qr, m,
+                // s, tr, y, qx).  The ' is the delimiter in that case.
+                if let Some(line) = &self.current_line {
+                    let so_far = &line.line[start..line.pos];
+                    if matches!(so_far, b"q" | b"qq" | b"qw" | b"qr" | b"m" | b"s" | b"tr" | b"y" | b"qx") {
+                        break;
+                    }
+                }
+                // Apostrophe as package separator: Foo'Bar → Foo::Bar
+                self.skip(1);
+                first = true; // next char starts a new segment
             } else if self.effective_utf8 && b >= 0x80 {
                 // UTF-8 multi-byte character: decode and check
                 // XID_Start for the first character, XID_Continue
@@ -1920,6 +1964,11 @@ impl Lexer {
             }
         }
         let name = String::from_utf8_lossy(self.line_slice(start)).into_owned();
+        // Normalize apostrophe separators to :: so the AST always
+        // uses :: regardless of which separator the source used.
+        // ASCII 0x27 cannot appear inside UTF-8 multi-byte sequences,
+        // so a simple replace is safe.
+        let name = if name.contains('\'') { name.replace('\'', "::") } else { name };
         self.nfc_normalize(name)
     }
 
@@ -2140,6 +2189,7 @@ impl Lexer {
     /// uncommon and would require more machinery.
     pub fn try_autoquoted_bareword_subscript(&mut self) -> Option<(String, Span)> {
         let utf8 = self.effective_utf8;
+        let apos = self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR);
         let line = self.current_line.as_ref()?;
         let r = line.remaining();
         // Skip leading whitespace.
@@ -2168,6 +2218,18 @@ impl Lexer {
             let b = r[i];
             if b == b'_' || b.is_ascii_alphanumeric() {
                 i += 1;
+            } else if b == b'\'' && apos {
+                // Apostrophe as package separator: check that
+                // the next byte is an identifier start.
+                if let Some(&next) = r.get(i + 1) {
+                    if next == b'_' || next.is_ascii_alphabetic() || (utf8 && next >= 0x80) {
+                        i += 1; // consume apostrophe, loop continues
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             } else if utf8 && b >= 0x80 {
                 let tail = &r[i..];
                 if let Ok(s) = std::str::from_utf8(tail)
@@ -2196,6 +2258,8 @@ impl Lexer {
         // naturally when producing the `}` token.
         let name_bytes = &r[ident_start..ident_end];
         let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+        // Normalize apostrophe separators to ::
+        let name = if name.contains('\'') { name.replace('\'', "::") } else { name };
         let offset = line.offset;
         let pos = line.pos;
         let start_global = (offset + pos + ident_start) as u32;
@@ -2884,6 +2948,26 @@ impl Lexer {
             return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
         }
 
+        // $'ident — apostrophe as package separator in string
+        // interpolation.  Must check that ' is not the close
+        // delimiter (e.g. qq'$'x' — the ' closes the string).
+        if self.peek_byte(false) == Some(b'\'')
+            && self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
+            && self.context_stack.last().and_then(|ctx| ctx.delim).is_none_or(|d| d != '\'')
+            && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80))
+        {
+            self.skip(1); // consume the apostrophe
+            let rest = self.scan_ident();
+            let full_name = format!("::{rest}");
+            if self.peek_chain_starter() {
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.chain_active = true;
+                }
+                return Ok(Spanned { token: Token::InterpScalarChainStart(full_name), span: Span::new(start, self.span_pos()) });
+            }
+            return Ok(Spanned { token: Token::InterpScalar(full_name), span: Span::new(start, self.span_pos()) });
+        }
+
         // Bare $ not followed by a name — treat as literal
         Ok(Spanned { token: Token::ConstSegment("$".into()), span: Span::new(start, self.span_pos()) })
     }
@@ -2917,6 +3001,25 @@ impl Lexer {
                 return Ok(Spanned { token: Token::InterpArrayChainStart(name), span: Span::new(start, self.span_pos()) });
             }
             return Ok(Spanned { token: Token::InterpArray(name), span: Span::new(start, self.span_pos()) });
+        }
+
+        // @'ident — apostrophe as package separator in string
+        // interpolation (same logic as $'ident).
+        if next_byte == Some(b'\'')
+            && self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
+            && self.context_stack.last().and_then(|ctx| ctx.delim).is_none_or(|d| d != '\'')
+            && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80))
+        {
+            self.skip(1); // consume the apostrophe
+            let rest = self.scan_ident();
+            let full_name = format!("::{rest}");
+            if self.peek_chain_starter() {
+                if let Some(ctx) = self.context_stack.last_mut() {
+                    ctx.chain_active = true;
+                }
+                return Ok(Spanned { token: Token::InterpArrayChainStart(full_name), span: Span::new(start, self.span_pos()) });
+            }
+            return Ok(Spanned { token: Token::InterpArray(full_name), span: Span::new(start, self.span_pos()) });
         }
 
         // Bare @ not followed by a name — treat as literal
