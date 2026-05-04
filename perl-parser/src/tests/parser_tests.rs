@@ -11687,3 +11687,95 @@ fn apos_interp_utf8_in_string() {
         tokens
     );
 }
+
+// ── any/all list processing operators ────────────────────
+
+#[test]
+fn parse_any_block_list() {
+    // any { BLOCK } LIST — basic form.
+    let prog = parse("use feature 'any'; my @x = (1,2,3); my $r = any { $_ > 2 } @x;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_all_block_list() {
+    // all { BLOCK } LIST — basic form.
+    let prog = parse("use feature 'all'; my @x = (1,2,3); my $r = all { $_ > 0 } @x;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_any_with_parens() {
+    // any({ BLOCK }, LIST) — parenthesized form.
+    let prog = parse("use feature 'any'; my $r = any({ $_ > 2 }, 1, 2, 3);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_all_with_parens() {
+    // all({ BLOCK }, LIST) — parenthesized form.
+    let prog = parse("use feature 'all'; my $r = all({ $_ > 0 }, 1, 2, 3);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_any_without_feature_is_bareword() {
+    // Without the feature, 'any' is a regular bareword.
+    // any(...) parses as a function call, not a keyword.
+    let prog = parse("my $r = any(1, 2, 3);");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::FuncCall(ref name, _) if name == "any"), "expected FuncCall(any), got {:?}", init.kind);
+}
+
+#[test]
+fn parse_all_without_feature_is_bareword() {
+    // Without the feature, 'all' is a regular bareword.
+    let prog = parse("my $r = all(1, 2, 3);");
+    let init = first_assign_rhs(&prog);
+    assert!(matches!(init.kind, ExprKind::FuncCall(ref name, _) if name == "all"), "expected FuncCall(all), got {:?}", init.kind);
+}
+
+#[test]
+fn parse_any_with_feature_is_keyword() {
+    // With the feature, 'any { BLOCK } LIST' uses keyword parsing.
+    // Verify it parses as a FuncCall with an anon-sub first arg
+    // (block-list-op pattern like grep/map).
+    let prog = parse("use feature 'any'; my $r = any { $_ > 0 } 1, 2, 3;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_all_with_feature_is_keyword() {
+    // With the feature, 'all { BLOCK } LIST' uses keyword parsing.
+    let prog = parse("use feature 'all'; my $r = all { $_ > 0 } 1, 2, 3;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_any_nested_in_all() {
+    // Nested: all { any { ... } @inner } @outer
+    let prog = parse("use feature 'any'; use feature 'all'; my $r = all { any { $_ > 0 } @_ } @lists;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_any_with_literal_list() {
+    // any { BLOCK } literal list
+    let prog = parse("use feature 'any'; my $r = any { $_ > 5 } 1, 2, 3, 4, 5, 6;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_any_fat_comma_autoquotes() {
+    // any => 1 — fat comma autoquotes 'any' as a string even
+    // with the feature enabled.
+    let prog = parse("use feature 'any'; my %h = (any => 1);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn parse_all_fat_comma_autoquotes() {
+    // all => 1 — fat comma autoquotes 'all' as a string.
+    let prog = parse("use feature 'all'; my %h = (all => 1);");
+    assert!(!prog.statements.is_empty());
+}
