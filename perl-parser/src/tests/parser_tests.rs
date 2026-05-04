@@ -11850,14 +11850,20 @@ fn apos_given_bareword_off_is_package() {
     // so given'bar becomes given::bar (a package-qualified name).
     let prog = parse("my $x = given'bar;");
     let init = first_assign_rhs(&prog);
-    // Package-qualified bareword — may be Bareword or FuncCall
-    // depending on context.
-    let name = match &init.kind {
-        ExprKind::FuncCall(name, _) => name.as_str(),
-        ExprKind::Bareword(name) => name.as_str(),
-        other => panic!("expected bareword or func call, got {other:?}"),
-    };
-    assert_eq!(name, "given::bar");
+    assert!(matches!(&init.kind, ExprKind::Bareword(s) if s == "given::bar"), "expected Bareword(given::bar), got {:?}", init.kind);
+}
+
+#[test]
+fn apos_given_bareword_off_is_func_call() {
+    // given'bar(1) WITHOUT the switch feature — given is a bareword,
+    // so given'bar is given::bar, and (1) makes it a FuncCall.
+    let prog = parse("my $x = given'bar(1);");
+    let init = first_assign_rhs(&prog);
+    assert!(
+        matches!(&init.kind, ExprKind::FuncCall(name, args) if name == "given::bar" && args.len() == 1),
+        "expected FuncCall(given::bar, [1]), got {:?}",
+        init.kind
+    );
 }
 
 #[test]

@@ -169,54 +169,12 @@ impl Parser {
                     Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) }
                 }
             });
-            // Downgrade feature-gated keywords to plain idents
-            // when the governing feature is not active in the
-            // current lexical scope.  This lets user code that
-            // predates the feature (or explicitly `no feature`s
-            // it) keep using these words as function names,
-            // method names, hash keys, etc.  Same in spirit as
-            // the parser resolving `/` to regex-vs-division:
-            // the lexer emits a context-free classification and
-            // the parser refines it with scope-level information.
-            self.maybe_demote_keyword();
         }
         // self.current is Some by construction above.
         match &self.current {
             Some(s) => &s.token,
             None => unreachable!("peek_token: current is Some"),
         }
-    }
-
-    /// Rewrite a feature-gated `Keyword` in the lookahead cache
-    /// as a plain `Ident(name)` when the governing feature is
-    /// off.  No-op if the token isn't such a keyword or if the
-    /// feature is active.
-    fn maybe_demote_keyword(&mut self) {
-        let Some(sp) = &self.current else {
-            return;
-        };
-        let kw = match sp.token {
-            Token::Keyword(kw) => kw,
-            _ => return,
-        };
-        // Map keyword → governing feature.  Only feature-gated
-        // keywords appear here; unconditional keywords (my, sub,
-        // if, etc.) are omitted and always stay as Keyword.
-        let needed = match kw {
-            Keyword::Try | Keyword::Catch | Keyword::Finally => Features::TRY,
-            Keyword::Defer => Features::DEFER,
-            Keyword::Given | Keyword::When | Keyword::Default => Features::SWITCH,
-            Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST => Features::CLASS,
-            Keyword::Any => Features::KEYWORD_ANY,
-            Keyword::All => Features::KEYWORD_ALL,
-            _ => return,
-        };
-        if self.pragmas.features.contains(needed) {
-            return;
-        }
-        let name: &str = kw.into();
-        let span = sp.span;
-        self.current = Some(Spanned { token: Token::Ident(name.to_string()), span });
     }
 
     /// Peek at the span of the current token.

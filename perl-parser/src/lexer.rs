@@ -230,8 +230,9 @@ impl Lexer {
             None => false,
             Some(kw) => {
                 // Feature-gated keywords: only active when their
-                // feature is enabled.  Mirrors the check in
-                // Parser::maybe_downgrade_keyword.
+                // feature is enabled.  The same mapping is used
+                // in lex_word to emit Ident instead of Keyword
+                // for inactive feature-gated keywords.
                 let needed = match kw {
                     Keyword::Try | Keyword::Catch | Keyword::Finally => Features::TRY,
                     Keyword::Defer => Features::DEFER,
@@ -2154,9 +2155,21 @@ impl Lexer {
             return Ok(Token::Assign(AssignOp::RepeatEq));
         }
 
-        // Keywords
+        // Keywords — check feature gating for conditional keywords.
         if let Some(kw) = keyword::lookup_keyword(&name) {
-            return Ok(Token::Keyword(kw));
+            let needed = match kw {
+                Keyword::Try | Keyword::Catch | Keyword::Finally => Some(Features::TRY),
+                Keyword::Defer => Some(Features::DEFER),
+                Keyword::Given | Keyword::When | Keyword::Default => Some(Features::SWITCH),
+                Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST => Some(Features::CLASS),
+                Keyword::Any => Some(Features::KEYWORD_ANY),
+                Keyword::All => Some(Features::KEYWORD_ALL),
+                _ => None, // unconditional keyword — always active
+            };
+            if needed.is_none_or(|f| self.features.contains(f)) {
+                return Ok(Token::Keyword(kw));
+            }
+            // Feature not active — fall through to Ident.
         }
 
         // Regular identifier / bareword
