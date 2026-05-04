@@ -1930,7 +1930,13 @@ impl Lexer {
             } else if b == b'\''
                 && !first
                 && self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
-                && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80))
+                // Don't consume ' when it's the close delimiter of the
+                // current string context (e.g. qq'$Foo'bar — the ' after
+                // Foo closes the string, not a package separator).
+                && self.context_stack.last().and_then(|ctx| ctx.delim).is_none_or(|d| d != '\'')
+                && self.peek_byte_at(1).is_some_and(|next|
+                    next == b'_' || next.is_ascii_alphabetic()
+                    || (self.effective_utf8 && next >= 0x80))
             {
                 // Don't consume ' as a package separator if the identifier
                 // scanned so far is a quote-like keyword (q, qq, qw, qr, m,

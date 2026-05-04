@@ -2550,3 +2550,32 @@ fn apos_interp_not_when_delimiter() {
     let tokens = lex_all("qq'hello';");
     assert!(tokens.iter().any(|t| matches!(t, Token::ConstSegment(s) if s == "hello")), "expected ConstSegment(hello) for qq', got tokens: {:?}", tokens);
 }
+
+#[test]
+fn apos_scan_ident_respects_close_delimiter() {
+    // qq'$Foo' . 'rest' — inside qq with ' delimiter:
+    // $Foo should be the variable (not $Foo::bar).
+    // The ' after Foo closes the string.
+    let tokens = lex_all("qq'$Foo' . 'rest';");
+    assert!(
+        tokens.iter().any(|t| matches!(t, Token::InterpScalar(s) if s == "Foo")),
+        "expected InterpScalar(Foo), not Foo::bar — ' is the close delimiter, got: {:?}",
+        tokens
+    );
+}
+
+#[test]
+fn apos_scan_ident_stops_at_close_delimiter() {
+    // qq'$Foo'bar — the ' after Foo is the close delimiter of
+    // the qq string, not a package separator.  scan_ident must
+    // not consume past it.
+    let tokens = lex_all("qq'$Foo'bar;");
+    // Tokens should be: QuoteSublexBegin, InterpScalar("Foo"),
+    // SublexEnd, Ident("bar"), Semi
+    assert!(
+        tokens.iter().any(|t| matches!(t, Token::InterpScalar(s) if s == "Foo")),
+        "expected InterpScalar(Foo) — ' is close delimiter, not separator, got: {:?}",
+        tokens
+    );
+    assert!(tokens.iter().any(|t| matches!(t, Token::Ident(s) if s == "bar")), "expected Ident(bar) after close delimiter, got: {:?}", tokens);
+}
