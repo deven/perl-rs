@@ -11898,3 +11898,400 @@ fn apos_try_bareword_off_is_package() {
     let tokens = collect_tokens("try'x;");
     assert!(matches!(&tokens[0], Token::Ident(s) if s == "try::x"), "expected Ident(try::x), got {:?}", tokens[0]);
 }
+
+// ══════════════════════════════════════════════════════════
+// Pending NFC / encoding / body scanner tests
+//
+// These tests document known gaps.  Most will fail until the
+// body scanner rework and source::encoding pragma are
+// implemented.  Mark #[ignore] after confirming failure.
+// ══════════════════════════════════════════════════════════
+
+// ── Heredoc tag NFC normalization ─────────────────────────
+//
+// Deliberate deviation from Perl: heredoc tags and terminators
+// are NFC-normalized so composed/decomposed forms match.
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn heredoc_nfc_composed_tag_decomposed_terminator() {
+    // Tag is composed café (U+00E9), terminator is decomposed
+    // (e + U+0301).  Should match after NFC.
+    // café composed: 63 61 66 C3 A9
+    // café decomposed: 63 61 66 65 CC 81
+    let src = b"use utf8; my $x = <<caf\xC3\xA9;\nbody\ncafe\xCC\x81\n";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "composed tag should match decomposed terminator: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn heredoc_nfc_decomposed_tag_composed_terminator() {
+    // Reverse: decomposed tag, composed terminator.
+    let src = b"use utf8; my $x = <<cafe\xCC\x81;\nbody\ncaf\xC3\xA9\n";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "decomposed tag should match composed terminator: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn heredoc_nfc_quoted_double() {
+    // <<"café" with composed tag, decomposed terminator.
+    let src = b"use utf8; my $x = <<\"caf\xC3\xA9\";\nbody\ncafe\xCC\x81\n";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "double-quoted composed tag should match decomposed terminator: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn heredoc_nfc_quoted_single() {
+    // <<'café' with composed tag, decomposed terminator.
+    let src = b"use utf8; my $x = <<'caf\xC3\xA9';\nbody\ncafe\xCC\x81\n";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "single-quoted composed tag should match decomposed terminator: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn heredoc_nfc_backslash_tag() {
+    // <<\café with composed tag, decomposed terminator.
+    let src = b"use utf8; my $x = <<\\caf\xC3\xA9;\nbody\ncafe\xCC\x81\n";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "backslash composed tag should match decomposed terminator: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn heredoc_nfc_indented() {
+    // <<~café with composed tag, decomposed terminator.
+    let src = b"use utf8; my $x = <<~caf\xC3\xA9;\n    body\n    cafe\xCC\x81\n";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "indented composed tag should match decomposed terminator: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn heredoc_nfc_devanagari_tag() {
+    // Heredoc tag using Devanagari: <<ऩ where ऩ (U+0929) is
+    // composed, terminator is decomposed (न + ़ = U+0928 + U+093C).
+    // Composed ऩ: E0 A4 A9
+    // Decomposed: E0 A4 A8 E0 A4 BC
+    let src = b"use utf8; my $x = <<\xE0\xA4\xA9;\nbody\n\xE0\xA4\xA8\xE0\xA4\xBC\n";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "Devanagari composed tag should match decomposed terminator: {:?}", result.err());
+}
+
+// ── Tibetan delimiter + Devanagari combining mark in body ─
+//
+// Tibetan ༺ (U+0F3A, bytes E0 BC BA) and Devanagari nukta
+// ़ (U+093C, bytes E0 A4 BC) share lead byte 0xE0.
+// memchr scanning for the close delimiter ༻ (E0 BC BB)
+// triggers on the nukta's lead byte, potentially splitting
+// a base+nukta sequence across NFC normalization batches.
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn tibetan_delim_devanagari_nukta_in_body() {
+    // q༺ text with decomposed ऩ (न + ़) inside ༻
+    // The nukta's lead byte 0xE0 matches the delimiter's lead
+    // byte, causing memchr to trigger mid-combining-sequence.
+    // After NFC, the body should contain composed ऩ (U+0929).
+    //
+    // q = 71
+    // ༺ = E0 BC BA
+    // न = E0 A4 A8
+    // ़ = E0 A4 BC  (memchr triggers here on E0!)
+    // ༻ = E0 BC BB
+    let src = b"use utf8; my $x = q\xE0\xBC\xBA\xE0\xA4\xA8\xE0\xA4\xBC\xE0\xBC\xBB;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "Tibetan delim with Devanagari nukta should parse: {:?}", result.err());
+    // TODO: verify ConstSegment contains composed ऩ (E0 A4 A9),
+    // not decomposed न + ़ (E0 A4 A8 E0 A4 BC).
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn tibetan_delim_devanagari_in_qq_interpolation() {
+    // qq༺ $x with decomposed ऩ ༻ — interpolating string with
+    // the same lead-byte collision, plus interpolation trigger.
+    let src = b"use utf8; my $x = 1; my $y = qq\xE0\xBC\xBA$x \xE0\xA4\xA8\xE0\xA4\xBC\xE0\xBC\xBB;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "Tibetan delim qq with Devanagari should parse: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn tibetan_delim_multiple_nuktas_in_body() {
+    // Multiple decomposed Devanagari characters in a Tibetan-
+    // delimited string.  Each nukta triggers memchr on 0xE0.
+    // नक़ = U+0928 U+0915 U+093C (decomposed)
+    let src = b"use utf8; my $x = q\xE0\xBC\xBA\xE0\xA4\xA8\xE0\xA4\x95\xE0\xA4\xBC\xE0\xBC\xBB;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "multiple Devanagari chars in Tibetan delims should parse: {:?}", result.err());
+}
+
+// ── Body scanner: invalid UTF-8 handling ──────────────────
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn body_invalid_utf8_under_use_utf8_should_error() {
+    // 0xFF is never valid UTF-8.  Under `use utf8`, this should
+    // be a hard error, not silent replacement with U+FFFD.
+    let src = b"use utf8; my $x = \"hello \xFF world\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "invalid UTF-8 byte under `use utf8` should be an error");
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn body_truncated_utf8_under_use_utf8_should_error() {
+    // 0xC3 without continuation byte — truncated UTF-8.
+    let src = b"use utf8; my $x = \"caf\xC3\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "truncated UTF-8 under `use utf8` should be an error");
+}
+
+#[test]
+fn body_high_bytes_without_utf8_are_raw() {
+    // Without `use utf8`, bytes > 127 are raw Latin-1.
+    // \xE9 is é in Latin-1 (single byte, NOT a UTF-8 lead byte).
+    // Should pass through as a raw byte.
+    let src = b"my $x = \"caf\xE9\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "high bytes without `use utf8` should pass through: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn body_overlong_utf8_under_use_utf8_should_error() {
+    // Overlong encoding of '/' (U+002F): C0 AF.
+    // Valid UTF-8 decoders must reject this.
+    let src = b"use utf8; my $x = \"\xC0\xAF\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "overlong UTF-8 under `use utf8` should be an error");
+}
+
+// ── Body scanner: NFC normalization of raw content ────────
+
+#[test]
+fn body_nfc_normalizes_raw_decomposed() {
+    // Decomposed ñ (n + U+0303) in source under `use utf8`
+    // should be NFC-normalized to composed ñ (U+00F1).
+    // n = 6E, combining tilde = CC 83, composed ñ = C3 B1
+    let src = b"use utf8; my $x = \"n\xCC\x83\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "decomposed char in string should parse: {:?}", result.err());
+    // TODO: verify ConstSegment contains C3 B1, not 6E CC 83.
+}
+
+#[test]
+fn body_escape_chars_not_normalized() {
+    // \x{6e}\x{303} produces n + combining tilde via escapes.
+    // These should NOT be NFC-normalized — they are escape-
+    // produced, not raw source characters.
+    let prog = parse("use utf8; my $x = \"\\x{6e}\\x{303}\";");
+    assert!(!prog.statements.is_empty());
+    // TODO: verify the string contains 6E CC 83 (decomposed),
+    // NOT C3 B1 (composed).
+}
+
+#[test]
+fn body_nfc_devanagari_in_string() {
+    // Decomposed ऩ (U+0928 + U+093C) in a double-quoted string
+    // under `use utf8` should NFC-normalize to U+0929.
+    let src = b"use utf8; my $x = \"\xE0\xA4\xA8\xE0\xA4\xBC\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "Devanagari decomposed in string should parse: {:?}", result.err());
+    // TODO: verify ConstSegment contains E0 A4 A9 (composed).
+}
+
+#[test]
+fn body_no_nfc_without_utf8() {
+    // Without `use utf8`, raw bytes should NOT be NFC-normalized
+    // even if they happen to form valid decomposed UTF-8.
+    // The bytes are Latin-1, not Unicode.
+    let src = b"my $x = \"n\xCC\x83\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "bytes without `use utf8` should pass through: {:?}", result.err());
+    // TODO: verify the bytes are preserved exactly as-is.
+}
+
+// ── Identifier NFC normalization ──────────────────────────
+
+#[test]
+fn ident_nfc_devanagari() {
+    // Decomposed ऩ (U+0928 + U+093C) in an identifier under
+    // `use utf8` should NFC-normalize to U+0929.
+    let src = b"use utf8; my $\xE0\xA4\xA8\xE0\xA4\xBC = 1;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "Devanagari decomposed identifier should parse: {:?}", result.err());
+    // The variable should be $ऩ (composed), same as if the
+    // source had contained the composed form directly.
+}
+
+#[test]
+fn ident_nfc_composed_and_decomposed_are_same_variable() {
+    // Two assignments to the "same" variable using composed and
+    // decomposed forms.  After NFC normalization, they should
+    // resolve to the same identifier.
+    let src = b"use utf8; my $caf\xC3\xA9 = 1; $cafe\xCC\x81 = 2;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "composed and decomposed should be same variable: {:?}", result.err());
+    // TODO: verify both produce ScalarVar("café") with composed é.
+}
+
+// ── source::encoding pragma ──────────────────────────────
+//
+// New in 5.41.  Not yet implemented.
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_utf8_enables_utf8() {
+    // `use source::encoding 'utf8'` is a synonym for `use utf8`.
+    let src = "use source::encoding 'utf8'; my $caf\u{00E9} = 1;";
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_ok(), "source::encoding 'utf8' should enable UTF-8: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_ascii_rejects_high_bytes() {
+    // `use source::encoding 'ascii'` should error on any
+    // non-ASCII byte in source.
+    let src = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "source::encoding 'ascii' should reject non-ASCII");
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_ascii_allows_escapes() {
+    // Under ascii mode, escape sequences producing non-ASCII
+    // should still be allowed — only raw source bytes are
+    // restricted.  First verify ascii mode IS active by
+    // confirming raw non-ASCII is rejected:
+    let src = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
+    assert!(crate::parse(src).is_err(), "source::encoding 'ascii' should reject raw non-ASCII");
+    // Then verify escapes still work:
+    let prog = parse("use source::encoding 'ascii'; my $x = \"caf\\x{e9}\";");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_ascii_implied_by_v5_42() {
+    // `use v5.42` should imply `use source::encoding 'ascii'`.
+    let src = b"use v5.42; my $x = \"caf\xC3\xA9\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "use v5.42 should imply ascii source encoding");
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn no_source_encoding_disables() {
+    // `no source::encoding` disables both UTF-8 and ASCII modes.
+    // First verify ascii mode IS active:
+    let src1 = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
+    assert!(crate::parse(src1).is_err(), "ascii should reject non-ASCII before 'no'");
+    // Then verify `no source::encoding` allows non-ASCII again:
+    let src2 = b"use source::encoding 'ascii'; no source::encoding; my $x = \"caf\xC3\xA9\";";
+    assert!(crate::parse(src2).is_ok(), "no source::encoding should allow non-ASCII: {:?}", crate::parse(src2).err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_ascii_is_lexically_scoped() {
+    // Inside block: ascii should reject non-ASCII.
+    let src1 = b"{ use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\"; }";
+    assert!(crate::parse(src1).is_err(), "ascii should reject inside block");
+    // Outside block: non-ASCII should be allowed again.
+    let src2 = b"{ use source::encoding 'ascii'; } my $x = \"caf\xC3\xA9\";";
+    assert!(crate::parse(src2).is_ok(), "ascii should not leak out of block: {:?}", crate::parse(src2).err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_bad_argument_is_error() {
+    // Only 'ascii' and 'utf8' are accepted.  Anything else should
+    // be an error (Perl's module dies with "Bad argument").
+    let result = crate::parse(b"use source::encoding 'latin1';");
+    assert!(result.is_err(), "source::encoding 'latin1' should be an error");
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_no_argument_is_error() {
+    // `use source::encoding` without an argument should be an error.
+    let result = crate::parse(b"use source::encoding;");
+    assert!(result.is_err(), "source::encoding without argument should be an error");
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_utf8_clears_ascii() {
+    // First verify ascii mode IS rejecting:
+    let src1 = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
+    assert!(crate::parse(src1).is_err(), "ascii should reject non-ASCII before switching");
+    // Then verify switching to utf8 clears ascii and allows UTF-8:
+    let src2 = b"use source::encoding 'ascii'; use source::encoding 'utf8'; my $x = \"caf\xC3\xA9\";";
+    assert!(crate::parse(src2).is_ok(), "switching from ascii to utf8 should allow UTF-8: {:?}", crate::parse(src2).err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_ascii_clears_utf8() {
+    // `use source::encoding 'ascii'` calls unimport() first,
+    // which clears utf8 mode.  Unicode identifiers should no
+    // longer be valid.
+    let src = "use utf8; use source::encoding 'ascii'; my $caf\u{00E9} = 1;";
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_err(), "switching from utf8 to ascii should reject Unicode identifiers");
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_ascii_implied_by_v5_41() {
+    // The perlexperiment docs say "v5.41.0 or higher" activates
+    // ascii source encoding.  Unlike Features flags (which round
+    // odd minors down to the prior even), ascii source encoding
+    // is a separate pragma state that activates at the exact
+    // version threshold.  `use v5.41` SHOULD activate it.
+    let src = b"use v5.41; my $x = \"caf\xC3\xA9\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "use v5.41 should imply ascii source encoding");
+}
+
+#[test]
+fn source_encoding_ascii_not_implied_by_v5_40() {
+    // `use v5.40` should NOT imply ascii mode.
+    // Non-ASCII raw bytes should be allowed (as raw bytes,
+    // not necessarily valid UTF-8).
+    let src = b"use v5.40; my $x = \"caf\xC3\xA9\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "use v5.40 should not imply ascii: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn source_encoding_ascii_then_use_utf8() {
+    // `use source::encoding 'ascii'` then `use utf8`.
+    // These are independent pragmas — `use utf8` does NOT clear
+    // the ascii hint bit.  Both are active simultaneously.
+    // The ascii check should still reject non-ASCII raw bytes
+    // even though utf8 mode is also on.
+    let src = b"use source::encoding 'ascii'; use utf8; my $x = \"caf\xC3\xA9\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "ascii + utf8 should still reject non-ASCII raw bytes");
+}
+
+#[test]
+#[ignore] // pending: NFC normalization / source::encoding / body scanner rework
+fn use_utf8_then_source_encoding_ascii() {
+    // `use utf8` then `use source::encoding 'ascii'`.
+    // source::encoding's import() calls unimport() first,
+    // which clears utf8 mode.  Then sets ascii.
+    // Result: utf8 is off, ascii is on.
+    let src = b"use utf8; use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "source::encoding 'ascii' should clear utf8 and reject non-ASCII");
+}
