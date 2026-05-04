@@ -11779,3 +11779,116 @@ fn parse_all_fat_comma_autoquotes() {
     let prog = parse("use feature 'all'; my %h = (all => 1);");
     assert!(!prog.statements.is_empty());
 }
+
+// ── Adversarial: apostrophe after keywords ───────────────
+
+#[test]
+fn apos_grep_keyword_not_consumed_as_package() {
+    // grep'x',@list — non-block grep with string expression.
+    // scan_ident must not consume grep'x as grep::x.
+    let prog = parse("my @list = ('ax','bx','c'); my @r = grep'x',@list;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_sort_keyword_not_consumed_as_package() {
+    // sort'func' — sort with a named comparison function.
+    // scan_ident must not consume sort'func as sort::func.
+    let prog = parse("sub func { $a cmp $b } my @list = (3,1,2); my @r = sort'func'@list;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_map_keyword_not_consumed_as_package() {
+    // map with string expression: map'x'.$_,@list
+    // scan_ident must not consume map'x as map::x.
+    let prog = parse("my @list = (1,2,3); my @r = map'x',@list;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_print_keyword_not_consumed_as_package() {
+    // print'hello' — print with adjacent string argument.
+    // scan_ident must not consume print'hello as print::hello.
+    let prog = parse("print'hello';");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_say_keyword_not_consumed_as_package() {
+    // say'hello' — say with adjacent string argument.
+    let prog = parse("use feature 'say'; say'hello';");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_die_keyword_not_consumed_as_package() {
+    // die'message' — die with adjacent string argument.
+    let prog = parse("die'oops';");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_return_keyword_not_consumed_as_package() {
+    // return'value' — return with adjacent string argument.
+    let prog = parse("sub foo { return'ok' }");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_given_keyword_on_not_consumed() {
+    // given'bar with use feature 'switch' — given is a keyword,
+    // scan_ident must not consume given'bar as given::bar.
+    // This is a syntax error in Perl (given expects a condition).
+    let result = crate::parse(b"use feature 'switch'; given'bar' { }");
+    assert!(result.is_err(), "expected error: given is a keyword, 'bar' is not a valid condition syntax");
+}
+
+#[test]
+fn apos_given_bareword_off_is_package() {
+    // given'bar WITHOUT the switch feature — given is a bareword,
+    // so given'bar becomes given::bar (a package-qualified name).
+    let prog = parse("my $x = given'bar;");
+    let init = first_assign_rhs(&prog);
+    // Package-qualified bareword — may be Bareword or FuncCall
+    // depending on context.
+    let name = match &init.kind {
+        ExprKind::FuncCall(name, _) => name.as_str(),
+        ExprKind::Bareword(name) => name.as_str(),
+        other => panic!("expected bareword or func call, got {other:?}"),
+    };
+    assert_eq!(name, "given::bar");
+}
+
+#[test]
+fn apos_any_keyword_on_not_consumed() {
+    // any'x' with use feature 'any' — any is a keyword,
+    // scan_ident must not consume any'x as any::x.
+    // Without the fix, scan_ident greedily consumes any'x
+    // as any::x and the trailing ' is unterminated.
+    // With the fix, any is a keyword and 'x' is its argument.
+    let prog = parse("use feature 'any'; my $r = any'x',1,2,3;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn apos_any_bareword_off_is_package() {
+    // any'x WITHOUT the feature — any is a bareword,
+    // so any'x becomes any::x.
+    let tokens = collect_tokens("any'x;");
+    assert!(matches!(&tokens[0], Token::Ident(s) if s == "any::x"), "expected Ident(any::x), got {:?}", tokens[0]);
+}
+
+#[test]
+fn apos_try_keyword_on_not_consumed() {
+    // try'x with use feature 'try' — try is a keyword.
+    let result = crate::parse(b"use feature 'try'; try'x' catch ($e) { }");
+    assert!(result.is_err(), "expected error: try expects a block");
+}
+
+#[test]
+fn apos_try_bareword_off_is_package() {
+    // try'x WITHOUT the feature — try is a bareword.
+    let tokens = collect_tokens("try'x;");
+    assert!(matches!(&tokens[0], Token::Ident(s) if s == "try::x"), "expected Ident(try::x), got {:?}", tokens[0]);
+}

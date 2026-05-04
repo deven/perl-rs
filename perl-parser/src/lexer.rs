@@ -208,6 +208,44 @@ impl Lexer {
         b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)
     }
 
+    /// Check whether the given bytes form an active keyword.
+    /// Returns true for unconditional keywords (print, grep, etc.)
+    /// and for feature-gated keywords whose feature is currently
+    /// enabled.  Returns false for feature-gated keywords whose
+    /// feature is off (they are just barewords in that case).
+    /// Also returns true for quote-like operators (q, qq, qr, qx,
+    /// m, s, tr, y) which are not in the keyword table but must
+    /// still prevent apostrophe consumption in `scan_ident`.
+    fn is_active_keyword(&self, name: &[u8]) -> bool {
+        // Quote-like operators — not in lookup_keyword but always
+        // act as keywords for delimiter purposes.
+        if matches!(name, b"q" | b"qq" | b"qw" | b"qr" | b"m" | b"s" | b"tr" | b"y" | b"qx") {
+            return true;
+        }
+        let name_str = match std::str::from_utf8(name) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        match keyword::lookup_keyword(name_str) {
+            None => false,
+            Some(kw) => {
+                // Feature-gated keywords: only active when their
+                // feature is enabled.  Mirrors the check in
+                // Parser::maybe_downgrade_keyword.
+                let needed = match kw {
+                    Keyword::Try | Keyword::Catch | Keyword::Finally => Features::TRY,
+                    Keyword::Defer => Features::DEFER,
+                    Keyword::Given | Keyword::When | Keyword::Default => Features::SWITCH,
+                    Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST => Features::CLASS,
+                    Keyword::Any => Features::KEYWORD_ANY,
+                    Keyword::All => Features::KEYWORD_ALL,
+                    _ => return true, // unconditional keyword
+                };
+                self.features.contains(needed)
+            }
+        }
+    }
+
     /// Decode the UTF-8 character starting at the current position.
     /// Returns `(char, byte_length)` on success, `None` for invalid
     /// UTF-8 or empty remaining input.
@@ -1938,12 +1976,15 @@ impl Lexer {
                     next == b'_' || next.is_ascii_alphabetic()
                     || (self.effective_utf8 && next >= 0x80))
             {
-                // Don't consume ' as a package separator if the identifier
-                // scanned so far is a quote-like keyword (q, qq, qw, qr, m,
-                // s, tr, y, qx).  The ' is the delimiter in that case.
+                // Don't consume ' as a package separator if the
+                // identifier scanned so far is an active keyword.
+                // Quote-like operators use ' as a delimiter;
+                // unconditional keywords (print, grep, die, etc.)
+                // always stop; feature-gated keywords (given, any,
+                // try, etc.) stop only when their feature is active.
                 if let Some(line) = &self.current_line {
                     let so_far = &line.line[start..line.pos];
-                    if matches!(so_far, b"q" | b"qq" | b"qw" | b"qr" | b"m" | b"s" | b"tr" | b"y" | b"qx") {
+                    if self.is_active_keyword(so_far) {
                         break;
                     }
                 }
