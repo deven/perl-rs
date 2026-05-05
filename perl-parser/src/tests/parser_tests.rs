@@ -12782,3 +12782,182 @@ fn nullary_times_in_assignment() {
     let prog = parse("my @t = times;");
     assert!(!prog.statements.is_empty());
 }
+
+// ── elseif diagnostic ───────────────────────────────────────
+
+#[test]
+fn elseif_after_if_gives_helpful_error() {
+    let result = crate::parse(b"if (1) { } elseif (2) { }");
+    assert!(result.is_err());
+    let msg = result.unwrap_err().message;
+    assert!(msg.contains("elseif should be elsif"), "got: {msg}");
+}
+
+#[test]
+fn elseif_after_elsif_gives_helpful_error() {
+    let result = crate::parse(b"if (1) { } elsif (2) { } elseif (3) { }");
+    assert!(result.is_err());
+    let msg = result.unwrap_err().message;
+    assert!(msg.contains("elseif should be elsif"), "got: {msg}");
+}
+
+#[test]
+fn elseif_after_unless_gives_helpful_error() {
+    let result = crate::parse(b"unless (1) { } elseif (2) { }");
+    assert!(result.is_err());
+    let msg = result.unwrap_err().message;
+    assert!(msg.contains("elseif should be elsif"), "got: {msg}");
+}
+
+// ── Named unary builtins (additional) ───────────────────────
+
+#[test]
+fn named_unary_sleep_with_arg() {
+    // `sleep 5` must parse as `sleep(5)`, not bareword + separate statement.
+    let prog = parse("sleep 5;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "sleep");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(sleep), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_sleep_bare() {
+    // `sleep;` with no argument.
+    let prog = parse("sleep;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "sleep");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(sleep), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_sin_dollar_x() {
+    // `sin $x` takes one argument.
+    let prog = parse("sin $x;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "sin");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(sin), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_localtime_bare() {
+    // `localtime;` with no argument.
+    let prog = parse("localtime;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "localtime");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(localtime), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_localtime_with_parens() {
+    let prog = parse("localtime(time);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "localtime");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(localtime), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_alarm_with_arg() {
+    let prog = parse("alarm 30;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "alarm");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(alarm), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_quotemeta_with_arg() {
+    let prog = parse("quotemeta $str;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "quotemeta");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(quotemeta), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_exp_in_expression() {
+    // `exp(1) + 1` — named unary with parens, then addition.
+    let prog = parse("exp(1) + 1;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::Add, lhs, _) => match &lhs.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "exp");
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected FuncCall(exp), got {other:?}"),
+            },
+            other => panic!("expected BinOp(Add), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_fat_comma_autoquotes() {
+    // `sleep => 42` — fat comma autoquotes the keyword.
+    let prog = parse("my %h = (sleep => 42);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn named_unary_log_cos_chained() {
+    // `log(cos($x))` — nested named unaries with parens.
+    let prog = parse("log(cos($x));");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "log");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(log), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}

@@ -13,6 +13,7 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "if" => Some(Keyword::If),
         "else" => Some(Keyword::Else),
         "elsif" => Some(Keyword::Elsif),
+        "elseif" => Some(Keyword::Elseif),
         "unless" => Some(Keyword::Unless),
         "while" => Some(Keyword::While),
         "until" => Some(Keyword::Until),
@@ -117,6 +118,20 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "pos" => Some(Keyword::Pos),
         "system" => Some(Keyword::System),
         "exec" => Some(Keyword::Exec),
+        // Named unary builtins (additional)
+        "sleep" => Some(Keyword::Sleep),
+        "alarm" => Some(Keyword::Alarm),
+        "localtime" => Some(Keyword::Localtime),
+        "gmtime" => Some(Keyword::Gmtime),
+        "sin" => Some(Keyword::Sin),
+        "cos" => Some(Keyword::Cos),
+        "exp" => Some(Keyword::Exp),
+        "log" => Some(Keyword::Log),
+        "quotemeta" => Some(Keyword::Quotemeta),
+        "prototype" => Some(Keyword::Prototype),
+        "readpipe" => Some(Keyword::Readpipe),
+        "chroot" => Some(Keyword::Chroot),
+        "reset" => Some(Keyword::Reset),
         "qw" => Some(Keyword::Qw),
         "format" => Some(Keyword::Format),
         "BEGIN" => Some(Keyword::BEGIN),
@@ -187,6 +202,7 @@ impl From<Keyword> for &'static str {
             Keyword::If => "if",
             Keyword::Else => "else",
             Keyword::Elsif => "elsif",
+            Keyword::Elseif => "elseif",
             Keyword::Unless => "unless",
             Keyword::While => "while",
             Keyword::Until => "until",
@@ -291,6 +307,19 @@ impl From<Keyword> for &'static str {
             Keyword::Pos => "pos",
             Keyword::System => "system",
             Keyword::Exec => "exec",
+            Keyword::Sleep => "sleep",
+            Keyword::Alarm => "alarm",
+            Keyword::Localtime => "localtime",
+            Keyword::Gmtime => "gmtime",
+            Keyword::Sin => "sin",
+            Keyword::Cos => "cos",
+            Keyword::Exp => "exp",
+            Keyword::Log => "log",
+            Keyword::Quotemeta => "quotemeta",
+            Keyword::Prototype => "prototype",
+            Keyword::Readpipe => "readpipe",
+            Keyword::Chroot => "chroot",
+            Keyword::Reset => "reset",
             Keyword::Qw => "qw",
             Keyword::Format => "format",
             Keyword::BEGIN => "BEGIN",
@@ -397,6 +426,19 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Undef
             | Keyword::Scalar
             | Keyword::Require
+            | Keyword::Sleep
+            | Keyword::Alarm
+            | Keyword::Localtime
+            | Keyword::Gmtime
+            | Keyword::Sin
+            | Keyword::Cos
+            | Keyword::Exp
+            | Keyword::Log
+            | Keyword::Quotemeta
+            | Keyword::Prototype
+            | Keyword::Readpipe
+            | Keyword::Chroot
+            | Keyword::Reset
     )
 }
 

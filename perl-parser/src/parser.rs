@@ -1008,6 +1008,11 @@ impl Parser {
             elsif_clauses.push((cond, block));
         }
 
+        // Catch common mistake: `elseif` instead of `elsif`.
+        if self.at(&Token::Keyword(Keyword::Elseif))? {
+            return Err(ParseError::new("elseif should be elsif", self.peek_span()));
+        }
+
         let else_block = if self.eat(&Token::Keyword(Keyword::Else))? { Some(self.parse_block()?) } else { None };
 
         Ok(StmtKind::If(IfStmt { condition, then_block, elsif_clauses, else_block }))
@@ -1022,6 +1027,11 @@ impl Parser {
             let cond = self.parse_paren_expr()?;
             let block = self.parse_block()?;
             elsif_clauses.push((cond, block));
+        }
+
+        // Catch common mistake: `elseif` instead of `elsif`.
+        if self.at(&Token::Keyword(Keyword::Elseif))? {
+            return Err(ParseError::new("elseif should be elsif", self.peek_span()));
         }
 
         let else_block = if self.eat(&Token::Keyword(Keyword::Else))? { Some(self.parse_block()?) } else { None };

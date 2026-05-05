@@ -23,6 +23,7 @@ pub enum Keyword {
     // ── Control flow ──────────────────────────────────────────
     If,
     Elsif,
+    Elseif, // parsed only to emit "elseif should be elsif" diagnostic
     Else,
     Unless,
     While,
@@ -161,6 +162,21 @@ pub enum Keyword {
     System,
     Exec,
     Qw,
+
+    // ── Named unary builtins (additional) ────────────────────
+    Sleep,
+    Alarm,
+    Localtime,
+    Gmtime,
+    Sin,
+    Cos,
+    Exp,
+    Log,
+    Quotemeta,
+    Prototype,
+    Readpipe,
+    Chroot,
+    Reset,
 
     // ── List-processing (block-first) ──────────────────────
     Any,
