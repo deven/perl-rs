@@ -12295,3 +12295,160 @@ fn use_utf8_then_source_encoding_ascii() {
     let result = crate::parse(src);
     assert!(result.is_err(), "source::encoding 'ascii' should clear utf8 and reject non-ASCII");
 }
+
+// ── UTF-8 BOM handling ───────────────────────────────────
+//
+// "you need either a Byte Order Mark at the beginning of your
+// source code, or use utf8;" — the UTF-8 BOM (EF BB BF) at
+// the start of a file should implicitly enable use utf8.
+
+#[test]
+#[ignore] // pending: BOM detection / UTF-8 validation
+fn utf8_bom_enables_utf8_mode() {
+    // UTF-8 BOM (EF BB BF) at start of file should implicitly
+    // enable use utf8, allowing Unicode identifiers.
+    let src = b"\xEF\xBB\xBFmy $caf\xC3\xA9 = 1;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "BOM at start should enable utf8 mode: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: BOM detection / UTF-8 validation
+fn utf8_bom_stripped_from_output() {
+    // The BOM itself should be stripped, not appear as a token
+    // or cause a parse error.
+    let src = b"\xEF\xBB\xBFmy $x = 1;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "BOM should be silently stripped: {:?}", result.err());
+}
+
+#[test]
+fn utf8_bom_not_at_start_is_not_stripped() {
+    // BOM bytes (EF BB BF) NOT at the very start of the file
+    // are not special.  Without use utf8, they are raw bytes
+    // that the lexer rejects as unrecognized characters.
+    let src = b"my $x = 1; \xEF\xBB\xBF";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "mid-file BOM bytes should not be silently accepted");
+}
+
+// ── Perl's extended UTF-8 ────────────────────────────────
+//
+// Perl allows code points above U+10FFFF via its "extended
+// UTF-8" encoding.  Rust's char only goes to U+10FFFF.
+
+#[test]
+fn escape_above_unicode_max() {
+    // \x{110000} is above Unicode max but valid in Perl's
+    // extended UTF-8.  Should not be rejected.
+    let prog = parse("my $x = \"\\x{110000}\";");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn escape_very_large_codepoint() {
+    // Perl allows absurdly large code points.
+    let prog = parse("my $x = \"\\x{7FFFFFFF}\";");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn escape_unicode_max_is_valid() {
+    // \x{10FFFF} is the maximum Unicode code point and should
+    // always work.
+    let prog = parse("my $x = \"\\x{10FFFF}\";");
+    assert!(!prog.statements.is_empty());
+}
+
+// ── no utf8 restoring raw byte mode ──────────────────────
+//
+// "no utf8 tells Perl to switch back to treating the source
+// text as literal bytes in the current lexical scope"
+
+#[test]
+fn no_utf8_restores_raw_byte_mode() {
+    // After `no utf8`, non-ASCII bytes should be treated as
+    // raw bytes, not as UTF-8.  \xE9 is a single Latin-1 byte
+    // (é), not a UTF-8 lead byte.
+    let src = b"use utf8; no utf8; my $x = \"caf\xE9\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "no utf8 should restore raw byte mode: {:?}", result.err());
+}
+
+#[test]
+fn no_utf8_in_block_restores_after_block() {
+    // Lexically scoped: `no utf8` inside a block should not
+    // affect code after the block.
+    let src = "use utf8; { no utf8; } my $caf\u{00E9} = 1;";
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_ok(), "utf8 should be restored after block: {:?}", result.err());
+}
+
+#[test]
+fn utf8_and_no_utf8_interleaved() {
+    // Multiple utf8/no utf8 switches in the same file.
+    let mut src = Vec::new();
+    src.extend_from_slice(b"use utf8; my $caf\xC3\xA9 = 1; "); // UTF-8 mode: composed é
+    src.extend_from_slice(b"{ no utf8; my $x = \"caf\xE9\"; } "); // raw mode: Latin-1 é
+    src.extend_from_slice(b"my $\xC3\xBC = 2;"); // back to UTF-8 mode: ü
+    let result = crate::parse(&src);
+    assert!(result.is_ok(), "interleaved utf8/no utf8 should work: {:?}", result.err());
+}
+
+#[test]
+#[ignore] // pending: BOM detection / UTF-8 validation
+fn use_utf8_rejects_non_utf8_bytes() {
+    // "if you have non-ASCII, non-UTF-8 bytes in your script...
+    // use utf8 will be unhappy"
+    // \xE9 alone is invalid UTF-8 (it's Latin-1 é).
+    // Under use utf8, this should be an error.
+    let src = b"use utf8; my $x = \"caf\xE9\";";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "non-UTF-8 bytes under use utf8 should error");
+}
+
+#[test]
+fn use_utf8_rejects_non_utf8_in_identifier() {
+    // Invalid UTF-8 in an identifier under use utf8 should be
+    // an error, not silently accepted.
+    let src = b"use utf8; my $caf\xE9 = 1;";
+    let result = crate::parse(src);
+    assert!(result.is_err(), "non-UTF-8 byte in identifier under use utf8 should error");
+}
+
+#[test]
+fn no_utf8_allows_non_utf8_bytes_in_string() {
+    // Without use utf8, \xE9 is a raw byte, not invalid UTF-8.
+    let src = b"my $x = \"caf\xE9\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "raw bytes without use utf8 should be allowed: {:?}", result.err());
+}
+
+// ── utf8 pragma lexical scoping edge cases ───────────────
+
+#[test]
+fn utf8_pragma_nested_blocks() {
+    // Nested blocks with different utf8 settings.
+    let src = "use utf8; my $\u{00E9} = 1; { no utf8; { use utf8; my $\u{00FC} = 2; } }";
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_ok(), "nested utf8 blocks should work: {:?}", result.err());
+}
+
+#[test]
+fn utf8_pragma_in_sub_body() {
+    // use utf8 inside a sub body is lexically scoped to that sub.
+    let src = b"sub foo { use utf8; my $caf\xC3\xA9 = 1; } my $x = 1;";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "utf8 in sub body should be scoped: {:?}", result.err());
+}
+
+#[test]
+fn utf8_pragma_does_not_leak_to_next_statement() {
+    // After the block with use utf8 closes, non-ASCII bytes
+    // in the next statement should be raw bytes, not UTF-8.
+    // \xE9 as a raw byte should be fine outside the utf8 block,
+    // but would be invalid UTF-8 inside one.
+    let src = b"{ use utf8; my $x = 1; } my $y = \"caf\xE9\";";
+    let result = crate::parse(src);
+    assert!(result.is_ok(), "utf8 should not leak past block: {:?}", result.err());
+}
