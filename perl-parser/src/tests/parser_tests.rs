@@ -12961,3 +12961,92 @@ fn named_unary_log_cos_chained() {
         other => panic!("expected Expr, got {other:?}"),
     }
 }
+
+// ── select dual-form ────────────────────────────────────────
+
+#[test]
+fn select_one_arg_filehandle() {
+    let prog = parse("select STDOUT;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "select");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected ListOp(select), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn select_one_arg_with_parens() {
+    let prog = parse("select(STDOUT);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "select");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected ListOp(select), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn select_four_arg_syscall() {
+    let prog = parse("select($rin, $win, $ein, 0.25);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "select");
+                assert_eq!(args.len(), 4);
+            }
+            other => panic!("expected ListOp(select), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn select_four_arg_no_parens() {
+    let prog = parse("select undef, undef, undef, 0.25;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "select");
+                assert_eq!(args.len(), 4);
+            }
+            other => panic!("expected ListOp(select), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn select_zero_arg() {
+    let prog = parse("select();");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "select");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected ListOp(select), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn select_in_assignment() {
+    let prog = parse("my $old = select(STDERR);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn select_fat_comma_autoquotes() {
+    let prog = parse("my %h = (select => 42);");
+    assert!(!prog.statements.is_empty());
+}

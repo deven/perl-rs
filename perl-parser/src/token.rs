@@ -144,6 +144,7 @@ pub enum Keyword {
     Write,
     Seek,
     Tell,
+    Select,
     Eof,
     Getc,
     Readline,

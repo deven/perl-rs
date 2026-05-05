@@ -100,6 +100,7 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "read" => Some(Keyword::Read),
         "write" => Some(Keyword::Write),
         "seek" => Some(Keyword::Seek),
+        "select" => Some(Keyword::Select),
         "tell" => Some(Keyword::Tell),
         "eof" => Some(Keyword::Eof),
         "getc" => Some(Keyword::Getc),
@@ -289,6 +290,7 @@ impl From<Keyword> for &'static str {
             Keyword::Read => "read",
             Keyword::Write => "write",
             Keyword::Seek => "seek",
+            Keyword::Select => "select",
             Keyword::Tell => "tell",
             Keyword::Eof => "eof",
             Keyword::Getc => "getc",
@@ -519,6 +521,7 @@ pub fn is_list_op(kw: Keyword) -> bool {
             | Keyword::Untie
             | Keyword::Bless
             | Keyword::Mkdir
+            | Keyword::Select
     )
 }
 
