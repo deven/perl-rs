@@ -2097,6 +2097,9 @@ impl Parser {
             Token::Keyword(Keyword::Stat) => self.parse_stat_op(false, span),
             Token::Keyword(Keyword::Lstat) => self.parse_stat_op(true, span),
 
+            // Nullary keywords — never consume arguments
+            Token::Keyword(kw) if keyword::is_nullary(kw) => self.parse_nullary(kw, span),
+
             // Named unary keywords
             Token::Keyword(kw) if keyword::is_named_unary(kw) => self.parse_named_unary(kw, span),
 
@@ -2571,6 +2574,25 @@ impl Parser {
 
         let end_span = args.last().map(|a| a.span).unwrap_or(start);
         Ok(Expr { kind: ExprKind::FuncCall(name, args), span: start.merge(end_span) })
+    }
+
+    /// Parse a nullary builtin.  These never consume arguments, so
+    /// `time+86_400` is always `time() + 86_400`.  Explicit empty
+    /// parens (`time()`) are accepted.
+    fn parse_nullary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
+        let name = (<&str>::from(kw)).to_string();
+
+        // Accept optional empty parens: `time()`
+        if self.at(&Token::LeftParen)? {
+            self.next_token()?; // consume (
+            let end = self.peek_span();
+            self.expect_token(&Token::RightParen)?;
+            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span: span.merge(end) });
+        }
+
+        // No parens — emit as a zero-arg call; the next token is an
+        // operator, not an argument.
+        Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span })
     }
 
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {

@@ -182,6 +182,30 @@ pub enum Keyword {
     Blessed, // from Scalar::Util but common
     Continue,
 
+    // ── Nullary builtins ─────────────────────────────────────
+    // These take no arguments at all, so `time+1` is `time() + 1`.
+    Time,
+    Times,
+    Fork,
+    Wait,
+    Getppid,
+    Getlogin,
+    // Password/group/host/net/proto/serv database traversal
+    Setpwent,
+    Setgrent,
+    Endpwent,
+    Endgrent,
+    Endhostent,
+    Endnetent,
+    Endprotoent,
+    Endservent,
+    Getpwent,
+    Getgrent,
+    Gethostent,
+    Getnetent,
+    Getprotoent,
+    Getservent,
+
     // ── Typed layer (§14, our extensions) ─────────────────────
     Let,
     Fn,

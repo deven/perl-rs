@@ -137,6 +137,27 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "untie" => Some(Keyword::Untie),
         "tied" => Some(Keyword::Tied),
         "bless" => Some(Keyword::Bless),
+        // Nullary builtins (no arguments)
+        "time" => Some(Keyword::Time),
+        "times" => Some(Keyword::Times),
+        "fork" => Some(Keyword::Fork),
+        "wait" => Some(Keyword::Wait),
+        "getppid" => Some(Keyword::Getppid),
+        "getlogin" => Some(Keyword::Getlogin),
+        "setpwent" => Some(Keyword::Setpwent),
+        "setgrent" => Some(Keyword::Setgrent),
+        "endpwent" => Some(Keyword::Endpwent),
+        "endgrent" => Some(Keyword::Endgrent),
+        "endhostent" => Some(Keyword::Endhostent),
+        "endnetent" => Some(Keyword::Endnetent),
+        "endprotoent" => Some(Keyword::Endprotoent),
+        "endservent" => Some(Keyword::Endservent),
+        "getpwent" => Some(Keyword::Getpwent),
+        "getgrent" => Some(Keyword::Getgrent),
+        "gethostent" => Some(Keyword::Gethostent),
+        "getnetent" => Some(Keyword::Getnetent),
+        "getprotoent" => Some(Keyword::Getprotoent),
+        "getservent" => Some(Keyword::Getservent),
         // String comparison operators (keywords, not symbols)
         "eq" => Some(Keyword::Eq),
         "ne" => Some(Keyword::Ne),
@@ -291,6 +312,26 @@ impl From<Keyword> for &'static str {
             Keyword::Tied => "tied",
             Keyword::Bless => "bless",
             Keyword::Blessed => "blessed",
+            Keyword::Time => "time",
+            Keyword::Times => "times",
+            Keyword::Fork => "fork",
+            Keyword::Wait => "wait",
+            Keyword::Getppid => "getppid",
+            Keyword::Getlogin => "getlogin",
+            Keyword::Setpwent => "setpwent",
+            Keyword::Setgrent => "setgrent",
+            Keyword::Endpwent => "endpwent",
+            Keyword::Endgrent => "endgrent",
+            Keyword::Endhostent => "endhostent",
+            Keyword::Endnetent => "endnetent",
+            Keyword::Endprotoent => "endprotoent",
+            Keyword::Endservent => "endservent",
+            Keyword::Getpwent => "getpwent",
+            Keyword::Getgrent => "getgrent",
+            Keyword::Gethostent => "gethostent",
+            Keyword::Getnetent => "getnetent",
+            Keyword::Getprotoent => "getprotoent",
+            Keyword::Getservent => "getservent",
             Keyword::Die_ => "die",
             Keyword::Eq => "eq",
             Keyword::Ne => "ne",
@@ -349,7 +390,6 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Shift
             | Keyword::Pos
             | Keyword::Umask
-            | Keyword::Wantarray
             | Keyword::Exit
             | Keyword::Tied
             | Keyword::Die
@@ -357,6 +397,38 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Undef
             | Keyword::Scalar
             | Keyword::Require
+    )
+}
+
+/// Is this keyword a nullary builtin (takes no arguments)?
+///
+/// Nullary builtins never consume a following term as an argument,
+/// so `time+86_400` is always `time() + 86_400`.  They do accept
+/// explicit empty parens: `time()`.
+pub fn is_nullary(kw: Keyword) -> bool {
+    matches!(
+        kw,
+        Keyword::Wantarray
+            | Keyword::Time
+            | Keyword::Times
+            | Keyword::Fork
+            | Keyword::Wait
+            | Keyword::Getppid
+            | Keyword::Getlogin
+            | Keyword::Setpwent
+            | Keyword::Setgrent
+            | Keyword::Endpwent
+            | Keyword::Endgrent
+            | Keyword::Endhostent
+            | Keyword::Endnetent
+            | Keyword::Endprotoent
+            | Keyword::Endservent
+            | Keyword::Getpwent
+            | Keyword::Getgrent
+            | Keyword::Gethostent
+            | Keyword::Getnetent
+            | Keyword::Getprotoent
+            | Keyword::Getservent
     )
 }
 

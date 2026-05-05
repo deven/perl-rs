@@ -12651,3 +12651,134 @@ fn not_utf16_binary_garbage() {
     // from a UTF-16 transcode attempt.
     let _ = result;
 }
+
+// ── Nullary builtins ────────────────────────────────────────
+
+#[test]
+fn nullary_time_plus_number() {
+    // `time+86_400` must parse as `time() + 86_400`, not `time(+86_400)`.
+    let prog = parse("time+86_400;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::Add, lhs, _rhs) => match &lhs.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "time");
+                    assert!(args.is_empty(), "time must have zero args");
+                }
+                other => panic!("expected FuncCall(time), got {other:?}"),
+            },
+            other => panic!("expected BinOp(Add), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullary_time_with_empty_parens() {
+    // `time()` is explicitly accepted.
+    let prog = parse("time();");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "time");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(time), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullary_fork_bare() {
+    // `fork;` must parse as a zero-arg function call.
+    let prog = parse("fork;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "fork");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(fork), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullary_wait_bare() {
+    let prog = parse("wait;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "wait");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(wait), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullary_wantarray_in_conditional() {
+    // `wantarray ? 1 : 0` — wantarray is nullary, the `?` is ternary.
+    let prog = parse("wantarray ? 1 : 0;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Ternary(cond, _, _) => {
+                assert!(matches!(cond.kind, ExprKind::Wantarray));
+            }
+            other => panic!("expected Ternary, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullary_time_fat_comma_autoquotes() {
+    // `time => 42` — fat comma autoquotes, so "time" is a string key.
+    let prog = parse("my %h = (time => 42);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn nullary_getppid_in_expression() {
+    // `getppid == 1` — getppid is nullary.
+    let prog = parse("getppid == 1;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::NumEq, lhs, _) => match &lhs.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "getppid");
+                    assert!(args.is_empty());
+                }
+                other => panic!("expected FuncCall(getppid), got {other:?}"),
+            },
+            other => panic!("expected BinOp(NumEq), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullary_endpwent_bare() {
+    let prog = parse("endpwent;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "endpwent");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(endpwent), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullary_times_in_assignment() {
+    // `my @t = times;`
+    let prog = parse("my @t = times;");
+    assert!(!prog.statements.is_empty());
+}
