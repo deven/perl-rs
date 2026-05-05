@@ -119,6 +119,18 @@ fn first_assign_rhs(prog: &Program) -> Expr {
     panic!("no assignment found in program");
 }
 
+/// Extract the string value from the first `my $x = "..."` in the program.
+/// Works for StringLit, and InterpolatedString with only Const and NamedChar
+/// parts (no runtime interpolation).
+fn first_assign_str(prog: &Program) -> String {
+    let rhs = first_assign_rhs(prog);
+    match &rhs.kind {
+        ExprKind::StringLit(s) => s.clone(),
+        ExprKind::InterpolatedString(interp) => interp.as_plain_string().expect("expected constant string content"),
+        other => panic!("expected string expression, got {other:?}"),
+    }
+}
+
 /// For tests that need the initializer from a `my $x = expr;`
 /// declaration-statement.  Returns the RHS of the Assign.
 fn decl_init(stmt: &Statement) -> &Expr {
@@ -9086,18 +9098,15 @@ fn escape_n_unicode_codepoint_ascii() {
 }
 
 #[test]
-fn escape_n_charname_placeholder() {
-    // `\N{SNOWMAN}` — named character.  Without a charnames
-    // database the parser emits U+FFFD as a placeholder.
-    // Verifying it doesn't error and produces a single-char
-    // string.
+fn escape_n_charname_resolved() {
+    // `\N{SNOWMAN}` — named character resolved via unicode_names2
+    // to U+2603 (☃).
     let e = parse_expr_str(r#""\N{SNOWMAN}";"#);
     match &e.kind {
         ExprKind::StringLit(s) => {
-            assert_eq!(s.len(), 3); // U+FFFD is 3 bytes in UTF-8
-            assert!(s.contains('\u{FFFD}'));
+            assert_eq!(s, "\u{2603}", "\\N{{SNOWMAN}} should resolve to snowman");
         }
-        other => panic!("expected StringLit with placeholder, got {other:?}"),
+        other => panic!("expected StringLit with snowman, got {other:?}"),
     }
 }
 
@@ -12451,4 +12460,92 @@ fn utf8_pragma_does_not_leak_to_next_statement() {
     let src = b"{ use utf8; my $x = 1; } my $y = \"caf\xE9\";";
     let result = crate::parse(src);
     assert!(result.is_ok(), "utf8 should not leak past block: {:?}", result.err());
+}
+
+// ── \N{CHARNAME} named Unicode character escapes ─────────
+
+#[test]
+fn named_char_snowman() {
+    // \N{SNOWMAN} → U+2603 (☃)
+    let prog = parse("my $x = \"\\N{SNOWMAN}\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "\u{2603}", "\\N{{SNOWMAN}} should resolve to U+2603");
+}
+
+#[test]
+fn named_char_white_smiling_face() {
+    // \N{WHITE SMILING FACE} → U+263A (☺)
+    let prog = parse("my $x = \"\\N{WHITE SMILING FACE}\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "\u{263A}");
+}
+
+#[test]
+fn named_char_u_plus_hex() {
+    // \N{U+263A} — hex code point form
+    let prog = parse("my $x = \"\\N{U+263A}\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "\u{263A}");
+}
+
+#[test]
+fn named_char_case_insensitive() {
+    // unicode_names2 uses loose matching: case insensitive
+    let prog = parse("my $x = \"\\N{snowman}\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "\u{2603}");
+}
+
+#[test]
+fn named_char_latin_capital_a_with_acute() {
+    let prog = parse("my $x = \"\\N{LATIN CAPITAL LETTER A WITH ACUTE}\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "\u{00C1}");
+}
+
+#[test]
+fn named_char_greek_small_letter_alpha() {
+    let prog = parse("my $x = \"\\N{GREEK SMALL LETTER ALPHA}\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "\u{03B1}");
+}
+
+#[test]
+fn named_char_unknown_name_is_error() {
+    let result = crate::parse(b"my $x = \"\\N{NONEXISTENT CHARACTER NAME}\";");
+    assert!(result.is_err(), "unknown character name should be an error");
+}
+
+#[test]
+fn named_char_in_regex() {
+    let prog = parse("my $x = 1; $x =~ /\\N{SNOWMAN}/;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn named_char_multiple_in_string() {
+    let prog = parse("my $x = \"\\N{SNOWMAN} and \\N{WHITE SMILING FACE}\";");
+    let s = first_assign_str(&prog);
+    assert!(s.contains('\u{2603}'), "should contain snowman");
+    assert!(s.contains('\u{263A}'), "should contain smiling face");
+}
+
+#[test]
+fn named_char_mixed_with_other_escapes() {
+    let prog = parse("my $x = \"A\\N{SNOWMAN}B\\x{263A}C\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "A\u{2603}B\u{263A}C");
+}
+
+#[test]
+fn named_char_bare_n_without_braces() {
+    let prog = parse("my $x = \"\\N\";");
+    let s = first_assign_str(&prog);
+    assert_eq!(s, "\\N");
+}
+
+#[test]
+fn named_char_in_heredoc() {
+    let prog = parse("my $x = <<END;\n\\N{SNOWMAN}\nEND\n");
+    assert!(!prog.statements.is_empty());
 }

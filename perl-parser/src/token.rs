@@ -382,6 +382,14 @@ pub enum Token {
     /// determines the chain is complete (closing bracket at
     /// depth 0 with no continuation).
     InterpChainEnd,
+    /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character
+    /// inside a string.  Emitted as a separate token (like
+    /// interpolation) so the AST preserves the original name
+    /// for tooling.  The resolved character is in `codepoint`.
+    NamedChar {
+        name: String,
+        codepoint: u32,
+    },
 
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.

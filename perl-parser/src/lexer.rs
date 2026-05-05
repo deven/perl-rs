@@ -2416,6 +2416,33 @@ impl Lexer {
             if b == b'@' {
                 return self.lex_interp_array(start);
             }
+            // \N{CHARNAME} — named Unicode character.  Handled here
+            // (not in process_escape) so it emits a separate NamedChar
+            // token, like interpolation.  The \N{U+XXXX} hex form
+            // stays in process_escape since it's just a hex escape
+            // with no name to preserve.
+            if !raw
+                && b == b'\\'
+                && self.peek_byte_at(1) == Some(b'N')
+                && self.peek_byte_at(2) == Some(b'{')
+                && !(self.peek_byte_at(3) == Some(b'U') && self.peek_byte_at(4) == Some(b'+'))
+            {
+                let escape_start = self.span_pos();
+                self.skip(3); // consume \N{
+                let mut name = String::new();
+                while let Some(b) = self.peek_byte(false) {
+                    if b == b'}' {
+                        self.skip(1);
+                        break;
+                    }
+                    self.skip(1);
+                    name.push(b as char);
+                }
+                let codepoint = unicode_names2::character(&name)
+                    .map(|c| c as u32)
+                    .ok_or_else(|| ParseError::new(format!("Unknown Unicode character name \"{name}\""), Span::new(escape_start, self.span_pos())))?;
+                return Ok(Spanned { token: Token::NamedChar { name, codepoint }, span: Span::new(escape_start, self.span_pos()) });
+            }
         }
 
         // Regex code blocks: (?{...}), (??{...}), and (*{...}).
@@ -2595,6 +2622,18 @@ impl Lexer {
                     break;
                 }
                 b'\\' => {
+                    // Before consuming the backslash, check for
+                    // \N{CHARNAME} (not \N{U+XXXX}).  Break to flush
+                    // accumulated text as ConstSegment; the next
+                    // lex_body call's fast dispatch handles the escape.
+                    if interpolating
+                        && !raw
+                        && self.peek_byte_at(1) == Some(b'N')
+                        && self.peek_byte_at(2) == Some(b'{')
+                        && !(self.peek_byte_at(3) == Some(b'U') && self.peek_byte_at(4) == Some(b'+'))
+                    {
+                        break;
+                    }
                     self.skip(1);
                     if raw {
                         // Raw: backslash prevents delimiter matching.
@@ -2621,7 +2660,7 @@ impl Lexer {
                         s.push('\\');
                     } else if interpolating {
                         // Double-quote escapes.
-                        self.process_escape(&mut s, close);
+                        self.process_escape(&mut s, close)?;
                     } else {
                         // Literal (single-quote) escapes: \\ → \,
                         // \close → close, \open → open.
@@ -2715,7 +2754,7 @@ impl Lexer {
 
     /// Process a backslash escape inside a double-quoted string.
     /// The backslash has already been consumed.
-    fn process_escape(&mut self, s: &mut String, close: Option<char>) {
+    fn process_escape(&mut self, s: &mut String, close: Option<char>) -> Result<(), ParseError> {
         match self.peek_byte(false) {
             Some(b'n') => {
                 self.skip(1);
@@ -2809,11 +2848,13 @@ impl Lexer {
                 }
             }
             Some(b'N') => {
-                // \N{...} — Unicode named or codepoint escape.
+                // \N{U+XXXX} — hex codepoint escape.
+                // \N{CHARNAME} is handled inline in lex_body before
+                // process_escape is called, so only the U+ form and
+                // bare \N reach here.
                 self.skip(1);
                 if self.peek_byte(false) == Some(b'{') {
                     self.skip(1);
-                    // Collect everything up to the closing `}`.
                     let mut name = String::new();
                     while let Some(b) = self.peek_byte(false) {
                         if b == b'}' {
@@ -2824,16 +2865,12 @@ impl Lexer {
                         name.push(b as char);
                     }
                     if let Some(hex) = name.strip_prefix("U+") {
-                        // \N{U+XXXX} — hex codepoint, self-contained.
                         let n = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
                         s.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
                     } else {
-                        // \N{CHARNAME} — requires `use charnames` to
-                        // resolve at compile time.  The parser doesn't
-                        // have the charnames database; emit a Unicode
-                        // replacement character as a placeholder.  A
-                        // future compilation pass can resolve the name
-                        // from the AST if needed.
+                        // Should not reach here — lex_body intercepts
+                        // \N{CHARNAME} before calling process_escape.
+                        // Defensive fallback: push replacement char.
                         s.push('\u{FFFD}');
                     }
                 } else {
@@ -2946,6 +2983,7 @@ impl Lexer {
             }
             _ => s.push('\\'),
         }
+        Ok(())
     }
 
     /// Lex `$name`, `${name}`, or `${expr}` interpolation inside a string.

@@ -10,3 +10,4 @@ bytes                 = { workspace = true }
 memchr                = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-xid           = { workspace = true }
+unicode_names2        = { workspace = true }

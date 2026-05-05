@@ -3095,6 +3095,10 @@ impl Parser {
                     self.next_token()?;
                     parts.push(InterpPart::Const(s));
                 }
+                Token::NamedChar { name, codepoint } => {
+                    self.next_token()?;
+                    parts.push(InterpPart::NamedChar { name, codepoint });
+                }
                 Token::InterpScalar(name) => {
                     let span = self.peek_span();
                     self.next_token()?;

@@ -315,18 +315,29 @@ pub enum StatTarget {
 pub struct Interpolated(pub Vec<InterpPart>);
 
 impl Interpolated {
-    /// If this is a single constant with no interpolation, return
-    /// the plain string.  Returns `Some("")` for empty.
+    /// If this contains only constant parts (no runtime interpolation),
+    /// return the plain string.  `Const` and `NamedChar` segments are
+    /// both constant — `NamedChar` is resolved at lex time.
+    /// Returns `Some("")` for empty.
     pub fn as_plain_string(&self) -> Option<String> {
         if self.0.is_empty() {
             return Some(String::new());
         }
-        if self.0.len() == 1
-            && let InterpPart::Const(s) = &self.0[0]
-        {
-            return Some(s.clone());
+        let mut result = String::new();
+        for part in &self.0 {
+            match part {
+                InterpPart::Const(s) => result.push_str(s),
+                InterpPart::NamedChar { codepoint, .. } => {
+                    if let Some(c) = char::from_u32(*codepoint) {
+                        result.push(c);
+                    } else {
+                        return None; // extended UTF-8 above U+10FFFF
+                    }
+                }
+                _ => return None, // has runtime interpolation
+            }
         }
-        None
+        Some(result)
     }
 }
 
@@ -348,6 +359,17 @@ pub enum InterpPart {
     RegexCode(String, Box<Expr>),
     /// `(??{code})` — postponed regex code block.
     RegexCondCode(String, Box<Expr>),
+    /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character.
+    /// Preserves the original name for tooling (formatters, linters)
+    /// while storing the resolved code point.  The string content
+    /// already contains the resolved character in the surrounding
+    /// `Const` segments; this variant exists for round-trip fidelity
+    /// and will be emitted when the body scanner is reworked to
+    /// produce separate segments for named character escapes.
+    NamedChar {
+        name: String,
+        codepoint: u32,
+    },
 }
 
 /// Binary operators.
