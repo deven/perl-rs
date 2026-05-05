@@ -12549,3 +12549,12 @@ fn named_char_in_heredoc() {
     let prog = parse("my $x = <<END;\n\\N{SNOWMAN}\nEND\n");
     assert!(!prog.statements.is_empty());
 }
+
+#[test]
+fn named_char_invalid_hex_in_u_plus_silent_fffd() {
+    // \N{U+SNOWMAN} — "SNOWMAN" is not valid hexadecimal.
+    // The parser silently produces U+FFFD via unwrap_or instead
+    // of reporting an error.  This is silent data corruption.
+    let result = crate::parse(b"my $x = \"\\N{U+SNOWMAN}\";");
+    assert!(result.is_err(), "\\N{{U+SNOWMAN}} should error, not silently produce U+FFFD");
+}

@@ -2854,6 +2854,7 @@ impl Lexer {
                 // bare \N reach here.
                 self.skip(1);
                 if self.peek_byte(false) == Some(b'{') {
+                    let escape_start = self.span_pos();
                     self.skip(1);
                     let mut name = String::new();
                     while let Some(b) = self.peek_byte(false) {
@@ -2865,7 +2866,8 @@ impl Lexer {
                         name.push(b as char);
                     }
                     if let Some(hex) = name.strip_prefix("U+") {
-                        let n = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
+                        let n = u32::from_str_radix(hex, 16)
+                            .map_err(|_| ParseError::new(format!("Invalid hex in \\N{{U+{hex}}}"), Span::new(escape_start, self.span_pos())))?;
                         s.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
                     } else {
                         // Should not reach here — lex_body intercepts
