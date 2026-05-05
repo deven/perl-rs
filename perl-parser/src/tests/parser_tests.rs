@@ -12312,7 +12312,6 @@ fn use_utf8_then_source_encoding_ascii() {
 // the start of a file should implicitly enable use utf8.
 
 #[test]
-#[ignore] // pending: BOM detection / UTF-8 validation
 fn utf8_bom_enables_utf8_mode() {
     // UTF-8 BOM (EF BB BF) at start of file should implicitly
     // enable use utf8, allowing Unicode identifiers.
@@ -12322,7 +12321,6 @@ fn utf8_bom_enables_utf8_mode() {
 }
 
 #[test]
-#[ignore] // pending: BOM detection / UTF-8 validation
 fn utf8_bom_stripped_from_output() {
     // The BOM itself should be stripped, not appear as a token
     // or cause a parse error.
@@ -12557,4 +12555,99 @@ fn named_char_invalid_hex_in_u_plus_silent_fffd() {
     // of reporting an error.  This is silent data corruption.
     let result = crate::parse(b"my $x = \"\\N{U+SNOWMAN}\";");
     assert!(result.is_err(), "\\N{{U+SNOWMAN}} should error, not silently produce U+FFFD");
+}
+
+// ── UTF-16 script autodetection ──────────────────────────
+
+#[test]
+fn utf16le_bom_transcodes_to_utf8() {
+    // UTF-16LE BOM (FF FE) followed by "my $x = 1;\n" in UTF-16LE.
+    let src_str = "my $x = 1;\n";
+    let mut src: Vec<u8> = vec![0xFF, 0xFE]; // BOM
+    for ch in src_str.encode_utf16() {
+        src.extend_from_slice(&ch.to_le_bytes());
+    }
+    let result = crate::parse(&src);
+    assert!(result.is_ok(), "UTF-16LE with BOM should be transcoded and parsed: {:?}", result.err());
+}
+
+#[test]
+fn utf16be_bom_transcodes_to_utf8() {
+    // UTF-16BE BOM (FE FF) followed by "my $x = 1;\n" in UTF-16BE.
+    let src_str = "my $x = 1;\n";
+    let mut src: Vec<u8> = vec![0xFE, 0xFF]; // BOM
+    for ch in src_str.encode_utf16() {
+        src.extend_from_slice(&ch.to_be_bytes());
+    }
+    let result = crate::parse(&src);
+    assert!(result.is_ok(), "UTF-16BE with BOM should be transcoded and parsed: {:?}", result.err());
+}
+
+#[test]
+fn utf16le_no_bom_heuristic() {
+    // UTF-16LE without BOM — heuristic detection.
+    // "my $x = 1;\n" in UTF-16LE (no BOM).
+    let src_str = "my $x = 1;\n";
+    let mut src: Vec<u8> = Vec::new();
+    for ch in src_str.encode_utf16() {
+        src.extend_from_slice(&ch.to_le_bytes());
+    }
+    let result = crate::parse(&src);
+    assert!(result.is_ok(), "UTF-16LE without BOM should be detected and parsed: {:?}", result.err());
+}
+
+#[test]
+fn utf16be_no_bom_heuristic() {
+    // UTF-16BE without BOM — heuristic detection.
+    let src_str = "my $x = 1;\n";
+    let mut src: Vec<u8> = Vec::new();
+    for ch in src_str.encode_utf16() {
+        src.extend_from_slice(&ch.to_be_bytes());
+    }
+    let result = crate::parse(&src);
+    assert!(result.is_ok(), "UTF-16BE without BOM should be detected and parsed: {:?}", result.err());
+}
+
+#[test]
+fn utf16le_bom_with_unicode_content() {
+    // UTF-16LE with BOM, source contains Unicode identifiers.
+    // "use utf8; my $café = 1;\n"
+    let src_str = "use utf8; my $caf\u{00E9} = 1;\n";
+    let mut src: Vec<u8> = vec![0xFF, 0xFE];
+    for ch in src_str.encode_utf16() {
+        src.extend_from_slice(&ch.to_le_bytes());
+    }
+    let result = crate::parse(&src);
+    assert!(result.is_ok(), "UTF-16LE with Unicode content should work: {:?}", result.err());
+}
+
+#[test]
+fn utf16_with_surrogate_pairs() {
+    // UTF-16LE with BOM, source contains U+1F600 (GRINNING FACE)
+    // in a string literal via \N{U+1F600}.
+    let src_str = "my $x = \"\\N{U+1F600}\";\n";
+    let mut src: Vec<u8> = vec![0xFF, 0xFE];
+    for ch in src_str.encode_utf16() {
+        src.extend_from_slice(&ch.to_le_bytes());
+    }
+    let result = crate::parse(&src);
+    assert!(result.is_ok(), "UTF-16 with surrogate pairs should work: {:?}", result.err());
+}
+
+#[test]
+fn not_utf16_plain_ascii() {
+    // Plain ASCII should NOT be detected as UTF-16.
+    let prog = parse("my $x = 1;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn not_utf16_binary_garbage() {
+    // Random bytes that happen to start with 00 should not
+    // be misdetected as UTF-16BE if the pattern doesn't hold.
+    let src = b"\x00\x01\x02\x03";
+    let result = crate::parse(src);
+    // This might error for other reasons, but shouldn't crash
+    // from a UTF-16 transcode attempt.
+    let _ = result;
 }

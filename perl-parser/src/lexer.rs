@@ -158,13 +158,15 @@ pub(crate) struct Lexer {
 
 impl Lexer {
     pub fn new(src: &[u8]) -> Self {
+        let source = LexerSource::new(src);
+        let bom = source.bom_utf8;
         Lexer {
-            source: LexerSource::new(src),
+            source,
             current_line: None,
             context_stack: Vec::new(),
             pending_error: None,
             format_state: None,
-            utf8_mode: false,
+            utf8_mode: bom,
             effective_utf8: false,
             features: Features::DEFAULT,
             case_mod_stack: Vec::new(),
@@ -177,13 +179,15 @@ impl Lexer {
     /// and diagnostic messages).  Equivalent to `Lexer::new` when
     /// the caller doesn't care about filename reporting.
     pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
+        let source = LexerSource::with_filename(src, filename);
+        let bom = source.bom_utf8;
         Lexer {
-            source: LexerSource::with_filename(src, filename),
+            source,
             current_line: None,
             context_stack: Vec::new(),
             pending_error: None,
             format_state: None,
-            utf8_mode: false,
+            utf8_mode: bom,
             effective_utf8: false,
             features: Features::DEFAULT,
             case_mod_stack: Vec::new(),

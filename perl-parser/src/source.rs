@@ -153,6 +153,10 @@ pub(crate) struct LexerSource {
     /// Line to deliver after the virtual EOF of a subst body.
     /// Contains the remainder of the source line after the flags.
     subst_saved_line: Option<LexerLine>,
+    /// Set when a UTF-8 BOM, UTF-16 BOM, or UTF-16 heuristic was
+    /// detected at the start of the source.  The Lexer uses this
+    /// to enable `utf8_mode` automatically.
+    pub(crate) bom_utf8: bool,
 }
 
 /// A raw line read from the source buffer before indent processing.
@@ -178,8 +182,9 @@ impl LexerSource {
     /// filename is surfaced via [`Self::filename`] and used for
     /// `__FILE__` resolution.
     pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
+        let (src_bytes, bom_utf8) = Self::detect_and_transcode(Bytes::copy_from_slice(src));
         LexerSource {
-            src: Bytes::copy_from_slice(src),
+            src: src_bytes,
             filename: filename.into(),
             cursor: 0,
             line_number: 1,
@@ -189,7 +194,94 @@ impl LexerSource {
             terminator_pending: false,
             subst_eof_pending: false,
             subst_saved_line: None,
+            bom_utf8,
         }
+    }
+
+    /// Detect BOM or UTF-16 encoding at the start of a source
+    /// buffer and transcode to UTF-8 if needed.  Returns the
+    /// (possibly transcoded) source bytes and whether UTF-8 mode
+    /// should be enabled.
+    ///
+    /// Takes an owned `Bytes` so the common case (no BOM, no
+    /// UTF-16) is zero-copy.  UTF-8 BOM stripping uses
+    /// `Bytes::slice` (also zero-copy).  Only UTF-16 transcoding
+    /// allocates a new buffer.
+    ///
+    /// Detection order (matching Perl's `S_swallow_bom`):
+    /// - `EF BB BF` → UTF-8 BOM: strip, enable utf8
+    /// - `FF FE`    → UTF-16LE BOM: strip + transcode to UTF-8
+    /// - `FE FF`    → UTF-16BE BOM: strip + transcode to UTF-8
+    /// - `00 xx` pattern → heuristic UTF-16BE (no BOM)
+    /// - `xx 00` pattern → heuristic UTF-16LE (no BOM)
+    fn detect_and_transcode(src: Bytes) -> (Bytes, bool) {
+        if src.len() >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
+            // UTF-8 BOM — strip it, enable utf8 mode.
+            return (src.slice(3..), true);
+        }
+        if src.len() >= 2 {
+            if src[0] == 0xFF && src[1] == 0xFE {
+                // UTF-16LE BOM — strip BOM, transcode remainder.
+                let utf8 = Self::transcode_utf16(&src[2..], true);
+                return (Bytes::from(utf8), true);
+            }
+            if src[0] == 0xFE && src[1] == 0xFF {
+                // UTF-16BE BOM — strip BOM, transcode remainder.
+                let utf8 = Self::transcode_utf16(&src[2..], false);
+                return (Bytes::from(utf8), true);
+            }
+        }
+        // Heuristic: check for UTF-16 without BOM by looking at
+        // the first few bytes for a null-interleaving pattern.
+        if src.len() >= 4 {
+            let looks_le = src[1] == 0 && src[3] == 0 && src[0] != 0 && src[2] != 0;
+            let looks_be = src[0] == 0 && src[2] == 0 && src[1] != 0 && src[3] != 0;
+            if looks_le {
+                let utf8 = Self::transcode_utf16(&src, true);
+                return (Bytes::from(utf8), true);
+            }
+            if looks_be {
+                let utf8 = Self::transcode_utf16(&src, false);
+                return (Bytes::from(utf8), true);
+            }
+        }
+        // No BOM, not UTF-16 — pass through unchanged (zero-copy).
+        (src, false)
+    }
+
+    /// Transcode UTF-16 bytes to UTF-8.  Handles surrogate pairs
+    /// for code points above U+FFFF.  Ignores a trailing odd byte.
+    fn transcode_utf16(src: &[u8], little_endian: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(src.len());
+        let mut i = 0;
+        while i + 1 < src.len() {
+            let unit = if little_endian { u16::from_le_bytes([src[i], src[i + 1]]) } else { u16::from_be_bytes([src[i], src[i + 1]]) };
+            i += 2;
+            let cp = if (0xD800..=0xDBFF).contains(&unit) {
+                // High surrogate — read the low surrogate.
+                if i + 1 < src.len() {
+                    let lo = if little_endian { u16::from_le_bytes([src[i], src[i + 1]]) } else { u16::from_be_bytes([src[i], src[i + 1]]) };
+                    if (0xDC00..=0xDFFF).contains(&lo) {
+                        i += 2;
+                        0x10000 + ((unit as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00)
+                    } else {
+                        0xFFFD // unpaired high surrogate
+                    }
+                } else {
+                    0xFFFD // truncated
+                }
+            } else if (0xDC00..=0xDFFF).contains(&unit) {
+                0xFFFD // unpaired low surrogate
+            } else {
+                unit as u32
+            };
+            // Encode code point as UTF-8.
+            if let Some(c) = char::from_u32(cp) {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        out
     }
 
     /// Create a new `LexerSource` from an existing `Bytes` buffer.
@@ -197,6 +289,7 @@ impl LexerSource {
     /// placeholder filename.
     #[allow(dead_code)]
     pub fn from_bytes(src: Bytes) -> Self {
+        let (src, bom_utf8) = Self::detect_and_transcode(src);
         LexerSource {
             src,
             filename: "(script)".into(),
@@ -208,6 +301,7 @@ impl LexerSource {
             terminator_pending: false,
             subst_eof_pending: false,
             subst_saved_line: None,
+            bom_utf8,
         }
     }
 
