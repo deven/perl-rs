@@ -13470,3 +13470,54 @@ fn all_nullary_keywords_parse() {
         }
     }
 }
+
+// ── Keyword names in declaration contexts ───────────────────
+
+#[test]
+fn sub_decl_with_keyword_name_send() {
+    // `sub send { }` — valid Perl, keyword used as sub name.
+    let prog = parse("sub send { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "send"),
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn sub_decl_with_keyword_name_pack() {
+    let prog = parse("sub pack { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "pack"),
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn sub_decl_with_keyword_name_print() {
+    // Pre-existing keyword — verify we didn't break this.
+    let prog = parse("sub print { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "print"),
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn package_decl_with_keyword_name() {
+    // `package send;` — valid Perl.
+    let prog = parse("package send; 1;");
+    match &prog.statements[0].kind {
+        StmtKind::PackageDecl(pd) => assert_eq!(pd.name, "send"),
+        other => panic!("expected Package, got {other:?}"),
+    }
+}
+
+#[test]
+fn format_decl_with_keyword_name() {
+    // `format send = ... .` — valid Perl.
+    let prog = parse("format send =\n@<<<\n$x\n.\n");
+    match &prog.statements[0].kind {
+        StmtKind::FormatDecl(fd) => assert_eq!(fd.name, "send"),
+        other => panic!("expected FormatDecl, got {other:?}"),
+    }
+}

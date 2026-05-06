@@ -384,7 +384,7 @@ impl Parser {
                             };
                             // `my sub foo { }`, `state sub foo { }`, `our sub foo { }`
                             if self.eat(&Token::Keyword(Keyword::Sub))? {
-                                if matches!(self.peek_token(), Token::Ident(_)) {
+                                if matches!(self.peek_token(), Token::Ident(_) | Token::Keyword(_)) {
                                     let (kind, _) = (self.parse_sub_decl_body(kw_span)?, false);
                                     // Patch the scope onto the SubDecl.
                                     let kind = match kind {
@@ -420,7 +420,7 @@ impl Parser {
                             }
                         }
                         Keyword::Sub => {
-                            if matches!(self.peek_token(), Token::Ident(_)) {
+                            if matches!(self.peek_token(), Token::Ident(_) | Token::Keyword(_)) {
                                 (self.parse_sub_decl_body(kw_span)?, false)
                             } else {
                                 let expr = self.parse_anon_sub(kw_span)?;
@@ -639,6 +639,8 @@ impl Parser {
     fn parse_sub_decl_body(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(name) => name,
+            // Keywords are valid sub names: `sub send { }`, `sub print { }`.
+            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
         };
 
@@ -1149,6 +1151,8 @@ impl Parser {
     fn parse_package_decl(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(n) => n,
+            // Keywords are valid package names: `package send;`
+            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
             other => return Err(ParseError::new(format!("expected package name, got {other:?}"), start)),
         };
 
@@ -1324,13 +1328,17 @@ impl Parser {
 
     fn parse_format(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         // Optional name (defaults to STDOUT)
-        let name = if let Token::Ident(_) = self.peek_token() {
-            match self.next_token()?.token {
+        let name = match self.peek_token() {
+            Token::Ident(_) => match self.next_token()?.token {
                 Token::Ident(s) => s,
                 _ => unreachable!(),
-            }
-        } else {
-            "STDOUT".to_string()
+            },
+            // Keywords are valid format names: `format send = ...`.
+            Token::Keyword(_) => match self.next_token()?.token {
+                Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+                _ => unreachable!(),
+            },
+            _ => "STDOUT".to_string(),
         };
 
         // Expect '='
@@ -1495,6 +1503,8 @@ impl Parser {
     fn parse_method(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(n) => n,
+            // Keywords are valid method names: `method send { }`.
+            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
             other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
         };
 
