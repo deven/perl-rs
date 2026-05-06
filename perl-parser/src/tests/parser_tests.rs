@@ -13050,3 +13050,423 @@ fn select_fat_comma_autoquotes() {
     let prog = parse("my %h = (select => 42);");
     assert!(!prog.statements.is_empty());
 }
+
+// ── Additional list operator builtins ───────────────────────
+
+#[test]
+fn listop_waitpid_two_args() {
+    // `waitpid $pid, 0` — system/process list op.
+    let prog = parse("waitpid $pid, 0;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "waitpid");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(waitpid), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_kill_signal_and_pids() {
+    // `kill 'HUP', $pid1, $pid2`
+    let prog = parse("kill 'HUP', $pid1, $pid2;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "kill");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected ListOp(kill), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_socket_four_args() {
+    // `socket(my $sock, PF_INET, SOCK_STREAM, 0)`
+    let prog = parse("socket(my $sock, 2, 1, 0);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "socket");
+                assert_eq!(args.len(), 4);
+            }
+            other => panic!("expected ListOp(socket), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_send_with_parens() {
+    let prog = parse("send($sock, $msg, 0);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "send");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected ListOp(send), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_pack_template_and_values() {
+    // `pack "A*", $data`
+    let prog = parse("pack 'A*', $data;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "pack");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(pack), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_unpack_template_and_data() {
+    let prog = parse("unpack('N', $buf);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "unpack");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(unpack), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_flock_two_args() {
+    let prog = parse("flock $fh, 2;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "flock");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(flock), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_link_two_args() {
+    let prog = parse("link $old, $new;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "link");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(link), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_truncate_two_args() {
+    let prog = parse("truncate $fh, 0;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "truncate");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(truncate), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_sysread_three_args() {
+    let prog = parse("sysread($fh, $buf, 1024);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "sysread");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected ListOp(sysread), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_utime_list() {
+    // `utime $atime, $mtime, @files`
+    let prog = parse("utime $atime, $mtime, @files;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "utime");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected ListOp(utime), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_vec_three_args() {
+    let prog = parse("vec($flags, 0, 8);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "vec");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected ListOp(vec), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_fcntl_three_args() {
+    let prog = parse("fcntl($fh, 2, 0);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "fcntl");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected ListOp(fcntl), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_msgrcv_five_args() {
+    let prog = parse("msgrcv($id, $buf, 256, 0, 0);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "msgrcv");
+                assert_eq!(args.len(), 5);
+            }
+            other => panic!("expected ListOp(msgrcv), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+// Named unary — database lookups
+
+#[test]
+fn named_unary_getpwnam() {
+    // `getpwnam "root"` — named unary, takes one arg.
+    let prog = parse("getpwnam 'root';");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "getpwnam");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(getpwnam), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_getpwuid() {
+    let prog = parse("getpwuid 0;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "getpwuid");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(getpwuid), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_gethostbyname() {
+    let prog = parse("gethostbyname $host;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "gethostbyname");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(gethostbyname), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+// Multi-arg database lookups (list ops)
+
+#[test]
+fn listop_getservbyname() {
+    let prog = parse("getservbyname 'http', 'tcp';");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "getservbyname");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(getservbyname), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn listop_fat_comma_autoquotes_pack() {
+    // `pack => 42` — fat comma autoquotes the keyword.
+    let prog = parse("my %h = (pack => 42);");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn all_list_op_keywords_parse() {
+    // Verify every list operator keyword parses as a ListOp, not a bareword.
+    let list_ops = [
+        "waitpid",
+        "kill",
+        "pipe",
+        "setpgrp",
+        "setpriority",
+        "getpriority",
+        "syscall",
+        "socket",
+        "socketpair",
+        "bind",
+        "connect",
+        "listen",
+        "accept",
+        "shutdown",
+        "send",
+        "recv",
+        "setsockopt",
+        "getsockopt",
+        "shmget",
+        "shmctl",
+        "shmread",
+        "shmwrite",
+        "semget",
+        "semctl",
+        "semop",
+        "msgget",
+        "msgctl",
+        "msgsnd",
+        "msgrcv",
+        "getservbyname",
+        "gethostbyaddr",
+        "getnetbyaddr",
+        "getservbyport",
+        "sysopen",
+        "sysread",
+        "syswrite",
+        "sysseek",
+        "truncate",
+        "fcntl",
+        "ioctl",
+        "flock",
+        "seekdir",
+        "link",
+        "symlink",
+        "utime",
+        "pack",
+        "unpack",
+        "vec",
+        "formline",
+        "select",
+    ];
+    for kw in list_ops {
+        let src = format!("{kw}($x, $y);");
+        let prog = parse(&src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::ListOp(name, _) => {
+                    assert_eq!(name, kw, "{kw} should parse as ListOp");
+                }
+                other => panic!("{kw} parsed as {other:?}, expected ListOp"),
+            },
+            other => panic!("{kw} statement: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn all_named_unary_db_keywords_parse() {
+    // Verify every database-lookup named unary parses as FuncCall.
+    let unaries = ["getpwnam", "getgrnam", "gethostbyname", "getnetbyname", "getprotobyname", "getpwuid", "getgrgid", "getprotobynumber"];
+    for kw in unaries {
+        let src = format!("{kw} $arg;");
+        let prog = parse(&src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, kw, "{kw} should parse as FuncCall");
+                    assert_eq!(args.len(), 1, "{kw} should have one arg");
+                }
+                other => panic!("{kw} parsed as {other:?}, expected FuncCall"),
+            },
+            other => panic!("{kw} statement: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn all_nullary_keywords_parse() {
+    // Verify every nullary builtin parses as a zero-arg FuncCall.
+    let nullaries = [
+        "time",
+        "times",
+        "fork",
+        "wait",
+        "getppid",
+        "getlogin",
+        "setpwent",
+        "setgrent",
+        "endpwent",
+        "endgrent",
+        "endhostent",
+        "endnetent",
+        "endprotoent",
+        "endservent",
+        "getpwent",
+        "getgrent",
+        "gethostent",
+        "getnetent",
+        "getprotoent",
+        "getservent",
+    ];
+    for kw in nullaries {
+        let src = format!("{kw};");
+        let prog = parse(&src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, kw, "{kw} should parse as FuncCall");
+                    assert!(args.is_empty(), "{kw} should have zero args");
+                }
+                other => panic!("{kw} parsed as {other:?}, expected zero-arg FuncCall"),
+            },
+            other => panic!("{kw} statement: {other:?}"),
+        }
+    }
+}

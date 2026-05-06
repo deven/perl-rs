@@ -133,6 +133,71 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "readpipe" => Some(Keyword::Readpipe),
         "chroot" => Some(Keyword::Chroot),
         "reset" => Some(Keyword::Reset),
+        // Named unary — database lookup (single arg)
+        "getpwnam" => Some(Keyword::Getpwnam),
+        "getgrnam" => Some(Keyword::Getgrnam),
+        "gethostbyname" => Some(Keyword::Gethostbyname),
+        "getnetbyname" => Some(Keyword::Getnetbyname),
+        "getprotobyname" => Some(Keyword::Getprotobyname),
+        "getpwuid" => Some(Keyword::Getpwuid),
+        "getgrgid" => Some(Keyword::Getgrgid),
+        "getprotobynumber" => Some(Keyword::Getprotobynumber),
+        // List operators — system/process
+        "waitpid" => Some(Keyword::Waitpid),
+        "kill" => Some(Keyword::Kill),
+        "pipe" => Some(Keyword::Pipe),
+        "setpgrp" => Some(Keyword::Setpgrp),
+        "setpriority" => Some(Keyword::Setpriority),
+        "getpriority" => Some(Keyword::Getpriority),
+        "syscall" => Some(Keyword::Syscall),
+        // List operators — socket/network
+        "socket" => Some(Keyword::Socket),
+        "socketpair" => Some(Keyword::Socketpair),
+        "bind" => Some(Keyword::Bind),
+        "connect" => Some(Keyword::Connect),
+        "listen" => Some(Keyword::Listen),
+        "accept" => Some(Keyword::Accept),
+        "shutdown" => Some(Keyword::Shutdown),
+        "send" => Some(Keyword::Send),
+        "recv" => Some(Keyword::Recv),
+        "setsockopt" => Some(Keyword::Setsockopt),
+        "getsockopt" => Some(Keyword::Getsockopt),
+        // List operators — SysV IPC
+        "shmget" => Some(Keyword::Shmget),
+        "shmctl" => Some(Keyword::Shmctl),
+        "shmread" => Some(Keyword::Shmread),
+        "shmwrite" => Some(Keyword::Shmwrite),
+        "semget" => Some(Keyword::Semget),
+        "semctl" => Some(Keyword::Semctl),
+        "semop" => Some(Keyword::Semop),
+        "msgget" => Some(Keyword::Msgget),
+        "msgctl" => Some(Keyword::Msgctl),
+        "msgsnd" => Some(Keyword::Msgsnd),
+        "msgrcv" => Some(Keyword::Msgrcv),
+        // List operators — database lookup (multi-arg)
+        "getservbyname" => Some(Keyword::Getservbyname),
+        "gethostbyaddr" => Some(Keyword::Gethostbyaddr),
+        "getnetbyaddr" => Some(Keyword::Getnetbyaddr),
+        "getservbyport" => Some(Keyword::Getservbyport),
+        // List operators — low-level I/O
+        "sysopen" => Some(Keyword::Sysopen),
+        "sysread" => Some(Keyword::Sysread),
+        "syswrite" => Some(Keyword::Syswrite),
+        "sysseek" => Some(Keyword::Sysseek),
+        "truncate" => Some(Keyword::Truncate),
+        "fcntl" => Some(Keyword::Fcntl),
+        "ioctl" => Some(Keyword::Ioctl),
+        "flock" => Some(Keyword::Flock),
+        "seekdir" => Some(Keyword::Seekdir),
+        // List operators — file ops
+        "link" => Some(Keyword::Link),
+        "symlink" => Some(Keyword::Symlink),
+        "utime" => Some(Keyword::Utime),
+        // List operators — data
+        "pack" => Some(Keyword::Pack),
+        "unpack" => Some(Keyword::Unpack),
+        "vec" => Some(Keyword::Vec),
+        "formline" => Some(Keyword::Formline),
         "qw" => Some(Keyword::Qw),
         "format" => Some(Keyword::Format),
         "BEGIN" => Some(Keyword::BEGIN),
@@ -322,6 +387,63 @@ impl From<Keyword> for &'static str {
             Keyword::Readpipe => "readpipe",
             Keyword::Chroot => "chroot",
             Keyword::Reset => "reset",
+            Keyword::Getpwnam => "getpwnam",
+            Keyword::Getgrnam => "getgrnam",
+            Keyword::Gethostbyname => "gethostbyname",
+            Keyword::Getnetbyname => "getnetbyname",
+            Keyword::Getprotobyname => "getprotobyname",
+            Keyword::Getpwuid => "getpwuid",
+            Keyword::Getgrgid => "getgrgid",
+            Keyword::Getprotobynumber => "getprotobynumber",
+            Keyword::Waitpid => "waitpid",
+            Keyword::Kill => "kill",
+            Keyword::Pipe => "pipe",
+            Keyword::Setpgrp => "setpgrp",
+            Keyword::Setpriority => "setpriority",
+            Keyword::Getpriority => "getpriority",
+            Keyword::Syscall => "syscall",
+            Keyword::Socket => "socket",
+            Keyword::Socketpair => "socketpair",
+            Keyword::Bind => "bind",
+            Keyword::Connect => "connect",
+            Keyword::Listen => "listen",
+            Keyword::Accept => "accept",
+            Keyword::Shutdown => "shutdown",
+            Keyword::Send => "send",
+            Keyword::Recv => "recv",
+            Keyword::Setsockopt => "setsockopt",
+            Keyword::Getsockopt => "getsockopt",
+            Keyword::Shmget => "shmget",
+            Keyword::Shmctl => "shmctl",
+            Keyword::Shmread => "shmread",
+            Keyword::Shmwrite => "shmwrite",
+            Keyword::Semget => "semget",
+            Keyword::Semctl => "semctl",
+            Keyword::Semop => "semop",
+            Keyword::Msgget => "msgget",
+            Keyword::Msgctl => "msgctl",
+            Keyword::Msgsnd => "msgsnd",
+            Keyword::Msgrcv => "msgrcv",
+            Keyword::Getservbyname => "getservbyname",
+            Keyword::Gethostbyaddr => "gethostbyaddr",
+            Keyword::Getnetbyaddr => "getnetbyaddr",
+            Keyword::Getservbyport => "getservbyport",
+            Keyword::Sysopen => "sysopen",
+            Keyword::Sysread => "sysread",
+            Keyword::Syswrite => "syswrite",
+            Keyword::Sysseek => "sysseek",
+            Keyword::Truncate => "truncate",
+            Keyword::Fcntl => "fcntl",
+            Keyword::Ioctl => "ioctl",
+            Keyword::Flock => "flock",
+            Keyword::Seekdir => "seekdir",
+            Keyword::Link => "link",
+            Keyword::Symlink => "symlink",
+            Keyword::Utime => "utime",
+            Keyword::Pack => "pack",
+            Keyword::Unpack => "unpack",
+            Keyword::Vec => "vec",
+            Keyword::Formline => "formline",
             Keyword::Qw => "qw",
             Keyword::Format => "format",
             Keyword::BEGIN => "BEGIN",
@@ -441,6 +563,14 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Readpipe
             | Keyword::Chroot
             | Keyword::Reset
+            | Keyword::Getpwnam
+            | Keyword::Getgrnam
+            | Keyword::Gethostbyname
+            | Keyword::Getnetbyname
+            | Keyword::Getprotobyname
+            | Keyword::Getpwuid
+            | Keyword::Getgrgid
+            | Keyword::Getprotobynumber
     )
 }
 
@@ -522,6 +652,62 @@ pub fn is_list_op(kw: Keyword) -> bool {
             | Keyword::Bless
             | Keyword::Mkdir
             | Keyword::Select
+            // System/process
+            | Keyword::Waitpid
+            | Keyword::Kill
+            | Keyword::Pipe
+            | Keyword::Setpgrp
+            | Keyword::Setpriority
+            | Keyword::Getpriority
+            | Keyword::Syscall
+            // Socket/network
+            | Keyword::Socket
+            | Keyword::Socketpair
+            | Keyword::Bind
+            | Keyword::Connect
+            | Keyword::Listen
+            | Keyword::Accept
+            | Keyword::Shutdown
+            | Keyword::Send
+            | Keyword::Recv
+            | Keyword::Setsockopt
+            | Keyword::Getsockopt
+            // SysV IPC
+            | Keyword::Shmget
+            | Keyword::Shmctl
+            | Keyword::Shmread
+            | Keyword::Shmwrite
+            | Keyword::Semget
+            | Keyword::Semctl
+            | Keyword::Semop
+            | Keyword::Msgget
+            | Keyword::Msgctl
+            | Keyword::Msgsnd
+            | Keyword::Msgrcv
+            // Database lookup (multi-arg)
+            | Keyword::Getservbyname
+            | Keyword::Gethostbyaddr
+            | Keyword::Getnetbyaddr
+            | Keyword::Getservbyport
+            // Low-level I/O
+            | Keyword::Sysopen
+            | Keyword::Sysread
+            | Keyword::Syswrite
+            | Keyword::Sysseek
+            | Keyword::Truncate
+            | Keyword::Fcntl
+            | Keyword::Ioctl
+            | Keyword::Flock
+            | Keyword::Seekdir
+            // File ops
+            | Keyword::Link
+            | Keyword::Symlink
+            | Keyword::Utime
+            // Data
+            | Keyword::Pack
+            | Keyword::Unpack
+            | Keyword::Vec
+            | Keyword::Formline
     )
 }
 
