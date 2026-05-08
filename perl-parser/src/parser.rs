@@ -2618,8 +2618,19 @@ impl Parser {
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
         let name = (<&str>::from(kw)).to_string();
 
-        // Named unary with optional arg
-        if self.at(&Token::Semi)? || self.at_eof()? || self.at(&Token::RightBrace)? || self.at(&Token::RightParen)? {
+        // Named unary with optional arg — check for tokens that
+        // indicate "no argument follows."
+        if self.at(&Token::Semi)?
+            || self.at_eof()?
+            || self.at(&Token::RightBrace)?
+            || self.at(&Token::RightParen)?
+            || self.at(&Token::Comma)?
+            || self.at(&Token::RightBracket)?
+            || matches!(
+                self.peek_token(),
+                Token::Keyword(Keyword::If | Keyword::Unless | Keyword::While | Keyword::Until | Keyword::For | Keyword::Foreach | Keyword::Or | Keyword::And)
+            )
+        {
             // No argument
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
         }
@@ -2639,8 +2650,12 @@ impl Parser {
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: span.merge(end) });
         }
 
-        // Parse one term as the argument
-        let arg = self.parse_expr(PREC_COMMA)?;
+        // Parse one term as the argument at named-unary precedence.
+        // Named unary binds tighter than ternary, comparison, logical
+        // operators: `defined $x ? 1 : 0` is `defined($x) ? 1 : 0`,
+        // `defined $x || $y` is `defined($x) || $y`.  But it binds
+        // looser than arithmetic: `lc $x . $y` is `lc($x . $y)`.
+        let arg = self.parse_expr(PREC_NAMED_UNARY)?;
         let end = span.merge(arg.span);
         Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: end })
     }
@@ -2656,8 +2671,19 @@ impl Parser {
     /// minus the `prefers_defined_or` check (neither `fc` nor
     /// `evalbytes` needs it).
     fn parse_feature_named_unary(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
-        // No argument: `fc;` or `fc)` or at EOF.
-        if self.at(&Token::Semi)? || self.at_eof()? || self.at(&Token::RightBrace)? || self.at(&Token::RightParen)? {
+        // No argument: `fc;` or `fc)` or at EOF, or followed by
+        // postfix modifier / low-precedence operator.
+        if self.at(&Token::Semi)?
+            || self.at_eof()?
+            || self.at(&Token::RightBrace)?
+            || self.at(&Token::RightParen)?
+            || self.at(&Token::Comma)?
+            || self.at(&Token::RightBracket)?
+            || matches!(
+                self.peek_token(),
+                Token::Keyword(Keyword::If | Keyword::Unless | Keyword::While | Keyword::Until | Keyword::For | Keyword::Foreach | Keyword::Or | Keyword::And)
+            )
+        {
             return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
         }
 

@@ -13521,3 +13521,110 @@ fn format_decl_with_keyword_name() {
         other => panic!("expected FormatDecl, got {other:?}"),
     }
 }
+
+// ── Named unary postfix modifier and precedence fixes ───────
+
+#[test]
+fn named_unary_sleep_postfix_if() {
+    // `sleep if $tired;` — postfix modifier, sleep has zero args.
+    let prog = parse("sleep if $tired;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::If, body, _), .. }) => match &body.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "sleep");
+                assert!(args.is_empty(), "sleep should have zero args before postfix if");
+            }
+            other => panic!("expected FuncCall(sleep), got {other:?}"),
+        },
+        other => panic!("expected PostfixControl If, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_chdir_or_die() {
+    // `chdir or die;` — low-precedence `or`, chdir has zero args.
+    let prog = parse("chdir or die;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::LowOr, lhs, _) => match &lhs.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "chdir");
+                    assert!(args.is_empty(), "chdir should have zero args before `or`");
+                }
+                other => panic!("expected FuncCall(chdir), got {other:?}"),
+            },
+            other => panic!("expected BinOp(LowOr), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_defined_ternary_precedence() {
+    // `defined $x ? 1 : 0` is `defined($x) ? 1 : 0`, NOT `defined($x ? 1 : 0)`.
+    let prog = parse("defined $x ? 1 : 0;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Ternary(cond, _, _) => match &cond.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "defined");
+                    assert_eq!(args.len(), 1, "defined should consume only $x");
+                }
+                other => panic!("expected FuncCall(defined) as ternary condition, got {other:?}"),
+            },
+            other => panic!("expected Ternary, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_defined_logical_or_precedence() {
+    // `defined $x || $y` is `defined($x) || $y`.
+    let prog = parse("defined $x || $y;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::Or, lhs, _) => match &lhs.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, "defined");
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected FuncCall(defined), got {other:?}"),
+            },
+            other => panic!("expected BinOp(Or), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_lc_concat_precedence() {
+    // `lc $x . $y` is `lc($x . $y)` — concat is above named-unary precedence.
+    let prog = parse("lc $x . $y;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "lc");
+                assert_eq!(args.len(), 1);
+                // The single arg should be a Concat binop.
+                assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Concat, _, _)));
+            }
+            other => panic!("expected FuncCall(lc), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_unary_sleep_for_postfix_loop() {
+    // `sleep for 1..5` — postfix for loop.
+    let prog = parse("sleep for 1..5;");
+    assert!(!prog.statements.is_empty());
+}
+
+#[test]
+fn named_unary_alarm_with_arg_postfix_if() {
+    // `alarm 30 if $need_timeout` — arg then postfix modifier.
+    let prog = parse("alarm 30 if $need_timeout;");
+    assert!(!prog.statements.is_empty());
+}
