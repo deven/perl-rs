@@ -187,6 +187,23 @@ pub enum Keyword {
     Getpwuid,
     Getgrgid,
     Getprotobynumber,
+    // Named unary — additional
+    Fileno,
+    Getpeername,
+    Getpgrp,
+    Getsockname,
+    Rewinddir,
+    Sethostent,
+    Setnetent,
+    Setprotoent,
+    Setservent,
+    Study,
+    Telldir,
+    Dbmclose,
+    Lock, // weak keyword — overridable by user sub
+    // Feature-gated named unaries
+    Evalbytes, // feature 'evalbytes'
+    Fc,        // feature 'fc'
 
     // ── List operator builtins (additional) ──────────────────
     // System/process
@@ -245,6 +262,20 @@ pub enum Keyword {
     Unpack,
     Vec,
     Formline,
+    // Additional list operators
+    Atan2,
+    Crypt,
+    Dbmopen,
+    AUTOLOAD,
+    DESTROY,
+
+    // ── Infix operator keywords ─────────────────────────────
+    X,   // string repeat operator
+    Xor, // low-precedence logical xor
+    Isa, // class-instance test (feature-gated)
+
+    // ── Flow control ────────────────────────────────────────
+    Break, // exits given/when block (feature-gated under 'switch')
 
     // ── List-processing (block-first) ──────────────────────
     Any,

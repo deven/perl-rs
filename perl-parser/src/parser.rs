@@ -1171,14 +1171,17 @@ impl Parser {
             // Block form: `package Name { ... }` — switch packages
             // for the duration of the block, then restore.
             let saved = std::mem::replace(&mut self.current_package, std::sync::Arc::from(name.as_str()));
+            self.lexer.current_package = name.clone();
             let block = self.parse_block()?;
             self.current_package = saved;
+            self.lexer.current_package = self.current_package.to_string();
             Some(block)
         } else {
             // Statement form: `package Name;` — switch packages for
             // everything that follows in this compilation unit.
             self.eat(&Token::Semi)?;
             self.current_package = std::sync::Arc::from(name.as_str());
+            self.lexer.current_package = name.clone();
             None
         };
 
@@ -1274,6 +1277,21 @@ impl Parser {
         // decide whether to accept multi-byte identifiers.
         self.lexer.set_utf8_mode(self.pragmas.utf8);
         self.lexer.features = self.pragmas.features;
+
+        // `use subs qw(name ...)` — mark names as imported so the
+        // lexer emits Token::Ident instead of Token::Keyword for
+        // weak keywords, allowing user subs to override builtins.
+        if !is_no
+            && module == "subs"
+            && let Some(ref items) = imports
+        {
+            for item in items {
+                if let ExprKind::StringLit(name) = &item.kind {
+                    let fqn = format!("{}::{}", self.current_package, name);
+                    self.lexer.imported_subs.insert(fqn);
+                }
+            }
+        }
 
         Ok(StmtKind::UseDecl(UseDecl { is_no, module, version, imports, span: start.merge(self.peek_span()) }))
     }
@@ -1662,6 +1680,7 @@ impl Parser {
             // restore after.
             let saved_pragmas = this.pragmas;
             let saved_package = this.current_package.clone();
+            let saved_imported_subs = this.lexer.imported_subs.clone();
 
             let start = this.peek_span();
             let result = (|this: &mut Parser| -> Result<Block, ParseError> {
@@ -1680,9 +1699,11 @@ impl Parser {
 
             this.pragmas = saved_pragmas;
             this.current_package = saved_package;
-            // Sync shared UTF-8 flag with the restored state.
+            // Sync shared state with the restored lexical scope.
             this.lexer.set_utf8_mode(this.pragmas.utf8);
             this.lexer.features = this.pragmas.features;
+            this.lexer.current_package = this.current_package.to_string();
+            this.lexer.imported_subs = saved_imported_subs;
             result
         })
     }
@@ -2113,6 +2134,14 @@ impl Parser {
                 }
             }
 
+            // break — exits a given/when block.  No label argument.
+            Token::Keyword(Keyword::Break) => Ok(Expr { kind: ExprKind::FuncCall("break".into(), vec![]), span }),
+
+            // `x` is a weak keyword: in prefix position it acts as an
+            // identifier (function call / bareword).  In infix position
+            // the Pratt parser handles it as the repeat operator.
+            Token::Keyword(Keyword::X) => self.parse_ident_term("x".to_string(), span),
+
             // stat / lstat — dedicated AST nodes with StatTarget
             Token::Keyword(Keyword::Stat) => self.parse_stat_op(false, span),
             Token::Keyword(Keyword::Lstat) => self.parse_stat_op(true, span),
@@ -2323,20 +2352,6 @@ impl Parser {
         // Autoquote: bareword followed by `=>` (fat comma) or `}` (hash subscript)
         if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
-        }
-
-        // Feature-gated named-unary builtins.  `fc` and
-        // `evalbytes` become operators only when their feature is
-        // active; without the feature they're ordinary
-        // identifiers, which fall through to the general
-        // function-call/bareword path below.
-        let feature_gated_unary = match name.as_str() {
-            "fc" if self.pragmas.features.contains(Features::FC) => true,
-            "evalbytes" if self.pragmas.features.contains(Features::EVALBYTES) => true,
-            _ => false,
-        };
-        if feature_gated_unary {
-            return self.parse_feature_named_unary(name, span);
         }
 
         // Look up in the symbol table to see if this is a known sub.
@@ -2628,7 +2643,17 @@ impl Parser {
             || self.at(&Token::RightBracket)?
             || matches!(
                 self.peek_token(),
-                Token::Keyword(Keyword::If | Keyword::Unless | Keyword::While | Keyword::Until | Keyword::For | Keyword::Foreach | Keyword::Or | Keyword::And)
+                Token::Keyword(
+                    Keyword::If
+                        | Keyword::Unless
+                        | Keyword::While
+                        | Keyword::Until
+                        | Keyword::For
+                        | Keyword::Foreach
+                        | Keyword::Or
+                        | Keyword::And
+                        | Keyword::Xor
+                )
             )
         {
             // No argument
@@ -2655,48 +2680,6 @@ impl Parser {
         // operators: `defined $x ? 1 : 0` is `defined($x) ? 1 : 0`,
         // `defined $x || $y` is `defined($x) || $y`.  But it binds
         // looser than arithmetic: `lc $x . $y` is `lc($x . $y)`.
-        let arg = self.parse_expr(PREC_NAMED_UNARY)?;
-        let end = span.merge(arg.span);
-        Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: end })
-    }
-
-    /// Parse a feature-gated named-unary builtin called by its
-    /// string name (rather than a `Keyword` enum variant).
-    ///
-    /// Used for `fc` and `evalbytes`, which are feature-gated and
-    /// therefore not in the keyword table: adding them there would
-    /// make them keywords even when the feature is off, shadowing
-    /// any user-defined sub of the same name.  This helper is
-    /// essentially the string-name version of `parse_named_unary`
-    /// minus the `prefers_defined_or` check (neither `fc` nor
-    /// `evalbytes` needs it).
-    fn parse_feature_named_unary(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
-        // No argument: `fc;` or `fc)` or at EOF, or followed by
-        // postfix modifier / low-precedence operator.
-        if self.at(&Token::Semi)?
-            || self.at_eof()?
-            || self.at(&Token::RightBrace)?
-            || self.at(&Token::RightParen)?
-            || self.at(&Token::Comma)?
-            || self.at(&Token::RightBracket)?
-            || matches!(
-                self.peek_token(),
-                Token::Keyword(Keyword::If | Keyword::Unless | Keyword::While | Keyword::Until | Keyword::For | Keyword::Foreach | Keyword::Or | Keyword::And)
-            )
-        {
-            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
-        }
-
-        // Parenthesized: `fc($x)`.
-        if self.at(&Token::LeftParen)? {
-            self.next_token()?;
-            let arg = self.parse_expr(PREC_LOW)?;
-            let end = self.peek_span();
-            self.expect_token(&Token::RightParen)?;
-            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: span.merge(end) });
-        }
-
-        // Unparenthesized: one argument at named-unary precedence.
         let arg = self.parse_expr(PREC_NAMED_UNARY)?;
         let end = span.merge(arg.span);
         Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: end })
@@ -3272,7 +3255,6 @@ impl Parser {
         // Snapshot feature bits we may consult before the match
         // on self.peek_token() — that call takes a mutable borrow
         // of self, which we can't hold across further field access.
-        let isa_active = self.pragmas.features.contains(Features::ISA);
         let smartmatch_active = self.pragmas.features.contains(Features::SMARTMATCH);
 
         match self.peek_token() {
@@ -3314,15 +3296,9 @@ impl Parser {
             Token::Keyword(Keyword::Lt) | Token::Keyword(Keyword::Gt) | Token::Keyword(Keyword::Le) | Token::Keyword(Keyword::Ge) => {
                 Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non })
             }
-            Token::Ident(name) => match name.as_str() {
-                "x" => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
-                "xor" => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
-                // `isa` is feature-gated: treated as an infix
-                // operator only when the `isa` feature is active.
-                // Without it, it's an ordinary bareword.
-                "isa" if isa_active => Some(OpInfo { prec: PREC_ISA, assoc: Assoc::Non }),
-                _ => None,
-            },
+            Token::Keyword(Keyword::X) => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
+            Token::Keyword(Keyword::Xor) => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
+            Token::Keyword(Keyword::Isa) => Some(OpInfo { prec: PREC_ISA, assoc: Assoc::Non }),
             _ => None,
         }
     }
@@ -3825,6 +3801,9 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::NotBinding => Ok(BinOp::NotBinding),
         Token::Keyword(Keyword::And) => Ok(BinOp::LowAnd),
         Token::Keyword(Keyword::Or) => Ok(BinOp::LowOr),
+        Token::Keyword(Keyword::X) => Ok(BinOp::Repeat),
+        Token::Keyword(Keyword::Xor) => Ok(BinOp::LowXor),
+        Token::Keyword(Keyword::Isa) => Ok(BinOp::Isa),
         Token::Keyword(Keyword::Eq) => Ok(BinOp::StrEq),
         Token::Keyword(Keyword::Ne) => Ok(BinOp::StrNe),
         Token::Keyword(Keyword::Lt) => Ok(BinOp::StrLt),
@@ -3832,14 +3811,6 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::Keyword(Keyword::Le) => Ok(BinOp::StrLe),
         Token::Keyword(Keyword::Ge) => Ok(BinOp::StrGe),
         Token::Keyword(Keyword::Cmp) => Ok(BinOp::StrCmp),
-        Token::Ident(name) => match name.as_str() {
-            "x" => Ok(BinOp::Repeat),
-            "xor" => Ok(BinOp::LowXor),
-            // Only reaches here when op_info already gated on the
-            // `isa` feature, so no feature check needed.
-            "isa" => Ok(BinOp::Isa),
-            _ => Err(ParseError::new(format!("not a binary operator: {token:?}"), Span::DUMMY)),
-        },
         other => Err(ParseError::new(format!("not a binary operator: {other:?}"), Span::DUMMY)),
     }
 }

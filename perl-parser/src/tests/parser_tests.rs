@@ -13628,3 +13628,382 @@ fn named_unary_alarm_with_arg_postfix_if() {
     let prog = parse("alarm 30 if $need_timeout;");
     assert!(!prog.statements.is_empty());
 }
+
+// ── Keyword audit: final batch ──────────────────────────────
+
+#[test]
+fn keyword_x_as_repeat_operator() {
+    // `"ab" x 3` — x is the infix repeat operator.
+    let prog = parse("\"ab\" x 3;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::Repeat, _, _) => {}
+            other => panic!("expected BinOp(Repeat), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_x_in_prefix_position() {
+    // `x()` — x as a function call (weak keyword, prefix position).
+    let prog = parse("x();");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "x"),
+            other => panic!("expected FuncCall(x), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_xor_as_infix_operator() {
+    // `$a xor $b` — low-precedence logical xor.
+    let prog = parse("$a xor $b;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::LowXor, _, _) => {}
+            other => panic!("expected BinOp(LowXor), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_isa_as_infix_operator() {
+    // `$obj isa Foo` — class-instance test (feature-gated).
+    let prog = parse("use feature 'isa'; $obj isa Foo;");
+    // Find the isa expression (second statement)
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::Isa, _, _) => {}
+            other => panic!("expected BinOp(Isa), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_isa_without_feature_is_ident() {
+    // Without the isa feature, `isa` is a bare identifier.
+    let prog = parse("isa();");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "isa"),
+            other => panic!("expected FuncCall(isa), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_break_bare() {
+    // `break;` — exits given/when block.
+    let prog = parse("use feature 'switch'; break;");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "break");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(break), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_break_without_feature_is_ident() {
+    // Without switch feature, `break` is a bare identifier.
+    let prog = parse("break();");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "break"),
+            other => panic!("expected FuncCall(break), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_evalbytes_with_feature() {
+    let prog = parse("use feature 'evalbytes'; evalbytes $bytes;");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "evalbytes");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(evalbytes), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_fc_with_feature() {
+    let prog = parse("use feature 'fc'; fc $str;");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "fc");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(fc), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_lock_named_unary() {
+    let prog = parse("lock $var;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "lock");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(lock), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_atan2_list_op() {
+    let prog = parse("atan2 $y, $x;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "atan2");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(atan2), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_crypt_list_op() {
+    let prog = parse("crypt $plain, $salt;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "crypt");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected ListOp(crypt), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_autoload_list_op() {
+    let prog = parse("AUTOLOAD();");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "AUTOLOAD");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected ListOp(AUTOLOAD), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_destroy_list_op() {
+    let prog = parse("DESTROY();");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::ListOp(name, args) => {
+                assert_eq!(name, "DESTROY");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected ListOp(DESTROY), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_fileno_named_unary() {
+    let prog = parse("fileno $fh;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "fileno");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(fileno), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_study_named_unary() {
+    let prog = parse("study $str;");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "study");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected FuncCall(study), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_sub_decl_with_keyword_x() {
+    // `sub x { }` — valid, x is a weak keyword.
+    let prog = parse("sub x { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "x"),
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_sub_decl_with_keyword_xor() {
+    let prog = parse("sub xor { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "xor"),
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_sub_decl_with_keyword_lock() {
+    let prog = parse("sub lock { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "lock"),
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+// Exhaustive coverage: verify every new keyword parses correctly.
+
+#[test]
+fn all_final_batch_named_unaries_parse() {
+    let unaries = [
+        "fileno",
+        "getpeername",
+        "getpgrp",
+        "getsockname",
+        "rewinddir",
+        "sethostent",
+        "setnetent",
+        "setprotoent",
+        "setservent",
+        "study",
+        "telldir",
+        "dbmclose",
+        "lock",
+    ];
+    for kw in unaries {
+        let src = format!("{kw} $arg;");
+        let prog = parse(&src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::FuncCall(name, args) => {
+                    assert_eq!(name, kw, "{kw} should parse as FuncCall");
+                    assert_eq!(args.len(), 1, "{kw} should have one arg");
+                }
+                other => panic!("{kw} parsed as {other:?}, expected FuncCall"),
+            },
+            other => panic!("{kw} statement: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn all_final_batch_list_ops_parse() {
+    let list_ops = ["atan2", "crypt", "dbmopen", "AUTOLOAD", "DESTROY"];
+    for kw in list_ops {
+        let src = format!("{kw}($x, $y);");
+        let prog = parse(&src);
+        match &prog.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::ListOp(name, _) => {
+                    assert_eq!(name, kw, "{kw} should parse as ListOp");
+                }
+                other => panic!("{kw} parsed as {other:?}, expected ListOp"),
+            },
+            other => panic!("{kw} statement: {other:?}"),
+        }
+    }
+}
+
+// ── Weak keyword override via use subs ──────────────────────
+
+#[test]
+fn weak_keyword_abs_overridden_by_use_subs() {
+    // `use subs 'abs'` imports abs, so it should parse as a function call
+    // (identifier) rather than the builtin named unary.
+    let prog = parse("use subs 'abs'; abs(-5);");
+    // The abs(-5) call should be a FuncCall (identifier path), not a named
+    // unary FuncCall.  With use subs, the lexer emits Token::Ident("abs")
+    // instead of Token::Keyword(Keyword::Abs).
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "abs"),
+            other => panic!("expected FuncCall(abs), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn weak_keyword_not_overridden_without_use_subs() {
+    // Without `use subs`, abs is still a keyword (named unary).
+    let prog = parse("abs(-5);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "abs"),
+            other => panic!("expected FuncCall(abs), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn strong_keyword_not_overridden_by_use_subs() {
+    // `print` is a strong keyword — `use subs 'print'` should NOT override it.
+    let prog = parse("use subs 'print'; print 42;");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::PrintOp(..) => {} // still parsed as print op
+            other => panic!("expected PrintOp, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn weak_keyword_use_subs_scoped_to_block() {
+    // `use subs` inside a block should not leak out.
+    let prog = parse("{ use subs 'abs'; abs(-5); } abs(-5);");
+    // The second abs(-5) outside the block should still be a keyword.
+    let outer_stmt = &prog.statements[1];
+    match &outer_stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "abs"),
+            other => panic!("expected FuncCall(abs), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}

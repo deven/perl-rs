@@ -133,6 +133,22 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "readpipe" => Some(Keyword::Readpipe),
         "chroot" => Some(Keyword::Chroot),
         "reset" => Some(Keyword::Reset),
+        // Named unary — additional
+        "fileno" => Some(Keyword::Fileno),
+        "getpeername" => Some(Keyword::Getpeername),
+        "getpgrp" => Some(Keyword::Getpgrp),
+        "getsockname" => Some(Keyword::Getsockname),
+        "rewinddir" => Some(Keyword::Rewinddir),
+        "sethostent" => Some(Keyword::Sethostent),
+        "setnetent" => Some(Keyword::Setnetent),
+        "setprotoent" => Some(Keyword::Setprotoent),
+        "setservent" => Some(Keyword::Setservent),
+        "study" => Some(Keyword::Study),
+        "telldir" => Some(Keyword::Telldir),
+        "dbmclose" => Some(Keyword::Dbmclose),
+        "lock" => Some(Keyword::Lock),
+        "evalbytes" => Some(Keyword::Evalbytes),
+        "fc" => Some(Keyword::Fc),
         // Named unary — database lookup (single arg)
         "getpwnam" => Some(Keyword::Getpwnam),
         "getgrnam" => Some(Keyword::Getgrnam),
@@ -198,6 +214,18 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "unpack" => Some(Keyword::Unpack),
         "vec" => Some(Keyword::Vec),
         "formline" => Some(Keyword::Formline),
+        // Additional list operators
+        "atan2" => Some(Keyword::Atan2),
+        "crypt" => Some(Keyword::Crypt),
+        "dbmopen" => Some(Keyword::Dbmopen),
+        "AUTOLOAD" => Some(Keyword::AUTOLOAD),
+        "DESTROY" => Some(Keyword::DESTROY),
+        // Infix operator keywords
+        "x" => Some(Keyword::X),
+        "xor" => Some(Keyword::Xor),
+        "isa" => Some(Keyword::Isa),
+        // Flow control
+        "break" => Some(Keyword::Break),
         "qw" => Some(Keyword::Qw),
         "format" => Some(Keyword::Format),
         "BEGIN" => Some(Keyword::BEGIN),
@@ -387,6 +415,21 @@ impl From<Keyword> for &'static str {
             Keyword::Readpipe => "readpipe",
             Keyword::Chroot => "chroot",
             Keyword::Reset => "reset",
+            Keyword::Fileno => "fileno",
+            Keyword::Getpeername => "getpeername",
+            Keyword::Getpgrp => "getpgrp",
+            Keyword::Getsockname => "getsockname",
+            Keyword::Rewinddir => "rewinddir",
+            Keyword::Sethostent => "sethostent",
+            Keyword::Setnetent => "setnetent",
+            Keyword::Setprotoent => "setprotoent",
+            Keyword::Setservent => "setservent",
+            Keyword::Study => "study",
+            Keyword::Telldir => "telldir",
+            Keyword::Dbmclose => "dbmclose",
+            Keyword::Lock => "lock",
+            Keyword::Evalbytes => "evalbytes",
+            Keyword::Fc => "fc",
             Keyword::Getpwnam => "getpwnam",
             Keyword::Getgrnam => "getgrnam",
             Keyword::Gethostbyname => "gethostbyname",
@@ -444,6 +487,15 @@ impl From<Keyword> for &'static str {
             Keyword::Unpack => "unpack",
             Keyword::Vec => "vec",
             Keyword::Formline => "formline",
+            Keyword::Atan2 => "atan2",
+            Keyword::Crypt => "crypt",
+            Keyword::Dbmopen => "dbmopen",
+            Keyword::AUTOLOAD => "AUTOLOAD",
+            Keyword::DESTROY => "DESTROY",
+            Keyword::X => "x",
+            Keyword::Xor => "xor",
+            Keyword::Isa => "isa",
+            Keyword::Break => "break",
             Keyword::Qw => "qw",
             Keyword::Format => "format",
             Keyword::BEGIN => "BEGIN",
@@ -571,6 +623,21 @@ pub fn is_named_unary(kw: Keyword) -> bool {
             | Keyword::Getpwuid
             | Keyword::Getgrgid
             | Keyword::Getprotobynumber
+            | Keyword::Fileno
+            | Keyword::Getpeername
+            | Keyword::Getpgrp
+            | Keyword::Getsockname
+            | Keyword::Rewinddir
+            | Keyword::Sethostent
+            | Keyword::Setnetent
+            | Keyword::Setprotoent
+            | Keyword::Setservent
+            | Keyword::Study
+            | Keyword::Telldir
+            | Keyword::Dbmclose
+            | Keyword::Lock
+            | Keyword::Evalbytes
+            | Keyword::Fc
     )
 }
 
@@ -708,6 +775,11 @@ pub fn is_list_op(kw: Keyword) -> bool {
             | Keyword::Unpack
             | Keyword::Vec
             | Keyword::Formline
+            | Keyword::Atan2
+            | Keyword::Crypt
+            | Keyword::Dbmopen
+            | Keyword::AUTOLOAD
+            | Keyword::DESTROY
     )
 }
 
@@ -758,4 +830,84 @@ pub fn is_statement_keyword(kw: Keyword) -> bool {
             | Keyword::Field
             | Keyword::Method
     )
+}
+
+/// Is this keyword "strong" (`+` in regen/keywords.pl)?
+///
+/// Strong keywords always take precedence over user-defined subs.
+/// Weak keywords (the negation) can be overridden by imported subs
+/// (via `use subs`, `Exporter`, etc.).  A local `sub abs { }` produces
+/// an "Ambiguous call resolved as CORE::abs()" warning but the keyword
+/// still wins; only an imported sub actually overrides.
+pub fn is_strong(kw: Keyword) -> bool {
+    matches!(
+        kw,
+        Keyword::ADJUST
+            | Keyword::AUTOLOAD
+            | Keyword::BEGIN
+            | Keyword::UNITCHECK
+            | Keyword::DESTROY
+            | Keyword::END
+            | Keyword::INIT
+            | Keyword::CHECK
+            | Keyword::Catch
+            | Keyword::Default
+            | Keyword::Defer
+            | Keyword::Defined
+            | Keyword::Delete
+            | Keyword::Do
+            | Keyword::Else
+            | Keyword::Elsif
+            | Keyword::Elseif
+            | Keyword::Eval
+            | Keyword::Exists
+            | Keyword::Finally
+            | Keyword::For
+            | Keyword::Foreach
+            | Keyword::Format
+            | Keyword::Given
+            | Keyword::Glob
+            | Keyword::Goto
+            | Keyword::Grep
+            | Keyword::If
+            | Keyword::Last
+            | Keyword::Local
+            | Keyword::Map
+            | Keyword::My
+            | Keyword::Next
+            | Keyword::No
+            | Keyword::Our
+            | Keyword::Package
+            | Keyword::Pos
+            | Keyword::Print
+            | Keyword::Printf
+            | Keyword::Prototype
+            | Keyword::Qw
+            | Keyword::Redo
+            | Keyword::Require
+            | Keyword::Return
+            | Keyword::Say
+            | Keyword::Scalar
+            | Keyword::Sort
+            | Keyword::Split
+            | Keyword::State
+            | Keyword::Study
+            | Keyword::Sub
+            | Keyword::Try
+            | Keyword::Undef
+            | Keyword::Unless
+            | Keyword::Until
+            | Keyword::Use
+            | Keyword::When
+            | Keyword::While
+    )
+}
+
+/// Is this keyword "weak" (`-` in regen/keywords.pl)?
+///
+/// Weak keywords can be overridden by imported subs.  When the lexer
+/// encounters a weak keyword whose name has been imported into the
+/// current package, it emits `Token::Ident` instead of `Token::Keyword`.
+pub fn is_weak(kw: Keyword) -> bool {
+    !is_strong(kw)
 }

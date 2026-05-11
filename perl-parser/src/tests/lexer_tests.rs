@@ -2076,7 +2076,7 @@ fn lex_repeat_assign_with_space() {
     // `x =` with space → Ident("x") then Assign(Eq), NOT RepeatEq.
     let tokens = lex_all("$s x = 3;");
     assert!(!tokens.contains(&Token::Assign(AssignOp::RepeatEq)), "x = (with space) should NOT produce RepeatEq; got {:?}", tokens);
-    assert!(tokens.contains(&Token::Ident("x".into())), "x should be Ident; got {:?}", tokens);
+    assert!(tokens.contains(&Token::Keyword(Keyword::X)), "x should be Keyword(X); got {:?}", tokens);
 }
 
 #[test]
