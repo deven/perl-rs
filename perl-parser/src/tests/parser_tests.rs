@@ -13950,17 +13950,14 @@ fn all_final_batch_list_ops_parse() {
 
 #[test]
 fn weak_keyword_abs_overridden_by_use_subs() {
-    // `use subs 'abs'` imports abs, so it should parse as a function call
-    // (identifier) rather than the builtin named unary.
-    let prog = parse("use subs 'abs'; abs(-5);");
-    // The abs(-5) call should be a FuncCall (identifier path), not a named
-    // unary FuncCall.  With use subs, the lexer emits Token::Ident("abs")
-    // instead of Token::Keyword(Keyword::Abs).
+    // `use subs 'abs'` imports abs — bare usage becomes a bareword,
+    // not the named unary FuncCall it would normally be.
+    let prog = parse("use subs 'abs'; abs;");
     let stmt = &prog.statements[1];
     match &stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::FuncCall(name, _) => assert_eq!(name, "abs"),
-            other => panic!("expected FuncCall(abs), got {other:?}"),
+            ExprKind::Bareword(name) => assert_eq!(name, "abs"),
+            other => panic!("expected Bareword(abs), got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
     }
@@ -13996,14 +13993,49 @@ fn strong_keyword_not_overridden_by_use_subs() {
 #[test]
 fn weak_keyword_use_subs_scoped_to_block() {
     // `use subs` inside a block should not leak out.
-    let prog = parse("{ use subs 'abs'; abs(-5); } abs(-5);");
-    // The second abs(-5) outside the block should still be a keyword.
+    // Inside: abs is overridden → Bareword.  Outside: abs is keyword → FuncCall.
+    let prog = parse("{ use subs 'abs'; abs; } abs;");
+    // The outer `abs;` should be the keyword (FuncCall), not Bareword.
     let outer_stmt = &prog.statements[1];
     match &outer_stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::FuncCall(name, _) => assert_eq!(name, "abs"),
-            other => panic!("expected FuncCall(abs), got {other:?}"),
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "abs");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall(abs) outside block, got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn weak_keyword_abs_overridden_by_use_subs_qw() {
+    // `use subs qw(abs)` — the common real-world form with qw().
+    // Without parens, named unary produces FuncCall("abs", []) but
+    // an overridden identifier produces Bareword("abs").
+    let prog = parse("use subs qw(abs); abs;");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Bareword(name) => assert_eq!(name, "abs"),
+            other => panic!("expected Bareword(abs) from overridden keyword, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn weak_keyword_multiple_qw_overrides() {
+    // `use subs qw(abs sin)` overrides both — bare usage becomes barewords.
+    let prog = parse("use subs qw(abs sin); abs; sin;");
+    for (i, name) in [(1, "abs"), (2, "sin")] {
+        match &prog.statements[i].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::Bareword(n) => assert_eq!(n, name),
+                other => panic!("{name}: expected Bareword, got {other:?}"),
+            },
+            other => panic!("{name}: expected Expr, got {other:?}"),
+        }
     }
 }

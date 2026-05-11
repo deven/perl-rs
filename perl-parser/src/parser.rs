@@ -1286,9 +1286,18 @@ impl Parser {
             && let Some(ref items) = imports
         {
             for item in items {
-                if let ExprKind::StringLit(name) = &item.kind {
-                    let fqn = format!("{}::{}", self.current_package, name);
-                    self.lexer.imported_subs.insert(fqn);
+                match &item.kind {
+                    ExprKind::StringLit(name) => {
+                        let fqn = format!("{}::{}", self.current_package, name);
+                        self.lexer.imported_subs.insert(fqn);
+                    }
+                    ExprKind::QwList(names) => {
+                        for name in names {
+                            let fqn = format!("{}::{}", self.current_package, name);
+                            self.lexer.imported_subs.insert(fqn);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
