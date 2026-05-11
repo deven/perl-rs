@@ -778,8 +778,6 @@ pub fn is_list_op(kw: Keyword) -> bool {
             | Keyword::Atan2
             | Keyword::Crypt
             | Keyword::Dbmopen
-            | Keyword::AUTOLOAD
-            | Keyword::DESTROY
     )
 }
 
@@ -829,6 +827,8 @@ pub fn is_statement_keyword(kw: Keyword) -> bool {
             | Keyword::Class
             | Keyword::Field
             | Keyword::Method
+            | Keyword::AUTOLOAD
+            | Keyword::DESTROY
     )
 }
 

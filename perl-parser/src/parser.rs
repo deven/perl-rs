@@ -445,6 +445,17 @@ impl Parser {
                         Keyword::UNITCHECK => (self.parse_phaser(PhaserKind::Unitcheck)?, false),
                         Keyword::ADJUST => (self.parse_phaser(PhaserKind::Adjust)?, false),
 
+                        // AUTOLOAD/DESTROY — implicit sub declarations.
+                        // `AUTOLOAD { ... }` is `sub AUTOLOAD { ... }`.
+                        // `AUTOLOAD;` is `sub AUTOLOAD;` (forward decl).
+                        // `AUTOLOAD()` is `sub AUTOLOAD ();` (prototype).
+                        // They are NEVER function calls — Perl always
+                        // treats them as implicit sub declarations.
+                        Keyword::AUTOLOAD | Keyword::DESTROY => {
+                            let name: &str = kw.into();
+                            (self.parse_sub_decl_with_name(name.to_string(), kw_span)?, false)
+                        }
+
                         // given/when/default
                         Keyword::Given => (self.parse_given()?, false),
                         Keyword::When => (self.parse_when()?, false),
@@ -643,7 +654,13 @@ impl Parser {
             Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
         };
+        self.parse_sub_decl_with_name(name, start)
+    }
 
+    /// Parse a sub declaration body when the name is already known.
+    /// Shared between `sub NAME ...` and implicit sub forms like
+    /// `AUTOLOAD { ... }` / `DESTROY { ... }`.
+    fn parse_sub_decl_with_name(&mut self, name: String, start: Span) -> Result<StmtKind, ParseError> {
         // Dispatch on the `signatures` feature: when active, the
         // grammar is `sub NAME [ATTRS] [SIGNATURE] BLOCK` — attrs
         // come before the paren-form, which is a signature.
@@ -1171,17 +1188,14 @@ impl Parser {
             // Block form: `package Name { ... }` — switch packages
             // for the duration of the block, then restore.
             let saved = std::mem::replace(&mut self.current_package, std::sync::Arc::from(name.as_str()));
-            self.lexer.current_package = name.clone();
             let block = self.parse_block()?;
             self.current_package = saved;
-            self.lexer.current_package = self.current_package.to_string();
             Some(block)
         } else {
             // Statement form: `package Name;` — switch packages for
             // everything that follows in this compilation unit.
             self.eat(&Token::Semi)?;
             self.current_package = std::sync::Arc::from(name.as_str());
-            self.lexer.current_package = name.clone();
             None
         };
 
@@ -1278,9 +1292,9 @@ impl Parser {
         self.lexer.set_utf8_mode(self.pragmas.utf8);
         self.lexer.features = self.pragmas.features;
 
-        // `use subs qw(name ...)` — mark names as imported so the
-        // lexer emits Token::Ident instead of Token::Keyword for
-        // weak keywords, allowing user subs to override builtins.
+        // `use subs qw(name ...)` — forward-declare names in the
+        // symbol table so the parser recognizes them as known subs.
+        // This causes weak keywords to be overridden in term position.
         if !is_no
             && module == "subs"
             && let Some(ref items) = imports
@@ -1288,13 +1302,11 @@ impl Parser {
             for item in items {
                 match &item.kind {
                     ExprKind::StringLit(name) => {
-                        let fqn = format!("{}::{}", self.current_package, name);
-                        self.lexer.imported_subs.insert(fqn);
+                        self.symbols.entry(&self.current_package.clone()).declare_sub(name, None, Vec::new(), true);
                     }
                     ExprKind::QwList(names) => {
                         for name in names {
-                            let fqn = format!("{}::{}", self.current_package, name);
-                            self.lexer.imported_subs.insert(fqn);
+                            self.symbols.entry(&self.current_package.clone()).declare_sub(name, None, Vec::new(), true);
                         }
                     }
                     _ => {}
@@ -1689,7 +1701,6 @@ impl Parser {
             // restore after.
             let saved_pragmas = this.pragmas;
             let saved_package = this.current_package.clone();
-            let saved_imported_subs = this.lexer.imported_subs.clone();
 
             let start = this.peek_span();
             let result = (|this: &mut Parser| -> Result<Block, ParseError> {
@@ -1711,8 +1722,6 @@ impl Parser {
             // Sync shared state with the restored lexical scope.
             this.lexer.set_utf8_mode(this.pragmas.utf8);
             this.lexer.features = this.pragmas.features;
-            this.lexer.current_package = this.current_package.to_string();
-            this.lexer.imported_subs = saved_imported_subs;
             result
         })
     }
@@ -1759,6 +1768,20 @@ impl Parser {
         {
             let name: &str = (*kw).into();
             return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
+        }
+
+        // Weak keyword override: if this keyword has been declared
+        // as a sub (via `use subs`, `sub name;`, etc.), treat it as
+        // an identifier in term position so the user sub takes
+        // precedence.  Infix position is unaffected — `"ab" x 3`
+        // always works as repeat.
+        if let Token::Keyword(kw) = &spanned.token
+            && keyword::is_weak(*kw)
+        {
+            let name: &str = (*kw).into();
+            if self.symbols.lookup(name, &self.current_package).is_some() {
+                return self.parse_ident_term(name.to_string(), span);
+            }
         }
 
         match spanned.token {
@@ -1938,10 +1961,10 @@ impl Parser {
                         }
                         let end = self.peek_span();
                         self.expect_token(&Token::RightParen)?;
-                        Ok(Expr { kind: ExprKind::FuncCall(name, args), span: span.merge(end) })
+                        Ok(Expr { kind: ExprKind::FuncCall(self.qualify_sub_name(&name), args), span: span.merge(end) })
                     } else {
                         // &foo with no parens — call with current @_
-                        Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span: span.merge(name_span) })
+                        Ok(Expr { kind: ExprKind::FuncCall(self.qualify_sub_name(&name), vec![]), span: span.merge(name_span) })
                     }
                 } else {
                     // &$coderef or &$coderef(args)
@@ -2113,20 +2136,20 @@ impl Parser {
             // return with optional value
             Token::Keyword(Keyword::Return) => {
                 if self.at(&Token::Semi)? || self.at(&Token::RightBrace)? || self.at_eof()? {
-                    Ok(Expr { kind: ExprKind::FuncCall("return".into(), vec![]), span })
+                    Ok(Expr { kind: ExprKind::FuncCall("CORE::return".into(), vec![]), span })
                 } else {
                     let val = self.parse_expr(PREC_COMMA)?;
                     let end = span.merge(val.span);
-                    Ok(Expr { kind: ExprKind::FuncCall("return".into(), vec![val]), span: end })
+                    Ok(Expr { kind: ExprKind::FuncCall("CORE::return".into(), vec![val]), span: end })
                 }
             }
 
             // last/next/redo with optional label
             Token::Keyword(Keyword::Last) | Token::Keyword(Keyword::Next) | Token::Keyword(Keyword::Redo) => {
                 let name = match spanned.token {
-                    Token::Keyword(Keyword::Last) => "last",
-                    Token::Keyword(Keyword::Next) => "next",
-                    Token::Keyword(Keyword::Redo) => "redo",
+                    Token::Keyword(Keyword::Last) => "CORE::last",
+                    Token::Keyword(Keyword::Next) => "CORE::next",
+                    Token::Keyword(Keyword::Redo) => "CORE::redo",
                     _ => unreachable!(),
                 };
                 // Optional label argument
@@ -2144,7 +2167,7 @@ impl Parser {
             }
 
             // break — exits a given/when block.  No label argument.
-            Token::Keyword(Keyword::Break) => Ok(Expr { kind: ExprKind::FuncCall("break".into(), vec![]), span }),
+            Token::Keyword(Keyword::Break) => Ok(Expr { kind: ExprKind::FuncCall("CORE::break".into(), vec![]), span }),
 
             // `x` is a weak keyword: in prefix position it acts as an
             // identifier (function call / bareword).  In infix position
@@ -2308,17 +2331,17 @@ impl Parser {
             Token::Keyword(Keyword::Goto) => {
                 let arg = self.parse_expr(PREC_COMMA)?;
                 let end = span.merge(arg.span);
-                Ok(Expr { kind: ExprKind::FuncCall("goto".into(), vec![arg]), span: end })
+                Ok(Expr { kind: ExprKind::FuncCall("CORE::goto".into(), vec![arg]), span: end })
             }
             Token::Keyword(Keyword::Dump) => {
                 // `dump LABEL` — same precedence as goto.
                 // Deprecated; mostly used to create core dumps.
                 if self.at_eof()? || self.at(&Token::Semi)? {
-                    Ok(Expr { kind: ExprKind::FuncCall("dump".into(), vec![]), span })
+                    Ok(Expr { kind: ExprKind::FuncCall("CORE::dump".into(), vec![]), span })
                 } else {
                     let arg = self.parse_expr(PREC_COMMA)?;
                     let end = span.merge(arg.span);
-                    Ok(Expr { kind: ExprKind::FuncCall("dump".into(), vec![arg]), span: end })
+                    Ok(Expr { kind: ExprKind::FuncCall("CORE::dump".into(), vec![arg]), span: end })
                 }
             }
 
@@ -2384,19 +2407,19 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            return Ok(Expr { kind: ExprKind::FuncCall(name, args), span: span.merge(end) });
+            return Ok(Expr { kind: ExprKind::FuncCall(self.qualify_sub_name(&name), args), span: span.merge(end) });
         }
 
         // No parens — if we know this sub has a prototype, use it to
         // drive argument parsing.
         if let Some(proto) = proto {
-            return self.parse_prototyped_call(name, span, &proto);
+            return self.parse_prototyped_call(self.qualify_sub_name(&name), span, &proto);
         }
 
         // No parens, no prototype, but the sub is known: parse as a
         // list operator call (greedy args until end-of-statement).
         if is_known_sub {
-            return self.parse_known_sub_call(name, span);
+            return self.parse_known_sub_call(self.qualify_sub_name(&name), span);
         }
 
         // Indirect object syntax: METHOD CLASS ARGS
@@ -2620,11 +2643,25 @@ impl Parser {
         Ok(Expr { kind: ExprKind::FuncCall(name, args), span: start.merge(end_span) })
     }
 
+    /// Convert a keyword to its `CORE::name` form for the AST.
+    /// Keyword-dispatched function calls use this so the compiler can
+    /// distinguish builtins (`CORE::abs`) from user subs (`abs`).
+    fn core_name(kw: Keyword) -> String {
+        format!("CORE::{}", <&str>::from(kw))
+    }
+
+    /// Package-qualify a bare sub name for the AST.
+    /// `foo` in package `Bar` → `Bar::foo`.
+    /// Already-qualified names like `Foo::bar` are left unchanged.
+    fn qualify_sub_name(&self, name: &str) -> String {
+        if name.contains("::") { name.to_string() } else { format!("{}::{}", self.current_package, name) }
+    }
+
     /// Parse a nullary builtin.  These never consume arguments, so
     /// `time+86_400` is always `time() + 86_400`.  Explicit empty
     /// parens (`time()`) are accepted.
     fn parse_nullary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = (<&str>::from(kw)).to_string();
+        let name = Self::core_name(kw);
 
         // Accept optional empty parens: `time()`
         if self.at(&Token::LeftParen)? {
@@ -2640,7 +2677,7 @@ impl Parser {
     }
 
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = (<&str>::from(kw)).to_string();
+        let name = Self::core_name(kw);
 
         // Named unary with optional arg — check for tokens that
         // indicate "no argument follows."
@@ -2711,12 +2748,12 @@ impl Parser {
     fn readline_expr(content: String, safe: bool, span: Span) -> Result<Expr, ParseError> {
         if content.is_empty() {
             // `<>` (safe=false) or `<<>>` (safe=true).
-            let name = if safe { "readline_safe" } else { "readline" };
+            let name = if safe { "CORE::readline_safe" } else { "CORE::readline" };
             Ok(Expr { kind: ExprKind::FuncCall(name.into(), vec![]), span })
         } else if content.contains('*') || content.contains('?') {
-            Ok(Expr { kind: ExprKind::FuncCall("glob".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+            Ok(Expr { kind: ExprKind::FuncCall("CORE::glob".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
         } else {
-            Ok(Expr { kind: ExprKind::FuncCall("readline".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+            Ok(Expr { kind: ExprKind::FuncCall("CORE::readline".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
         }
     }
 
@@ -2773,7 +2810,7 @@ impl Parser {
     }
 
     fn parse_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = (<&str>::from(kw)).to_string();
+        let name = Self::core_name(kw);
 
         // Check for parens
         if self.at(&Token::LeftParen)? {
@@ -2818,7 +2855,7 @@ impl Parser {
     /// Parse sort/map/grep with optional block as first argument.
     /// `sort { $a <=> $b } @list`, `map { ... } @list`, `grep { ... } @list`
     fn parse_block_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = (<&str>::from(kw)).to_string();
+        let name = Self::core_name(kw);
 
         // Check for parens: sort(...), map(...), grep(...)
         if self.at(&Token::LeftParen)? {
@@ -2885,7 +2922,7 @@ impl Parser {
     /// Parse print/say with optional filehandle as first argument.
     /// `print STDERR "error"`, `print "hello"`, `say $fh "data"`
     fn parse_print_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = (<&str>::from(kw)).to_string();
+        let name = Self::core_name(kw);
 
         // Handle optional parens — print(...) form
         let in_parens = self.eat(&Token::LeftParen)?;
@@ -3863,18 +3900,18 @@ fn apply_case_mod_wrap(mut expr: Expr, flags: CaseMod) -> Expr {
 
     // One-shot overrides persistent case mode.
     if flags.contains(CaseMod::LCFIRST) {
-        expr = Expr { kind: ExprKind::FuncCall("lcfirst".into(), vec![expr]), span };
+        expr = Expr { kind: ExprKind::FuncCall("CORE::lcfirst".into(), vec![expr]), span };
     } else if flags.contains(CaseMod::UCFIRST) {
-        expr = Expr { kind: ExprKind::FuncCall("ucfirst".into(), vec![expr]), span };
+        expr = Expr { kind: ExprKind::FuncCall("CORE::ucfirst".into(), vec![expr]), span };
     } else if flags.contains(CaseMod::UPPER) {
-        expr = Expr { kind: ExprKind::FuncCall("uc".into(), vec![expr]), span };
+        expr = Expr { kind: ExprKind::FuncCall("CORE::uc".into(), vec![expr]), span };
     } else if flags.contains(CaseMod::LOWER) || flags.contains(CaseMod::FOLD) {
-        expr = Expr { kind: ExprKind::FuncCall("lc".into(), vec![expr]), span };
+        expr = Expr { kind: ExprKind::FuncCall("CORE::lc".into(), vec![expr]), span };
     }
 
     // Quotemeta wraps outermost (applied last, after case).
     if flags.contains(CaseMod::QUOTEMETA) {
-        expr = Expr { kind: ExprKind::FuncCall("quotemeta".into(), vec![expr]), span };
+        expr = Expr { kind: ExprKind::FuncCall("CORE::quotemeta".into(), vec![expr]), span };
     }
 
     expr

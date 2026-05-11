@@ -146,15 +146,6 @@ pub(crate) struct Lexer {
     /// Written by the parser when features change or when restoring
     /// pragma state at block boundaries.
     pub(crate) features: Features,
-    /// Names of subs that have been imported into the current package
-    /// (via `use subs`, `Exporter`, etc.).  When a weak keyword's name
-    /// appears here, the lexer emits `Token::Ident` instead of
-    /// `Token::Keyword`, allowing the imported sub to override the
-    /// builtin.  Maintained by the parser.
-    pub(crate) imported_subs: std::collections::HashSet<String>,
-    /// Current package name, synced from the parser.  Used together
-    /// with `imported_subs` to resolve weak keyword overrides.
-    pub(crate) current_package: String,
     /// Stacked cumulative case-modification flags.  Each `\L`/`\U`/
     /// `\F`/`\Q` pushes the current flags ORed with the new mode;
     /// `\E` pops, reverting to the enclosing flags.
@@ -178,8 +169,6 @@ impl Lexer {
             utf8_mode: bom,
             effective_utf8: false,
             features: Features::DEFAULT,
-            imported_subs: std::collections::HashSet::new(),
-            current_package: "main".to_string(),
             case_mod_stack: Vec::new(),
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
@@ -201,8 +190,6 @@ impl Lexer {
             utf8_mode: bom,
             effective_utf8: false,
             features: Features::DEFAULT,
-            imported_subs: std::collections::HashSet::new(),
-            current_package: "main".to_string(),
             case_mod_stack: Vec::new(),
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
@@ -2187,16 +2174,6 @@ impl Lexer {
                 _ => None, // unconditional keyword — always active
             };
             if needed.is_none_or(|f| self.features.contains(f)) {
-                // Weak keyword override: if this keyword is weak (`-` in
-                // regen/keywords.pl) and a sub with this name has been
-                // imported into the current package, treat it as an
-                // identifier so the imported sub takes precedence.
-                if keyword::is_weak(kw) {
-                    let fqn = format!("{}::{}", self.current_package, name);
-                    if self.imported_subs.contains(&fqn) {
-                        return Ok(Token::Ident(name));
-                    }
-                }
                 return Ok(Token::Keyword(kw));
             }
             // Feature not active — fall through to Ident.

@@ -336,7 +336,7 @@ fn parse_print_list() {
     let prog = parse(r#"print "hello", " ", "world";"#);
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, fh, args), .. }) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 3);
         }
@@ -619,7 +619,7 @@ fn parse_print_interp_string() {
     assert_eq!(prog.statements.len(), 1);
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, fh, args), .. }) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::InterpolatedString(_)));
@@ -1714,7 +1714,7 @@ fn parse_heredoc_then_statement() {
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[0].kind {
-        StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _, _), .. }) => assert_eq!(name, "print"),
+        StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _, _), .. }) => assert_eq!(name, "CORE::print"),
         other => panic!("expected print PrintOp, got {other:?}"),
     }
     match &prog.statements[1].kind {
@@ -1793,7 +1793,7 @@ fn parse_return_value() {
     let e = parse_expr_str("return 42;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "return");
+            assert_eq!(name, "CORE::return");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected return call, got {other:?}"),
@@ -1805,7 +1805,7 @@ fn parse_return_bare() {
     let e = parse_expr_str("return;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "return");
+            assert_eq!(name, "CORE::return");
             assert_eq!(args.len(), 0);
         }
         other => panic!("expected bare return, got {other:?}"),
@@ -1817,7 +1817,7 @@ fn parse_last_with_label() {
     let e = parse_expr_str("last OUTER;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "last");
+            assert_eq!(name, "CORE::last");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected last with label, got {other:?}"),
@@ -1829,7 +1829,7 @@ fn parse_next_bare() {
     let e = parse_expr_str("next;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "next");
+            assert_eq!(name, "CORE::next");
             assert_eq!(args.len(), 0);
         }
         other => panic!("expected bare next, got {other:?}"),
@@ -1894,7 +1894,7 @@ fn parse_sort_block() {
     let e = parse_expr_str("sort { $a <=> $b } @list;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "sort");
+            assert_eq!(name, "CORE::sort");
             assert!(args.len() >= 2); // block + @list
             assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
         }
@@ -1907,7 +1907,7 @@ fn parse_map_block() {
     let e = parse_expr_str("map { $_ * 2 } @nums;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "map");
+            assert_eq!(name, "CORE::map");
             assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
         }
         other => panic!("expected map ListOp, got {other:?}"),
@@ -1919,7 +1919,7 @@ fn parse_grep_block() {
     let e = parse_expr_str("grep { $_ > 0 } @nums;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "grep");
+            assert_eq!(name, "CORE::grep");
             assert!(matches!(args[0].kind, ExprKind::AnonSub(..)));
         }
         other => panic!("expected grep ListOp, got {other:?}"),
@@ -1931,7 +1931,7 @@ fn parse_sort_no_block() {
     let e = parse_expr_str("sort @list;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "sort");
+            assert_eq!(name, "CORE::sort");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected sort ListOp, got {other:?}"),
@@ -1945,7 +1945,7 @@ fn parse_print_simple() {
     let prog = parse(r#"print "hello";"#);
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, fh, _), .. }) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
         }
         other => panic!("expected print PrintOp, got {other:?}"),
@@ -2072,7 +2072,7 @@ fn parse_yada_yada() {
 fn parse_goto() {
     let e = parse_expr_str("goto LABEL;");
     match &e.kind {
-        ExprKind::FuncCall(name, _) => assert_eq!(name, "goto"),
+        ExprKind::FuncCall(name, _) => assert_eq!(name, "CORE::goto"),
         other => panic!("expected goto, got {other:?}"),
     }
 }
@@ -2084,7 +2084,7 @@ fn parse_diamond() {
     let e = parse_expr_str("<>;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "readline");
+            assert_eq!(name, "CORE::readline");
             assert_eq!(args.len(), 0);
         }
         other => panic!("expected readline, got {other:?}"),
@@ -2096,7 +2096,7 @@ fn parse_readline_stdin() {
     let e = parse_expr_str("<STDIN>;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "readline");
+            assert_eq!(name, "CORE::readline");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected readline, got {other:?}"),
@@ -2314,7 +2314,7 @@ fn parse_scalar_keyword() {
     let e = parse_expr_str("scalar @array;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "scalar");
+            assert_eq!(name, "CORE::scalar");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected scalar call, got {other:?}"),
@@ -2446,7 +2446,7 @@ fn parse_ampersand_call() {
     let e = parse_expr_str("&foo(1, 2);");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -2472,7 +2472,7 @@ fn parse_ampersand_bare() {
     let e = parse_expr_str("&foo;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 0);
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -2559,7 +2559,7 @@ fn parse_require() {
     let e = parse_expr_str("require Foo::Bar;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "require");
+            assert_eq!(name, "CORE::require");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected require call, got {other:?}"),
@@ -3315,7 +3315,7 @@ fn fc_requires_feature() {
     // the function name is captured.
     let e = parse_expr_stmt("fc($x);");
     match e.kind {
-        ExprKind::FuncCall(name, _) => assert_eq!(name, "fc"),
+        ExprKind::FuncCall(name, _) => assert_eq!(name, "main::fc"),
         other => panic!("expected FuncCall, got {other:?}"),
     }
 }
@@ -3325,7 +3325,7 @@ fn fc_with_feature_paren() {
     let e = parse_expr_stmt("use feature 'fc'; fc($x);");
     match e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "fc");
+            assert_eq!(name, "CORE::fc");
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
         }
@@ -3340,7 +3340,7 @@ fn fc_with_feature_no_paren() {
     let e = parse_expr_stmt("use feature 'fc'; fc $x;");
     match e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "fc");
+            assert_eq!(name, "CORE::fc");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -3354,7 +3354,7 @@ fn evalbytes_with_feature() {
     let e = parse_expr_stmt(r#"use feature 'evalbytes'; evalbytes("1+1");"#);
     match e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "evalbytes");
+            assert_eq!(name, "CORE::evalbytes");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -4376,7 +4376,7 @@ fn parse_heredoc_two_stacked() {
     // First statement: print with two heredoc args.
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _, args), .. }) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert_eq!(args.len(), 2);
             assert!(matches!(&args[0].kind, ExprKind::StringLit(s) if s == "body A\n"));
             assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "body B\n"));
@@ -5351,7 +5351,7 @@ fn parse_delete_local_hash_elem() {
     let e = parse_expr_str("delete local $hash{key};");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "delete");
+            assert_eq!(name, "CORE::delete");
             assert!(matches!(args[0].kind, ExprKind::Local(_)));
         }
         other => panic!("expected delete(Local(...)), got {other:?}"),
@@ -6057,7 +6057,7 @@ fn parse_defined() {
     let e = parse_expr_str("defined $x;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "defined");
+            assert_eq!(name, "CORE::defined");
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "x"));
         }
@@ -6070,7 +6070,7 @@ fn parse_chomp() {
     let e = parse_expr_str("chomp $line;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "chomp");
+            assert_eq!(name, "CORE::chomp");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected chomp FuncCall, got {other:?}"),
@@ -6082,7 +6082,7 @@ fn parse_die_no_arg() {
     let e = parse_expr_str("die;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "die");
+            assert_eq!(name, "CORE::die");
             assert_eq!(args.len(), 0);
         }
         other => panic!("expected bare die, got {other:?}"),
@@ -6094,7 +6094,7 @@ fn parse_push_list() {
     let e = parse_expr_str("push @arr, 1, 2, 3;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "push");
+            assert_eq!(name, "CORE::push");
             assert_eq!(args.len(), 4);
         }
         other => panic!("expected push ListOp, got {other:?}"),
@@ -6106,7 +6106,7 @@ fn parse_join_list() {
     let e = parse_expr_str("join ',', @arr;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "join");
+            assert_eq!(name, "CORE::join");
             assert_eq!(args.len(), 2);
         }
         other => panic!("expected join ListOp, got {other:?}"),
@@ -6118,7 +6118,7 @@ fn parse_split_regex() {
     let e = parse_expr_str("split /,/, $str;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "split");
+            assert_eq!(name, "CORE::split");
             assert_eq!(args.len(), 2);
             assert!(matches!(args[0].kind, ExprKind::Regex(_, _, _)));
         }
@@ -6131,7 +6131,7 @@ fn parse_sort_subname() {
     let e = parse_expr_str("sort compare @list;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "sort");
+            assert_eq!(name, "CORE::sort");
             assert!(args.len() >= 2);
             assert!(matches!(args[0].kind, ExprKind::Bareword(_)));
         }
@@ -6144,7 +6144,7 @@ fn parse_open_three_arg() {
     let e = parse_expr_str("open my $fh, '<', 'file.txt';");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "open");
+            assert_eq!(name, "CORE::open");
             assert_eq!(args.len(), 3);
         }
         other => panic!("expected open ListOp, got {other:?}"),
@@ -6156,7 +6156,7 @@ fn parse_bless_two_arg() {
     let e = parse_expr_str("bless $self, 'Foo';");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "bless");
+            assert_eq!(name, "CORE::bless");
             assert_eq!(args.len(), 2);
         }
         other => panic!("expected bless ListOp, got {other:?}"),
@@ -6190,7 +6190,7 @@ fn parse_glob_wildcard() {
     let e = parse_expr_str("<*.txt>;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "glob");
+            assert_eq!(name, "CORE::glob");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected glob FuncCall, got {other:?}"),
@@ -6429,7 +6429,7 @@ fn parse_scalar_context() {
     let e = parse_expr_str("scalar @arr;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "scalar");
+            assert_eq!(name, "CORE::scalar");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected scalar FuncCall, got {other:?}"),
@@ -6456,7 +6456,7 @@ fn parse_require_version() {
     let e = parse_expr_str("require 5.010;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "require");
+            assert_eq!(name, "CORE::require");
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected require with version, got {other:?}"),
@@ -6750,7 +6750,7 @@ fn fc_named_unary_precedence() {
     // `fc($x . $y)`, NOT `fc($x) . $y`.
     let e = parse_expr_stmt("use feature 'fc'; fc $x . $y;");
     match e.kind {
-        ExprKind::FuncCall(ref name, ref args) if name == "fc" => {
+        ExprKind::FuncCall(ref name, ref args) if name == "CORE::fc" => {
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Concat, _, _)), "argument should be the whole Concat expr, got {:?}", args[0].kind);
         }
@@ -6965,7 +6965,7 @@ fn parse_print_filehandle() {
     let e = parse_expr_str("print STDERR 'error';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             match fh.as_deref() {
                 Some(Expr { kind: ExprKind::Bareword(n), .. }) => assert_eq!(n, "STDERR"),
                 other => panic!("expected filehandle Bareword('STDERR'), got {other:?}"),
@@ -6982,7 +6982,7 @@ fn parse_print_filehandle_parens() {
     let e = parse_expr_str(r#"print(STDERR "testing\n");"#);
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
             assert_eq!(args.len(), 1);
         }
@@ -6996,7 +6996,7 @@ fn parse_print_comma_not_filehandle() {
     let e = parse_expr_str("print STDERR, 'hello';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 2);
         }
@@ -7010,7 +7010,7 @@ fn parse_print_scalar_filehandle() {
     let e = parse_expr_str("print $fh 'hello';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::ScalarVar(n), .. }) if n == "fh"));
             assert_eq!(args.len(), 1);
         }
@@ -7024,7 +7024,7 @@ fn parse_print_bare_no_args() {
     let e = parse_expr_str("print STDERR;");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
             assert_eq!(args.len(), 0);
         }
@@ -7037,7 +7037,7 @@ fn parse_say_filehandle() {
     let e = parse_expr_str("say STDERR 'error';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "say");
+            assert_eq!(name, "CORE::say");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
             assert_eq!(args.len(), 1);
         }
@@ -7050,7 +7050,7 @@ fn parse_printf_filehandle() {
     let e = parse_expr_str("printf STDERR '%s', $msg;");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "printf");
+            assert_eq!(name, "CORE::printf");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
             assert_eq!(args.len(), 2);
         }
@@ -7064,7 +7064,7 @@ fn parse_print_no_args() {
     let e = parse_expr_str("print;");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 0);
         }
@@ -7078,7 +7078,7 @@ fn parse_print_parens_no_args() {
     let e = parse_expr_str("print();");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 0);
         }
@@ -7092,7 +7092,7 @@ fn parse_print_parens_fh_no_args() {
     let e = parse_expr_str("print(STDERR);");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
             assert_eq!(args.len(), 0);
         }
@@ -7106,7 +7106,7 @@ fn parse_print_parens_scalar_fh() {
     let e = parse_expr_str("print($fh $_);");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::ScalarVar(n), .. }) if n == "fh"));
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "_"));
@@ -7122,7 +7122,7 @@ fn parse_print_parens_scalar_not_fh() {
     let e = parse_expr_str("print($f);");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "f"));
@@ -7137,7 +7137,7 @@ fn parse_print_scalar_not_fh() {
     let e = parse_expr_str("print $f;");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(ref n) if n == "f"));
@@ -7151,7 +7151,7 @@ fn parse_say_no_filehandle() {
     let e = parse_expr_str("say 'hello';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "say");
+            assert_eq!(name, "CORE::say");
             assert!(fh.is_none());
             assert_eq!(args.len(), 1);
         }
@@ -7164,7 +7164,7 @@ fn parse_say_parens_filehandle() {
     let e = parse_expr_str("say(STDERR 'hello');");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "say");
+            assert_eq!(name, "CORE::say");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
             assert_eq!(args.len(), 1);
         }
@@ -7177,7 +7177,7 @@ fn parse_printf_no_filehandle() {
     let e = parse_expr_str("printf '%s', $msg;");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "printf");
+            assert_eq!(name, "CORE::printf");
             assert!(fh.is_none());
             assert_eq!(args.len(), 2);
         }
@@ -7190,7 +7190,7 @@ fn parse_printf_parens_filehandle() {
     let e = parse_expr_str("printf(STDERR '%s', $msg);");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "printf");
+            assert_eq!(name, "CORE::printf");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDERR"));
             assert_eq!(args.len(), 2);
         }
@@ -7203,7 +7203,7 @@ fn parse_print_stdout_filehandle() {
     let e = parse_expr_str("print STDOUT 'hello';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(matches!(fh.as_deref(), Some(Expr { kind: ExprKind::Bareword(n), .. }) if n == "STDOUT"));
             assert_eq!(args.len(), 1);
         }
@@ -7443,7 +7443,7 @@ fn hard_print_slash_is_regex() {
     let prog = parse("print /x/;");
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _fh, args), .. }) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::Regex(_, _, _)), "expected Regex arg, got {:?}", args[0].kind);
         }
@@ -7510,7 +7510,7 @@ fn hard_map_outer_brace_is_block() {
     let e = parse_expr_str("map { a => 1 } @list;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "map");
+            assert_eq!(name, "CORE::map");
             // First arg is the block (as AnonSub).
             assert!(matches!(args[0].kind, ExprKind::AnonSub(..)), "expected AnonSub block, got {:?}", args[0].kind);
         }
@@ -7524,7 +7524,7 @@ fn hard_map_nested_brace_is_hash() {
     let e = parse_expr_str("map { { a => 1 } } @list;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "map");
+            assert_eq!(name, "CORE::map");
             // Outer: AnonSub wrapping the block.
             let body = match &args[0].kind {
                 ExprKind::AnonSub(_, _, _, block) => block,
@@ -7864,7 +7864,7 @@ fn hard_nightmare_map_ternary_hash() {
     let e = parse_expr_str("map { /x/ ? { a => 1 } : { b => 2 } } @list;");
     match &e.kind {
         ExprKind::ListOp(name, args) => {
-            assert_eq!(name, "map");
+            assert_eq!(name, "CORE::map");
             let block = match &args[0].kind {
                 ExprKind::AnonSub(_, _, _, b) => b,
                 other => panic!("expected AnonSub, got {other:?}"),
@@ -8184,7 +8184,7 @@ fn proto_empty_stops_at_plus() {
         ExprKind::BinOp(BinOp::Add, lhs, rhs) => {
             match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "foo");
+                    assert_eq!(name, "main::foo");
                     assert_eq!(args.len(), 0, "empty-proto call should have 0 args");
                 }
                 other => panic!("expected FuncCall(foo, []), got {other:?}"),
@@ -8202,7 +8202,7 @@ fn proto_single_scalar_takes_one_expr() {
     let e = parse_call_with_proto("sub foo ($); foo $a + $b;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 1, "$-proto should take exactly 1 arg");
             assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)), "arg should be $a + $b, got {:?}", args[0].kind);
         }
@@ -8222,7 +8222,7 @@ fn proto_single_scalar_comma_terminates_arg() {
             assert_eq!(items.len(), 2);
             match &items[0].kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "foo");
+                    assert_eq!(name, "main::foo");
                     assert_eq!(args.len(), 1);
                     assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
                 }
@@ -8241,7 +8241,7 @@ fn proto_two_scalars_takes_two_args() {
     let e = parse_call_with_proto("sub foo ($$); foo $a + $b, $c;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2, "$$-proto should take 2 args");
             assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)), "arg 1 should be Add, got {:?}", args[0].kind);
             assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)), "arg 2 should be $c, got {:?}", args[1].kind);
@@ -8258,7 +8258,7 @@ fn proto_block_and_list() {
     let e = parse_call_with_proto("sub foo (&@); foo { $x } @list;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2, "&@-proto should take block + list = 2 args");
             assert!(matches!(args[0].kind, ExprKind::AnonSub(..)), "arg 1 should be AnonSub (block), got {:?}", args[0].kind);
             assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)), "arg 2 should be @list, got {:?}", args[1].kind);
@@ -8274,7 +8274,7 @@ fn proto_slurpy_list_takes_everything() {
     let e = parse_call_with_proto("sub foo (@); foo $a, $b, $c;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 3);
         }
         other => panic!("expected FuncCall with 3 args, got {other:?}"),
@@ -8288,7 +8288,7 @@ fn proto_forward_declaration_registers_proto() {
     let e = parse_call_with_proto("sub foo ($$); foo $a, $b;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
         }
         other => panic!("expected FuncCall with 2 args, got {other:?}"),
@@ -8302,7 +8302,7 @@ fn known_sub_without_proto_is_list_op() {
     let e = parse_call_with_proto("sub foo { 1 } foo 1, 2;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
             assert!(matches!(args[0].kind, ExprKind::IntLit(1)));
             assert!(matches!(args[1].kind, ExprKind::IntLit(2)));
@@ -8368,7 +8368,7 @@ fn proto_underscore_with_arg_takes_it() {
     let e = parse_call_with_proto("sub foo (_); foo $x;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 1);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)), "expected ScalarVar, got {:?}", args[0].kind);
         }
@@ -8383,7 +8383,7 @@ fn proto_underscore_without_arg_inserts_default_var() {
     let e = parse_call_with_proto("sub foo (_); foo;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 1, "_-slot should default to DefaultVar when omitted");
             assert!(matches!(args[0].kind, ExprKind::DefaultVar), "expected DefaultVar, got {:?}", args[0].kind);
         }
@@ -8417,7 +8417,7 @@ fn proto_glob_bareword_becomes_glob_var() {
     let e = parse_call_with_proto("sub foo (*); foo STDIN;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 1);
             match &args[0].kind {
                 ExprKind::GlobVar(n) => assert_eq!(n, "STDIN"),
@@ -8478,7 +8478,7 @@ fn proto_parens_form_parses_generic_list() {
     let e = parse_call_with_proto("sub foo ($); foo($a + $b, $c);");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2, "parens form should parse both args regardless of $ proto");
             assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)));
             assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)));
@@ -8495,7 +8495,7 @@ fn proto_parens_form_ignores_empty_proto() {
     let e = parse_call_with_proto("sub foo (); foo(1, 2);");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
         }
         other => panic!("expected FuncCall with 2 args, got {other:?}"),
@@ -8511,7 +8511,7 @@ fn proto_ampersand_call_bypasses_empty_proto() {
     let e = parse_call_with_proto("sub foo (); &foo(1, 2);");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2, "&foo(...) bypasses empty proto");
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -8526,7 +8526,7 @@ fn proto_ampersand_no_parens_bypasses_proto() {
     let e = parse_call_with_proto("sub foo ($); &foo;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 0, "&foo with no parens inherits @_");
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -8570,7 +8570,7 @@ fn proto_scalar_relational_terminates_arg() {
         ExprKind::BinOp(BinOp::NumLt, lhs, rhs) => {
             match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "foo");
+                    assert_eq!(name, "main::foo");
                     assert_eq!(args.len(), 1);
                     assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
                 }
@@ -8592,7 +8592,7 @@ fn proto_scalar_equality_terminates_arg() {
         ExprKind::BinOp(BinOp::NumEq, lhs, rhs) => {
             match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "foo");
+                    assert_eq!(name, "main::foo");
                     assert_eq!(args.len(), 1);
                     assert!(matches!(args[0].kind, ExprKind::IntLit(1)));
                 }
@@ -8613,7 +8613,7 @@ fn proto_scalar_ternary_terminates_arg() {
     match &e.kind {
         ExprKind::Ternary(cond, _, _) => match &cond.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "foo");
+                assert_eq!(name, "main::foo");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall as ternary cond, got {other:?}"),
@@ -8650,7 +8650,7 @@ fn proto_amp_slot_accepts_backslash_sub_ref() {
     let e = parse_call_with_proto("sub foo (&@); foo \\&bar, @list;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
             // First arg is a ref-take around something naming `bar`.
             assert!(matches!(args[0].kind, ExprKind::Ref(_)), "expected Ref(...), got {:?}", args[0].kind);
@@ -8667,7 +8667,7 @@ fn proto_amp_slot_accepts_scalar_coderef() {
     let e = parse_call_with_proto("sub foo (&@); foo $cref, @list;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)), "expected ScalarVar, got {:?}", args[0].kind);
             assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
@@ -8683,7 +8683,7 @@ fn proto_amp_slot_accepts_anonymous_sub() {
     let e = parse_call_with_proto("sub foo (&@); foo sub { 1 }, @list;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
             assert!(matches!(args[0].kind, ExprKind::AnonSub(..)), "expected AnonSub, got {:?}", args[0].kind);
             assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)));
@@ -8722,7 +8722,7 @@ fn proto_auto_ref_array() {
     let e = parse_call_with_proto("sub foo (\\@); foo @arr;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 1);
             match &args[0].kind {
                 ExprKind::Ref(inner) => {
@@ -8902,7 +8902,7 @@ fn proto_amp_non_initial_brace_is_hash_ref() {
     let e = parse_call_with_proto("sub foo ($&); foo $x, { a => 1 };");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
             assert!(matches!(args[0].kind, ExprKind::ScalarVar(_)));
             assert!(matches!(args[1].kind, ExprKind::AnonHash(_)), "expected AnonHash, got {:?}", args[1].kind);
@@ -8983,7 +8983,7 @@ fn proto_attribute_form_registers_prototype() {
     let e = parse_call_with_proto("sub foo :prototype($$) { } foo $a + $b, $c;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "foo");
+            assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2, ":prototype($$) should give 2 args");
             assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Add, _, _)));
             assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)));
@@ -9001,7 +9001,7 @@ fn proto_attribute_empty_proto_forces_zero_args() {
         ExprKind::BinOp(BinOp::Add, lhs, rhs) => {
             match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "foo");
+                    assert_eq!(name, "main::foo");
                     assert_eq!(args.len(), 0);
                 }
                 other => panic!("expected FuncCall(foo, []), got {other:?}"),
@@ -9747,7 +9747,7 @@ fn case_mod_interp_uppercase() {
             // Second part: $x wrapped in uc().
             match &interp.0[1] {
                 InterpPart::ScalarInterp(expr) => {
-                    assert!(matches!(&expr.kind, ExprKind::FuncCall(name, _) if name == "uc"), "interp should be uc($x), got {:?}", expr.kind);
+                    assert!(matches!(&expr.kind, ExprKind::FuncCall(name, _) if name == "CORE::uc"), "interp should be uc($x), got {:?}", expr.kind);
                 }
                 other => panic!("expected ScalarInterp, got {other:?}"),
             }
@@ -9763,7 +9763,7 @@ fn case_mod_interp_lcfirst() {
     match &e.kind {
         ExprKind::InterpolatedString(interp) => match &interp.0[0] {
             InterpPart::ScalarInterp(expr) => {
-                assert!(matches!(&expr.kind, ExprKind::FuncCall(name, _) if name == "lcfirst"), "interp should be lcfirst($X), got {:?}", expr.kind);
+                assert!(matches!(&expr.kind, ExprKind::FuncCall(name, _) if name == "CORE::lcfirst"), "interp should be lcfirst($X), got {:?}", expr.kind);
             }
             other => panic!("expected ScalarInterp, got {other:?}"),
         },
@@ -9781,9 +9781,9 @@ fn case_mod_interp_quotemeta_upper() {
                 InterpPart::ScalarInterp(expr) => {
                     // Outermost should be quotemeta.
                     match &expr.kind {
-                        ExprKind::FuncCall(name, args) if name == "quotemeta" => {
+                        ExprKind::FuncCall(name, args) if name == "CORE::quotemeta" => {
                             // Inner should be uc.
-                            assert!(matches!(&args[0].kind, ExprKind::FuncCall(n, _) if n == "uc"), "inner should be uc, got {:?}", args[0].kind);
+                            assert!(matches!(&args[0].kind, ExprKind::FuncCall(n, _) if n == "CORE::uc"), "inner should be uc, got {:?}", args[0].kind);
                         }
                         other => panic!("expected quotemeta(uc($x)), got {other:?}"),
                     }
@@ -10346,13 +10346,13 @@ fn all_block_list() {
 fn any_without_feature_is_bareword() {
     // Without `use feature 'any'`, `any` is a regular identifier.
     let e = parse_expr_str("any();");
-    assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "any"), "without feature, any() should be a regular call, got {:?}", e.kind);
+    assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "main::any"), "without feature, any() should be a regular call, got {:?}", e.kind);
 }
 
 #[test]
 fn all_without_feature_is_bareword() {
     let e = parse_expr_str("all();");
-    assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "all"), "without feature, all() should be a regular call, got {:?}", e.kind);
+    assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "main::all"), "without feature, all() should be a regular call, got {:?}", e.kind);
 }
 
 // ── UTF-8 identifier validation ─────────────────────────
@@ -11140,7 +11140,7 @@ fn hard_empty_regex_from_defined_or_in_term_position() {
     let e = parse_expr_stmt("print //ms;");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
-            assert_eq!(name, "print");
+            assert_eq!(name, "CORE::print");
             assert!(fh.is_none());
             assert_eq!(args.len(), 1);
             assert!(matches!(
@@ -11307,7 +11307,7 @@ fn source_line_inside_block_uses_physical_line() {
 #[test]
 fn downgraded_keyword_class_can_be_called_as_ident() {
     let e = parse_expr_stmt("class($x);");
-    assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "class"));
+    assert!(matches!(e.kind, ExprKind::FuncCall(ref name, _) if name == "main::class"));
 }
 
 #[test]
@@ -11733,7 +11733,7 @@ fn parse_any_without_feature_is_bareword() {
     // any(...) parses as a function call, not a keyword.
     let prog = parse("my $r = any(1, 2, 3);");
     let init = first_assign_rhs(&prog);
-    assert!(matches!(init.kind, ExprKind::FuncCall(ref name, _) if name == "any"), "expected FuncCall(any), got {:?}", init.kind);
+    assert!(matches!(init.kind, ExprKind::FuncCall(ref name, _) if name == "main::any"), "expected FuncCall(any), got {:?}", init.kind);
 }
 
 #[test]
@@ -11741,7 +11741,7 @@ fn parse_all_without_feature_is_bareword() {
     // Without the feature, 'all' is a regular bareword.
     let prog = parse("my $r = all(1, 2, 3);");
     let init = first_assign_rhs(&prog);
-    assert!(matches!(init.kind, ExprKind::FuncCall(ref name, _) if name == "all"), "expected FuncCall(all), got {:?}", init.kind);
+    assert!(matches!(init.kind, ExprKind::FuncCall(ref name, _) if name == "main::all"), "expected FuncCall(all), got {:?}", init.kind);
 }
 
 #[test]
@@ -12662,7 +12662,7 @@ fn nullary_time_plus_number() {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::BinOp(BinOp::Add, lhs, _rhs) => match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "time");
+                    assert_eq!(name, "CORE::time");
                     assert!(args.is_empty(), "time must have zero args");
                 }
                 other => panic!("expected FuncCall(time), got {other:?}"),
@@ -12680,7 +12680,7 @@ fn nullary_time_with_empty_parens() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "time");
+                assert_eq!(name, "CORE::time");
                 assert!(args.is_empty());
             }
             other => panic!("expected FuncCall(time), got {other:?}"),
@@ -12696,7 +12696,7 @@ fn nullary_fork_bare() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "fork");
+                assert_eq!(name, "CORE::fork");
                 assert!(args.is_empty());
             }
             other => panic!("expected FuncCall(fork), got {other:?}"),
@@ -12711,7 +12711,7 @@ fn nullary_wait_bare() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "wait");
+                assert_eq!(name, "CORE::wait");
                 assert!(args.is_empty());
             }
             other => panic!("expected FuncCall(wait), got {other:?}"),
@@ -12750,7 +12750,7 @@ fn nullary_getppid_in_expression() {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::BinOp(BinOp::NumEq, lhs, _) => match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "getppid");
+                    assert_eq!(name, "CORE::getppid");
                     assert!(args.is_empty());
                 }
                 other => panic!("expected FuncCall(getppid), got {other:?}"),
@@ -12767,7 +12767,7 @@ fn nullary_endpwent_bare() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "endpwent");
+                assert_eq!(name, "CORE::endpwent");
                 assert!(args.is_empty());
             }
             other => panic!("expected FuncCall(endpwent), got {other:?}"),
@@ -12818,7 +12818,7 @@ fn named_unary_sleep_with_arg() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "sleep");
+                assert_eq!(name, "CORE::sleep");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(sleep), got {other:?}"),
@@ -12834,7 +12834,7 @@ fn named_unary_sleep_bare() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "sleep");
+                assert_eq!(name, "CORE::sleep");
                 assert!(args.is_empty());
             }
             other => panic!("expected FuncCall(sleep), got {other:?}"),
@@ -12850,7 +12850,7 @@ fn named_unary_sin_dollar_x() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "sin");
+                assert_eq!(name, "CORE::sin");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(sin), got {other:?}"),
@@ -12866,7 +12866,7 @@ fn named_unary_localtime_bare() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "localtime");
+                assert_eq!(name, "CORE::localtime");
                 assert!(args.is_empty());
             }
             other => panic!("expected FuncCall(localtime), got {other:?}"),
@@ -12881,7 +12881,7 @@ fn named_unary_localtime_with_parens() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "localtime");
+                assert_eq!(name, "CORE::localtime");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(localtime), got {other:?}"),
@@ -12896,7 +12896,7 @@ fn named_unary_alarm_with_arg() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "alarm");
+                assert_eq!(name, "CORE::alarm");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(alarm), got {other:?}"),
@@ -12911,7 +12911,7 @@ fn named_unary_quotemeta_with_arg() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "quotemeta");
+                assert_eq!(name, "CORE::quotemeta");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(quotemeta), got {other:?}"),
@@ -12928,7 +12928,7 @@ fn named_unary_exp_in_expression() {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::BinOp(BinOp::Add, lhs, _) => match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "exp");
+                    assert_eq!(name, "CORE::exp");
                     assert_eq!(args.len(), 1);
                 }
                 other => panic!("expected FuncCall(exp), got {other:?}"),
@@ -12953,7 +12953,7 @@ fn named_unary_log_cos_chained() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "log");
+                assert_eq!(name, "CORE::log");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(log), got {other:?}"),
@@ -12970,7 +12970,7 @@ fn select_one_arg_filehandle() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "select");
+                assert_eq!(name, "CORE::select");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected ListOp(select), got {other:?}"),
@@ -12985,7 +12985,7 @@ fn select_one_arg_with_parens() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "select");
+                assert_eq!(name, "CORE::select");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected ListOp(select), got {other:?}"),
@@ -13000,7 +13000,7 @@ fn select_four_arg_syscall() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "select");
+                assert_eq!(name, "CORE::select");
                 assert_eq!(args.len(), 4);
             }
             other => panic!("expected ListOp(select), got {other:?}"),
@@ -13015,7 +13015,7 @@ fn select_four_arg_no_parens() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "select");
+                assert_eq!(name, "CORE::select");
                 assert_eq!(args.len(), 4);
             }
             other => panic!("expected ListOp(select), got {other:?}"),
@@ -13030,7 +13030,7 @@ fn select_zero_arg() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "select");
+                assert_eq!(name, "CORE::select");
                 assert!(args.is_empty());
             }
             other => panic!("expected ListOp(select), got {other:?}"),
@@ -13060,7 +13060,7 @@ fn listop_waitpid_two_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "waitpid");
+                assert_eq!(name, "CORE::waitpid");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(waitpid), got {other:?}"),
@@ -13076,7 +13076,7 @@ fn listop_kill_signal_and_pids() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "kill");
+                assert_eq!(name, "CORE::kill");
                 assert_eq!(args.len(), 3);
             }
             other => panic!("expected ListOp(kill), got {other:?}"),
@@ -13092,7 +13092,7 @@ fn listop_socket_four_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "socket");
+                assert_eq!(name, "CORE::socket");
                 assert_eq!(args.len(), 4);
             }
             other => panic!("expected ListOp(socket), got {other:?}"),
@@ -13107,7 +13107,7 @@ fn listop_send_with_parens() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "send");
+                assert_eq!(name, "CORE::send");
                 assert_eq!(args.len(), 3);
             }
             other => panic!("expected ListOp(send), got {other:?}"),
@@ -13123,7 +13123,7 @@ fn listop_pack_template_and_values() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "pack");
+                assert_eq!(name, "CORE::pack");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(pack), got {other:?}"),
@@ -13138,7 +13138,7 @@ fn listop_unpack_template_and_data() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "unpack");
+                assert_eq!(name, "CORE::unpack");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(unpack), got {other:?}"),
@@ -13153,7 +13153,7 @@ fn listop_flock_two_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "flock");
+                assert_eq!(name, "CORE::flock");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(flock), got {other:?}"),
@@ -13168,7 +13168,7 @@ fn listop_link_two_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "link");
+                assert_eq!(name, "CORE::link");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(link), got {other:?}"),
@@ -13183,7 +13183,7 @@ fn listop_truncate_two_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "truncate");
+                assert_eq!(name, "CORE::truncate");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(truncate), got {other:?}"),
@@ -13198,7 +13198,7 @@ fn listop_sysread_three_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "sysread");
+                assert_eq!(name, "CORE::sysread");
                 assert_eq!(args.len(), 3);
             }
             other => panic!("expected ListOp(sysread), got {other:?}"),
@@ -13214,7 +13214,7 @@ fn listop_utime_list() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "utime");
+                assert_eq!(name, "CORE::utime");
                 assert_eq!(args.len(), 3);
             }
             other => panic!("expected ListOp(utime), got {other:?}"),
@@ -13229,7 +13229,7 @@ fn listop_vec_three_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "vec");
+                assert_eq!(name, "CORE::vec");
                 assert_eq!(args.len(), 3);
             }
             other => panic!("expected ListOp(vec), got {other:?}"),
@@ -13244,7 +13244,7 @@ fn listop_fcntl_three_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "fcntl");
+                assert_eq!(name, "CORE::fcntl");
                 assert_eq!(args.len(), 3);
             }
             other => panic!("expected ListOp(fcntl), got {other:?}"),
@@ -13259,7 +13259,7 @@ fn listop_msgrcv_five_args() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "msgrcv");
+                assert_eq!(name, "CORE::msgrcv");
                 assert_eq!(args.len(), 5);
             }
             other => panic!("expected ListOp(msgrcv), got {other:?}"),
@@ -13277,7 +13277,7 @@ fn named_unary_getpwnam() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "getpwnam");
+                assert_eq!(name, "CORE::getpwnam");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(getpwnam), got {other:?}"),
@@ -13292,7 +13292,7 @@ fn named_unary_getpwuid() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "getpwuid");
+                assert_eq!(name, "CORE::getpwuid");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(getpwuid), got {other:?}"),
@@ -13307,7 +13307,7 @@ fn named_unary_gethostbyname() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "gethostbyname");
+                assert_eq!(name, "CORE::gethostbyname");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(gethostbyname), got {other:?}"),
@@ -13324,7 +13324,7 @@ fn listop_getservbyname() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "getservbyname");
+                assert_eq!(name, "CORE::getservbyname");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(getservbyname), got {other:?}"),
@@ -13401,7 +13401,8 @@ fn all_list_op_keywords_parse() {
         match &prog.statements[0].kind {
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::ListOp(name, _) => {
-                    assert_eq!(name, kw, "{kw} should parse as ListOp");
+                    let expected = format!("CORE::{kw}");
+                    assert_eq!(name, &expected, "{kw} should parse as ListOp");
                 }
                 other => panic!("{kw} parsed as {other:?}, expected ListOp"),
             },
@@ -13420,7 +13421,10 @@ fn all_named_unary_db_keywords_parse() {
         match &prog.statements[0].kind {
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, kw, "{kw} should parse as FuncCall");
+                    {
+                        let expected = format!("CORE::{kw}");
+                        assert_eq!(name, &expected, "{kw} should parse as FuncCall");
+                    }
                     assert_eq!(args.len(), 1, "{kw} should have one arg");
                 }
                 other => panic!("{kw} parsed as {other:?}, expected FuncCall"),
@@ -13461,7 +13465,10 @@ fn all_nullary_keywords_parse() {
         match &prog.statements[0].kind {
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, kw, "{kw} should parse as FuncCall");
+                    {
+                        let expected = format!("CORE::{kw}");
+                        assert_eq!(name, &expected, "{kw} should parse as FuncCall");
+                    }
                     assert!(args.is_empty(), "{kw} should have zero args");
                 }
                 other => panic!("{kw} parsed as {other:?}, expected zero-arg FuncCall"),
@@ -13531,7 +13538,7 @@ fn named_unary_sleep_postfix_if() {
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::If, body, _), .. }) => match &body.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "sleep");
+                assert_eq!(name, "CORE::sleep");
                 assert!(args.is_empty(), "sleep should have zero args before postfix if");
             }
             other => panic!("expected FuncCall(sleep), got {other:?}"),
@@ -13548,7 +13555,7 @@ fn named_unary_chdir_or_die() {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::BinOp(BinOp::LowOr, lhs, _) => match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "chdir");
+                    assert_eq!(name, "CORE::chdir");
                     assert!(args.is_empty(), "chdir should have zero args before `or`");
                 }
                 other => panic!("expected FuncCall(chdir), got {other:?}"),
@@ -13567,7 +13574,7 @@ fn named_unary_defined_ternary_precedence() {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::Ternary(cond, _, _) => match &cond.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "defined");
+                    assert_eq!(name, "CORE::defined");
                     assert_eq!(args.len(), 1, "defined should consume only $x");
                 }
                 other => panic!("expected FuncCall(defined) as ternary condition, got {other:?}"),
@@ -13586,7 +13593,7 @@ fn named_unary_defined_logical_or_precedence() {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::BinOp(BinOp::Or, lhs, _) => match &lhs.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, "defined");
+                    assert_eq!(name, "CORE::defined");
                     assert_eq!(args.len(), 1);
                 }
                 other => panic!("expected FuncCall(defined), got {other:?}"),
@@ -13604,7 +13611,7 @@ fn named_unary_lc_concat_precedence() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "lc");
+                assert_eq!(name, "CORE::lc");
                 assert_eq!(args.len(), 1);
                 // The single arg should be a Concat binop.
                 assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Concat, _, _)));
@@ -13650,7 +13657,7 @@ fn keyword_x_in_prefix_position() {
     let prog = parse("x();");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::FuncCall(name, _) => assert_eq!(name, "x"),
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "main::x"),
             other => panic!("expected FuncCall(x), got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
@@ -13691,7 +13698,7 @@ fn keyword_isa_without_feature_is_ident() {
     let prog = parse("isa();");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::FuncCall(name, _) => assert_eq!(name, "isa"),
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "main::isa"),
             other => panic!("expected FuncCall(isa), got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
@@ -13706,7 +13713,7 @@ fn keyword_break_bare() {
     match &stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "break");
+                assert_eq!(name, "CORE::break");
                 assert!(args.is_empty());
             }
             other => panic!("expected FuncCall(break), got {other:?}"),
@@ -13721,7 +13728,7 @@ fn keyword_break_without_feature_is_ident() {
     let prog = parse("break();");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::FuncCall(name, _) => assert_eq!(name, "break"),
+            ExprKind::FuncCall(name, _) => assert_eq!(name, "main::break"),
             other => panic!("expected FuncCall(break), got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
@@ -13735,7 +13742,7 @@ fn keyword_evalbytes_with_feature() {
     match &stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "evalbytes");
+                assert_eq!(name, "CORE::evalbytes");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(evalbytes), got {other:?}"),
@@ -13751,7 +13758,7 @@ fn keyword_fc_with_feature() {
     match &stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "fc");
+                assert_eq!(name, "CORE::fc");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(fc), got {other:?}"),
@@ -13766,7 +13773,7 @@ fn keyword_lock_named_unary() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "lock");
+                assert_eq!(name, "CORE::lock");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(lock), got {other:?}"),
@@ -13781,7 +13788,7 @@ fn keyword_atan2_list_op() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "atan2");
+                assert_eq!(name, "CORE::atan2");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(atan2), got {other:?}"),
@@ -13796,7 +13803,7 @@ fn keyword_crypt_list_op() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "crypt");
+                assert_eq!(name, "CORE::crypt");
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected ListOp(crypt), got {other:?}"),
@@ -13806,32 +13813,22 @@ fn keyword_crypt_list_op() {
 }
 
 #[test]
-fn keyword_autoload_list_op() {
+fn keyword_autoload_forward_decl() {
+    // `AUTOLOAD()` is `sub AUTOLOAD ();` — forward declaration with empty prototype.
     let prog = parse("AUTOLOAD();");
     match &prog.statements[0].kind {
-        StmtKind::Expr(e) => match &e.kind {
-            ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "AUTOLOAD");
-                assert!(args.is_empty());
-            }
-            other => panic!("expected ListOp(AUTOLOAD), got {other:?}"),
-        },
-        other => panic!("expected Expr, got {other:?}"),
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "AUTOLOAD"),
+        other => panic!("expected SubDecl(AUTOLOAD), got {other:?}"),
     }
 }
 
 #[test]
-fn keyword_destroy_list_op() {
+fn keyword_destroy_forward_decl() {
+    // `DESTROY()` is `sub DESTROY ();` — forward declaration with empty prototype.
     let prog = parse("DESTROY();");
     match &prog.statements[0].kind {
-        StmtKind::Expr(e) => match &e.kind {
-            ExprKind::ListOp(name, args) => {
-                assert_eq!(name, "DESTROY");
-                assert!(args.is_empty());
-            }
-            other => panic!("expected ListOp(DESTROY), got {other:?}"),
-        },
-        other => panic!("expected Expr, got {other:?}"),
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "DESTROY"),
+        other => panic!("expected SubDecl(DESTROY), got {other:?}"),
     }
 }
 
@@ -13841,7 +13838,7 @@ fn keyword_fileno_named_unary() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "fileno");
+                assert_eq!(name, "CORE::fileno");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(fileno), got {other:?}"),
@@ -13856,7 +13853,7 @@ fn keyword_study_named_unary() {
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "study");
+                assert_eq!(name, "CORE::study");
                 assert_eq!(args.len(), 1);
             }
             other => panic!("expected FuncCall(study), got {other:?}"),
@@ -13918,7 +13915,10 @@ fn all_final_batch_named_unaries_parse() {
         match &prog.statements[0].kind {
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::FuncCall(name, args) => {
-                    assert_eq!(name, kw, "{kw} should parse as FuncCall");
+                    {
+                        let expected = format!("CORE::{kw}");
+                        assert_eq!(name, &expected, "{kw} should parse as FuncCall");
+                    }
                     assert_eq!(args.len(), 1, "{kw} should have one arg");
                 }
                 other => panic!("{kw} parsed as {other:?}, expected FuncCall"),
@@ -13930,14 +13930,15 @@ fn all_final_batch_named_unaries_parse() {
 
 #[test]
 fn all_final_batch_list_ops_parse() {
-    let list_ops = ["atan2", "crypt", "dbmopen", "AUTOLOAD", "DESTROY"];
+    let list_ops = ["atan2", "crypt", "dbmopen"];
     for kw in list_ops {
         let src = format!("{kw}($x, $y);");
         let prog = parse(&src);
         match &prog.statements[0].kind {
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::ListOp(name, _) => {
-                    assert_eq!(name, kw, "{kw} should parse as ListOp");
+                    let expected = format!("CORE::{kw}");
+                    assert_eq!(name, &expected, "{kw} should parse as ListOp");
                 }
                 other => panic!("{kw} parsed as {other:?}, expected ListOp"),
             },
@@ -13950,14 +13951,19 @@ fn all_final_batch_list_ops_parse() {
 
 #[test]
 fn weak_keyword_abs_overridden_by_use_subs() {
-    // `use subs 'abs'` imports abs — bare usage becomes a bareword,
-    // not the named unary FuncCall it would normally be.
-    let prog = parse("use subs 'abs'; abs;");
+    // Without override, `abs $x ? 1 : 0` is `abs($x) ? 1 : 0` — Ternary at top.
+    // With override, it's `abs($x ? 1 : 0)` — FuncCall at top (list op precedence).
+    let prog = parse("use subs 'abs'; abs $x ? 1 : 0;");
     let stmt = &prog.statements[1];
     match &stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::Bareword(name) => assert_eq!(name, "abs"),
-            other => panic!("expected Bareword(abs), got {other:?}"),
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "main::abs");
+                // The ternary is INSIDE the args — list op consumed it.
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].kind, ExprKind::Ternary(_, _, _)), "arg should be ternary, got {:?}", args[0].kind);
+            }
+            other => panic!("expected FuncCall(abs) at top (override active), got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
     }
@@ -13965,12 +13971,16 @@ fn weak_keyword_abs_overridden_by_use_subs() {
 
 #[test]
 fn weak_keyword_not_overridden_without_use_subs() {
-    // Without `use subs`, abs is still a keyword (named unary).
-    let prog = parse("abs(-5);");
+    // Without use subs, `abs $x ? 1 : 0` is named unary:
+    // Ternary at top, with FuncCall(abs, [$x]) as condition.
+    let prog = parse("abs $x ? 1 : 0;");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::FuncCall(name, _) => assert_eq!(name, "abs"),
-            other => panic!("expected FuncCall(abs), got {other:?}"),
+            ExprKind::Ternary(cond, _, _) => match &cond.kind {
+                ExprKind::FuncCall(name, _) => assert_eq!(name, "CORE::abs"),
+                other => panic!("expected FuncCall(abs) as ternary condition, got {other:?}"),
+            },
+            other => panic!("expected Ternary at top (named unary), got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
     }
@@ -13978,7 +13988,7 @@ fn weak_keyword_not_overridden_without_use_subs() {
 
 #[test]
 fn strong_keyword_not_overridden_by_use_subs() {
-    // `print` is a strong keyword — `use subs 'print'` should NOT override it.
+    // `print` is strong — `use subs 'print'` should NOT override it.
     let prog = parse("use subs 'print'; print 42;");
     let stmt = &prog.statements[1];
     match &stmt.kind {
@@ -13991,19 +14001,17 @@ fn strong_keyword_not_overridden_by_use_subs() {
 }
 
 #[test]
-fn weak_keyword_use_subs_scoped_to_block() {
-    // `use subs` inside a block should not leak out.
-    // Inside: abs is overridden → Bareword.  Outside: abs is keyword → FuncCall.
-    let prog = parse("{ use subs 'abs'; abs; } abs;");
-    // The outer `abs;` should be the keyword (FuncCall), not Bareword.
+fn weak_keyword_use_subs_is_package_level() {
+    // `use subs` is package-level — override persists outside blocks.
+    let prog = parse("{ use subs 'abs'; } abs $x ? 1 : 0;");
     let outer_stmt = &prog.statements[1];
     match &outer_stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
-                assert_eq!(name, "abs");
-                assert!(args.is_empty());
+                assert_eq!(name, "main::abs");
+                assert!(matches!(args[0].kind, ExprKind::Ternary(_, _, _)), "override should persist — ternary inside FuncCall");
             }
-            other => panic!("expected FuncCall(abs) outside block, got {other:?}"),
+            other => panic!("expected FuncCall(abs) — use subs is package-level, got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
     }
@@ -14011,15 +14019,16 @@ fn weak_keyword_use_subs_scoped_to_block() {
 
 #[test]
 fn weak_keyword_abs_overridden_by_use_subs_qw() {
-    // `use subs qw(abs)` — the common real-world form with qw().
-    // Without parens, named unary produces FuncCall("abs", []) but
-    // an overridden identifier produces Bareword("abs").
-    let prog = parse("use subs qw(abs); abs;");
+    // `use subs qw(abs)` — same override via qw form.
+    let prog = parse("use subs qw(abs); abs $x ? 1 : 0;");
     let stmt = &prog.statements[1];
     match &stmt.kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::Bareword(name) => assert_eq!(name, "abs"),
-            other => panic!("expected Bareword(abs) from overridden keyword, got {other:?}"),
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "main::abs");
+                assert!(matches!(args[0].kind, ExprKind::Ternary(_, _, _)), "ternary should be inside FuncCall args");
+            }
+            other => panic!("expected FuncCall(abs) with override, got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
     }
@@ -14027,15 +14036,85 @@ fn weak_keyword_abs_overridden_by_use_subs_qw() {
 
 #[test]
 fn weak_keyword_multiple_qw_overrides() {
-    // `use subs qw(abs sin)` overrides both — bare usage becomes barewords.
-    let prog = parse("use subs qw(abs sin); abs; sin;");
-    for (i, name) in [(1, "abs"), (2, "sin")] {
+    // Both abs and sin overridden — both should consume ternary.
+    let prog = parse("use subs qw(abs sin); abs $x ? 1 : 0; sin $y ? 1 : 0;");
+    for (i, name) in [(1, "main::abs"), (2, "main::sin")] {
         match &prog.statements[i].kind {
             StmtKind::Expr(e) => match &e.kind {
-                ExprKind::Bareword(n) => assert_eq!(n, name),
-                other => panic!("{name}: expected Bareword, got {other:?}"),
+                ExprKind::FuncCall(n, args) => {
+                    assert_eq!(n, name);
+                    assert!(matches!(args[0].kind, ExprKind::Ternary(_, _, _)), "{name}: ternary should be inside FuncCall");
+                }
+                other => panic!("{name}: expected FuncCall, got {other:?}"),
             },
             other => panic!("{name}: expected Expr, got {other:?}"),
         }
+    }
+}
+
+// ── AUTOLOAD/DESTROY as implicit sub declarations ───────────
+
+#[test]
+fn autoload_block_is_sub_declaration() {
+    // `AUTOLOAD { 1 }` without `sub` is an implicit sub declaration in Perl.
+    let prog = parse("AUTOLOAD { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "AUTOLOAD"),
+        other => panic!("expected SubDecl(AUTOLOAD), got {other:?}"),
+    }
+}
+
+#[test]
+fn destroy_block_is_sub_declaration() {
+    // `DESTROY { 1 }` without `sub` is an implicit sub declaration.
+    let prog = parse("DESTROY { 1 }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => assert_eq!(sd.name, "DESTROY"),
+        other => panic!("expected SubDecl(DESTROY), got {other:?}"),
+    }
+}
+
+// ── Weak keyword override must not break infix operators ────
+
+#[test]
+fn use_subs_x_does_not_break_infix_repeat() {
+    // `use subs "x"` overrides prefix x, but infix `"ab" x 3` must
+    // still parse as the repeat operator.
+    let prog = parse("use subs 'x'; \"ab\" x 3;");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::Repeat, _, _) => {}
+            other => panic!("expected BinOp(Repeat), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn use_subs_xor_does_not_break_infix_xor() {
+    // `use subs "xor"` overrides prefix, but infix must still work.
+    let prog = parse("use subs 'xor'; $a xor $b;");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::LowXor, _, _) => {}
+            other => panic!("expected BinOp(LowXor), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn use_subs_eq_does_not_break_infix_eq() {
+    // `use subs "eq"` overrides prefix, but infix must still work.
+    let prog = parse("use subs 'eq'; \"a\" eq \"b\";");
+    let stmt = &prog.statements[1];
+    match &stmt.kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::StrEq, _, _) => {}
+            other => panic!("expected BinOp(StrEq), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
     }
 }
