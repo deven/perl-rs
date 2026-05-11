@@ -1762,9 +1762,8 @@ impl Parser {
         let span = spanned.span;
 
         // Fat comma autoquotes keywords: `if => 1` produces StringLit("if").
-        // RightBrace also autoquotes: $hash{if} produces StringLit("if").
         if let Token::Keyword(kw) = &spanned.token
-            && matches!(self.peek_token(), Token::FatComma | Token::RightBrace)
+            && matches!(self.peek_token(), Token::FatComma)
         {
             let name: &str = (*kw).into();
             return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
@@ -2168,6 +2167,11 @@ impl Parser {
 
             // break — exits a given/when block.  No label argument.
             Token::Keyword(Keyword::Break) => Ok(Expr { kind: ExprKind::FuncCall("CORE::break".into(), vec![]), span }),
+
+            // continue — falls through to the next when in a given block.
+            // Different from `continue BLOCK` after loops, which is
+            // handled at statement level.
+            Token::Keyword(Keyword::Continue) => Ok(Expr { kind: ExprKind::FuncCall("CORE::continue".into(), vec![]), span }),
 
             // `x` is a weak keyword: in prefix position it acts as an
             // identifier (function call / bareword).  In infix position

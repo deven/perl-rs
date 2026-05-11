@@ -14118,3 +14118,27 @@ fn use_subs_eq_does_not_break_infix_eq() {
         other => panic!("expected Expr, got {other:?}"),
     }
 }
+
+// ── Keyword before } is NOT autoquoted ──────────────────────
+
+#[test]
+fn keyword_before_right_brace_not_autoquoted() {
+    // `sub foo { abs }` — abs is a zero-arg named unary call,
+    // NOT a string literal.  The RightBrace check in parse_term's
+    // fat comma autoquoting must not fire here.
+    let prog = parse("sub foo { abs }");
+    match &prog.statements[0].kind {
+        StmtKind::SubDecl(sd) => {
+            let body_stmt = &sd.body.statements[0];
+            match &body_stmt.kind {
+                StmtKind::Expr(e) => match &e.kind {
+                    ExprKind::FuncCall(name, _) => assert_eq!(name, "CORE::abs"),
+                    ExprKind::StringLit(s) => panic!("abs was autoquoted to StringLit(\"{s}\") — bug!"),
+                    other => panic!("expected FuncCall(CORE::abs), got {other:?}"),
+                },
+                other => panic!("expected Expr, got {other:?}"),
+            }
+        }
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
