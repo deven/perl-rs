@@ -3,8 +3,9 @@
 //! The AST preserves syntactic distinctions that matter for diagnostics, lowering, and tooling.  It is the public
 //! output of `perl-parser`.
 
+use crate::keyword::Keyword;
 use crate::span::Span;
-use crate::token::{AssignOp, DataEndMarker, FieldKind, RegexKind, RepeatKind};
+use crate::token::{AssignOp, FieldKind, RegexKind, RepeatKind};
 
 /// A complete Perl program.
 #[derive(Clone, Debug)]
@@ -79,7 +80,7 @@ pub enum StmtKind {
 
     /// Logical end of script: `__END__`, `__DATA__`, `^D`, or `^Z`.  The `u32` is the byte offset where trailing data
     /// begins (after the marker line's newline).
-    DataEnd(DataEndMarker, u32),
+    DataEnd(Keyword, u32),
 
     /// `format NAME = ... .`
     FormatDecl(FormatDecl),

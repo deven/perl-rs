@@ -79,9 +79,9 @@ fn lex_all(src: &str) -> Vec<Token> {
             | Token::Arrow
             | Token::SourceFile(_)
             | Token::SourceLine(_)
-            | Token::CurrentPackage
-            | Token::CurrentSub
-            | Token::CurrentClass => {
+            | Token::Keyword(Keyword::__PACKAGE__)
+            | Token::Keyword(Keyword::__SUB__)
+            | Token::Keyword(Keyword::__CLASS__) => {
                 term_context = false;
             }
             // Sub-tokens inside strings/regex don't change context.
@@ -1457,43 +1457,38 @@ fn lex_glob_wildcard() {
     assert_eq!(tokens, vec![Token::Readline("*.txt".into(), false)]);
 }
 
-// ── DataEnd tokens ────────────────────────────────────────
+// ── __END__ / __DATA__ tokens ────────────────────────────
 
 #[test]
 fn lex_end_token() {
     let tokens = lex_all("1;\n__END__\nstuff");
-    assert!(tokens.contains(&Token::DataEnd(DataEndMarker::End)));
+    assert!(tokens.contains(&Token::Keyword(Keyword::__END__)));
 }
 
 #[test]
 fn lex_data_token() {
     let tokens = lex_all("1;\n__DATA__\nstuff");
-    assert!(tokens.contains(&Token::DataEnd(DataEndMarker::Data)));
+    assert!(tokens.contains(&Token::Keyword(Keyword::__DATA__)));
 }
 
 #[test]
-fn lex_end_not_at_column_0_is_bareword() {
-    // Indented __END__ is a bareword, not end-of-source.
+fn lex_end_not_at_column_0_still_recognized() {
+    // __END__ is recognized at any position, not just column 0.
     let tokens = lex_all("1;\n  __END__\nstuff\n");
-    assert!(!tokens.contains(&Token::DataEnd(DataEndMarker::End)));
-    assert!(tokens.contains(&Token::Ident("__END__".into())));
-    // Code after the pseudo-__END__ is still lexed as code.
-    assert!(tokens.contains(&Token::Ident("stuff".into())));
+    assert!(tokens.contains(&Token::Keyword(Keyword::__END__)));
 }
 
 #[test]
-fn lex_end_after_other_token_is_bareword() {
-    // __END__ after another token on the same line is not special.
+fn lex_end_after_other_token_still_recognized() {
+    // __END__ after other tokens on the same line is still recognized.
     let tokens = lex_all("my $x = __END__;\n");
-    assert!(!tokens.contains(&Token::DataEnd(DataEndMarker::End)));
-    assert!(tokens.contains(&Token::Ident("__END__".into())));
+    assert!(tokens.contains(&Token::Keyword(Keyword::__END__)));
 }
 
 #[test]
-fn lex_data_not_at_column_0_is_bareword() {
+fn lex_data_not_at_column_0_still_recognized() {
     let tokens = lex_all("foo __DATA__\nbar\n");
-    assert!(!tokens.contains(&Token::DataEnd(DataEndMarker::Data)));
-    assert!(tokens.contains(&Token::Ident("__DATA__".into())));
+    assert!(tokens.contains(&Token::Keyword(Keyword::__DATA__)));
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //! Quote-like constructs emit a stream of sub-tokens (§5.4) rather than a single string token, enabling the parser to
 //! build interpolation AST nodes directly.
 
+use crate::keyword::Keyword;
 use crate::span::Span;
 
 /// A token with its source location.
@@ -13,332 +14,6 @@ use crate::span::Span;
 pub struct Spanned {
     pub token: Token,
     pub span: Span,
-}
-
-/// Perl keyword.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Keyword {
-    // ── Control flow ──────────────────────────────────────────
-    If,
-    Elsif,
-    Elseif, // parsed only to emit "elseif should be elsif" diagnostic
-    Else,
-    Unless,
-    While,
-    Until,
-    For,
-    Foreach,
-    Given,
-    When,
-    Default,
-
-    // ── Exception handling ────────────────────────────────────
-    Try,
-    Catch,
-    Finally,
-    Defer,
-
-    // ── Declarations ──────────────────────────────────────────
-    My,
-    Our,
-    Local,
-    State,
-    Sub,
-    Format,
-    Package,
-    Class,
-    Field,
-    Method,
-
-    // ── Module ────────────────────────────────────────────────
-    Use,
-    No,
-    Require,
-    Do,
-
-    // ── Operators / special ───────────────────────────────────
-    And, // low-precedence `and`
-    Or,  // low-precedence `or`
-    Not, // low-precedence `not`
-    Eq,
-    Ne,
-    Lt,
-    Gt,
-    Le,
-    Ge,
-    Cmp, // string comparison
-
-    // ── Loop control ──────────────────────────────────────────
-    Last,
-    Next,
-    Redo,
-    Goto,
-    Dump,
-
-    // ── Special values ────────────────────────────────────────
-    Undef,
-    Return,
-
-    // ── Eval / execution ──────────────────────────────────────
-    Eval,
-    Die,
-    Warn,
-
-    // ── I/O and builtins emitted as distinct token classes ────
-    Print,
-    Say,
-    Chomp,
-    Chop,
-    Defined,
-    Ref,
-    Exists,
-    Delete,
-    Push,
-    Pop,
-    Shift,
-    Unshift,
-    Splice,
-    Keys,
-    Values,
-    Each,
-    Reverse,
-    Sort,
-    Map,
-    Grep,
-    Join,
-    Split,
-    Sprintf,
-    Printf,
-    Chr,
-    Ord,
-    Hex,
-    Oct,
-    Lc,
-    Uc,
-    Lcfirst,
-    Ucfirst,
-    Length,
-    Substr,
-    Index,
-    Rindex,
-    Abs,
-    Int,
-    Sqrt,
-    Rand,
-    Srand,
-    Wantarray,
-    Scalar,
-    Caller,
-    Die_,
-    Exit,
-    Chdir,
-    Mkdir,
-    Rmdir,
-    Unlink,
-    Rename,
-    Open,
-    Close,
-    Read,
-    Write,
-    Seek,
-    Tell,
-    Select,
-    Eof,
-    Getc,
-    Readline,
-    Readlink,
-    Binmode,
-    Stat,
-    Lstat,
-    Chmod,
-    Chown,
-    Umask,
-    Glob,
-    Opendir,
-    Readdir,
-    Closedir,
-    Pos,
-    System,
-    Exec,
-    Qw,
-
-    // ── Quote-like operators ─────────────────────────────────
-    // These are emitted as keywords by `lex_word` and dispatched by the parser, which decides whether to enter sublexing
-    // (quote op) or autoquote (fat comma / hash subscript).
-    Q,
-    Qq,
-    Qr,
-    Qx,
-    M,
-    S,
-    Tr,
-    Y,
-
-    // ── Named unary builtins (additional) ────────────────────
-    Sleep,
-    Alarm,
-    Localtime,
-    Gmtime,
-    Sin,
-    Cos,
-    Exp,
-    Log,
-    Quotemeta,
-    Prototype,
-    Readpipe,
-    Chroot,
-    Reset,
-    // Named unary — database lookup (single arg)
-    Getpwnam,
-    Getgrnam,
-    Gethostbyname,
-    Getnetbyname,
-    Getprotobyname,
-    Getpwuid,
-    Getgrgid,
-    Getprotobynumber,
-    // Named unary — additional
-    Fileno,
-    Getpeername,
-    Getpgrp,
-    Getsockname,
-    Rewinddir,
-    Sethostent,
-    Setnetent,
-    Setprotoent,
-    Setservent,
-    Study,
-    Telldir,
-    Dbmclose,
-    Lock, // weak keyword — overridable by user sub
-    // Feature-gated named unaries
-    Evalbytes, // feature 'evalbytes'
-    Fc,        // feature 'fc'
-
-    // ── List operator builtins (additional) ──────────────────
-    // System/process
-    Waitpid,
-    Kill,
-    Pipe,
-    Setpgrp,
-    Setpriority,
-    Getpriority,
-    Syscall,
-    // Socket/network
-    Socket,
-    Socketpair,
-    Bind,
-    Connect,
-    Listen,
-    Accept,
-    Shutdown,
-    Send,
-    Recv,
-    Setsockopt,
-    Getsockopt,
-    // SysV IPC
-    Shmget,
-    Shmctl,
-    Shmread,
-    Shmwrite,
-    Semget,
-    Semctl,
-    Semop,
-    Msgget,
-    Msgctl,
-    Msgsnd,
-    Msgrcv,
-    // Database lookup (multi-arg)
-    Getservbyname,
-    Gethostbyaddr,
-    Getnetbyaddr,
-    Getservbyport,
-    // Low-level I/O
-    Sysopen,
-    Sysread,
-    Syswrite,
-    Sysseek,
-    Truncate,
-    Fcntl,
-    Ioctl,
-    Flock,
-    Seekdir,
-    // File operations
-    Link,
-    Symlink,
-    Utime,
-    // Data
-    Pack,
-    Unpack,
-    Vec,
-    Formline,
-    // Additional list operators
-    Atan2,
-    Crypt,
-    Dbmopen,
-    AUTOLOAD,
-    DESTROY,
-
-    // ── Infix operator keywords ─────────────────────────────
-    X,   // string repeat operator
-    Xor, // low-precedence logical xor
-    Isa, // class-instance test (feature-gated)
-
-    // ── Flow control ────────────────────────────────────────
-    Break, // exits given/when block (feature-gated under 'switch')
-
-    // ── List-processing (block-first) ──────────────────────
-    Any,
-    All,
-
-    // ── Phaser blocks ─────────────────────────────────────────
-    BEGIN,
-    END,
-    INIT,
-    CHECK,
-    UNITCHECK,
-    ADJUST,
-
-    // ── Miscellaneous ─────────────────────────────────────────
-    Tie,
-    Untie,
-    Tied,
-    Bless,
-    Blessed, // from Scalar::Util but common
-    Continue,
-
-    // ── Nullary builtins ─────────────────────────────────────
-    // These take no arguments at all, so `time+1` is `time() + 1`.
-    Time,
-    Times,
-    Fork,
-    Wait,
-    Getppid,
-    Getlogin,
-    // Password/group/host/net/proto/serv database traversal
-    Setpwent,
-    Setgrent,
-    Endpwent,
-    Endgrent,
-    Endhostent,
-    Endnetent,
-    Endprotoent,
-    Endservent,
-    Getpwent,
-    Getgrent,
-    Gethostent,
-    Getnetent,
-    Getprotoent,
-    Getservent,
-
-    // ── Typed layer (§14, our extensions) ─────────────────────
-    Let,
-    Fn,
-    Struct,
-    Enum,
-    Impl,
-    Trait,
-    Match,
 }
 
 /// Assignment operator variant.
@@ -561,16 +236,6 @@ pub enum Token {
     SourceFile(String),
     /// `__LINE__` — current source line number.  Captured at lex time.
     SourceLine(u32),
-    /// `__PACKAGE__` — marker.  The parser fills in the current package name when building the AST node (the lexer
-    /// doesn't track packages).
-    CurrentPackage,
-    /// `__SUB__` — marker.  Gated on the `current_sub` feature; the parser checks and either emits an
-    /// `ExprKind::CurrentSub` or falls back to treating it as a bareword.  No compile-time value — it's a runtime
-    /// reference to the current sub.
-    CurrentSub,
-    /// `__CLASS__` — marker.  Yields the name of the class being constructed during field initializers and ADJUST
-    /// blocks (5.38+).
-    CurrentClass,
 
     // ── Format sub-tokens ─────────────────────────────────────
     /// Opens a `format NAME = ... .` body.  `name` is the format name (defaults to `STDOUT` when omitted at the call
@@ -605,7 +270,7 @@ pub enum Token {
     // ── Special ───────────────────────────────────────────────
     /// `qw/.../` — list of words.
     QwList(Vec<String>),
-    /// `__END__`, `__DATA__`, `^D` (0x04), or `^Z` (0x1a) — logical end of script.
+    /// `^D` (0x04) or `^Z` (0x1a) — logical end of script.  `__END__` and `__DATA__` are handled as keywords.
     DataEnd(DataEndMarker),
     /// Yada yada yada (`...` as a statement).
     YadaYada,
@@ -614,13 +279,9 @@ pub enum Token {
     Readline(String, bool),
 }
 
-/// Which marker triggered logical end-of-script.
+/// Which control character triggered logical end-of-script.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataEndMarker {
-    /// `__END__` — trailing data readable via `<main::DATA>`.
-    End,
-    /// `__DATA__` — trailing data readable via `<DATA>` in current package.
-    Data,
     /// ^D (0x04) — logical EOF, no DATA filehandle.
     CtrlD,
     /// ^Z (0x1a) — logical EOF, no DATA filehandle.

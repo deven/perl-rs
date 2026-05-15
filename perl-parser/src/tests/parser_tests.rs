@@ -2130,10 +2130,10 @@ fn parse_end_stops_parsing() {
     // Should have 2 statements: my decl and DataEnd
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[1].kind {
-        StmtKind::DataEnd(DataEndMarker::End, offset) => {
+        StmtKind::DataEnd(Keyword::__END__, offset) => {
             assert_eq!(&src.as_bytes()[*offset as usize..], b"This is not code.\n");
         }
-        other => panic!("expected DataEnd(End), got {other:?}"),
+        other => panic!("expected DataEnd(__END__), got {other:?}"),
     }
 }
 
@@ -2143,10 +2143,10 @@ fn parse_data_stops_parsing() {
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[1].kind {
-        StmtKind::DataEnd(DataEndMarker::Data, offset) => {
+        StmtKind::DataEnd(Keyword::__DATA__, offset) => {
             assert_eq!(&src.as_bytes()[*offset as usize..], b"raw data here\n");
         }
-        other => panic!("expected DataEnd(Data), got {other:?}"),
+        other => panic!("expected DataEnd(__DATA__), got {other:?}"),
     }
 }
 
@@ -2156,10 +2156,10 @@ fn parse_ctrl_d_stops_parsing() {
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[1].kind {
-        StmtKind::DataEnd(DataEndMarker::CtrlD, offset) => {
+        StmtKind::DataEnd(Keyword::__END__, offset) => {
             assert_eq!(&src.as_bytes()[*offset as usize..], b"ignored code\n");
         }
-        other => panic!("expected DataEnd(CtrlD), got {other:?}"),
+        other => panic!("expected DataEnd(__END__), got {other:?}"),
     }
 }
 
@@ -2169,10 +2169,10 @@ fn parse_ctrl_z_stops_parsing() {
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[1].kind {
-        StmtKind::DataEnd(DataEndMarker::CtrlZ, offset) => {
+        StmtKind::DataEnd(Keyword::__END__, offset) => {
             assert_eq!(&src.as_bytes()[*offset as usize..], b"ignored code\n");
         }
-        other => panic!("expected DataEnd(CtrlZ), got {other:?}"),
+        other => panic!("expected DataEnd(__END__), got {other:?}"),
     }
 }
 

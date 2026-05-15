@@ -13,7 +13,7 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_xid::UnicodeXID;
 
 use crate::error::ParseError;
-use crate::keyword;
+use crate::keyword::{self, Keyword};
 use crate::pragma::Features;
 use crate::source::{LexerLine, LexerSource};
 use crate::span::Span;
@@ -128,6 +128,9 @@ pub(crate) struct Lexer {
     case_mod_lcfirst: bool,
     /// `\u` pending — titlecase the very next character only.
     case_mod_ucfirst: bool,
+    /// Set by `autoquoted_eof` when `__DATA__` or `__END__` triggers logical end-of-source.  When true,
+    /// `lex_normal_token` returns `Eof` immediately.
+    logical_eof: bool,
 }
 
 impl Lexer {
@@ -146,6 +149,7 @@ impl Lexer {
             case_mod_stack: Vec::new(),
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
+            logical_eof: false,
         }
     }
 
@@ -166,6 +170,7 @@ impl Lexer {
             case_mod_stack: Vec::new(),
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
+            logical_eof: false,
         }
     }
 
@@ -940,6 +945,11 @@ impl Lexer {
 
     /// Lex a token in normal (code) mode.
     fn lex_normal_token(&mut self) -> Result<Spanned, ParseError> {
+        if self.logical_eof {
+            let start = self.span_pos();
+            return Ok(Spanned { token: Token::Eof, span: Span::new(start, start) });
+        }
+
         self.skip_ws_and_comments()?;
 
         let start = self.span_pos();
@@ -1909,35 +1919,30 @@ impl Lexer {
     }
 
     fn lex_word(&mut self) -> Result<Token, ParseError> {
-        // Remember the column at which this word starts — needed for __END__/__DATA__ which are only special at column
-        // 0.
-        let word_start = self.line_pos();
         let name = self.scan_ident();
 
         // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or, xor, not) are always emitted as Ident(name).  The
         // parser recognizes them as operators in operator context via peek_op_info and token_to_binop.
 
-        // Special tokens
+        // Special literal keywords — resolved here because they carry lex-time data or need feature gating.
         match name.as_str() {
             "__FILE__" => {
                 let fname = self.source.filename().to_string();
                 return Ok(Token::SourceFile(fname));
             }
             "__LINE__" => {
-                // Use the line number of the line currently being scanned.  `current_line` is always Some here because
-                // we just scanned an identifier from it.
                 let line_no = self.current_line.as_ref().map(|l| l.number).unwrap_or(0) as u32;
                 return Ok(Token::SourceLine(line_no));
             }
-            "__PACKAGE__" => return Ok(Token::CurrentPackage),
-            "__SUB__" => return Ok(Token::CurrentSub),
-            "__CLASS__" => return Ok(Token::CurrentClass),
-            // __END__ / __DATA__ are only recognized at column 0 — matching Perl's behavior.  When indented or preceded
-            // by other tokens on the line, they're just barewords.
-            "__END__" | "__DATA__" if word_start == 0 => {
-                let marker = if name == "__END__" { DataEndMarker::End } else { DataEndMarker::Data };
-                return Ok(Token::DataEnd(marker));
+            "__PACKAGE__" => return Ok(Token::Keyword(Keyword::__PACKAGE__)),
+            "__SUB__" if self.features.contains(Features::CURRENT_SUB) => {
+                return Ok(Token::Keyword(Keyword::__SUB__));
             }
+            "__CLASS__" if self.features.contains(Features::CLASS) => {
+                return Ok(Token::Keyword(Keyword::__CLASS__));
+            }
+            "__DATA__" => return Ok(Token::Keyword(Keyword::__DATA__)),
+            "__END__" => return Ok(Token::Keyword(Keyword::__END__)),
             _ => {}
         }
 
@@ -2016,6 +2021,22 @@ impl Lexer {
     pub fn skip_ws_and_peek_byte(&mut self) -> Option<u8> {
         let _ = self.skip_ws_and_comments_no_pod();
         self.peek_byte(false)
+    }
+
+    /// Check whether `__DATA__` or `__END__` should be autoquoted (fat comma `=>` follows) or triggers logical EOF.
+    /// Called by the parser after receiving the keyword token.
+    ///
+    /// Returns `true` if `=>` follows (autoquoting applies, keyword becomes `StringLit`, lexer state unchanged).
+    /// Returns `false` if logical EOF was triggered (rest of current line discarded, subsequent lex calls return EOF).
+    pub fn autoquoted_eof(&mut self) -> bool {
+        let _ = self.skip_ws_and_comments_no_pod();
+        if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
+            return true; // don't consume, don't trigger EOF
+        }
+        // Discard the rest of the current line and set logical EOF.
+        self.current_line = None;
+        self.logical_eof = true;
+        false
     }
 
     // ── Strings ───────────────────────────────────────────────

@@ -5,12 +5,11 @@
 
 use crate::ast::*;
 use crate::error::ParseError;
-use crate::keyword;
+use crate::keyword::{self, Keyword};
 use crate::lexer::Lexer;
 use crate::pragma::{Features, Pragmas, resolve_feature_name};
 use crate::span::Span;
 use crate::symbol::{ProtoSlot, SubPrototype, SymbolTable};
-use crate::token::Keyword;
 use crate::token::*;
 
 #[cfg(test)]
@@ -309,29 +308,41 @@ impl Parser {
             return Ok(Statement { kind: StmtKind::Empty, span: start, terminated: true });
         }
 
-        // __END__ / __DATA__ / ^D / ^Z — stop parsing immediately
-        if let Token::DataEnd(marker) = self.peek_token() {
-            let marker = *marker;
+        // __END__ / __DATA__ / ^D / ^Z — stop parsing immediately.
+        // __END__/__DATA__ are keywords; ^D/^Z are Token::DataEnd.
+        if let Token::Keyword(kw) = self.peek_token()
+            && keyword::is_data_eof_keyword(*kw)
+        {
+            let kw = *kw;
+            let kw_span = self.peek_span();
             self.next_token()?;
-            // Compute the byte offset where trailing data begins.
-            let data_offset = match marker {
-                // ^D / ^Z: data starts immediately after the control char.
-                DataEndMarker::CtrlD | DataEndMarker::CtrlZ => self.lexer.current_pos() as u32,
-                // __END__ / __DATA__: data starts after the current line.
-                DataEndMarker::End | DataEndMarker::Data => {
-                    // Skip rest of current line.  Data starts on the next line.
-                    let remaining_len = self.lexer.remaining().len();
-                    let mut offset = self.lexer.current_pos() + remaining_len;
-                    // Account for the line terminator (\n) which is not in remaining().
-                    if self.lexer.line_is_terminated() {
-                        offset += 1;
-                    }
-                    offset as u32
-                }
-            };
-            // Skip all remaining source — everything after is not code.
+
+            // Compute the data offset BEFORE calling autoquoted_eof (which may discard the current line).  The trailing
+            // data starts on the next line — skip past remaining bytes on the current line plus its terminator.
+            let remaining_len = self.lexer.remaining().len();
+            let mut data_offset = self.lexer.current_pos() + remaining_len;
+            if self.lexer.line_is_terminated() {
+                data_offset += 1;
+            }
+
+            // Check for fat-comma autoquoting: `__END__ => val`.
+            if self.lexer.autoquoted_eof() {
+                // Autoquoted — treat as expression statement.
+                let name: &str = kw.into();
+                let expr = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
+                let full = self.with_descent(|this| this.parse_expr_continuation(expr, PREC_LOW))?;
+                let terminated = self.eat(&Token::Semi)?;
+                return Ok(Statement { kind: StmtKind::Expr(full), span: start.merge(self.peek_span()), terminated });
+            }
+            // Logical EOF triggered by autoquoted_eof.
+            return Ok(Statement { kind: StmtKind::DataEnd(kw, data_offset as u32), span: start.merge(kw_span), terminated: false });
+        }
+        if let Token::DataEnd(_marker) = self.peek_token() {
+            self.next_token()?;
+            // ^D / ^Z: data starts immediately after the control char.
+            let data_offset = self.lexer.current_pos() as u32;
             self.lexer.skip_to_end();
-            return Ok(Statement { kind: StmtKind::DataEnd(marker, data_offset), span: start.merge(self.peek_span()), terminated: false });
+            return Ok(Statement { kind: StmtKind::DataEnd(Keyword::__END__, data_offset), span: start.merge(self.peek_span()), terminated: false });
         }
 
         let (kind, terminated) = match self.peek_token().clone() {
@@ -622,7 +633,7 @@ impl Parser {
         let name = match self.next_token()?.token {
             Token::Ident(name) => name,
             // Keywords are valid sub names: `sub send { }`, `sub print { }`.
-            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+            Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
         };
         self.parse_sub_decl_with_name(name, start)
@@ -849,7 +860,7 @@ impl Parser {
             // Attribute names can be identifiers or keywords (e.g. :method, :lvalue)
             let name = match self.peek_token().clone() {
                 Token::Ident(s) => Some(s),
-                Token::Keyword(kw) => Some((<&str>::from(kw)).to_string()),
+                Token::Keyword(kw) => Some(<&str>::from(kw).to_string()),
                 _ => None,
             };
             if let Some(name) = name {
@@ -1115,7 +1126,7 @@ impl Parser {
         let name = match self.next_token()?.token {
             Token::Ident(n) => n,
             // Keywords are valid package names: `package send;`
-            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+            Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected package name, got {other:?}"), start)),
         };
 
@@ -1176,7 +1187,7 @@ impl Parser {
             }
             Token::StrLit(n) => n,
             // Keywords can be module names: `use if`, `use open`, etc.
-            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+            Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected module name or version, got {other:?}"), start)),
         };
 
@@ -1310,7 +1321,7 @@ impl Parser {
             },
             // Keywords are valid format names: `format send = ...`.
             Token::Keyword(_) => match self.next_token()?.token {
-                Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+                Token::Keyword(kw) => <&str>::from(kw).to_string(),
                 _ => unreachable!(),
             },
             _ => "STDOUT".to_string(),
@@ -1473,7 +1484,7 @@ impl Parser {
         let name = match self.next_token()?.token {
             Token::Ident(n) => n,
             // Keywords are valid method names: `method send { }`.
-            Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+            Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
         };
 
@@ -1689,6 +1700,15 @@ impl Parser {
             && matches!(self.peek_token(), Token::FatComma)
         {
             let name: &str = (*kw).into();
+            return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
+        }
+        // SourceFile/SourceLine tokens also participate in fat-comma autoquoting.
+        if matches!(&spanned.token, Token::SourceFile(_) | Token::SourceLine(_)) && matches!(self.peek_token(), Token::FatComma) {
+            let name = match &spanned.token {
+                Token::SourceFile(_) => "__FILE__",
+                Token::SourceLine(_) => "__LINE__",
+                _ => unreachable!(),
+            };
             return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
         }
 
@@ -1924,25 +1944,17 @@ impl Parser {
 
             Token::Ident(name) => self.parse_ident_term(name, span),
 
-            // Compile-time constants.  SourceFile/SourceLine carry their values in the token itself (captured at lex
-            // time); CurrentPackage is a marker filled with the parser's current package; CurrentSub is a marker that
-            // evaluates at runtime.
+            // Compile-time special literals.  SourceFile/SourceLine carry lex-time values; __PACKAGE__ is resolved from
+            // the parser's state.  __SUB__ and __CLASS__ are feature-gated — the lexer only emits them as keywords when
+            // the feature is active (otherwise they become Ident, falling through to the arm above).
             Token::SourceFile(path) => Ok(Expr { kind: ExprKind::SourceFile(path), span }),
             Token::SourceLine(n) => Ok(Expr { kind: ExprKind::SourceLine(n), span }),
-            Token::CurrentPackage => {
+            Token::Keyword(Keyword::__PACKAGE__) => {
                 let pkg = self.current_package.to_string();
                 Ok(Expr { kind: ExprKind::CurrentPackage(pkg), span })
             }
-            Token::CurrentSub => {
-                // Gated on the `current_sub` feature.  Without it, `__SUB__` falls back to a bareword — matching Perl's
-                // behavior where unknown-at-compile-time barewords become string literals.
-                if self.pragmas.features.contains(Features::CURRENT_SUB) {
-                    Ok(Expr { kind: ExprKind::CurrentSub, span })
-                } else {
-                    Ok(Expr { kind: ExprKind::Bareword("__SUB__".to_string()), span })
-                }
-            }
-            Token::CurrentClass => Ok(Expr { kind: ExprKind::CurrentClass, span }),
+            Token::Keyword(Keyword::__SUB__) => Ok(Expr { kind: ExprKind::CurrentSub, span }),
+            Token::Keyword(Keyword::__CLASS__) => Ok(Expr { kind: ExprKind::CurrentClass, span }),
 
             Token::Keyword(Keyword::Undef) => Ok(Expr { kind: ExprKind::Undef, span }),
             Token::Keyword(Keyword::Wantarray) => Ok(Expr { kind: ExprKind::Wantarray, span }),
@@ -2607,8 +2619,8 @@ impl Parser {
 
     /// Convert a keyword to its `CORE::name` form for the AST.  Keyword-dispatched function calls use this so the
     /// compiler can distinguish builtins (`CORE::abs`) from user subs (`abs`).
-    fn core_name(kw: Keyword) -> String {
-        format!("CORE::{}", <&str>::from(kw))
+    fn core_name(kw: &Keyword) -> String {
+        format!("CORE::{}", <&str>::from(*kw))
     }
 
     /// Package-qualify a bare sub name for the AST.  `foo` in package `Bar` → `Bar::foo`.  Already-qualified names like
@@ -2620,7 +2632,7 @@ impl Parser {
     /// Parse a nullary builtin.  These never consume arguments, so `time+86_400` is always `time() + 86_400`.  Explicit
     /// empty parens (`time()`) are accepted.
     fn parse_nullary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = Self::core_name(kw);
+        let name = Self::core_name(&kw);
 
         // Accept optional empty parens: `time()`
         if self.at(&Token::LeftParen)? {
@@ -2635,7 +2647,7 @@ impl Parser {
     }
 
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = Self::core_name(kw);
+        let name = Self::core_name(&kw);
 
         // Named unary with optional arg — check for tokens that indicate "no argument follows."
         if self.at(&Token::Semi)?
@@ -2762,7 +2774,7 @@ impl Parser {
     }
 
     fn parse_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = Self::core_name(kw);
+        let name = Self::core_name(&kw);
 
         // Check for parens
         if self.at(&Token::LeftParen)? {
@@ -2807,7 +2819,7 @@ impl Parser {
     /// Parse sort/map/grep with optional block as first argument.  `sort { $a <=> $b } @list`, `map { ... } @list`,
     /// `grep { ... } @list`
     fn parse_block_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = Self::core_name(kw);
+        let name = Self::core_name(&kw);
 
         // Check for parens: sort(...), map(...), grep(...)
         if self.at(&Token::LeftParen)? {
@@ -2874,7 +2886,7 @@ impl Parser {
     /// Parse print/say with optional filehandle as first argument.  `print STDERR "error"`, `print "hello"`, `say $fh
     /// "data"`
     fn parse_print_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let name = Self::core_name(kw);
+        let name = Self::core_name(&kw);
 
         // Handle optional parens — print(...) form
         let in_parens = self.eat(&Token::LeftParen)?;
@@ -3071,6 +3083,21 @@ impl Parser {
                 }
                 // Not autoquoting — push keyword back, fall through to parse_expr.
                 self.current = Some(Spanned { token: Token::Keyword(kw), span });
+            }
+
+            // SourceFile/SourceLine carry values but still participate in hash-subscript autoquoting.
+            Token::SourceFile(_) | Token::SourceLine(_) => {
+                let name = match &tok {
+                    Token::SourceFile(_) => "__FILE__",
+                    Token::SourceLine(_) => "__LINE__",
+                    _ => unreachable!(),
+                };
+                self.next_token()?;
+                if matches!(self.peek_token(), Token::RightBrace | Token::FatComma) {
+                    return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
+                }
+                // Not autoquoting — push original token back.
+                self.current = Some(Spanned { token: tok, span });
             }
 
             Token::Minus => {
@@ -3665,7 +3692,7 @@ impl Parser {
                     // Lexical method: ->&name or ->&name(args)
                     let method_name = match self.peek_token().clone() {
                         Token::Ident(name) => name,
-                        Token::Keyword(kw) => (<&str>::from(kw)).to_string(),
+                        Token::Keyword(kw) => <&str>::from(kw).to_string(),
                         other => return Err(ParseError::new(format!("expected * or method name after ->&, got {other:?}"), self.peek_span())),
                     };
                     self.next_token()?;

@@ -1,6 +1,276 @@
 //! Keyword table — maps identifier strings to `Keyword` variants.
 
-use crate::token::Keyword;
+/// Perl keyword.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Keyword {
+    __FILE__,
+    __LINE__,
+    __PACKAGE__,
+    __CLASS__,
+    __DATA__,
+    __END__,
+    __SUB__,
+    ADJUST,
+    AUTOLOAD,
+    BEGIN,
+    UNITCHECK,
+    DESTROY,
+    END,
+    INIT,
+    CHECK,
+    Abs,
+    Accept,
+    Alarm,
+    All,
+    And,
+    Any,
+    Atan2,
+    Bind,
+    Binmode,
+    Bless,
+    Break,
+    Caller,
+    Catch,
+    Chdir,
+    Chmod,
+    Chomp,
+    Chop,
+    Chown,
+    Chr,
+    Chroot,
+    Class,
+    Close,
+    Closedir,
+    Cmp,
+    Connect,
+    Continue,
+    Cos,
+    Crypt,
+    Dbmclose,
+    Dbmopen,
+    Default,
+    Defer,
+    Defined,
+    Delete,
+    Die,
+    Do,
+    Dump,
+    Each,
+    Else,
+    Elsif,
+    Elseif, // parsed only to emit "elseif should be elsif" diagnostic
+    Endgrent,
+    Endhostent,
+    Endnetent,
+    Endprotoent,
+    Endpwent,
+    Endservent,
+    Eof,
+    Eq,
+    Eval,
+    Evalbytes,
+    Exec,
+    Exists,
+    Exit,
+    Exp,
+    Fc,
+    Fcntl,
+    Field,
+    Fileno,
+    Finally,
+    Flock,
+    For,
+    Foreach,
+    Fork,
+    Format,
+    Formline,
+    Ge,
+    Getc,
+    Getgrent,
+    Getgrgid,
+    Getgrnam,
+    Gethostbyaddr,
+    Gethostbyname,
+    Gethostent,
+    Getlogin,
+    Getnetbyaddr,
+    Getnetbyname,
+    Getnetent,
+    Getpeername,
+    Getpgrp,
+    Getppid,
+    Getpriority,
+    Getprotobyname,
+    Getprotobynumber,
+    Getprotoent,
+    Getpwent,
+    Getpwnam,
+    Getpwuid,
+    Getservbyname,
+    Getservbyport,
+    Getservent,
+    Getsockname,
+    Getsockopt,
+    Given,
+    Glob,
+    Gmtime,
+    Goto,
+    Grep,
+    Gt,
+    Hex,
+    If,
+    Index,
+    Int,
+    Ioctl,
+    Isa,
+    Join,
+    Keys,
+    Kill,
+    Last,
+    Lc,
+    Lcfirst,
+    Le,
+    Length,
+    Link,
+    Listen,
+    Local,
+    Localtime,
+    Lock,
+    Log,
+    Lstat,
+    Lt,
+    M,
+    Map,
+    Method,
+    Mkdir,
+    Msgctl,
+    Msgget,
+    Msgrcv,
+    Msgsnd,
+    My,
+    Ne,
+    Next,
+    No,
+    Not,
+    Oct,
+    Open,
+    Opendir,
+    Or,
+    Ord,
+    Our,
+    Pack,
+    Package,
+    Pipe,
+    Pop,
+    Pos,
+    Print,
+    Printf,
+    Prototype,
+    Push,
+    Q,
+    Qq,
+    Qr,
+    Quotemeta,
+    Qw,
+    Qx,
+    Rand,
+    Read,
+    Readdir,
+    Readline,
+    Readlink,
+    Readpipe,
+    Recv,
+    Redo,
+    Ref,
+    Rename,
+    Require,
+    Reset,
+    Return,
+    Reverse,
+    Rewinddir,
+    Rindex,
+    Rmdir,
+    S,
+    Say,
+    Scalar,
+    Seek,
+    Seekdir,
+    Select,
+    Semctl,
+    Semget,
+    Semop,
+    Send,
+    Setgrent,
+    Sethostent,
+    Setnetent,
+    Setpgrp,
+    Setpriority,
+    Setprotoent,
+    Setpwent,
+    Setservent,
+    Setsockopt,
+    Shift,
+    Shmctl,
+    Shmget,
+    Shmread,
+    Shmwrite,
+    Shutdown,
+    Sin,
+    Sleep,
+    Socket,
+    Socketpair,
+    Sort,
+    Splice,
+    Split,
+    Sprintf,
+    Sqrt,
+    Srand,
+    Stat,
+    State,
+    Study,
+    Sub,
+    Substr,
+    Symlink,
+    Syscall,
+    Sysopen,
+    Sysread,
+    Sysseek,
+    System,
+    Syswrite,
+    Tell,
+    Telldir,
+    Tie,
+    Tied,
+    Time,
+    Times,
+    Tr,
+    Try,
+    Truncate,
+    Uc,
+    Ucfirst,
+    Umask,
+    Undef,
+    Unless,
+    Unlink,
+    Unpack,
+    Unshift,
+    Untie,
+    Until,
+    Use,
+    Utime,
+    Values,
+    Vec,
+    Wait,
+    Waitpid,
+    Wantarray,
+    Warn,
+    When,
+    While,
+    Write,
+    X,
+    Xor,
+    Y,
+}
 
 /// Look up a keyword by name.  Returns `None` if not a keyword.
 pub fn lookup_keyword(name: &str) -> Option<Keyword> {
@@ -282,14 +552,6 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "le" => Some(Keyword::Le),
         "ge" => Some(Keyword::Ge),
         "cmp" => Some(Keyword::Cmp),
-        // Typed layer (our extensions)
-        "let" => Some(Keyword::Let),
-        "fn" => Some(Keyword::Fn),
-        "struct" => Some(Keyword::Struct),
-        "enum" => Some(Keyword::Enum),
-        "impl" => Some(Keyword::Impl),
-        "trait" => Some(Keyword::Trait),
-        "match" => Some(Keyword::Match),
         _ => None,
     }
 }
@@ -298,275 +560,273 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
 impl From<Keyword> for &'static str {
     fn from(kw: Keyword) -> &'static str {
         match kw {
-            Keyword::My => "my",
-            Keyword::Sub => "sub",
-            Keyword::If => "if",
-            Keyword::Else => "else",
-            Keyword::Elsif => "elsif",
-            Keyword::Elseif => "elseif",
-            Keyword::Unless => "unless",
-            Keyword::While => "while",
-            Keyword::Until => "until",
-            Keyword::For => "for",
-            Keyword::Foreach => "foreach",
-            Keyword::Return => "return",
-            Keyword::Use => "use",
-            Keyword::No => "no",
-            Keyword::Our => "our",
-            Keyword::Local => "local",
-            Keyword::State => "state",
-            Keyword::Do => "do",
-            Keyword::Require => "require",
-            Keyword::Package => "package",
-            Keyword::Class => "class",
-            Keyword::Field => "field",
-            Keyword::Method => "method",
-            Keyword::And => "and",
-            Keyword::Or => "or",
-            Keyword::Not => "not",
-            Keyword::Undef => "undef",
-            Keyword::Die => "die",
-            Keyword::Warn => "warn",
-            Keyword::Eval => "eval",
-            Keyword::Print => "print",
-            Keyword::Say => "say",
-            Keyword::Last => "last",
-            Keyword::Next => "next",
-            Keyword::Redo => "redo",
-            Keyword::Goto => "goto",
-            Keyword::Dump => "dump",
-            Keyword::Defined => "defined",
-            Keyword::Ref => "ref",
-            Keyword::Exists => "exists",
-            Keyword::Delete => "delete",
-            Keyword::Push => "push",
-            Keyword::Pop => "pop",
-            Keyword::Shift => "shift",
-            Keyword::Unshift => "unshift",
-            Keyword::Splice => "splice",
-            Keyword::Keys => "keys",
-            Keyword::Values => "values",
-            Keyword::Each => "each",
-            Keyword::Reverse => "reverse",
-            Keyword::Sort => "sort",
-            Keyword::Map => "map",
-            Keyword::Grep => "grep",
-            Keyword::Any => "any",
-            Keyword::All => "all",
-            Keyword::Join => "join",
-            Keyword::Split => "split",
-            Keyword::Sprintf => "sprintf",
-            Keyword::Printf => "printf",
-            Keyword::Chomp => "chomp",
-            Keyword::Chop => "chop",
-            Keyword::Chr => "chr",
-            Keyword::Ord => "ord",
-            Keyword::Hex => "hex",
-            Keyword::Oct => "oct",
-            Keyword::Lc => "lc",
-            Keyword::Uc => "uc",
-            Keyword::Lcfirst => "lcfirst",
-            Keyword::Ucfirst => "ucfirst",
-            Keyword::Length => "length",
-            Keyword::Substr => "substr",
-            Keyword::Index => "index",
-            Keyword::Rindex => "rindex",
-            Keyword::Abs => "abs",
-            Keyword::Int => "int",
-            Keyword::Sqrt => "sqrt",
-            Keyword::Rand => "rand",
-            Keyword::Srand => "srand",
-            Keyword::Wantarray => "wantarray",
-            Keyword::Scalar => "scalar",
-            Keyword::Caller => "caller",
-            Keyword::Exit => "exit",
-            Keyword::Chdir => "chdir",
-            Keyword::Mkdir => "mkdir",
-            Keyword::Rmdir => "rmdir",
-            Keyword::Unlink => "unlink",
-            Keyword::Rename => "rename",
-            Keyword::Open => "open",
-            Keyword::Close => "close",
-            Keyword::Read => "read",
-            Keyword::Write => "write",
-            Keyword::Seek => "seek",
-            Keyword::Select => "select",
-            Keyword::Tell => "tell",
-            Keyword::Eof => "eof",
-            Keyword::Getc => "getc",
-            Keyword::Readline => "readline",
-            Keyword::Readlink => "readlink",
-            Keyword::Binmode => "binmode",
-            Keyword::Stat => "stat",
-            Keyword::Lstat => "lstat",
-            Keyword::Chmod => "chmod",
-            Keyword::Chown => "chown",
-            Keyword::Umask => "umask",
-            Keyword::Glob => "glob",
-            Keyword::Opendir => "opendir",
-            Keyword::Readdir => "readdir",
-            Keyword::Closedir => "closedir",
-            Keyword::Pos => "pos",
-            Keyword::System => "system",
-            Keyword::Exec => "exec",
-            Keyword::Sleep => "sleep",
-            Keyword::Alarm => "alarm",
-            Keyword::Localtime => "localtime",
-            Keyword::Gmtime => "gmtime",
-            Keyword::Sin => "sin",
-            Keyword::Cos => "cos",
-            Keyword::Exp => "exp",
-            Keyword::Log => "log",
-            Keyword::Quotemeta => "quotemeta",
-            Keyword::Prototype => "prototype",
-            Keyword::Readpipe => "readpipe",
-            Keyword::Chroot => "chroot",
-            Keyword::Reset => "reset",
-            Keyword::Fileno => "fileno",
-            Keyword::Getpeername => "getpeername",
-            Keyword::Getpgrp => "getpgrp",
-            Keyword::Getsockname => "getsockname",
-            Keyword::Rewinddir => "rewinddir",
-            Keyword::Sethostent => "sethostent",
-            Keyword::Setnetent => "setnetent",
-            Keyword::Setprotoent => "setprotoent",
-            Keyword::Setservent => "setservent",
-            Keyword::Study => "study",
-            Keyword::Telldir => "telldir",
-            Keyword::Dbmclose => "dbmclose",
-            Keyword::Lock => "lock",
-            Keyword::Evalbytes => "evalbytes",
-            Keyword::Fc => "fc",
-            Keyword::Getpwnam => "getpwnam",
-            Keyword::Getgrnam => "getgrnam",
-            Keyword::Gethostbyname => "gethostbyname",
-            Keyword::Getnetbyname => "getnetbyname",
-            Keyword::Getprotobyname => "getprotobyname",
-            Keyword::Getpwuid => "getpwuid",
-            Keyword::Getgrgid => "getgrgid",
-            Keyword::Getprotobynumber => "getprotobynumber",
-            Keyword::Waitpid => "waitpid",
-            Keyword::Kill => "kill",
-            Keyword::Pipe => "pipe",
-            Keyword::Setpgrp => "setpgrp",
-            Keyword::Setpriority => "setpriority",
-            Keyword::Getpriority => "getpriority",
-            Keyword::Syscall => "syscall",
-            Keyword::Socket => "socket",
-            Keyword::Socketpair => "socketpair",
-            Keyword::Bind => "bind",
-            Keyword::Connect => "connect",
-            Keyword::Listen => "listen",
-            Keyword::Accept => "accept",
-            Keyword::Shutdown => "shutdown",
-            Keyword::Send => "send",
-            Keyword::Recv => "recv",
-            Keyword::Setsockopt => "setsockopt",
-            Keyword::Getsockopt => "getsockopt",
-            Keyword::Shmget => "shmget",
-            Keyword::Shmctl => "shmctl",
-            Keyword::Shmread => "shmread",
-            Keyword::Shmwrite => "shmwrite",
-            Keyword::Semget => "semget",
-            Keyword::Semctl => "semctl",
-            Keyword::Semop => "semop",
-            Keyword::Msgget => "msgget",
-            Keyword::Msgctl => "msgctl",
-            Keyword::Msgsnd => "msgsnd",
-            Keyword::Msgrcv => "msgrcv",
-            Keyword::Getservbyname => "getservbyname",
-            Keyword::Gethostbyaddr => "gethostbyaddr",
-            Keyword::Getnetbyaddr => "getnetbyaddr",
-            Keyword::Getservbyport => "getservbyport",
-            Keyword::Sysopen => "sysopen",
-            Keyword::Sysread => "sysread",
-            Keyword::Syswrite => "syswrite",
-            Keyword::Sysseek => "sysseek",
-            Keyword::Truncate => "truncate",
-            Keyword::Fcntl => "fcntl",
-            Keyword::Ioctl => "ioctl",
-            Keyword::Flock => "flock",
-            Keyword::Seekdir => "seekdir",
-            Keyword::Link => "link",
-            Keyword::Symlink => "symlink",
-            Keyword::Utime => "utime",
-            Keyword::Pack => "pack",
-            Keyword::Unpack => "unpack",
-            Keyword::Vec => "vec",
-            Keyword::Formline => "formline",
-            Keyword::Atan2 => "atan2",
-            Keyword::Crypt => "crypt",
-            Keyword::Dbmopen => "dbmopen",
+            Keyword::__FILE__ => "__FILE__",
+            Keyword::__LINE__ => "__LINE__",
+            Keyword::__PACKAGE__ => "__PACKAGE__",
+            Keyword::__CLASS__ => "__CLASS__",
+            Keyword::__DATA__ => "__DATA__",
+            Keyword::__END__ => "__END__",
+            Keyword::__SUB__ => "__SUB__",
+            Keyword::ADJUST => "ADJUST",
             Keyword::AUTOLOAD => "AUTOLOAD",
-            Keyword::DESTROY => "DESTROY",
-            Keyword::X => "x",
-            Keyword::Xor => "xor",
-            Keyword::Isa => "isa",
-            Keyword::Break => "break",
-            Keyword::Qw => "qw",
-            Keyword::Q => "q",
-            Keyword::Qq => "qq",
-            Keyword::Qr => "qr",
-            Keyword::Qx => "qx",
-            Keyword::M => "m",
-            Keyword::S => "s",
-            Keyword::Tr => "tr",
-            Keyword::Y => "y",
-            Keyword::Format => "format",
             Keyword::BEGIN => "BEGIN",
+            Keyword::UNITCHECK => "UNITCHECK",
+            Keyword::DESTROY => "DESTROY",
             Keyword::END => "END",
             Keyword::INIT => "INIT",
             Keyword::CHECK => "CHECK",
-            Keyword::UNITCHECK => "UNITCHECK",
-            Keyword::ADJUST => "ADJUST",
-            Keyword::Given => "given",
-            Keyword::When => "when",
-            Keyword::Default => "default",
-            Keyword::Try => "try",
-            Keyword::Catch => "catch",
-            Keyword::Finally => "finally",
-            Keyword::Defer => "defer",
-            Keyword::Continue => "continue",
-            Keyword::Tie => "tie",
-            Keyword::Untie => "untie",
-            Keyword::Tied => "tied",
+            Keyword::Abs => "abs",
+            Keyword::Accept => "accept",
+            Keyword::Alarm => "alarm",
+            Keyword::All => "all",
+            Keyword::And => "and",
+            Keyword::Any => "any",
+            Keyword::Atan2 => "atan2",
+            Keyword::Bind => "bind",
+            Keyword::Binmode => "binmode",
             Keyword::Bless => "bless",
-            Keyword::Blessed => "blessed",
-            Keyword::Time => "time",
-            Keyword::Times => "times",
-            Keyword::Fork => "fork",
-            Keyword::Wait => "wait",
-            Keyword::Getppid => "getppid",
-            Keyword::Getlogin => "getlogin",
-            Keyword::Setpwent => "setpwent",
-            Keyword::Setgrent => "setgrent",
-            Keyword::Endpwent => "endpwent",
+            Keyword::Break => "break",
+            Keyword::Caller => "caller",
+            Keyword::Catch => "catch",
+            Keyword::Chdir => "chdir",
+            Keyword::Chmod => "chmod",
+            Keyword::Chomp => "chomp",
+            Keyword::Chop => "chop",
+            Keyword::Chown => "chown",
+            Keyword::Chr => "chr",
+            Keyword::Chroot => "chroot",
+            Keyword::Class => "class",
+            Keyword::Close => "close",
+            Keyword::Closedir => "closedir",
+            Keyword::Cmp => "cmp",
+            Keyword::Connect => "connect",
+            Keyword::Continue => "continue",
+            Keyword::Cos => "cos",
+            Keyword::Crypt => "crypt",
+            Keyword::Dbmclose => "dbmclose",
+            Keyword::Dbmopen => "dbmopen",
+            Keyword::Default => "default",
+            Keyword::Defer => "defer",
+            Keyword::Defined => "defined",
+            Keyword::Delete => "delete",
+            Keyword::Die => "die",
+            Keyword::Do => "do",
+            Keyword::Dump => "dump",
+            Keyword::Each => "each",
+            Keyword::Else => "else",
+            Keyword::Elsif => "elsif",
+            Keyword::Elseif => "elseif",
             Keyword::Endgrent => "endgrent",
             Keyword::Endhostent => "endhostent",
             Keyword::Endnetent => "endnetent",
             Keyword::Endprotoent => "endprotoent",
+            Keyword::Endpwent => "endpwent",
             Keyword::Endservent => "endservent",
-            Keyword::Getpwent => "getpwent",
-            Keyword::Getgrent => "getgrent",
-            Keyword::Gethostent => "gethostent",
-            Keyword::Getnetent => "getnetent",
-            Keyword::Getprotoent => "getprotoent",
-            Keyword::Getservent => "getservent",
-            Keyword::Die_ => "die",
+            Keyword::Eof => "eof",
             Keyword::Eq => "eq",
-            Keyword::Ne => "ne",
-            Keyword::Lt => "lt",
-            Keyword::Gt => "gt",
-            Keyword::Le => "le",
+            Keyword::Eval => "eval",
+            Keyword::Evalbytes => "evalbytes",
+            Keyword::Exec => "exec",
+            Keyword::Exists => "exists",
+            Keyword::Exit => "exit",
+            Keyword::Exp => "exp",
+            Keyword::Fc => "fc",
+            Keyword::Fcntl => "fcntl",
+            Keyword::Field => "field",
+            Keyword::Fileno => "fileno",
+            Keyword::Finally => "finally",
+            Keyword::Flock => "flock",
+            Keyword::For => "for",
+            Keyword::Foreach => "foreach",
+            Keyword::Fork => "fork",
+            Keyword::Format => "format",
+            Keyword::Formline => "formline",
             Keyword::Ge => "ge",
-            Keyword::Cmp => "cmp",
-            Keyword::Let => "let",
-            Keyword::Fn => "fn",
-            Keyword::Struct => "struct",
-            Keyword::Enum => "enum",
-            Keyword::Impl => "impl",
-            Keyword::Trait => "trait",
-            Keyword::Match => "match",
+            Keyword::Getc => "getc",
+            Keyword::Getgrent => "getgrent",
+            Keyword::Getgrgid => "getgrgid",
+            Keyword::Getgrnam => "getgrnam",
+            Keyword::Gethostbyaddr => "gethostbyaddr",
+            Keyword::Gethostbyname => "gethostbyname",
+            Keyword::Gethostent => "gethostent",
+            Keyword::Getlogin => "getlogin",
+            Keyword::Getnetbyaddr => "getnetbyaddr",
+            Keyword::Getnetbyname => "getnetbyname",
+            Keyword::Getnetent => "getnetent",
+            Keyword::Getpeername => "getpeername",
+            Keyword::Getpgrp => "getpgrp",
+            Keyword::Getppid => "getppid",
+            Keyword::Getpriority => "getpriority",
+            Keyword::Getprotobyname => "getprotobyname",
+            Keyword::Getprotobynumber => "getprotobynumber",
+            Keyword::Getprotoent => "getprotoent",
+            Keyword::Getpwent => "getpwent",
+            Keyword::Getpwnam => "getpwnam",
+            Keyword::Getpwuid => "getpwuid",
+            Keyword::Getservbyname => "getservbyname",
+            Keyword::Getservbyport => "getservbyport",
+            Keyword::Getservent => "getservent",
+            Keyword::Getsockname => "getsockname",
+            Keyword::Getsockopt => "getsockopt",
+            Keyword::Given => "given",
+            Keyword::Glob => "glob",
+            Keyword::Gmtime => "gmtime",
+            Keyword::Goto => "goto",
+            Keyword::Grep => "grep",
+            Keyword::Gt => "gt",
+            Keyword::Hex => "hex",
+            Keyword::If => "if",
+            Keyword::Index => "index",
+            Keyword::Int => "int",
+            Keyword::Ioctl => "ioctl",
+            Keyword::Isa => "isa",
+            Keyword::Join => "join",
+            Keyword::Keys => "keys",
+            Keyword::Kill => "kill",
+            Keyword::Last => "last",
+            Keyword::Lc => "lc",
+            Keyword::Lcfirst => "lcfirst",
+            Keyword::Le => "le",
+            Keyword::Length => "length",
+            Keyword::Link => "link",
+            Keyword::Listen => "listen",
+            Keyword::Local => "local",
+            Keyword::Localtime => "localtime",
+            Keyword::Lock => "lock",
+            Keyword::Log => "log",
+            Keyword::Lstat => "lstat",
+            Keyword::Lt => "lt",
+            Keyword::M => "m",
+            Keyword::Map => "map",
+            Keyword::Method => "method",
+            Keyword::Mkdir => "mkdir",
+            Keyword::Msgctl => "msgctl",
+            Keyword::Msgget => "msgget",
+            Keyword::Msgrcv => "msgrcv",
+            Keyword::Msgsnd => "msgsnd",
+            Keyword::My => "my",
+            Keyword::Ne => "ne",
+            Keyword::Next => "next",
+            Keyword::No => "no",
+            Keyword::Not => "not",
+            Keyword::Oct => "oct",
+            Keyword::Open => "open",
+            Keyword::Opendir => "opendir",
+            Keyword::Or => "or",
+            Keyword::Ord => "ord",
+            Keyword::Our => "our",
+            Keyword::Pack => "pack",
+            Keyword::Package => "package",
+            Keyword::Pipe => "pipe",
+            Keyword::Pop => "pop",
+            Keyword::Pos => "pos",
+            Keyword::Print => "print",
+            Keyword::Printf => "printf",
+            Keyword::Prototype => "prototype",
+            Keyword::Push => "push",
+            Keyword::Q => "q",
+            Keyword::Qq => "qq",
+            Keyword::Qr => "qr",
+            Keyword::Quotemeta => "quotemeta",
+            Keyword::Qw => "qw",
+            Keyword::Qx => "qx",
+            Keyword::Rand => "rand",
+            Keyword::Read => "read",
+            Keyword::Readdir => "readdir",
+            Keyword::Readline => "readline",
+            Keyword::Readlink => "readlink",
+            Keyword::Readpipe => "readpipe",
+            Keyword::Recv => "recv",
+            Keyword::Redo => "redo",
+            Keyword::Ref => "ref",
+            Keyword::Rename => "rename",
+            Keyword::Require => "require",
+            Keyword::Reset => "reset",
+            Keyword::Return => "return",
+            Keyword::Reverse => "reverse",
+            Keyword::Rewinddir => "rewinddir",
+            Keyword::Rindex => "rindex",
+            Keyword::Rmdir => "rmdir",
+            Keyword::S => "s",
+            Keyword::Say => "say",
+            Keyword::Scalar => "scalar",
+            Keyword::Seek => "seek",
+            Keyword::Seekdir => "seekdir",
+            Keyword::Select => "select",
+            Keyword::Semctl => "semctl",
+            Keyword::Semget => "semget",
+            Keyword::Semop => "semop",
+            Keyword::Send => "send",
+            Keyword::Setgrent => "setgrent",
+            Keyword::Sethostent => "sethostent",
+            Keyword::Setnetent => "setnetent",
+            Keyword::Setpgrp => "setpgrp",
+            Keyword::Setpriority => "setpriority",
+            Keyword::Setprotoent => "setprotoent",
+            Keyword::Setpwent => "setpwent",
+            Keyword::Setservent => "setservent",
+            Keyword::Setsockopt => "setsockopt",
+            Keyword::Shift => "shift",
+            Keyword::Shmctl => "shmctl",
+            Keyword::Shmget => "shmget",
+            Keyword::Shmread => "shmread",
+            Keyword::Shmwrite => "shmwrite",
+            Keyword::Shutdown => "shutdown",
+            Keyword::Sin => "sin",
+            Keyword::Sleep => "sleep",
+            Keyword::Socket => "socket",
+            Keyword::Socketpair => "socketpair",
+            Keyword::Sort => "sort",
+            Keyword::Splice => "splice",
+            Keyword::Split => "split",
+            Keyword::Sprintf => "sprintf",
+            Keyword::Sqrt => "sqrt",
+            Keyword::Srand => "srand",
+            Keyword::Stat => "stat",
+            Keyword::State => "state",
+            Keyword::Study => "study",
+            Keyword::Sub => "sub",
+            Keyword::Substr => "substr",
+            Keyword::Symlink => "symlink",
+            Keyword::Syscall => "syscall",
+            Keyword::Sysopen => "sysopen",
+            Keyword::Sysread => "sysread",
+            Keyword::Sysseek => "sysseek",
+            Keyword::System => "system",
+            Keyword::Syswrite => "syswrite",
+            Keyword::Tell => "tell",
+            Keyword::Telldir => "telldir",
+            Keyword::Tie => "tie",
+            Keyword::Tied => "tied",
+            Keyword::Time => "time",
+            Keyword::Times => "times",
+            Keyword::Tr => "tr",
+            Keyword::Try => "try",
+            Keyword::Truncate => "truncate",
+            Keyword::Uc => "uc",
+            Keyword::Ucfirst => "ucfirst",
+            Keyword::Umask => "umask",
+            Keyword::Undef => "undef",
+            Keyword::Unless => "unless",
+            Keyword::Unlink => "unlink",
+            Keyword::Unpack => "unpack",
+            Keyword::Unshift => "unshift",
+            Keyword::Untie => "untie",
+            Keyword::Until => "until",
+            Keyword::Use => "use",
+            Keyword::Utime => "utime",
+            Keyword::Values => "values",
+            Keyword::Vec => "vec",
+            Keyword::Wait => "wait",
+            Keyword::Waitpid => "waitpid",
+            Keyword::Wantarray => "wantarray",
+            Keyword::Warn => "warn",
+            Keyword::When => "when",
+            Keyword::While => "while",
+            Keyword::Write => "write",
+            Keyword::X => "x",
+            Keyword::Xor => "xor",
+            Keyword::Y => "y",
         }
     }
 }
@@ -579,87 +839,93 @@ pub fn is_quote_keyword(kw: Keyword) -> bool {
     matches!(kw, Keyword::Q | Keyword::Qq | Keyword::Qw | Keyword::Qr | Keyword::Qx | Keyword::M | Keyword::S | Keyword::Tr | Keyword::Y)
 }
 
+/// Is this keyword a data-EOF trigger (`__DATA__`, `__END__`)?  These require special handling in the parser: if not
+/// autoquoted (fat comma, hash subscript), they trigger a logical end-of-source via a lexer callback.
+pub fn is_data_eof_keyword(kw: Keyword) -> bool {
+    matches!(kw, Keyword::__DATA__ | Keyword::__END__)
+}
+
 /// Is this keyword a named unary operator?  After a named unary, the next thing is a term (so `/` is regex).
 pub fn is_named_unary(kw: Keyword) -> bool {
     matches!(
         kw,
-        Keyword::Defined
-            | Keyword::Ref
-            | Keyword::Exists
-            | Keyword::Delete
+        Keyword::Abs
+            | Keyword::Alarm
+            | Keyword::Caller
+            | Keyword::Chdir
             | Keyword::Chomp
             | Keyword::Chop
             | Keyword::Chr
-            | Keyword::Ord
-            | Keyword::Hex
-            | Keyword::Oct
-            | Keyword::Lc
-            | Keyword::Uc
-            | Keyword::Lcfirst
-            | Keyword::Ucfirst
-            | Keyword::Length
-            | Keyword::Abs
-            | Keyword::Int
-            | Keyword::Sqrt
-            | Keyword::Rand
-            | Keyword::Srand
-            | Keyword::Caller
-            | Keyword::Eof
-            | Keyword::Getc
-            | Keyword::Readline
-            | Keyword::Readlink
-            | Keyword::Rmdir
-            | Keyword::Chdir
+            | Keyword::Chroot
             | Keyword::Close
             | Keyword::Closedir
-            | Keyword::Readdir
-            | Keyword::Pop
-            | Keyword::Shift
-            | Keyword::Pos
-            | Keyword::Umask
-            | Keyword::Exit
-            | Keyword::Tied
-            | Keyword::Die
-            | Keyword::Warn
-            | Keyword::Undef
-            | Keyword::Scalar
-            | Keyword::Require
-            | Keyword::Sleep
-            | Keyword::Alarm
-            | Keyword::Localtime
-            | Keyword::Gmtime
-            | Keyword::Sin
             | Keyword::Cos
+            | Keyword::Dbmclose
+            | Keyword::Defined
+            | Keyword::Delete
+            | Keyword::Die
+            | Keyword::Eof
+            | Keyword::Evalbytes
+            | Keyword::Exists
+            | Keyword::Exit
             | Keyword::Exp
-            | Keyword::Log
-            | Keyword::Quotemeta
-            | Keyword::Prototype
-            | Keyword::Readpipe
-            | Keyword::Chroot
-            | Keyword::Reset
-            | Keyword::Getpwnam
+            | Keyword::Fc
+            | Keyword::Fileno
+            | Keyword::Getc
+            | Keyword::Getgrgid
             | Keyword::Getgrnam
             | Keyword::Gethostbyname
             | Keyword::Getnetbyname
-            | Keyword::Getprotobyname
-            | Keyword::Getpwuid
-            | Keyword::Getgrgid
-            | Keyword::Getprotobynumber
-            | Keyword::Fileno
             | Keyword::Getpeername
             | Keyword::Getpgrp
+            | Keyword::Getprotobyname
+            | Keyword::Getprotobynumber
+            | Keyword::Getpwnam
+            | Keyword::Getpwuid
             | Keyword::Getsockname
+            | Keyword::Gmtime
+            | Keyword::Hex
+            | Keyword::Int
+            | Keyword::Lc
+            | Keyword::Lcfirst
+            | Keyword::Length
+            | Keyword::Localtime
+            | Keyword::Lock
+            | Keyword::Log
+            | Keyword::Oct
+            | Keyword::Ord
+            | Keyword::Pop
+            | Keyword::Pos
+            | Keyword::Prototype
+            | Keyword::Quotemeta
+            | Keyword::Rand
+            | Keyword::Readdir
+            | Keyword::Readline
+            | Keyword::Readlink
+            | Keyword::Readpipe
+            | Keyword::Ref
+            | Keyword::Require
+            | Keyword::Reset
             | Keyword::Rewinddir
+            | Keyword::Rmdir
+            | Keyword::Scalar
             | Keyword::Sethostent
             | Keyword::Setnetent
             | Keyword::Setprotoent
             | Keyword::Setservent
+            | Keyword::Shift
+            | Keyword::Sin
+            | Keyword::Sleep
+            | Keyword::Sqrt
+            | Keyword::Srand
             | Keyword::Study
             | Keyword::Telldir
-            | Keyword::Dbmclose
-            | Keyword::Lock
-            | Keyword::Evalbytes
-            | Keyword::Fc
+            | Keyword::Tied
+            | Keyword::Uc
+            | Keyword::Ucfirst
+            | Keyword::Umask
+            | Keyword::Undef
+            | Keyword::Warn
     )
 }
 
@@ -670,27 +936,27 @@ pub fn is_named_unary(kw: Keyword) -> bool {
 pub fn is_nullary(kw: Keyword) -> bool {
     matches!(
         kw,
-        Keyword::Wantarray
-            | Keyword::Time
-            | Keyword::Times
-            | Keyword::Fork
-            | Keyword::Wait
-            | Keyword::Getppid
-            | Keyword::Getlogin
-            | Keyword::Setpwent
-            | Keyword::Setgrent
-            | Keyword::Endpwent
-            | Keyword::Endgrent
+        Keyword::Endgrent
             | Keyword::Endhostent
             | Keyword::Endnetent
             | Keyword::Endprotoent
+            | Keyword::Endpwent
             | Keyword::Endservent
-            | Keyword::Getpwent
+            | Keyword::Fork
             | Keyword::Getgrent
             | Keyword::Gethostent
+            | Keyword::Getlogin
             | Keyword::Getnetent
+            | Keyword::Getppid
             | Keyword::Getprotoent
+            | Keyword::Getpwent
             | Keyword::Getservent
+            | Keyword::Setgrent
+            | Keyword::Setpwent
+            | Keyword::Time
+            | Keyword::Times
+            | Keyword::Wait
+            | Keyword::Wantarray
     )
 }
 
@@ -706,97 +972,90 @@ pub fn prefers_defined_or(kw: Keyword) -> bool {
 pub fn is_list_op(kw: Keyword) -> bool {
     matches!(
         kw,
-        Keyword::Push
-            | Keyword::Unshift
-            | Keyword::Splice
-            | Keyword::Keys
-            | Keyword::Values
+        Keyword::Accept
+            | Keyword::Atan2
+            | Keyword::Bind
+            | Keyword::Binmode
+            | Keyword::Bless
+            | Keyword::Chmod
+            | Keyword::Chown
+            | Keyword::Connect
+            | Keyword::Crypt
+            | Keyword::Dbmopen
             | Keyword::Each
-            | Keyword::Reverse
+            | Keyword::Exec
+            | Keyword::Fcntl
+            | Keyword::Flock
+            | Keyword::Formline
+            | Keyword::Gethostbyaddr
+            | Keyword::Getnetbyaddr
+            | Keyword::Getpriority
+            | Keyword::Getservbyname
+            | Keyword::Getservbyport
+            | Keyword::Getsockopt
+            | Keyword::Glob
+            | Keyword::Index
+            | Keyword::Ioctl
             | Keyword::Join
+            | Keyword::Keys
+            | Keyword::Kill
+            | Keyword::Link
+            | Keyword::Listen
+            | Keyword::Mkdir
+            | Keyword::Msgctl
+            | Keyword::Msgget
+            | Keyword::Msgrcv
+            | Keyword::Msgsnd
+            | Keyword::Open
+            | Keyword::Opendir
+            | Keyword::Pack
+            | Keyword::Pipe
+            | Keyword::Push
+            | Keyword::Read
+            | Keyword::Recv
+            | Keyword::Rename
+            | Keyword::Reverse
+            | Keyword::Rindex
+            | Keyword::Seek
+            | Keyword::Seekdir
+            | Keyword::Select
+            | Keyword::Semctl
+            | Keyword::Semget
+            | Keyword::Semop
+            | Keyword::Send
+            | Keyword::Setpgrp
+            | Keyword::Setpriority
+            | Keyword::Setsockopt
+            | Keyword::Shmctl
+            | Keyword::Shmget
+            | Keyword::Shmread
+            | Keyword::Shmwrite
+            | Keyword::Shutdown
+            | Keyword::Socket
+            | Keyword::Socketpair
+            | Keyword::Splice
             | Keyword::Split
             | Keyword::Sprintf
             | Keyword::Substr
-            | Keyword::Index
-            | Keyword::Rindex
-            | Keyword::Chmod
-            | Keyword::Chown
-            | Keyword::Unlink
-            | Keyword::Rename
-            | Keyword::Open
-            | Keyword::Read
-            | Keyword::Write
-            | Keyword::Seek
-            | Keyword::Tell
-            | Keyword::Binmode
-            | Keyword::Glob
-            | Keyword::Opendir
-            | Keyword::System
-            | Keyword::Exec
-            | Keyword::Tie
-            | Keyword::Untie
-            | Keyword::Bless
-            | Keyword::Mkdir
-            | Keyword::Select
-            // System/process
-            | Keyword::Waitpid
-            | Keyword::Kill
-            | Keyword::Pipe
-            | Keyword::Setpgrp
-            | Keyword::Setpriority
-            | Keyword::Getpriority
+            | Keyword::Symlink
             | Keyword::Syscall
-            // Socket/network
-            | Keyword::Socket
-            | Keyword::Socketpair
-            | Keyword::Bind
-            | Keyword::Connect
-            | Keyword::Listen
-            | Keyword::Accept
-            | Keyword::Shutdown
-            | Keyword::Send
-            | Keyword::Recv
-            | Keyword::Setsockopt
-            | Keyword::Getsockopt
-            // SysV IPC
-            | Keyword::Shmget
-            | Keyword::Shmctl
-            | Keyword::Shmread
-            | Keyword::Shmwrite
-            | Keyword::Semget
-            | Keyword::Semctl
-            | Keyword::Semop
-            | Keyword::Msgget
-            | Keyword::Msgctl
-            | Keyword::Msgsnd
-            | Keyword::Msgrcv
-            // Database lookup (multi-arg)
-            | Keyword::Getservbyname
-            | Keyword::Gethostbyaddr
-            | Keyword::Getnetbyaddr
-            | Keyword::Getservbyport
-            // Low-level I/O
             | Keyword::Sysopen
             | Keyword::Sysread
-            | Keyword::Syswrite
             | Keyword::Sysseek
+            | Keyword::System
+            | Keyword::Syswrite
+            | Keyword::Tell
+            | Keyword::Tie
             | Keyword::Truncate
-            | Keyword::Fcntl
-            | Keyword::Ioctl
-            | Keyword::Flock
-            | Keyword::Seekdir
-            // File ops
-            | Keyword::Link
-            | Keyword::Symlink
-            | Keyword::Utime
-            // Data
-            | Keyword::Pack
+            | Keyword::Unlink
             | Keyword::Unpack
+            | Keyword::Unshift
+            | Keyword::Untie
+            | Keyword::Utime
+            | Keyword::Values
             | Keyword::Vec
-            | Keyword::Formline
-            | Keyword::Atan2
-            | Keyword::Crypt
-            | Keyword::Dbmopen
+            | Keyword::Waitpid
+            | Keyword::Write
     )
 }
 
@@ -815,36 +1074,36 @@ pub fn is_print_op(kw: Keyword) -> bool {
 pub fn is_statement_keyword(kw: Keyword) -> bool {
     matches!(
         kw,
-        Keyword::My
-            | Keyword::Our
-            | Keyword::State
-            | Keyword::Sub
-            | Keyword::If
-            | Keyword::Unless
-            | Keyword::While
-            | Keyword::Until
-            | Keyword::For
-            | Keyword::Foreach
-            | Keyword::Package
-            | Keyword::Use
-            | Keyword::No
+        Keyword::ADJUST
+            | Keyword::AUTOLOAD
             | Keyword::BEGIN
+            | Keyword::UNITCHECK
+            | Keyword::DESTROY
             | Keyword::END
             | Keyword::INIT
             | Keyword::CHECK
-            | Keyword::UNITCHECK
-            | Keyword::ADJUST
-            | Keyword::Given
-            | Keyword::When
-            | Keyword::Default
-            | Keyword::Try
-            | Keyword::Defer
-            | Keyword::Format
             | Keyword::Class
+            | Keyword::Default
+            | Keyword::Defer
             | Keyword::Field
+            | Keyword::For
+            | Keyword::Foreach
+            | Keyword::Format
+            | Keyword::Given
+            | Keyword::If
             | Keyword::Method
-            | Keyword::AUTOLOAD
-            | Keyword::DESTROY
+            | Keyword::My
+            | Keyword::No
+            | Keyword::Our
+            | Keyword::Package
+            | Keyword::State
+            | Keyword::Sub
+            | Keyword::Try
+            | Keyword::Unless
+            | Keyword::Until
+            | Keyword::Use
+            | Keyword::When
+            | Keyword::While
     )
 }
 
@@ -856,7 +1115,9 @@ pub fn is_statement_keyword(kw: Keyword) -> bool {
 pub fn is_strong(kw: Keyword) -> bool {
     matches!(
         kw,
-        Keyword::ADJUST
+        Keyword::__DATA__
+            | Keyword::__END__
+            | Keyword::ADJUST
             | Keyword::AUTOLOAD
             | Keyword::BEGIN
             | Keyword::UNITCHECK
@@ -886,6 +1147,7 @@ pub fn is_strong(kw: Keyword) -> bool {
             | Keyword::If
             | Keyword::Last
             | Keyword::Local
+            | Keyword::M
             | Keyword::Map
             | Keyword::My
             | Keyword::Next
@@ -896,18 +1158,15 @@ pub fn is_strong(kw: Keyword) -> bool {
             | Keyword::Print
             | Keyword::Printf
             | Keyword::Prototype
-            | Keyword::Qw
             | Keyword::Q
             | Keyword::Qq
             | Keyword::Qr
+            | Keyword::Qw
             | Keyword::Qx
-            | Keyword::M
-            | Keyword::S
-            | Keyword::Tr
-            | Keyword::Y
             | Keyword::Redo
             | Keyword::Require
             | Keyword::Return
+            | Keyword::S
             | Keyword::Say
             | Keyword::Scalar
             | Keyword::Sort
@@ -915,6 +1174,7 @@ pub fn is_strong(kw: Keyword) -> bool {
             | Keyword::State
             | Keyword::Study
             | Keyword::Sub
+            | Keyword::Tr
             | Keyword::Try
             | Keyword::Undef
             | Keyword::Unless
@@ -922,6 +1182,7 @@ pub fn is_strong(kw: Keyword) -> bool {
             | Keyword::Use
             | Keyword::When
             | Keyword::While
+            | Keyword::Y
     )
 }
 
