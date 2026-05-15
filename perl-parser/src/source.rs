@@ -1,10 +1,8 @@
 //! Line-oriented source delivery for the lexer.
 //!
-//! `LexerSource` manages line splitting, CRLF normalization, heredoc
-//! body sequencing, and indentation stripping.  The lexer receives
-//! one line at a time via `LexerLine` and scans bytes within it,
-//! never dealing with line boundaries, newline encoding, or heredoc
-//! line reordering.
+//! `LexerSource` manages line splitting, CRLF normalization, heredoc body sequencing, and indentation stripping.  The
+//! lexer receives one line at a time via `LexerLine` and scans bytes within it, never dealing with line boundaries,
+//! newline encoding, or heredoc line reordering.
 //!
 //! See design document §5.4 for the full design rationale.
 
@@ -25,33 +23,29 @@ mod tests;
 
 /// A single line of source code with a byte-scanning cursor.
 ///
-/// The lexer's working unit.  All fields are `pub(crate)` — the lexer
-/// freely reads and writes `pos` for cursor control, and reads `number`
-/// and `offset` for span computation.
+/// The lexer's working unit.  All fields are `pub(crate)` — the lexer freely reads and writes `pos` for cursor control,
+/// and reads `number` and `offset` for span computation.
 #[derive(Clone, Debug)]
 pub(crate) struct LexerLine {
     /// 1-based line number in the original source.
     pub number: usize,
     /// Byte offset of the start of this line in the original source.
     pub offset: usize,
-    /// Line content without line ending.  When inside an indented
-    /// heredoc, the required indentation prefix has been stripped.
+    /// Line content without line ending.  When inside an indented heredoc, the required indentation prefix has been
+    /// stripped.
     pub line: Bytes,
     /// Whether this line was terminated by a newline in the source.
     pub terminated: bool,
     /// Current scanning position within `line`.
     pub pos: usize,
-    /// Whether the line contains only ASCII bytes (all < 0x80).
-    /// Computed for free during newline scanning and used to skip
-    /// UTF-8 decoding and NFC normalization for all-ASCII lines.
+    /// Whether the line contains only ASCII bytes (all < 0x80).  Computed for free during newline scanning and used to
+    /// skip UTF-8 decoding and NFC normalization for all-ASCII lines.
     pub ascii_only: bool,
 }
 
 impl LexerLine {
-    /// Peek at the current byte without advancing.
-    /// Returns `b'\n'` at the end of a terminated line.
-    /// Returns `None` only when truly exhausted (past \n or
-    /// unterminated line fully consumed).
+    /// Peek at the current byte without advancing.  Returns `b'\n'` at the end of a terminated line.  Returns `None`
+    /// only when truly exhausted (past \n or unterminated line fully consumed).
     #[inline]
     pub fn peek_byte(&self) -> Option<u8> {
         if self.pos < self.line.len() {
@@ -76,9 +70,8 @@ impl LexerLine {
         }
     }
 
-    /// Consume the current byte and advance the cursor.
-    /// Returns `b'\n'` at the end of a terminated line.
-    /// Returns `None` only when truly exhausted.
+    /// Consume the current byte and advance the cursor.  Returns `b'\n'` at the end of a terminated line.  Returns
+    /// `None` only when truly exhausted.
     #[cfg(test)]
     #[inline]
     pub fn advance_byte(&mut self) -> Option<u8> {
@@ -94,15 +87,13 @@ impl LexerLine {
         }
     }
 
-    /// The remaining unscanned content bytes (not including the
-    /// virtual `\n` line terminator).
+    /// The remaining unscanned content bytes (not including the virtual `\n` line terminator).
     #[inline]
     pub fn remaining(&self) -> &[u8] {
         if self.pos < self.line.len() { &self.line[self.pos..] } else { &[] }
     }
 
-    /// Byte offset in the original source at the current cursor position.
-    /// Used for span construction.
+    /// Byte offset in the original source at the current cursor position.  Used for span construction.
     #[inline]
     pub fn global_pos(&self) -> u32 {
         (self.offset + self.pos) as u32
@@ -120,14 +111,12 @@ struct HeredocContext {
 
 /// Line-oriented source for the lexer.
 ///
-/// Provides lines to the lexer via `next_line()`, handling CRLF
-/// normalization, heredoc body sequencing, and indentation stripping.
-/// The lexer never manages these concerns directly.
+/// Provides lines to the lexer via `next_line()`, handling CRLF normalization, heredoc body sequencing, and indentation
+/// stripping.  The lexer never manages these concerns directly.
 pub(crate) struct LexerSource {
     /// The complete source buffer.
     src: Bytes,
-    /// Name of the source — used for `__FILE__` resolution and
-    /// diagnostic messages.  Defaults to `"(script)"` when the
+    /// Name of the source — used for `__FILE__` resolution and diagnostic messages.  Defaults to `"(script)"` when the
     /// caller doesn't supply one (e.g., `Parser::new(src)`).
     filename: String,
     /// Current byte position for reading the next line.
@@ -136,26 +125,23 @@ pub(crate) struct LexerSource {
     line_number: usize,
     /// Stack of active heredoc contexts.
     heredoc_stack: Vec<HeredocContext>,
-    /// Lines queued for delivery by future `next_line()` calls.
-    /// Used for heredoc remainder delivery, push_back, and subst bodies.
+    /// Lines queued for delivery by future `next_line()` calls.  Used for heredoc remainder delivery, push_back, and
+    /// subst bodies.
     queued_lines: VecDeque<LexerLine>,
-    /// Indentation prefix to strip from every non-empty line.
-    /// Set by `start_indented_heredoc`, restored when the heredoc
-    /// finishes.
+    /// Indentation prefix to strip from every non-empty line.  Set by `start_indented_heredoc`, restored when the
+    /// heredoc finishes.
     required_indent: Option<Bytes>,
-    /// Set when a heredoc terminator was found during a peek call.
-    /// The next consuming call will pop the heredoc context.
+    /// Set when a heredoc terminator was found during a peek call.  The next consuming call will pop the heredoc
+    /// context.
     terminator_pending: bool,
-    /// Set when the queued body lines of a substitution have been
-    /// delivered.  The next `next_line` returns `None` (virtual EOF),
-    /// then delivers the saved remainder.
+    /// Set when the queued body lines of a substitution have been delivered.  The next `next_line` returns `None`
+    /// (virtual EOF), then delivers the saved remainder.
     subst_eof_pending: bool,
-    /// Line to deliver after the virtual EOF of a subst body.
-    /// Contains the remainder of the source line after the flags.
+    /// Line to deliver after the virtual EOF of a subst body.  Contains the remainder of the source line after the
+    /// flags.
     subst_saved_line: Option<LexerLine>,
-    /// Set when a UTF-8 BOM, UTF-16 BOM, or UTF-16 heuristic was
-    /// detected at the start of the source.  The Lexer uses this
-    /// to enable `utf8_mode` automatically.
+    /// Set when a UTF-8 BOM, UTF-16 BOM, or UTF-16 heuristic was detected at the start of the source.  The Lexer uses
+    /// this to enable `utf8_mode` automatically.
     pub(crate) bom_utf8: bool,
 }
 
@@ -169,18 +155,15 @@ struct RawLine {
 }
 
 impl LexerSource {
-    /// Create a new `LexerSource` from a byte slice, using the
-    /// default placeholder filename `"(script)"`.
+    /// Create a new `LexerSource` from a byte slice, using the default placeholder filename `"(script)"`.
     ///
-    /// The bytes are copied into a `Bytes` buffer once.  All subsequent
-    /// line slicing is zero-copy.
+    /// The bytes are copied into a `Bytes` buffer once.  All subsequent line slicing is zero-copy.
     pub fn new(src: &[u8]) -> Self {
         Self::with_filename(src, "(script)")
     }
 
-    /// Create a new `LexerSource` with a specific filename.  The
-    /// filename is surfaced via [`Self::filename`] and used for
-    /// `__FILE__` resolution.
+    /// Create a new `LexerSource` with a specific filename.  The filename is surfaced via [`Self::filename`] and used
+    /// for `__FILE__` resolution.
     pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
         let (src_bytes, bom_utf8) = Self::detect_and_transcode(Bytes::copy_from_slice(src));
         LexerSource {
@@ -198,15 +181,11 @@ impl LexerSource {
         }
     }
 
-    /// Detect BOM or UTF-16 encoding at the start of a source
-    /// buffer and transcode to UTF-8 if needed.  Returns the
-    /// (possibly transcoded) source bytes and whether UTF-8 mode
-    /// should be enabled.
+    /// Detect BOM or UTF-16 encoding at the start of a source buffer and transcode to UTF-8 if needed.  Returns the
+    /// (possibly transcoded) source bytes and whether UTF-8 mode should be enabled.
     ///
-    /// Takes an owned `Bytes` so the common case (no BOM, no
-    /// UTF-16) is zero-copy.  UTF-8 BOM stripping uses
-    /// `Bytes::slice` (also zero-copy).  Only UTF-16 transcoding
-    /// allocates a new buffer.
+    /// Takes an owned `Bytes` so the common case (no BOM, no UTF-16) is zero-copy.  UTF-8 BOM stripping uses
+    /// `Bytes::slice` (also zero-copy).  Only UTF-16 transcoding allocates a new buffer.
     ///
     /// Detection order (matching Perl's `S_swallow_bom`):
     /// - `EF BB BF` → UTF-8 BOM: strip, enable utf8
@@ -231,8 +210,7 @@ impl LexerSource {
                 return (Bytes::from(utf8), true);
             }
         }
-        // Heuristic: check for UTF-16 without BOM by looking at
-        // the first few bytes for a null-interleaving pattern.
+        // Heuristic: check for UTF-16 without BOM by looking at the first few bytes for a null-interleaving pattern.
         if src.len() >= 4 {
             let looks_le = src[1] == 0 && src[3] == 0 && src[0] != 0 && src[2] != 0;
             let looks_be = src[0] == 0 && src[2] == 0 && src[1] != 0 && src[3] != 0;
@@ -249,8 +227,8 @@ impl LexerSource {
         (src, false)
     }
 
-    /// Transcode UTF-16 bytes to UTF-8.  Handles surrogate pairs
-    /// for code points above U+FFFF.  Ignores a trailing odd byte.
+    /// Transcode UTF-16 bytes to UTF-8.  Handles surrogate pairs for code points above U+FFFF.  Ignores a trailing odd
+    /// byte.
     fn transcode_utf16(src: &[u8], little_endian: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(src.len());
         let mut i = 0;
@@ -284,8 +262,7 @@ impl LexerSource {
         out
     }
 
-    /// Create a new `LexerSource` from an existing `Bytes` buffer.
-    /// Zero-copy — just a refcount bump.  Uses the default
+    /// Create a new `LexerSource` from an existing `Bytes` buffer.  Zero-copy — just a refcount bump.  Uses the default
     /// placeholder filename.
     #[allow(dead_code)]
     pub fn from_bytes(src: Bytes) -> Self {
@@ -305,8 +282,7 @@ impl LexerSource {
         }
     }
 
-    /// Current byte position in the source buffer.
-    /// Used for global position when no current line is active.
+    /// Current byte position in the source buffer.  Used for global position when no current line is active.
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -317,9 +293,8 @@ impl LexerSource {
         self.line_number
     }
 
-    /// Name of the source file being lexed, for `__FILE__`
-    /// resolution and diagnostics.  Defaults to `"(script)"`
-    /// when the caller used [`Self::new`] without a filename.
+    /// Name of the source file being lexed, for `__FILE__` resolution and diagnostics.  Defaults to `"(script)"` when
+    /// the caller used [`Self::new`] without a filename.
     pub fn filename(&self) -> &str {
         &self.filename
     }
@@ -334,14 +309,13 @@ impl LexerSource {
         self.filename = name;
     }
 
-    /// Raw slice of the source buffer.  For rare operations that need
-    /// access to the underlying bytes (e.g. format body extraction).
+    /// Raw slice of the source buffer.  For rare operations that need access to the underlying bytes (e.g. format body
+    /// extraction).
     pub fn src_slice(&self, start: usize, end: usize) -> &[u8] {
         &self.src[start..end]
     }
 
-    /// Push lines to be returned by future `next_line()` calls,
-    /// ahead of any lines read from the source.
+    /// Push lines to be returned by future `next_line()` calls, ahead of any lines read from the source.
     pub fn push_back(&mut self, mut lines: VecDeque<LexerLine>) {
         lines.append(&mut self.queued_lines);
         self.queued_lines = lines;
@@ -349,18 +323,14 @@ impl LexerSource {
 
     /// Get the next line.
     ///
-    /// Returns `Ok(Some(line))` for content, `Ok(None)` when a heredoc
-    /// body is finished (the saved remainder will be returned by the
-    /// next call), or `Err` for real errors (unterminated heredoc,
-    /// indentation mismatch).
+    /// Returns `Ok(Some(line))` for content, `Ok(None)` when a heredoc body is finished (the saved remainder will be
+    /// returned by the next call), or `Err` for real errors (unterminated heredoc, indentation mismatch).
     ///
-    /// `peek_heredoc`: when true and a heredoc terminator is found,
-    /// returns `Ok(None)` without consuming the signal — the heredoc
-    /// context stays on the stack and `queued_lines` is not modified.
-    /// The next call with `peek_heredoc=false` will consume it.
+    /// `peek_heredoc`: when true and a heredoc terminator is found, returns `Ok(None)` without consuming the signal —
+    /// the heredoc context stays on the stack and `queued_lines` is not modified.  The next call with
+    /// `peek_heredoc=false` will consume it.
     pub fn next_line(&mut self, peek_heredoc: bool) -> Result<Option<LexerLine>, ParseError> {
-        // 0. If a terminator was found during a previous peek call,
-        //    handle it without reading another line.
+        // 0. If a terminator was found during a previous peek call, handle it without reading another line.
         if self.terminator_pending {
             if !peek_heredoc {
                 // Consume the pending terminator.
@@ -373,8 +343,8 @@ impl LexerSource {
             return Ok(None);
         }
 
-        // 1. Return queued line if present (from heredoc remainder,
-        //    push_back, or subst body — not subject to terminator check).
+        // 1. Return queued line if present (from heredoc remainder, push_back, or subst body — not subject to
+        //    terminator check).
         if let Some(line) = self.queued_lines.pop_front() {
             return Ok(Some(line));
         }
@@ -428,10 +398,8 @@ impl LexerSource {
 
     /// Begin processing an indented heredoc body (`<<~TAG`).
     ///
-    /// Scans ahead to find the terminator, sets the required
-    /// indentation from its whitespace prefix.  The current line is
-    /// taken from the Option (setting it to None) and saved internally
-    /// for restoration when the terminator is found.
+    /// Scans ahead to find the terminator, sets the required indentation from its whitespace prefix.  The current line
+    /// is taken from the Option (setting it to None) and saved internally for restoration when the terminator is found.
     pub fn start_indented_heredoc(&mut self, tag: Bytes, current_line: &mut Option<LexerLine>) -> Result<(), ParseError> {
         let line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_indented_heredoc called without a current line", Span::DUMMY))?;
         let prev_indent = self.required_indent.clone();
@@ -448,9 +416,8 @@ impl LexerSource {
 
     /// Begin processing a non-indented heredoc body (`<<TAG`).
     ///
-    /// The current line is taken from the Option (setting it to None)
-    /// and saved internally for restoration when the terminator is
-    /// found.  Does not change the required indentation.
+    /// The current line is taken from the Option (setting it to None) and saved internally for restoration when the
+    /// terminator is found.  Does not change the required indentation.
     pub fn start_heredoc(&mut self, tag: Bytes, current_line: &mut Option<LexerLine>) -> Result<(), ParseError> {
         let line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_heredoc called without a current line", Span::DUMMY))?;
         let prev_indent = self.required_indent.clone();
@@ -461,10 +428,9 @@ impl LexerSource {
 
     /// Begin processing a substitution replacement body.
     ///
-    /// Takes the current line, scans ahead to find the closing
-    /// delimiter and flags, then queues the body lines for delivery
-    /// with a virtual EOF at the end.  The remainder of the source
-    /// line after the flags is saved for delivery after the EOF.
+    /// Takes the current line, scans ahead to find the closing delimiter and flags, then queues the body lines for
+    /// delivery with a virtual EOF at the end.  The remainder of the source line after the flags is saved for delivery
+    /// after the EOF.
     ///
     /// Returns the captured flags (or None if no flags).
     pub fn start_subst_body(&mut self, delim: char, extra_paired: bool, current_line: &mut Option<LexerLine>) -> Result<Option<String>, ParseError> {
@@ -512,8 +478,7 @@ impl LexerSource {
                     pos += 2;
                 }
             } else if rest.starts_with(close_bytes.as_bytes()) && depth == 0 {
-                // Found closing delimiter at `pos`.
-                // Body content on this line: everything before `pos`.
+                // Found closing delimiter at `pos`.  Body content on this line: everything before `pos`.
                 let truncated = LexerLine {
                     line: line.line.slice(..pos),
                     offset: line.offset,
@@ -565,9 +530,8 @@ impl LexerSource {
 
     /// Read the next raw line from the source buffer.
     ///
-    /// Splits on `\n`, strips `\r` before `\n` (CRLF normalization).
-    /// Standalone `\r` not followed by `\n` is preserved as a literal
-    /// byte.  Returns `None` at EOF.
+    /// Splits on `\n`, strips `\r` before `\n` (CRLF normalization).  Standalone `\r` not followed by `\n` is preserved
+    /// as a literal byte.  Returns `None` at EOF.
     fn read_raw_line(&mut self) -> Option<RawLine> {
         if self.cursor >= self.src.len() {
             return None;
@@ -602,8 +566,8 @@ impl LexerSource {
 
     /// Strip the required indent from a raw line.
     ///
-    /// Returns the `LexerLine` with indent stripped and cursor at 0.
-    /// Empty lines (zero content) are allowed without the indent prefix.
+    /// Returns the `LexerLine` with indent stripped and cursor at 0.  Empty lines (zero content) are allowed without
+    /// the indent prefix.
     fn strip_indent(&self, raw: RawLine) -> Result<LexerLine, ParseError> {
         let (content, indent_len) = if let Some(indent) = &self.required_indent {
             if raw.content.starts_with(indent.as_ref()) {
@@ -624,9 +588,8 @@ impl LexerSource {
         Ok(LexerLine { number: raw.number, offset: raw.offset + indent_len, line: content, terminated: raw.terminated, pos: 0, ascii_only: raw.ascii_only })
     }
 
-    /// Scan ahead from the current cursor to find an indented heredoc
-    /// terminator.  Returns the full raw whitespace prefix of the
-    /// terminator line.  Does not advance the cursor.
+    /// Scan ahead from the current cursor to find an indented heredoc terminator.  Returns the full raw whitespace
+    /// prefix of the terminator line.  Does not advance the cursor.
     fn scan_for_indented_terminator(&mut self, tag: &[u8]) -> Result<Bytes, ParseError> {
         let saved_cursor = self.cursor;
         let saved_line_number = self.line_number;

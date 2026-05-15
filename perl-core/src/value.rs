@@ -1,11 +1,8 @@
-//! The top-level `Value` enum — compact variants for common cases,
-//! `Arc`-wrapped variants for shared values.
+//! The top-level `Value` enum — compact variants for common cases, `Arc`-wrapped variants for shared values.
 //!
-//! Most Perl values are simple: just a number, just a string, just a
-//! reference.  The compact `Value` variants handle these with no heap
-//! allocation and no locking overhead.  Only values that need full Perl
-//! SV semantics (multi-representation caching, magic, blessing) are
-//! upgraded to `Value::Scalar(Sv)`.
+//! Most Perl values are simple: just a number, just a string, just a reference.  The compact `Value` variants handle
+//! these with no heap allocation and no locking overhead.  Only values that need full Perl SV semantics (multi-
+//! representation caching, magic, blessing) are upgraded to `Value::Scalar(Sv)`.
 
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -44,16 +41,14 @@ use std::collections::HashMap;
 
 /// A Perl value.
 ///
-/// The compact variants (`Int`, `Float`, `SmallStr`, `Str`) are inline —
-/// no heap allocation, no `Arc`, no locking.  These cover the vast
-/// majority of values in a typical Perl program.
+/// The compact variants (`Int`, `Float`, `SmallStr`, `Str`) are inline — no heap allocation, no `Arc`, no locking.
+/// These cover the vast majority of values in a typical Perl program.
 ///
-/// `Scalar(Sv)` is the full Perl SV with multi-representation caching,
-/// magic, and blessing.  Values are upgraded to this form when needed
-/// (see [`Value::upgrade_to_scalar`]).
+/// `Scalar(Sv)` is the full Perl SV with multi-representation caching, magic, and blessing.  Values are upgraded to
+/// this form when needed (see [`Value::upgrade_to_scalar`]).
 ///
-/// Container types (`Array`, `Hash`) and code/regex are always `Arc`-wrapped
-/// because they have shared identity from creation.
+/// Container types (`Array`, `Hash`) and code/regex are always `Arc`-wrapped because they have shared identity from
+/// creation.
 #[derive(Clone, Default)]
 pub enum Value {
     // ── Compact scalar variants (no heap allocation) ──────────
@@ -77,8 +72,8 @@ pub enum Value {
     Ref(Sv),
 
     // ── Full scalar ───────────────────────────────────────────
-    /// Full Perl SV — multi-rep caching, magic, blessing, etc.
-    /// Upgrade target for compact variants when they need SV features.
+    /// Full Perl SV — multi-rep caching, magic, blessing, etc.  Upgrade target for compact variants when they need SV
+    /// features.
     Scalar(Sv),
 
     // ── Container types ───────────────────────────────────────
@@ -133,10 +128,8 @@ impl Value {
 
     /// Perl truthiness.
     ///
-    /// False values: `undef`, `0`, `0.0`, `""`, `"0"`, empty arrays,
-    /// empty hashes.
-    /// True values: nonzero numbers, non-false strings, references,
-    /// non-empty arrays, non-empty hashes, code refs, regexes.
+    /// False values: `undef`, `0`, `0.0`, `""`, `"0"`, empty arrays, empty hashes.  True values: nonzero numbers,
+    /// non-false strings, references, non-empty arrays, non-empty hashes, code refs, regexes.
     pub fn is_true(&self) -> bool {
         match self {
             Value::Undef => false,
@@ -161,12 +154,10 @@ impl Value {
 
     /// Upgrade this value to a full `Scalar` behind `Arc<RwLock<>>`.
     ///
-    /// If already a `Scalar`, returns a clone of the `Sv` (refcount bump).
-    /// Otherwise, creates a new `Scalar` from the compact representation,
-    /// replaces `self` with `Value::Scalar(sv)`, and returns the `Sv`.
+    /// If already a `Scalar`, returns a clone of the `Sv` (refcount bump).  Otherwise, creates a new `Scalar` from the
+    /// compact representation, replaces `self` with `Value::Scalar(sv)`, and returns the `Sv`.
     ///
-    /// **Once upgraded, never downgrade.**  Identity via `Arc` address
-    /// must be preserved.
+    /// **Once upgraded, never downgrade.**  Identity via `Arc` address must be preserved.
     pub fn upgrade_to_scalar(&mut self) -> Sv {
         match self {
             Value::Scalar(sv) => sv.clone(),
@@ -195,13 +186,10 @@ impl Value {
     }
 
     // ── Convenience accessors ─────────────────────────────────
-    // These provide quick access to the underlying value without
-    // upgrading.  For coercing access (e.g., reading a string as
-    // an integer), upgrade to Scalar first and use its coercion
-    // methods.
+    // These provide quick access to the underlying value without upgrading.  For coercing access (e.g., reading a
+    // string as an integer), upgrade to Scalar first and use its coercion methods.
 
-    /// Try to read as i64 without upgrading.
-    /// Returns `None` for non-numeric compact types.
+    /// Try to read as i64 without upgrading.  Returns `None` for non-numeric compact types.
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Int(n) => Some(*n),
@@ -238,8 +226,7 @@ impl Value {
     }
 
     // ── Coercing numeric access ───────────────────────────────
-    // These follow Perl's coercion rules: strings are parsed as
-    // numbers, undef becomes 0, references are their address.
+    // These follow Perl's coercion rules: strings are parsed as numbers, undef becomes 0, references are their address.
     // Unlike `as_int`/`as_num`, these always return a value.
 
     /// Coerce to i64 following Perl's numeric conversion rules.
@@ -289,9 +276,8 @@ impl Value {
     }
 
     // ── Arithmetic ────────────────────────────────────────────
-    // Perl's arithmetic coerces operands to numeric.  If both
-    // operands are integers and the result fits in i64, the result
-    // is integer.  Otherwise float.
+    // Perl's arithmetic coerces operands to numeric.  If both operands are integers and the result fits in i64, the
+    // result is integer.  Otherwise float.
 
     /// Addition (`$a + $b`).
     pub fn add(&self, other: &Value) -> Value {
@@ -329,9 +315,8 @@ impl Value {
 
     /// Division (`$a / $b`).
     ///
-    /// Perl's `/` returns a float unless both operands are integers
-    /// and the result is exact.  Division by zero is a fatal error
-    /// in Perl; here we return `Inf` or `NaN` as Rust does.
+    /// Perl's `/` returns a float unless both operands are integers and the result is exact.  Division by zero is a
+    /// fatal error in Perl; here we return `Inf` or `NaN` as Rust does.
     pub fn div(&self, other: &Value) -> Value {
         if let (Value::Int(a), Value::Int(b)) = (self, other)
             && *b != 0
@@ -349,8 +334,7 @@ impl Value {
         let a = self.coerce_to_int();
         let b = other.coerce_to_int();
         if b == 0 {
-            // Perl dies on modulo by zero; for now return 0.
-            // The runtime will handle the error.
+            // Perl dies on modulo by zero; for now return 0.  The runtime will handle the error.
             return Value::Int(0);
         }
         Value::Int(a % b)
@@ -365,8 +349,7 @@ impl Value {
             },
             Value::Float(n) => Value::Float(-n),
             _ => {
-                // Perl also handles string negation: -"foo" → "-foo"
-                // For now, coerce to numeric and negate.
+                // Perl also handles string negation: -"foo" → "-foo"  For now, coerce to numeric and negate.
                 let n = self.coerce_to_num();
                 Value::Float(-n)
             }
@@ -377,8 +360,7 @@ impl Value {
 
     /// Concatenation (`$a . $b`).
     ///
-    /// Coerces both sides to their string representation and
-    /// concatenates.
+    /// Coerces both sides to their string representation and concatenates.
     pub fn concat(&self, other: &Value) -> Value {
         // Fast path: both are already strings
         if let (Some(a), Some(b)) = (self.as_bytes(), other.as_bytes()) {
@@ -426,8 +408,7 @@ impl Value {
 
     // ── Comparison ────────────────────────────────────────────
 
-    /// Numeric comparison (`$a <=> $b`).
-    /// Returns -1, 0, or 1 as a Value::Int.
+    /// Numeric comparison (`$a <=> $b`).  Returns -1, 0, or 1 as a Value::Int.
     pub fn num_cmp(&self, other: &Value) -> Value {
         let a = self.coerce_to_num();
         let b = other.coerce_to_num();
@@ -470,8 +451,7 @@ impl Value {
         self.coerce_to_num() >= other.coerce_to_num()
     }
 
-    /// String comparison (`$a cmp $b`).
-    /// Returns -1, 0, or 1 as a Value::Int.
+    /// String comparison (`$a cmp $b`).  Returns -1, 0, or 1 as a Value::Int.
     pub fn str_cmp(&self, other: &Value) -> Value {
         let a = self.stringify();
         let b = other.stringify();
@@ -521,9 +501,8 @@ impl Value {
 
     /// Convert this value to its Perl string representation.
     ///
-    /// This is the operation that happens when a value is used in
-    /// string context: `print`, `.` concatenation, `"$x"` interpolation,
-    /// `eq`/`ne` comparison.
+    /// This is the operation that happens when a value is used in string context: `print`, `.` concatenation, `"$x"`
+    /// interpolation, `eq`/`ne` comparison.
     ///
     /// Rules:
     /// - `Undef` → `""` (empty string; in practice Perl warns)
@@ -556,8 +535,8 @@ impl Value {
                 PerlString::from_str(&len.to_string())
             }
             Value::Hash(hv) => {
-                // Perl 5 stringifies a hash as "N/M" where N = used buckets,
-                // M = total buckets.  We approximate with "N/N" (key count).
+                // Perl 5 stringifies a hash as "N/M" where N = used buckets, M = total buckets.  We approximate with
+                // "N/N" (key count).
                 let len = hv.read().map(|h| h.len()).unwrap_or(0);
                 if len == 0 { PerlString::from_str("0") } else { PerlString::from_str(&format!("{}/{}", len, len)) }
             }
@@ -574,9 +553,8 @@ impl Value {
 
     /// Write the string representation to a byte buffer.
     ///
-    /// More efficient than `stringify()` when you just need to
-    /// append to output — avoids allocating a PerlString for types
-    /// that are already byte slices.
+    /// More efficient than `stringify()` when you just need to append to output — avoids allocating a PerlString for
+    /// types that are already byte slices.
     pub fn write_bytes_to(&self, buf: &mut Vec<u8>) {
         match self {
             Value::Undef => {} // empty string — no bytes
@@ -590,8 +568,8 @@ impl Value {
             Value::SmallStr(ss) => buf.extend_from_slice(ss.as_bytes()),
             Value::Str(ps) => buf.extend_from_slice(ps.as_bytes()),
             _ => {
-                // For ref/scalar/array/hash/code/regex, fall back to
-                // stringify() — these are less common in hot output paths.
+                // For ref/scalar/array/hash/code/regex, fall back to stringify() — these are less common in hot output
+                // paths.
                 let ps = self.stringify();
                 buf.extend_from_slice(ps.as_bytes());
             }
@@ -601,8 +579,7 @@ impl Value {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Perl string falseness check on raw bytes.
-/// Empty (`b""`) and the string `"0"` (`b"0"`) are false.
+/// Perl string falseness check on raw bytes.  Empty (`b""`) and the string `"0"` (`b"0"`) are false.
 #[inline]
 fn bytes_are_false(bytes: &[u8]) -> bool {
     bytes.is_empty() || bytes == b"0"
@@ -638,8 +615,7 @@ impl fmt::Display for Value {
             Value::SmallStr(ss) => fmt::Display::fmt(ss, f),
             Value::Str(ps) => fmt::Display::fmt(ps, f),
             _ => {
-                // References, scalars, containers, code, regex —
-                // convert via stringify to avoid duplicating logic.
+                // References, scalars, containers, code, regex — convert via stringify to avoid duplicating logic.
                 let ps = self.stringify();
                 fmt::Display::fmt(&ps, f)
             }

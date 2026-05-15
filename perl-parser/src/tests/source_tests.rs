@@ -157,8 +157,7 @@ fn heredoc_basic() {
     let decl = source.next_line(false).unwrap().unwrap();
     assert_eq!(&decl.line[..], b"my $x = <<END . \"suffix\";");
 
-    // Simulate lexer: found <<END at some position in decl.
-    // Save the remainder and start the heredoc.
+    // Simulate lexer: found <<END at some position in decl.  Save the remainder and start the heredoc.
     let mut current_line = Some(LexerLine {
         number: decl.number,
         offset: decl.offset,

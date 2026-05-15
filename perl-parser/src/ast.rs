@@ -1,7 +1,7 @@
 //! Abstract Syntax Tree — syntax-oriented, not execution-oriented (§7).
 //!
-//! The AST preserves syntactic distinctions that matter for diagnostics,
-//! lowering, and tooling.  It is the public output of `perl-parser`.
+//! The AST preserves syntactic distinctions that matter for diagnostics, lowering, and tooling.  It is the public
+//! output of `perl-parser`.
 
 use crate::span::Span;
 use crate::token::{AssignOp, DataEndMarker, FieldKind, RegexKind, RepeatKind};
@@ -18,8 +18,7 @@ pub struct Program {
 pub struct Statement {
     pub kind: StmtKind,
     pub span: Span,
-    /// Whether the statement was followed by a semicolon.
-    /// Used to distinguish `{ expr }` (hash constructor candidate)
+    /// Whether the statement was followed by a semicolon.  Used to distinguish `{ expr }` (hash constructor candidate)
     /// from `{ expr; }` (block) at statement level.
     pub terminated: bool,
 }
@@ -28,12 +27,9 @@ pub struct Statement {
 pub enum StmtKind {
     /// Expression statement (expression followed by `;`).
     ///
-    /// In Perl, declarations (`my`, `our`, `state`, `local`) are
-    /// expressions, not statements — `my $x = 5, $y` parses as
-    /// `(my $x = 5), $y`.  They therefore appear here wrapped as
-    /// `Expr(...)`, with `ExprKind::Decl` / `ExprKind::Local`
-    /// (often inside `ExprKind::Assign` when an initializer is
-    /// present).
+    /// In Perl, declarations (`my`, `our`, `state`, `local`) are expressions, not statements — `my $x = 5, $y` parses
+    /// as `(my $x = 5), $y`.  They therefore appear here wrapped as `Expr(...)`, with `ExprKind::Decl` /
+    /// `ExprKind::Local` (often inside `ExprKind::Assign` when an initializer is present).
     Expr(Expr),
 
     /// `sub name { ... }` or `sub name (proto) { ... }`.
@@ -81,9 +77,8 @@ pub enum StmtKind {
     /// Empty statement (bare `;`).
     Empty,
 
-    /// Logical end of script: `__END__`, `__DATA__`, `^D`, or `^Z`.
-    /// The `u32` is the byte offset where trailing data begins
-    /// (after the marker line's newline).
+    /// Logical end of script: `__END__`, `__DATA__`, `^D`, or `^Z`.  The `u32` is the byte offset where trailing data
+    /// begins (after the marker line's newline).
     DataEnd(DataEndMarker, u32),
 
     /// `format NAME = ... .`
@@ -133,27 +128,22 @@ pub enum ExprKind {
     /// `%!`, `%+`, `%-`, `%{^CAPTURE}`, etc.
     SpecialHashVar(String),
 
-    /// The default variable (`$_`) inserted implicitly by the
-    /// parser — e.g., when a prototype's `_` slot is omitted from
-    /// a call.  Distinct from `ScalarVar("_")`, which represents
-    /// the scalar *variable* named `_` as written in the source
-    /// (and which may be a lexical `my $_` rather than the global
-    /// default).  At runtime, `DefaultVar` always refers to the
-    /// global default; `ScalarVar("_")` follows normal scope rules.
+    /// The default variable (`$_`) inserted implicitly by the parser — e.g., when a prototype's `_` slot is omitted
+    /// from a call.  Distinct from `ScalarVar("_")`, which represents the scalar *variable* named `_` as written in the
+    /// source (and which may be a lexical `my $_` rather than the global default).  At runtime, `DefaultVar` always
+    /// refers to the global default; `ScalarVar("_")` follows normal scope rules.
     DefaultVar,
 
-    /// `my $x`, `our ($a, $b)`, `state $x` in expression context.
-    /// The Pratt parser handles `= expr` as normal assignment wrapping this.
+    /// `my $x`, `our ($a, $b)`, `state $x` in expression context.  The Pratt parser handles `= expr` as normal
+    /// assignment wrapping this.
     Decl(DeclScope, Vec<VarDecl>),
     /// `local LVALUE` — localize any lvalue (hash elem, glob, etc.).
     Local(Box<Expr>),
 
     // ── Binary operations ─────────────────────────────────────
     BinOp(BinOp, Box<Expr>, Box<Expr>),
-    /// Chained comparison: `$x < $y <= $z` → ops [<, <=],
-    /// operands [x, y, z].  Semantics: each adjacent pair is
-    /// compared, results implicitly ANDed, interior operands
-    /// evaluated at most once.  `operands.len() == ops.len() + 1`.
+    /// Chained comparison: `$x < $y <= $z` → ops [<, <=], operands [x, y, z].  Semantics: compare each adjacent pair,
+    /// results implicitly ANDed, interior operands evaluated at most once.  `operands.len() == ops.len() + 1`.
     ChainedCmp(Vec<BinOp>, Vec<Expr>),
 
     // ── Unary operations ──────────────────────────────────────
@@ -197,10 +187,8 @@ pub enum ExprKind {
     AnonArray(Vec<Expr>),
     /// `{...}` — anonymous hash ref (when disambiguated from block).
     AnonHash(Vec<Expr>),
-    /// `sub { ... }` — anonymous sub.  Fields: prototype (raw
-    /// bytes), signature (parsed 5.20+ signatures syntax), body.
-    /// Prototype, attributes, and signature are parsed per the
-    /// `signatures` feature: with signatures, attrs come before
+    /// `sub { ... }` — anonymous sub.  Fields: prototype (raw bytes), signature (parsed 5.20+ signatures syntax), body.
+    /// Prototype, attributes, and signature are parsed per the `signatures` feature: with signatures, attrs come before
     /// the paren-form; without, prototype comes before attrs.
     AnonSub(Option<String>, Vec<Attribute>, Option<Signature>, Block),
 
@@ -216,9 +204,8 @@ pub enum ExprKind {
     IndirectMethodCall(Box<Expr>, String, Vec<Expr>),
 
     // ── Bareword ──────────────────────────────────────────────
-    /// A bare identifier not followed by `(` — class name, constant,
-    /// or bareword.  The parser doesn't resolve which; that's the
-    /// compiler's job.
+    /// A bare identifier not followed by `(` — class name, constant, or bareword.  The parser doesn't resolve which;
+    /// that's the compiler's job.
     Bareword(String),
 
     // ── List operators ────────────────────────────────────────
@@ -265,20 +252,15 @@ pub enum ExprKind {
     SourceFile(String),
     /// `__LINE__` — source line number at parse time (1-based).
     SourceLine(u32),
-    /// `__PACKAGE__` — name of the package in effect when this
-    /// expression was parsed.  Filled by the parser from its
+    /// `__PACKAGE__` — name of the package in effect when this expression was parsed.  Filled by the parser from its
     /// `current_package` state.
     CurrentPackage(String),
-    /// `__SUB__` — reference to the current subroutine, or
-    /// `undef` if outside any sub.  Resolved at runtime; no
-    /// compile-time data.  Emitted only when the `current_sub`
-    /// feature is active; otherwise the token falls through as
+    /// `__SUB__` — reference to the current subroutine, or `undef` if outside any sub.  Resolved at runtime; no
+    /// compile-time data.  Emitted only when the `current_sub` feature is active; otherwise the token falls through as
     /// a bareword.
     CurrentSub,
-    /// `__CLASS__` — name of the class being constructed during
-    /// field initializers and ADJUST blocks (5.38+, Corinna).
-    /// Resolved at runtime (may differ from the compile-time
-    /// class if a subclass inherits the field).
+    /// `__CLASS__` — name of the class being constructed during field initializers and ADJUST blocks (5.38+, Corinna).
+    /// Resolved at runtime (may differ from the compile-time class if a subclass inherits the field).
     CurrentClass,
 
     // ── Placeholder for incremental development ───────────────
@@ -292,11 +274,10 @@ pub enum ExprKind {
     Lstat(StatTarget),
 }
 
-/// The operand of a stat-family operation: filetest operators (`-e`, `-f`,
-/// `-d`, etc.), `stat`, and `lstat`.
+/// The operand of a stat-family operation: filetest operators (`-e`, `-f`, `-d`, etc.), `stat`, and `lstat`.
 ///
-/// All three share the Perl convention that a bare `_` means "reuse the
-/// cached stat buffer from the most recent `stat`, `lstat`, or filetest."
+/// All three share the Perl convention that a bare `_` means "reuse the cached stat buffer from the most recent `stat`,
+/// `lstat`, or filetest."
 #[derive(Clone, Debug)]
 pub enum StatTarget {
     /// An expression: `-f $file`, `-d "/tmp"`, `stat $fh`, or stacked
@@ -309,16 +290,13 @@ pub enum StatTarget {
     Default,
 }
 
-/// A sequence of interpolated parts — used for strings, regex
-/// patterns, and substitution replacements.
+/// A sequence of interpolated parts — used for strings, regex patterns, and substitution replacements.
 #[derive(Clone, Debug)]
 pub struct Interpolated(pub Vec<InterpPart>);
 
 impl Interpolated {
-    /// If this contains only constant parts (no runtime interpolation),
-    /// return the plain string.  `Const` and `NamedChar` segments are
-    /// both constant — `NamedChar` is resolved at lex time.
-    /// Returns `Some("")` for empty.
+    /// If this contains only constant parts (no runtime interpolation), return the plain string.  `Const` and
+    /// `NamedChar` segments are both constant — `NamedChar` is resolved at lex time.  Returns `Some("")` for empty.
     pub fn as_plain_string(&self) -> Option<String> {
         if self.0.is_empty() {
             return Some(String::new());
@@ -345,27 +323,21 @@ impl Interpolated {
 #[derive(Clone, Debug)]
 pub enum InterpPart {
     Const(String),
-    /// `$var`, `$var[0]`, `$var->{k}`, `$var->[0]{k}`, etc.
-    /// Wraps the full subscripted expression — not just a name —
-    /// so chained subscripts (`$h->{k}[0]->{x}`) are parsed
-    /// into real AST rather than stringified literally.
+    /// `$var`, `$var[0]`, `$var->{k}`, `$var->[0]{k}`, etc.  Wraps the full subscripted expression — not just a name —
+    /// so chained subscripts (`$h->{k}[0]->{x}`) are parsed into real AST rather than stringified literally.
     ScalarInterp(Box<Expr>),
-    /// `@var`, `@var[1..3]`, `@var{'a','b'}` — whole-array or
-    /// slice interpolation.  Like `ScalarInterp`, holds the
-    /// full expression.
+    /// `@var`, `@var[1..3]`, `@var{'a','b'}` — whole-array or slice interpolation.  Like `ScalarInterp`, holds the full
+    /// expression.
     ArrayInterp(Box<Expr>),
     ExprInterp(Box<Expr>),
     /// `(?{code})` — raw text for stringification + parsed code.
     RegexCode(String, Box<Expr>),
     /// `(??{code})` — postponed regex code block.
     RegexCondCode(String, Box<Expr>),
-    /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character.
-    /// Preserves the original name for tooling (formatters, linters)
-    /// while storing the resolved code point.  The string content
-    /// already contains the resolved character in the surrounding
-    /// `Const` segments; this variant exists for round-trip fidelity
-    /// and will be emitted when the body scanner is reworked to
-    /// produce separate segments for named character escapes.
+    /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character.  Preserves the original name for tooling (formatters,
+    /// linters) while storing the resolved code point.  The string content already contains the resolved character in
+    /// the surrounding `Const` segments; this variant exists for round-trip fidelity and will be emitted when the body
+    /// scanner is reworked to produce separate segments for named character escapes.
     NamedChar {
         name: String,
         codepoint: u32,
@@ -474,23 +446,19 @@ pub enum ArrowTarget {
     ArraySliceIndices(Box<Expr>),
     /// `$ref->@{keys}` — slice of hash returning values as array.
     ArraySliceKeys(Box<Expr>),
-    /// `$ref->%[indices]` — key/value pairs from an array
-    /// (indices paired with values).
+    /// `$ref->%[indices]` — key/value pairs from an array (indices paired with values).
     KvSliceIndices(Box<Expr>),
     /// `$ref->%{keys}` — key/value pairs from a hash.
     KvSliceKeys(Box<Expr>),
     /// `$obj->$method(args)` dynamic method dispatch.
     DynMethod(Box<Expr>, Vec<Expr>),
-    /// `$ref->$#*` — postfix last-index of an array reference,
-    /// equivalent to `$#{$ref}`.  Requires coordinated lexer
-    /// handling: the sequence `$#*` after `->` is consumed as a
-    /// unit because the lexer otherwise treats the `#` as the
+    /// `$ref->$#*` — postfix last-index of an array reference, equivalent to `$#{$ref}`.  Requires coordinated lexer
+    /// handling: the sequence `$#*` after `->` is consumed as a unit because the lexer otherwise treats the `#` as the
     /// start of a comment.
     LastIndex,
 }
 
-/// Sigil for dereference operations.
-/// Scope of a variable declaration in expression context.
+/// Sigil for dereference operations.  Scope of a variable declaration in expression context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclScope {
     My,
@@ -546,10 +514,9 @@ pub struct VarDecl {
     pub span: Span,
     /// Attributes on the variable declaration: `my $x : Foo`.
     pub attributes: Vec<Attribute>,
-    /// Reference-declaration form: `my \$x` binds `$x` as an alias
-    /// (via the `declared_refs` feature, 5.26+).  The RHS of the
-    /// enclosing assignment must be a matching reference.  When
-    /// `false`, this is a normal copy-initialized variable.
+    /// Reference-declaration form: `my \$x` binds `$x` as an alias (via the `declared_refs` feature, 5.26+).  The RHS
+    /// of the enclosing assignment must be a matching reference.  When `false`, this is a normal copy-initialized
+    /// variable.
     pub is_ref: bool,
 }
 
@@ -557,18 +524,14 @@ pub struct VarDecl {
 #[derive(Clone, Debug)]
 pub struct SubDecl {
     pub name: String,
-    /// Lexical scope for `my sub`, `state sub`, `our sub`.
-    /// `None` for regular package subs.
+    /// Lexical scope for `my sub`, `state sub`, `our sub`.  `None` for regular package subs.
     pub scope: Option<DeclScope>,
-    /// Paren-form prototype from pre-signatures Perl (e.g. `($$)`,
-    /// `(\@\%)`).  Stored as raw bytes.  Mutually exclusive with
-    /// `signature` (the `signatures` feature controls which path
-    /// parses the paren-form).  A `:prototype(...)` attribute
-    /// shows up in `attributes` and coexists with either.
+    /// Paren-form prototype from pre-signatures Perl (e.g. `($$)`, `(\@\%)`).  Stored as raw bytes.  Mutually exclusive
+    /// with `signature` (the `signatures` feature controls which path parses the paren-form).  A `:prototype(...)`
+    /// attribute shows up in `attributes` and coexists with either.
     pub prototype: Option<String>,
     pub attributes: Vec<Attribute>,
-    /// Parsed parameter signature from 5.20+ signatures syntax.
-    /// Present when the `signatures` feature is active at the
+    /// Parsed parameter signature from 5.20+ signatures syntax.  Present when the `signatures` feature is active at the
     /// declaration site.
     pub signature: Option<Signature>,
     pub body: Block,
@@ -577,9 +540,8 @@ pub struct SubDecl {
 
 /// Parsed subroutine signature (the `signatures` feature).
 ///
-/// Each parameter is one of several `SigParam` variants: named
-/// scalar (optionally with a default), slurpy array, slurpy hash,
-/// or an anonymous placeholder that accepts and discards a value.
+/// Each parameter is one of several `SigParam` variants: named scalar (optionally with a default), slurpy array, slurpy
+/// hash, or an anonymous placeholder that accepts and discards a value.
 #[derive(Clone, Debug)]
 pub struct Signature {
     pub params: Vec<SigParam>,
@@ -589,20 +551,17 @@ pub struct Signature {
 /// One parameter in a signature.
 #[derive(Clone, Debug)]
 pub enum SigParam {
-    /// `$name`, `$name = DEFAULT`, `$name //= DEFAULT`, `$name ||= DEFAULT`.
-    /// Positional.  When `default` is `None`, the parameter is required.
+    /// `$name`, `$name = DEFAULT`, `$name //= DEFAULT`, `$name ||= DEFAULT`.  Positional.  When `default` is `None`,
+    /// the parameter is required.
     Scalar { name: String, default: Option<(SigDefaultKind, Expr)>, span: Span },
-    /// `@name` — slurpy, captures all remaining positional
-    /// arguments.  Must appear last if at all.
+    /// `@name` — slurpy, captures all remaining positional arguments.  Must appear last if at all.
     SlurpyArray { name: String, span: Span },
-    /// `%name` — slurpy, captures remaining name/value pairs.
-    /// Must appear last if at all.
+    /// `%name` — slurpy, captures remaining name/value pairs.  Must appear last if at all.
     SlurpyHash { name: String, span: Span },
-    /// `$` — anonymous scalar placeholder; accepts a value without
-    /// binding it.  Optional `default` for `$ = expr` or `$=` forms.
+    /// `$` — anonymous scalar placeholder; accepts a value without binding it.  Optional `default` for `$ = expr` or
+    /// `$=` forms.
     AnonScalar { default: Option<(SigDefaultKind, Expr)>, span: Span },
-    /// `@` — anonymous slurpy array (consumes remaining positional
-    /// args without binding).
+    /// `@` — anonymous slurpy array (consumes remaining positional args without binding).
     AnonArray { span: Span },
     /// `%` — anonymous slurpy hash.
     AnonHash { span: Span },
@@ -712,9 +671,8 @@ pub struct TryStmt {
 
 /// `format NAME = ... .`
 ///
-/// `lines` captures every source line of the body in order,
-/// classified into one of the four `FormatLine` variants.  Picture
-/// lines are already paired with their argument expressions.
+/// `lines` captures every source line of the body in order, classified into one of the four `FormatLine` variants.
+/// Picture lines are already paired with their argument expressions.
 #[derive(Clone, Debug)]
 pub struct FormatDecl {
     pub name: String,
@@ -725,31 +683,25 @@ pub struct FormatDecl {
 /// One line of a format body.
 #[derive(Clone, Debug)]
 pub enum FormatLine {
-    /// `# ...` — comment, not rendered.  Stored without the leading
-    /// `#` or surrounding whitespace; the full source is available
-    /// via `span`.
+    /// `# ...` — comment, not rendered.  Stored without the leading `#` or surrounding whitespace; the full source is
+    /// available via `span`.
     Comment { text: String, span: Span },
 
-    /// Empty or whitespace-only line; renders as a blank line of
-    /// output.
+    /// Empty or whitespace-only line; renders as a blank line of output.
     Blank { span: Span },
 
-    /// A picture line containing no field specifiers.  The text is
-    /// stored with any `~`/`~~` characters already replaced with
-    /// spaces (so the output width matches the source layout); the
-    /// `repeat` field records the original repeat behavior.
+    /// A picture line containing no field specifiers.  The text is stored with any `~`/`~~` characters already replaced
+    /// with spaces (so the output width matches the source layout); the `repeat` field records the original repeat
+    /// behavior.
     Literal { repeat: RepeatKind, text: String, span: Span },
 
-    /// A picture line containing at least one field.  Arguments come
-    /// from the source line immediately following the picture: one
-    /// expression per field in order.  When the argument line begins
-    /// with `{`, expressions may span multiple source lines until
-    /// the matching `}`.
+    /// A picture line containing at least one field.  Arguments come from the source line immediately following the
+    /// picture: one expression per field in order.  When the argument line begins with `{`, expressions may span
+    /// multiple source lines until the matching `}`.
     Picture { repeat: RepeatKind, parts: Vec<FormatPart>, args: Vec<Expr>, span: Span },
 }
 
-/// One piece of a picture line.  Literals and fields interleave in
-/// source order.
+/// One piece of a picture line.  Literals and fields interleave in source order.
 #[derive(Clone, Debug)]
 pub enum FormatPart {
     /// Run of literal text (tildes already normalized to spaces).

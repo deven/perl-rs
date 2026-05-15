@@ -1,21 +1,16 @@
 //! Scalar value flags — cache validity and metadata bits.
 //!
 //! These flags follow Perl 5's SV flag model:
-//! - **Validity flags** (INT_VALID, NUM_VALID, STR_VALID, REF_VALID): which
-//!   cached representations are current.
-//! - **Metadata flags** (READONLY, UTF8, TAINT, MAGICAL, WEAK): orthogonal
-//!   properties of the value.
+//! - **Validity flags** (INT_VALID, NUM_VALID, STR_VALID, REF_VALID): which cached representations are current.
+//! - **Metadata flags** (READONLY, UTF8, TAINT, MAGICAL, WEAK): orthogonal properties of the value.
 
 /// Flags for a `Scalar` value.
 ///
-/// Validity flags indicate which representation slots contain current data.
-/// The coercion engine reads these to determine the fast path (e.g., INT_VALID
-/// set means the integer representation is valid — return it directly) and
-/// sets them when caching a new representation (e.g., parsing a string as an
-/// integer sets INT_VALID).
+/// Validity flags indicate which representation slots contain current data.  The coercion engine reads these to
+/// determine the fast path (e.g., INT_VALID set means the integer representation is valid — return it directly) and
+/// sets them when caching a new representation (e.g., parsing a string as an integer sets INT_VALID).
 ///
-/// Metadata flags describe orthogonal properties that don't affect which
-/// representation is current.
+/// Metadata flags describe orthogonal properties that don't affect which representation is current.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScalarFlags(u16);
 
@@ -39,8 +34,8 @@ impl ScalarFlags {
     /// Value is read-only (Internals::SvREADONLY).
     pub const READONLY: ScalarFlags = ScalarFlags(1 << 4);
 
-    /// String value is valid UTF-8 (redundant with PerlStringSlot's
-    /// own flag, but kept for fast checking without unpacking the string slot).
+    /// String value is valid UTF-8 (redundant with PerlStringSlot's own flag, but kept for fast checking without
+    /// unpacking the string slot).
     pub const UTF8: ScalarFlags = ScalarFlags(1 << 5);
 
     /// Value is tainted (taint mode).

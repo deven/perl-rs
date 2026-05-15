@@ -97,8 +97,8 @@ fn bundle_below_5_10_is_default() {
 
 #[test]
 fn bundle_5_10() {
-    // :5.10 = apostrophe_as_package_separator bareword_filehandles
-    //         indirect multidimensional say smartmatch state switch
+    // :5.10 = apostrophe_as_package_separator bareword_filehandles indirect multidimensional say smartmatch state
+    //         switch
     let b = version_bundle(5, 10);
     let expected = Features::APOSTROPHE_AS_PACKAGE_SEPARATOR
         | Features::BAREWORD_FILEHANDLES
@@ -144,10 +144,8 @@ fn bundle_5_28_adds_bitwise() {
 
 #[test]
 fn bundle_5_36_full_membership() {
-    // Per perlfeature: :5.36 = apostrophe_as_package_separator
-    // bareword_filehandles bitwise current_sub evalbytes fc isa
-    // postderef_qq say signatures smartmatch state unicode_eval
-    // unicode_strings.
+    // Per perlfeature: :5.36 = apostrophe_as_package_separator bareword_filehandles bitwise current_sub evalbytes fc
+    // isa postderef_qq say signatures smartmatch state unicode_eval unicode_strings.
     let expected = Features::APOSTROPHE_AS_PACKAGE_SEPARATOR
         | Features::BAREWORD_FILEHANDLES
         | Features::BITWISE

@@ -1,9 +1,8 @@
 //! Heap-allocated Perl string — `Bytes` + UTF-8 flag.
 //!
-//! The underlying buffer uses [`bytes::Bytes`], giving O(1) cloning
-//! (reference-count bump) and O(1) slicing.  Short strings that live
-//! inside a `Value::SmallStr` or `PerlStringSlot::Inline` never reach
-//! this type — only strings that need heap allocation go through here.
+//! The underlying buffer uses [`bytes::Bytes`], giving O(1) cloning (reference-count bump) and O(1) slicing.  Short
+//! strings that live inside a `Value::SmallStr` or `PerlStringSlot::Inline` never reach this type — only strings that
+//! need heap allocation go through here.
 
 use std::fmt;
 
@@ -11,18 +10,16 @@ use bytes::{Bytes, BytesMut};
 
 /// A Perl string: an octet sequence with an optional UTF-8 flag.
 ///
-/// Unlike Rust's `String`, a `PerlString` can hold arbitrary bytes.
-/// The `is_utf8` flag indicates whether the bytes are valid UTF-8,
-/// enabling zero-cost conversion to `&str` when set.
+/// Unlike Rust's `String`, a `PerlString` can hold arbitrary bytes.  The `is_utf8` flag indicates whether the bytes are
+/// valid UTF-8, enabling zero-cost conversion to `&str` when set.
 ///
-/// Cloning a `PerlString` is O(1) — it bumps the reference count on
-/// the underlying `Bytes` buffer rather than copying the data.
+/// Cloning a `PerlString` is O(1) — it bumps the reference count on the underlying `Bytes` buffer rather than copying
+/// the data.
 ///
 /// # Invariant
 ///
-/// If `is_utf8` is `true`, then `buf` MUST contain valid UTF-8.
-/// All mutating methods are responsible for maintaining this invariant
-/// (typically by clearing the flag when the result might not be UTF-8).
+/// If `is_utf8` is `true`, then `buf` MUST contain valid UTF-8.  All mutating methods are responsible for maintaining
+/// this invariant (typically by clearing the flag when the result might not be UTF-8).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PerlString {
     buf: Bytes,
@@ -45,8 +42,7 @@ impl PerlString {
 
     /// Create a Perl string from raw bytes.  The UTF-8 flag is NOT set.
     ///
-    /// Accepts anything convertible to `Bytes`: `Vec<u8>`, `&'static [u8]`,
-    /// `Bytes`, etc.
+    /// Accepts anything convertible to `Bytes`: `Vec<u8>`, `&'static [u8]`, `Bytes`, etc.
     pub fn from_bytes(bytes: impl Into<Bytes>) -> Self {
         PerlString { buf: bytes.into(), is_utf8: false }
     }
@@ -60,8 +56,7 @@ impl PerlString {
         PerlString { buf: bytes.into(), is_utf8 }
     }
 
-    /// Create a Perl string from raw bytes, checking UTF-8 validity.
-    /// Sets the flag if the bytes are valid UTF-8.
+    /// Create a Perl string from raw bytes, checking UTF-8 validity.  Sets the flag if the bytes are valid UTF-8.
     pub fn from_bytes_detect_utf8(bytes: impl Into<Bytes>) -> Self {
         let buf: Bytes = bytes.into();
         let is_utf8 = std::str::from_utf8(&buf).is_ok();
@@ -70,12 +65,10 @@ impl PerlString {
 
     // ── Accessors ─────────────────────────────────────────────────
 
-    /// Zero-cost `&str` view when the UTF-8 flag is set.
-    /// Returns `None` if the string is not flagged as UTF-8.
+    /// Zero-cost `&str` view when the UTF-8 flag is set.  Returns `None` if the string is not flagged as UTF-8.
     pub fn as_str(&self) -> Option<&str> {
         if self.is_utf8 {
-            // SAFETY: we maintain the invariant that is_utf8 == true
-            // means self.buf contains valid UTF-8.
+            // SAFETY: we maintain the invariant that is_utf8 == true means self.buf contains valid UTF-8.
             Some(unsafe { std::str::from_utf8_unchecked(&self.buf) })
         } else {
             None
@@ -89,9 +82,8 @@ impl PerlString {
 
     /// Shared `Bytes` handle — O(1) reference-count bump.
     ///
-    /// Use this when you need an owned handle to the buffer without
-    /// consuming the `PerlString` (e.g., passing to another thread,
-    /// storing alongside the original, or zero-copy slicing).
+    /// Use this when you need an owned handle to the buffer without consuming the `PerlString` (e.g., passing to
+    /// another thread, storing alongside the original, or zero-copy slicing).
     pub fn bytes(&self) -> Bytes {
         self.buf.clone()
     }
@@ -113,19 +105,18 @@ impl PerlString {
 
     // ── Mutation ──────────────────────────────────────────────────
 
-    /// Append bytes from a `&str`.  Preserves UTF-8 flag if already set
-    /// (appending valid UTF-8 to valid UTF-8 is valid UTF-8).
+    /// Append bytes from a `&str`.  Preserves UTF-8 flag if already set (appending valid UTF-8 to valid UTF-8 is valid
+    /// UTF-8).
     pub fn push_str(&mut self, s: &str) {
         let mut new_buf = BytesMut::with_capacity(self.buf.len() + s.len());
         new_buf.extend_from_slice(&self.buf);
         new_buf.extend_from_slice(s.as_bytes());
         self.buf = new_buf.freeze();
-        // If we were already UTF-8, appending a &str keeps us UTF-8.
-        // If we weren't, appending UTF-8 doesn't make us UTF-8.
+        // If we were already UTF-8, appending a &str keeps us UTF-8.  If we weren't, appending UTF-8 doesn't make us
+        // UTF-8.
     }
 
-    /// Append raw bytes.  Clears the UTF-8 flag (we can't guarantee
-    /// the result is valid UTF-8).
+    /// Append raw bytes.  Clears the UTF-8 flag (we can't guarantee the result is valid UTF-8).
     pub fn push_bytes(&mut self, bytes: impl AsRef<[u8]>) {
         let bytes = bytes.as_ref();
         let mut new_buf = BytesMut::with_capacity(self.buf.len() + bytes.len());
@@ -147,13 +138,12 @@ impl PerlString {
     /// Clear the string contents.
     pub fn clear(&mut self) {
         self.buf = Bytes::new();
-        // An empty string is trivially valid UTF-8, but we preserve
-        // the flag state for consistency with Perl 5 behavior.
+        // An empty string is trivially valid UTF-8, but we preserve the flag state for consistency with Perl 5
+        // behavior.
     }
 
-    /// Truncate to `len` bytes.  Uses zero-copy slicing on the
-    /// underlying `Bytes` buffer.  Clears UTF-8 flag if truncation
-    /// might split a multi-byte character.
+    /// Truncate to `len` bytes.  Uses zero-copy slicing on the underlying `Bytes` buffer.  Clears UTF-8 flag if
+    /// truncation might split a multi-byte character.
     pub fn truncate(&mut self, len: usize) {
         if len < self.buf.len() {
             self.buf = self.buf.slice(..len);
@@ -166,8 +156,7 @@ impl PerlString {
         }
     }
 
-    /// Set the UTF-8 flag, validating the contents first.
-    /// Returns `true` if the contents are valid UTF-8 (flag set),
+    /// Set the UTF-8 flag, validating the contents first.  Returns `true` if the contents are valid UTF-8 (flag set),
     /// `false` if not (flag unchanged).
     pub fn upgrade_to_utf8(&mut self) -> bool {
         if self.is_utf8 {
@@ -188,14 +177,13 @@ impl PerlString {
 
     // ── Conversion ────────────────────────────────────────────────
 
-    /// Consume the PerlString and return the underlying `Bytes` buffer.
-    /// This is O(1) — no data is copied.
+    /// Consume the PerlString and return the underlying `Bytes` buffer.  This is O(1) — no data is copied.
     pub fn into_bytes(self) -> Bytes {
         self.buf
     }
 
-    /// Consume the PerlString and attempt to convert to a Rust `String`.
-    /// Returns `Err(self)` if the contents are not valid UTF-8.
+    /// Consume the PerlString and attempt to convert to a Rust `String`.  Returns `Err(self)` if the contents are not
+    /// valid UTF-8.
     pub fn into_string(self) -> Result<String, Self> {
         if self.is_utf8 {
             // SAFETY: is_utf8 flag guarantees valid UTF-8.
@@ -210,10 +198,8 @@ impl PerlString {
 
     // ── Numeric parsing (for SV coercion) ─────────────────────────
 
-    /// Attempt to parse the string as an i64.
-    /// Follows Perl's numeric conversion rules: leading whitespace is
-    /// skipped, trailing non-numeric characters are ignored, and an
-    /// empty or non-numeric string yields 0.
+    /// Attempt to parse the string as an i64.  Follows Perl's numeric conversion rules: leading whitespace is skipped,
+    /// trailing non-numeric characters are ignored, and an empty or non-numeric string yields 0.
     pub fn parse_iv(&self) -> i64 {
         let s = self.trimmed_bytes();
         if s.is_empty() {
@@ -230,8 +216,7 @@ impl PerlString {
         0
     }
 
-    /// Attempt to parse the string as an f64.
-    /// Same leading-whitespace / trailing-garbage rules as `parse_iv`.
+    /// Attempt to parse the string as an f64.  Same leading-whitespace / trailing-garbage rules as `parse_iv`.
     pub fn parse_nv(&self) -> f64 {
         let s = self.trimmed_bytes();
         if s.is_empty() {
@@ -258,8 +243,7 @@ impl PerlString {
 
 // ── Perl-style numeric parsing helpers ────────────────────────────
 
-/// Parse as much of the leading portion of `s` as a valid integer.
-/// Returns 0 if no leading digits.
+/// Parse as much of the leading portion of `s` as a valid integer.  Returns 0 if no leading digits.
 fn perl_atoi(s: &str) -> i64 {
     let s = s.trim_start();
     if s.is_empty() {
@@ -305,8 +289,7 @@ fn perl_atoi(s: &str) -> i64 {
     if negative { -val } else { val }
 }
 
-/// Parse as much of the leading portion of `s` as a valid float.
-/// Returns 0.0 if no leading numeric content.
+/// Parse as much of the leading portion of `s` as a valid float.  Returns 0.0 if no leading numeric content.
 fn perl_atof(s: &str) -> f64 {
     let bytes = s.as_bytes();
     let mut end = 0;
@@ -568,11 +551,9 @@ mod tests {
         let b = PerlString::from_str("hello");
         let c = PerlString::from_bytes(b"hello".to_vec());
         assert_eq!(a, b);
-        // Different UTF-8 flag, same bytes — should they be equal?
-        // In Perl, "hello" eq "hello" regardless of internal flags.
-        // Our PartialEq derives from the struct, so flag matters.
-        // This is intentional — internal representation equality,
-        // not Perl-level equality (which is handled by the runtime).
+        // Different UTF-8 flag, same bytes — should they be equal?  In Perl, "hello" eq "hello" regardless of internal
+        // flags.  Our PartialEq derives from the struct, so flag matters.  This is intentional — internal
+        // representation equality, not Perl-level equality (which is handled by the runtime).
         assert_ne!(a, c);
     }
 
@@ -608,8 +589,7 @@ mod tests {
         let original_ptr = s.as_bytes().as_ptr();
         let mut t = s.clone();
         t.truncate(5);
-        // After truncation, the pointer should still reference
-        // the same underlying allocation.
+        // After truncation, the pointer should still reference the same underlying allocation.
         assert_eq!(t.as_bytes().as_ptr(), original_ptr);
         assert_eq!(t.as_str(), Some("hello"));
     }

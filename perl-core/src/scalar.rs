@@ -6,8 +6,8 @@
 //! - Blessing into a package (objects)
 //! - Readonly / taint flags
 //!
-//! Most values start as compact `Value` variants and are upgraded to
-//! `Scalar` only when needed (see `Value::upgrade_to_scalar`).
+//! Most values start as compact `Value` variants and are upgraded to `Scalar` only when needed (see
+//! `Value::upgrade_to_scalar`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -16,18 +16,17 @@ use crate::flags::ScalarFlags;
 use crate::value::Value;
 use crate::{PerlString, PerlStringSlot};
 
-// Placeholder types — will be fleshed out as the runtime develops.
-// Using empty structs for now so the code compiles and the shape is right.
+// Placeholder types — will be fleshed out as the runtime develops.  Using empty structs for now so the code compiles
+// and the shape is right.
 
-/// A chain of magic (tie, overload, etc.) attached to a scalar.
-/// Will be a linked list of trait objects implementing the Magic trait.
+/// A chain of magic (tie, overload, etc.) attached to a scalar.  Will be a linked list of trait objects implementing
+/// the Magic trait.
 pub struct MagicChain {
     // TODO: Vec<Box<dyn Magic>> or linked list
     _private: (),
 }
 
-/// A package stash — the symbol table for a package.
-/// Will be a HashMap<PerlString, Glob> or similar.
+/// A package stash — the symbol table for a package.  Will be a HashMap<PerlString, Glob> or similar.
 pub struct Stash {
     // TODO: name, symbol table, ISA, method cache
     _private: (),
@@ -35,9 +34,8 @@ pub struct Stash {
 
 /// The full Perl scalar.
 ///
-/// Parallel representation slots with flag-driven validity, following
-/// Perl 5's SV model.  `$x = "42"` sets STR_VALID; `$x + 0` sets INT_VALID and
-/// caches 42 in `int` without clearing the string.
+/// Parallel representation slots with flag-driven validity, following Perl 5's SV model.  `$x = "42"` sets STR_VALID;
+/// `$x + 0` sets INT_VALID and caches 42 in `int` without clearing the string.
 ///
 /// # Flag Discipline
 ///
@@ -48,12 +46,10 @@ pub struct Stash {
 ///
 /// Writing a new representation typically invalidates the others:
 /// - Setting a string: set STR_VALID, clear INT_VALID and NUM_VALID.
-/// - Setting an integer: set INT_VALID, clear STR_VALID and NUM_VALID (unless
-///   caching).
+/// - Setting an integer: set INT_VALID, clear STR_VALID and NUM_VALID (unless caching).
 ///
 /// Reading a missing representation triggers lazy coercion:
-/// - Reading int when only STR_VALID is set: parse the string, cache in int,
-///   set INT_VALID.
+/// - Reading int when only STR_VALID is set: parse the string, cache in int, set INT_VALID.
 pub struct Scalar {
     /// Which representations are valid + metadata.
     pub(crate) flags: ScalarFlags,
@@ -64,12 +60,10 @@ pub struct Scalar {
     /// Float representation.  Valid when NUM_VALID is set.
     pub(crate) num: f64,
 
-    /// String representation.  Valid when STR_VALID is set.
-    /// Uses small-string optimization internally.
+    /// String representation.  Valid when STR_VALID is set.  Uses small-string optimization internally.
     pub(crate) bytes: PerlStringSlot,
 
-    /// Reference target.  Valid when REF_VALID is set.
-    /// When set, this scalar IS a reference (like Perl's RV).
+    /// Reference target.  Valid when REF_VALID is set.  When set, this scalar IS a reference (like Perl's RV).
     pub(crate) reference: Option<Value>,
 
     /// Magic chain (tie, overload, special variable magic).
@@ -159,8 +153,7 @@ impl Scalar {
     ///
     /// References are always true.  Everything else is true.
     ///
-    /// When multiple representations are valid, numeric is checked
-    /// first (faster than string comparison).
+    /// When multiple representations are valid, numeric is checked first (faster than string comparison).
     pub fn is_true(&self) -> bool {
         // References are always true.
         if self.flags.contains(ScalarFlags::REF_VALID) {
@@ -188,8 +181,7 @@ impl Scalar {
 
     // ── Integer access (with lazy coercion) ───────────────────────
 
-    /// Get the integer value, coercing from other representations if needed.
-    /// Caches the result by setting INT_VALID.
+    /// Get the integer value, coercing from other representations if needed.  Caches the result by setting INT_VALID.
     pub fn get_int(&mut self) -> i64 {
         if self.flags.contains(ScalarFlags::INT_VALID) {
             return self.int;
@@ -227,8 +219,7 @@ impl Scalar {
 
     // ── Float access (with lazy coercion) ─────────────────────────
 
-    /// Get the float value, coercing from other representations if needed.
-    /// Caches the result by setting NUM_VALID.
+    /// Get the float value, coercing from other representations if needed.  Caches the result by setting NUM_VALID.
     pub fn get_num(&mut self) -> f64 {
         if self.flags.contains(ScalarFlags::NUM_VALID) {
             return self.num;
@@ -263,8 +254,7 @@ impl Scalar {
 
     // ── String access (with lazy coercion) ────────────────────────
 
-    /// Get a string view, coercing from other representations if needed.
-    /// Caches the result by setting STR_VALID.
+    /// Get a string view, coercing from other representations if needed.  Caches the result by setting STR_VALID.
     /// Returns `None` only for undef.
     pub fn get_bytes(&mut self) -> Option<&[u8]> {
         if self.flags.contains(ScalarFlags::STR_VALID) {
@@ -289,8 +279,7 @@ impl Scalar {
         None
     }
 
-    /// Get a `&str` view if the string representation is UTF-8.
-    /// Coerces if needed (numeric → string is always UTF-8).
+    /// Get a `&str` view if the string representation is UTF-8.  Coerces if needed (numeric → string is always UTF-8).
     pub fn get_str(&mut self) -> Option<&str> {
         // Ensure string is populated
         self.get_bytes()?;
@@ -311,9 +300,8 @@ impl Scalar {
         self.flags.remove(ScalarFlags::INT_VALID | ScalarFlags::NUM_VALID | ScalarFlags::UTF8);
     }
 
-    /// Get the string representation as an owned `PerlString`.
-    /// Coerces if needed (populates the string cache as a side effect).
-    /// Returns an empty string for undef.
+    /// Get the string representation as an owned `PerlString`.  Coerces if needed (populates the string cache as a side
+    /// effect).  Returns an empty string for undef.
     pub fn stringify(&mut self) -> PerlString {
         // Ensure string cache is populated (may coerce from int/num).
         if self.get_bytes().is_none() {
@@ -336,8 +324,7 @@ impl Scalar {
         if self.flags.contains(ScalarFlags::REF_VALID) { self.reference.as_ref() } else { None }
     }
 
-    /// Set this scalar to be a reference to the given value.
-    /// Clears all other representations.
+    /// Set this scalar to be a reference to the given value.  Clears all other representations.
     pub fn set_rv(&mut self, target: Value) {
         self.reference = Some(target);
         self.flags = ScalarFlags::REF_VALID;
@@ -376,22 +363,18 @@ impl Scalar {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Format a float the way Perl does.  Perl uses Gconvert which is
-/// essentially `sprintf("%.15g", n)` — shortest representation that
-/// round-trips.  Rust doesn't have %g, so we approximate:
-/// use Display (which gives shortest round-trip representation),
-/// falling back to LowerExp for very large/small values.
+/// Format a float the way Perl does.  Perl uses Gconvert which is essentially `sprintf("%.15g", n)` — shortest
+/// representation that round-trips.  Rust doesn't have %g, so we approximate: use Display (which gives shortest round-
+/// trip representation), falling back to LowerExp for very large/small values.
 pub(crate) fn format_nv(n: f64) -> String {
     if n == 0.0 {
         return "0".to_string();
     }
-    // Rust's Display for f64 gives shortest round-trip representation
-    // which is close to %g behavior.
+    // Rust's Display for f64 gives shortest round-trip representation which is close to %g behavior.
     format!("{}", n)
 }
 
-/// Perl string falseness: `""` (empty) and `"0"` are false.
-/// Everything else is true.
+/// Perl string falseness: `""` (empty) and `"0"` are false.  Everything else is true.
 fn string_is_false(slot: &PerlStringSlot) -> bool {
     match slot.as_bytes() {
         None => true,       // no string → false (shouldn't happen if STR_VALID is set)

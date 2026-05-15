@@ -1,12 +1,10 @@
 //! Token types emitted by the lexer.
 //!
-//! The lexer does context-sensitive disambiguation (§5.2), so the parser
-//! receives tokens that already reflect whether `/` is division or regex,
-//! whether `{` is a block or hash, etc.
+//! The lexer does context-sensitive disambiguation (§5.2), so the parser receives tokens that already reflect whether
+//! `/` is division or regex, whether `{` is a block or hash, etc.
 //!
-//! Quote-like constructs emit a stream of sub-tokens (§5.4) rather than
-//! a single string token, enabling the parser to build interpolation AST
-//! nodes directly.
+//! Quote-like constructs emit a stream of sub-tokens (§5.4) rather than a single string token, enabling the parser to
+//! build interpolation AST nodes directly.
 
 use crate::span::Span;
 
@@ -359,8 +357,8 @@ pub enum AssignOp {
 
 /// Tokens emitted by the lexer.
 ///
-/// Named to match perly.y token names where practical, but reorganized
-/// by function rather than by how toke.c happens to emit them.
+/// Named to match perly.y token names where practical, but reorganized by function rather than by how toke.c happens to
+/// emit them.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
     // ── End of input ──────────────────────────────────────────
@@ -496,35 +494,28 @@ pub enum Token {
     SublexEnd,
     /// Literal segment inside a quote.
     ConstSegment(String),
-    /// `$name` or `${name}` interpolation inside a quote.
-    /// Emitted when the sigil+name isn't followed by a subscript
+    /// `$name` or `${name}` interpolation inside a quote.  Emitted when the sigil+name isn't followed by a subscript
     /// starter — the simple case.
     InterpScalar(String),
     /// `@name` interpolation inside a quote (array in string).
     InterpArray(String),
-    /// `${expr}` expression interpolation — lexer switches to normal code mode.
-    /// Parser calls parse_expr(), then expect_token(RightBrace).
+    /// `${expr}` expression interpolation — lexer switches to normal code mode.  Parser calls parse_expr(), then
+    /// expect_token(RightBrace).
     InterpScalarExprStart,
     /// `@{expr}` expression interpolation — lexer switches to normal code mode.
     InterpArrayExprStart,
-    /// `$name` followed by one or more subscripts inside a quote
-    /// (e.g. `"$h->{key}"`, `"$a[0]"`, `"$h->{k}[0]"`).  Carries
-    /// the variable name.  The lexer then emits normal code
-    /// tokens for the subscript chain, terminated by
+    /// `$name` followed by one or more subscripts inside a quote (e.g. `"$h->{key}"`, `"$a[0]"`, `"$h->{k}[0]"`).
+    /// Carries the variable name.  The lexer then emits normal code tokens for the subscript chain, terminated by
     /// `InterpChainEnd`.
     InterpScalarChainStart(String),
-    /// `@name` followed by a subscript — array slice or chained
-    /// subscript interpolation (e.g. `"@a[1..3]"`, `"@a{'k'}"`).
+    /// `@name` followed by a subscript — array slice or chained subscript interpolation (e.g. `"@a[1..3]"`,
+    /// `"@a{'k'}"`).
     InterpArrayChainStart(String),
-    /// End marker for a subscript chain started by either of
-    /// the `ChainStart` tokens above.  Emitted when the lexer
-    /// determines the chain is complete (closing bracket at
-    /// depth 0 with no continuation).
+    /// End marker for a subscript chain started by either of the `ChainStart` tokens above.  Emitted when the lexer
+    /// determines the chain is complete (closing bracket at depth 0 with no continuation).
     InterpChainEnd,
-    /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character
-    /// inside a string.  Emitted as a separate token (like
-    /// interpolation) so the AST preserves the original name
-    /// for tooling.  The resolved character is in `codepoint`.
+    /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character inside a string.  Emitted as a separate token (like
+    /// interpolation) so the AST preserves the original name for tooling.  The resolved character is in `codepoint`.
     NamedChar {
         name: String,
         codepoint: u32,
@@ -533,17 +524,14 @@ pub enum Token {
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.
     RegexSublexBegin(RegexKind, char),
-    /// `(?{` — embedded code block in a regex pattern.
-    /// Lexer switches to normal code mode until `}`.
+    /// `(?{` — embedded code block in a regex pattern.  Lexer switches to normal code mode until `}`.
     RegexCodeStart,
-    /// `(??{` — postponed regex code block.
-    /// Lexer switches to normal code mode until `}`.
+    /// `(??{` — postponed regex code block.  Lexer switches to normal code mode until `}`.
     RegexCondCodeStart,
 
     // ── Substitution / transliteration ──────────────────────────
-    /// Start of a substitution.  The delimiter char is carried so
-    /// the parser can pass it back to `start_subst_replacement`.
-    /// Pattern body tokens follow until SublexEnd.
+    /// Start of a substitution.  The delimiter char is carried so the parser can pass it back to
+    /// `start_subst_replacement`.  Pattern body tokens follow until SublexEnd.
     SubstSublexBegin(char),
     /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
     TranslitLit(String, String, Option<String>),
@@ -553,67 +541,53 @@ pub enum Token {
     HeredocBegin(HeredocKind, String),
     /// Body of a heredoc (sub-tokens if interpolating).
     HeredocEnd,
-    /// Complete heredoc with body already collected (bootstrap).
-    /// Fields: kind, tag, body.
+    /// Complete heredoc with body already collected (bootstrap).  Fields: kind, tag, body.
     HeredocLit(HeredocKind, String, String),
 
     // ── Special compile-time tokens ───────────────────────────
-    /// `__FILE__` — current source filename.  Captured at lex
-    /// time from `LexerSource::filename()`.
+    /// `__FILE__` — current source filename.  Captured at lex time from `LexerSource::filename()`.
     SourceFile(String),
-    /// `__LINE__` — current source line number.  Captured at lex
-    /// time.
+    /// `__LINE__` — current source line number.  Captured at lex time.
     SourceLine(u32),
-    /// `__PACKAGE__` — marker.  The parser fills in the current
-    /// package name when building the AST node (the lexer
+    /// `__PACKAGE__` — marker.  The parser fills in the current package name when building the AST node (the lexer
     /// doesn't track packages).
     CurrentPackage,
-    /// `__SUB__` — marker.  Gated on the `current_sub` feature;
-    /// the parser checks and either emits an `ExprKind::CurrentSub`
-    /// or falls back to treating it as a bareword.  No compile-time
-    /// value — it's a runtime reference to the current sub.
+    /// `__SUB__` — marker.  Gated on the `current_sub` feature; the parser checks and either emits an
+    /// `ExprKind::CurrentSub` or falls back to treating it as a bareword.  No compile-time value — it's a runtime
+    /// reference to the current sub.
     CurrentSub,
-    /// `__CLASS__` — marker.  Yields the name of the class being
-    /// constructed during field initializers and ADJUST blocks (5.38+).
+    /// `__CLASS__` — marker.  Yields the name of the class being constructed during field initializers and ADJUST
+    /// blocks (5.38+).
     CurrentClass,
 
     // ── Format sub-tokens ─────────────────────────────────────
-    /// Opens a `format NAME = ... .` body.  `name` is the format
-    /// name (defaults to `STDOUT` when omitted at the call site).
-    /// The sublex context ends with `SublexEnd` at the `.` terminator.
+    /// Opens a `format NAME = ... .` body.  `name` is the format name (defaults to `STDOUT` when omitted at the call
+    /// site).  The sublex context ends with `SublexEnd` at the `.` terminator.
     FormatSublexBegin(String),
     /// `# ...` — comment line inside a format (column-0 `#`).
     FormatComment(String),
     /// Whitespace-only line inside a format.
     FormatBlankLine,
-    /// A picture line containing no field specifiers.  Emitted
-    /// instead of the `FormatPictureBegin` / … / `FormatPictureEnd`
-    /// stream when the line has only literal text (tildes
-    /// normalized to spaces).
+    /// A picture line containing no field specifiers.  Emitted instead of the `FormatPictureBegin` / … /
+    /// `FormatPictureEnd` stream when the line has only literal text (tildes normalized to spaces).
     FormatLiteralLine(RepeatKind, String),
-    /// Start of a picture line that contains one or more fields.
-    /// Followed by alternating `FormatLiteral` and `FormatField`
-    /// tokens, then `FormatPictureEnd`, then `FormatArgsBegin`.
+    /// Start of a picture line that contains one or more fields.  Followed by alternating `FormatLiteral` and
+    /// `FormatField` tokens, then `FormatPictureEnd`, then `FormatArgsBegin`.
     FormatPictureBegin(RepeatKind),
-    /// Literal run of text between or around fields inside a
-    /// picture line.  Tildes have already been replaced with
-    /// spaces; the `RepeatKind` is on the enclosing
-    /// `FormatPictureBegin`.
+    /// Literal run of text between or around fields inside a picture line.  Tildes have already been replaced with
+    /// spaces; the `RepeatKind` is on the enclosing `FormatPictureBegin`.
     FormatLiteral(String),
     /// One field specifier in a picture line.
     FormatField(FieldKind),
     /// Closes a picture line.  Always followed by `FormatArgsBegin`.
     FormatPictureEnd,
-    /// Start of the argument line following a picture.  The lexer
-    /// emits normal code tokens until `FormatArgsEnd`.  Two modes:
+    /// Start of the argument line following a picture.  The lexer emits normal code tokens until `FormatArgsEnd`.  Two
+    /// modes:
     ///   * Line mode (default): newline terminates the args.
-    ///   * Braced mode: if the parser sees a `{` as the first
-    ///     token and calls `lexer.format_args_enter_braced()`,
-    ///     matching `}` terminates instead (expressions may span
-    ///     multiple lines).
+    ///   * Braced mode: if the parser sees a `{` as the first token and calls `lexer.format_args_enter_braced()`,
+    ///     matching `}` terminates instead (expressions may span multiple lines).
     FormatArgsBegin,
-    /// Closes the argument line.  Next token resumes format body
-    /// scanning.
+    /// Closes the argument line.  Next token resumes format body scanning.
     FormatArgsEnd,
 
     // ── Special ───────────────────────────────────────────────
@@ -623,8 +597,8 @@ pub enum Token {
     DataEnd(DataEndMarker),
     /// Yada yada yada (`...` as a statement).
     YadaYada,
-    /// `<STDIN>`, `<$fh>`, `<*.txt>` — readline or glob.
-    /// The bool is `true` for `<<>>` (safe double diamond, 3-arg open).
+    /// `<STDIN>`, `<$fh>`, `<*.txt>` — readline or glob.  The bool is `true` for `<<>>` (safe double diamond, 3-arg
+    /// open).
     Readline(String, bool),
 }
 
@@ -680,39 +654,33 @@ pub enum HeredocKind {
     IndentedLiteral,
 }
 
-/// Repeat behavior on a format picture line, controlled by `~` or
-/// `~~` characters anywhere in the line.
+/// Repeat behavior on a format picture line, controlled by `~` or `~~` characters anywhere in the line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepeatKind {
     /// No `~` on the line.
     None,
-    /// At least one `~` on the line: suppress the line if all
-    /// fields produce empty output.
+    /// At least one `~` on the line: suppress the line if all fields produce empty output.
     Suppress,
-    /// `~~` anywhere on the line: repeat the line until all fields
-    /// are exhausted (become undef).
+    /// `~~` anywhere on the line: repeat the line until all fields are exhausted (become undef).
     Repeat,
 }
 
 /// One field specifier in a format picture line.
 ///
-/// See `perlform` for details.  Widths are in source columns and
-/// include the leading `@` or `^` character.  `u32` matches Perl's
-/// internal representation (C `int`), which has been empirically
-/// verified to support fields wider than 65535.
+/// See `perlform` for details.  Widths are in source columns and include the leading `@` or `^` character.  `u32`
+/// matches Perl's internal representation (C `int`), which has been empirically verified to support fields wider than
+/// 65535.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
-    /// `@<<<<` — text, left-justified.  `truncate_ellipsis` is set
-    /// when the field ends with `...` (shown in output when the
-    /// value was truncated).
+    /// `@<<<<` — text, left-justified.  `truncate_ellipsis` is set when the field ends with `...` (shown in output when
+    /// the value was truncated).
     LeftJustify { width: u32, truncate_ellipsis: bool },
     /// `@>>>>` — text, right-justified.
     RightJustify { width: u32, truncate_ellipsis: bool },
     /// `@||||` — text, centered.
     Center { width: u32, truncate_ellipsis: bool },
 
-    /// `^<<<<` — fill mode, left-justified (word-wraps, chops the
-    /// source scalar).
+    /// `^<<<<` — fill mode, left-justified (word-wraps, chops the source scalar).
     FillLeft { width: u32, truncate_ellipsis: bool },
     /// `^>>>>` — fill mode, right-justified.
     FillRight { width: u32, truncate_ellipsis: bool },
@@ -721,15 +689,12 @@ pub enum FieldKind {
 
     /// `@*` — variable-width multi-line field.
     MultiLine,
-    /// `^*` — variable-width, one line at a time; chops the source
-    /// scalar.
+    /// `^*` — variable-width, one line at a time; chops the source scalar.
     FillMultiLine,
 
-    /// `@####` (integer) or `@####.##` (with fractional part).
-    /// `leading_zeros` is set when the first `#` was written as `0`
-    /// (pad with zeros instead of spaces).  `caret` is set for
-    /// `^###` — blanks the field when the value is undef instead
-    /// of rendering as 0.
+    /// `@####` (integer) or `@####.##` (with fractional part).  `leading_zeros` is set when the first `#` was written
+    /// as `0` (pad with zeros instead of spaces).  `caret` is set for `^###` — blanks the field when the value is undef
+    /// instead of rendering as 0.
     Numeric { integer_digits: u32, decimal_digits: Option<u32>, leading_zeros: bool, caret: bool },
 }
 
@@ -815,12 +780,9 @@ impl std::fmt::Display for Token {
 
 // ── Case-modification flags ─────────────────────────────────────
 //
-// Tracks the active `\L`/`\U`/`\F`/`\Q` state inside interpolating
-// strings.  Stored as bitflags for cheap copy/combine.  The lexer
-// maintains a stack of these (each entry is the cumulative flags
-// at that nesting level); `\l`/`\u` one-shots are tracked
-// separately but have their own flag bits so they can be attached
-// to interpolation tokens for the parser.
+// Tracks the active `\L`/`\U`/`\F`/`\Q` state inside interpolating strings.  Stored as bitflags for cheap copy/combine.
+// The lexer maintains a stack of these (each entry is the cumulative flags at that nesting level); `\l`/`\u` one-shots
+// are tracked separately but have their own flag bits so they can be attached to interpolation tokens for the parser.
 
 use std::ops::{BitOr, BitOrAssign};
 

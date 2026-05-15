@@ -1,23 +1,18 @@
 //! Symbol table — tracks packages, subroutines, and imports.
 //!
-//! Populated as the parser encounters `sub` declarations, `package`
-//! statements, and (eventually) `use` imports.  Consulted at call
-//! sites to drive prototype-aware argument parsing.
+//! Populated as the parser encounters `sub` declarations, `package` statements, and (eventually) `use` imports.
+//! Consulted at call sites to drive prototype-aware argument parsing.
 //!
 //! ## Organization
 //!
-//! * [`SymbolTable`] owns the tree of all known packages, keyed by
-//!   package name.
-//! * [`Namespace`] represents a single package's stash: a map of
-//!   subs declared in that package, plus a map of imports that have
-//!   been pulled into its local namespace.
-//! * [`SubInfo`] is what we know about a single subroutine: its
-//!   prototype (if any), attributes, and whether we've seen a body
-//!   for it yet.
+//! * [`SymbolTable`] owns the tree of all known packages, keyed by package name.
+//! * [`Namespace`] represents a single package's stash: a map of subs declared in that package, plus a map of imports
+//!   that have been pulled into its local namespace.
+//! * [`SubInfo`] is what we know about a single subroutine: its prototype (if any), attributes, and whether we've seen
+//!   a body for it yet.
 //!
-//! The parser holds a `SymbolTable` and a `current_package: Arc<str>`
-//! pointer into it.  Package switches (`package Foo;`, block form
-//! `package Foo { ... }`) just update the pointer.
+//! The parser holds a `SymbolTable` and a `current_package: Arc<str>` pointer into it.  Package switches (`package
+//! Foo;`, block form `package Foo { ... }`) just update the pointer.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -31,17 +26,14 @@ mod tests;
 
 /// A parsed Perl subroutine prototype.
 ///
-/// Perl stores prototypes as raw strings like `"$$"`, `"\@;@"`,
-/// `"&@"`.  We parse once at declaration time into a structured form
-/// for efficient consultation at call sites.
+/// Perl stores prototypes as raw strings like `"$$"`, `"\@;@"`, `"&@"`.  We parse once at declaration time into a
+/// structured form for efficient consultation at call sites.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubPrototype {
-    /// The raw prototype string as written in the source.  Preserved
-    /// for round-tripping and diagnostics.
+    /// The raw prototype string as written in the source.  Preserved for round-tripping and diagnostics.
     pub raw: String,
-    /// Number of required slots at the front of `slots`.  The
-    /// remaining `slots.len() - required` slots are optional (after
-    /// the `;` separator in the raw prototype).
+    /// Number of required slots at the front of `slots`.  The remaining `slots.len() - required` slots are optional
+    /// (after the `;` separator in the raw prototype).
     pub required: usize,
     /// Ordered list of argument slots.
     pub slots: Vec<ProtoSlot>,
@@ -60,16 +52,13 @@ pub enum ProtoSlot {
     Glob,
     /// `+` — array or hash (Perl 5.14+).  Not auto-referenced.
     ArrayOrHash,
-    /// `\X` — auto-reference the argument, which must be of the
-    /// given reference kind.
+    /// `\X` — auto-reference the argument, which must be of the given reference kind.
     AutoRef(RefKind),
-    /// `\[...]` — auto-reference, with the argument allowed to be
-    /// any one of the listed kinds.
+    /// `\[...]` — auto-reference, with the argument allowed to be any one of the listed kinds.
     AutoRefOneOf(Vec<RefKind>),
     /// `@` — absorb all remaining arguments as a list.  Always last.
     SlurpyList,
-    /// `%` — absorb all remaining arguments as key-value pairs.
-    /// Always last.
+    /// `%` — absorb all remaining arguments as key-value pairs.  Always last.
     SlurpyHash,
 }
 
@@ -92,19 +81,17 @@ pub enum RefKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrototypeError {
     pub message: String,
-    /// Byte offset into the prototype string where the error was
-    /// detected.
+    /// Byte offset into the prototype string where the error was detected.
     pub position: usize,
 }
 
 impl SubPrototype {
     /// Parse a prototype string into structured form.
     ///
-    /// Accepts the raw characters from between `(...)` in a `sub`
-    /// declaration, e.g. `"$$"`, `"\@;@"`, `"&@"`, `"_"`, `"\[$@%]"`.
+    /// Accepts the raw characters from between `(...)` in a `sub` declaration, e.g. `"$$"`, `"\@;@"`, `"&@"`, `"_"`,
+    /// `"\[$@%]"`.
     ///
-    /// Whitespace in prototypes is ignored (Perl allows spacing for
-    /// readability).
+    /// Whitespace in prototypes is ignored (Perl allows spacing for readability).
     pub fn parse(raw: &str) -> Result<Self, PrototypeError> {
         let bytes = raw.as_bytes();
         let mut slots = Vec::new();
@@ -121,9 +108,8 @@ impl SubPrototype {
                     continue;
                 }
                 b';' => {
-                    // Marker between required and optional.  If we
-                    // see this twice, later ones are harmless no-ops
-                    // in Perl (only the first `;` matters).
+                    // Marker between required and optional.  If we see this twice, later ones are harmless no-ops in
+                    // Perl (only the first `;` matters).
                     if !required_complete {
                         required_count = slots.len();
                         required_complete = true;
@@ -134,8 +120,7 @@ impl SubPrototype {
                 _ => {}
             }
 
-            // Slurpy slots (@, %) must appear last.  Once we've seen
-            // one, no further slots are allowed.
+            // Slurpy slots (@, %) must appear last.  Once we've seen one, no further slots are allowed.
             if matches!(slots.last(), Some(ProtoSlot::SlurpyList | ProtoSlot::SlurpyHash)) {
                 return Err(PrototypeError { message: "prototype character after slurpy @ or %".to_string(), position: i });
             }
@@ -170,8 +155,7 @@ impl SubPrototype {
                     ProtoSlot::SlurpyHash
                 }
                 b'\\' => {
-                    // Backslash introduces auto-ref.  Next byte is
-                    // either a single ref char or a `[...]` group.
+                    // Backslash introduces auto-ref.  Next byte is either a single ref char or a `[...]` group.
                     i += 1;
                     if i >= bytes.len() {
                         return Err(PrototypeError { message: "trailing backslash in prototype".to_string(), position: i - 1 });
@@ -243,15 +227,14 @@ fn ref_kind_from_byte(b: u8) -> Option<RefKind> {
 
 /// Everything the parser knows about a subroutine.
 ///
-/// `name` is the bare name (no `Foo::` prefix); the containing
-/// package is implicit from which `Namespace` holds this `SubInfo`.
+/// `name` is the bare name (no `Foo::` prefix); the containing package is implicit from which `Namespace` holds this
+/// `SubInfo`.
 #[derive(Clone, Debug)]
 pub struct SubInfo {
     pub name: Arc<str>,
     pub prototype: Option<SubPrototype>,
     pub attributes: Vec<String>,
-    /// `true` if we've only seen a forward declaration so far
-    /// (`sub foo ($$);` without a body).  Cleared when a full
+    /// `true` if we've only seen a forward declaration so far (`sub foo ($$);` without a body).  Cleared when a full
     /// definition is encountered.
     pub forward_declaration: bool,
 }
@@ -267,16 +250,14 @@ pub struct ImportTarget {
 
 // ─── Single-package namespace ─────────────────────────────────────
 
-/// One Perl package's stash: its locally-declared subs and its
-/// imports.
+/// One Perl package's stash: its locally-declared subs and its imports.
 #[derive(Clone, Debug, Default)]
 pub struct Namespace {
     pub name: Arc<str>,
     /// Subs declared in this package, keyed by bare name.
     pub subs: BTreeMap<Arc<str>, SubInfo>,
-    /// Imports pulled into this package: local_name → (target_package,
-    /// target_name).  Populated by `use` (not yet implemented; API
-    /// ready for it).
+    /// Imports pulled into this package: local_name → (target_package, target_name).  Populated by `use` (not yet
+    /// implemented; API ready for it).
     pub imports: BTreeMap<Arc<str>, ImportTarget>,
 }
 
@@ -285,15 +266,14 @@ impl Namespace {
         Namespace { name, subs: BTreeMap::new(), imports: BTreeMap::new() }
     }
 
-    /// Look up a sub in this package's local subs only.  Does not
-    /// follow imports.  For cross-package resolution with import
-    /// chasing, use [`SymbolTable::lookup`].
+    /// Look up a sub in this package's local subs only.  Does not follow imports.  For cross-package resolution with
+    /// import chasing, use [`SymbolTable::lookup`].
     pub fn lookup_sub(&self, bare_name: &str) -> Option<&SubInfo> {
         self.subs.get(bare_name)
     }
 
-    /// Declare a sub in this package, replacing any existing entry
-    /// of the same name (which handles forward-decl → full-defn).
+    /// Declare a sub in this package, replacing any existing entry of the same name (which handles forward-decl →
+    /// full-defn).
     pub fn declare_sub(&mut self, bare_name: &str, prototype: Option<SubPrototype>, attributes: Vec<String>, forward_declaration: bool) {
         let name: Arc<str> = Arc::from(bare_name);
         self.subs.insert(name.clone(), SubInfo { name, prototype, attributes, forward_declaration });
@@ -333,13 +313,11 @@ impl SymbolTable {
         self.namespaces.values()
     }
 
-    /// Import a sub from one package into another's local namespace.
-    /// After this, looking up `local_name` with `into_package` as
-    /// the default package resolves to (`from_package`, `from_name`).
+    /// Import a sub from one package into another's local namespace.  After this, looking up `local_name` with
+    /// `into_package` as the default package resolves to (`from_package`, `from_name`).
     ///
-    /// Creates either namespace lazily if absent.  The target is
-    /// stored as a name pair; it does not need to exist at the time
-    /// of import (forward references are allowed).
+    /// Creates either namespace lazily if absent.  The target is stored as a name pair; it does not need to exist at
+    /// the time of import (forward references are allowed).
     pub fn import(&mut self, into_package: &str, local_name: &str, from_package: &str, from_name: &str) {
         // Ensure the source namespace exists (even if empty) so that
         // packages() reflects everything we've heard of.
@@ -351,14 +329,11 @@ impl SymbolTable {
 
     /// Look up a sub by the name as written at a call site.
     ///
-    /// * If `name` contains `::`, it's treated as fully-qualified:
-    ///   the part before the last `::` is the package, and we look
-    ///   only in that package (plus its import chain).
-    /// * Otherwise, `name` is bare and we look in `default_package`
-    ///   first, then follow that namespace's imports.
+    /// * If `name` contains `::`, it's treated as fully-qualified: the part before the last `::` is the package, and we
+    ///   look only in that package (plus its import chain).
+    /// * Otherwise, `name` is bare and we look in `default_package` first, then follow that namespace's imports.
     ///
-    /// Import chains are followed up to a depth sufficient to detect
-    /// cycles; a cycle returns `None`.
+    /// Import chains are followed up to a depth sufficient to detect cycles; a cycle returns `None`.
     pub fn lookup(&self, name: &str, default_package: &str) -> Option<&SubInfo> {
         let (package, bare) = split_qualified_name(name, default_package);
         self.resolve(package, bare)
@@ -366,12 +341,10 @@ impl SymbolTable {
 
     /// Resolve a (package, bare) pair, following imports.
     fn resolve(&self, package: &str, bare: &str) -> Option<&SubInfo> {
-        // Use Arc<str> for the iteration variables.  The first
-        // iteration allocates from the caller's &str; subsequent
-        // iterations clone the Arc<str>s stored on the import
-        // target, which is an atomic ref-count bump rather than a
-        // byte copy.  This also keeps the types consistent with
-        // the storage on `SubInfo` / `ImportTarget` / `Namespace`.
+        // Use Arc<str> for the iteration variables.  The first iteration allocates from the caller's &str; subsequent
+        // iterations clone the Arc<str>s stored on the import target, which is an atomic ref-count bump rather than a
+        // byte copy.  This also keeps the types consistent with the storage on `SubInfo` / `ImportTarget` /
+        // `Namespace`.
         let mut package: Arc<str> = Arc::from(package);
         let mut bare: Arc<str> = Arc::from(bare);
         let mut visited: HashSet<(Arc<str>, Arc<str>)> = HashSet::new();
@@ -396,9 +369,8 @@ impl SymbolTable {
 
 /// Split a name that may be bare or fully-qualified.
 ///
-/// Returns `(package, bare_name)`.  If the name contains `::`, the
-/// package is the prefix before the last `::`; otherwise it's
-/// `default_package`.
+/// Returns `(package, bare_name)`.  If the name contains `::`, the package is the prefix before the last `::`;
+/// otherwise it's `default_package`.
 fn split_qualified_name<'a>(name: &'a str, default_package: &'a str) -> (&'a str, &'a str) {
     match name.rfind("::") {
         Some(idx) => (&name[..idx], &name[idx + 2..]),

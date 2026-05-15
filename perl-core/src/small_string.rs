@@ -1,8 +1,7 @@
 //! Inline small string — up to 22 bytes with no heap allocation.
 //!
-//! Used for the compact `Value::SmallStr` variant.  Most hash keys,
-//! identifiers, short literals, and numeric stringifications fit
-//! within 22 bytes.
+//! Used for the compact `Value::SmallStr` variant.  Most hash keys, identifiers, short literals, and numeric
+//! stringifications fit within 22 bytes.
 
 use std::fmt;
 
@@ -15,8 +14,8 @@ pub const SMALL_STRING_MAX: usize = 22;
 
 /// An inline Perl string that fits in 24 bytes total (22 data + len + flag).
 ///
-/// Like [`PerlString`], this is an octet sequence with an optional UTF-8 flag,
-/// but stored entirely on the stack with no heap allocation.
+/// Like [`PerlString`], this is an octet sequence with an optional UTF-8 flag, but stored entirely on the stack with no
+/// heap allocation.
 ///
 /// # Invariant
 ///
@@ -102,10 +101,8 @@ impl SmallString {
 
     // ── Conversion to heap-allocated PerlString ───────────────────
 
-    /// Promote to a heap-allocated `PerlString`.
-    /// This is a one-way operation — used when the string needs to
-    /// grow beyond [`SMALL_STRING_MAX`] bytes or when a `PerlString`
-    /// is required.
+    /// Promote to a heap-allocated `PerlString`.  This is a one-way operation — used when the string needs to grow
+    /// beyond [`SMALL_STRING_MAX`] bytes or when a `PerlString` is required.
     pub fn to_perl_string(&self) -> PerlString {
         // SAFETY: if is_utf8, then as_bytes() is valid UTF-8.
         unsafe { PerlString::from_bytes_utf8_unchecked(self.as_bytes().to_vec(), self.is_utf8) }
@@ -115,9 +112,8 @@ impl SmallString {
 
     /// Parse as i64 with Perl's numeric conversion rules.
     pub fn parse_iv(&self) -> i64 {
-        // Re-use PerlString's parsing by creating a temporary.
-        // This is a cold path — numeric conversion of a SmallString
-        // will typically upgrade it to a full Scalar anyway.
+        // Re-use PerlString's parsing by creating a temporary.  This is a cold path — numeric conversion of a
+        // SmallString will typically upgrade it to a full Scalar anyway.
         self.to_perl_string().parse_iv()
     }
 
@@ -147,8 +143,7 @@ impl fmt::Display for SmallString {
     }
 }
 
-/// Try to convert a `&str` into a `SmallString`.
-/// Fails if the string is longer than [`SMALL_STRING_MAX`] bytes.
+/// Try to convert a `&str` into a `SmallString`.  Fails if the string is longer than [`SMALL_STRING_MAX`] bytes.
 impl TryFrom<&str> for SmallString {
     type Error = ();
 

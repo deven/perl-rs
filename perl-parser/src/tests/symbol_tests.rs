@@ -239,8 +239,7 @@ fn symtab_import_chain() {
 #[test]
 fn symtab_import_cycle_returns_none() {
     let mut st = SymbolTable::new();
-    // A imports from B imports from A — infinite loop without
-    // a visited guard.
+    // A imports from B imports from A — infinite loop without a visited guard.
     st.import("A", "x", "B", "x");
     st.import("B", "x", "A", "x");
     assert!(st.lookup("x", "A").is_none());
@@ -270,12 +269,10 @@ fn symtab_local_overrides_import() {
 #[test]
 fn symtab_fqn_does_not_follow_default_imports() {
     let mut st = SymbolTable::new();
-    // Default package has an import; explicit FQN to another
-    // package should ignore it.
+    // Default package has an import; explicit FQN to another package should ignore it.
     st.entry("Real").declare_sub("x", None, vec![], false);
     st.import("Shadow", "x", "Real", "x");
-    // Looking up "Shadow::x" resolves via Shadow's imports →
-    // Real::x.  Looking up "Real::x" finds it directly.
+    // Looking up "Shadow::x" resolves via Shadow's imports → Real::x.  Looking up "Real::x" finds it directly.
     assert!(st.lookup("Shadow::x", "Other").is_some());
     assert!(st.lookup("Real::x", "Other").is_some());
     // But "x" (bare) in Other finds nothing.

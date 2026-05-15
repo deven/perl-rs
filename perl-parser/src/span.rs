@@ -1,7 +1,7 @@
 //! Source location tracking.
 //!
-//! Every token and AST node carries a `Span` recording its byte range
-//! in the source.  This supports diagnostics, source maps, and tooling.
+//! Every token and AST node carries a `Span` recording its byte range in the source.  This supports diagnostics, source
+//! maps, and tooling.
 
 /// A half-open byte range `[start, end)` in the source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -4,9 +4,8 @@ use crate::token::Keyword;
 
 /// Look up a keyword by name.  Returns `None` if not a keyword.
 pub fn lookup_keyword(name: &str) -> Option<Keyword> {
-    // Sorted by frequency of use for fast early-exit in a match.
-    // (A perfect hash or phf would be better for production, but
-    // a match is simpler and correct for bootstrapping.)
+    // Sorted by frequency of use for fast early-exit in a match.  (A perfect hash or phf would be better for
+    // production, but a match is simpler and correct for bootstrapping.)
     match name {
         "my" => Some(Keyword::My),
         "sub" => Some(Keyword::Sub),
@@ -556,8 +555,7 @@ impl From<Keyword> for &'static str {
     }
 }
 
-/// Is this keyword a named unary operator?
-/// After a named unary, the next thing is a term (so `/` is regex).
+/// Is this keyword a named unary operator?  After a named unary, the next thing is a term (so `/` is regex).
 pub fn is_named_unary(kw: Keyword) -> bool {
     matches!(
         kw,
@@ -643,9 +641,8 @@ pub fn is_named_unary(kw: Keyword) -> bool {
 
 /// Is this keyword a nullary builtin (takes no arguments)?
 ///
-/// Nullary builtins never consume a following term as an argument,
-/// so `time+86_400` is always `time() + 86_400`.  They do accept
-/// explicit empty parens: `time()`.
+/// Nullary builtins never consume a following term as an argument, so `time+86_400` is always `time() + 86_400`.  They
+/// do accept explicit empty parens: `time()`.
 pub fn is_nullary(kw: Keyword) -> bool {
     matches!(
         kw,
@@ -675,15 +672,13 @@ pub fn is_nullary(kw: Keyword) -> bool {
 
 /// Does this operator prefer `//` as defined-or over an empty regex argument?
 ///
-/// Matches toke.c's `UNIDOR` macro: shift, pop, getc, pos, readline,
-/// readlink, undef, umask.  After these operators, `shift // 0` is
-/// parsed as `shift() // 0`, not `shift(m//)`.
+/// Matches toke.c's `UNIDOR` macro: shift, pop, getc, pos, readline, readlink, undef, umask.  After these operators,
+/// `shift // 0` is parsed as `shift() // 0`, not `shift(m//)`.
 pub fn prefers_defined_or(kw: Keyword) -> bool {
     matches!(kw, Keyword::Shift | Keyword::Pop | Keyword::Getc | Keyword::Pos | Keyword::Readline | Keyword::Readlink | Keyword::Undef | Keyword::Umask)
 }
 
-/// Is this keyword a list operator?
-/// After a list op, the next thing is a term (so `/` is regex).
+/// Is this keyword a list operator?  After a list op, the next thing is a term (so `/` is regex).
 pub fn is_list_op(kw: Keyword) -> bool {
     matches!(
         kw,
@@ -781,21 +776,18 @@ pub fn is_list_op(kw: Keyword) -> bool {
     )
 }
 
-/// Is this keyword a block-list operator (sort/map/grep)?
-/// These take an optional block as the first argument.
+/// Is this keyword a block-list operator (sort/map/grep)?  These take an optional block as the first argument.
 pub fn is_block_list_op(kw: Keyword) -> bool {
     matches!(kw, Keyword::Sort | Keyword::Map | Keyword::Grep | Keyword::Any | Keyword::All)
 }
 
-/// Is this keyword a print-like operator?
-/// These take an optional filehandle as the first argument.
+/// Is this keyword a print-like operator?  These take an optional filehandle as the first argument.
 pub fn is_print_op(kw: Keyword) -> bool {
     matches!(kw, Keyword::Print | Keyword::Say | Keyword::Printf)
 }
 
-/// Keywords that have dedicated statement-level handlers in the parser.
-/// These are consumed before dispatching, so they need the fat comma
-/// check at the statement level rather than in parse_term.
+/// Keywords that have dedicated statement-level handlers in the parser.  These are consumed before dispatching, so they
+/// need the fat comma check at the statement level rather than in parse_term.
 pub fn is_statement_keyword(kw: Keyword) -> bool {
     matches!(
         kw,
@@ -834,11 +826,9 @@ pub fn is_statement_keyword(kw: Keyword) -> bool {
 
 /// Is this keyword "strong" (`+` in regen/keywords.pl)?
 ///
-/// Strong keywords always take precedence over user-defined subs.
-/// Weak keywords (the negation) can be overridden by imported subs
-/// (via `use subs`, `Exporter`, etc.).  A local `sub abs { }` produces
-/// an "Ambiguous call resolved as CORE::abs()" warning but the keyword
-/// still wins; only an imported sub actually overrides.
+/// Strong keywords always take precedence over user-defined subs.  Weak keywords (the negation) can be overridden by
+/// imported subs (via `use subs`, `Exporter`, etc.).  A local `sub abs { }` produces an "Ambiguous call resolved as
+/// CORE::abs()" warning but the keyword still wins; only an imported sub actually overrides.
 pub fn is_strong(kw: Keyword) -> bool {
     matches!(
         kw,
@@ -905,9 +895,8 @@ pub fn is_strong(kw: Keyword) -> bool {
 
 /// Is this keyword "weak" (`-` in regen/keywords.pl)?
 ///
-/// Weak keywords can be overridden by imported subs.  When the lexer
-/// encounters a weak keyword whose name has been imported into the
-/// current package, it emits `Token::Ident` instead of `Token::Keyword`.
+/// Weak keywords can be overridden by imported subs.  When the lexer encounters a weak keyword whose name has been
+/// imported into the current package, it emits `Token::Ident` instead of `Token::Keyword`.
 pub fn is_weak(kw: Keyword) -> bool {
     !is_strong(kw)
 }

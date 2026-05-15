@@ -1,16 +1,14 @@
 //! String cache slot for the `Scalar` struct.
 //!
-//! This enum provides small-string optimization within the `bytes` field
-//! of a full `Scalar`.  Even after a value has been upgraded from a
-//! compact `Value` variant to a full `Scalar` (behind `Arc<RwLock<>>`),
-//! short strings in the cache avoid an additional heap allocation.
+//! This enum provides small-string optimization within the `bytes` field of a full `Scalar`.  Even after a value has
+//! been upgraded from a compact `Value` variant to a full `Scalar` (behind `Arc<RwLock<>>`), short strings in the cache
+//! avoid an additional heap allocation.
 
 use std::fmt;
 
 use crate::PerlString;
 
-/// Maximum bytes for an inline string within a `PerlStringSlot`.
-/// Sized to match `PerlString` so the enum doesn't grow.
+/// Maximum bytes for an inline string within a `PerlStringSlot`.  Sized to match `PerlString` so the enum doesn't grow.
 pub const SLOT_INLINE_MAX: usize = 24;
 
 /// The string cache inside a `Scalar`.
@@ -19,8 +17,8 @@ pub const SLOT_INLINE_MAX: usize = 24;
 /// - `Inline` — short string stored directly in the Scalar struct.
 /// - `Heap` — longer string on the heap via `PerlString`.
 ///
-/// Note that `None` means "no string cache", not "empty string".
-/// An empty string is `Inline { len: 0, .. }` with STR_VALID set.
+/// Note that `None` means "no string cache", not "empty string".  An empty string is `Inline { len: 0, .. }` with
+/// STR_VALID set.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub enum PerlStringSlot {
     /// No string representation cached.
@@ -127,8 +125,7 @@ impl PerlStringSlot {
         self.len() == 0
     }
 
-    /// Convert the cached value to a `PerlString`.
-    /// Returns `None` if no string is cached.
+    /// Convert the cached value to a `PerlString`.  Returns `None` if no string is cached.
     pub fn to_perl_string(&self) -> Option<PerlString> {
         match self {
             PerlStringSlot::None => None,

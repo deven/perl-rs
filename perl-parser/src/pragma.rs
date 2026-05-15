@@ -1,21 +1,17 @@
 //! Lexically-scoped pragma state that affects parsing.
 //!
-//! Perl's `use feature`, `use utf8`, and version bundles
-//! (`use v5.36`) all influence how source code is parsed.  The
-//! parser tracks them in [`Pragmas`], which is saved on block entry
-//! and restored on block exit so the effect remains lexical.
+//! Perl's `use feature`, `use utf8`, and version bundles (`use v5.36`) all influence how source code is parsed.  The
+//! parser tracks them in [`Pragmas`], which is saved on block entry and restored on block exit so the effect remains
+//! lexical.
 //!
-//! The feature set and bundle contents are modeled on the
-//! `perlfeature` manpage; see the module tests for the exact
+//! The feature set and bundle contents are modeled on the `perlfeature` manpage; see the module tests for the exact
 //! bundle membership.
 //!
 //! ## Phase 1 scope
 //!
-//! This module tracks state only; no existing parsing behavior
-//! changes based on the recorded flags yet.  Future phases will
-//! consult [`Pragmas::features`] to, e.g., choose between prototype
-//! and signature parsing for `sub foo (...)`, or to enable
-//! postderef syntax.
+//! This module tracks state only; no existing parsing behavior changes based on the recorded flags yet.  Future phases
+//! will consult [`Pragmas::features`] to, e.g., choose between prototype and signature parsing for `sub foo (...)`, or
+//! to enable postderef syntax.
 
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 
@@ -26,16 +22,15 @@ mod tests;
 
 /// Set of features enabled via `use feature`.
 ///
-/// Stored as a bit-set for cheap copy (save/restore across block
-/// boundaries is the hot path).  Each feature has an associated
-/// constant; operator overloads let bundles be expressed naturally
-/// as `Features::SAY | Features::STATE | Features::SIGNATURES`.
+/// Stored as a bit-set for cheap copy (save/restore across block boundaries is the hot path).  Each feature has an
+/// associated constant; operator overloads let bundles be expressed naturally as `Features::SAY | Features::STATE |
+/// Features::SIGNATURES`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features(u32);
 
 impl Features {
-    /// No features active.  Not the same as the `:default` bundle —
-    /// see [`Features::DEFAULT`] for the pre-`use feature` baseline.
+    /// No features active.  Not the same as the `:default` bundle — see [`Features::DEFAULT`] for the pre-`use feature`
+    /// baseline.
     pub const EMPTY: Features = Features(0);
 
     // ── Individual features ───────────────────────────────────
@@ -44,11 +39,9 @@ impl Features {
     pub const SAY: Features = Features(1 << 0);
     /// `state` — makes `state` a keyword (5.10+).
     pub const STATE: Features = Features(1 << 1);
-    /// `switch` — enables `given`/`when`/`default` (5.10, removed
-    /// from the `:5.36` bundle and later).
+    /// `switch` — enables `given`/`when`/`default` (5.10, removed from the `:5.36` bundle and later).
     pub const SWITCH: Features = Features(1 << 2);
-    /// `smartmatch` — the `~~` operator.  Enabled by default
-    /// through the `:5.40` bundle, removed from `:5.42`.
+    /// `smartmatch` — the `~~` operator.  Enabled by default through the `:5.40` bundle, removed from `:5.42`.
     pub const SMARTMATCH: Features = Features(1 << 3);
     /// `evalbytes` — makes `evalbytes` a keyword (5.16+).
     pub const EVALBYTES: Features = Features(1 << 4);
@@ -56,21 +49,15 @@ impl Features {
     pub const CURRENT_SUB: Features = Features(1 << 5);
     /// `fc` — makes `fc` a keyword (5.16+).
     pub const FC: Features = Features(1 << 6);
-    /// `postderef` — the historical name for postfix dereference
-    /// syntax *outside* interpolating strings.  As of Perl 5.24
-    /// the syntax is always on regardless of this flag, so the
-    /// bit is effectively cosmetic: enabling or disabling it has
-    /// no parsing effect.  Kept as a distinct flag from
-    /// [`Features::POSTDEREF_QQ`] so that `use feature 'postderef';`
-    /// doesn't accidentally enable the qq extension.
+    /// `postderef` — the historical name for postfix dereference syntax *outside* interpolating strings.  As of Perl
+    /// 5.24 the syntax is always on regardless of this flag, so the bit is effectively cosmetic: enabling or disabling
+    /// it has no parsing effect.  Kept as a distinct flag from [`Features::POSTDEREF_QQ`] so that `use feature
+    /// 'postderef';` doesn't accidentally enable the qq extension.
     pub const POSTDEREF: Features = Features(1 << 7);
-    /// `postderef_qq` — postfix dereference inside interpolating
-    /// strings (5.20+, stable in `:5.24`+).  This is the flag
-    /// that actually gates parsing behavior; plain `postderef` is
-    /// a no-op but distinct.
+    /// `postderef_qq` — postfix dereference inside interpolating strings (5.20+, stable in `:5.24`+).  This is the flag
+    /// that actually gates parsing behavior; plain `postderef` is a no-op but distinct.
     pub const POSTDEREF_QQ: Features = Features(1 << 27);
-    /// `signatures` — `sub foo ($x, $y) { ... }` parses as a
-    /// signature rather than a prototype (stable in `:5.36`+).
+    /// `signatures` — `sub foo ($x, $y) { ... }` parses as a signature rather than a prototype (stable in `:5.36`+).
     pub const SIGNATURES: Features = Features(1 << 8);
     /// `refaliasing` — `\$x = \$y;` (experimental, 5.22+).
     pub const REFALIASING: Features = Features(1 << 9);
@@ -78,41 +65,32 @@ impl Features {
     pub const DECLARED_REFS: Features = Features(1 << 10);
     /// `isa` — the `isa` infix operator (stable in `:5.36`+).
     pub const ISA: Features = Features(1 << 11);
-    /// `try` — `try { ... } catch ($e) { ... }` (enters the
-    /// `:5.40` bundle).
+    /// `try` — `try { ... } catch ($e) { ... }` (enters the `:5.40` bundle).
     pub const TRY: Features = Features(1 << 12);
     /// `defer` — `defer { ... }` (experimental, 5.36+).
     pub const DEFER: Features = Features(1 << 13);
-    /// `class` — `class Name { field $x; method ... }`
-    /// (experimental, 5.38+).
+    /// `class` — `class Name { field $x; method ... }` (experimental, 5.38+).
     pub const CLASS: Features = Features(1 << 14);
-    /// `extra_paired_delimiters` — more delimiter pairs for
-    /// quote-like operators (experimental, 5.36+).
+    /// `extra_paired_delimiters` — more delimiter pairs for quote-like operators (experimental, 5.36+).
     pub const EXTRA_PAIRED_DELIMITERS: Features = Features(1 << 15);
-    /// `bareword_filehandles` — bareword filehandles recognized;
-    /// in `:default`, dropped from `:5.38` and later.
+    /// `bareword_filehandles` — bareword filehandles recognized; in `:default`, dropped from `:5.38` and later.
     pub const BAREWORD_FILEHANDLES: Features = Features(1 << 16);
-    /// `indirect` — indirect method call syntax (`new Foo`);
-    /// in `:default`, dropped from `:5.36` and later.
+    /// `indirect` — indirect method call syntax (`new Foo`); in `:default`, dropped from `:5.36` and later.
     pub const INDIRECT: Features = Features(1 << 17);
-    /// `apostrophe_as_package_separator` — `'` acts as `::` in
-    /// source-level names.  In `:default`, dropped from `:5.42`.
+    /// `apostrophe_as_package_separator` — `'` acts as `::` in source-level names.  In `:default`, dropped from
+    /// `:5.42`.
     pub const APOSTROPHE_AS_PACKAGE_SEPARATOR: Features = Features(1 << 18);
-    /// `multidimensional` — `$h{a,b}` lookup emulation;
-    /// in `:default`, dropped from `:5.36` and later.
+    /// `multidimensional` — `$h{a,b}` lookup emulation; in `:default`, dropped from `:5.36` and later.
     pub const MULTIDIMENSIONAL: Features = Features(1 << 19);
     /// `unicode_strings` (5.12+).
     pub const UNICODE_STRINGS: Features = Features(1 << 20);
     /// `unicode_eval` (5.16+).
     pub const UNICODE_EVAL: Features = Features(1 << 21);
-    /// `bitwise` — numeric vs. string-bitwise op selection
-    /// (stable in `:5.28`+).
+    /// `bitwise` — numeric vs. string-bitwise op selection (stable in `:5.28`+).
     pub const BITWISE: Features = Features(1 << 22);
-    /// `module_true` — modules don't need an explicit trailing
-    /// true value (enters the `:5.38` bundle).
+    /// `module_true` — modules don't need an explicit trailing true value (enters the `:5.38` bundle).
     pub const MODULE_TRUE: Features = Features(1 << 23);
-    /// `lexical_subs` — `my sub` etc.  Enabled unconditionally
-    /// since 5.26, tracked here for pre-5.26 source.
+    /// `lexical_subs` — `my sub` etc.  Enabled unconditionally since 5.26, tracked here for pre-5.26 source.
     pub const LEXICAL_SUBS: Features = Features(1 << 24);
     /// `keyword_any` — experimental `any` operator.
     pub const KEYWORD_ANY: Features = Features(1 << 25);
@@ -121,8 +99,7 @@ impl Features {
 
     // ── Pre-made bundles ──────────────────────────────────────
 
-    /// The `:default` bundle — features active before any
-    /// `use feature` or `use vN.M` declaration.
+    /// The `:default` bundle — features active before any `use feature` or `use vN.M` declaration.
     pub const DEFAULT: Features =
         Features(Self::INDIRECT.0 | Self::MULTIDIMENSIONAL.0 | Self::BAREWORD_FILEHANDLES.0 | Self::APOSTROPHE_AS_PACKAGE_SEPARATOR.0 | Self::SMARTMATCH.0);
 
@@ -175,10 +152,8 @@ impl Features {
         self.0 &= !other.0;
     }
 
-    /// Apply a version bundle.  `use v5.36` or `use 5.036` both
-    /// arrive here as `(5, 36)`.  Replaces `self` with exactly the
-    /// bundle's feature set — matches Perl's "use vN.M does an
-    /// implicit `no feature ':all'; use feature ':5.N';`"
+    /// Apply a version bundle.  `use v5.36` or `use 5.036` both arrive here as `(5, 36)`.  Replaces `self` with exactly
+    /// the bundle's feature set — matches Perl's "use vN.M does an implicit `no feature ':all'; use feature ':5.N';`"
     /// behavior.
     ///
     /// Versions below 5.10 load the `:default` bundle.
@@ -187,10 +162,8 @@ impl Features {
     }
 }
 
-/// Look up a feature or bundle name as written in `use feature
-/// 'NAME'`.  Handles both individual features and bundle
-/// aliases (`:all`, `:default`, `:5.N`).  Returns `None` for
-/// unknown names.
+/// Look up a feature or bundle name as written in `use feature 'NAME'`.  Handles both individual features and bundle
+/// aliases (`:all`, `:default`, `:5.N`).  Returns `None` for unknown names.
 pub fn resolve_feature_name(name: &str) -> Option<Features> {
     // Bundle alias: `:all`, `:default`, `:5.N`, `:5.N.M`.
     if let Some(tail) = name.strip_prefix(':') {
@@ -204,10 +177,8 @@ pub fn resolve_feature_name(name: &str) -> Option<Features> {
         "evalbytes" => Features::EVALBYTES,
         "current_sub" => Features::CURRENT_SUB,
         "fc" => Features::FC,
-        // `postderef` and `postderef_qq` are distinct.  Plain
-        // `postderef` is historical and effectively cosmetic
-        // (syntax is always on since 5.24); `postderef_qq` is
-        // the flag that actually gates interpolation behavior.
+        // `postderef` and `postderef_qq` are distinct.  Plain `postderef` is historical and effectively cosmetic
+        // (syntax is always on since 5.24); `postderef_qq` is the flag that actually gates interpolation behavior.
         "postderef" => Features::POSTDEREF,
         "postderef_qq" => Features::POSTDEREF_QQ,
         "signatures" => Features::SIGNATURES,
@@ -235,8 +206,7 @@ pub fn resolve_feature_name(name: &str) -> Option<Features> {
     })
 }
 
-/// Resolve the tail of a `:NAME` bundle alias.  `:all` and
-/// `:default` are named; `:5.N[.M]` parses as a version bundle
+/// Resolve the tail of a `:NAME` bundle alias.  `:all` and `:default` are named; `:5.N[.M]` parses as a version bundle
 /// (sub-version ignored per perlfeature).
 fn resolve_bundle_alias(tail: &str) -> Option<Features> {
     match tail {
@@ -254,10 +224,8 @@ fn resolve_bundle_alias(tail: &str) -> Option<Features> {
 
 /// Compute the feature set for a `use vN.M` bundle.
 ///
-/// Bundles below 5.10 load `:default`.  Odd minor versions round
-/// down (per perlfeature: development versions share the previous
-/// stable bundle).  This table is built directly from the
-/// `perlfeature` "FEATURE BUNDLES" table.
+/// Bundles below 5.10 load `:default`.  Odd minor versions round down (per perlfeature: development versions share the
+/// previous stable bundle).  This table is built directly from the `perlfeature` "FEATURE BUNDLES" table.
 fn version_bundle(major: u32, minor: u32) -> Features {
     if major < 5 || (major == 5 && minor < 10) {
         return Features::DEFAULT;
@@ -282,8 +250,7 @@ fn version_bundle(major: u32, minor: u32) -> Features {
     }
 }
 
-/// 5.10 / 5.12 / 5.14 bundle base.  5.12 adds `unicode_strings`;
-/// 5.14 is identical to 5.12.
+/// 5.10 / 5.12 / 5.14 bundle base.  5.12 adds `unicode_strings`; 5.14 is identical to 5.12.
 fn bundle_5_10_through_14(minor: u32) -> Features {
     let mut b = Features::APOSTROPHE_AS_PACKAGE_SEPARATOR
         | Features::BAREWORD_FILEHANDLES
@@ -382,21 +349,18 @@ impl Not for Features {
 
 /// All parser-visible pragma state for the current lexical scope.
 ///
-/// Currently tracks the `feature` pragma (via [`Features`]) and the
-/// `utf8` pragma.  Future pragmas that affect parsing would be
-/// added here.
+/// Currently tracks the `feature` pragma (via [`Features`]) and the `utf8` pragma.  Future pragmas that affect parsing
+/// would be added here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pragmas {
     pub features: Features,
-    /// `use utf8` — source treated as UTF-8.  Identifiers may
-    /// contain non-ASCII characters, string literal bytes are
+    /// `use utf8` — source treated as UTF-8.  Identifiers may contain non-ASCII characters, string literal bytes are
     /// interpreted as Unicode code points.
     pub utf8: bool,
 }
 
 impl Pragmas {
-    /// Default parser state: features = `:default` bundle, no
-    /// `use utf8`.
+    /// Default parser state: features = `:default` bundle, no `use utf8`.
     pub const fn new() -> Self {
         Pragmas { features: Features::DEFAULT, utf8: false }
     }

@@ -16,8 +16,7 @@ fn parse_expr_str(src: &str) -> Expr {
     }
 }
 
-/// Collect all tokens from source, for tests that need to
-/// inspect token-level output (e.g. NFC on variable names).
+/// Collect all tokens from source, for tests that need to inspect token-level output (e.g. NFC on variable names).
 fn collect_tokens(src: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(src.as_bytes());
     let mut tokens = Vec::new();
@@ -31,9 +30,8 @@ fn collect_tokens(src: &str) -> Vec<Token> {
     tokens
 }
 
-/// Like `collect_tokens` but with UTF-8 mode pre-enabled,
-/// for tests that need to tokenize Unicode identifiers
-/// without going through the full parser pragma machinery.
+/// Like `collect_tokens` but with UTF-8 mode pre-enabled, for tests that need to tokenize Unicode identifiers without
+/// going through the full parser pragma machinery.
 fn collect_tokens_utf8(src: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(src.as_bytes());
     lexer.set_utf8_mode(true);
@@ -48,8 +46,7 @@ fn collect_tokens_utf8(src: &str) -> Vec<Token> {
     tokens
 }
 
-/// Extract the first variable name from a program containing
-/// `my $name;` or `my $name = expr;`.  Handles both bare
+/// Extract the first variable name from a program containing `my $name;` or `my $name = expr;`.  Handles both bare
 /// declarations and assignment-wrapped declarations.
 fn first_decl_name(prog: &Program) -> String {
     for stmt in &prog.statements {
@@ -119,9 +116,8 @@ fn first_assign_rhs(prog: &Program) -> Expr {
     panic!("no assignment found in program");
 }
 
-/// Extract the string value from the first `my $x = "..."` in the program.
-/// Works for StringLit, and InterpolatedString with only Const and NamedChar
-/// parts (no runtime interpolation).
+/// Extract the string value from the first `my $x = "..."` in the program.  Works for StringLit, and InterpolatedString
+/// with only Const and NamedChar parts (no runtime interpolation).
 fn first_assign_str(prog: &Program) -> String {
     let rhs = first_assign_rhs(prog);
     match &rhs.kind {
@@ -131,8 +127,7 @@ fn first_assign_str(prog: &Program) -> String {
     }
 }
 
-/// For tests that need the initializer from a `my $x = expr;`
-/// declaration-statement.  Returns the RHS of the Assign.
+/// For tests that need the initializer from a `my $x = expr;` declaration-statement.  Returns the RHS of the Assign.
 fn decl_init(stmt: &Statement) -> &Expr {
     match &stmt.kind {
         StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, rhs), .. }) => {
@@ -143,8 +138,8 @@ fn decl_init(stmt: &Statement) -> &Expr {
     }
 }
 
-/// For tests that need the var list from a declaration.
-/// Works for both `my $x;` (plain Decl) and `my $x = ...;` (Assign(Decl, _)).
+/// For tests that need the var list from a declaration.  Works for both `my $x;` (plain Decl) and `my $x = ...;`
+/// (Assign(Decl, _)).
 fn decl_vars(stmt: &Statement) -> (DeclScope, &[VarDecl]) {
     let expr = match &stmt.kind {
         StmtKind::Expr(e) => e,
@@ -454,8 +449,7 @@ fn parse_package() {
 fn parse_multiple_statements() {
     let prog = parse("my $x = 1; my $y = 2; $x + $y;");
     assert_eq!(prog.statements.len(), 3);
-    // First two are `my` declarations with initializers, so
-    // Stmt::Expr wrapping Assign(Decl, ...).
+    // First two are `my` declarations with initializers, so Stmt::Expr wrapping Assign(Decl, ...).
     let (_s0, _v0) = decl_vars(&prog.statements[0]);
     let (_s1, _v1) = decl_vars(&prog.statements[1]);
     match &prog.statements[2].kind {
@@ -548,10 +542,8 @@ fn parse_interp_array() {
     }
 }
 
-/// Extract the variable name from a simple scalar-interp
-/// (one that wraps a bare ScalarVar with no subscripts).
-/// Returns None if the part isn't a ScalarInterp or the inner
-/// expr isn't a bare variable.
+/// Extract the variable name from a simple scalar-interp (one that wraps a bare ScalarVar with no subscripts).  Returns
+/// None if the part isn't a ScalarInterp or the inner expr isn't a bare variable.
 fn scalar_interp_name(p: &InterpPart) -> Option<&str> {
     match p {
         InterpPart::ScalarInterp(expr) => match &expr.kind {
@@ -573,8 +565,7 @@ fn array_interp_name(p: &InterpPart) -> Option<&str> {
     }
 }
 
-/// Pull the inner expression out of a ScalarInterp for tests
-/// that need to inspect the subscript structure.
+/// Pull the inner expression out of a ScalarInterp for tests that need to inspect the subscript structure.
 fn scalar_interp_expr(p: &InterpPart) -> &Expr {
     match p {
         InterpPart::ScalarInterp(e) => e,
@@ -631,8 +622,7 @@ fn parse_print_interp_string() {
 // ═══════════════════════════════════════════════════════════
 // Subscript-chain interpolation inside strings.
 //
-// All of these should parse the subscript into real AST
-// nodes inside a `ScalarInterp(Box<Expr>)` / `ArrayInterp(...)`
+// All of these should parse the subscript into real AST nodes inside a `ScalarInterp(Box<Expr>)` / `ArrayInterp(...)`
 // part — not be swallowed into a `Const` segment.
 // ═══════════════════════════════════════════════════════════
 
@@ -641,15 +631,13 @@ fn interp_parts(src: &str) -> Vec<InterpPart> {
     let e = parse_expr_str(src);
     match e.kind {
         ExprKind::InterpolatedString(Interpolated(parts)) => parts,
-        // Some single-subscript strings collapse via merge
-        // into a non-interpolated StringLit in degenerate
-        // cases — callers pass non-degenerate sources.
+        // Some single-subscript strings collapse via merge into a non-interpolated StringLit in degenerate cases —
+        // callers pass non-degenerate sources.
         other => panic!("expected InterpolatedString, got {other:?} for {src:?}"),
     }
 }
 
-/// For string-level asserts: the N-th part should be a
-/// scalar-interp wrapping an expression whose pretty-printed
+/// For string-level asserts: the N-th part should be a scalar-interp wrapping an expression whose pretty-printed
 /// outline matches a given structural check.
 fn scalar_part(parts: &[InterpPart], n: usize) -> &Expr {
     scalar_interp_expr(&parts[n])
@@ -663,15 +651,14 @@ fn array_part(parts: &[InterpPart], n: usize) -> &Expr {
 
 #[test]
 fn interp_hash_elem_arrow() {
-    // "$h->{key}" — classic bugged case.  Must parse as a
-    // ScalarInterp wrapping ArrowDeref(ScalarVar(h), HashElem(key)).
+    // "$h->{key}" — classic bugged case.  Must parse as a ScalarInterp wrapping ArrowDeref(ScalarVar(h),
+    // HashElem(key)).
     let parts = interp_parts(r#""$h->{key}";"#);
     let e = scalar_part(&parts, 0);
     match &e.kind {
         ExprKind::ArrowDeref(recv, ArrowTarget::HashElem(k)) => {
             assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "h"));
-            // Key is a bareword (autoquoted by the subscript
-            // rule in the parser).
+            // Key is a bareword (autoquoted by the subscript rule in the parser).
             assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "key"));
         }
         other => panic!("expected ArrowDeref hash-elem, got {other:?}"),
@@ -694,8 +681,7 @@ fn interp_array_elem_arrow() {
 
 #[test]
 fn interp_hash_elem_direct() {
-    // "$h{key}" — no arrow.  In Perl this is still a hash
-    // element access because `$h{...}` is equivalent to
+    // "$h{key}" — no arrow.  In Perl this is still a hash element access because `$h{...}` is equivalent to
     // `${h}{...}`.  Parses as HashElem(ScalarVar(h), key).
     let parts = interp_parts(r#""$h{key}";"#);
     let e = scalar_part(&parts, 0);
@@ -726,8 +712,7 @@ fn interp_array_elem_direct() {
 
 #[test]
 fn interp_chain_two_hash_levels() {
-    // "$h->{a}{b}" — arrow before first, implicit between.
-    // Hash elem wrapped in hash elem.
+    // "$h->{a}{b}" — arrow before first, implicit between.  Hash elem wrapped in hash elem.
     let parts = interp_parts(r#""$h->{a}{b}";"#);
     let e = scalar_part(&parts, 0);
     // Outer: HashElem(ArrowDeref(..., HashElem(h, a)), b)
@@ -938,8 +923,7 @@ fn interp_two_chains_one_string() {
 
 #[test]
 fn interp_bare_arrow_is_literal() {
-    // "$a->" — bare arrow with nothing after.  Lexer must not
-    // start a chain; the `->` stays literal text.
+    // "$a->" — bare arrow with nothing after.  Lexer must not start a chain; the `->` stays literal text.
     let parts = interp_parts(r#""$a->";"#);
     assert_eq!(parts.len(), 2);
     assert_eq!(scalar_interp_name(&parts[0]), Some("a"));
@@ -948,9 +932,8 @@ fn interp_bare_arrow_is_literal() {
 
 #[test]
 fn interp_bare_arrow_then_ident_is_literal() {
-    // "$a->foo" — method-call shape is NOT interpolated in
-    // strings (per perlop).  `$a` interpolates; `->foo`
-    // renders literally.
+    // "$a->foo" — method-call shape is NOT interpolated in strings (per perlop).  `$a` interpolates; `->foo` renders
+    // literally.
     let parts = interp_parts(r#""$a->foo";"#);
     assert_eq!(parts.len(), 2);
     assert_eq!(scalar_interp_name(&parts[0]), Some("a"));
@@ -959,8 +942,7 @@ fn interp_bare_arrow_then_ident_is_literal() {
 
 #[test]
 fn interp_plain_scalar_no_subscript() {
-    // Simple "$name" shouldn't start a chain.  Still uses the
-    // new ScalarInterp(Box<Expr>) wrapper around a bare
+    // Simple "$name" shouldn't start a chain.  Still uses the new ScalarInterp(Box<Expr>) wrapper around a bare
     // ScalarVar.
     let parts = interp_parts(r#""Hello $name!";"#);
     assert_eq!(parts.len(), 3);
@@ -969,8 +951,7 @@ fn interp_plain_scalar_no_subscript() {
 
 #[test]
 fn interp_trailing_literal_bracket() {
-    // "$a [0]" — space before `[` means it's NOT a subscript.
-    // The literal `[` and `]` stay as ConstSegment.
+    // "$a [0]" — space before `[` means it's NOT a subscript.  The literal `[` and `]` stay as ConstSegment.
     let parts = interp_parts(r#""$a [0]";"#);
     // Parts: ScalarInterp(a), Const(" [0]").
     assert_eq!(parts.len(), 2);
@@ -1004,15 +985,11 @@ fn interp_escaped_arrow_after_var() {
 
 #[test]
 fn interp_subscript_with_nested_braces() {
-    // `"$h->{$x}{y}"` — two nested subscripts, with `y` as
-    // a bareword hash key in the inner-most subscript.
+    // `"$h->{$x}{y}"` — two nested subscripts, with `y` as a bareword hash key in the inner-most subscript.
     //
-    // `y}` is a lexer edge case: `y` is one of the quote
-    // keywords (alias for `tr`), so at_quote_delimiter must
-    // reject the closing `}` that follows.  Tests below
-    // cover every quote keyword × every closing delimiter
-    // combination; this one spot-checks the interaction with
-    // subscript-chain interpolation specifically.
+    // `y}` is a lexer edge case: `y` is one of the quote keywords (alias for `tr`), so at_quote_delimiter must reject
+    // the closing `}` that follows.  Tests below cover every quote keyword × every closing delimiter combination; this
+    // one spot-checks the interaction with subscript-chain interpolation specifically.
     let parts = interp_parts(r#""$h->{$x}{y}";"#);
     let e = scalar_part(&parts, 0);
     match &e.kind {
@@ -1046,8 +1023,7 @@ fn interp_subscript_with_func_call() {
 
 #[test]
 fn interp_qq_with_subscript() {
-    // qq{...} uses `{}` as delimiter; the `{key}` inside is
-    // still recognized as a hash subscript.
+    // qq{...} uses `{}` as delimiter; the `{key}` inside is still recognized as a hash subscript.
     let e = parse_expr_str("qq{$h->{key}};");
     match &e.kind {
         ExprKind::InterpolatedString(Interpolated(parts)) => {
@@ -1063,8 +1039,7 @@ fn interp_qq_with_subscript() {
 
 #[test]
 fn interp_chain_then_concat() {
-    // Interpolated string concatenated with another.  The
-    // chain in the first one must still be parsed correctly.
+    // Interpolated string concatenated with another.  The chain in the first one must still be parsed correctly.
     let e = parse_expr_str(r#""$h->{key}" . "plain";"#);
     match &e.kind {
         ExprKind::BinOp(BinOp::Concat, left, _) => {
@@ -1103,9 +1078,8 @@ fn interp_array_chain_in_mid_string() {
 
 #[test]
 fn interp_braced_name_then_literal_subscript() {
-    // "${name}[0]" — `${name}` is explicit braced form.
-    // The `[0]` after the `}` is literal text (per Perl
-    // behavior: ${name}[0] interpolates only $name).
+    // "${name}[0]" — `${name}` is explicit braced form.  The `[0]` after the `}` is literal text (per Perl behavior:
+    // ${name}[0] interpolates only $name).
     let parts = interp_parts(r#""${name}[0]";"#);
     assert_eq!(parts.len(), 2);
     assert_eq!(scalar_interp_name(&parts[0]), Some("name"));
@@ -1116,8 +1090,7 @@ fn interp_braced_name_then_literal_subscript() {
 
 #[test]
 fn regex_interp_subscript() {
-    // m/$h->{key}/ — regex bodies use the same interp
-    // machinery; chains should work there too.
+    // m/$h->{key}/ — regex bodies use the same interp machinery; chains should work there too.
     let e = parse_expr_str(r#"m/$h->{key}/;"#);
     match &e.kind {
         ExprKind::Regex(_, pat, _) => {
@@ -1140,13 +1113,10 @@ fn regex_interp_subscript() {
 
 // ── Missing tests promised in the audit ───────────────────
 //
-// These cover interpolation contexts beyond plain `"..."` —
-// heredoc bodies, `qr//`, `s///` pattern and replacement,
-// and the `@{[expr]}` form mixed with chains.  A few cases
-// don't work yet and are marked `#[ignore]` with a clear
-// note explaining the gap; they're here rather than absent
-// so the gap is visible in the test suite rather than only
-// in my memory.
+// These cover interpolation contexts beyond plain `"..."` — heredoc bodies, `qr//`, `s///` pattern and replacement,
+// and the `@{[expr]}` form mixed with chains.  A few cases don't work yet and are marked `#[ignore]` with a clear note
+// explaining the gap; they're here rather than absent so the gap is visible in the test suite rather than only in my
+// memory.
 
 // Heredoc with chain in body.
 
@@ -1258,11 +1228,8 @@ fn interp_chain_in_subst_replacement() {
 
 #[test]
 fn interp_array_expr_form_with_chain_inside() {
-    // `"@{[$h->{k}]}"` — the @{[...]} form wraps an
-    // expression; the expression internally uses a
-    // subscript chain.  Outer shape is ExprInterp (not
-    // ChainStart) because the leading token is `@{`, not
-    // `@name`.
+    // `"@{[$h->{k}]}"` — the @{[...]} form wraps an expression; the expression internally uses a subscript chain.
+    // Outer shape is ExprInterp (not ChainStart) because the leading token is `@{`, not `@name`.
     let parts = interp_parts(r#""@{[$h->{k}]}";"#);
     let expr_part = parts
         .iter()
@@ -1271,8 +1238,7 @@ fn interp_array_expr_form_with_chain_inside() {
             _ => None,
         })
         .expect("expected an ExprInterp part");
-    // Inside: anonymous array ref containing the chain.
-    // AnonArray([ArrowDeref(h, HashElem(k))])
+    // Inside: anonymous array ref containing the chain.  AnonArray([ArrowDeref(h, HashElem(k))])
     match &expr_part.kind {
         ExprKind::AnonArray(items) => {
             assert_eq!(items.len(), 1);
@@ -1282,13 +1248,10 @@ fn interp_array_expr_form_with_chain_inside() {
     }
 }
 
-// Escape sequences in hash-subscript position are NOT
-// processed as string escapes.  `"$h{\x41}"` is NOT
-// `$h{'A'}`; per `perl -MO=Deparse -e '"$h{\x41}"'` it
-// parses as `"$h{\'x41'}"` — the `\` is the reference
-// operator applied to the autoquoted bareword `x41`.  The
-// hash lookup key is therefore a scalar reference (which
-// stringifies to `SCALAR(0x...)` at runtime).
+// Escape sequences in hash-subscript position are NOT processed as string escapes.  `"$h{\x41}"` is NOT `$h{'A'}`; per
+// `perl -MO=Deparse -e '"$h{\x41}"'` it parses as `"$h{\'x41'}"` — the `\` is the reference operator applied to the
+// autoquoted bareword `x41`.  The hash lookup key is therefore a scalar reference (which stringifies to `SCALAR(0x...)`
+// at runtime).
 //
 // Verified with the Perl debugger:
 //
@@ -1315,16 +1278,13 @@ fn interp_escape_sequence_in_hash_subscript_is_ref_to_bareword() {
 
 // ── Known gaps — ignored tests, kept visible ─────────────
 //
-// These encode behavior we haven't implemented yet.  Each
-// is marked `#[ignore]` with a note explaining what's
-// missing.  Running with `cargo test -- --ignored` will
-// run them and show the real failures.
+// These encode behavior we haven't implemented yet.  Each is marked `#[ignore]` with a note explaining what's missing.
+// Running with `cargo test -- --ignored` will run them and show the real failures.
 
 #[test]
 fn interp_postderef_qq_array() {
-    // `"$ref->@*"` — postderef array form inside a string.
-    // Requires peek_chain_starter to recognize `->@*` and
-    // the chain dispatch to end on `Star` at depth 0.
+    // `"$ref->@*"` — postderef array form inside a string.  Requires peek_chain_starter to recognize `->@*` and the
+    // chain dispatch to end on `Star` at depth 0.
     let parts = interp_parts(r#""$ref->@*";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefArray)), "expected ArrowDeref(_, DerefArray), got {:?}", e.kind);
@@ -1348,12 +1308,9 @@ fn interp_postderef_qq_scalar() {
 
 #[test]
 fn interp_postderef_qq_last_index() {
-    // `"$ref->$#*"` — postderef last-index in a string.
-    // The `#` would normally start a comment in code mode;
-    // this works because the parser's `try_consume_hash_star`
-    // consumes the raw `#*` bytes between lex_token calls,
-    // and (in chain mode) sets `chain_end_pending` so the
-    // chain terminates cleanly.
+    // `"$ref->$#*"` — postderef last-index in a string.  The `#` would normally start a comment in code mode; this
+    // works because the parser's `try_consume_hash_star` consumes the raw `#*` bytes between lex_token calls, and (in
+    // chain mode) sets `chain_end_pending` so the chain terminates cleanly.
     let parts = interp_parts(r#""$ref->$#*";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::LastIndex)), "expected ArrowDeref(_, LastIndex), got {:?}", e.kind);
@@ -1496,8 +1453,7 @@ fn parse_empty_regex_in_split() {
 
 #[test]
 fn parse_empty_regex_space_not_flags() {
-    // // gi — space separates, so gi is NOT flags.
-    // This produces an empty regex with no flags.
+    // // gi — space separates, so gi is NOT flags.  This produces an empty regex with no flags.
     let e = parse_expr_str("$x =~ //gi;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
@@ -1550,8 +1506,8 @@ fn parse_tr_invalid_flag() {
 
 // ── prefers_defined_or: UNIDOR operators ────────────────
 //
-// After these operators, // is defined-or, not an empty regex.
-// Matches toke.c's UNIDOR macro and XTERMORDORDOR behavior.
+// After these operators, // is defined-or, not an empty regex.  Matches toke.c's UNIDOR macro and XTERMORDORDOR
+// behavior.
 
 #[test]
 fn parse_shift_prefers_defined_or() {
@@ -1610,9 +1566,8 @@ fn parse_filetest_prefers_defined_or() {
 
 #[test]
 fn parse_shift_defined_or_bareword() {
-    // shift //i 0 — in Perl this is a syntax error because i is not
-    // predeclared.  Our parser is more permissive: it parses as
-    // shift() // i(0) since any bareword can be a function call.
+    // shift //i 0 — in Perl this is a syntax error because i is not predeclared.  Our parser is more permissive: it
+    // parses as shift() // i(0) since any bareword can be a function call.
     let e = parse_expr_str("shift //i 0;");
     assert!(matches!(e.kind, ExprKind::BinOp(BinOp::DefinedOr, _, _)));
 }
@@ -2225,8 +2180,7 @@ fn parse_ctrl_z_stops_parsing() {
 #[test]
 fn parse_pod_skipped() {
     let prog = parse("my $x = 1;\n\n=pod\n\nThis is pod.\n\n=cut\n\nmy $y = 2;\n");
-    // Should see both my declarations, pod is invisible.
-    // Each is Stmt::Expr wrapping Assign(Decl(My), _).
+    // Should see both my declarations, pod is invisible.  Each is Stmt::Expr wrapping Assign(Decl(My), _).
     let my_count = prog
         .statements
         .iter()
@@ -2337,8 +2291,7 @@ fn parse_unless_elsif_else() {
 
 #[test]
 fn parse_decl_in_expr_context() {
-    // my $x = 5 in statement context still works.
-    // Now represented as Stmt::Expr wrapping Assign(Decl(My), IntLit(5)).
+    // my $x = 5 in statement context still works.  Now represented as Stmt::Expr wrapping Assign(Decl(My), IntLit(5)).
     let prog = parse("my $x = 5;");
     let (scope, vars) = decl_vars(&prog.statements[0]);
     assert_eq!(scope, DeclScope::My);
@@ -2707,9 +2660,8 @@ fn parse_vstring_no_dots() {
 
 // ── pragma tests ──────────────────────────────────────────
 
-/// Parse a program and return the parser's final pragma state.
-/// Because pragmas are lexically scoped, this reflects whatever
-/// was in effect at end-of-file (i.e., the outermost scope).
+/// Parse a program and return the parser's final pragma state.  Because pragmas are lexically scoped, this reflects
+/// whatever was in effect at end-of-file (i.e., the outermost scope).
 fn parse_pragmas(src: &str) -> crate::pragma::Pragmas {
     let mut p = Parser::new(src.as_bytes()).unwrap();
     let _ = p.parse_program().unwrap();
@@ -2719,8 +2671,7 @@ fn parse_pragmas(src: &str) -> crate::pragma::Pragmas {
 #[test]
 fn pragma_default_has_default_bundle() {
     let p = parse_pragmas("my $x = 1;");
-    // Pre-`use feature` state: the `:default` bundle (indirect,
-    // multidimensional, bareword_filehandles,
+    // Pre-`use feature` state: the `:default` bundle (indirect, multidimensional, bareword_filehandles,
     // apostrophe_as_package_separator, smartmatch).
     assert_eq!(p.features, Features::DEFAULT);
     assert!(p.features.contains(Features::INDIRECT));
@@ -2756,8 +2707,7 @@ fn pragma_no_feature_removes_specific() {
 
 #[test]
 fn pragma_no_feature_bare_resets_to_default() {
-    // Per perlfeature: `no feature;` with no args resets to
-    // :default, not to empty.
+    // Per perlfeature: `no feature;` with no args resets to :default, not to empty.
     let p = parse_pragmas("use feature qw(say state signatures);\nno feature;\n");
     assert_eq!(p.features, Features::DEFAULT);
 }
@@ -2812,8 +2762,7 @@ fn pragma_no_utf8() {
 
 #[test]
 fn pragma_unknown_module_is_noop() {
-    // `use strict;` doesn't set any parsing-relevant flag yet
-    // and must not cause a panic.
+    // `use strict;` doesn't set any parsing-relevant flag yet and must not cause a panic.
     let p = parse_pragmas("use strict;");
     assert_eq!(p.features, Features::DEFAULT);
     assert!(!p.utf8);
@@ -2839,9 +2788,8 @@ fn pragma_lexical_scoping_outer_preserved() {
 
 #[test]
 fn pragma_version_bundle_resets_features() {
-    // `use v5.36` does implicit `no feature ':all'; use feature ':5.36'`.
-    // Applying after unrelated feature enables should leave only
-    // the bundle.
+    // `use v5.36` does implicit `no feature ':all'; use feature ':5.36'`.  Applying after unrelated feature enables
+    // should leave only the bundle.
     let p = parse_pragmas("use feature 'keyword_any';\nuse v5.36;\n");
     assert!(!p.features.contains(Features::KEYWORD_ANY), "version bundle should reset, not union");
     assert!(p.features.contains(Features::SIGNATURES));
@@ -2849,8 +2797,7 @@ fn pragma_version_bundle_resets_features() {
 
 // ── signature tests ───────────────────────────────────────
 
-/// Convenience: parse a program and return the last top-level
-/// SubDecl, panicking if none exists.
+/// Convenience: parse a program and return the last top-level SubDecl, panicking if none exists.
 fn parse_sub(src: &str) -> SubDecl {
     let prog = parse(src);
     for stmt in prog.statements.iter().rev() {
@@ -2863,10 +2810,8 @@ fn parse_sub(src: &str) -> SubDecl {
 
 #[test]
 fn sig_without_feature_is_prototype() {
-    // No `use feature 'signatures'` in scope: `($)` is a
-    // prototype (meaning "exactly one scalar argument").  We
-    // verify the signature path was NOT taken by checking
-    // that the prototype parser saw the raw text.
+    // No `use feature 'signatures'` in scope: `($)` is a prototype (meaning "exactly one scalar argument").  We verify
+    // the signature path was NOT taken by checking that the prototype parser saw the raw text.
     let s = parse_sub("sub f ($) { }");
     assert!(s.signature.is_none(), "no signature when feature off");
     assert_eq!(s.prototype.as_deref(), Some("$"), "paren-form goes to prototype");
@@ -2924,8 +2869,7 @@ fn sig_scalar_with_default() {
 
 #[test]
 fn sig_default_references_prior_param() {
-    // Default expression can reference earlier parameter —
-    // parser shouldn't care (just an expression).
+    // Default expression can reference earlier parameter — parser shouldn't care (just an expression).
     let s = parse_sub("use feature 'signatures'; sub f ($x, $y = $x * 2) { }");
     let sig = s.signature.expect("signature present");
     assert_eq!(sig.params.len(), 2);
@@ -2960,9 +2904,8 @@ fn sig_slurpy_hash() {
 
 #[test]
 fn sig_anonymous_placeholders() {
-    // Anonymous scalars — `$` without names — accept-and-discard.
-    // Only scalars here; slurpy forms (`@`, `%`) must be last
-    // and only one is allowed, so they get their own tests.
+    // Anonymous scalars — `$` without names — accept-and-discard.  Only scalars here; slurpy forms (`@`, `%`) must be
+    // last and only one is allowed, so they get their own tests.
     let s = parse_sub("use feature 'signatures'; sub f ($, $, $) { }");
     let sig = s.signature.expect("signature present");
     assert_eq!(sig.params.len(), 3);
@@ -3012,8 +2955,7 @@ fn sig_trailing_comma_allowed() {
 
 #[test]
 fn sig_with_prototype_attribute() {
-    // `:prototype($$)` attaches a prototype; the paren-form is
-    // still a signature when the feature is active.
+    // `:prototype($$)` attaches a prototype; the paren-form is still a signature when the feature is active.
     let s = parse_sub("use feature 'signatures'; sub f :prototype($$) ($x, $y) { }");
     let sig = s.signature.expect("signature present");
     assert_eq!(sig.params.len(), 2);
@@ -3026,8 +2968,7 @@ fn sig_with_prototype_attribute() {
 
 #[test]
 fn sig_enabled_by_use_v5_36() {
-    // Phase 1 hookup: the `:5.36` bundle includes signatures,
-    // so `use v5.36;` should enable the signature path without
+    // Phase 1 hookup: the `:5.36` bundle includes signatures, so `use v5.36;` should enable the signature path without
     // an explicit `use feature 'signatures';`.
     let s = parse_sub("use v5.36; sub f ($x, $y) { }");
     assert!(s.signature.is_some(), "use v5.36 should enable signatures");
@@ -3036,8 +2977,8 @@ fn sig_enabled_by_use_v5_36() {
 
 #[test]
 fn sig_feature_is_lexically_scoped() {
-    // Outer scope has signatures; inner `no feature 'signatures'`
-    // disables it for a sub declared inside the inner block.
+    // Outer scope has signatures; inner `no feature 'signatures'` disables it for a sub declared inside the inner
+    // block.
     let src = "\
 use feature 'signatures';
 sub outer ($x) { 1 }
@@ -3090,8 +3031,7 @@ fn sig_anon_sub_with_signature() {
     assert!(found, "expected an AnonSub with signature");
 }
 
-/// Helper: recursively walk a stmt looking for an AnonSub with
-/// a non-None signature.
+/// Helper: recursively walk a stmt looking for an AnonSub with a non-None signature.
 fn walk_for_anon_sub(stmt: &StmtKind, found: &mut bool) {
     if let StmtKind::Expr(expr) = stmt {
         walk_expr(expr, found);
@@ -3114,8 +3054,7 @@ fn walk_expr(expr: &Expr, found: &mut bool) {
 
 // ── postderef tests ───────────────────────────────────────
 
-/// Convenience: parse one expression statement, returning the
-/// inner expression.
+/// Convenience: parse one expression statement, returning the inner expression.
 fn parse_expr_stmt(src: &str) -> Expr {
     let prog = parse(src);
     for stmt in &prog.statements {
@@ -3126,8 +3065,7 @@ fn parse_expr_stmt(src: &str) -> Expr {
     panic!("no expression in program; statements: {:#?}", prog.statements);
 }
 
-/// Helper: walk the outermost arrow-deref off a parsed expr,
-/// returning the ArrowTarget.  Panics if the expression isn't
+/// Helper: walk the outermost arrow-deref off a parsed expr, returning the ArrowTarget.  Panics if the expression isn't
 /// an ArrowDeref.
 fn arrow_target(e: &Expr) -> &ArrowTarget {
     match &e.kind {
@@ -3156,17 +3094,15 @@ fn postderef_deref_scalar() {
 
 #[test]
 fn postderef_last_index() {
-    // `->$#*` — equivalent to `$#{$ref}`.  Requires lexer
-    // byte-level disambiguation because `#` would otherwise
-    // begin a comment.
+    // `->$#*` — equivalent to `$#{$ref}`.  Requires lexer byte-level disambiguation because `#` would otherwise begin a
+    // comment.
     let e = parse_expr_stmt("$r->$#*;");
     assert!(matches!(arrow_target(&e), ArrowTarget::LastIndex));
 }
 
 #[test]
 fn postderef_last_index_in_expr() {
-    // Embed in a larger expression to verify the parser
-    // continues past the LastIndex properly.
+    // Embed in a larger expression to verify the parser continues past the LastIndex properly.
     let e = parse_expr_stmt("my $n = $r->$#*;");
     match e.kind {
         ExprKind::Assign(_, _, rhs) => {
@@ -3178,11 +3114,9 @@ fn postderef_last_index_in_expr() {
 
 #[test]
 fn postderef_dollar_not_hashstar_still_fails() {
-    // `->$foo` (Dollar + named ScalarVar) is not postderef.
-    // The lexer greedily combines `$foo` into ScalarVar —
-    // which is handled as dynamic method dispatch in another
-    // arm.  We just verify `->$` followed by something
-    // neither `*` nor `#*` doesn't crash.
+    // `->$foo` (Dollar + named ScalarVar) is not postderef.  The lexer greedily combines `$foo` into ScalarVar — which
+    // is handled as dynamic method dispatch in another arm.  We just verify `->$` followed by something neither `*` nor
+    // `#*` doesn't crash.
     let src = "$r->$;";
     let mut p = match Parser::new(src.as_bytes()) {
         Ok(p) => p,
@@ -3250,8 +3184,7 @@ fn postderef_chained_on_complex_expr() {
 
 #[test]
 fn postderef_nested_slice() {
-    // `->@[0]->[1]` — slice followed by subscript chain.
-    // (Not semantically useful but should parse.)
+    // `->@[0]->[1]` — slice followed by subscript chain.  (Not semantically useful but should parse.)
     let e = parse_expr_stmt("$r->@[0];");
     match arrow_target(&e) {
         ArrowTarget::ArraySliceIndices(_) => {}
@@ -3265,10 +3198,8 @@ fn postderef_nested_slice() {
 
 #[test]
 fn isa_requires_feature() {
-    // Without the `isa` feature, `isa` is just an ordinary
-    // bareword (would be a function call or bareword
-    // reference).  We verify by checking that parsing
-    // `$x isa Foo` with no feature does NOT produce a BinOp.
+    // Without the `isa` feature, `isa` is just an ordinary bareword (would be a function call or bareword reference).
+    // We verify by checking that parsing `$x isa Foo` with no feature does NOT produce a BinOp.
     let e = parse_expr_stmt("$x isa Foo;");
     assert!(!matches!(e.kind, ExprKind::BinOp(BinOp::Isa, _, _)), "no isa feature → must not parse as Isa binop");
 }
@@ -3294,8 +3225,7 @@ fn isa_enabled_by_v5_36() {
 
 #[test]
 fn isa_precedence_vs_relational() {
-    // `isa` binds tighter than `<`, so `$x isa Foo < 1`
-    // groups as `($x isa Foo) < 1`.
+    // `isa` binds tighter than `<`, so `$x isa Foo < 1` groups as `($x isa Foo) < 1`.
     let e = parse_expr_stmt("use feature 'isa'; $x isa Foo < 1;");
     match e.kind {
         ExprKind::BinOp(BinOp::NumLt, lhs, _) => {
@@ -3309,10 +3239,8 @@ fn isa_precedence_vs_relational() {
 
 #[test]
 fn fc_requires_feature() {
-    // Without `fc` feature, `fc($x)` parses as an ordinary
-    // function call to a user sub named `fc`.  Either way
-    // we get a FuncCall; just confirm it doesn't error and
-    // the function name is captured.
+    // Without `fc` feature, `fc($x)` parses as an ordinary function call to a user sub named `fc`.  Either way we get a
+    // FuncCall; just confirm it doesn't error and the function name is captured.
     let e = parse_expr_stmt("fc($x);");
     match e.kind {
         ExprKind::FuncCall(name, _) => assert_eq!(name, "main::fc"),
@@ -3335,8 +3263,7 @@ fn fc_with_feature_paren() {
 
 #[test]
 fn fc_with_feature_no_paren() {
-    // `fc $x` — named unary, one argument at NAMED_UNARY
-    // precedence.
+    // `fc $x` — named unary, one argument at NAMED_UNARY precedence.
     let e = parse_expr_stmt("use feature 'fc'; fc $x;");
     match e.kind {
         ExprKind::FuncCall(name, args) => {
@@ -3365,8 +3292,7 @@ fn evalbytes_with_feature() {
 
 #[test]
 fn source_file_captured_at_lex_time() {
-    // Default filename placeholder when constructed via
-    // `parse(src)` / `Parser::new(src)`.
+    // Default filename placeholder when constructed via `parse(src)` / `Parser::new(src)`.
     let e = parse_expr_stmt("__FILE__;");
     match e.kind {
         ExprKind::SourceFile(path) => assert_eq!(path, "(script)"),
@@ -3376,9 +3302,8 @@ fn source_file_captured_at_lex_time() {
 
 #[test]
 fn source_file_uses_custom_filename() {
-    // `Parser::with_filename` / `parse_with_filename` plumbs
-    // the filename through to `LexerSource::filename()`,
-    // which `__FILE__` reads at lex time.
+    // `Parser::with_filename` / `parse_with_filename` plumbs the filename through to `LexerSource::filename()`, which
+    // `__FILE__` reads at lex time.
     let prog = crate::parse_with_filename(b"__FILE__;", "my_script.pl").expect("parse should succeed");
     let expr = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("expression statement");
     match expr.kind {
@@ -3419,8 +3344,7 @@ fn current_package_reflects_package_decl() {
 
 #[test]
 fn current_sub_requires_feature() {
-    // Without the current_sub feature, `__SUB__` falls back
-    // to bareword treatment.
+    // Without the current_sub feature, `__SUB__` falls back to bareword treatment.
     let e = parse_expr_stmt("__SUB__;");
     assert!(!matches!(e.kind, ExprKind::CurrentSub), "no current_sub feature → must not be CurrentSub");
 }
@@ -3440,20 +3364,15 @@ fn current_sub_via_v5_16() {
 
 // ── Feature-gated keyword downgrade ───────────────────────
 //
-// When the governing feature is off, try/catch/finally/defer,
-// given/when/default, and class/field/method all act as plain
-// identifiers — users can define subs with those names,
-// pass them as hash keys, etc.  These tests verify the
-// downgrade happens at the parser level so legacy code keeps
-// working.
+// When the governing feature is off, try/catch/finally/defer, given/when/default, and class/field/method all act as
+// plain identifiers — users can define subs with those names, pass them as hash keys, etc.  These tests verify the
+// downgrade happens at the parser level so legacy code keeps working.
 
 #[test]
 fn class_is_bareword_without_feature() {
-    // `sub class { ... }` — defining a sub named "class".
-    // With class feature off, the lexer emits
-    // Token::Keyword(Class) but the parser downgrades to
-    // Token::Ident("class") because we're not in a class
-    // scope.  The sub declaration should parse.
+    // `sub class { ... }` — defining a sub named "class".  With class feature off, the lexer emits
+    // Token::Keyword(Class) but the parser downgrades to Token::Ident("class") because we're not in a class scope.  The
+    // sub declaration should parse.
     let prog = parse("sub class { 1; }");
     assert!(
         prog.statements.iter().any(|s| matches!(
@@ -3468,8 +3387,7 @@ fn class_is_bareword_without_feature() {
 fn try_is_ident_without_feature() {
     // `my $try = try();` — `try` as a function call.
     let prog = parse("my $try = try();");
-    // Should parse as a normal expression statement (Decl
-    // assignment with FuncCall).  The inner expression is
+    // Should parse as a normal expression statement (Decl assignment with FuncCall).  The inner expression is
     // FuncCall("try", []), not a Try statement.
     assert!(!prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Try(_))), "must not parse as Try without feature");
 }
@@ -3483,11 +3401,9 @@ fn given_is_ident_without_feature() {
 
 #[test]
 fn defer_is_ident_without_feature() {
-    // `defer { ... }` would be a Defer statement with the
-    // defer feature; without it, `defer` is a bareword
-    // followed by a block, which is a parse error (or parsed
-    // as something else).  We just confirm it doesn't
-    // produce a Defer statement.
+    // `defer { ... }` would be a Defer statement with the defer feature; without it, `defer` is a bareword followed by
+    // a block, which is a parse error (or parsed as something else).  We just confirm it doesn't produce a Defer
+    // statement.
     let prog_result = Parser::new(b"my $x = defer;").and_then(|mut p| p.parse_program());
     if let Ok(prog) = prog_result {
         assert!(!prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Defer(_))), "must not parse as Defer without feature");
@@ -3496,9 +3412,8 @@ fn defer_is_ident_without_feature() {
 
 #[test]
 fn method_is_ident_without_feature() {
-    // Outside `use feature 'class'`, `method` is a plain sub
-    // name.  `sub method { ... }` at top level defines a
-    // regular sub.
+    // Outside `use feature 'class'`, `method` is a plain sub name.  `sub method { ... }` at top level defines a regular
+    // sub.
     let prog = parse("sub method { 1; }");
     assert!(
         prog.statements.iter().any(|s| matches!(
@@ -3511,8 +3426,7 @@ fn method_is_ident_without_feature() {
 
 #[test]
 fn try_keyword_reactivates_with_feature() {
-    // Sanity check: once `use feature 'try';` is seen, the
-    // downgrade stops happening for the rest of the scope.
+    // Sanity check: once `use feature 'try';` is seen, the downgrade stops happening for the rest of the scope.
     let prog = parse("use feature 'try'; try { 1; }");
     let has_try = prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Try(_)));
     assert!(has_try, "Try must parse when feature is active");
@@ -3520,10 +3434,8 @@ fn try_keyword_reactivates_with_feature() {
 
 #[test]
 fn feature_gate_is_lexically_scoped() {
-    // Inside a block, `no feature 'try'` disables the gate.
-    // Outside the block, `try` is still active.
-    // We only verify the outer `try { ... }` succeeds —
-    // demonstrating the scope restore after the inner block.
+    // Inside a block, `no feature 'try'` disables the gate.  Outside the block, `try` is still active.  We only verify
+    // the outer `try { ... }` succeeds — demonstrating the scope restore after the inner block.
     let prog = parse("use feature 'try'; try { 1; } catch ($e) { 2; }");
     assert!(prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Try(_))), "outer Try with feature on must parse");
 }
@@ -3532,8 +3444,7 @@ fn feature_gate_is_lexically_scoped() {
 
 #[test]
 fn refalias_requires_feature() {
-    // Without `refaliasing`, `\$a = \$b` is a parse error
-    // (Ref is not a valid lvalue).
+    // Without `refaliasing`, `\$a = \$b` is a parse error (Ref is not a valid lvalue).
     let src = "\\$a = \\$b;";
     let mut p = match Parser::new(src.as_bytes()) {
         Ok(p) => p,
@@ -3650,8 +3561,8 @@ fn declared_refs_list_mixed() {
 
 #[test]
 fn declared_refs_partial() {
-    // Mixing ref and non-ref in one decl: `my (\$a, $b)` — the
-    // parser accepts this (semantic validation is a later pass).
+    // Mixing ref and non-ref in one decl: `my (\$a, $b)` — the parser accepts this (semantic validation is a later
+    // pass).
     let e = parse_expr_stmt(
         "use feature 'declared_refs'; use feature 'refaliasing'; \
          no warnings 'experimental::refaliasing'; no warnings 'experimental::declared_refs'; \
@@ -3672,13 +3583,9 @@ fn declared_refs_partial() {
 
 #[test]
 fn declared_refs_via_v5_36() {
-    // `use v5.36` enables both refaliasing and declared_refs
-    // via the bundle.
-    // Actually, checking perlfeature: :5.36 does NOT include
-    // refaliasing/declared_refs (those are still experimental
-    // as of 5.36).  So this test expects a parse error.
-    // Using a feature-on path with explicit `use feature` in
-    // other tests above covers the positive case.
+    // `use v5.36` enables both refaliasing and declared_refs via the bundle.  Actually, checking perlfeature: :5.36
+    // does NOT include refaliasing/declared_refs (those are still experimental as of 5.36).  So this test expects a
+    // parse error.  Using a feature-on path with explicit `use feature` in other tests above covers the positive case.
     let src = "use v5.36; my \\$x = \\$y;";
     let mut p = match Parser::new(src.as_bytes()) {
         Ok(p) => p,
@@ -3690,8 +3597,7 @@ fn declared_refs_via_v5_36() {
 
 // ── format tests ──────────────────────────────────────────
 
-/// Convenience: parse a single format declaration, panic on any
-/// other top-level statement shape.
+/// Convenience: parse a single format declaration, panic on any other top-level statement shape.
 fn parse_fmt(src: &str) -> FormatDecl {
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 1, "expected one top-level stmt, got {}", prog.statements.len());
@@ -4110,8 +4016,7 @@ qw[a b c],
     let f = parse_fmt(src);
     match &f.lines[0] {
         FormatLine::Picture { args, .. } => {
-            // qw counts as one expr here (a QwList node); runtime
-            // flattens it.  Parser sees one argument.
+            // qw counts as one expr here (a QwList node); runtime flattens it.  Parser sees one argument.
             assert_eq!(args.len(), 1);
         }
         other => panic!("expected Picture, got {other:?}"),
@@ -4201,8 +4106,7 @@ my $y = 1;
 
 #[test]
 fn format_bare_at_is_literal() {
-    // `I have an @ here.` — the lone `@` isn't a field start,
-    // so the whole line parses as Literal.
+    // `I have an @ here.` — the lone `@` isn't a field start, so the whole line parses as Literal.
     let f = parse_fmt("format X =\nI have an @ here.\n.\n");
     match &f.lines[0] {
         FormatLine::Literal { text, .. } => assert_eq!(text, "I have an @ here."),
@@ -4212,8 +4116,7 @@ fn format_bare_at_is_literal() {
 
 // ── class/field/method tests ──────────────────────────────
 
-/// Convenience for class tests: prefixes the source with the
-/// required `use feature 'class'` and `no warnings` pragmas,
+/// Convenience for class tests: prefixes the source with the required `use feature 'class'` and `no warnings` pragmas,
 /// then returns the first ClassDecl statement.
 fn parse_class_prog(body: &str) -> Program {
     let src = format!("use feature 'class'; no warnings 'experimental::class'; {body}");
@@ -4464,9 +4367,8 @@ fn parse_heredoc_mixed_indented_non_indented() {
 
 #[test]
 fn parse_heredoc_same_tag_name() {
-    // Two heredocs with the same tag name.  The first body
-    // terminates at the first occurrence of the tag, then
-    // the second heredoc begins with a new body.
+    // Two heredocs with the same tag name.  The first body terminates at the first occurrence of the tag, then the
+    // second heredoc begins with a new body.
     let src = "print <<END, <<END;\nfirst\nEND\nsecond\nEND\n";
     let prog = parse(src);
     match &prog.statements[0].kind {
@@ -4506,16 +4408,13 @@ fn parse_heredoc_unterminated_gives_error() {
 
 // ── Torture test pieces ──────────────────────────────────
 //
-// Derived from a real Perl program that exercises heredoc
-// nesting, interpolation forms, and compile-time hoisting
-// simultaneously.  Each test below isolates one aspect so
-// failures are diagnostic.
+// Derived from a real Perl program that exercises heredoc nesting, interpolation forms, and compile-time hoisting
+// simultaneously.  Each test below isolates one aspect so failures are diagnostic.
 
 #[test]
 fn torture_heredoc_arithmetic_stacked() {
-    // `<<A + <<B + <<C` — three heredocs combined with `+`.
-    // Bodies are single numbers.  Deparse evaluates at
-    // compile time but we just verify parsing.
+    // `<<A + <<B + <<C` — three heredocs combined with `+`.  Bodies are single numbers.  Deparse evaluates at compile
+    // time but we just verify parsing.
     let src = "my $x = <<A + <<B + <<C;\n1\nA\n2\nB\n3\nC\n";
     let prog = parse(src);
     let init = decl_init(&prog.statements[0]);
@@ -4538,12 +4437,10 @@ fn torture_heredoc_arithmetic_stacked() {
 
 #[test]
 fn torture_ref_to_expr_in_interp() {
-    // `"${\(1 + 2)}"` — `${...}` with `\(expr)` inside.
-    // This is a common Perl idiom for embedding arbitrary
+    // `"${\(1 + 2)}"` — `${...}` with `\(expr)` inside.  This is a common Perl idiom for embedding arbitrary
     // expressions in interpolated strings.
     let parts = interp_parts(r#""${\(1 + 2)}";"#);
-    // Expect: ExprInterp containing Ref(Paren(Add(1, 2)))
-    // or Ref(Add(1, 2)) — depends on paren handling.
+    // Expect: ExprInterp containing Ref(Paren(Add(1, 2))) or Ref(Add(1, 2)) — depends on paren handling.
     assert_eq!(parts.len(), 1);
     match &parts[0] {
         InterpPart::ExprInterp(e) => {
@@ -4577,10 +4474,8 @@ fn torture_do_block_in_expression() {
 
 #[test]
 fn torture_begin_inside_do_block() {
-    // `do { BEGIN { our $a = 1; } $a }` — BEGIN hoists to
-    // compile time even inside a runtime do-block.  We just
-    // verify the parser accepts this; BEGIN semantics are
-    // runtime behavior.
+    // `do { BEGIN { our $a = 1; } $a }` — BEGIN hoists to compile time even inside a runtime do-block.  We just verify
+    // the parser accepts this; BEGIN semantics are runtime behavior.
     let prog = parse("my $x = do { BEGIN { our $a = 1; } $a };");
     let init = decl_init(&prog.statements[0]);
     match &init.kind {
@@ -4594,10 +4489,8 @@ fn torture_begin_inside_do_block() {
 
 #[test]
 fn torture_heredoc_in_interp_of_heredoc() {
-    // Heredoc inside `${\(...)}` inside another heredoc body.
-    // This is the nesting pattern from the torture test:
-    //   <<OUTER contains `${\(do { my $a = <<INNER; ... })}`.
-    // Simplified version:
+    // Heredoc inside `${\(...)}` inside another heredoc body.  This is the nesting pattern from the torture test:
+    //   <<OUTER contains `${\(do { my $a = <<INNER; ... })}`.  Simplified version:
     let src = "\
 my $x = <<OUTER;\n\
 prefix ${\\ do { <<INNER }}\n\
@@ -4632,9 +4525,8 @@ fn torture_qq_with_nested_heredoc() {
 
 #[test]
 fn torture_stacked_heredoc_list_assignment() {
-    // The exact pattern from the torture test:
-    // `my ($x, $y, $z) = (<<~X, <<Y, do { expr });`
-    // Simplified: just two heredocs plus a literal.
+    // The exact pattern from the torture test: `my ($x, $y, $z) = (<<~X, <<Y, do { expr });` Simplified: just two
+    // heredocs plus a literal.
     let src = "my ($x, $y, $z) = (<<~A, <<B, 42);\n    A-body\n    A\nB-body\nB\n";
     let prog = parse(src);
     assert!(!prog.statements.is_empty(), "should parse");
@@ -4643,9 +4535,8 @@ fn torture_stacked_heredoc_list_assignment() {
 // ── Dynamic method dispatch tests ─────────────────────────
 
 // ═══════════════════════════════════════════════════════════
-// Gap-probing tests — things I'm not sure the parser
-// handles.  Written to match Perl's actual behavior.
-// Failures are diagnostic: they tell us what to fix.
+// Gap-probing tests — things I'm not sure the parser handles.  Written to match Perl's actual behavior.  Failures are
+// diagnostic: they tell us what to fix.
 // ═══════════════════════════════════════════════════════════
 
 // ── Postderef_qq: remaining forms ────────────────────────
@@ -4660,8 +4551,7 @@ fn interp_postderef_qq_code() {
 
 #[test]
 fn interp_postderef_qq_glob() {
-    // `->**` — glob deref inside string.  Lexer emits
-    // Token::Power for `**`.
+    // `->**` — glob deref inside string.  Lexer emits Token::Power for `**`.
     let parts = interp_parts(r#""$ref->**";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefGlob)), "expected DerefGlob, got {:?}", e.kind);
@@ -4705,8 +4595,7 @@ fn heredoc_indented_empty_body() {
 
 #[test]
 fn heredoc_indented_blank_lines_preserved() {
-    // Blank lines in <<~ body should be preserved as
-    // empty lines (they don't need indentation).
+    // Blank lines in <<~ body should be preserved as empty lines (they don't need indentation).
     let src = "my $x = <<~END;\n    line1\n\n    line2\n    END\n";
     let prog = parse(src);
     let init = decl_init(&prog.statements[0]);
@@ -4736,8 +4625,7 @@ fn heredoc_backslash_form() {
 
 #[test]
 fn heredoc_backslash_no_escape_processing() {
-    // Per perlop: backslashes have no special meaning in a
-    // single-quoted here-doc, `\\` is two backslashes.
+    // Per perlop: backslashes have no special meaning in a single-quoted here-doc, `\\` is two backslashes.
     let src = "my $x = <<\\EOF;\nline with \\\\ two backslashes\nEOF\n";
     let prog = parse(src);
     let init = decl_init(&prog.statements[0]);
@@ -4761,9 +4649,8 @@ fn heredoc_indented_backslash_form() {
 
 #[test]
 fn heredoc_numeric_bare_tag() {
-    // Perl accepts <<0 as a heredoc with tag "0".
-    // The gate in lex_heredoc_after_shift_left must accept
-    // digits, not just alphabetic + underscore.
+    // Perl accepts <<0 as a heredoc with tag "0".  The gate in lex_heredoc_after_shift_left must accept digits, not
+    // just alphabetic + underscore.
     let prog = parse("my $x = <<0;\nhello\n0\n");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
@@ -4795,9 +4682,8 @@ fn heredoc_numeric_tag_42() {
 
 #[test]
 fn heredoc_tag_end_marker() {
-    // <<__END__ is a valid heredoc tag — __END__ inside the
-    // body is literal text, and the terminator __END__ is
-    // matched by the heredoc machinery, not the data-end detector.
+    // <<__END__ is a valid heredoc tag — __END__ inside the body is literal text, and the terminator __END__ is matched
+    // by the heredoc machinery, not the data-end detector.
     let prog = parse("my $x = <<__END__;\ncontent\n__END__\n");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
@@ -4812,8 +4698,7 @@ fn heredoc_tag_end_marker() {
 }
 
 // ── Heredoc keyword tags ──────────────────────────────────
-// Perl treats barewords after << as heredoc tags, even if they
-// are keyword names.
+// Perl treats barewords after << as heredoc tags, even if they are keyword names.
 
 #[test]
 fn heredoc_keyword_tag_if() {
@@ -4894,8 +4779,7 @@ fn end_marker_inside_heredoc_is_literal() {
 
 #[test]
 fn ternary_with_heredocs() {
-    // Both branches of ?: can be heredocs.  Bodies are queued
-    // in source order.
+    // Both branches of ?: can be heredocs.  Bodies are queued in source order.
     let src = "my $x = 1 ? <<A : <<B;\nfirst\nA\nsecond\nB\n";
     let prog = parse(src);
     assert!(!prog.statements.is_empty(), "should parse ternary with heredocs");
@@ -5062,8 +4946,7 @@ fn empty_interpolated_string() {
 
 #[test]
 fn negative_bareword_hash_key() {
-    // `$h{-key}` — the `-key` form is common in Perl.
-    // Parses as HashElem with StringLit("-key").
+    // `$h{-key}` — the `-key` form is common in Perl.  Parses as HashElem with StringLit("-key").
     let e = parse_expr_str("$h{-key};");
     match &e.kind {
         ExprKind::HashElem(_, k) => {
@@ -5131,8 +5014,7 @@ fn until_loop() {
 #[test]
 fn chained_method_calls() {
     let e = parse_expr_str("$obj->method1->method2->method3;");
-    // Outer: MethodCall(MethodCall(MethodCall($obj, "method1", []),
-    //        "method2", []), "method3", []).
+    // Outer: MethodCall(MethodCall(MethodCall($obj, "method1", []), "method2", []), "method3", []).
     // Note: `->method` produces MethodCall, not ArrowDeref.
     fn depth(e: &Expr) -> usize {
         match &e.kind {
@@ -5148,8 +5030,7 @@ fn chained_method_calls() {
 
 #[test]
 fn concat_and_repeat() {
-    // `"a" . "b" x 3` — `x` binds tighter than `.`.
-    // Parses as `"a" . ("b" x 3)`.
+    // `"a" . "b" x 3` — `x` binds tighter than `.`.  Parses as `"a" . ("b" x 3)`.
     let e = parse_expr_str(r#""a" . "b" x 3;"#);
     match &e.kind {
         ExprKind::BinOp(BinOp::Concat, _, rhs) => {
@@ -5477,8 +5358,7 @@ fn parse_filetest_letter_hash_subscript_autoquotes() {
 
 #[test]
 fn parse_filetest_in_block_body_not_autoquoted() {
-    // sub foo { -f } — filetest on $_, NOT autoquoted.
-    // The } closes the sub body, not a hash subscript.
+    // sub foo { -f } — filetest on $_, NOT autoquoted.  The } closes the sub body, not a hash subscript.
     let sub = parse_sub("sub foo { -f }");
     assert_eq!(sub.body.statements.len(), 1);
     match &sub.body.statements[0].kind {
@@ -6319,8 +6199,7 @@ fn parse_uppercase_comma_hash_at_stmt_level() {
 
 #[test]
 fn parse_lowercase_comma_block_at_stmt_level() {
-    // {foo, 1} — lowercase bareword followed by comma → block
-    // (could be a function call: foo(), 1).
+    // {foo, 1} — lowercase bareword followed by comma → block (could be a function call: foo(), 1).
     let prog = parse("{foo(1)};");
     match &prog.statements[0].kind {
         StmtKind::Block(_, _) => {}
@@ -6564,30 +6443,23 @@ fn parse_fat_comma_keyword_cross_line() {
 // ═══════════════════════════════════════════════════════════
 // Quote-keyword autoquoting.
 //
-// The 8 Perl quote-like operators — `q`, `qq`, `qw`, `qr`,
-// `m`, `s`, `tr`, `y` — are recognized as operators only
-// when followed by a *valid* opening delimiter (see
-// `at_quote_delimiter` in the lexer).  When not followed by
-// a valid opener — including when followed by `=>` (fat
-// comma), `}` (hash-subscript close), or any of the
-// closing paired delimiters `)`, `]`, `}`, `>` — they must
-// NOT start a quote op and must instead be treated as
-// ordinary barewords (autoquoted to string literals in the
-// appropriate contexts).
+// The 8 Perl quote-like operators — `q`, `qq`, `qw`, `qr`, `m`, `s`, `tr`, `y` — are recognized as operators only when
+// followed by a *valid* opening delimiter (see `at_quote_delimiter` in the lexer).  When not followed by a valid opener
+// — including when followed by `=>` (fat comma), `}` (hash-subscript close), or any of the closing paired delimiters
+// `)`, `]`, `}`, `>` — they must NOT start a quote op and must instead be treated as ordinary barewords (autoquoted to
+// string literals in the appropriate contexts).
 //
-// (`qx` — the backtick-equivalent — has the same lexical
-// shape but is omitted from this set to match Perl's common
-// "8 quote operators" terminology.)
+// (`qx` — the backtick-equivalent — has the same lexical shape but is omitted from this set to match Perl's common "8
+// quote operators" terminology.)
 // ═══════════════════════════════════════════════════════════
 
 // ── Autoquote in fat-comma context ────────────────────────
 
-/// Parse `(KEYWORD => 1);` and return the first list element.
-/// Handles the outer Paren wrapping produced by the `(...)`.
+/// Parse `(KEYWORD => 1);` and return the first list element.  Handles the outer Paren wrapping produced by the
+/// `(...)`.
 fn parse_kw_fat_comma(src: &str) -> Expr {
     let mut e = parse_expr_str(src);
-    // Unwrap a single-level Paren — `(k => v)` parses as
-    // Paren(List([k, v])) rather than bare List.
+    // Unwrap a single-level Paren — `(k => v)` parses as Paren(List([k, v])) rather than bare List.
     if let ExprKind::Paren(inner) = e.kind {
         e = *inner;
     }
@@ -6710,20 +6582,16 @@ fn autoquote_y_hash_key() {
 // ═══════════════════════════════════════════════════════════
 // Audit-driven gap-filling tests.
 //
-// The previous commits added many tests by phase, but the
-// audit I committed to in the interpolation masking
-// postmortem turned up several genuinely shallow ones and a
-// few real gaps.  These fill the worst of them.  Structured
-// by the phase they belong to.
+// The previous commits added many tests by phase, but the audit I committed to in the interpolation masking postmortem
+// turned up several genuinely shallow ones and a few real gaps.  These fill the worst of them.  Structured by the phase
+// they belong to.
 // ═══════════════════════════════════════════════════════════
 
 // ── Phase 3: postderef slice content verification ────────
 //
-// The original postderef slice tests checked only the
-// ArrowTarget variant, not the index/key contents.  A
-// regression that parsed `$r->@[0, 1, 2]` as
-// `ArraySliceIndices(IntLit(0))` (dropping the rest) would
-// slip through.  Tests below verify the inner expression.
+// The original postderef slice tests checked only the ArrowTarget variant, not the index/key contents.  A regression
+// that parsed `$r->@[0, 1, 2]` as `ArraySliceIndices(IntLit(0))` (dropping the rest) would slip through.  Tests below
+// verify the inner expression.
 
 #[test]
 fn postderef_array_slice_indices_content() {
@@ -6781,12 +6649,10 @@ fn postderef_kv_slice_indices_content() {
 
 #[test]
 fn postderef_nested_actually_nested() {
-    // Original `postderef_nested_slice` test claimed to
-    // cover chaining but only had one level.  This one
-    // actually chains: slice followed by arrow-array-elem.
+    // Original `postderef_nested_slice` test claimed to cover chaining but only had one level.  This one actually
+    // chains: slice followed by arrow-array-elem.
     let e = parse_expr_stmt("$r->@[0, 1]->[0];");
-    // Outer is ArrowDeref(_, ArrayElem(0)); inner is
-    // ArrowDeref($r, ArraySliceIndices([0, 1])).
+    // Outer is ArrowDeref(_, ArrayElem(0)); inner is ArrowDeref($r, ArraySliceIndices([0, 1])).
     match &e.kind {
         ExprKind::ArrowDeref(inner, ArrowTarget::ArrayElem(idx)) => {
             assert!(matches!(idx.kind, ExprKind::IntLit(0)));
@@ -6798,20 +6664,14 @@ fn postderef_nested_actually_nested() {
 
 // ── Phase 4: fc as named unary actually IS one ──────────
 //
-// `fc_requires_feature` was weak: it asserted parsing
-// didn't error and the name was "fc" — but that's true
-// regardless of whether fc was recognized as a named unary
-// or fell back to a generic FuncCall.  Counter-test: with
-// the feature on AND no parens, `fc` must bind as a
-// named-unary operator (precedence boundary: tighter than
-// `+`, looser than `*`).
+// `fc_requires_feature` was weak: it asserted parsing didn't error and the name was "fc" — but that's true regardless
+// of whether fc was recognized as a named unary or fell back to a generic FuncCall.  Counter-test: with the feature on
+// AND no parens, `fc` must bind as a named-unary operator (precedence boundary: tighter than `+`, looser than `*`).
 
 #[test]
 fn fc_named_unary_precedence() {
-    // `fc $x . $y` — named-unary operators parse their
-    // argument at NAMED_UNARY precedence, which is BELOW
-    // concat.  So the entire `$x . $y` is the argument:
-    // `fc($x . $y)`, NOT `fc($x) . $y`.
+    // `fc $x . $y` — named-unary operators parse their argument at NAMED_UNARY precedence, which is BELOW concat.  So
+    // the entire `$x . $y` is the argument: `fc($x . $y)`, NOT `fc($x) . $y`.
     let e = parse_expr_stmt("use feature 'fc'; fc $x . $y;");
     match e.kind {
         ExprKind::FuncCall(ref name, ref args) if name == "CORE::fc" => {
@@ -6824,10 +6684,8 @@ fn fc_named_unary_precedence() {
 
 // ── Phase 5b: reactivation tests for each gated keyword ──
 //
-// The original downgrade tests only checked `try` reactivates
-// when its feature is on.  Add the same check for each of
-// the seven keywords whose downgrade was implemented: each
-// should parse as its real keyword form when the feature is
+// The original downgrade tests only checked `try` reactivates when its feature is on.  Add the same check for each of
+// the seven keywords whose downgrade was implemented: each should parse as its real keyword form when the feature is
 // active.
 
 #[test]
@@ -6867,13 +6725,11 @@ fn class_reactivates_with_feature() {
 
 // ── Compile-time tokens in contexts ──────────────────────
 //
-// The original tests covered top-level __SUB__ / __PACKAGE__
-// but not nested contexts.
+// The original tests covered top-level __SUB__ / __PACKAGE__ but not nested contexts.
 
 #[test]
 fn current_sub_inside_named_sub() {
-    // __SUB__ inside a sub body — the token is lex-time so
-    // context doesn't affect its form; verify it parses.
+    // __SUB__ inside a sub body — the token is lex-time so context doesn't affect its form; verify it parses.
     let prog = parse("use feature 'current_sub'; sub f { __SUB__ }");
     let sub = prog
         .statements
@@ -6893,8 +6749,7 @@ fn current_sub_inside_named_sub() {
 
 #[test]
 fn current_package_after_nested_package_decl() {
-    // After `package Foo; package Bar;`, __PACKAGE__ gives
-    // "Bar".  Tests the parser state-tracking on successive
+    // After `package Foo; package Bar;`, __PACKAGE__ gives "Bar".  Tests the parser state-tracking on successive
     // package declarations.
     let prog = parse("package Foo;\npackage Bar;\n__PACKAGE__;\n");
     let e = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("expression statement");
@@ -6908,8 +6763,7 @@ fn current_package_after_nested_package_decl() {
 
 #[test]
 fn sig_slurpy_array_before_scalar_is_error() {
-    // `@rest` must be the last named parameter — a scalar
-    // after it is invalid.  The parser should reject.
+    // `@rest` must be the last named parameter — a scalar after it is invalid.  The parser should reject.
     let src = "use feature 'signatures'; sub f (@rest, $x) { }";
     let mut p = match Parser::new(src.as_bytes()) {
         Ok(p) => p,
@@ -7181,8 +7035,7 @@ fn parse_print_parens_scalar_fh() {
 
 #[test]
 fn parse_print_parens_scalar_not_fh() {
-    // print($f); — $f NOT a filehandle (followed by ), not a term).
-    // Prints value of $f to STDOUT.
+    // print($f); — $f NOT a filehandle (followed by ), not a term).  Prints value of $f to STDOUT.
     let e = parse_expr_str("print($f);");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
@@ -7474,16 +7327,12 @@ fn lexer_error_immediate() {
 
 // ── Hard parsing corpus ───────────────────────────────────
 //
-// The tests below are derived from a corpus of adversarial
-// cases targeting the hardest ambiguities in Perl parsing:
-// regex-vs-division, block-vs-hash, indirect object, ternary
-// associativity, comma/assignment precedence, arrow chains,
+// The tests below are derived from a corpus of adversarial cases targeting the hardest ambiguities in Perl parsing:
+// regex-vs-division, block-vs-hash, indirect object, ternary associativity, comma/assignment precedence, arrow chains,
 // interpolation, and heredoc integration.
 //
-// For each case we assert the specific structural facts we're
-// confident about — typically the top-level node kind and a
-// key grouping relationship.  We deliberately don't try to
-// match whole trees, to keep tests robust against AST
+// For each case we assert the specific structural facts we're confident about — typically the top-level node kind and a
+// key grouping relationship.  We deliberately don't try to match whole trees, to keep tests robust against AST
 // refactoring.
 
 // ── Regex vs division ─────────────────────────────────────
@@ -7971,9 +7820,8 @@ fn hard_nightmare_do_ternary_hash() {
 
 // ── Parse-or-error (Tier 1) — just verify these parse ─────
 //
-// For cases where the exact AST shape depends on decisions we
-// haven't firmed up (or features we haven't implemented yet),
-// at least verify the parser accepts them.
+// For cases where the exact AST shape depends on decisions we haven't firmed up (or features we haven't implemented
+// yet), at least verify the parser accepts them.
 
 #[test]
 fn hard_parses_map_slash() {
@@ -8013,8 +7861,7 @@ fn hard_parses_paren_grouping() {
 #[test]
 fn hard_my_assign_comma_grouping() {
     // `my $x = $a, $b;` — Perl parses as `(my $x = $a), $b`.
-    // Since `my` is an expression, the whole thing is a List with
-    // an Assign(Decl(My), $a) first, then $b.
+    // Since `my` is an expression, the whole thing is a List with an Assign(Decl(My), $a) first, then $b.
     let prog = parse("my $x = $a, $b;");
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
@@ -8074,9 +7921,8 @@ fn hard_state_assign_comma_grouping() {
 
 #[test]
 fn hard_local_assign_comma_grouping() {
-    // `local $x = $a, $b;` — local is an expression too; the trailing
-    // comma must NOT be absorbed into the Local operand.
-    // Must group as `(local $x = $a), $b`, giving List([Assign(Local($x), $a), $b]).
+    // `local $x = $a, $b;` — local is an expression too; the trailing comma must NOT be absorbed into the Local
+    // operand.  Must group as `(local $x = $a), $b`, giving List([Assign(Local($x), $a), $b]).
     let prog = parse("local $x = $a, $b;");
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
@@ -8096,8 +7942,7 @@ fn hard_local_assign_comma_grouping() {
 
 // ── Declarations as expressions: basic forms ──────────────
 //
-// Verify that each declaration kind produces an expression
-// (wrapped in Stmt::Expr), not a dedicated statement kind.
+// Verify that each declaration kind produces an expression (wrapped in Stmt::Expr), not a dedicated statement kind.
 
 #[test]
 fn hard_my_is_expression() {
@@ -8146,8 +7991,7 @@ fn hard_local_is_expression() {
 
 // ── Declarations in expression position ───────────────────
 //
-// Declarations as expressions should be usable in any context
-// that accepts an expression — not just at statement start.
+// Declarations as expressions should be usable in any context that accepts an expression — not just at statement start.
 
 #[test]
 fn hard_my_in_parens() {
@@ -8187,8 +8031,7 @@ fn hard_my_list_in_parens() {
 
 #[test]
 fn hard_my_in_if_condition() {
-    // `if (my $x = foo()) { ... }` — decl in an if condition.
-    // The decl is nested inside an If statement's paren-expr.
+    // `if (my $x = foo()) { ... }` — decl in an if condition.  The decl is nested inside an If statement's paren-expr.
     let prog = parse("if (my $x = foo()) { 1; }");
     match &prog.statements[0].kind {
         StmtKind::If(if_stmt) => match &if_stmt.condition.kind {
@@ -8222,13 +8065,10 @@ fn hard_parses_postfix_unless() {
 
 // ── Prototype-driven call-site parsing ─────────────────────
 //
-// These verify that a sub's prototype — registered in the
-// symbol table at declaration time — drives how arguments at
-// call sites are parsed.  Anti-oracle cases adapted from
-// ChatGPT's parser-breaker corpus.
+// These verify that a sub's prototype — registered in the symbol table at declaration time — drives how arguments at
+// call sites are parsed.  Anti-oracle cases adapted from ChatGPT's parser-breaker corpus.
 
-/// Given `sub NAME (PROTO); CALL`, parse and return the
-/// expression from the second statement (the call).
+/// Given `sub NAME (PROTO); CALL`, parse and return the expression from the second statement (the call).
 fn parse_call_with_proto(src: &str) -> Expr {
     let prog = parse(src);
     assert!(prog.statements.len() >= 2, "expected ≥2 statements (decl + call), got {}", prog.statements.len());
@@ -8241,8 +8081,7 @@ fn parse_call_with_proto(src: &str) -> Expr {
 #[test]
 fn proto_empty_stops_at_plus() {
     // sub foo (); foo + 1;
-    // Empty prototype forces zero args, so `+ 1` is a binary op.
-    // Expected: BinOp(Add, FuncCall("foo", []), Int(1)).
+    // Empty prototype forces zero args, so `+ 1` is a binary op.  Expected: BinOp(Add, FuncCall("foo", []), Int(1)).
     let e = parse_call_with_proto("sub foo (); foo + 1;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Add, lhs, rhs) => {
@@ -8277,8 +8116,7 @@ fn proto_single_scalar_takes_one_expr() {
 #[test]
 fn proto_single_scalar_comma_terminates_arg() {
     // sub foo ($); foo $a, $b;
-    // One-scalar proto: `$a` is the arg; comma ends the call,
-    // and `$b` is a separate list element.  Expected:
+    // One-scalar proto: `$a` is the arg; comma ends the call, and `$b` is a separate list element.  Expected:
     // List([FuncCall("foo", [$a]), $b]).
     let e = parse_call_with_proto("sub foo ($); foo $a, $b;");
     match &e.kind {
@@ -8317,8 +8155,7 @@ fn proto_two_scalars_takes_two_args() {
 #[test]
 fn proto_block_and_list() {
     // sub foo (&@); foo { $x } @list;
-    // &@-proto: first arg is a block (wrapped as AnonSub),
-    // second is the slurpy list.
+    // &@-proto: first arg is a block (wrapped as AnonSub), second is the slurpy list.
     let e = parse_call_with_proto("sub foo (&@); foo { $x } @list;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
@@ -8391,10 +8228,8 @@ fn unknown_sub_stays_bareword_before_operator() {
 
 #[test]
 fn proto_respects_package_scope() {
-    // A proto declared in Foo shouldn't affect bare calls in main.
-    // package Foo; sub bar (); package main; bar + 1;
-    // The bare `bar` in main isn't found → falls through to
-    // Bareword + BinOp.
+    // A proto declared in Foo shouldn't affect bare calls in main.  package Foo; sub bar (); package main; bar + 1;
+    // The bare `bar` in main isn't found → falls through to Bareword + BinOp.
     let prog = parse("package Foo; sub bar (); package main; bar + 1;");
     // Find the last statement (the `bar + 1` call).
     let last = prog.statements.last().expect("at least one stmt");
@@ -8409,8 +8244,7 @@ fn proto_respects_package_scope() {
 
 #[test]
 fn proto_respects_fully_qualified_call() {
-    // package Foo; sub bar (); package main; Foo::bar + 1;
-    // Fully-qualified call finds the proto → zero-arg call.
+    // package Foo; sub bar (); package main; Foo::bar + 1; Fully-qualified call finds the proto → zero-arg call.
     let prog = parse("package Foo; sub bar (); package main; Foo::bar + 1;");
     let last = prog.statements.last().expect("at least one stmt");
     match &last.kind {
@@ -8458,16 +8292,14 @@ fn proto_underscore_without_arg_inserts_default_var() {
 #[test]
 fn proto_underscore_distinct_from_explicit_dollar_underscore() {
     // sub foo (_); foo $_;
-    // Explicit $_ should be ScalarVar("_"), NOT DefaultVar.
-    // This pins down the distinction: the parser inserts
+    // Explicit $_ should be ScalarVar("_"), NOT DefaultVar.  This pins down the distinction: the parser inserts
     // DefaultVar only when the arg is omitted.
     let e = parse_call_with_proto("sub foo (_); foo $_;");
     match &e.kind {
         ExprKind::FuncCall(_, args) => {
             assert_eq!(args.len(), 1);
-            // Note: $_ may be represented as SpecialVar or
-            // ScalarVar depending on the lexer; either is fine,
-            // as long as it's NOT DefaultVar.
+            // Note: $_ may be represented as SpecialVar or ScalarVar depending on the lexer; either is fine, as long as
+            // it's NOT DefaultVar.
             assert!(!matches!(args[0].kind, ExprKind::DefaultVar), "explicit $_ should not become DefaultVar");
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -8509,8 +8341,7 @@ fn proto_glob_explicit_star_stays_glob() {
 #[test]
 fn proto_glob_scalar_passed_through() {
     // sub foo (*); foo $fh;
-    // A scalar expression in a `*` slot is parsed as-is —
-    // it's presumed to hold a glob ref at runtime.
+    // A scalar expression in a `*` slot is parsed as-is — it's presumed to hold a glob ref at runtime.
     let e = parse_call_with_proto("sub foo (*); foo $fh;");
     match &e.kind {
         ExprKind::FuncCall(_, args) => {
@@ -8524,21 +8355,17 @@ fn proto_glob_scalar_passed_through() {
 // ── Prototype bypass cases ─────────────────────────────────
 //
 // Two syntactic forms bypass prototype-driven argument parsing:
-//   1. Parens form: foo(args) — args are parens-delimited, so
-//      the parser takes a generic comma-separated list without
-//      consulting the prototype.  (Perl may still validate arg
-//      counts at compile time; that's a semantic-pass concern,
+//   1. Parens form: foo(args) — args are parens-delimited, so the parser takes a generic comma-separated list without
+//      consulting the prototype.  (Perl may still validate arg counts at compile time; that's a semantic-pass concern,
 //      not a parsing concern.)
-//   2. Ampersand form: &foo(args) — goes through the code-ref
-//      prefix path, completely bypassing parse_ident_term and
+//   2. Ampersand form: &foo(args) — goes through the code-ref prefix path, completely bypassing parse_ident_term and
 //      therefore the symbol-table lookup.
 
 #[test]
 fn proto_parens_form_parses_generic_list() {
     // sub foo ($); foo($a + $b, $c);
-    // Without parens, `$` proto would consume only `$a + $b`
-    // and leave `$c` in the outer comma list.  With parens,
-    // the args are delimited, so we get both.
+    // Without parens, `$` proto would consume only `$a + $b` and leave `$c` in the outer comma list.  With parens, the
+    // args are delimited, so we get both.
     let e = parse_call_with_proto("sub foo ($); foo($a + $b, $c);");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
@@ -8554,8 +8381,7 @@ fn proto_parens_form_parses_generic_list() {
 #[test]
 fn proto_parens_form_ignores_empty_proto() {
     // sub foo (); foo(1, 2);
-    // Parens form takes the args; Perl would report "Too many
-    // arguments" at compile time but we don't validate yet.
+    // Parens form takes the args; Perl would report "Too many arguments" at compile time but we don't validate yet.
     let e = parse_call_with_proto("sub foo (); foo(1, 2);");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
@@ -8569,8 +8395,7 @@ fn proto_parens_form_ignores_empty_proto() {
 #[test]
 fn proto_ampersand_call_bypasses_empty_proto() {
     // sub foo (); &foo(1, 2);
-    // &foo() completely bypasses prototype parsing.  Without
-    // the &, `foo(1, 2)` would still work via parens (see test
+    // &foo() completely bypasses prototype parsing.  Without the &, `foo(1, 2)` would still work via parens (see test
     // above), but the &-form is the canonical bypass.
     let e = parse_call_with_proto("sub foo (); &foo(1, 2);");
     match &e.kind {
@@ -8585,8 +8410,7 @@ fn proto_ampersand_call_bypasses_empty_proto() {
 #[test]
 fn proto_ampersand_no_parens_bypasses_proto() {
     // sub foo ($); &foo;
-    // &foo with no parens calls with current @_ (inherited);
-    // prototype is not consulted.
+    // &foo with no parens calls with current @_ (inherited); prototype is not consulted.
     let e = parse_call_with_proto("sub foo ($); &foo;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
@@ -8599,12 +8423,9 @@ fn proto_ampersand_no_parens_bypasses_proto() {
 
 // ── Named-unary precedence for scalar-ish slots ─────────────
 //
-// A `$`-slot (or `_`, `+`, `\X`, `\[...]`, glob-expression)
-// parses its arg at named-unary precedence.  That means
-// operators tighter than named unary (shift, +, -, *, /, **,
-// etc.) are consumed into the arg, while operators looser
-// (relational, equality, ternary, assignment, comma) terminate
-// the arg and apply at the outer level.
+// A `$`-slot (or `_`, `+`, `\X`, `\[...]`, glob-expression) parses its arg at named-unary precedence.  That means
+// operators tighter than named unary (shift, +, -, *, /, **, etc.) are consumed into the arg, while operators looser
+// (relational, equality, ternary, assignment, comma) terminate the arg and apply at the outer level.
 
 #[test]
 fn proto_scalar_tight_op_is_consumed() {
@@ -8627,8 +8448,7 @@ fn proto_scalar_tight_op_is_consumed() {
 #[test]
 fn proto_scalar_relational_terminates_arg() {
     // sub foo ($); foo $a < 1;
-    // `<` (relational, looser than named unary) terminates the
-    // arg.  Parses as `foo($a) < 1`.
+    // `<` (relational, looser than named unary) terminates the arg.  Parses as `foo($a) < 1`.
     let e = parse_call_with_proto("sub foo ($); foo $a < 1;");
     match &e.kind {
         ExprKind::BinOp(BinOp::NumLt, lhs, rhs) => {
@@ -8649,8 +8469,7 @@ fn proto_scalar_relational_terminates_arg() {
 #[test]
 fn proto_scalar_equality_terminates_arg() {
     // sub foo ($); foo 1 == 2;
-    // `==` is looser than named unary → terminates arg.
-    // Parses as `foo(1) == 2`.
+    // `==` is looser than named unary → terminates arg.  Parses as `foo(1) == 2`.
     let e = parse_call_with_proto("sub foo ($); foo 1 == 2;");
     match &e.kind {
         ExprKind::BinOp(BinOp::NumEq, lhs, rhs) => {
@@ -8671,8 +8490,7 @@ fn proto_scalar_equality_terminates_arg() {
 #[test]
 fn proto_scalar_ternary_terminates_arg() {
     // sub foo ($); foo $a ? $b : $c;
-    // Ternary is far below named unary → terminates arg.
-    // Parses as `foo($a) ? $b : $c`.
+    // Ternary is far below named unary → terminates arg.  Parses as `foo($a) ? $b : $c`.
     let e = parse_call_with_proto("sub foo ($); foo $a ? $b : $c;");
     match &e.kind {
         ExprKind::Ternary(cond, _, _) => match &cond.kind {
@@ -8689,8 +8507,7 @@ fn proto_scalar_ternary_terminates_arg() {
 #[test]
 fn proto_scalar_mul_and_add_both_consumed() {
     // sub foo ($); foo 1 + 2 * 3;
-    // Both `+` and `*` are tighter than named unary, so the
-    // whole arithmetic expression is the single arg.
+    // Both `+` and `*` are tighter than named unary, so the whole arithmetic expression is the single arg.
     let e = parse_call_with_proto("sub foo ($); foo 1 + 2 * 3;");
     match &e.kind {
         ExprKind::FuncCall(_, args) => {
@@ -8703,8 +8520,7 @@ fn proto_scalar_mul_and_add_both_consumed() {
 
 // ── & slot accepting code references ────────────────────────
 //
-// A `&` prototype slot accepts either a literal block (wrapped
-// as an anonymous sub) or any code-reference expression —
+// A `&` prototype slot accepts either a literal block (wrapped as an anonymous sub) or any code-reference expression —
 // `\&name`, `$coderef`, `sub { ... }`, etc.
 
 #[test]
@@ -8773,12 +8589,9 @@ fn proto_amp_slot_block_still_works() {
 
 // ── Auto-reference prototype slots ──────────────────────────
 //
-// `\$`, `\@`, `\%`, `\&`, `\*`, `\[...]`, and `+` all cause
-// the argument to be implicitly referenced at the call site.
-// `foo @arr` with `sub foo (\@)` is equivalent to `foo(\@arr)`.
-// The parser wraps the argument in an ExprKind::Ref; any
-// validation that the argument is of the expected kind is a
-// semantic-pass concern.
+// `\$`, `\@`, `\%`, `\&`, `\*`, `\[...]`, and `+` all cause the argument to be implicitly referenced at the call site.
+// `foo @arr` with `sub foo (\@)` is equivalent to `foo(\@arr)`.  The parser wraps the argument in an ExprKind::Ref; any
+// validation that the argument is of the expected kind is a semantic-pass concern.
 
 #[test]
 fn proto_auto_ref_array() {
@@ -8953,11 +8766,9 @@ fn proto_auto_ref_mixed_with_slurpy() {
 
 // ── Non-initial & slot: `{` is a hash-ref, not a block ──────
 //
-// In the initial slot, `&` plus a bare `{` parses the block as
-// an anonymous sub (the map/grep pattern).  In any non-initial
-// position, `{` at a call site is an ordinary hash-ref
-// constructor; to pass a code reference the caller must spell
-// it out: `sub { ... }`, `\&name`, `$coderef`, etc.
+// In the initial slot, `&` plus a bare `{` parses the block as an anonymous sub (the map/grep pattern).  In any non-
+// initial position, `{` at a call site is an ordinary hash-ref constructor; to pass a code reference the caller must
+// spell it out: `sub { ... }`, `\&name`, `$coderef`, etc.
 
 #[test]
 fn proto_amp_non_initial_brace_is_hash_ref() {
@@ -9004,8 +8815,7 @@ fn proto_amp_non_initial_backslash_name_works() {
 #[test]
 fn proto_amp_initial_block_still_works() {
     // sub foo (&); foo { 1 };
-    // Regression: initial `&` with bare block still wraps as
-    // AnonSub.
+    // Regression: initial `&` with bare block still wraps as AnonSub.
     let e = parse_call_with_proto("sub foo (&); foo { 1 };");
     match &e.kind {
         ExprKind::FuncCall(_, args) => {
@@ -9033,17 +8843,14 @@ fn proto_amp_initial_map_style_still_works() {
 
 // ── :prototype(...) attribute form ──────────────────────────
 //
-// Modern Perl (5.20+) allows the prototype to be declared via
-// an attribute rather than the paren form:
+// Modern Perl (5.20+) allows the prototype to be declared via an attribute rather than the paren form:
 //   sub foo :prototype($$) { ... }
-// The attribute form is equivalent to the paren form but
-// avoids the paren/signatures ambiguity.
+// The attribute form is equivalent to the paren form but avoids the paren/signatures ambiguity.
 
 #[test]
 fn proto_attribute_form_registers_prototype() {
     // sub foo :prototype($$) { } foo $a + $b, $c;
-    // Prototype declared via attribute drives call-site parsing
-    // just like the paren form.
+    // Prototype declared via attribute drives call-site parsing just like the paren form.
     let e = parse_call_with_proto("sub foo :prototype($$) { } foo $a + $b, $c;");
     match &e.kind {
         ExprKind::FuncCall(name, args) => {
@@ -9163,8 +8970,7 @@ fn escape_n_unicode_codepoint_ascii() {
 
 #[test]
 fn escape_n_charname_resolved() {
-    // `\N{SNOWMAN}` — named character resolved via unicode_names2
-    // to U+2603 (☃).
+    // `\N{SNOWMAN}` — named character resolved via unicode_names2 to U+2603 (☃).
     let e = parse_expr_str(r#""\N{SNOWMAN}";"#);
     match &e.kind {
         ExprKind::StringLit(s) => {
@@ -9214,11 +9020,9 @@ fn smartmatch_basic() {
 
 #[test]
 fn smartmatch_precedence_vs_equality() {
-    // `~~` is at PREC_EQ (same as `==`), non-associative.
-    // `$a == $b ~~ $c` should error or parse as comparison
-    // chain — but since both are non-associative at the same
-    // level, the Pratt loop stops after the first one.
-    // We just verify `$a ~~ $b` parses at the right level.
+    // `~~` is at PREC_EQ (same as `==`), non-associative.  `$a == $b ~~ $c` should error or parse as comparison chain —
+    // but since both are non-associative at the same level, the Pratt loop stops after the first one.  We just verify
+    // `$a ~~ $b` parses at the right level.
     let e = parse_expr_str("$a ~~ $b || $c;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Or, lhs, _) => {
@@ -9230,20 +9034,14 @@ fn smartmatch_precedence_vs_equality() {
 
 #[test]
 fn smartmatch_disabled_without_feature() {
-    // After `no feature ':all'`, smartmatch is off.
-    // The lexer still emits Token::SmartMatch (it doesn't
-    // have feature state), but peek_op_info won't recognize
-    // it as an operator.  The expression `$a ~~ $b` fails
-    // to parse as a single expression — `$a` is one
-    // statement and `~~` is an unexpected token.
+    // After `no feature ':all'`, smartmatch is off.  The lexer still emits Token::SmartMatch (it doesn't have feature
+    // state), but peek_op_info won't recognize it as an operator.  The expression `$a ~~ $b` fails to parse as a single
+    // expression — `$a` is one statement and `~~` is an unexpected token.
     //
-    // A full solution would need lexer-level token demotion
-    // (splitting SmartMatch back into two Tildes), similar
-    // to keyword demotion.  For now, verify the program
-    // doesn't produce a SmartMatch BinOp.
+    // A full solution would need lexer-level token demotion (splitting SmartMatch back into two Tildes), similar to
+    // keyword demotion.  For now, verify the program doesn't produce a SmartMatch BinOp.
     let prog = parse("no feature ':all'; ~$b;");
-    // Just confirms the feature removal doesn't break
-    // normal `~` (bitwise not).
+    // Just confirms the feature removal doesn't break normal `~` (bitwise not).
     assert!(!prog.statements.is_empty());
 }
 
@@ -9293,8 +9091,7 @@ fn string_bitwise_xor_assign() {
 
 #[test]
 fn string_bitwise_precedence() {
-    // `&.` has PREC_BIT_AND, which is tighter than `|.`.
-    // `$a |. $b &. $c` → `$a |. ($b &. $c)`.
+    // `&.` has PREC_BIT_AND, which is tighter than `|.`.  `$a |. $b &. $c` → `$a |. ($b &. $c)`.
     let e = parse_expr_str("$a |. $b &. $c;");
     match &e.kind {
         ExprKind::BinOp(BinOp::StringBitOr, _, rhs) => {
@@ -9308,10 +9105,8 @@ fn string_bitwise_precedence() {
 
 #[test]
 fn core_qualified_builtin() {
-    // `CORE::say(...)` parses as a package-qualified function call.
-    // The semantic distinction (forcing the builtin) is a
-    // compiler concern; the parser treats it like any other
-    // qualified name.
+    // `CORE::say(...)` parses as a package-qualified function call.  The semantic distinction (forcing the builtin) is
+    // a compiler concern; the parser treats it like any other qualified name.
     let prog = parse(r#"CORE::say("hello");"#);
     assert!(!prog.statements.is_empty(), "should parse CORE::say");
 }
@@ -9383,19 +9178,16 @@ fn utf8_error_without_pragma() {
 
 #[test]
 fn utf8_lexical_scoping() {
-    // `use utf8` is lexically scoped: inside a `no utf8`
-    // block, UTF-8 identifiers are rejected again.
+    // `use utf8` is lexically scoped: inside a `no utf8` block, UTF-8 identifiers are rejected again.
     let src = "use utf8; my $café = 1; { no utf8; my $x = 1; }";
     let prog = parse(src);
-    // The program parses — $café is in utf8 scope,
-    // $x is in no-utf8 scope (ASCII only, fine).
+    // The program parses — $café is in utf8 scope, $x is in no-utf8 scope (ASCII only, fine).
     assert!(prog.statements.len() >= 2);
 }
 
 #[test]
 fn utf8_lexical_scoping_error_in_block() {
-    // After `no utf8` inside a block, UTF-8 identifiers
-    // should error — matching Perl's behavior.
+    // After `no utf8` inside a block, UTF-8 identifiers should error — matching Perl's behavior.
     let src = "use utf8; { no utf8; my $café = 1; }";
     let mut p = match Parser::new(src.as_bytes()) {
         Ok(p) => p,
@@ -9413,16 +9205,14 @@ fn utf8_in_string_interpolation() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// perlsyn gap-probing tests — features from perlsyn that
-// may or may not be implemented.  Failures are diagnostic.
+// perlsyn gap-probing tests — features from perlsyn that may or may not be implemented.  Failures are diagnostic.
 // ═══════════════════════════════════════════════════════════
 
 // ── 1. Postfix `when` modifier ───────────────────────────
 
 #[test]
 fn postfix_when_modifier_v514() {
-    // `$abc = 1 when /^abc/;` — perlsyn lists `when EXPR`
-    // as a statement modifier alongside if/unless/while/until.
+    // `$abc = 1 when /^abc/;` — perlsyn lists `when EXPR` as a statement modifier alongside if/unless/while/until.
     // `use v5.14` enables the switch feature (5.10–5.34 bundle).
     let prog = parse("use v5.14; $abc = 1 when /^abc/;");
     assert!(prog.statements.len() >= 2, "should parse postfix when with use v5.14");
@@ -9437,14 +9227,11 @@ fn postfix_when_modifier_explicit_feature() {
 
 #[test]
 fn postfix_when_without_feature() {
-    // Without the switch feature, `when` is demoted to a bare
-    // identifier.  `$abc = 1 when ...` would parse `when` as
-    // a bareword function call — the expression becomes
-    // `1 when(...)` which is NOT a postfix modifier.
-    // Just verify it doesn't produce PostfixKind::When.
+    // Without the switch feature, `when` is demoted to a bare identifier.  `$abc = 1 when ...` would parse `when` as
+    // a bareword function call — the expression becomes `1 when(...)` which is NOT a postfix modifier.  Just verify it
+    // doesn't produce PostfixKind::When.
     let prog = parse("$abc = 1; when(/^abc/);");
-    // Without switch, `when` is a function call, not a keyword.
-    // The program parses as two separate statements.
+    // Without switch, `when` is a function call, not a keyword.  The program parses as two separate statements.
     assert!(prog.statements.len() >= 2);
     // Verify the first statement is NOT a postfix-when.
     let not_postfix_when = !matches!(&prog.statements[0].kind, StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::When, _, _), .. }));
@@ -9455,8 +9242,7 @@ fn postfix_when_without_feature() {
 
 #[test]
 fn continue_block_on_bare_block() {
-    // perlsyn: `LABEL BLOCK continue BLOCK` is valid.
-    // A bare block acts as a loop that executes once.
+    // perlsyn: `LABEL BLOCK continue BLOCK` is valid.  A bare block acts as a loop that executes once.
     let prog = parse("LOOP: { 1; } continue { 2; }");
     assert!(!prog.statements.is_empty(), "should parse bare block with continue");
 }
@@ -9471,8 +9257,7 @@ fn continue_block_on_unlabeled_bare_block() {
 
 #[test]
 fn foreach_multi_variable() {
-    // `for my ($key, $value) (%hash) { ... }` — iterating
-    // over multiple values at a time (Perl 5.36+).
+    // `for my ($key, $value) (%hash) { ... }` — iterating over multiple values at a time (Perl 5.36+).
     let prog = parse("for my ($key, $value) (%hash) { 1; }");
     assert!(!prog.statements.is_empty(), "should parse multi-variable foreach");
 }
@@ -9506,8 +9291,7 @@ fn break_in_given() {
 
 #[test]
 fn continue_fall_through_in_given() {
-    // `continue` inside a `when` block means fall through
-    // to the next when — different from `continue BLOCK`.
+    // `continue` inside a `when` block means fall through to the next when — different from `continue BLOCK`.
     let prog = parse("use v5.14; given ($x) { when (1) { $a = 1; continue } when (2) { $b = 1 } }");
     assert!(!prog.statements.is_empty(), "should parse continue as fall-through in given");
 }
@@ -9577,8 +9361,7 @@ fn line_directive_number_only() {
 
 #[test]
 fn line_directive_not_at_column_zero() {
-    // Leading whitespace — `#` is NOT at column 0, so it's
-    // just a regular comment, not a directive.
+    // Leading whitespace — `#` is NOT at column 0, so it's just a regular comment, not a directive.
     let prog = parse("  # line 200\n__LINE__;");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
@@ -9604,8 +9387,7 @@ fn logical_xor_operator() {
 
 #[test]
 fn logical_xor_precedence() {
-    // `^^` is lower than `||` but same level.
-    // `$a || $b ^^ $c` → `($a || $b) ^^ $c`.
+    // `^^` is lower than `||` but same level.  `$a || $b ^^ $c` → `($a || $b) ^^ $c`.
     let e = parse_expr_str("$a || $b ^^ $c;");
     match &e.kind {
         ExprKind::BinOp(BinOp::LogicalXor, lhs, _) => {
@@ -9779,9 +9561,7 @@ fn case_mod_quotemeta() {
 
 #[test]
 fn case_mod_stacking() {
-    // `"\Q'\Ufoo\Ebar'\E"` → `\\'FOObar\\'`
-    // \Q quotemeta, then \U uppercase stacks on top.
-    // \E pops \U, \E pops \Q.
+    // `"\Q'\Ufoo\Ebar'\E"` → `\\'FOObar\\'` \Q quotemeta, then \U uppercase stacks on top.  \E pops \U, \E pops \Q.
     let e = parse_expr_str(r#""\Q'\Ufoo\Ebar'\E";"#);
     match &e.kind {
         ExprKind::StringLit(s) => assert_eq!(s, "\\'FOObar\\'"),
@@ -9801,8 +9581,7 @@ fn case_mod_foldcase() {
 
 #[test]
 fn case_mod_interp_uppercase() {
-    // `"\Utest$x\E"` → InterpolatedString with:
-    //   Const("TEST"), ScalarInterp(uc($x))
+    // `"\Utest$x\E"` → InterpolatedString with: Const("TEST"), ScalarInterp(uc($x))
     let e = parse_expr_str(r#""\Utest$x\E";"#);
     match &e.kind {
         ExprKind::InterpolatedString(interp) => {
@@ -10457,8 +10236,8 @@ fn utf8_underscore_then_unicode() {
 
 #[test]
 fn utf8_package_qualified() {
-    // Verify the full qualified name survives scanning.
-    // `Package->new()` produces ExprKind::MethodCall(Bareword(pkg), "new", []).
+    // Verify the full qualified name survives scanning.  `Package->new()` produces ExprKind::MethodCall(Bareword(pkg),
+    // "new", []).
     let prog = parse("use utf8; Ünïcödé::módule->new();");
     let method_call = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("should find expression");
     match &method_call.kind {
@@ -10542,8 +10321,8 @@ fn utf8_punctuation_not_identifier() {
 
 #[test]
 fn utf8_combining_mark_not_identifier_start() {
-    // U+0301 COMBINING ACUTE ACCENT is XID_Continue but not XID_Start.
-    // As the first char after a sigil, it should fail.
+    // U+0301 COMBINING ACUTE ACCENT is XID_Continue but not XID_Start.  As the first char after a sigil, it should
+    // fail.
     let src = "use utf8; my $\u{0301}x = 1;";
     let mut p = Parser::new(src.as_bytes()).unwrap();
     assert!(p.parse_program().is_err(), "combining mark should not be valid as identifier start");
@@ -10551,8 +10330,7 @@ fn utf8_combining_mark_not_identifier_start() {
 
 #[test]
 fn utf8_combining_mark_ok_as_continue() {
-    // Combining mark after a valid start character is fine.
-    // `$e\u{0301}` = $é (e + combining acute) — valid.
+    // Combining mark after a valid start character is fine.  `$e\u{0301}` = $é (e + combining acute) — valid.
     let prog = parse("use utf8; my $e\u{0301} = 1;");
     assert!(!prog.statements.is_empty(), "combining mark as continuation should parse");
 }
@@ -10635,8 +10413,7 @@ fn nfc_ascii_identifiers_unchanged() {
 
 #[test]
 fn nfc_no_normalization_without_utf8() {
-    // Without `use utf8`, high bytes are errors, so NFC
-    // normalization never applies.
+    // Without `use utf8`, high bytes are errors, so NFC normalization never applies.
     let prog = parse("my $hello = 1;");
     assert!(!prog.statements.is_empty());
 }
@@ -10804,9 +10581,8 @@ fn utf8_hash_subscript_utf8_key() {
 
 #[test]
 fn nfc_same_identifier_both_forms_yields_same_name() {
-    // NFC $café and NFD $café in the same program must produce
-    // identical variable names, or the runtime would treat them
-    // as different variables.
+    // NFC $café and NFD $café in the same program must produce identical variable names, or the runtime would treat
+    // them as different variables.
     let tokens = collect_tokens_utf8("use utf8; $caf\u{00E9}; $cafe\u{0301};");
     let scalar_names: Vec<&str> = tokens.iter().filter_map(|t| if let Token::ScalarVar(name) = t { Some(name.as_str()) } else { None }).collect();
     assert!(scalar_names.len() >= 2, "should find at least 2 scalar vars");
@@ -10816,8 +10592,7 @@ fn nfc_same_identifier_both_forms_yields_same_name() {
 
 #[test]
 fn nfc_interpolation_variable_name_normalized() {
-    // Interpolated NFD $café inside a string — the InterpScalar
-    // token should contain the NFC name.
+    // Interpolated NFD $café inside a string — the InterpScalar token should contain the NFC name.
     let tokens = collect_tokens_utf8("use utf8; \"$cafe\u{0301}\"");
     let interp_name =
         tokens.iter().find_map(|t| if let Token::InterpScalar(name) = t { Some(name.clone()) } else { None }).expect("should find InterpScalar token");
@@ -10917,9 +10692,8 @@ fn nfc_sub_name_nfd_becomes_nfc() {
 
 #[test]
 fn double_quoted_non_ascii_body_ascii_delim() {
-    // Non-ASCII content in a regular double-quoted string under
-    // use utf8.  The memchr fast path should bulk-copy the UTF-8
-    // correctly.
+    // Non-ASCII content in a regular double-quoted string under use utf8.  The memchr fast path should bulk-copy the
+    // UTF-8 correctly.
     let prog = parse("use utf8; my $x = \"caf\u{00E9} \u{00A3}5\";");
     match &prog.statements[1].kind {
         StmtKind::Expr(e) => match &e.kind {
@@ -10939,9 +10713,8 @@ fn double_quoted_non_ascii_body_ascii_delim() {
 
 #[test]
 fn q_braces_with_non_ascii_under_utf8() {
-    // Standard q{} with non-ASCII body under use utf8.
-    // No Unicode delimiters — tests the basic byte-by-byte
-    // fallback with ASCII delimiters.
+    // Standard q{} with non-ASCII body under use utf8.  No Unicode delimiters — tests the basic byte-by-byte fallback
+    // with ASCII delimiters.
     let prog = parse("use utf8; my $x = q{caf\u{00E9}};");
     match &prog.statements[1].kind {
         StmtKind::Expr(e) => match &e.kind {
@@ -10957,8 +10730,7 @@ fn q_braces_with_non_ascii_under_utf8() {
 
 #[test]
 fn case_mod_uppercase_non_ascii() {
-    // "\Ucafé\E" under use utf8 — the byte-by-byte fallback
-    // must decode multi-byte UTF-8 characters, not split them
+    // "\Ucafé\E" under use utf8 — the byte-by-byte fallback must decode multi-byte UTF-8 characters, not split them
     // with skip(1) + b as char.
     let prog = parse("use utf8; my $x = \"\\Ucaf\u{00E9}\\E\";");
     match &prog.statements[1].kind {
@@ -10981,12 +10753,10 @@ fn case_mod_uppercase_non_ascii() {
 
 #[test]
 fn utf8_digit_after_package_separator_is_error() {
-    // `Foo::3bar` — 3 is XID_Continue but NOT XID_Start.
-    // After ::, the next segment needs XID_Start.
+    // `Foo::3bar` — 3 is XID_Continue but NOT XID_Start.  After ::, the next segment needs XID_Start.
     let src = "use utf8; Foo::3bar;";
     let mut p = Parser::new(src.as_bytes()).unwrap();
-    // This should either error or parse 3 as a number, not as
-    // part of the identifier.
+    // This should either error or parse 3 as a number, not as part of the identifier.
     let result = p.parse_program();
     if let Ok(prog) = result {
         // If it parsed, verify `Foo::3bar` is NOT a single identifier.
@@ -11033,8 +10803,7 @@ fn utf8_sigil_whitespace_then_unicode_name_exact() {
 
 #[test]
 fn utf8_heredoc_tag() {
-    // Heredoc near UTF-8 code — the tag itself is ASCII but
-    // the surrounding context uses UTF-8.
+    // Heredoc near UTF-8 code — the tag itself is ASCII but the surrounding context uses UTF-8.
     let src = "use utf8; my $café = <<FIN;\ncontent\nFIN\n";
     let rhs = first_assign_rhs(&parse(src));
     match &rhs.kind {
@@ -11231,8 +11000,7 @@ fn hard_plus_wraps_anon_hash() {
 
 #[test]
 fn hard_block_vs_hash_in_map() {
-    // `map { { a => 1 } } @list` — outer braces are a block,
-    // inner braces are an anonymous hash.
+    // `map { { a => 1 } } @list` — outer braces are a block, inner braces are an anonymous hash.
     let e = parse_expr_stmt("map { { a => 1 } } @list;");
 
     fn block_contains_anon_hash(block: &Block) -> bool {
@@ -11299,8 +11067,7 @@ fn hard_block_vs_hash_in_map() {
 
 #[test]
 fn current_package_restores_after_block_form_package() {
-    // `package Inner { ... }` — block-form package scopes
-    // and restores the outer package name.
+    // `package Inner { ... }` — block-form package scopes and restores the outer package name.
     let prog = parse(
         "package Outer;\n\
          package Inner { __PACKAGE__; }\n\
@@ -11334,9 +11101,8 @@ fn current_package_restores_after_block_form_package() {
 #[test]
 // Known bug: statement-form package inside bare block doesn't restore.
 fn current_package_restores_after_statement_form_in_block() {
-    // `{ package Inner; __PACKAGE__; }` — statement-form package
-    // inside a bare block.  In Perl, the package name is scoped
-    // to the enclosing block and restored on exit.
+    // `{ package Inner; __PACKAGE__; }` — statement-form package inside a bare block.  In Perl, the package name is
+    // scoped to the enclosing block and restored on exit.
     let prog = parse(
         "package Outer;\n\
          { package Inner; __PACKAGE__; }\n\
@@ -11481,10 +11247,8 @@ fn qw_math_angle_brackets() {
 
 #[test]
 fn q_unicode_delim_body_with_shared_lead_byte() {
-    // « is U+00AB (0xC2 0xAB), » is U+00BB (0xC2 0xBB).
-    // £ is U+00A3 (0xC2 0xA3) — shares lead byte 0xC2 with both.
-    // Memchr triggers on 0xC2 inside the body, but the old
-    // byte-by-byte fallback did skip(1) + b as char, splitting
+    // « is U+00AB (0xC2 0xAB), » is U+00BB (0xC2 0xBB).  £ is U+00A3 (0xC2 0xA3) — shares lead byte 0xC2 with both.
+    // Memchr triggers on 0xC2 inside the body, but the old byte-by-byte fallback did skip(1) + b as char, splitting
     // the multi-byte £ into two garbled characters.
     let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{00AB}\u{00A3}\u{00BB};");
     match &prog.statements[2].kind {
@@ -11514,8 +11278,7 @@ fn tr_unicode_delimiters_paired() {
 }
 
 // ── Non-paired Unicode delimiters ─────────────────────────
-// Without extra_paired_delimiters, Unicode chars work as
-// non-paired (same open/close) delimiters.
+// Without extra_paired_delimiters, Unicode chars work as non-paired (same open/close) delimiters.
 
 #[test]
 fn qq_unicode_non_paired_delimiter() {
@@ -11587,12 +11350,9 @@ fn heredoc_space_before_single_quoted_tag_allowed() {
 
 #[test]
 fn heredoc_space_before_bare_tag_is_shift() {
-    // << END (space before bare tag) is NOT a heredoc in Perl.
-    // Perl treats bare << as <<""  which is forbidden.
-    // Our parser should interpret this as shift-left, not a heredoc.
-    // "1 << END" with END undefined is a compile error in Perl,
-    // but for our parser it should parse as a shift expression,
-    // not as a heredoc.
+    // << END (space before bare tag) is NOT a heredoc in Perl.  Perl treats bare << as <<""  which is forbidden.  Our
+    // parser should interpret this as shift-left, not a heredoc.  "1 << END" with END undefined is a compile error in
+    // Perl, but for our parser it should parse as a shift expression, not as a heredoc.
     let src = "my $x = 1 << 2;";
     let prog = parse(src);
     let init = first_assign_rhs(&prog);
@@ -11695,8 +11455,7 @@ fn apos_hash_var_via_parser() {
 
 #[test]
 fn apos_disabled_by_v5_42() {
-    // use v5.42 disables apostrophe_as_package_separator.
-    // With the feature off, Foo'Bar is Foo (bareword) then 'Bar;'
+    // use v5.42 disables apostrophe_as_package_separator.  With the feature off, Foo'Bar is Foo (bareword) then 'Bar;'
     // (unterminated string — no closing ').  The parse should fail.
     let result = crate::parse(b"use v5.42; Foo'Bar;");
     assert!(result.is_err(), "expected parse error with feature off");
@@ -11721,8 +11480,8 @@ fn apos_re_enabled_after_v5_42() {
 
 #[test]
 fn apos_heredoc_tag_not_separator() {
-    // <<Foo'Bar — apostrophe starts a quoted tag, not a separator.
-    // Perl treats <<Foo as bare tag "Foo", then 'Bar' is a string.
+    // <<Foo'Bar — apostrophe starts a quoted tag, not a separator.  Perl treats <<Foo as bare tag "Foo", then 'Bar' is
+    // a string.
     let prog = parse("my $x = <<Foo . 'suffix';\nbody\nFoo\n");
     assert!(!prog.statements.is_empty());
 }
@@ -11793,8 +11552,7 @@ fn parse_all_with_parens() {
 
 #[test]
 fn parse_any_without_feature_is_bareword() {
-    // Without the feature, 'any' is a regular bareword.
-    // any(...) parses as a function call, not a keyword.
+    // Without the feature, 'any' is a regular bareword.  any(...) parses as a function call, not a keyword.
     let prog = parse("my $r = any(1, 2, 3);");
     let init = first_assign_rhs(&prog);
     assert!(matches!(init.kind, ExprKind::FuncCall(ref name, _) if name == "main::any"), "expected FuncCall(any), got {:?}", init.kind);
@@ -11810,9 +11568,8 @@ fn parse_all_without_feature_is_bareword() {
 
 #[test]
 fn parse_any_with_feature_is_keyword() {
-    // With the feature, 'any { BLOCK } LIST' uses keyword parsing.
-    // Verify it parses as a FuncCall with an anon-sub first arg
-    // (block-list-op pattern like grep/map).
+    // With the feature, 'any { BLOCK } LIST' uses keyword parsing.  Verify it parses as a FuncCall with an anon-sub
+    // first arg (block-list-op pattern like grep/map).
     let prog = parse("use feature 'any'; my $r = any { $_ > 0 } 1, 2, 3;");
     assert!(!prog.statements.is_empty());
 }
@@ -11840,8 +11597,7 @@ fn parse_any_with_literal_list() {
 
 #[test]
 fn parse_any_fat_comma_autoquotes() {
-    // any => 1 — fat comma autoquotes 'any' as a string even
-    // with the feature enabled.
+    // any => 1 — fat comma autoquotes 'any' as a string even with the feature enabled.
     let prog = parse("use feature 'any'; my %h = (any => 1);");
     assert!(!prog.statements.is_empty());
 }
@@ -11857,32 +11613,28 @@ fn parse_all_fat_comma_autoquotes() {
 
 #[test]
 fn apos_grep_keyword_not_consumed_as_package() {
-    // grep'x',@list — non-block grep with string expression.
-    // scan_ident must not consume grep'x as grep::x.
+    // grep'x',@list — non-block grep with string expression.  scan_ident must not consume grep'x as grep::x.
     let prog = parse("my @list = ('ax','bx','c'); my @r = grep'x',@list;");
     assert!(!prog.statements.is_empty());
 }
 
 #[test]
 fn apos_sort_keyword_not_consumed_as_package() {
-    // sort'func' — sort with a named comparison function.
-    // scan_ident must not consume sort'func as sort::func.
+    // sort'func' — sort with a named comparison function.  scan_ident must not consume sort'func as sort::func.
     let prog = parse("sub func { $a cmp $b } my @list = (3,1,2); my @r = sort'func'@list;");
     assert!(!prog.statements.is_empty());
 }
 
 #[test]
 fn apos_map_keyword_not_consumed_as_package() {
-    // map with string expression: map'x'.$_,@list
-    // scan_ident must not consume map'x as map::x.
+    // map with string expression: map'x'.$_,@list scan_ident must not consume map'x as map::x.
     let prog = parse("my @list = (1,2,3); my @r = map'x',@list;");
     assert!(!prog.statements.is_empty());
 }
 
 #[test]
 fn apos_print_keyword_not_consumed_as_package() {
-    // print'hello' — print with adjacent string argument.
-    // scan_ident must not consume print'hello as print::hello.
+    // print'hello' — print with adjacent string argument.  scan_ident must not consume print'hello as print::hello.
     let prog = parse("print'hello';");
     assert!(!prog.statements.is_empty());
 }
@@ -11910,8 +11662,7 @@ fn apos_return_keyword_not_consumed_as_package() {
 
 #[test]
 fn apos_given_keyword_on_not_consumed() {
-    // given'bar with use feature 'switch' — given is a keyword,
-    // scan_ident must not consume given'bar as given::bar.
+    // given'bar with use feature 'switch' — given is a keyword, scan_ident must not consume given'bar as given::bar.
     // This is a syntax error in Perl (given expects a condition).
     let result = crate::parse(b"use feature 'switch'; given'bar' { }");
     assert!(result.is_err(), "expected error: given is a keyword, 'bar' is not a valid condition syntax");
@@ -11919,8 +11670,8 @@ fn apos_given_keyword_on_not_consumed() {
 
 #[test]
 fn apos_given_bareword_off_is_package() {
-    // given'bar WITHOUT the switch feature — given is a bareword,
-    // so given'bar becomes given::bar (a package-qualified name).
+    // given'bar WITHOUT the switch feature — given is a bareword, so given'bar becomes given::bar (a package-qualified
+    // name).
     let prog = parse("my $x = given'bar;");
     let init = first_assign_rhs(&prog);
     assert!(matches!(&init.kind, ExprKind::Bareword(s) if s == "given::bar"), "expected Bareword(given::bar), got {:?}", init.kind);
@@ -11928,8 +11679,8 @@ fn apos_given_bareword_off_is_package() {
 
 #[test]
 fn apos_given_bareword_off_is_func_call() {
-    // given'bar(1) WITHOUT the switch feature — given is a bareword,
-    // so given'bar is given::bar, and (1) makes it a FuncCall.
+    // given'bar(1) WITHOUT the switch feature — given is a bareword, so given'bar is given::bar, and (1) makes it a
+    // FuncCall.
     let prog = parse("my $x = given'bar(1);");
     let init = first_assign_rhs(&prog);
     assert!(
@@ -11941,19 +11692,16 @@ fn apos_given_bareword_off_is_func_call() {
 
 #[test]
 fn apos_any_keyword_on_not_consumed() {
-    // any'x' with use feature 'any' — any is a keyword,
-    // scan_ident must not consume any'x as any::x.
-    // Without the fix, scan_ident greedily consumes any'x
-    // as any::x and the trailing ' is unterminated.
-    // With the fix, any is a keyword and 'x' is its argument.
+    // any'x' with use feature 'any' — any is a keyword, scan_ident must not consume any'x as any::x.  Without the fix,
+    // scan_ident greedily consumes any'x as any::x and the trailing ' is unterminated.  With the fix, any is a keyword
+    // and 'x' is its argument.
     let prog = parse("use feature 'any'; my $r = any'x',1,2,3;");
     assert!(!prog.statements.is_empty());
 }
 
 #[test]
 fn apos_any_bareword_off_is_package() {
-    // any'x WITHOUT the feature — any is a bareword,
-    // so any'x becomes any::x.
+    // any'x WITHOUT the feature — any is a bareword, so any'x becomes any::x.
     let tokens = collect_tokens("any'x;");
     assert!(matches!(&tokens[0], Token::Ident(s) if s == "any::x"), "expected Ident(any::x), got {:?}", tokens[0]);
 }
@@ -11975,21 +11723,18 @@ fn apos_try_bareword_off_is_package() {
 // ══════════════════════════════════════════════════════════
 // Pending NFC / encoding / body scanner tests
 //
-// These tests document known gaps.  Most will fail until the
-// body scanner rework and source::encoding pragma are
+// These tests document known gaps.  Most will fail until the body scanner rework and source::encoding pragma are
 // implemented.  Mark #[ignore] after confirming failure.
 // ══════════════════════════════════════════════════════════
 
 // ── Heredoc tag NFC normalization ─────────────────────────
 //
-// Deliberate deviation from Perl: heredoc tags and terminators
-// are NFC-normalized so composed/decomposed forms match.
+// Deliberate deviation from Perl: heredoc tags and terminators are NFC-normalized so composed/decomposed forms match.
 
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn heredoc_nfc_composed_tag_decomposed_terminator() {
-    // Tag is composed café (U+00E9), terminator is decomposed
-    // (e + U+0301).  Should match after NFC.
+    // Tag is composed café (U+00E9), terminator is decomposed (e + U+0301).  Should match after NFC.
     // café composed: 63 61 66 C3 A9
     // café decomposed: 63 61 66 65 CC 81
     let src = b"use utf8; my $x = <<caf\xC3\xA9;\nbody\ncafe\xCC\x81\n";
@@ -12045,8 +11790,8 @@ fn heredoc_nfc_indented() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn heredoc_nfc_devanagari_tag() {
-    // Heredoc tag using Devanagari: <<ऩ where ऩ (U+0929) is
-    // composed, terminator is decomposed (न + ़ = U+0928 + U+093C).
+    // Heredoc tag using Devanagari: <<ऩ where ऩ (U+0929) is composed, terminator is decomposed (न + ़ = U+0928 +
+    // U+093C).
     // Composed ऩ: E0 A4 A9
     // Decomposed: E0 A4 A8 E0 A4 BC
     let src = b"use utf8; my $x = <<\xE0\xA4\xA9;\nbody\n\xE0\xA4\xA8\xE0\xA4\xBC\n";
@@ -12056,37 +11801,31 @@ fn heredoc_nfc_devanagari_tag() {
 
 // ── Tibetan delimiter + Devanagari combining mark in body ─
 //
-// Tibetan ༺ (U+0F3A, bytes E0 BC BA) and Devanagari nukta
-// ़ (U+093C, bytes E0 A4 BC) share lead byte 0xE0.
-// memchr scanning for the close delimiter ༻ (E0 BC BB)
-// triggers on the nukta's lead byte, potentially splitting
-// a base+nukta sequence across NFC normalization batches.
+// Tibetan ༺ (U+0F3A, bytes E0 BC BA) and Devanagari nukta  ़ (U+093C, bytes E0 A4 BC) share lead byte 0xE0.  memchr
+// scanning for the close delimiter ༻ (E0 BC BB) triggers on the nukta's lead byte, potentially splitting a base+nukta
+// sequence across NFC normalization batches.
 
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn tibetan_delim_devanagari_nukta_in_body() {
-    // q༺ text with decomposed ऩ (न + ़) inside ༻
-    // The nukta's lead byte 0xE0 matches the delimiter's lead
-    // byte, causing memchr to trigger mid-combining-sequence.
-    // After NFC, the body should contain composed ऩ (U+0929).
+    // q༺ text with decomposed ऩ (न + ़) inside ༻ The nukta's lead byte 0xE0 matches the delimiter's lead byte, causing
+    // memchr to trigger mid-combining-sequence.  After NFC, the body should contain composed ऩ (U+0929).
     //
     // q = 71
     // ༺ = E0 BC BA
     // न = E0 A4 A8
-    // ़ = E0 A4 BC  (memchr triggers here on E0!)
+    //  ़ = E0 A4 BC  (memchr triggers here on E0!)
     // ༻ = E0 BC BB
     let src = b"use utf8; my $x = q\xE0\xBC\xBA\xE0\xA4\xA8\xE0\xA4\xBC\xE0\xBC\xBB;";
     let result = crate::parse(src);
     assert!(result.is_ok(), "Tibetan delim with Devanagari nukta should parse: {:?}", result.err());
-    // TODO: verify ConstSegment contains composed ऩ (E0 A4 A9),
-    // not decomposed न + ़ (E0 A4 A8 E0 A4 BC).
+    // TODO: verify ConstSegment contains composed ऩ (E0 A4 A9), not decomposed न + ़ (E0 A4 A8 E0 A4 BC).
 }
 
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn tibetan_delim_devanagari_in_qq_interpolation() {
-    // qq༺ $x with decomposed ऩ ༻ — interpolating string with
-    // the same lead-byte collision, plus interpolation trigger.
+    // qq༺ $x with decomposed ऩ ༻ — interpolating string with the same lead-byte collision, plus interpolation trigger.
     let src = b"use utf8; my $x = 1; my $y = qq\xE0\xBC\xBA$x \xE0\xA4\xA8\xE0\xA4\xBC\xE0\xBC\xBB;";
     let result = crate::parse(src);
     assert!(result.is_ok(), "Tibetan delim qq with Devanagari should parse: {:?}", result.err());
@@ -12095,8 +11834,7 @@ fn tibetan_delim_devanagari_in_qq_interpolation() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn tibetan_delim_multiple_nuktas_in_body() {
-    // Multiple decomposed Devanagari characters in a Tibetan-
-    // delimited string.  Each nukta triggers memchr on 0xE0.
+    // Multiple decomposed Devanagari characters in a Tibetan-delimited string.  Each nukta triggers memchr on 0xE0.
     // नक़ = U+0928 U+0915 U+093C (decomposed)
     let src = b"use utf8; my $x = q\xE0\xBC\xBA\xE0\xA4\xA8\xE0\xA4\x95\xE0\xA4\xBC\xE0\xBC\xBB;";
     let result = crate::parse(src);
@@ -12108,8 +11846,7 @@ fn tibetan_delim_multiple_nuktas_in_body() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn body_invalid_utf8_under_use_utf8_should_error() {
-    // 0xFF is never valid UTF-8.  Under `use utf8`, this should
-    // be a hard error, not silent replacement with U+FFFD.
+    // 0xFF is never valid UTF-8.  Under `use utf8`, this should be a hard error, not silent replacement with U+FFFD.
     let src = b"use utf8; my $x = \"hello \xFF world\";";
     let result = crate::parse(src);
     assert!(result.is_err(), "invalid UTF-8 byte under `use utf8` should be an error");
@@ -12126,8 +11863,7 @@ fn body_truncated_utf8_under_use_utf8_should_error() {
 
 #[test]
 fn body_high_bytes_without_utf8_are_raw() {
-    // Without `use utf8`, bytes > 127 are raw Latin-1.
-    // \xE9 is é in Latin-1 (single byte, NOT a UTF-8 lead byte).
+    // Without `use utf8`, bytes > 127 are raw Latin-1.  \xE9 is é in Latin-1 (single byte, NOT a UTF-8 lead byte).
     // Should pass through as a raw byte.
     let src = b"my $x = \"caf\xE9\";";
     let result = crate::parse(src);
@@ -12137,8 +11873,7 @@ fn body_high_bytes_without_utf8_are_raw() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn body_overlong_utf8_under_use_utf8_should_error() {
-    // Overlong encoding of '/' (U+002F): C0 AF.
-    // Valid UTF-8 decoders must reject this.
+    // Overlong encoding of '/' (U+002F): C0 AF.  Valid UTF-8 decoders must reject this.
     let src = b"use utf8; my $x = \"\xC0\xAF\";";
     let result = crate::parse(src);
     assert!(result.is_err(), "overlong UTF-8 under `use utf8` should be an error");
@@ -12148,8 +11883,7 @@ fn body_overlong_utf8_under_use_utf8_should_error() {
 
 #[test]
 fn body_nfc_normalizes_raw_decomposed() {
-    // Decomposed ñ (n + U+0303) in source under `use utf8`
-    // should be NFC-normalized to composed ñ (U+00F1).
+    // Decomposed ñ (n + U+0303) in source under `use utf8` should be NFC-normalized to composed ñ (U+00F1).
     // n = 6E, combining tilde = CC 83, composed ñ = C3 B1
     let src = b"use utf8; my $x = \"n\xCC\x83\";";
     let result = crate::parse(src);
@@ -12159,19 +11893,16 @@ fn body_nfc_normalizes_raw_decomposed() {
 
 #[test]
 fn body_escape_chars_not_normalized() {
-    // \x{6e}\x{303} produces n + combining tilde via escapes.
-    // These should NOT be NFC-normalized — they are escape-
+    // \x{6e}\x{303} produces n + combining tilde via escapes.  These should NOT be NFC-normalized — they are escape-
     // produced, not raw source characters.
     let prog = parse("use utf8; my $x = \"\\x{6e}\\x{303}\";");
     assert!(!prog.statements.is_empty());
-    // TODO: verify the string contains 6E CC 83 (decomposed),
-    // NOT C3 B1 (composed).
+    // TODO: verify the string contains 6E CC 83 (decomposed), NOT C3 B1 (composed).
 }
 
 #[test]
 fn body_nfc_devanagari_in_string() {
-    // Decomposed ऩ (U+0928 + U+093C) in a double-quoted string
-    // under `use utf8` should NFC-normalize to U+0929.
+    // Decomposed ऩ (U+0928 + U+093C) in a double-quoted string under `use utf8` should NFC-normalize to U+0929.
     let src = b"use utf8; my $x = \"\xE0\xA4\xA8\xE0\xA4\xBC\";";
     let result = crate::parse(src);
     assert!(result.is_ok(), "Devanagari decomposed in string should parse: {:?}", result.err());
@@ -12180,8 +11911,7 @@ fn body_nfc_devanagari_in_string() {
 
 #[test]
 fn body_no_nfc_without_utf8() {
-    // Without `use utf8`, raw bytes should NOT be NFC-normalized
-    // even if they happen to form valid decomposed UTF-8.
+    // Without `use utf8`, raw bytes should NOT be NFC-normalized even if they happen to form valid decomposed UTF-8.
     // The bytes are Latin-1, not Unicode.
     let src = b"my $x = \"n\xCC\x83\";";
     let result = crate::parse(src);
@@ -12193,19 +11923,16 @@ fn body_no_nfc_without_utf8() {
 
 #[test]
 fn ident_nfc_devanagari() {
-    // Decomposed ऩ (U+0928 + U+093C) in an identifier under
-    // `use utf8` should NFC-normalize to U+0929.
+    // Decomposed ऩ (U+0928 + U+093C) in an identifier under `use utf8` should NFC-normalize to U+0929.
     let src = b"use utf8; my $\xE0\xA4\xA8\xE0\xA4\xBC = 1;";
     let result = crate::parse(src);
     assert!(result.is_ok(), "Devanagari decomposed identifier should parse: {:?}", result.err());
-    // The variable should be $ऩ (composed), same as if the
-    // source had contained the composed form directly.
+    // The variable should be $ऩ (composed), same as if the source had contained the composed form directly.
 }
 
 #[test]
 fn ident_nfc_composed_and_decomposed_are_same_variable() {
-    // Two assignments to the "same" variable using composed and
-    // decomposed forms.  After NFC normalization, they should
+    // Two assignments to the "same" variable using composed and decomposed forms.  After NFC normalization, they should
     // resolve to the same identifier.
     let src = b"use utf8; my $caf\xC3\xA9 = 1; $cafe\xCC\x81 = 2;";
     let result = crate::parse(src);
@@ -12229,8 +11956,7 @@ fn source_encoding_utf8_enables_utf8() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn source_encoding_ascii_rejects_high_bytes() {
-    // `use source::encoding 'ascii'` should error on any
-    // non-ASCII byte in source.
+    // `use source::encoding 'ascii'` should error on any non-ASCII byte in source.
     let src = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
     let result = crate::parse(src);
     assert!(result.is_err(), "source::encoding 'ascii' should reject non-ASCII");
@@ -12239,10 +11965,8 @@ fn source_encoding_ascii_rejects_high_bytes() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn source_encoding_ascii_allows_escapes() {
-    // Under ascii mode, escape sequences producing non-ASCII
-    // should still be allowed — only raw source bytes are
-    // restricted.  First verify ascii mode IS active by
-    // confirming raw non-ASCII is rejected:
+    // Under ascii mode, escape sequences producing non-ASCII should still be allowed — only raw source bytes are
+    // restricted.  First verify ascii mode IS active by confirming raw non-ASCII is rejected:
     let src = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src).is_err(), "source::encoding 'ascii' should reject raw non-ASCII");
     // Then verify escapes still work:
@@ -12262,8 +11986,7 @@ fn source_encoding_ascii_implied_by_v5_42() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn no_source_encoding_disables() {
-    // `no source::encoding` disables both UTF-8 and ASCII modes.
-    // First verify ascii mode IS active:
+    // `no source::encoding` disables both UTF-8 and ASCII modes.  First verify ascii mode IS active:
     let src1 = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src1).is_err(), "ascii should reject non-ASCII before 'no'");
     // Then verify `no source::encoding` allows non-ASCII again:
@@ -12285,8 +12008,7 @@ fn source_encoding_ascii_is_lexically_scoped() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn source_encoding_bad_argument_is_error() {
-    // Only 'ascii' and 'utf8' are accepted.  Anything else should
-    // be an error (Perl's module dies with "Bad argument").
+    // Only 'ascii' and 'utf8' are accepted.  Anything else should be an error (Perl's module dies with "Bad argument").
     let result = crate::parse(b"use source::encoding 'latin1';");
     assert!(result.is_err(), "source::encoding 'latin1' should be an error");
 }
@@ -12313,8 +12035,7 @@ fn source_encoding_utf8_clears_ascii() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn source_encoding_ascii_clears_utf8() {
-    // `use source::encoding 'ascii'` calls unimport() first,
-    // which clears utf8 mode.  Unicode identifiers should no
+    // `use source::encoding 'ascii'` calls unimport() first, which clears utf8 mode.  Unicode identifiers should no
     // longer be valid.
     let src = "use utf8; use source::encoding 'ascii'; my $caf\u{00E9} = 1;";
     let result = crate::parse(src.as_bytes());
@@ -12324,11 +12045,9 @@ fn source_encoding_ascii_clears_utf8() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn source_encoding_ascii_implied_by_v5_41() {
-    // The perlexperiment docs say "v5.41.0 or higher" activates
-    // ascii source encoding.  Unlike Features flags (which round
-    // odd minors down to the prior even), ascii source encoding
-    // is a separate pragma state that activates at the exact
-    // version threshold.  `use v5.41` SHOULD activate it.
+    // The perlexperiment docs say "v5.41.0 or higher" activates ascii source encoding.  Unlike Features flags (which
+    // round odd minors down to the prior even), ascii source encoding is a separate pragma state that activates at the
+    // exact version threshold.  `use v5.41` SHOULD activate it.
     let src = b"use v5.41; my $x = \"caf\xC3\xA9\";";
     let result = crate::parse(src);
     assert!(result.is_err(), "use v5.41 should imply ascii source encoding");
@@ -12336,9 +12055,8 @@ fn source_encoding_ascii_implied_by_v5_41() {
 
 #[test]
 fn source_encoding_ascii_not_implied_by_v5_40() {
-    // `use v5.40` should NOT imply ascii mode.
-    // Non-ASCII raw bytes should be allowed (as raw bytes,
-    // not necessarily valid UTF-8).
+    // `use v5.40` should NOT imply ascii mode.  Non-ASCII raw bytes should be allowed (as raw bytes, not necessarily
+    // valid UTF-8).
     let src = b"use v5.40; my $x = \"caf\xC3\xA9\";";
     let result = crate::parse(src);
     assert!(result.is_ok(), "use v5.40 should not imply ascii: {:?}", result.err());
@@ -12347,11 +12065,9 @@ fn source_encoding_ascii_not_implied_by_v5_40() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn source_encoding_ascii_then_use_utf8() {
-    // `use source::encoding 'ascii'` then `use utf8`.
-    // These are independent pragmas — `use utf8` does NOT clear
-    // the ascii hint bit.  Both are active simultaneously.
-    // The ascii check should still reject non-ASCII raw bytes
-    // even though utf8 mode is also on.
+    // `use source::encoding 'ascii'` then `use utf8`.  These are independent pragmas — `use utf8` does NOT clear the
+    // ascii hint bit.  Both are active simultaneously.  The ascii check should still reject non-ASCII raw bytes even
+    // though utf8 mode is also on.
     let src = b"use source::encoding 'ascii'; use utf8; my $x = \"caf\xC3\xA9\";";
     let result = crate::parse(src);
     assert!(result.is_err(), "ascii + utf8 should still reject non-ASCII raw bytes");
@@ -12360,10 +12076,8 @@ fn source_encoding_ascii_then_use_utf8() {
 #[test]
 #[ignore] // pending: NFC normalization / source::encoding / body scanner rework
 fn use_utf8_then_source_encoding_ascii() {
-    // `use utf8` then `use source::encoding 'ascii'`.
-    // source::encoding's import() calls unimport() first,
-    // which clears utf8 mode.  Then sets ascii.
-    // Result: utf8 is off, ascii is on.
+    // `use utf8` then `use source::encoding 'ascii'`.  source::encoding's import() calls unimport() first, which clears
+    // utf8 mode.  Then sets ascii.  Result: utf8 is off, ascii is on.
     let src = b"use utf8; use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
     let result = crate::parse(src);
     assert!(result.is_err(), "source::encoding 'ascii' should clear utf8 and reject non-ASCII");
@@ -12371,14 +12085,12 @@ fn use_utf8_then_source_encoding_ascii() {
 
 // ── UTF-8 BOM handling ───────────────────────────────────
 //
-// "you need either a Byte Order Mark at the beginning of your
-// source code, or use utf8;" — the UTF-8 BOM (EF BB BF) at
+// "you need either a Byte Order Mark at the beginning of your source code, or use utf8;" — the UTF-8 BOM (EF BB BF) at
 // the start of a file should implicitly enable use utf8.
 
 #[test]
 fn utf8_bom_enables_utf8_mode() {
-    // UTF-8 BOM (EF BB BF) at start of file should implicitly
-    // enable use utf8, allowing Unicode identifiers.
+    // UTF-8 BOM (EF BB BF) at start of file should implicitly enable use utf8, allowing Unicode identifiers.
     let src = b"\xEF\xBB\xBFmy $caf\xC3\xA9 = 1;";
     let result = crate::parse(src);
     assert!(result.is_ok(), "BOM at start should enable utf8 mode: {:?}", result.err());
@@ -12386,8 +12098,7 @@ fn utf8_bom_enables_utf8_mode() {
 
 #[test]
 fn utf8_bom_stripped_from_output() {
-    // The BOM itself should be stripped, not appear as a token
-    // or cause a parse error.
+    // The BOM itself should be stripped, not appear as a token or cause a parse error.
     let src = b"\xEF\xBB\xBFmy $x = 1;";
     let result = crate::parse(src);
     assert!(result.is_ok(), "BOM should be silently stripped: {:?}", result.err());
@@ -12395,8 +12106,7 @@ fn utf8_bom_stripped_from_output() {
 
 #[test]
 fn utf8_bom_not_at_start_is_not_stripped() {
-    // BOM bytes (EF BB BF) NOT at the very start of the file
-    // are not special.  Without use utf8, they are raw bytes
+    // BOM bytes (EF BB BF) NOT at the very start of the file are not special.  Without use utf8, they are raw bytes
     // that the lexer rejects as unrecognized characters.
     let src = b"my $x = 1; \xEF\xBB\xBF";
     let result = crate::parse(src);
@@ -12405,13 +12115,11 @@ fn utf8_bom_not_at_start_is_not_stripped() {
 
 // ── Perl's extended UTF-8 ────────────────────────────────
 //
-// Perl allows code points above U+10FFFF via its "extended
-// UTF-8" encoding.  Rust's char only goes to U+10FFFF.
+// Perl allows code points above U+10FFFF via its "extended UTF-8" encoding.  Rust's char only goes to U+10FFFF.
 
 #[test]
 fn escape_above_unicode_max() {
-    // \x{110000} is above Unicode max but valid in Perl's
-    // extended UTF-8.  Should not be rejected.
+    // \x{110000} is above Unicode max but valid in Perl's extended UTF-8.  Should not be rejected.
     let prog = parse("my $x = \"\\x{110000}\";");
     assert!(!prog.statements.is_empty());
 }
@@ -12425,21 +12133,18 @@ fn escape_very_large_codepoint() {
 
 #[test]
 fn escape_unicode_max_is_valid() {
-    // \x{10FFFF} is the maximum Unicode code point and should
-    // always work.
+    // \x{10FFFF} is the maximum Unicode code point and should always work.
     let prog = parse("my $x = \"\\x{10FFFF}\";");
     assert!(!prog.statements.is_empty());
 }
 
 // ── no utf8 restoring raw byte mode ──────────────────────
 //
-// "no utf8 tells Perl to switch back to treating the source
-// text as literal bytes in the current lexical scope"
+// "no utf8 tells Perl to switch back to treating the source text as literal bytes in the current lexical scope"
 
 #[test]
 fn no_utf8_restores_raw_byte_mode() {
-    // After `no utf8`, non-ASCII bytes should be treated as
-    // raw bytes, not as UTF-8.  \xE9 is a single Latin-1 byte
+    // After `no utf8`, non-ASCII bytes should be treated as raw bytes, not as UTF-8.  \xE9 is a single Latin-1 byte
     // (é), not a UTF-8 lead byte.
     let src = b"use utf8; no utf8; my $x = \"caf\xE9\";";
     let result = crate::parse(src);
@@ -12448,8 +12153,7 @@ fn no_utf8_restores_raw_byte_mode() {
 
 #[test]
 fn no_utf8_in_block_restores_after_block() {
-    // Lexically scoped: `no utf8` inside a block should not
-    // affect code after the block.
+    // Lexically scoped: `no utf8` inside a block should not affect code after the block.
     let src = "use utf8; { no utf8; } my $caf\u{00E9} = 1;";
     let result = crate::parse(src.as_bytes());
     assert!(result.is_ok(), "utf8 should be restored after block: {:?}", result.err());
@@ -12469,10 +12173,8 @@ fn utf8_and_no_utf8_interleaved() {
 #[test]
 #[ignore] // pending: BOM detection / UTF-8 validation
 fn use_utf8_rejects_non_utf8_bytes() {
-    // "if you have non-ASCII, non-UTF-8 bytes in your script...
-    // use utf8 will be unhappy"
-    // \xE9 alone is invalid UTF-8 (it's Latin-1 é).
-    // Under use utf8, this should be an error.
+    // "if you have non-ASCII, non-UTF-8 bytes in your script... use utf8 will be unhappy"
+    // \xE9 alone is invalid UTF-8 (it's Latin-1 é).  Under use utf8, this should be an error.
     let src = b"use utf8; my $x = \"caf\xE9\";";
     let result = crate::parse(src);
     assert!(result.is_err(), "non-UTF-8 bytes under use utf8 should error");
@@ -12480,8 +12182,7 @@ fn use_utf8_rejects_non_utf8_bytes() {
 
 #[test]
 fn use_utf8_rejects_non_utf8_in_identifier() {
-    // Invalid UTF-8 in an identifier under use utf8 should be
-    // an error, not silently accepted.
+    // Invalid UTF-8 in an identifier under use utf8 should be an error, not silently accepted.
     let src = b"use utf8; my $caf\xE9 = 1;";
     let result = crate::parse(src);
     assert!(result.is_err(), "non-UTF-8 byte in identifier under use utf8 should error");
@@ -12515,10 +12216,8 @@ fn utf8_pragma_in_sub_body() {
 
 #[test]
 fn utf8_pragma_does_not_leak_to_next_statement() {
-    // After the block with use utf8 closes, non-ASCII bytes
-    // in the next statement should be raw bytes, not UTF-8.
-    // \xE9 as a raw byte should be fine outside the utf8 block,
-    // but would be invalid UTF-8 inside one.
+    // After the block with use utf8 closes, non-ASCII bytes in the next statement should be raw bytes, not UTF-8.
+    // \xE9 as a raw byte should be fine outside the utf8 block, but would be invalid UTF-8 inside one.
     let src = b"{ use utf8; my $x = 1; } my $y = \"caf\xE9\";";
     let result = crate::parse(src);
     assert!(result.is_ok(), "utf8 should not leak past block: {:?}", result.err());
@@ -12614,8 +12313,7 @@ fn named_char_in_heredoc() {
 
 #[test]
 fn named_char_invalid_hex_in_u_plus_silent_fffd() {
-    // \N{U+SNOWMAN} — "SNOWMAN" is not valid hexadecimal.
-    // The parser silently produces U+FFFD via unwrap_or instead
+    // \N{U+SNOWMAN} — "SNOWMAN" is not valid hexadecimal.  The parser silently produces U+FFFD via unwrap_or instead
     // of reporting an error.  This is silent data corruption.
     let result = crate::parse(b"my $x = \"\\N{U+SNOWMAN}\";");
     assert!(result.is_err(), "\\N{{U+SNOWMAN}} should error, not silently produce U+FFFD");
@@ -12649,8 +12347,7 @@ fn utf16be_bom_transcodes_to_utf8() {
 
 #[test]
 fn utf16le_no_bom_heuristic() {
-    // UTF-16LE without BOM — heuristic detection.
-    // "my $x = 1;\n" in UTF-16LE (no BOM).
+    // UTF-16LE without BOM — heuristic detection.  "my $x = 1;\n" in UTF-16LE (no BOM).
     let src_str = "my $x = 1;\n";
     let mut src: Vec<u8> = Vec::new();
     for ch in src_str.encode_utf16() {
@@ -12674,8 +12371,7 @@ fn utf16be_no_bom_heuristic() {
 
 #[test]
 fn utf16le_bom_with_unicode_content() {
-    // UTF-16LE with BOM, source contains Unicode identifiers.
-    // "use utf8; my $café = 1;\n"
+    // UTF-16LE with BOM, source contains Unicode identifiers.  "use utf8; my $café = 1;\n"
     let src_str = "use utf8; my $caf\u{00E9} = 1;\n";
     let mut src: Vec<u8> = vec![0xFF, 0xFE];
     for ch in src_str.encode_utf16() {
@@ -12687,8 +12383,7 @@ fn utf16le_bom_with_unicode_content() {
 
 #[test]
 fn utf16_with_surrogate_pairs() {
-    // UTF-16LE with BOM, source contains U+1F600 (GRINNING FACE)
-    // in a string literal via \N{U+1F600}.
+    // UTF-16LE with BOM, source contains U+1F600 (GRINNING FACE) in a string literal via \N{U+1F600}.
     let src_str = "my $x = \"\\N{U+1F600}\";\n";
     let mut src: Vec<u8> = vec![0xFF, 0xFE];
     for ch in src_str.encode_utf16() {
@@ -12707,12 +12402,10 @@ fn not_utf16_plain_ascii() {
 
 #[test]
 fn not_utf16_binary_garbage() {
-    // Random bytes that happen to start with 00 should not
-    // be misdetected as UTF-16BE if the pattern doesn't hold.
+    // Random bytes that happen to start with 00 should not be misdetected as UTF-16BE if the pattern doesn't hold.
     let src = b"\x00\x01\x02\x03";
     let result = crate::parse(src);
-    // This might error for other reasons, but shouldn't crash
-    // from a UTF-16 transcode attempt.
+    // This might error for other reasons, but shouldn't crash from a UTF-16 transcode attempt.
     let _ = result;
 }
 
@@ -14015,8 +13708,8 @@ fn all_final_batch_list_ops_parse() {
 
 #[test]
 fn weak_keyword_abs_overridden_by_use_subs() {
-    // Without override, `abs $x ? 1 : 0` is `abs($x) ? 1 : 0` — Ternary at top.
-    // With override, it's `abs($x ? 1 : 0)` — FuncCall at top (list op precedence).
+    // Without override, `abs $x ? 1 : 0` is `abs($x) ? 1 : 0` — Ternary at top.  With override, it's `abs($x ? 1 : 0)`
+    // — FuncCall at top (list op precedence).
     let prog = parse("use subs 'abs'; abs $x ? 1 : 0;");
     let stmt = &prog.statements[1];
     match &stmt.kind {
@@ -14035,8 +13728,7 @@ fn weak_keyword_abs_overridden_by_use_subs() {
 
 #[test]
 fn weak_keyword_not_overridden_without_use_subs() {
-    // Without use subs, `abs $x ? 1 : 0` is named unary:
-    // Ternary at top, with FuncCall(abs, [$x]) as condition.
+    // Without use subs, `abs $x ? 1 : 0` is named unary: Ternary at top, with FuncCall(abs, [$x]) as condition.
     let prog = parse("abs $x ? 1 : 0;");
     match &prog.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
@@ -14142,8 +13834,7 @@ fn destroy_block_is_sub_declaration() {
 
 #[test]
 fn use_subs_x_does_not_break_infix_repeat() {
-    // `use subs "x"` overrides prefix x, but infix `"ab" x 3` must
-    // still parse as the repeat operator.
+    // `use subs "x"` overrides prefix x, but infix `"ab" x 3` must still parse as the repeat operator.
     let prog = parse("use subs 'x'; \"ab\" x 3;");
     let stmt = &prog.statements[1];
     match &stmt.kind {
@@ -14187,9 +13878,8 @@ fn use_subs_eq_does_not_break_infix_eq() {
 
 #[test]
 fn keyword_before_right_brace_not_autoquoted() {
-    // `sub foo { abs }` — abs is a zero-arg named unary call,
-    // NOT a string literal.  The RightBrace check in parse_term's
-    // fat comma autoquoting must not fire here.
+    // `sub foo { abs }` — abs is a zero-arg named unary call, NOT a string literal.  The RightBrace check in
+    // parse_term's fat comma autoquoting must not fire here.
     let prog = parse("sub foo { abs }");
     match &prog.statements[0].kind {
         StmtKind::SubDecl(sd) => {
