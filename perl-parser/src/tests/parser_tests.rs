@@ -5475,6 +5475,70 @@ fn parse_filetest_letter_hash_subscript_autoquotes() {
     }
 }
 
+#[test]
+fn parse_filetest_in_block_body_not_autoquoted() {
+    // sub foo { -f } — filetest on $_, NOT autoquoted.
+    // The } closes the sub body, not a hash subscript.
+    let sub = parse_sub("sub foo { -f }");
+    assert_eq!(sub.body.statements.len(), 1);
+    match &sub.body.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Filetest(c, StatTarget::Default) => {
+                assert_eq!(*c, 'f');
+            }
+            other => panic!("expected Filetest('f', Default), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_hash_subscript_dash_multi_letter() {
+    // $hash{-key} — autoquotes as StringLit("-key")
+    let e = parse_expr_str("$hash{-key};");
+    match &e.kind {
+        ExprKind::HashElem(_, key) => match &key.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "-key"),
+            other => panic!("expected StringLit('-key'), got {other:?}"),
+        },
+        other => panic!("expected HashElem, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_known_sub_in_block_not_autoquoted() {
+    // sub bar { 1 } sub foo { bar }
+    // bar is a known sub — should be a function call, not a string.
+    let sub = parse_sub("sub bar { 1 } sub foo { bar }");
+    assert_eq!(sub.name, "foo");
+    assert_eq!(sub.body.statements.len(), 1);
+    match &sub.body.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert_eq!(name, "main::bar");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FuncCall('main::bar', []), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_unknown_bareword_in_block_autoquotes() {
+    // sub foo { bar } where bar is unknown — autoquoted to string.
+    let sub = parse_sub("sub foo { bar }");
+    assert_eq!(sub.name, "foo");
+    assert_eq!(sub.body.statements.len(), 1);
+    match &sub.body.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::StringLit(s) => assert_eq!(s, "bar"),
+            other => panic!("expected StringLit('bar'), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
 // ── stat / lstat tests ────────────────────────────────────
 
 #[test]
@@ -14140,5 +14204,39 @@ fn keyword_before_right_brace_not_autoquoted() {
             }
         }
         other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+// ── Hash subscript autoquoting edge cases ───────────────────
+
+#[test]
+fn hash_subscript_minus_keyword_autoquotes() {
+    // `$h{-abs}` should autoquote to StringLit("-abs"), not negate abs().
+    let prog = parse("$h{-abs};");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::HashElem(_, key) => match &key.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "-abs"),
+                other => panic!("expected StringLit(\"-abs\"), got {other:?}"),
+            },
+            other => panic!("expected HashElem, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn hash_subscript_minus_strong_keyword_autoquotes() {
+    // `$h{-if}` should autoquote to StringLit("-if").
+    let prog = parse("$h{-if};");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::HashElem(_, key) => match &key.kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "-if"),
+                other => panic!("expected StringLit(\"-if\"), got {other:?}"),
+            },
+            other => panic!("expected HashElem, got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
     }
 }

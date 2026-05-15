@@ -2385,8 +2385,9 @@ impl Parser {
     }
 
     fn parse_ident_term(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
-        // Autoquote: bareword followed by `=>` (fat comma) or `}` (hash subscript)
-        if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
+        // Autoquote: bareword followed by `=>` (fat comma) — always a string key,
+        // even for known sub names.
+        if matches!(self.peek_token(), Token::FatComma) {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
 
@@ -2398,6 +2399,15 @@ impl Parser {
             Some(info) => (true, info.prototype.clone()),
             None => (false, None),
         };
+
+        // Unknown bareword followed by `}` — treated as string literal.
+        // Known subs followed by `}` fall through to call parsing (zero-arg
+        // call as last expression in a block).  Hash subscript autoquoting
+        // is handled at the byte level by try_autoquoted_bareword_subscript
+        // before we ever reach here.
+        if !is_known_sub && matches!(self.peek_token(), Token::RightBrace) {
+            return Ok(Expr { kind: ExprKind::StringLit(name), span });
+        }
 
         // Check if followed by `(` — function call
         if self.at(&Token::LeftParen)? {
@@ -2763,8 +2773,12 @@ impl Parser {
 
     fn parse_filetest(&mut self, test_byte: u8, span: Span) -> Result<Expr, ParseError> {
         let test_char = test_byte as char;
-        // In autoquoting contexts (=> or }), treat as StringLit("-x")
-        if matches!(self.peek_token(), Token::FatComma | Token::RightBrace) {
+        // In fat-comma context, treat as StringLit("-x").
+        // Hash subscript autoquoting (-f inside {}) is handled at
+        // the byte level by try_autoquoted_bareword_subscript, so
+        // we don't check RightBrace here — that would misfire for
+        // `sub foo { -f }` which is a filetest on $_.
+        if matches!(self.peek_token(), Token::FatComma) {
             return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
         }
         let (target, end) = self.parse_stat_target(span)?;

@@ -2249,11 +2249,12 @@ impl Lexer {
     /// lexer, it may already have consumed `q}foo}` as a
     /// q-string.
     ///
-    /// Supports simple identifiers only (`foo`, `_bar`, `q`);
-    /// qualified names (`Foo::Bar`) and sigiled expressions
-    /// fall through to the general `parse_expr` path.  Line-
-    /// local: multi-line subscripts `$h{\n  foo\n}` are
-    /// uncommon and would require more machinery.
+    /// Supports simple identifiers (`foo`, `_bar`, `q`) and
+    /// dash-prefixed identifiers (`-key`, `-f`).  Qualified
+    /// names (`Foo::Bar`) and sigiled expressions fall through
+    /// to the general `parse_expr` path.  Line-local: multi-
+    /// line subscripts `$h{\n  foo\n}` are uncommon and would
+    /// require more machinery.
     pub fn try_autoquoted_bareword_subscript(&mut self) -> Option<(String, Span)> {
         let utf8 = self.effective_utf8;
         let apos = self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR);
@@ -2264,8 +2265,17 @@ impl Lexer {
         while i < r.len() && matches!(r[i], b' ' | b'\t') {
             i += 1;
         }
+        // Check for optional leading `-` (e.g. `$h{-key}`, `$h{-f}`).
+        // Perl autoquotes -bareword inside hash subscripts.
+        let has_dash = r.get(i).copied() == Some(b'-');
+        if has_dash {
+            i += 1;
+        }
         // Identifier start.
-        let first = *r.get(i)?;
+        let first = match r.get(i) {
+            Some(&b) => b,
+            None => return None,
+        };
         if first == b'_' || first.is_ascii_alphabetic() {
             // ASCII start — proceed.
         } else if utf8 && first >= 0x80 {
@@ -2279,7 +2289,9 @@ impl Lexer {
         } else {
             return None;
         }
-        let ident_start = i;
+        // ident_start includes the dash (if present) so the span
+        // and consumed-range cover the full `-bareword`.
+        let ident_start = if has_dash { i - 1 } else { i };
         // Scan identifier body.
         while i < r.len() {
             let b = r[i];
