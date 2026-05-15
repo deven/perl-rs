@@ -39,6 +39,19 @@ fn lex_all(src: &str) -> Vec<Token> {
         {
             spanned.token = tok;
         }
+        // In term context, quote keywords start sublexing — mimic the parser's `parse_quote_keyword` by skipping
+        // whitespace and calling `begin_quote_sublex`.  If `=>` follows, leave the keyword as-is (the parser would
+        // autoquote; the next lex call produces FatComma).
+        if let Token::Keyword(kw) = &spanned.token
+            && keyword::is_quote_keyword(*kw)
+            && term_context
+        {
+            let raw = lexer.skip_ws_and_peek_byte();
+            if !(raw == Some(b'=') && lexer.peek_byte_at(1) == Some(b'>')) {
+                let tok = lexer.begin_quote_sublex(*kw).unwrap();
+                spanned.token = tok;
+            }
+        }
         // Update term/operator state based on the token.
         match &spanned.token {
             Token::IntLit(_)
@@ -1607,14 +1620,14 @@ fn fat_comma_lookahead_y() {
 #[test]
 fn fat_comma_lookahead_no_ws_q() {
     let tokens = lex_all("q=>1;");
-    assert!(matches!(tokens[0], Token::Ident(ref s) if s == "q"), "expected Ident(q), got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::Keyword(Keyword::Q)), "expected Keyword(Q), got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
 #[test]
 fn fat_comma_lookahead_no_ws_y() {
     let tokens = lex_all("y=>1;");
-    assert!(matches!(tokens[0], Token::Ident(ref s) if s == "y"), "expected Ident(y), got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::Keyword(Keyword::Y)), "expected Keyword(Y), got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
@@ -1635,14 +1648,14 @@ fn fat_comma_lookahead_bare_equals_is_still_quote_op() {
 #[test]
 fn fat_comma_lookahead_q_across_newline() {
     let tokens = lex_all("q\n  => 1;");
-    assert!(matches!(tokens[0], Token::Ident(ref s) if s == "q"), "expected Ident(q) across newline, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::Keyword(Keyword::Q)), "expected Keyword(Q) across newline, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
 #[test]
 fn fat_comma_lookahead_y_across_newline() {
     let tokens = lex_all("y\n=>\n1;");
-    assert!(matches!(tokens[0], Token::Ident(ref s) if s == "y"), "expected Ident(y) across newlines, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::Keyword(Keyword::Y)), "expected Keyword(Y) across newlines, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
@@ -1651,7 +1664,7 @@ fn fat_comma_lookahead_skips_comment_to_find_arrow() {
     // Comment between the keyword and `=>` counts as whitespace-like for this lookahead, matching what the quote-op
     // delim scan would do anyway.
     let tokens = lex_all("m # comment\n => 1;");
-    assert!(matches!(tokens[0], Token::Ident(ref s) if s == "m"), "expected Ident(m) past comment, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::Keyword(Keyword::M)), "expected Keyword(M) past comment, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
@@ -1683,7 +1696,7 @@ fn quote_op_q_across_newline_then_fat_comma_autoquotes() {
     // Paired with the test above: `q\n=>` must still autoquote, so the lookahead isn't defeated by the relaxed post-ws
     // delimiter rule.
     let tokens = lex_all("q\n=>1;");
-    assert!(matches!(tokens[0], Token::Ident(ref s) if s == "q"), "expected Ident(q) from q\\n=>, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::Keyword(Keyword::Q)), "expected Keyword(Q) from q\\n=>, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
@@ -1720,8 +1733,8 @@ fn src_equals_delim(kw: &str, ws: &str) -> String {
 /// op.  (The specific token kind depends on the keyword; we don't pin it down here.)
 fn assert_not_autoquoted(tokens: &[Token], name: &str, src: &str) {
     let autoquoted_ident = matches!(&tokens[0], Token::Ident(s) if s == name);
-    let autoquoted_qw = name == "qw" && matches!(&tokens[0], Token::Keyword(Keyword::Qw));
-    assert!(!autoquoted_ident && !autoquoted_qw, "{name} should be a quote op for {src:?}, got autoquoted first token: {:?}", tokens[0]);
+    let autoquoted_kw = matches!(&tokens[0], Token::Keyword(kw) if { let n: &str = (*kw).into(); n == name });
+    assert!(!autoquoted_ident && !autoquoted_kw, "{name} should be a quote op for {src:?}, got autoquoted first token: {:?}", tokens[0]);
 }
 
 // `=` delim across newline — nine tests, one per keyword.

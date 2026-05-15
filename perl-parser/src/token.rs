@@ -162,6 +162,18 @@ pub enum Keyword {
     Exec,
     Qw,
 
+    // ── Quote-like operators ─────────────────────────────────
+    // These are emitted as keywords by `lex_word` and dispatched by the parser, which decides whether to enter sublexing
+    // (quote op) or autoquote (fat comma / hash subscript).
+    Q,
+    Qq,
+    Qr,
+    Qx,
+    M,
+    S,
+    Tr,
+    Y,
+
     // ── Named unary builtins (additional) ────────────────────
     Sleep,
     Alarm,

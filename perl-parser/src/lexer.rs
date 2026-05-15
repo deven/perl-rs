@@ -369,7 +369,7 @@ impl Lexer {
     }
 
     /// Peek at a byte at an offset from the current position.  Does NOT auto-load — only valid within the current line.
-    fn peek_byte_at(&self, offset: usize) -> Option<u8> {
+    pub(crate) fn peek_byte_at(&self, offset: usize) -> Option<u8> {
         self.current_line.as_ref()?.peek_byte_at(offset)
     }
 
@@ -1917,63 +1917,6 @@ impl Lexer {
         // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or, xor, not) are always emitted as Ident(name).  The
         // parser recognizes them as operators in operator context via peek_op_info and token_to_binop.
 
-        // q// qq// qw// qr// m// s/// tr/// y/// qx//
-        //
-        // Two-phase delimiter recognition, with a fat-comma lookahead checked at each phase:
-        //
-        //   Phase A (adjacent): no whitespace has been skipped.  scan_ident's contract guarantees the current byte
-        //   isn't alphanumeric/underscore, so `at_quote_delimiter` can apply the strict rule (reject word chars as a
-        //   defensive guard).  Special-case `=`: peek ahead one byte — if it's `>`, this is `=>` and we autoquote the
-        //   keyword as a bareword.
-        //
-        //   Phase B (after whitespace skip): if the adjacent byte was whitespace/newline/comment, skip through it
-        //   (possibly across lines) and re-decide.  After the skip, the delimiter CAN be alphanumeric — `q xabcx` is a
-        //   q-string with `x` as delim — so the strict `at_quote_delimiter` no longer applies; any non-EOF byte works.
-        //   Re-check for `=>` here too, since the fat comma could live past any amount of whitespace (`q\n=>\n1`
-        //   autoquotes `q`).
-        //
-        // Outside these two phases the keyword falls through to the Keyword/Ident dispatch at the end of lex_word.
-        let is_quote_kw = matches!(name.as_str(), "q" | "qq" | "qw" | "qr" | "m" | "s" | "tr" | "y" | "qx");
-        if is_quote_kw {
-            // Phase A: adjacent byte.
-            let immediate = self.peek_byte(false);
-            let is_ws_like = matches!(immediate, Some(b' ' | b'\t' | b'\n' | b'#') | None);
-            let adjacent_ok = if is_ws_like {
-                false
-            } else if immediate == Some(b'=') {
-                // Disambiguate `=` delim vs `=>` autoquote.
-                if self.peek_byte_at(1) == Some(b'>') {
-                    if name == "qw" {
-                        return Ok(Token::Keyword(Keyword::Qw));
-                    }
-                    return Ok(Token::Ident(name));
-                }
-                true
-            } else {
-                self.at_quote_delimiter()
-            };
-            if adjacent_ok {
-                return self.dispatch_quote_op(&name);
-            }
-            // Phase B: skip whitespace/comments and re-decide.  Use the no-pod variant: per Perl, `=pod` at col 0
-            // inside a quote-op delim scan is NOT a pod block — it's a candidate delimiter byte for the keyword.
-            if is_ws_like {
-                self.skip_ws_and_comments_no_pod()?;
-            }
-            // Re-check for `=>` past the whitespace.
-            if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
-                if name == "qw" {
-                    return Ok(Token::Keyword(Keyword::Qw));
-                }
-                return Ok(Token::Ident(name));
-            }
-            // Any non-EOF byte is a valid post-whitespace delimiter — including alphanumeric (`q\nxabcx`).
-            if self.peek_byte(false).is_some() {
-                return self.dispatch_quote_op(&name);
-            }
-            // EOF — fall through.
-        }
-
         // Special tokens
         match name.as_str() {
             "__FILE__" => {
@@ -2050,145 +1993,29 @@ impl Lexer {
         Ok(Token::Ident(name))
     }
 
-    /// Dispatch to the quote-op specific lexer given the keyword name.  Cursor must be positioned at the delimiter byte
-    /// (or on whitespace that `read_quote_delimiter` will skip).  Panics on unknown names; call only for names that
-    /// matched `is_quote_kw`.
-    fn dispatch_quote_op(&mut self, name: &str) -> Result<Token, ParseError> {
-        match name {
-            "q" => self.lex_q_string(),
-            "qq" => self.lex_qq_string(),
-            "qw" => self.lex_qw(),
-            "qr" => self.lex_qr(),
-            "m" => self.lex_m(),
-            "s" => self.lex_s(),
-            "tr" | "y" => self.lex_tr(),
-            "qx" => self.lex_qx(),
-            _ => unreachable!("dispatch_quote_op called with non-quote keyword: {name}"),
+    /// Start sublexing for a quote-like operator.  The cursor must be positioned at (or before whitespace preceding) the
+    /// delimiter byte.  Called by the parser after it decides a quote keyword should enter sublexing rather than
+    /// autoquoting.
+    pub fn begin_quote_sublex(&mut self, kw: Keyword) -> Result<Token, ParseError> {
+        match kw {
+            Keyword::Q => self.lex_q_string(),
+            Keyword::Qq => self.lex_qq_string(),
+            Keyword::Qw => self.lex_qw(),
+            Keyword::Qr => self.lex_qr(),
+            Keyword::Qx => self.lex_qx(),
+            Keyword::M => self.lex_m(),
+            Keyword::S => self.lex_s(),
+            Keyword::Tr | Keyword::Y => self.lex_tr(),
+            _ => unreachable!("begin_quote_sublex called with non-quote keyword: {kw:?}"),
         }
     }
 
-    /// Is the next byte a valid opener for a quote-like operator (`q{...}`, `m/.../`, `tr[...][...]`, etc.)?
-    ///
-    /// Perl accepts almost any non-word ASCII byte as an *unpaired* quote delimiter — including the closers `)`, `]`,
-    /// `}`, `>` when used as bare delimiters.  `q}foo}`, `m>foo>`, `s]foo]bar]` are all valid.  Paired usage (`q{foo}`,
-    /// `q<foo>`) is special-cased by `read_quote_delimiter`, but that's orthogonal to this predicate.
-    ///
-    /// The context-sensitive cases — `$h{q}` (autoquoted hash key) and `q => 1` (fat-comma autoquote) — are handled
-    /// elsewhere: the former by a parser-driven API (`try_autoquoted_bareword_subscript`), the latter by a fat-comma
-    /// lookahead at the lex_word dispatch site.
-    fn at_quote_delimiter(&self) -> bool {
-        match self.peek_byte_at(0) {
-            Some(b) => b != b'\n' && !b.is_ascii_alphanumeric() && b != b'_',
-            None => false,
-        }
-    }
-
-    /// Parser-driven API: try to consume an autoquoted bareword followed immediately by `}`.  Used inside `$h{...}`
-    /// hash-subscript bodies to preempt the lexer's quote- operator recognition — per Perl, `q}foo}` is a valid
-    /// q-string, but `$h{q}` autoquotes `q` to a string literal.  Only the parser knows the subscript context.
-    ///
-    /// The close delimiter is always `}` (hash subscript); a parameter would invite misuse — array subscripts have
-    /// integer/range semantics, not autoquoting, and fat-comma autoquoting is handled by a different mechanism in
-    /// `lex_word`.
-    ///
-    /// On success: consumes leading whitespace and the identifier, leaves the cursor positioned at (or just before) the
-    /// `}` byte, and returns `Some((name, span))`.  On failure (no identifier, or identifier not followed by `}`): the
-    /// cursor is unchanged and returns `None`.
-    ///
-    /// The parser MUST call this before any `peek_token` in the subscript body — once `peek_token` commits the lexer,
-    /// it may already have consumed `q}foo}` as a q-string.
-    ///
-    /// Supports simple identifiers (`foo`, `_bar`, `q`) and dash-prefixed identifiers (`-key`, `-f`).  Qualified names
-    /// (`Foo::Bar`) and sigiled expressions fall through to the general `parse_expr` path.  Line-local: multi-line
-    /// subscripts `$h{\n  foo\n}` are uncommon and would require more machinery.
-    pub fn try_autoquoted_bareword_subscript(&mut self) -> Option<(String, Span)> {
-        let utf8 = self.effective_utf8;
-        let apos = self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR);
-        let line = self.current_line.as_ref()?;
-        let r = line.remaining();
-        // Skip leading whitespace.
-        let mut i = 0;
-        while i < r.len() && matches!(r[i], b' ' | b'\t') {
-            i += 1;
-        }
-        // Check for optional leading `-` (e.g. `$h{-key}`, `$h{-f}`).  Perl autoquotes -bareword inside hash
-        // subscripts.
-        let has_dash = r.get(i).copied() == Some(b'-');
-        if has_dash {
-            i += 1;
-        }
-        // Identifier start.
-        let first = match r.get(i) {
-            Some(&b) => b,
-            None => return None,
-        };
-        if first == b'_' || first.is_ascii_alphabetic() {
-            // ASCII start — proceed.
-        } else if utf8 && first >= 0x80 {
-            // UTF-8 lead byte — decode and check.
-            let tail = &r[i..];
-            let s = std::str::from_utf8(tail).ok()?;
-            let ch = s.chars().next()?;
-            if !ch.is_alphabetic() {
-                return None;
-            }
-        } else {
-            return None;
-        }
-        // ident_start includes the dash (if present) so the span and consumed-range cover the full `-bareword`.
-        let ident_start = if has_dash { i - 1 } else { i };
-        // Scan identifier body.
-        while i < r.len() {
-            let b = r[i];
-            if b == b'_' || b.is_ascii_alphanumeric() {
-                i += 1;
-            } else if b == b'\'' && apos {
-                // Apostrophe as package separator: check that the next byte is an identifier start.
-                if let Some(&next) = r.get(i + 1) {
-                    if next == b'_' || next.is_ascii_alphabetic() || (utf8 && next >= 0x80) {
-                        i += 1; // consume apostrophe, loop continues
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else if utf8 && b >= 0x80 {
-                let tail = &r[i..];
-                if let Ok(s) = std::str::from_utf8(tail)
-                    && let Some(ch) = s.chars().next()
-                    && ch.is_alphanumeric()
-                {
-                    i += ch.len_utf8();
-                    continue;
-                }
-                break;
-            } else {
-                break;
-            }
-        }
-        let ident_end = i;
-        // Skip trailing whitespace before the expected `}`.
-        let mut j = i;
-        while j < r.len() && matches!(r[j], b' ' | b'\t') {
-            j += 1;
-        }
-        if r.get(j).copied() != Some(b'}') {
-            return None;
-        }
-        // Commit.  Consume leading ws + identifier; leave trailing ws (if any) for the next lex call to skip naturally
-        // when producing the `}` token.
-        let name_bytes = &r[ident_start..ident_end];
-        let name = std::str::from_utf8(name_bytes).ok()?.to_string();
-        // Normalize apostrophe separators to ::
-        let name = if name.contains('\'') { name.replace('\'', "::") } else { name };
-        let offset = line.offset;
-        let pos = line.pos;
-        let start_global = (offset + pos + ident_start) as u32;
-        let end_global = (offset + pos + ident_end) as u32;
-        let mline = self.current_line.as_mut()?;
-        mline.pos += ident_end;
-        Some((name, Span::new(start_global, end_global)))
+    /// Skip whitespace and `#` comments (not POD), then return the next raw byte without consuming it.  Used by the
+    /// parser to inspect the delimiter byte after a quote keyword without triggering tokenization.  Returns `None` at
+    /// EOF.
+    pub fn skip_ws_and_peek_byte(&mut self) -> Option<u8> {
+        let _ = self.skip_ws_and_comments_no_pod();
+        self.peek_byte(false)
     }
 
     // ── Strings ───────────────────────────────────────────────

@@ -226,6 +226,14 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         // Flow control
         "break" => Some(Keyword::Break),
         "qw" => Some(Keyword::Qw),
+        "q" => Some(Keyword::Q),
+        "qq" => Some(Keyword::Qq),
+        "qr" => Some(Keyword::Qr),
+        "qx" => Some(Keyword::Qx),
+        "m" => Some(Keyword::M),
+        "s" => Some(Keyword::S),
+        "tr" => Some(Keyword::Tr),
+        "y" => Some(Keyword::Y),
         "format" => Some(Keyword::Format),
         "BEGIN" => Some(Keyword::BEGIN),
         "END" => Some(Keyword::END),
@@ -496,6 +504,14 @@ impl From<Keyword> for &'static str {
             Keyword::Isa => "isa",
             Keyword::Break => "break",
             Keyword::Qw => "qw",
+            Keyword::Q => "q",
+            Keyword::Qq => "qq",
+            Keyword::Qr => "qr",
+            Keyword::Qx => "qx",
+            Keyword::M => "m",
+            Keyword::S => "s",
+            Keyword::Tr => "tr",
+            Keyword::Y => "y",
             Keyword::Format => "format",
             Keyword::BEGIN => "BEGIN",
             Keyword::END => "END",
@@ -553,6 +569,14 @@ impl From<Keyword> for &'static str {
             Keyword::Match => "match",
         }
     }
+}
+
+/// Is this keyword a quote-like operator (`q`, `qq`, `qw`, `qr`, `qx`, `m`, `s`, `tr`, `y`)?  These require special
+/// handling in the parser because they can start sublexing — the byte following the keyword (after whitespace) is the
+/// quote delimiter, not a normal token.  The parser must avoid calling `peek_token` before deciding whether to enter
+/// sublexing mode.
+pub fn is_quote_keyword(kw: Keyword) -> bool {
+    matches!(kw, Keyword::Q | Keyword::Qq | Keyword::Qw | Keyword::Qr | Keyword::Qx | Keyword::M | Keyword::S | Keyword::Tr | Keyword::Y)
 }
 
 /// Is this keyword a named unary operator?  After a named unary, the next thing is a term (so `/` is regex).
@@ -873,6 +897,14 @@ pub fn is_strong(kw: Keyword) -> bool {
             | Keyword::Printf
             | Keyword::Prototype
             | Keyword::Qw
+            | Keyword::Q
+            | Keyword::Qq
+            | Keyword::Qr
+            | Keyword::Qx
+            | Keyword::M
+            | Keyword::S
+            | Keyword::Tr
+            | Keyword::Y
             | Keyword::Redo
             | Keyword::Require
             | Keyword::Return
