@@ -691,7 +691,7 @@ fn lex_valid_explicit_octal() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — numeric edge cases
+// Numeric edge cases
 // ═══════════════════════════════════════════════════════════
 
 #[test]

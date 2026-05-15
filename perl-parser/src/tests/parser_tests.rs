@@ -4535,7 +4535,7 @@ fn torture_stacked_heredoc_list_assignment() {
 // ── Dynamic method dispatch tests ─────────────────────────
 
 // ═══════════════════════════════════════════════════════════
-// Gap-probing tests — things I'm not sure the parser handles.  Written to match Perl's actual behavior.  Failures are
+// Gap-probing tests — edge cases that may not be handled yet.  Written to match Perl's actual behavior.  Failures are
 // diagnostic: they tell us what to fix.
 // ═══════════════════════════════════════════════════════════
 
@@ -5561,7 +5561,7 @@ fn parse_special_hash_caret_capture_all() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — compound assignment operators
+// Compound assignment operators
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -5649,7 +5649,7 @@ fn parse_assign_shift_r() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — precedence verification
+// Precedence verification
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -5720,7 +5720,7 @@ fn prec_not_low_vs_and_low() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — operators with AST verification
+// Operators with AST verification
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -5813,7 +5813,7 @@ fn parse_str_cmp() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — arrow deref targets
+// Arrow deref targets
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -5863,7 +5863,7 @@ fn parse_triple_deref() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — postfix control flow variants
+// Postfix control flow variants
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -5903,7 +5903,7 @@ fn parse_postfix_for() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — declaration variants
+// Declaration variants
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -5993,7 +5993,7 @@ fn parse_no_decl() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — builtins
+// Builtins
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -6108,7 +6108,7 @@ fn parse_bless_two_arg() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — special forms
+// Special forms
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -6233,7 +6233,7 @@ fn parse_nested_anon_constructors() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — phaser blocks (INIT/CHECK/UNITCHECK)
+// Phaser blocks (INIT/CHECK/UNITCHECK)
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -6255,7 +6255,7 @@ fn parse_unitcheck_block() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — control flow variants
+// Control flow variants
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -6290,7 +6290,7 @@ fn parse_empty_statements() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — regex flags
+// Regex flags
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -6364,7 +6364,7 @@ fn parse_tr_with_flags() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — miscellaneous
+// Miscellaneous
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -6582,16 +6582,14 @@ fn autoquote_y_hash_key() {
 // ═══════════════════════════════════════════════════════════
 // Audit-driven gap-filling tests.
 //
-// The previous commits added many tests by phase, but the audit I committed to in the interpolation masking postmortem
-// turned up several genuinely shallow ones and a few real gaps.  These fill the worst of them.  Structured by the phase
-// they belong to.
+// Deeper coverage for areas where earlier tests only checked the outer AST variant without verifying inner content.
+// Structured by the phase they belong to.
 // ═══════════════════════════════════════════════════════════
 
 // ── Phase 3: postderef slice content verification ────────
 //
-// The original postderef slice tests checked only the ArrowTarget variant, not the index/key contents.  A regression
-// that parsed `$r->@[0, 1, 2]` as `ArraySliceIndices(IntLit(0))` (dropping the rest) would slip through.  Tests below
-// verify the inner expression.
+// Verify inner expression contents of postderef slices, not just the ArrowTarget variant.  Without this, a regression
+// that parsed `$r->@[0, 1, 2]` as `ArraySliceIndices(IntLit(0))` (dropping the rest) would slip through.
 
 #[test]
 fn postderef_array_slice_indices_content() {
@@ -6684,9 +6682,8 @@ fn fc_named_unary_precedence() {
 
 // ── Phase 5b: reactivation tests for each gated keyword ──
 //
-// The original downgrade tests only checked `try` reactivates when its feature is on.  Add the same check for each of
-// the seven keywords whose downgrade was implemented: each should parse as its real keyword form when the feature is
-// active.
+// Verify that each of the seven feature-gated keywords parses as its real keyword form when the corresponding feature
+// is active.
 
 #[test]
 fn catch_reactivates_with_try_feature() {
@@ -6725,7 +6722,7 @@ fn class_reactivates_with_feature() {
 
 // ── Compile-time tokens in contexts ──────────────────────
 //
-// The original tests covered top-level __SUB__ / __PACKAGE__ but not nested contexts.
+// Verify __SUB__, __PACKAGE__, and similar compile-time tokens in nested contexts (inside sub bodies, blocks, etc.).
 
 #[test]
 fn current_sub_inside_named_sub() {
@@ -6785,7 +6782,7 @@ fn sig_two_slurpies_is_error() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NEW TESTS — known gaps (ignored until implemented)
+// Known gaps (ignored until implemented)
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -8066,7 +8063,7 @@ fn hard_parses_postfix_unless() {
 // ── Prototype-driven call-site parsing ─────────────────────
 //
 // These verify that a sub's prototype — registered in the symbol table at declaration time — drives how arguments at
-// call sites are parsed.  Anti-oracle cases adapted from ChatGPT's parser-breaker corpus.
+// call sites are parsed.  Includes adversarial cases designed to break naive parsers.
 
 /// Given `sub NAME (PROTO); CALL`, parse and return the expression from the second statement (the call).
 fn parse_call_with_proto(src: &str) -> Expr {
@@ -8943,7 +8940,7 @@ fn hard_parses_tricky_slash_combinations() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Tests for previously-unimplemented syntax features.
+// Extended syntax features.
 // ═══════════════════════════════════════════════════════════
 
 // ── \N{U+XXXX} and \N{name} escapes ──────────────────────
@@ -10895,7 +10892,7 @@ fn memchr_regex_with_code_block() {
     assert!(has_regex, "should contain a regex bind operation");
 }
 
-// ── ChatGPT torture tests ───────────────────────────────
+// ── Adversarial edge cases ───────────────────────────────
 
 #[test]
 fn autoquote_try_fat_comma() {
@@ -11692,9 +11689,8 @@ fn apos_given_bareword_off_is_func_call() {
 
 #[test]
 fn apos_any_keyword_on_not_consumed() {
-    // any'x' with use feature 'any' — any is a keyword, scan_ident must not consume any'x as any::x.  Without the fix,
-    // scan_ident greedily consumes any'x as any::x and the trailing ' is unterminated.  With the fix, any is a keyword
-    // and 'x' is its argument.
+    // any'x' with use feature 'any' — any is a keyword, so scan_ident must not consume any'x as any::x (which would
+    // leave the trailing ' unterminated).  Instead, any is recognized as a keyword and 'x' is its argument.
     let prog = parse("use feature 'any'; my $r = any'x',1,2,3;");
     assert!(!prog.statements.is_empty());
 }

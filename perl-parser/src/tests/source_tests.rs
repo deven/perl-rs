@@ -510,7 +510,7 @@ fn ascii_only_heredoc_body_lines() {
     assert!(source.next_line(false).unwrap().is_none());
 }
 
-// ── ChatGPT torture tests ───────────────────────────────
+// ── Adversarial edge cases ───────────────────────────────
 
 #[test]
 fn heredoc_terminator_at_eof_without_newline() {
