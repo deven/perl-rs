@@ -2294,13 +2294,6 @@ impl Parser {
             None => (false, None),
         };
 
-        // Unknown bareword followed by `}` — treated as string literal.  Known subs followed by `}` fall through to
-        // call parsing (zero-arg call as last expression in a block).  Hash subscript autoquoting is handled at the
-        // byte level by try_autoquoted_bareword_subscript before we ever reach here.
-        if !is_known_sub && matches!(self.peek_token(), Token::RightBrace) {
-            return Ok(Expr { kind: ExprKind::StringLit(name), span });
-        }
-
         // Check if followed by `(` — function call
         if self.at(&Token::LeftParen)? {
             self.next_token()?;
@@ -2631,9 +2624,8 @@ impl Parser {
 
     fn parse_filetest(&mut self, test_byte: u8, span: Span) -> Result<Expr, ParseError> {
         let test_char = test_byte as char;
-        // In fat-comma context, treat as StringLit("-x").  Hash subscript autoquoting (-f inside {}) is handled at the
-        // byte level by try_autoquoted_bareword_subscript, so we don't check RightBrace here — that would misfire for
-        // `sub foo { -f }` which is a filetest on $_.
+        // In fat-comma context (`-f => val`), treat as StringLit("-x"), not a filetest.  Hash subscript autoquoting
+        // (`$h{-f}`) is handled at the byte level by try_autoquoted_bareword_subscript before we ever reach here.
         if matches!(self.peek_token(), Token::FatComma) {
             return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
         }
@@ -2972,8 +2964,8 @@ impl Parser {
         if let Some((name, span)) = self.lexer.try_autoquoted_bareword_subscript() {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
-        // Other autoquoting rules — bareword followed by `=>` or `}` (when not a quote op), `-bareword` — are handled
-        // inside parse_expr via parse_ident_term and the Minus-prefix bareword path.
+        // All hash-subscript autoquoting is handled above.  If the byte-level scanner didn't match (expression with
+        // operators, sigiled variables, function calls, etc.), fall through to normal expression parsing.
         self.parse_expr(PREC_LOW)
     }
 

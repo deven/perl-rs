@@ -1267,10 +1267,11 @@ fn interp_escape_sequence_in_hash_subscript_is_ref_to_bareword() {
     match &e.kind {
         ExprKind::HashElem(_, k) => match &k.kind {
             ExprKind::Ref(inner) => {
-                // Inner: the autoquoted bareword "x41".
-                assert!(matches!(inner.kind, ExprKind::StringLit(ref s) if s == "x41"), "expected Ref(StringLit('x41')), inner was {:?}", inner.kind);
+                // Inner: the bareword "x41".  `\x41` inside `{...}` is code, not a string escape — the backslash is
+                // the reference operator and x41 is a bareword.  Under `use strict 'subs'` this would be an error.
+                assert!(matches!(inner.kind, ExprKind::Bareword(ref s) if s == "x41"), "expected Ref(Bareword('x41')), inner was {:?}", inner.kind);
             }
-            other => panic!("expected Ref(StringLit('x41')) as hash key, got {other:?}"),
+            other => panic!("expected Ref(Bareword('x41')) as hash key, got {other:?}"),
         },
         other => panic!("expected HashElem, got {other:?}"),
     }
@@ -5405,15 +5406,17 @@ fn parse_known_sub_in_block_not_autoquoted() {
 }
 
 #[test]
-fn parse_unknown_bareword_in_block_autoquotes() {
-    // sub foo { bar } where bar is unknown — autoquoted to string.
+fn parse_unknown_bareword_in_block_is_bareword() {
+    // sub foo { bar } where bar is unknown — produces Bareword (not StringLit).  Under `use strict 'subs'` this would
+    // be a compile error; without strict, Perl stringifies it at runtime.  The AST preserves the distinction so a later
+    // pass can enforce strict.
     let sub = parse_sub("sub foo { bar }");
     assert_eq!(sub.name, "foo");
     assert_eq!(sub.body.statements.len(), 1);
     match &sub.body.statements[0].kind {
         StmtKind::Expr(e) => match &e.kind {
-            ExprKind::StringLit(s) => assert_eq!(s, "bar"),
-            other => panic!("expected StringLit('bar'), got {other:?}"),
+            ExprKind::Bareword(s) => assert_eq!(s, "bar"),
+            other => panic!("expected Bareword('bar'), got {other:?}"),
         },
         other => panic!("expected Expr, got {other:?}"),
     }
