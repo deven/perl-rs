@@ -40,14 +40,14 @@ fn lex_all(src: &str) -> Vec<Token> {
             spanned.token = tok;
         }
         // In term context, quote keywords start sublexing — mimic the parser's `parse_quote_keyword` by skipping
-        // whitespace and calling `begin_quote_sublex`.  If `=>` follows, leave the keyword as-is (the parser would
-        // autoquote; the next lex call produces FatComma).
+        // whitespace and calling `begin_quote_sublex`.  Fat-comma autoquoting (`q => 1`) is handled by the lexer, which
+        // returns StrLit instead of the keyword.
         if let Token::Keyword(kw) = &spanned.token
             && keyword::is_quote_keyword(*kw)
             && term_context
         {
             let raw = lexer.skip_ws_and_peek_byte();
-            if !(raw == Some(b'=') && lexer.peek_byte_at(1) == Some(b'>')) {
+            if raw.is_some() {
                 let tok = lexer.begin_quote_sublex(*kw).unwrap();
                 spanned.token = tok;
             }

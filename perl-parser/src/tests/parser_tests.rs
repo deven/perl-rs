@@ -2728,17 +2728,13 @@ fn parse_qualified_name_before_fat_comma() {
 
 #[test]
 fn parse_neg_bareword_fat_comma() {
-    // -key => 42 — the lexer autoquotes `key` to StrLit("key"), the parser wraps in Negate.  At runtime, string
-    // negation of "key" produces "-key".  (A future optimization could collapse this to StringLit("-key") at parse
-    // time, matching Perl's Deparse output.)
+    // -key => 42 — the lexer autoquotes `key` to StrLit("key"), the parser's string negation collapse produces
+    // StringLit("-key"), matching Perl's compile-time folding.
     let e = parse_expr_str("-key => 42;");
     match &e.kind {
-        ExprKind::List(items) => match &items[0].kind {
-            ExprKind::UnaryOp(UnaryOp::Negate, inner) => {
-                assert!(matches!(inner.kind, ExprKind::StringLit(ref s) if s == "key"), "expected StringLit(\"key\"), got {:?}", inner.kind);
-            }
-            other => panic!("expected Negate(StringLit(\"key\")), got {other:?}"),
-        },
+        ExprKind::List(items) => {
+            assert!(matches!(items[0].kind, ExprKind::StringLit(ref s) if s == "-key"), "expected StringLit(\"-key\"), got {:?}", items[0].kind);
+        }
         other => panic!("expected List, got {other:?}"),
     }
 }
@@ -2758,6 +2754,27 @@ fn parse_neg_func_call_not_quoted() {
     // -func() → negate the function call, NOT autoquote
     let e = parse_expr_str("-func();");
     assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::Negate, _)));
+}
+
+#[test]
+fn parse_string_negation_collapse() {
+    // -"foo" → StringLit("-foo")
+    let e = parse_expr_str("-\"foo\";");
+    assert!(matches!(e.kind, ExprKind::StringLit(ref s) if s == "-foo"), "expected StringLit(\"-foo\"), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_string_negation_collapse_minus_prefix() {
+    // -"-foo" → StringLit("+foo")
+    let e = parse_expr_str("-\"-foo\";");
+    assert!(matches!(e.kind, ExprKind::StringLit(ref s) if s == "+foo"), "expected StringLit(\"+foo\"), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_string_negation_collapse_plus_prefix() {
+    // -"+foo" → StringLit("-foo")
+    let e = parse_expr_str("-\"+foo\";");
+    assert!(matches!(e.kind, ExprKind::StringLit(ref s) if s == "-foo"), "expected StringLit(\"-foo\"), got {:?}", e.kind);
 }
 
 // ── Attribute tests ───────────────────────────────────────

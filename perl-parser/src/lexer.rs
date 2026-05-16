@@ -3105,6 +3105,11 @@ impl Lexer {
             return None;
         }
         self.skip(1);
+        // Fat-comma autoquoting: `-f => val` → StrLit("-f").  This function is always called after a minus, so the
+        // "-" prefix is implicit.
+        if self.at_fat_comma() {
+            return Some(Token::StrLit(format!("-{}", b as char)));
+        }
         Some(Token::Filetest(b))
     }
 

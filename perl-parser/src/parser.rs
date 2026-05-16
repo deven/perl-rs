@@ -312,149 +312,136 @@ impl Parser {
         }
 
         let (kind, terminated) = match self.peek_token().clone() {
-            // Statement-level keywords: consume first, check for fat comma autoquoting (e.g. `if => 1`), then dispatch
-            // to handler.
+            // Statement-level keywords: consume first, then dispatch to handler.  Fat-comma autoquoting (e.g. `if => 1`)
+            // is handled by the lexer, which returns StrLit instead of Keyword.
             Token::Keyword(kw) if keyword::is_statement_keyword(kw) => {
                 let kw_span = self.peek_span();
                 self.next_token()?; // consume the keyword
-                if matches!(self.peek_token(), Token::FatComma) {
-                    // Autoquote: keyword is used as a hash key.
-                    let expr = self.with_descent(|this| {
-                        let name: &str = kw.into();
-                        let initial = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
-                        this.parse_expr_continuation(initial, PREC_LOW)
-                    })?;
-                    let kind = self.maybe_postfix_control(expr)?;
-                    let terminated = self.eat(&Token::Semi)?;
-                    (kind, terminated)
-                } else {
-                    match kw {
-                        // my/our/state are expressions, not statements.  The keyword has already been consumed;
-                        // construct the Decl expression and run the Pratt loop to pick up optional `= expr` assignment
-                        // and trailing `, $other` list members.
-                        Keyword::My | Keyword::Our | Keyword::State => {
-                            let scope = match kw {
-                                Keyword::My => DeclScope::My,
-                                Keyword::Our => DeclScope::Our,
-                                Keyword::State => DeclScope::State,
-                                _ => unreachable!(),
-                            };
-                            // `my sub foo { }`, `state sub foo { }`, `our sub foo { }`
-                            if self.eat(&Token::Keyword(Keyword::Sub))? {
-                                if matches!(self.peek_token(), Token::Ident(_) | Token::Keyword(_)) {
-                                    let (kind, _) = (self.parse_sub_decl_body(kw_span)?, false);
-                                    // Patch the scope onto the SubDecl.
-                                    let kind = match kind {
-                                        StmtKind::SubDecl(mut sd) => {
-                                            sd.scope = Some(scope);
-                                            StmtKind::SubDecl(sd)
-                                        }
-                                        other => other,
-                                    };
-                                    (kind, false)
-                                } else {
-                                    return Err(ParseError::new("expected sub name after my/our/state sub", self.peek_span()));
-                                }
-                            // `my method foo { }`, `state method foo { }`
-                            } else if self.eat(&Token::Keyword(Keyword::Method))? {
-                                let kind = self.parse_method(kw_span)?;
+                match kw {
+                    // my/our/state are expressions, not statements.  The keyword has already been consumed;
+                    // construct the Decl expression and run the Pratt loop to pick up optional `= expr` assignment
+                    // and trailing `, $other` list members.
+                    Keyword::My | Keyword::Our | Keyword::State => {
+                        let scope = match kw {
+                            Keyword::My => DeclScope::My,
+                            Keyword::Our => DeclScope::Our,
+                            Keyword::State => DeclScope::State,
+                            _ => unreachable!(),
+                        };
+                        // `my sub foo { }`, `state sub foo { }`, `our sub foo { }`
+                        if self.eat(&Token::Keyword(Keyword::Sub))? {
+                            if matches!(self.peek_token(), Token::Ident(_) | Token::Keyword(_)) {
+                                let (kind, _) = (self.parse_sub_decl_body(kw_span)?, false);
+                                // Patch the scope onto the SubDecl.
                                 let kind = match kind {
-                                    StmtKind::MethodDecl(mut sd) => {
+                                    StmtKind::SubDecl(mut sd) => {
                                         sd.scope = Some(scope);
-                                        StmtKind::MethodDecl(sd)
+                                        StmtKind::SubDecl(sd)
                                     }
                                     other => other,
                                 };
                                 (kind, false)
                             } else {
-                                let expr = self.with_descent(|this| {
-                                    let initial = this.parse_decl_expr(scope, kw_span)?;
-                                    this.parse_expr_continuation(initial, PREC_LOW)
-                                })?;
-                                let kind = self.maybe_postfix_control(expr)?;
-                                let terminated = self.eat(&Token::Semi)?;
-                                (kind, terminated)
+                                return Err(ParseError::new("expected sub name after my/our/state sub", self.peek_span()));
                             }
+                        // `my method foo { }`, `state method foo { }`
+                        } else if self.eat(&Token::Keyword(Keyword::Method))? {
+                            let kind = self.parse_method(kw_span)?;
+                            let kind = match kind {
+                                StmtKind::MethodDecl(mut sd) => {
+                                    sd.scope = Some(scope);
+                                    StmtKind::MethodDecl(sd)
+                                }
+                                other => other,
+                            };
+                            (kind, false)
+                        } else {
+                            let expr = self.with_descent(|this| {
+                                let initial = this.parse_decl_expr(scope, kw_span)?;
+                                this.parse_expr_continuation(initial, PREC_LOW)
+                            })?;
+                            let kind = self.maybe_postfix_control(expr)?;
+                            let terminated = self.eat(&Token::Semi)?;
+                            (kind, terminated)
                         }
-                        Keyword::Sub => {
-                            if matches!(self.peek_token(), Token::Ident(_) | Token::Keyword(_)) {
-                                (self.parse_sub_decl_body(kw_span)?, false)
-                            } else {
-                                let expr = self.parse_anon_sub(kw_span)?;
-                                let kind = self.maybe_postfix_control(expr)?;
-                                let terminated = self.eat(&Token::Semi)?;
-                                (kind, terminated)
-                            }
-                        }
-                        Keyword::If => (self.parse_if_stmt()?, false),
-                        Keyword::Unless => (self.parse_unless_stmt()?, false),
-                        Keyword::While => (self.parse_while_stmt()?, false),
-                        Keyword::Until => (self.parse_until_stmt()?, false),
-                        Keyword::For | Keyword::Foreach => (self.parse_for_stmt()?, false),
-                        Keyword::Package => (self.parse_package_decl(kw_span)?, false),
-                        Keyword::Use | Keyword::No => (self.parse_use_decl(kw_span, kw == Keyword::No)?, false),
-
-                        // Phaser blocks
-                        Keyword::BEGIN => (self.parse_phaser(PhaserKind::Begin)?, false),
-                        Keyword::END => (self.parse_phaser(PhaserKind::End)?, false),
-                        Keyword::INIT => (self.parse_phaser(PhaserKind::Init)?, false),
-                        Keyword::CHECK => (self.parse_phaser(PhaserKind::Check)?, false),
-                        Keyword::UNITCHECK => (self.parse_phaser(PhaserKind::Unitcheck)?, false),
-                        Keyword::ADJUST => (self.parse_phaser(PhaserKind::Adjust)?, false),
-
-                        // AUTOLOAD/DESTROY — implicit sub declarations.  `AUTOLOAD { ... }` is `sub AUTOLOAD { ... }`.
-                        // `AUTOLOAD;` is `sub AUTOLOAD;` (forward decl).  `AUTOLOAD()` is `sub AUTOLOAD ();`
-                        // (prototype).  They are NEVER function calls — Perl always treats them as implicit sub
-                        // declarations.
-                        Keyword::AUTOLOAD | Keyword::DESTROY => {
-                            let name: &str = kw.into();
-                            (self.parse_sub_decl_with_name(name.to_string(), kw_span)?, false)
-                        }
-
-                        // given/when/default
-                        Keyword::Given => (self.parse_given()?, false),
-                        Keyword::When => (self.parse_when()?, false),
-                        Keyword::Default => {
-                            let block = self.parse_block()?;
-                            (StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: kw_span }, block), false)
-                        }
-
-                        // try/catch/finally/defer
-                        Keyword::Try => (self.parse_try()?, false),
-                        Keyword::Defer => {
-                            let block = self.parse_block()?;
-                            (StmtKind::Defer(block), false)
-                        }
-
-                        // format NAME = ... .
-                        Keyword::Format => (self.parse_format(kw_span)?, false),
-
-                        // class Name :attrs { ... }
-                        Keyword::Class => (self.parse_class(kw_span)?, false),
-
-                        // field $var :attrs = default;
-                        Keyword::Field => (self.parse_field(kw_span)?, false),
-
-                        // method name(params) { ... } or method { ... }
-                        Keyword::Method => {
-                            if matches!(self.peek_token(), Token::Ident(_)) {
-                                (self.parse_method(kw_span)?, false)
-                            } else {
-                                let expr = self.parse_anon_method(kw_span)?;
-                                let kind = self.maybe_postfix_control(expr)?;
-                                let terminated = self.eat(&Token::Semi)?;
-                                (kind, terminated)
-                            }
-                        }
-
-                        // Any other statement keyword not handled above.
-                        _ => unreachable!("unhandled statement keyword: {kw:?}"),
                     }
+                    Keyword::Sub => {
+                        if matches!(self.peek_token(), Token::Ident(_) | Token::Keyword(_)) {
+                            (self.parse_sub_decl_body(kw_span)?, false)
+                        } else {
+                            let expr = self.parse_anon_sub(kw_span)?;
+                            let kind = self.maybe_postfix_control(expr)?;
+                            let terminated = self.eat(&Token::Semi)?;
+                            (kind, terminated)
+                        }
+                    }
+                    Keyword::If => (self.parse_if_stmt()?, false),
+                    Keyword::Unless => (self.parse_unless_stmt()?, false),
+                    Keyword::While => (self.parse_while_stmt()?, false),
+                    Keyword::Until => (self.parse_until_stmt()?, false),
+                    Keyword::For | Keyword::Foreach => (self.parse_for_stmt()?, false),
+                    Keyword::Package => (self.parse_package_decl(kw_span)?, false),
+                    Keyword::Use | Keyword::No => (self.parse_use_decl(kw_span, kw == Keyword::No)?, false),
+
+                    // Phaser blocks
+                    Keyword::BEGIN => (self.parse_phaser(PhaserKind::Begin)?, false),
+                    Keyword::END => (self.parse_phaser(PhaserKind::End)?, false),
+                    Keyword::INIT => (self.parse_phaser(PhaserKind::Init)?, false),
+                    Keyword::CHECK => (self.parse_phaser(PhaserKind::Check)?, false),
+                    Keyword::UNITCHECK => (self.parse_phaser(PhaserKind::Unitcheck)?, false),
+                    Keyword::ADJUST => (self.parse_phaser(PhaserKind::Adjust)?, false),
+
+                    // AUTOLOAD/DESTROY — implicit sub declarations.  `AUTOLOAD { ... }` is `sub AUTOLOAD { ... }`.
+                    // `AUTOLOAD;` is `sub AUTOLOAD;` (forward decl).  `AUTOLOAD()` is `sub AUTOLOAD ();`
+                    // (prototype).  They are NEVER function calls — Perl always treats them as implicit sub
+                    // declarations.
+                    Keyword::AUTOLOAD | Keyword::DESTROY => {
+                        let name: &str = kw.into();
+                        (self.parse_sub_decl_with_name(name.to_string(), kw_span)?, false)
+                    }
+
+                    // given/when/default
+                    Keyword::Given => (self.parse_given()?, false),
+                    Keyword::When => (self.parse_when()?, false),
+                    Keyword::Default => {
+                        let block = self.parse_block()?;
+                        (StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: kw_span }, block), false)
+                    }
+
+                    // try/catch/finally/defer
+                    Keyword::Try => (self.parse_try()?, false),
+                    Keyword::Defer => {
+                        let block = self.parse_block()?;
+                        (StmtKind::Defer(block), false)
+                    }
+
+                    // format NAME = ... .
+                    Keyword::Format => (self.parse_format(kw_span)?, false),
+
+                    // class Name :attrs { ... }
+                    Keyword::Class => (self.parse_class(kw_span)?, false),
+
+                    // field $var :attrs = default;
+                    Keyword::Field => (self.parse_field(kw_span)?, false),
+
+                    // method name(params) { ... } or method { ... }
+                    Keyword::Method => {
+                        if matches!(self.peek_token(), Token::Ident(_)) {
+                            (self.parse_method(kw_span)?, false)
+                        } else {
+                            let expr = self.parse_anon_method(kw_span)?;
+                            let kind = self.maybe_postfix_control(expr)?;
+                            let terminated = self.eat(&Token::Semi)?;
+                            (kind, terminated)
+                        }
+                    }
+
+                    // Any other statement keyword not handled above.
+                    _ => unreachable!("unhandled statement keyword: {kw:?}"),
                 }
             }
 
-            // Expression keywords (local, return, etc.) and non-keywords go through parse_expr_statement.  parse_term
-            // handles fat comma autoquoting for these.
+            // Expression keywords (local, return, etc.) and non-keywords go through parse_expr_statement.
             Token::Keyword(Keyword::Local) => self.parse_expr_statement()?,
 
             // `{` at statement level — parse as block, then check if it should be reclassified as a hash constructor.
@@ -1911,9 +1898,16 @@ impl Parser {
             // Prefix unary operators
             Token::Minus => {
                 // -f, -d, -r, etc. → filetest operator (single letter not followed by word-continuation char).
-                if let Some(Token::Filetest(b)) = self.lexer.lex_filetest_after_minus() {
-                    let end = self.peek_span();
-                    return self.parse_filetest(b, span.merge(end));
+                // In fat-comma context (`-f => val`), lex_filetest_after_minus returns StrLit("-f") directly.
+                match self.lexer.lex_filetest_after_minus() {
+                    Some(Token::Filetest(b)) => {
+                        let end = self.peek_span();
+                        return self.parse_filetest(b, span.merge(end));
+                    }
+                    Some(Token::StrLit(s)) => {
+                        return Ok(Expr { kind: ExprKind::StringLit(s), span });
+                    }
+                    _ => {}
                 }
                 // -bareword (not followed by parens) → StringLit("-bareword")
                 // Perl: unary minus on an identifier always returns "-identifier".
@@ -1929,6 +1923,18 @@ impl Parser {
                     return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(ident_span) });
                 }
                 let operand = self.parse_expr(PREC_UNARY)?;
+                // String negation collapse: -"foo" → "-foo", -"-foo" → "+foo", -"+foo" → "-foo".  Matches Perl's
+                // compile-time folding of unary minus on string literals.
+                if let ExprKind::StringLit(ref s) = operand.kind {
+                    let negated = if let Some(rest) = s.strip_prefix('-') {
+                        format!("+{rest}")
+                    } else if let Some(rest) = s.strip_prefix('+') {
+                        format!("-{rest}")
+                    } else {
+                        format!("-{s}")
+                    };
+                    return Ok(Expr { kind: ExprKind::StringLit(negated), span: span.merge(operand.span) });
+                }
                 Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(operand)) })
             }
             Token::Plus => {
@@ -2251,16 +2257,11 @@ impl Parser {
     }
 
     /// Handle a quote keyword (`q`, `qq`, `qw`, `qr`, `qx`, `m`, `s`, `tr`, `y`) received in `parse_term`.  Skips
-    /// whitespace and peeks at the raw delimiter byte to decide between autoquoting (fat comma `=>`) and starting
-    /// sublexing.  Must be called BEFORE any `peek_token()` — tokenizing the delimiter byte would be destructive.
+    /// whitespace and peeks at the raw delimiter byte to decide whether to start sublexing.  Fat-comma autoquoting
+    /// (e.g. `q => 1`) is handled by the lexer, which returns StrLit instead of the keyword.  Must be called BEFORE any
+    /// `peek_token()` — tokenizing the delimiter byte would be destructive.
     fn parse_quote_keyword(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
         let raw = self.lexer.skip_ws_and_peek_byte();
-
-        // Fat comma: `q => 1` → StringLit("q").  Don't consume `=>` — the Pratt loop will see FatComma.
-        if raw == Some(b'=') && self.lexer.peek_byte_at(1) == Some(b'>') {
-            let name: &str = kw.into();
-            return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-        }
 
         // No delimiter byte (EOF) — treat as bareword.
         if raw.is_none() {
@@ -2329,11 +2330,6 @@ impl Parser {
     }
 
     fn parse_ident_term(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
-        // Autoquote: bareword followed by `=>` (fat comma) — always a string key, even for known sub names.
-        if matches!(self.peek_token(), Token::FatComma) {
-            return Ok(Expr { kind: ExprKind::StringLit(name), span });
-        }
-
         // Look up in the symbol table to see if this is a known sub.  Clone the prototype (small: raw string + a Vec of
         // slot enums) and the "is known" flag so we can release the borrow on self before parsing args.
         let (is_known_sub, proto) = match self.symbols.lookup(&name, &self.current_package) {
@@ -2671,11 +2667,6 @@ impl Parser {
 
     fn parse_filetest(&mut self, test_byte: u8, span: Span) -> Result<Expr, ParseError> {
         let test_char = test_byte as char;
-        // In fat-comma context (`-f => val`), treat as StringLit("-x"), not a filetest.  Hash subscript autoquoting
-        // (`$h{-f}`) is handled by parse_hash_subscript_key's keyword/minus interception before we ever reach here.
-        if matches!(self.peek_token(), Token::FatComma) {
-            return Ok(Expr { kind: ExprKind::StringLit(format!("-{test_char}")), span });
-        }
         let (target, end) = self.parse_stat_target(span)?;
         Ok(Expr { span: span.merge(end), kind: ExprKind::Filetest(test_char, target) })
     }
