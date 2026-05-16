@@ -103,6 +103,9 @@ pub struct Parser {
     /// Lexically-scoped pragma state (`use feature`, `use utf8`, version bundles).  Saved/restored across block
     /// boundaries by `parse_block`.
     pragmas: Pragmas,
+    /// Set when `__DATA__` or `__END__` triggers logical EOF mid-expression (inside `parse_term`).  The statement-level
+    /// loop in `parse_program` picks this up after the current statement finishes and emits a `DataEnd` node.
+    pending_data_end: Option<(Keyword, u32)>,
 }
 
 impl Parser {
@@ -128,6 +131,7 @@ impl Parser {
             symbols: SymbolTable::new(),
             current_package: std::sync::Arc::from("main"),
             pragmas: Pragmas::new(),
+            pending_data_end: None,
         })
     }
 
@@ -286,6 +290,13 @@ impl Parser {
             if is_data_end {
                 break;
             }
+            // If __DATA__/__END__ triggered EOF mid-expression, parse_term stored the pending info.  Emit the DataEnd
+            // node now that the expression statement has been collected.
+            if let Some((kw, offset)) = self.pending_data_end.take() {
+                let end_span = self.peek_span();
+                statements.push(Statement { kind: StmtKind::DataEnd(kw, offset), span: end_span, terminated: false });
+                break;
+            }
         }
 
         // A lexer error produces Eof, which exits the loop above.  If advance() was never called to surface it, catch
@@ -308,8 +319,7 @@ impl Parser {
             return Ok(Statement { kind: StmtKind::Empty, span: start, terminated: true });
         }
 
-        // __END__ / __DATA__ / ^D / ^Z — stop parsing immediately.
-        // __END__/__DATA__ are keywords; ^D/^Z are Token::DataEnd.
+        // __END__ / __DATA__ — stop parsing immediately.  ^D/^Z trigger logical EOF in the lexer directly.
         if let Token::Keyword(kw) = self.peek_token()
             && keyword::is_data_eof_keyword(*kw)
         {
@@ -317,32 +327,17 @@ impl Parser {
             let kw_span = self.peek_span();
             self.next_token()?;
 
-            // Compute the data offset BEFORE calling autoquoted_eof (which may discard the current line).  The trailing
-            // data starts on the next line — skip past remaining bytes on the current line plus its terminator.
-            let remaining_len = self.lexer.remaining().len();
-            let mut data_offset = self.lexer.current_pos() + remaining_len;
-            if self.lexer.line_is_terminated() {
-                data_offset += 1;
+            // Check for autoquoting (`__END__ => val`).  If not autoquoted, autoquoted_eof triggers logical EOF and
+            // returns the byte offset where trailing data begins (after any pending heredoc bodies).
+            if let Some(data_offset) = self.lexer.autoquoted_eof(false) {
+                return Ok(Statement { kind: StmtKind::DataEnd(kw, data_offset), span: start.merge(kw_span), terminated: false });
             }
-
-            // Check for fat-comma autoquoting: `__END__ => val`.
-            if self.lexer.autoquoted_eof() {
-                // Autoquoted — treat as expression statement.
-                let name: &str = kw.into();
-                let expr = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
-                let full = self.with_descent(|this| this.parse_expr_continuation(expr, PREC_LOW))?;
-                let terminated = self.eat(&Token::Semi)?;
-                return Ok(Statement { kind: StmtKind::Expr(full), span: start.merge(self.peek_span()), terminated });
-            }
-            // Logical EOF triggered by autoquoted_eof.
-            return Ok(Statement { kind: StmtKind::DataEnd(kw, data_offset as u32), span: start.merge(kw_span), terminated: false });
-        }
-        if let Token::DataEnd(_marker) = self.peek_token() {
-            self.next_token()?;
-            // ^D / ^Z: data starts immediately after the control char.
-            let data_offset = self.lexer.current_pos() as u32;
-            self.lexer.skip_to_end();
-            return Ok(Statement { kind: StmtKind::DataEnd(Keyword::__END__, data_offset), span: start.merge(self.peek_span()), terminated: false });
+            // Autoquoted — treat as expression statement.
+            let name: &str = kw.into();
+            let expr = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
+            let full = self.with_descent(|this| this.parse_expr_continuation(expr, PREC_LOW))?;
+            let terminated = self.eat(&Token::Semi)?;
+            return Ok(Statement { kind: StmtKind::Expr(full), span: start.merge(self.peek_span()), terminated });
         }
 
         let (kind, terminated) = match self.peek_token().clone() {
@@ -1693,6 +1688,24 @@ impl Parser {
             && keyword::is_quote_keyword(*kw)
         {
             return self.parse_quote_keyword(*kw, span);
+        }
+
+        // __DATA__/__END__ must be intercepted before peek_token() — autoquoting is same-line only, but peek_token()
+        // would skip newlines and tokenize the next line.  The lexer pre-skips same-line whitespace after the keyword,
+        // so autoquoted_eof() just peeks at the current byte for `=>`.  If not found, it triggers logical EOF and
+        // returns the byte offset where trailing data begins.
+        if let Token::Keyword(kw) = &spanned.token
+            && keyword::is_data_eof_keyword(*kw)
+        {
+            if let Some(data_offset) = self.lexer.autoquoted_eof(false) {
+                // Logical EOF triggered mid-expression.  Store the pending DataEnd for parse_program to emit after the
+                // current statement finishes.  Return Undef as a placeholder; the Pratt loop will see Eof on the next
+                // peek and exit.
+                self.pending_data_end = Some((*kw, data_offset));
+                return Ok(Expr { kind: ExprKind::Undef, span });
+            }
+            let name: &str = (*kw).into();
+            return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
         }
 
         // Fat comma autoquotes keywords: `if => 1` produces StringLit("if").
@@ -3075,6 +3088,17 @@ impl Parser {
                     }
                     // Not autoquoting — start sublexing (e.g. `$h{q/abc/}` is valid Perl).
                     return self.dispatch_quote_result(kw, span);
+                }
+                // __DATA__/__END__: autoquoting is same-line only.  The lexer pre-skipped same-line whitespace, so
+                // autoquoted_eof(true) peeks for `=>` or `}` at the current position.  If neither, EOF is triggered.
+                if keyword::is_data_eof_keyword(kw) {
+                    if let Some(_data_offset) = self.lexer.autoquoted_eof(true) {
+                        // Logical EOF triggered inside a hash subscript — the `}` will never be found.
+                        return Err(ParseError::new("unexpected __END__/__DATA__ inside hash subscript", span));
+                    }
+                    // Autoquoted — `}` or `=>` follows on the same line.
+                    let name: &str = kw.into();
+                    return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
                 }
                 // Non-quote keyword: safe to peek token (tokenization won't misfire).
                 if matches!(self.peek_token(), Token::RightBrace | Token::FatComma) {

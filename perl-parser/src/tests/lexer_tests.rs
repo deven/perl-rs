@@ -1493,14 +1493,20 @@ fn lex_data_not_at_column_0_still_recognized() {
 
 #[test]
 fn lex_ctrl_d_eof() {
+    // ^D triggers logical EOF — tokens before it are collected, everything after is ignored.
     let tokens = lex_all("1;\x04more stuff");
-    assert!(tokens.contains(&Token::DataEnd(DataEndMarker::CtrlD)));
+    assert!(tokens.contains(&Token::IntLit(1)));
+    assert!(tokens.contains(&Token::Semi));
+    assert!(!tokens.contains(&Token::Ident("more".into())));
 }
 
 #[test]
 fn lex_ctrl_z_eof() {
+    // ^Z triggers logical EOF — same behavior as ^D.
     let tokens = lex_all("1;\x1amore stuff");
-    assert!(tokens.contains(&Token::DataEnd(DataEndMarker::CtrlZ)));
+    assert!(tokens.contains(&Token::IntLit(1)));
+    assert!(tokens.contains(&Token::Semi));
+    assert!(!tokens.contains(&Token::Ident("more".into())));
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════

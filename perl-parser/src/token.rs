@@ -270,22 +270,11 @@ pub enum Token {
     // ── Special ───────────────────────────────────────────────
     /// `qw/.../` — list of words.
     QwList(Vec<String>),
-    /// `^D` (0x04) or `^Z` (0x1a) — logical end of script.  `__END__` and `__DATA__` are handled as keywords.
-    DataEnd(DataEndMarker),
     /// Yada yada yada (`...` as a statement).
     YadaYada,
     /// `<STDIN>`, `<$fh>`, `<*.txt>` — readline or glob.  The bool is `true` for `<<>>` (safe double diamond, 3-arg
     /// open).
     Readline(String, bool),
-}
-
-/// Which control character triggered logical end-of-script.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataEndMarker {
-    /// ^D (0x04) — logical EOF, no DATA filehandle.
-    CtrlD,
-    /// ^Z (0x1a) — logical EOF, no DATA filehandle.
-    CtrlZ,
 }
 
 /// Kind of quote-like construct.

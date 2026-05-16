@@ -505,23 +505,6 @@ impl Lexer {
         std::str::from_utf8(bytes).map_err(|_| ParseError::new("invalid UTF-8 in source", self.span_from(start)))
     }
 
-    /// Whether the current line was terminated by a newline in the source.
-    pub fn line_is_terminated(&self) -> bool {
-        self.current_line.as_ref().is_some_and(|l| l.terminated)
-    }
-
-    /// Skip to end of source — used after __END__/__DATA__.
-    pub fn skip_to_end(&mut self) {
-        self.current_line = None;
-        // Drain the source.
-        while let Ok(Some(_)) = self.source.next_line(false) {}
-    }
-
-    /// Current byte position in source (global).
-    pub fn current_pos(&self) -> usize {
-        self.pos()
-    }
-
     /// Raw slice of the source buffer.  For rare operations that need global byte access (e.g. format body extraction).
     pub fn slice(&self, start: usize, end: usize) -> &[u8] {
         self.source.src_slice(start, end)
@@ -1080,14 +1063,12 @@ impl Lexer {
                 Token::RightBrace
             }
 
-            // ^D (0x04) and ^Z (0x1a) — logical end of script.
-            b'\x04' => {
+            // ^D (0x04) and ^Z (0x1a) — logical end of script.  Unlike __DATA__/__END__, these don't set up a DATA
+            // filehandle; they just trigger EOF.
+            b'\x04' | b'\x1a' => {
                 self.skip(1);
-                Token::DataEnd(DataEndMarker::CtrlD)
-            }
-            b'\x1a' => {
-                self.skip(1);
-                Token::DataEnd(DataEndMarker::CtrlZ)
+                self.logical_eof = true;
+                Token::Eof
             }
 
             other => {
@@ -1941,8 +1922,19 @@ impl Lexer {
             "__CLASS__" if self.features.contains(Features::CLASS) => {
                 return Ok(Token::Keyword(Keyword::__CLASS__));
             }
-            "__DATA__" => return Ok(Token::Keyword(Keyword::__DATA__)),
-            "__END__" => return Ok(Token::Keyword(Keyword::__END__)),
+            "__DATA__" => {
+                // Skip same-line whitespace so the parser's autoquoted_eof() can peek at the next byte directly.
+                while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
+                    self.skip(1);
+                }
+                return Ok(Token::Keyword(Keyword::__DATA__));
+            }
+            "__END__" => {
+                while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
+                    self.skip(1);
+                }
+                return Ok(Token::Keyword(Keyword::__END__));
+            }
             _ => {}
         }
 
@@ -2023,20 +2015,34 @@ impl Lexer {
         self.peek_byte(false)
     }
 
-    /// Check whether `__DATA__` or `__END__` should be autoquoted (fat comma `=>` follows) or triggers logical EOF.
-    /// Called by the parser after receiving the keyword token.
+    /// Check whether `__DATA__` or `__END__` should be autoquoted or triggers logical EOF.  Called by the parser after
+    /// receiving the keyword token.  The lexer has already skipped same-line whitespace after the keyword, so the cursor
+    /// is positioned at the first non-space/tab byte (or end of line).
     ///
-    /// Returns `true` if `=>` follows (autoquoting applies, keyword becomes `StringLit`, lexer state unchanged).
-    /// Returns `false` if logical EOF was triggered (rest of current line discarded, subsequent lex calls return EOF).
-    pub fn autoquoted_eof(&mut self) -> bool {
-        let _ = self.skip_ws_and_comments_no_pod();
+    /// `in_hash_subscript`: when true, `}` also triggers autoquoting (for `$h{__END__}`).
+    ///
+    /// Returns `None` if autoquoting applies (`=>` or `}` follows).  Lexer state is unchanged.
+    /// Returns `Some(offset)` if logical EOF was triggered.  The offset is the byte position where trailing data begins
+    /// (the line after the `__END__`/`__DATA__` line, past any pending heredoc bodies which the source layer collects
+    /// transparently).
+    pub fn autoquoted_eof(&mut self, in_hash_subscript: bool) -> Option<u32> {
         if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
-            return true; // don't consume, don't trigger EOF
+            return None;
         }
-        // Discard the rest of the current line and set logical EOF.
+        if in_hash_subscript && self.peek_byte(false) == Some(b'}') {
+            return None;
+        }
+        // Discard the rest of the current line.
         self.current_line = None;
+        // Fetch the next line from the source.  Heredoc bodies (if any) were already collected during normal lexing
+        // before we reached __DATA__/__END__, so the next line is the first line of DATA content.  Its offset is where
+        // the DATA filehandle content begins.
+        let offset = match self.source.next_line(false) {
+            Ok(Some(line)) => line.offset as u32,
+            _ => self.source.cursor() as u32, // no more source — DATA is empty
+        };
         self.logical_eof = true;
-        false
+        Some(offset)
     }
 
     // ── Strings ───────────────────────────────────────────────

@@ -2152,28 +2152,99 @@ fn parse_data_stops_parsing() {
 
 #[test]
 fn parse_ctrl_d_stops_parsing() {
+    // ^D triggers logical EOF — only code before it is parsed, no DataEnd statement produced.
     let src = "my $x = 1;\x04ignored code\n";
+    let prog = parse(src);
+    assert_eq!(prog.statements.len(), 1);
+    assert!(matches!(prog.statements[0].kind, StmtKind::Expr(_)));
+}
+
+#[test]
+fn parse_ctrl_z_stops_parsing() {
+    // ^Z triggers logical EOF — same behavior as ^D.
+    let src = "my $x = 1;\x1aignored code\n";
+    let prog = parse(src);
+    assert_eq!(prog.statements.len(), 1);
+    assert!(matches!(prog.statements[0].kind, StmtKind::Expr(_)));
+}
+
+#[test]
+fn parse_ctrl_d_mid_expression() {
+    // ^D mid-expression: `printf "%s\n", 123^D456` — only `123` is parsed, `456` is gone.
+    let prog = parse("printf \"%s\\n\", 123\x04456;\n");
+    assert_eq!(prog.statements.len(), 1);
+}
+
+#[test]
+fn parse_end_data_offset_after_current_line() {
+    // __END__ data starts on the NEXT line — the rest of the __END__ line is discarded.
+    let src = "my $x = 1;\n__END__ ignored rest of line\nDATA line 1\nDATA line 2\n";
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[1].kind {
         StmtKind::DataEnd(Keyword::__END__, offset) => {
-            assert_eq!(&src.as_bytes()[*offset as usize..], b"ignored code\n");
+            let data = &src.as_bytes()[*offset as usize..];
+            assert_eq!(data, b"DATA line 1\nDATA line 2\n");
         }
         other => panic!("expected DataEnd(__END__), got {other:?}"),
     }
 }
 
 #[test]
-fn parse_ctrl_z_stops_parsing() {
-    let src = "my $x = 1;\x1aignored code\n";
+fn parse_data_data_offset_after_current_line() {
+    // __DATA__ data starts on the NEXT line, same as __END__.
+    let src = "my $x = 1;\n__DATA__ ignored\nraw data here\n";
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[1].kind {
-        StmtKind::DataEnd(Keyword::__END__, offset) => {
-            assert_eq!(&src.as_bytes()[*offset as usize..], b"ignored code\n");
+        StmtKind::DataEnd(Keyword::__DATA__, offset) => {
+            let data = &src.as_bytes()[*offset as usize..];
+            assert_eq!(data, b"raw data here\n");
         }
-        other => panic!("expected DataEnd(__END__), got {other:?}"),
+        other => panic!("expected DataEnd(__DATA__), got {other:?}"),
     }
+}
+
+#[test]
+fn parse_end_autoquoted_fat_comma() {
+    // __END__ => val — autoquoted as a string, does NOT trigger EOF.
+    let prog = parse("my %h = (__END__ => 1);\n");
+    assert_eq!(prog.statements.len(), 1);
+    // Should be a my declaration with a hash assignment, not EOF.
+    assert!(matches!(prog.statements[0].kind, StmtKind::Expr(_)));
+}
+
+#[test]
+fn parse_end_with_heredocs_on_same_line() {
+    // Heredocs started before __END__ on the same line have their bodies collected from subsequent lines.  DATA
+    // starts after all heredoc bodies.
+    //
+    //   print <<X, __END__
+    //   body of X
+    //   X
+    //   this is DATA
+    //
+    // Expected: one print statement with the heredoc, then DataEnd pointing at "this is DATA\n".
+    let src = "print <<X, __END__\nbody of X\nX\nthis is DATA\n";
+    let prog = parse(src);
+    let has_data_end = prog.statements.iter().any(|s| matches!(s.kind, StmtKind::DataEnd(_, _)));
+    assert!(has_data_end, "expected DataEnd statement, got {prog:?}");
+    match prog.statements.last().map(|s| &s.kind) {
+        Some(StmtKind::DataEnd(Keyword::__END__, offset)) => {
+            assert_eq!(&src.as_bytes()[*offset as usize..], b"this is DATA\n");
+        }
+        other => panic!("expected DataEnd(__END__) as last statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_ctrl_d_with_heredocs_on_same_line() {
+    // Heredocs started before ^D on the same line still have their bodies collected.  Unlike __END__, ^D does not set
+    // up a DATA filehandle — the content after the heredoc bodies is simply discarded.
+    let src = "print <<X,\x04\nbody of X\nX\norphaned data\n";
+    let prog = parse(src);
+    // Should have one print statement with the heredoc resolved.
+    assert_eq!(prog.statements.len(), 1);
 }
 
 // ── Pod skipping test ─────────────────────────────────────
