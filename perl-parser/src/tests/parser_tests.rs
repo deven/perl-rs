@@ -8059,6 +8059,214 @@ fn depth_prefix_ops_are_iterative() {
     assert!(result.is_ok(), "deeply nested prefix ops should be iterative, got: {:?}", result.err());
 }
 
+// ── Iterative parser adversarial tests ────────────────────
+
+#[test]
+fn iter_paren_subscript_still_works() {
+    // `(1, 2, 3)[1]` — postfix subscript after parens.  Paren no longer wraps in AST; maybe_postfix_subscript must
+    // still attach the subscript.
+    let e = parse_expr_str("(1, 2, 3)[1];");
+    assert!(matches!(e.kind, ExprKind::ArrayElem(_, _)), "expected ArrayElem, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_mixed_nesting() {
+    // `[{a => [1]}]` — alternating array/hash frames on the continuation stack.
+    let e = parse_expr_str("[{a => [1]}];");
+    match &e.kind {
+        ExprKind::AnonArray(outer) => {
+            assert_eq!(outer.len(), 1);
+            match &outer[0].kind {
+                ExprKind::AnonHash(inner) => {
+                    assert_eq!(inner.len(), 2); // "a", [1]
+                }
+                other => panic!("expected AnonHash, got {other:?}"),
+            }
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_prefix_inside_array() {
+    // `[-1, !0, \$x]` — prefix ops nested inside an ArrayRef accumulator.
+    let e = parse_expr_str("[-1, !0, \\$x];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 3);
+            assert!(matches!(elems[0].kind, ExprKind::UnaryOp(UnaryOp::Negate, _)));
+            assert!(matches!(elems[1].kind, ExprKind::UnaryOp(UnaryOp::LogNot, _)));
+            assert!(matches!(elems[2].kind, ExprKind::Ref(_)));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_string_negation_chain() {
+    // `-(-(-"foo"))` — backward phase must chain string negation collapse correctly.
+    // -"foo" → "-foo", then -"-foo" → "+foo", then -"+foo" → "-foo".
+    let e = parse_expr_str("-(-(-\"foo\"));");
+    assert!(matches!(e.kind, ExprKind::StringLit(ref s) if s == "-foo"), "expected StringLit(\"-foo\"), got {:?}", e.kind);
+}
+
+#[test]
+fn iter_empty_nested_containers() {
+    // `[[], {}]` — empty containers hit the Leaf path inside an accumulator.
+    let e = parse_expr_str("[[], {}];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].kind, ExprKind::AnonArray(ref v) if v.is_empty()));
+            assert!(matches!(elems[1].kind, ExprKind::AnonHash(ref v) if v.is_empty()));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_trailing_comma_array() {
+    // `[1, 2, 3,]` — trailing comma in array ref.
+    let e = parse_expr_str("[1, 2, 3,];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => assert_eq!(elems.len(), 3),
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_trailing_comma_hash() {
+    // `{a => 1, b => 2,}` — trailing comma in hash ref.
+    let e = parse_expr_str("{a => 1, b => 2,};");
+    match &e.kind {
+        ExprKind::AnonHash(elems) => assert_eq!(elems.len(), 4), // a, 1, b, 2
+        other => panic!("expected AnonHash, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_deeply_mixed_array_hash() {
+    // `[{[{[1]}]}]` — 5 levels of alternating array/hash nesting, all iterative.
+    let e = parse_expr_str("[{a => [{b => [1]}]}];");
+    assert!(matches!(e.kind, ExprKind::AnonArray(_)), "expected AnonArray, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_precedence_preserved_without_paren_node() {
+    // `(1 + 2) * 3` — without Paren node, tree must still capture `Add` before `Mul`.
+    let e = parse_expr_str("(1 + 2) * 3;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Mul, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add on LHS of Mul, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Mul, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_local_hash_elem() {
+    // `local $hash{key}` — local frame wrapping a postfix subscript chain.
+    let e = parse_expr_str("local $hash{key};");
+    assert!(matches!(e.kind, ExprKind::Local(_)), "expected Local, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_nested_paren_ref() {
+    // `\(1, 2)` — reference to a parenthesized list.  Ref frame, then Paren frame on the stack.
+    let e = parse_expr_str("\\(1, 2);");
+    match &e.kind {
+        ExprKind::Ref(inner) => {
+            assert!(matches!(inner.kind, ExprKind::List(_)), "expected List inside Ref, got {:?}", inner.kind);
+        }
+        other => panic!("expected Ref, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_double_parens_with_infix() {
+    // `((1 + 2))` — double parens collapse to nothing, inner Add preserved.
+    let e = parse_expr_str("((1 + 2));");
+    assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_assignment_inside_array() {
+    // `[$x = 1, $y = 2]` — right-associative assignment inside an ArrayRef accumulator.
+    let e = parse_expr_str("[$x = 1, $y = 2];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+            assert!(matches!(elems[1].kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_ternary_inside_array() {
+    // `[$x ? 1 : 0, $y]` — ternary infix inside accumulator at PREC_COMMA+1.
+    let e = parse_expr_str("[$x ? 1 : 0, $y];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].kind, ExprKind::Ternary(_, _, _)));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_not_keyword_with_parens() {
+    // `not ($x)` — Not frame at PREC_NOT_LOW, then Paren frame at PREC_LOW.  Two frames interact on the stack.
+    let e = parse_expr_str("not ($x);");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Not, inner) => {
+            assert!(matches!(inner.kind, ExprKind::ScalarVar(_)), "expected ScalarVar, got {:?}", inner.kind);
+        }
+        other => panic!("expected UnaryOp(Not), got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_hash_ref_as_rhs() {
+    // `$x = { a => 1 }` — hash ref via try_prefix in a nested parse_expr call (RHS of assignment).
+    let e = parse_expr_str("$x = { a => 1 };");
+    match &e.kind {
+        ExprKind::Assign(_, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::AnonHash(_)), "expected AnonHash, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_postfix_inc_after_paren() {
+    // `($x)++` — postfix ++ must see through the removed Paren and apply to the variable.
+    let e = parse_expr_str("($x)++;");
+    assert!(matches!(e.kind, ExprKind::PostfixOp(PostfixOp::Inc, _)), "expected PostfixOp(Inc), got {:?}", e.kind);
+}
+
+#[test]
+fn iter_chained_method_after_paren() {
+    // `($obj)->method` — method call on result of paren expression.
+    let e = parse_expr_str("($obj)->method;");
+    assert!(matches!(e.kind, ExprKind::MethodCall(_, _, _)), "expected MethodCall, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_single_elem_array_no_comma() {
+    // `[42]` — single element, no comma, no trailing comma.  ArrayRef accumulator must handle one-element case.
+    let e = parse_expr_str("[42];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 1);
+            assert!(matches!(elems[0].kind, ExprKind::IntLit(42)));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
 // ── Combined nightmare cases ──────────────────────────────
 
 #[test]
