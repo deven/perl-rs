@@ -128,9 +128,12 @@ pub(crate) struct Lexer {
     case_mod_lcfirst: bool,
     /// `\u` pending — titlecase the very next character only.
     case_mod_ucfirst: bool,
-    /// Set by `autoquoted_eof` when `__DATA__` or `__END__` triggers logical end-of-source.  When true,
-    /// `lex_normal_token` returns `Eof` immediately.
-    logical_eof: bool,
+    /// Set by `lex_word` when `__DATA__` or `__END__` triggers logical end-of-source, or by the `^D`/`^Z` handler.
+    /// When true, `lex_normal_token` returns `Eof` immediately.
+    pub(crate) logical_eof: bool,
+    /// Set when `__DATA__` or `__END__` triggers logical EOF.  Stores the keyword and the byte offset where trailing
+    /// data begins (for the `<DATA>` filehandle).  The parser reads this after the statement loop exits.
+    pub(crate) data_end_info: Option<(Keyword, u32)>,
 }
 
 impl Lexer {
@@ -150,6 +153,7 @@ impl Lexer {
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
             logical_eof: false,
+            data_end_info: None,
         }
     }
 
@@ -171,6 +175,7 @@ impl Lexer {
             case_mod_lcfirst: false,
             case_mod_ucfirst: false,
             logical_eof: false,
+            data_end_info: None,
         }
     }
 
@@ -508,6 +513,110 @@ impl Lexer {
     /// Raw slice of the source buffer.  For rare operations that need global byte access (e.g. format body extraction).
     pub fn slice(&self, start: usize, end: usize) -> &[u8] {
         self.source.src_slice(start, end)
+    }
+
+    /// Byte-level scan for hash subscript autoquoting.  Called by the parser immediately after consuming `{` in a hash
+    /// subscript context, before any tokenization of the subscript body.
+    ///
+    /// Matches the pattern: `[ \t]* [-]? [ \t]* IDENT [ \t]* }` on a SINGLE LINE (no newlines or comments).  If
+    /// matched, consumes everything up to (but not including) `}` and returns `Some((name, span))` where `name` is the
+    /// autoquoted string (e.g. `"foo"` or `"-foo"`).  If the pattern doesn't match, the lexer position is unchanged and
+    /// `None` is returned, signaling the parser to fall through to normal expression parsing.
+    ///
+    /// This handles all hash subscript autoquoting in one place: `$h{foo}`, `$h{-foo}`, `$h{if}`, `$h{-if}`,
+    /// `$h{__FILE__}`, `$h{-__END__}`, `$h{q}`, etc.  Keywords and special tokens are treated as plain identifiers at
+    /// the byte level — the parser doesn't need to intercept them individually.
+    pub fn try_autoquoted_subscript_key(&mut self) -> Option<(String, Span)> {
+        let line = self.current_line.as_ref()?;
+        let r = line.remaining();
+        let mut i = 0;
+
+        // Skip leading horizontal whitespace.
+        while i < r.len() && matches!(r[i], b' ' | b'\t') {
+            i += 1;
+        }
+
+        // Optional `-` prefix.
+        let has_dash = r.get(i).copied() == Some(b'-');
+        if has_dash {
+            i += 1;
+            // Skip whitespace between `-` and identifier.
+            while i < r.len() && matches!(r[i], b' ' | b'\t') {
+                i += 1;
+            }
+        }
+
+        // Identifier: must start with [a-zA-Z_] (or UTF-8 lead byte in UTF-8 mode).
+        let ident_start = i;
+        let &first = r.get(i)?;
+        if first == b'_' || first.is_ascii_alphabetic() {
+            i += 1;
+        } else if self.effective_utf8 && first >= 0x80 {
+            let tail = &r[i..];
+            let s = std::str::from_utf8(tail).ok()?;
+            let ch = s.chars().next()?;
+            if !ch.is_alphabetic() {
+                return None;
+            }
+            i += ch.len_utf8();
+        } else {
+            return None;
+        }
+
+        // Identifier body: [a-zA-Z0-9_] (or UTF-8 continuation).
+        while i < r.len() {
+            let b = r[i];
+            if b == b'_' || b.is_ascii_alphanumeric() {
+                i += 1;
+            } else if self.effective_utf8 && b >= 0x80 {
+                let tail = &r[i..];
+                if let Ok(s) = std::str::from_utf8(tail)
+                    && let Some(ch) = s.chars().next()
+                    && ch.is_alphanumeric()
+                {
+                    i += ch.len_utf8();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        let ident_end = i;
+
+        // Must have scanned at least one identifier character.
+        if ident_end == ident_start {
+            return None;
+        }
+
+        // Skip trailing horizontal whitespace.
+        while i < r.len() && matches!(r[i], b' ' | b'\t') {
+            i += 1;
+        }
+
+        // Must be followed by `}` on the same line.
+        if r.get(i).copied() != Some(b'}') {
+            return None;
+        }
+
+        // Build the autoquoted string.
+        let ident_bytes = &r[ident_start..ident_end];
+        let ident = std::str::from_utf8(ident_bytes).ok()?;
+        let name = if has_dash { format!("-{ident}") } else { ident.to_string() };
+
+        // Compute span and consume.  The span covers from the first meaningful byte (dash or ident start) through the
+        // end of the identifier.  Leave `}` unconsumed for the parser to match.
+        let offset = line.offset;
+        let pos = line.pos;
+        let span_start = if has_dash { pos } else { pos + ident_start };
+        let start_global = (offset + span_start) as u32;
+        let end_global = (offset + pos + ident_end) as u32;
+
+        // Advance the lexer past the identifier and trailing whitespace (up to but not including `}`).
+        let mline = self.current_line.as_mut()?;
+        mline.pos += i;
+
+        Some((name, Span::new(start_global, end_global)))
     }
 
     // ── Format sublexing ──────────────────────────────────────
@@ -1905,35 +2014,40 @@ impl Lexer {
         // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or, xor, not) are always emitted as Ident(name).  The
         // parser recognizes them as operators in operator context via peek_op_info and token_to_binop.
 
-        // Special literal keywords — resolved here because they carry lex-time data or need feature gating.
+        // Special double-underscore tokens.  __DATA__/__END__ have same-line-only autoquoting and trigger EOF.
+        // __FILE__/__LINE__ must save their lex-time values before at_fat_comma (which may advance past newlines and
+        // `# line` directives).  Other __ tokens (__PACKAGE__, __SUB__, __CLASS__) go through normal keyword lookup.
         match name.as_str() {
+            "__DATA__" | "__END__" => {
+                let kw = if name == "__DATA__" { Keyword::__DATA__ } else { Keyword::__END__ };
+                while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
+                    self.skip(1);
+                }
+                if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
+                    return Ok(Token::StrLit(name));
+                }
+                self.current_line = None;
+                let offset = match self.source.next_line(false) {
+                    Ok(Some(line)) => line.offset as u32,
+                    _ => self.source.cursor() as u32,
+                };
+                self.data_end_info = Some((kw, offset));
+                self.logical_eof = true;
+                return Ok(Token::Eof);
+            }
             "__FILE__" => {
-                let fname = self.source.filename().to_string();
-                return Ok(Token::SourceFile(fname));
+                let saved_filename = self.source.filename().to_string();
+                if self.at_fat_comma() {
+                    return Ok(Token::StrLit(name));
+                }
+                return Ok(Token::SourceFile(saved_filename));
             }
             "__LINE__" => {
-                let line_no = self.current_line.as_ref().map(|l| l.number).unwrap_or(0) as u32;
-                return Ok(Token::SourceLine(line_no));
-            }
-            "__PACKAGE__" => return Ok(Token::Keyword(Keyword::__PACKAGE__)),
-            "__SUB__" if self.features.contains(Features::CURRENT_SUB) => {
-                return Ok(Token::Keyword(Keyword::__SUB__));
-            }
-            "__CLASS__" if self.features.contains(Features::CLASS) => {
-                return Ok(Token::Keyword(Keyword::__CLASS__));
-            }
-            "__DATA__" => {
-                // Skip same-line whitespace so the parser's autoquoted_eof() can peek at the next byte directly.
-                while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
-                    self.skip(1);
+                let saved_line_no = self.current_line.as_ref().map(|l| l.number).unwrap_or(0) as u32;
+                if self.at_fat_comma() {
+                    return Ok(Token::StrLit(name));
                 }
-                return Ok(Token::Keyword(Keyword::__DATA__));
-            }
-            "__END__" => {
-                while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
-                    self.skip(1);
-                }
-                return Ok(Token::Keyword(Keyword::__END__));
+                return Ok(Token::SourceLine(saved_line_no));
             }
             _ => {}
         }
@@ -1966,13 +2080,20 @@ impl Lexer {
             return Ok(Token::Assign(AssignOp::RepeatEq));
         }
 
+        // Fat-comma autoquoting: `if => 1`, `foo => 1`, `__PACKAGE__ => 1`, etc.  The four tokens above (__DATA__,
+        // __END__, __FILE__, __LINE__) already handled their own fat-comma checks; everything else goes through here.
+        if self.at_fat_comma() {
+            return Ok(Token::StrLit(name));
+        }
+
         // Keywords — check feature gating for conditional keywords.
         if let Some(kw) = keyword::lookup_keyword(&name) {
             let needed = match kw {
                 Keyword::Try | Keyword::Catch | Keyword::Finally => Some(Features::TRY),
                 Keyword::Defer => Some(Features::DEFER),
                 Keyword::Given | Keyword::When | Keyword::Default | Keyword::Break => Some(Features::SWITCH),
-                Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST => Some(Features::CLASS),
+                Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST | Keyword::__CLASS__ => Some(Features::CLASS),
+                Keyword::__SUB__ => Some(Features::CURRENT_SUB),
                 Keyword::Any => Some(Features::KEYWORD_ANY),
                 Keyword::All => Some(Features::KEYWORD_ALL),
                 Keyword::Evalbytes => Some(Features::EVALBYTES),
@@ -2015,34 +2136,12 @@ impl Lexer {
         self.peek_byte(false)
     }
 
-    /// Check whether `__DATA__` or `__END__` should be autoquoted or triggers logical EOF.  Called by the parser after
-    /// receiving the keyword token.  The lexer has already skipped same-line whitespace after the keyword, so the cursor
-    /// is positioned at the first non-space/tab byte (or end of line).
-    ///
-    /// `in_hash_subscript`: when true, `}` also triggers autoquoting (for `$h{__END__}`).
-    ///
-    /// Returns `None` if autoquoting applies (`=>` or `}` follows).  Lexer state is unchanged.
-    /// Returns `Some(offset)` if logical EOF was triggered.  The offset is the byte position where trailing data begins
-    /// (the line after the `__END__`/`__DATA__` line, past any pending heredoc bodies which the source layer collects
-    /// transparently).
-    pub fn autoquoted_eof(&mut self, in_hash_subscript: bool) -> Option<u32> {
-        if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
-            return None;
-        }
-        if in_hash_subscript && self.peek_byte(false) == Some(b'}') {
-            return None;
-        }
-        // Discard the rest of the current line.
-        self.current_line = None;
-        // Fetch the next line from the source.  Heredoc bodies (if any) were already collected during normal lexing
-        // before we reached __DATA__/__END__, so the next line is the first line of DATA content.  Its offset is where
-        // the DATA filehandle content begins.
-        let offset = match self.source.next_line(false) {
-            Ok(Some(line)) => line.offset as u32,
-            _ => self.source.cursor() as u32, // no more source — DATA is empty
-        };
-        self.logical_eof = true;
-        Some(offset)
+    /// Skip whitespace/newlines/comments (not POD) and check if `=>` (fat comma) follows.  Used by `lex_word` to
+    /// autoquote keywords and identifiers at lex time.  Consumes the whitespace regardless of the result — the next
+    /// `lex_normal_token` call would have skipped it anyway.
+    fn at_fat_comma(&mut self) -> bool {
+        let _ = self.skip_ws_and_comments_no_pod();
+        self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>')
     }
 
     // ── Strings ───────────────────────────────────────────────

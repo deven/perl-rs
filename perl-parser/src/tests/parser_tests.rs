@@ -2176,6 +2176,34 @@ fn parse_ctrl_d_mid_expression() {
 }
 
 #[test]
+fn parse_trailing_comma_at_physical_eof() {
+    // `print 1, 2,` with no semicolon or newline — trailing comma in a list is valid in Perl.
+    let result = crate::parse(b"print 1, 2,");
+    assert!(result.is_ok(), "trailing comma at physical EOF should be valid, got {:?}", result.err());
+}
+
+#[test]
+fn parse_trailing_comma_at_ctrl_d() {
+    // `print 1, 2,` followed by ^D — trailing comma before logical EOF should also be valid.
+    let result = crate::parse(b"print 1, 2,\x04 3, 4, 5;\n");
+    assert!(result.is_ok(), "trailing comma at logical EOF should be valid, got {:?}", result.err());
+}
+
+#[test]
+fn parse_trailing_comma_at_logical_eof() {
+    // `print 1, 2,` followed by __END__ — trailing comma before logical EOF should also be valid.
+    let result = crate::parse(b"print 1, 2,\n__END__\ndata\n");
+    assert!(result.is_ok(), "trailing comma at logical EOF should be valid, got {:?}", result.err());
+}
+
+#[test]
+fn parse_trailing_comma_in_parens() {
+    // `print(1, 2,)` — trailing comma inside parenthesized argument list is valid in Perl.
+    let prog = parse("print(1, 2,);\n");
+    assert_eq!(prog.statements.len(), 1);
+}
+
+#[test]
 fn parse_end_data_offset_after_current_line() {
     // __END__ data starts on the NEXT line — the rest of the __END__ line is discarded.
     let src = "my $x = 1;\n__END__ ignored rest of line\nDATA line 1\nDATA line 2\n";
@@ -2216,19 +2244,12 @@ fn parse_end_autoquoted_fat_comma() {
 
 #[test]
 fn parse_end_with_heredocs_on_same_line() {
-    // Heredocs started before __END__ on the same line have their bodies collected from subsequent lines.  DATA
-    // starts after all heredoc bodies.
-    //
-    //   print <<X, __END__
-    //   body of X
-    //   X
-    //   this is DATA
-    //
-    // Expected: one print statement with the heredoc, then DataEnd pointing at "this is DATA\n".
+    // `print <<X, __END__` — the trailing comma after the heredoc is valid; __END__ terminates the list.  DATA starts
+    // after the heredoc body.
     let src = "print <<X, __END__\nbody of X\nX\nthis is DATA\n";
     let prog = parse(src);
     let has_data_end = prog.statements.iter().any(|s| matches!(s.kind, StmtKind::DataEnd(_, _)));
-    assert!(has_data_end, "expected DataEnd statement");
+    assert!(has_data_end, "expected DataEnd statement, got {prog:?}");
     match prog.statements.last().map(|s| &s.kind) {
         Some(StmtKind::DataEnd(Keyword::__END__, offset)) => {
             assert_eq!(&src.as_bytes()[*offset as usize..], b"this is DATA\n");
@@ -2239,11 +2260,10 @@ fn parse_end_with_heredocs_on_same_line() {
 
 #[test]
 fn parse_ctrl_d_with_heredocs_on_same_line() {
-    // Heredocs started before ^D on the same line still have their bodies collected.  Unlike __END__, ^D does not set
-    // up a DATA filehandle — the content after the heredoc bodies is simply discarded.
+    // `print <<X,^D` — the trailing comma after the heredoc is valid; ^D terminates the list.  The heredoc body is
+    // still collected.
     let src = "print <<X,\x04\nbody of X\nX\norphaned data\n";
     let prog = parse(src);
-    // Should have one print statement with the heredoc resolved.
     assert_eq!(prog.statements.len(), 1);
 }
 
@@ -2262,6 +2282,31 @@ fn parse_minus_end_in_hash_subscript_same_line_autoquotes() {
     match &e.kind {
         ExprKind::HashElem(_, key) => {
             assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "-__END__"), "expected StringLit(\"-__END__\"), got {:?}", key.kind);
+        }
+        other => panic!("expected HashElem, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_minus_file_in_hash_subscript_autoquotes() {
+    // $h{-__FILE__} — autoquotes to StringLit("-__FILE__"), same as any -bareword in a hash subscript.  The lexer
+    // resolves __FILE__ to Token::SourceFile, but in -bareword hash subscript context it should still autoquote.
+    let e = parse_expr_str("$h{-__FILE__};");
+    match &e.kind {
+        ExprKind::HashElem(_, key) => {
+            assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "-__FILE__"), "expected StringLit(\"-__FILE__\"), got {:?}", key.kind);
+        }
+        other => panic!("expected HashElem, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_minus_line_in_hash_subscript_autoquotes() {
+    // $h{-__LINE__} — same as -__FILE__, autoquotes to StringLit("-__LINE__").
+    let e = parse_expr_str("$h{-__LINE__};");
+    match &e.kind {
+        ExprKind::HashElem(_, key) => {
+            assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "-__LINE__"), "expected StringLit(\"-__LINE__\"), got {:?}", key.kind);
         }
         other => panic!("expected HashElem, got {other:?}"),
     }
@@ -2663,12 +2708,16 @@ fn parse_hash_expr_not_autoquoted() {
 
 #[test]
 fn parse_neg_bareword_fat_comma() {
-    // -key => 42 should produce StringLit("-key")
+    // -key => 42 — the lexer autoquotes `key` to StrLit("key"), the parser wraps in Negate.  At runtime, string
+    // negation of "key" produces "-key".  (A future optimization could collapse this to StringLit("-key") at parse
+    // time, matching Perl's Deparse output.)
     let e = parse_expr_str("-key => 42;");
     match &e.kind {
         ExprKind::List(items) => match &items[0].kind {
-            ExprKind::StringLit(s) => assert_eq!(s, "-key"),
-            other => panic!("expected StringLit('-key'), got {other:?}"),
+            ExprKind::UnaryOp(UnaryOp::Negate, inner) => {
+                assert!(matches!(inner.kind, ExprKind::StringLit(ref s) if s == "key"), "expected StringLit(\"key\"), got {:?}", inner.kind);
+            }
+            other => panic!("expected Negate(StringLit(\"key\")), got {other:?}"),
         },
         other => panic!("expected List, got {other:?}"),
     }

@@ -351,8 +351,8 @@ fn lex_comment() {
 #[test]
 fn lex_fat_comma() {
     let tokens = lex_all("foo => 42");
-    // "foo" is an ident, "=>" is fat comma
-    assert_eq!(tokens, vec![Token::Ident("foo".into()), Token::FatComma, Token::IntLit(42),]);
+    // "foo" before => is autoquoted to StrLit by the lexer.
+    assert_eq!(tokens, vec![Token::StrLit("foo".into()), Token::FatComma, Token::IntLit(42),]);
 }
 
 #[test]
@@ -1460,35 +1460,51 @@ fn lex_glob_wildcard() {
 // ── __END__ / __DATA__ tokens ────────────────────────────
 
 #[test]
-fn lex_end_token() {
+fn lex_end_triggers_eof() {
+    // __END__ without => triggers logical EOF — tokens before it are collected, everything after is ignored.
     let tokens = lex_all("1;\n__END__\nstuff");
-    assert!(tokens.contains(&Token::Keyword(Keyword::__END__)));
+    assert!(tokens.contains(&Token::IntLit(1)));
+    assert!(tokens.contains(&Token::Semi));
+    assert!(!tokens.contains(&Token::Ident("stuff".into())));
 }
 
 #[test]
-fn lex_data_token() {
+fn lex_data_triggers_eof() {
     let tokens = lex_all("1;\n__DATA__\nstuff");
-    assert!(tokens.contains(&Token::Keyword(Keyword::__DATA__)));
+    assert!(tokens.contains(&Token::IntLit(1)));
+    assert!(tokens.contains(&Token::Semi));
+    assert!(!tokens.contains(&Token::Ident("stuff".into())));
 }
 
 #[test]
-fn lex_end_not_at_column_0_still_recognized() {
+fn lex_end_not_at_column_0_still_triggers_eof() {
     // __END__ is recognized at any position, not just column 0.
     let tokens = lex_all("1;\n  __END__\nstuff\n");
-    assert!(tokens.contains(&Token::Keyword(Keyword::__END__)));
+    assert!(tokens.contains(&Token::IntLit(1)));
+    assert!(!tokens.contains(&Token::Ident("stuff".into())));
 }
 
 #[test]
-fn lex_end_after_other_token_still_recognized() {
-    // __END__ after other tokens on the same line is still recognized.
+fn lex_end_after_other_token_still_triggers_eof() {
+    // __END__ after other tokens on the same line triggers EOF.
     let tokens = lex_all("my $x = __END__;\n");
-    assert!(tokens.contains(&Token::Keyword(Keyword::__END__)));
+    assert!(tokens.contains(&Token::Keyword(Keyword::My)));
+    assert!(!tokens.contains(&Token::Semi)); // semicolon is after __END__, discarded
 }
 
 #[test]
-fn lex_data_not_at_column_0_still_recognized() {
+fn lex_data_not_at_column_0_still_triggers_eof() {
     let tokens = lex_all("foo __DATA__\nbar\n");
-    assert!(tokens.contains(&Token::Keyword(Keyword::__DATA__)));
+    assert!(tokens.contains(&Token::Ident("foo".into())));
+    assert!(!tokens.contains(&Token::Ident("bar".into())));
+}
+
+#[test]
+fn lex_end_with_fat_comma_autoquotes() {
+    // __END__ => ... — the => triggers fat-comma autoquoting, so __END__ is returned as StrLit.
+    let tokens = lex_all("__END__ => 1;");
+    assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "__END__"), "expected StrLit(\"__END__\"), got {:?}", tokens[0]);
+    assert!(tokens.contains(&Token::FatComma));
 }
 
 #[test]
@@ -1571,49 +1587,44 @@ fn quote_op_y_with_rbrace_delim() {
 
 /// For each keyword, `KEYWORD => 1` must NOT start a quote op — the lexer should emit the keyword as an ordinary
 /// identifier (or Keyword for `qw`) so the parser's fat-comma autoquote fires.
-fn assert_kw_before_fat_comma_is_bareword(src: &str, expected_name: &str) {
+fn assert_fat_comma_autoquotes(src: &str, expected_name: &str) {
     let tokens = lex_all(src);
-    assert!(tokens.len() >= 3, "expected at least 3 tokens for {src:?}, got {tokens:?}");
-    let is_bareword = matches!(&tokens[0], Token::Ident(s) if s == expected_name)
-        || matches!(&tokens[0], Token::Keyword(kw) if {
-            let n: &str = (*kw).into();
-            n == expected_name
-        });
-    assert!(is_bareword, "expected bareword `{expected_name}` for {src:?}, got {:?}", tokens[0]);
+    assert!(tokens.len() >= 2, "expected at least 2 tokens for {src:?}, got {tokens:?}");
+    assert!(matches!(&tokens[0], Token::StrLit(s) if s == expected_name), "expected StrLit({expected_name:?}) for {src:?}, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma), "expected FatComma second for {src:?}, got {:?}", tokens[1]);
 }
 
 #[test]
 fn fat_comma_lookahead_q() {
-    assert_kw_before_fat_comma_is_bareword("q => 1;", "q");
+    assert_fat_comma_autoquotes("q => 1;", "q");
 }
 #[test]
 fn fat_comma_lookahead_qq() {
-    assert_kw_before_fat_comma_is_bareword("qq => 1;", "qq");
+    assert_fat_comma_autoquotes("qq => 1;", "qq");
 }
 #[test]
 fn fat_comma_lookahead_qw() {
-    assert_kw_before_fat_comma_is_bareword("qw => 1;", "qw");
+    assert_fat_comma_autoquotes("qw => 1;", "qw");
 }
 #[test]
 fn fat_comma_lookahead_qr() {
-    assert_kw_before_fat_comma_is_bareword("qr => 1;", "qr");
+    assert_fat_comma_autoquotes("qr => 1;", "qr");
 }
 #[test]
 fn fat_comma_lookahead_m() {
-    assert_kw_before_fat_comma_is_bareword("m => 1;", "m");
+    assert_fat_comma_autoquotes("m => 1;", "m");
 }
 #[test]
 fn fat_comma_lookahead_s() {
-    assert_kw_before_fat_comma_is_bareword("s => 1;", "s");
+    assert_fat_comma_autoquotes("s => 1;", "s");
 }
 #[test]
 fn fat_comma_lookahead_tr() {
-    assert_kw_before_fat_comma_is_bareword("tr => 1;", "tr");
+    assert_fat_comma_autoquotes("tr => 1;", "tr");
 }
 #[test]
 fn fat_comma_lookahead_y() {
-    assert_kw_before_fat_comma_is_bareword("y => 1;", "y");
+    assert_fat_comma_autoquotes("y => 1;", "y");
 }
 
 /// No-whitespace form: `q=>1` — Perl's `=>` is recognized as a single token before `q=...=` interpretation, so this
@@ -1621,14 +1632,14 @@ fn fat_comma_lookahead_y() {
 #[test]
 fn fat_comma_lookahead_no_ws_q() {
     let tokens = lex_all("q=>1;");
-    assert!(matches!(tokens[0], Token::Keyword(Keyword::Q)), "expected Keyword(Q), got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "q"), "expected StrLit(\"q\"), got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
 #[test]
 fn fat_comma_lookahead_no_ws_y() {
     let tokens = lex_all("y=>1;");
-    assert!(matches!(tokens[0], Token::Keyword(Keyword::Y)), "expected Keyword(Y), got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "y"), "expected StrLit(\"y\"), got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
@@ -1649,23 +1660,21 @@ fn fat_comma_lookahead_bare_equals_is_still_quote_op() {
 #[test]
 fn fat_comma_lookahead_q_across_newline() {
     let tokens = lex_all("q\n  => 1;");
-    assert!(matches!(tokens[0], Token::Keyword(Keyword::Q)), "expected Keyword(Q) across newline, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "q"), "expected StrLit(\"q\") across newline, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
 #[test]
 fn fat_comma_lookahead_y_across_newline() {
     let tokens = lex_all("y\n=>\n1;");
-    assert!(matches!(tokens[0], Token::Keyword(Keyword::Y)), "expected Keyword(Y) across newlines, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "y"), "expected StrLit(\"y\") across newlines, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
 #[test]
 fn fat_comma_lookahead_skips_comment_to_find_arrow() {
-    // Comment between the keyword and `=>` counts as whitespace-like for this lookahead, matching what the quote-op
-    // delim scan would do anyway.
     let tokens = lex_all("m # comment\n => 1;");
-    assert!(matches!(tokens[0], Token::Keyword(Keyword::M)), "expected Keyword(M) past comment, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "m"), "expected StrLit(\"m\") past comment, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
@@ -1697,7 +1706,7 @@ fn quote_op_q_across_newline_then_fat_comma_autoquotes() {
     // Paired with the test above: `q\n=>` must still autoquote, so the lookahead isn't defeated by the relaxed post-ws
     // delimiter rule.
     let tokens = lex_all("q\n=>1;");
-    assert!(matches!(tokens[0], Token::Keyword(Keyword::Q)), "expected Keyword(Q) from q\\n=>, got {:?}", tokens[0]);
+    assert!(matches!(tokens[0], Token::StrLit(ref s) if s == "q"), "expected StrLit(\"q\") from q\\n=>, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma));
 }
 
@@ -1735,7 +1744,8 @@ fn src_equals_delim(kw: &str, ws: &str) -> String {
 fn assert_not_autoquoted(tokens: &[Token], name: &str, src: &str) {
     let autoquoted_ident = matches!(&tokens[0], Token::Ident(s) if s == name);
     let autoquoted_kw = matches!(&tokens[0], Token::Keyword(kw) if { let n: &str = (*kw).into(); n == name });
-    assert!(!autoquoted_ident && !autoquoted_kw, "{name} should be a quote op for {src:?}, got autoquoted first token: {:?}", tokens[0]);
+    let autoquoted_str = matches!(&tokens[0], Token::StrLit(s) if s == name);
+    assert!(!autoquoted_ident && !autoquoted_kw && !autoquoted_str, "{name} should be a quote op for {src:?}, got autoquoted first token: {:?}", tokens[0]);
 }
 
 // `=` delim across newline — nine tests, one per keyword.
@@ -1897,12 +1907,7 @@ fn quote_op_alnum_delim_across_newline_qx() {
 
 fn assert_autoquoted_via_fat_comma(src: &str, name: &str) {
     let tokens = lex_all(src);
-    let is_bareword = matches!(&tokens[0], Token::Ident(s) if s == name)
-        || matches!(&tokens[0], Token::Keyword(kw) if {
-            let n: &str = (*kw).into();
-            n == name
-        });
-    assert!(is_bareword, "expected bareword `{name}` for {src:?}, got {:?}", tokens[0]);
+    assert!(matches!(&tokens[0], Token::StrLit(s) if s == name), "expected StrLit({name:?}) for {src:?}, got {:?}", tokens[0]);
     assert!(matches!(tokens[1], Token::FatComma), "expected FatComma second for {src:?}, got {:?}", tokens[1]);
 }
 

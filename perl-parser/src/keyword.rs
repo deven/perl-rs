@@ -552,6 +552,9 @@ pub fn lookup_keyword(name: &str) -> Option<Keyword> {
         "le" => Some(Keyword::Le),
         "ge" => Some(Keyword::Ge),
         "cmp" => Some(Keyword::Cmp),
+        "__PACKAGE__" => Some(Keyword::__PACKAGE__),
+        "__SUB__" => Some(Keyword::__SUB__),
+        "__CLASS__" => Some(Keyword::__CLASS__),
         _ => None,
     }
 }
@@ -837,12 +840,6 @@ impl From<Keyword> for &'static str {
 /// sublexing mode.
 pub fn is_quote_keyword(kw: Keyword) -> bool {
     matches!(kw, Keyword::Q | Keyword::Qq | Keyword::Qw | Keyword::Qr | Keyword::Qx | Keyword::M | Keyword::S | Keyword::Tr | Keyword::Y)
-}
-
-/// Is this keyword a data-EOF trigger (`__DATA__`, `__END__`)?  These require special handling in the parser: if not
-/// autoquoted (fat comma, hash subscript), they trigger a logical end-of-source via a lexer callback.
-pub fn is_data_eof_keyword(kw: Keyword) -> bool {
-    matches!(kw, Keyword::__DATA__ | Keyword::__END__)
 }
 
 /// Is this keyword a named unary operator?  After a named unary, the next thing is a term (so `/` is regex).

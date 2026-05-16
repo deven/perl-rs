@@ -103,9 +103,6 @@ pub struct Parser {
     /// Lexically-scoped pragma state (`use feature`, `use utf8`, version bundles).  Saved/restored across block
     /// boundaries by `parse_block`.
     pragmas: Pragmas,
-    /// Set when `__DATA__` or `__END__` triggers logical EOF mid-expression (inside `parse_term`).  The statement-level
-    /// loop in `parse_program` picks this up after the current statement finishes and emits a `DataEnd` node.
-    pending_data_end: Option<(Keyword, u32)>,
 }
 
 impl Parser {
@@ -131,7 +128,6 @@ impl Parser {
             symbols: SymbolTable::new(),
             current_package: std::sync::Arc::from("main"),
             pragmas: Pragmas::new(),
-            pending_data_end: None,
         })
     }
 
@@ -285,18 +281,14 @@ impl Parser {
 
         while !self.at_eof()? {
             let stmt = self.parse_statement()?;
-            let is_data_end = matches!(stmt.kind, StmtKind::DataEnd(_, _));
             statements.push(stmt);
-            if is_data_end {
-                break;
-            }
-            // If __DATA__/__END__ triggered EOF mid-expression, parse_term stored the pending info.  Emit the DataEnd
-            // node now that the expression statement has been collected.
-            if let Some((kw, offset)) = self.pending_data_end.take() {
-                let end_span = self.peek_span();
-                statements.push(Statement { kind: StmtKind::DataEnd(kw, offset), span: end_span, terminated: false });
-                break;
-            }
+        }
+
+        // If __DATA__/__END__ triggered logical EOF, the lexer stored the keyword and data offset.  Emit a DataEnd
+        // node so the compiler knows where the DATA filehandle content begins.
+        if let Some((kw, offset)) = self.lexer.data_end_info.take() {
+            let end_span = self.peek_span();
+            statements.push(Statement { kind: StmtKind::DataEnd(kw, offset), span: end_span, terminated: false });
         }
 
         // A lexer error produces Eof, which exits the loop above.  If advance() was never called to surface it, catch
@@ -317,27 +309,6 @@ impl Parser {
         // Empty statement
         if self.eat(&Token::Semi)? {
             return Ok(Statement { kind: StmtKind::Empty, span: start, terminated: true });
-        }
-
-        // __END__ / __DATA__ — stop parsing immediately.  ^D/^Z trigger logical EOF in the lexer directly.
-        if let Token::Keyword(kw) = self.peek_token()
-            && keyword::is_data_eof_keyword(*kw)
-        {
-            let kw = *kw;
-            let kw_span = self.peek_span();
-            self.next_token()?;
-
-            // Check for autoquoting (`__END__ => val`).  If not autoquoted, autoquoted_eof triggers logical EOF and
-            // returns the byte offset where trailing data begins (after any pending heredoc bodies).
-            if let Some(data_offset) = self.lexer.autoquoted_eof(false) {
-                return Ok(Statement { kind: StmtKind::DataEnd(kw, data_offset), span: start.merge(kw_span), terminated: false });
-            }
-            // Autoquoted — treat as expression statement.
-            let name: &str = kw.into();
-            let expr = Expr { kind: ExprKind::StringLit(name.to_string()), span: kw_span };
-            let full = self.with_descent(|this| this.parse_expr_continuation(expr, PREC_LOW))?;
-            let terminated = self.eat(&Token::Semi)?;
-            return Ok(Statement { kind: StmtKind::Expr(full), span: start.merge(self.peek_span()), terminated });
         }
 
         let (kind, terminated) = match self.peek_token().clone() {
@@ -1690,41 +1661,6 @@ impl Parser {
             return self.parse_quote_keyword(*kw, span);
         }
 
-        // __DATA__/__END__ must be intercepted before peek_token() — autoquoting is same-line only, but peek_token()
-        // would skip newlines and tokenize the next line.  The lexer pre-skips same-line whitespace after the keyword,
-        // so autoquoted_eof() just peeks at the current byte for `=>`.  If not found, it triggers logical EOF and
-        // returns the byte offset where trailing data begins.
-        if let Token::Keyword(kw) = &spanned.token
-            && keyword::is_data_eof_keyword(*kw)
-        {
-            if let Some(data_offset) = self.lexer.autoquoted_eof(false) {
-                // Logical EOF triggered mid-expression.  Store the pending DataEnd for parse_program to emit after the
-                // current statement finishes.  Return Undef as a placeholder; the Pratt loop will see Eof on the next
-                // peek and exit.
-                self.pending_data_end = Some((*kw, data_offset));
-                return Ok(Expr { kind: ExprKind::Undef, span });
-            }
-            let name: &str = (*kw).into();
-            return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-        }
-
-        // Fat comma autoquotes keywords: `if => 1` produces StringLit("if").
-        if let Token::Keyword(kw) = &spanned.token
-            && matches!(self.peek_token(), Token::FatComma)
-        {
-            let name: &str = (*kw).into();
-            return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-        }
-        // SourceFile/SourceLine tokens also participate in fat-comma autoquoting.
-        if matches!(&spanned.token, Token::SourceFile(_) | Token::SourceLine(_)) && matches!(self.peek_token(), Token::FatComma) {
-            let name = match &spanned.token {
-                Token::SourceFile(_) => "__FILE__",
-                Token::SourceLine(_) => "__LINE__",
-                _ => unreachable!(),
-            };
-            return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-        }
-
         // Weak keyword override: if this keyword has been declared as a sub (via `use subs`, `sub name;`, etc.), treat
         // it as an identifier in term position so the user sub takes precedence.  Infix position is unaffected — `"ab"
         // x 3` always works as repeat.
@@ -2309,6 +2245,10 @@ impl Parser {
                     Ok(Expr { span: span.merge(arg.span), kind: ExprKind::DoExpr(Box::new(arg)) })
                 }
             }
+
+            // Logical EOF from __DATA__/__END__/^D/^Z mid-expression — silently terminate.  The Pratt loop will see
+            // Eof on the next peek and exit, so the surrounding expression terminates with whatever was collected.
+            Token::Eof if self.lexer.logical_eof => Ok(Expr { kind: ExprKind::Undef, span }),
 
             other => Err(ParseError::new(format!("expected expression, got {other:?}"), span)),
         }
@@ -3061,139 +3001,19 @@ impl Parser {
     /// Parse the key expression inside `{ }` hash subscripts.  Handles bareword autoquoting: `$hash{key}` →
     /// StringLit("key"), `$hash{-key}` → StringLit("-key"), `$hash{if}` → StringLit("if"), etc.
     ///
-    /// The parser intercepts keywords and minus before falling through to `parse_expr`, because:
-    /// - Quote keywords (`q`, `m`, `s`, etc.) would start sublexing with `}` as delimiter
-    /// - Non-quote keywords (`if`, `while`, etc.) would dispatch as statements
-    /// - Minus followed by a filetest letter or keyword needs special autoquoting
+    /// Autoquoting is handled by a single byte-level scan (`try_autoquoted_subscript_key`) that matches the pattern
+    /// `[ \t]* [-]? [ \t]* IDENT [ \t]* }` on a SINGLE LINE.  This catches all autoquoting cases uniformly: keywords,
+    /// special tokens (`__FILE__`, `__END__`), and plain barewords are all just identifiers at the byte level.
     ///
-    /// Everything else (sigils, operators, function calls) goes through normal expression parsing, with a post-processing
-    /// step that converts top-level `Bareword` to `StringLit` and no-arg `Filetest` to `StringLit("-x")`.
+    /// If the scan doesn't match, everything goes through normal `parse_expr` — quote keywords, data-EOF keywords, and
+    /// filetests are all handled by their existing mechanisms in `parse_term`.
     fn parse_hash_subscript_key(&mut self) -> Result<Expr, ParseError> {
-        let tok = self.peek_token().clone();
-        let span = self.peek_span();
-
-        match tok {
-            Token::Keyword(kw) => {
-                self.next_token()?;
-                if keyword::is_quote_keyword(kw) {
-                    // Must peek raw byte — tokenizing the delimiter would be destructive.
-                    let raw = self.lexer.skip_ws_and_peek_byte();
-                    if raw == Some(b'}') {
-                        let name: &str = kw.into();
-                        return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-                    }
-                    if raw == Some(b'=') && self.lexer.peek_byte_at(1) == Some(b'>') {
-                        let name: &str = kw.into();
-                        return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-                    }
-                    // Not autoquoting — start sublexing (e.g. `$h{q/abc/}` is valid Perl).
-                    return self.dispatch_quote_result(kw, span);
-                }
-                // __DATA__/__END__: autoquoting is same-line only.  The lexer pre-skipped same-line whitespace, so
-                // autoquoted_eof(true) peeks for `=>` or `}` at the current position.  If neither, EOF is triggered.
-                if keyword::is_data_eof_keyword(kw) {
-                    if let Some(_data_offset) = self.lexer.autoquoted_eof(true) {
-                        // Logical EOF triggered inside a hash subscript — the `}` will never be found.
-                        return Err(ParseError::new("unexpected __END__/__DATA__ inside hash subscript", span));
-                    }
-                    // Autoquoted — `}` or `=>` follows on the same line.
-                    let name: &str = kw.into();
-                    return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-                }
-                // Non-quote keyword: safe to peek token (tokenization won't misfire).
-                if matches!(self.peek_token(), Token::RightBrace | Token::FatComma) {
-                    let name: &str = kw.into();
-                    return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-                }
-                // Not autoquoting — push keyword back, fall through to parse_expr.
-                self.current = Some(Spanned { token: Token::Keyword(kw), span });
-            }
-
-            // SourceFile/SourceLine carry values but still participate in hash-subscript autoquoting.
-            Token::SourceFile(_) | Token::SourceLine(_) => {
-                let name = match &tok {
-                    Token::SourceFile(_) => "__FILE__",
-                    Token::SourceLine(_) => "__LINE__",
-                    _ => unreachable!(),
-                };
-                self.next_token()?;
-                if matches!(self.peek_token(), Token::RightBrace | Token::FatComma) {
-                    return Ok(Expr { kind: ExprKind::StringLit(name.to_string()), span });
-                }
-                // Not autoquoting — push original token back.
-                self.current = Some(Spanned { token: tok, span });
-            }
-
-            Token::Minus => {
-                self.next_token()?;
-                return self.parse_hash_key_after_minus(span);
-            }
-
-            _ => {}
+        // The one-token cache must be empty so the byte-level scanner sees the raw source bytes immediately after `{`.
+        debug_assert!(self.current.is_none(), "parse_hash_subscript_key: one-token cache must be empty");
+        if let Some((name, span)) = self.lexer.try_autoquoted_subscript_key() {
+            return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
-
-        let expr = self.parse_expr(PREC_LOW)?;
-        Ok(Self::autoquote_subscript_expr(expr))
-    }
-
-    /// Post-process an expression parsed inside a hash subscript: convert top-level `Bareword` to `StringLit` and
-    /// no-argument `Filetest` (e.g. `-f` with implicit `$_`) to `StringLit("-f")`.
-    fn autoquote_subscript_expr(expr: Expr) -> Expr {
-        match &expr.kind {
-            ExprKind::Bareword(name) => Expr { kind: ExprKind::StringLit(name.clone()), span: expr.span },
-            ExprKind::Filetest(c, StatTarget::Default) => Expr { kind: ExprKind::StringLit(format!("-{c}")), span: expr.span },
-            _ => expr,
-        }
-    }
-
-    /// Handle minus inside a hash subscript: `-f}` → StringLit("-f"), `-keyword}` → StringLit("-keyword"), otherwise
-    /// fall through to normal negation.
-    fn parse_hash_key_after_minus(&mut self, minus_span: Span) -> Result<Expr, ParseError> {
-        // Try filetest: -f, -d, etc.
-        if let Some(Token::Filetest(b)) = self.lexer.lex_filetest_after_minus() {
-            let ft_span = self.peek_span();
-            let combined = minus_span.merge(ft_span);
-            // -f} → autoquote; -f $_ → real filetest (post-processing won't touch it, it has an argument).
-            if matches!(self.peek_token(), Token::RightBrace | Token::FatComma) {
-                return Ok(Expr { kind: ExprKind::StringLit(format!("-{}", b as char)), span: combined });
-            }
-            return self.parse_filetest(b, combined);
-        }
-
-        // -keyword} → autoquote
-        if let Token::Keyword(kw) = self.peek_token().clone() {
-            let kw_span = self.peek_span();
-            self.next_token()?;
-            // __DATA__/__END__: same-line autoquoting only.
-            if keyword::is_data_eof_keyword(kw) {
-                if let Some(_data_offset) = self.lexer.autoquoted_eof(true) {
-                    return Err(ParseError::new("unexpected __END__/__DATA__ inside hash subscript", minus_span));
-                }
-                let name: &str = kw.into();
-                return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: minus_span.merge(kw_span) });
-            }
-            if matches!(self.peek_token(), Token::RightBrace | Token::FatComma) {
-                let name: &str = kw.into();
-                return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: minus_span.merge(kw_span) });
-            }
-            // Not autoquoting — push keyword back, fall through to negation.
-            self.current = Some(Spanned { token: Token::Keyword(kw), span: kw_span });
-        }
-
-        // -ident: existing behavior (StringLit("-name") for bare idents, negate for func calls).
-        if let Token::Ident(name) = self.peek_token().clone() {
-            let ident_span = self.peek_span();
-            self.next_token()?;
-            if matches!(self.peek_token(), Token::LeftParen) {
-                let func = self.parse_ident_term(name, ident_span)?;
-                return Ok(Expr { span: minus_span.merge(func.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(func)) });
-            }
-            return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: minus_span.merge(ident_span) });
-        }
-
-        // General negation.
-        let operand = self.parse_expr(PREC_UNARY)?;
-        Ok(Expr { span: minus_span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(operand)) })
+        self.parse_expr(PREC_LOW)
     }
 
     /// Check for `%hash{keys}` (kv hash slice) or `%array[indices]` (kv array slice) subscripts on a hash-sigil
