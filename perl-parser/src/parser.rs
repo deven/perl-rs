@@ -3164,6 +3164,14 @@ impl Parser {
         if let Token::Keyword(kw) = self.peek_token().clone() {
             let kw_span = self.peek_span();
             self.next_token()?;
+            // __DATA__/__END__: same-line autoquoting only.
+            if keyword::is_data_eof_keyword(kw) {
+                if let Some(_data_offset) = self.lexer.autoquoted_eof(true) {
+                    return Err(ParseError::new("unexpected __END__/__DATA__ inside hash subscript", minus_span));
+                }
+                let name: &str = kw.into();
+                return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: minus_span.merge(kw_span) });
+            }
             if matches!(self.peek_token(), Token::RightBrace | Token::FatComma) {
                 let name: &str = kw.into();
                 return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: minus_span.merge(kw_span) });

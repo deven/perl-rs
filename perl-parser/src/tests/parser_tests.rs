@@ -2228,7 +2228,7 @@ fn parse_end_with_heredocs_on_same_line() {
     let src = "print <<X, __END__\nbody of X\nX\nthis is DATA\n";
     let prog = parse(src);
     let has_data_end = prog.statements.iter().any(|s| matches!(s.kind, StmtKind::DataEnd(_, _)));
-    assert!(has_data_end, "expected DataEnd statement, got {prog:?}");
+    assert!(has_data_end, "expected DataEnd statement");
     match prog.statements.last().map(|s| &s.kind) {
         Some(StmtKind::DataEnd(Keyword::__END__, offset)) => {
             assert_eq!(&src.as_bytes()[*offset as usize..], b"this is DATA\n");
@@ -2245,6 +2245,26 @@ fn parse_ctrl_d_with_heredocs_on_same_line() {
     let prog = parse(src);
     // Should have one print statement with the heredoc resolved.
     assert_eq!(prog.statements.len(), 1);
+}
+
+#[test]
+fn parse_minus_end_in_hash_subscript_across_lines_triggers_eof() {
+    // $h{-__END__\n} — the } is on the next line, so __END__ should trigger logical EOF (same-line autoquoting only).
+    // The hash subscript is never closed, so this must be a parse error.
+    let result = crate::parse(b"my %h; $h{-__END__\n}\n");
+    assert!(result.is_err(), "-__END__ with }} on next line should trigger EOF, not autoquote across lines");
+}
+
+#[test]
+fn parse_minus_end_in_hash_subscript_same_line_autoquotes() {
+    // $h{-__END__} on a single line — autoquotes to StringLit("-__END__").
+    let e = parse_expr_str("$h{-__END__};");
+    match &e.kind {
+        ExprKind::HashElem(_, key) => {
+            assert!(matches!(key.kind, ExprKind::StringLit(ref s) if s == "-__END__"), "expected StringLit(\"-__END__\"), got {:?}", key.kind);
+        }
+        other => panic!("expected HashElem, got {other:?}"),
+    }
 }
 
 // ── Pod skipping test ─────────────────────────────────────
