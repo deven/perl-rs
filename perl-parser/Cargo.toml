@@ -8,6 +8,11 @@ description = "Perl lexer, Pratt parser, and AST"
 [dependencies]
 bytes                 = { workspace = true }
 memchr                = { workspace = true }
+phf                   = { workspace = true }
+phf_codegen           = { workspace = true }
+phf_generator         = { workspace = true }
+phf_macros            = { workspace = true }
+phf_shared            = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-xid           = { workspace = true }
 unicode_names2        = { workspace = true }

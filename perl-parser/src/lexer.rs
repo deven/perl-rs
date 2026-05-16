@@ -199,31 +199,7 @@ impl Lexer {
     /// operators (q, qq, qr, qx, m, s, tr, y) which are not in the keyword table but must still prevent apostrophe
     /// consumption in `scan_ident`.
     fn is_active_keyword(&self, name: &[u8]) -> bool {
-        // Quote-like operators — not in lookup_keyword but always act as keywords for delimiter purposes.
-        if matches!(name, b"q" | b"qq" | b"qw" | b"qr" | b"m" | b"s" | b"tr" | b"y" | b"qx") {
-            return true;
-        }
-        let name_str = match std::str::from_utf8(name) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        match keyword::lookup_keyword(name_str) {
-            None => false,
-            Some(kw) => {
-                // Feature-gated keywords: only active when their feature is enabled.  The same mapping is used in
-                // lex_word to emit Ident instead of Keyword for inactive feature-gated keywords.
-                let needed = match kw {
-                    Keyword::Try | Keyword::Catch | Keyword::Finally => Features::TRY,
-                    Keyword::Defer => Features::DEFER,
-                    Keyword::Given | Keyword::When | Keyword::Default => Features::SWITCH,
-                    Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST => Features::CLASS,
-                    Keyword::Any => Features::KEYWORD_ANY,
-                    Keyword::All => Features::KEYWORD_ALL,
-                    _ => return true, // unconditional keyword
-                };
-                self.features.contains(needed)
-            }
-        }
+        keyword::lookup_keyword(name, self.features).is_some()
     }
 
     /// Decode the UTF-8 character starting at the current position.  Returns `(char, byte_length)` on success, `None`
@@ -2092,25 +2068,9 @@ impl Lexer {
             return Ok(Token::VersionLit(vstr));
         }
 
-        // Keywords — check feature gating for conditional keywords.
-        if let Some(kw) = keyword::lookup_keyword(&name) {
-            let needed = match kw {
-                Keyword::Try | Keyword::Catch | Keyword::Finally => Some(Features::TRY),
-                Keyword::Defer => Some(Features::DEFER),
-                Keyword::Given | Keyword::When | Keyword::Default | Keyword::Break => Some(Features::SWITCH),
-                Keyword::Class | Keyword::Field | Keyword::Method | Keyword::ADJUST | Keyword::__CLASS__ => Some(Features::CLASS),
-                Keyword::__SUB__ => Some(Features::CURRENT_SUB),
-                Keyword::Any => Some(Features::KEYWORD_ANY),
-                Keyword::All => Some(Features::KEYWORD_ALL),
-                Keyword::Evalbytes => Some(Features::EVALBYTES),
-                Keyword::Fc => Some(Features::FC),
-                Keyword::Isa => Some(Features::ISA),
-                _ => None, // unconditional keyword — always active
-            };
-            if needed.is_none_or(|f| self.features.contains(f)) {
-                return Ok(Token::Keyword(kw));
-            }
-            // Feature not active — fall through to Ident.
+        // Keywords — lookup_keyword handles feature gating internally.
+        if let Some(kw) = keyword::lookup_keyword(name.as_bytes(), self.features) {
+            return Ok(Token::Keyword(kw));
         }
 
         // Regular identifier / bareword
