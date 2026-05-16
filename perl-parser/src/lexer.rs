@@ -1080,7 +1080,7 @@ impl Lexer {
                     } else {
                         Token::LogicalXor
                     }
-                } else if self.peek_byte(false) == Some(b'.') {
+                } else if self.peek_byte(false) == Some(b'.') && self.features.contains(Features::BITWISE) {
                     self.skip(1);
                     if self.peek_byte(false) == Some(b'=') {
                         self.skip(1);
@@ -1100,7 +1100,7 @@ impl Lexer {
                 if self.peek_byte(false) == Some(b'~') {
                     self.skip(1);
                     Token::SmartMatch
-                } else if self.peek_byte(false) == Some(b'.') {
+                } else if self.peek_byte(false) == Some(b'.') && self.features.contains(Features::BITWISE) {
                     self.skip(1);
                     Token::StringBitNot
                 } else {
@@ -2872,21 +2872,24 @@ impl Lexer {
         matches!(r.first(), Some(b'[') | Some(b'{'))
             || (r.len() >= 3 && r[0] == b'-' && r[1] == b'>' && {
                 let c = r[2];
-                // Subscript forms: ->[idx], ->{key}.
+                // Subscript forms: ->[idx], ->{key} — always valid in interpolation.
                 matches!(c, b'[' | b'{')
-                    // Postderef whole: ->@*, ->%*, ->$*, ->&*, ->**.
-                    || (r.len() >= 4
-                        && matches!(c, b'@' | b'%' | b'$' | b'&' | b'*')
-                        && r[3] == b'*')
-                    // Postderef slices: ->@[, ->@{, ->%[, ->%{.
-                    || (r.len() >= 4
-                        && matches!(c, b'@' | b'%')
-                        && matches!(r[3], b'[' | b'{'))
-                    // Postderef last-index: ->$#*.
-                    || (r.len() >= 5
-                        && c == b'$'
-                        && r[3] == b'#'
-                        && r[4] == b'*')
+                    // Postderef forms require `use feature 'postderef_qq'`.
+                    || (self.features.contains(Features::POSTDEREF_QQ) && (
+                        // Postderef whole: ->@*, ->%*, ->$*, ->&*, ->**.
+                        (r.len() >= 4
+                            && matches!(c, b'@' | b'%' | b'$' | b'&' | b'*')
+                            && r[3] == b'*')
+                        // Postderef slices: ->@[, ->@{, ->%[, ->%{.
+                        || (r.len() >= 4
+                            && matches!(c, b'@' | b'%')
+                            && matches!(r[3], b'[' | b'{'))
+                        // Postderef last-index: ->$#*.
+                        || (r.len() >= 5
+                            && c == b'$'
+                            && r[3] == b'#'
+                            && r[4] == b'*')
+                    ))
             })
     }
 
@@ -3452,7 +3455,7 @@ impl Lexer {
                     Token::AndAnd
                 }
             }
-            Some(b'.') => {
+            Some(b'.') if self.features.contains(Features::BITWISE) => {
                 self.skip(1);
                 if self.peek_byte(false) == Some(b'=') {
                     self.skip(1);
@@ -3481,7 +3484,7 @@ impl Lexer {
                     Token::OrOr
                 }
             }
-            Some(b'.') => {
+            Some(b'.') if self.features.contains(Features::BITWISE) => {
                 self.skip(1);
                 if self.peek_byte(false) == Some(b'=') {
                     self.skip(1);

@@ -8,12 +8,14 @@ fn parse(src: &str) -> Program {
 }
 
 fn parse_expr_str(src: &str) -> Expr {
-    // Wrap in a statement to parse
     let prog = parse(src);
-    match &prog.statements[0].kind {
-        StmtKind::Expr(e) => e.clone(),
-        other => panic!("expected expression, got {other:?}"),
+    // Find the first expression statement (skipping use/no declarations from `use feature` etc.).
+    for stmt in &prog.statements {
+        if let StmtKind::Expr(e) = &stmt.kind {
+            return e.clone();
+        }
     }
+    panic!("no expression statement found in: {src}");
 }
 
 /// Collect all tokens from source, for tests that need to inspect token-level output (e.g. NFC on variable names).
@@ -1286,7 +1288,7 @@ fn interp_escape_sequence_in_hash_subscript_is_ref_to_bareword() {
 fn interp_postderef_qq_array() {
     // `"$ref->@*"` — postderef array form inside a string.  Requires peek_chain_starter to recognize `->@*` and the
     // chain dispatch to end on `Star` at depth 0.
-    let parts = interp_parts(r#""$ref->@*";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->@*";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefArray)), "expected ArrowDeref(_, DerefArray), got {:?}", e.kind);
 }
@@ -1294,7 +1296,7 @@ fn interp_postderef_qq_array() {
 #[test]
 fn interp_postderef_qq_hash() {
     // `"$ref->%*"` — postderef hash form.
-    let parts = interp_parts(r#""$ref->%*";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->%*";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefHash)), "expected ArrowDeref(_, DerefHash), got {:?}", e.kind);
 }
@@ -1302,7 +1304,7 @@ fn interp_postderef_qq_hash() {
 #[test]
 fn interp_postderef_qq_scalar() {
     // `"$ref->$*"` — postderef scalar form.
-    let parts = interp_parts(r#""$ref->$*";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->$*";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefScalar)), "expected ArrowDeref(_, DerefScalar), got {:?}", e.kind);
 }
@@ -1312,7 +1314,7 @@ fn interp_postderef_qq_last_index() {
     // `"$ref->$#*"` — postderef last-index in a string.  The `#` would normally start a comment in code mode; this
     // works because the parser's `try_consume_hash_star` consumes the raw `#*` bytes between lex_token calls, and (in
     // chain mode) sets `chain_end_pending` so the chain terminates cleanly.
-    let parts = interp_parts(r#""$ref->$#*";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->$#*";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::LastIndex)), "expected ArrowDeref(_, LastIndex), got {:?}", e.kind);
 }
@@ -1320,7 +1322,7 @@ fn interp_postderef_qq_last_index() {
 #[test]
 fn interp_postderef_qq_chained_after_subscript() {
     // `"$h->{key}->@*"` — subscript then postderef in one chain.
-    let parts = interp_parts(r#""$h->{key}->@*";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$h->{key}->@*";"#);
     let e = scalar_part(&parts, 0);
     match &e.kind {
         ExprKind::ArrowDeref(inner, ArrowTarget::DerefArray) => {
@@ -1334,7 +1336,7 @@ fn interp_postderef_qq_chained_after_subscript() {
 #[test]
 fn interp_postderef_qq_with_surrounding_text() {
     // `"values: $ref->@* end"` — postderef mid-string.
-    let parts = interp_parts(r#""values: $ref->@* end";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "values: $ref->@* end";"#);
     assert_eq!(parts.len(), 3);
     assert!(matches!(&parts[0], InterpPart::Const(s) if s == "values: "));
     let e = scalar_part(&parts, 1);
@@ -4722,7 +4724,7 @@ fn torture_stacked_heredoc_list_assignment() {
 #[test]
 fn interp_postderef_qq_code() {
     // `->&*` — code deref inside string.
-    let parts = interp_parts(r#""$ref->&*";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->&*";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefCode)), "expected DerefCode, got {:?}", e.kind);
 }
@@ -4730,7 +4732,7 @@ fn interp_postderef_qq_code() {
 #[test]
 fn interp_postderef_qq_glob() {
     // `->**` — glob deref inside string.  Lexer emits Token::Power for `**`.
-    let parts = interp_parts(r#""$ref->**";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->**";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::DerefGlob)), "expected DerefGlob, got {:?}", e.kind);
 }
@@ -4738,7 +4740,7 @@ fn interp_postderef_qq_glob() {
 #[test]
 fn interp_postderef_qq_array_slice() {
     // `->@[0,1]` — array slice inside string.
-    let parts = interp_parts(r#""$ref->@[0,1]";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->@[0,1]";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::ArraySliceIndices(_))), "expected ArraySliceIndices, got {:?}", e.kind);
 }
@@ -4746,7 +4748,7 @@ fn interp_postderef_qq_array_slice() {
 #[test]
 fn interp_postderef_qq_hash_slice() {
     // `->@{"a","b"}` — hash slice (values) inside string.
-    let parts = interp_parts(r#""$ref->@{'a','b'}";"#);
+    let parts = interp_parts(r#"use feature 'postderef_qq'; "$ref->@{'a','b'}";"#);
     let e = scalar_part(&parts, 0);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::ArraySliceKeys(_))), "expected ArraySliceKeys, got {:?}", e.kind);
 }
@@ -6097,8 +6099,8 @@ fn parse_our_decl() {
 
 #[test]
 fn parse_state_decl() {
-    let prog = parse("state $counter = 0;");
-    let (scope, vars) = decl_vars(&prog.statements[0]);
+    let prog = parse("use feature 'state'; state $counter = 0;");
+    let (scope, vars) = decl_vars(&prog.statements[1]);
     assert_eq!(scope, DeclScope::State);
     assert_eq!(vars[0].name, "counter");
 }
@@ -7129,7 +7131,7 @@ fn parse_print_bare_no_args() {
 
 #[test]
 fn parse_say_filehandle() {
-    let e = parse_expr_str("say STDERR 'error';");
+    let e = parse_expr_str("use feature 'say'; say STDERR 'error';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
             assert_eq!(name, "CORE::say");
@@ -7242,7 +7244,7 @@ fn parse_print_scalar_not_fh() {
 
 #[test]
 fn parse_say_no_filehandle() {
-    let e = parse_expr_str("say 'hello';");
+    let e = parse_expr_str("use feature 'say'; say 'hello';");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
             assert_eq!(name, "CORE::say");
@@ -7255,7 +7257,7 @@ fn parse_say_no_filehandle() {
 
 #[test]
 fn parse_say_parens_filehandle() {
-    let e = parse_expr_str("say(STDERR 'hello');");
+    let e = parse_expr_str("use feature 'say'; say(STDERR 'hello');");
     match &e.kind {
         ExprKind::PrintOp(name, fh, args) => {
             assert_eq!(name, "CORE::say");
@@ -8080,8 +8082,9 @@ fn hard_our_assign_comma_grouping() {
 #[test]
 fn hard_state_assign_comma_grouping() {
     // `state $x = $a, $b;` — same behavior as `my` with a different scope.
-    let prog = parse("state $x = $a, $b;");
-    match &prog.statements[0].kind {
+    let prog = parse("use feature 'state'; state $x = $a, $b;");
+    // statements[0] is the `use` declaration; the expression is statements[1].
+    match &prog.statements[1].kind {
         StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
             assert_eq!(items.len(), 2);
             match &items[0].kind {
@@ -8146,8 +8149,8 @@ fn hard_our_is_expression() {
 
 #[test]
 fn hard_state_is_expression() {
-    let prog = parse("state $x;");
-    match &prog.statements[0].kind {
+    let prog = parse("use feature 'state'; state $x;");
+    match &prog.statements[1].kind {
         StmtKind::Expr(Expr { kind: ExprKind::Decl(DeclScope::State, vars), .. }) => {
             assert_eq!(vars[0].name, "x");
         }
@@ -9226,50 +9229,50 @@ fn smartmatch_disabled_without_feature() {
 
 #[test]
 fn string_bitwise_and() {
-    let e = parse_expr_str("$a &. $b;");
+    let e = parse_expr_str("use feature 'bitwise'; $a &. $b;");
     assert!(matches!(e.kind, ExprKind::BinOp(BinOp::StringBitAnd, _, _)), "expected StringBitAnd, got {:?}", e.kind);
 }
 
 #[test]
 fn string_bitwise_or() {
-    let e = parse_expr_str("$a |. $b;");
+    let e = parse_expr_str("use feature 'bitwise'; $a |. $b;");
     assert!(matches!(e.kind, ExprKind::BinOp(BinOp::StringBitOr, _, _)), "expected StringBitOr, got {:?}", e.kind);
 }
 
 #[test]
 fn string_bitwise_xor() {
-    let e = parse_expr_str("$a ^. $b;");
+    let e = parse_expr_str("use feature 'bitwise'; $a ^. $b;");
     assert!(matches!(e.kind, ExprKind::BinOp(BinOp::StringBitXor, _, _)), "expected StringBitXor, got {:?}", e.kind);
 }
 
 #[test]
 fn string_bitwise_not() {
-    let e = parse_expr_str("~. $a;");
+    let e = parse_expr_str("use feature 'bitwise'; ~. $a;");
     assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::StringBitNot, _)), "expected StringBitNot, got {:?}", e.kind);
 }
 
 #[test]
 fn string_bitwise_and_assign() {
-    let e = parse_expr_str("$a &.= $b;");
+    let e = parse_expr_str("use feature 'bitwise'; $a &.= $b;");
     assert!(matches!(e.kind, ExprKind::Assign(AssignOp::StringBitAndEq, _, _)), "expected &.= assign, got {:?}", e.kind);
 }
 
 #[test]
 fn string_bitwise_or_assign() {
-    let e = parse_expr_str("$a |.= $b;");
+    let e = parse_expr_str("use feature 'bitwise'; $a |.= $b;");
     assert!(matches!(e.kind, ExprKind::Assign(AssignOp::StringBitOrEq, _, _)), "expected |.= assign, got {:?}", e.kind);
 }
 
 #[test]
 fn string_bitwise_xor_assign() {
-    let e = parse_expr_str("$a ^.= $b;");
+    let e = parse_expr_str("use feature 'bitwise'; $a ^.= $b;");
     assert!(matches!(e.kind, ExprKind::Assign(AssignOp::StringBitXorEq, _, _)), "expected ^.= assign, got {:?}", e.kind);
 }
 
 #[test]
 fn string_bitwise_precedence() {
     // `&.` has PREC_BIT_AND, which is tighter than `|.`.  `$a |. $b &. $c` → `$a |. ($b &. $c)`.
-    let e = parse_expr_str("$a |. $b &. $c;");
+    let e = parse_expr_str("use feature 'bitwise'; $a |. $b &. $c;");
     match &e.kind {
         ExprKind::BinOp(BinOp::StringBitOr, _, rhs) => {
             assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::StringBitAnd, _, _)), "expected &. to bind tighter than |.");

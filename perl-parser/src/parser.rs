@@ -142,6 +142,13 @@ impl Parser {
         &self.pragmas
     }
 
+    /// Override the active feature set.  Updates both the parser's pragma state and the lexer's cached copy.  Primarily
+    /// for tests that need to parse under a specific feature bundle without a `use feature` declaration in the source.
+    pub fn set_features(&mut self, features: Features) {
+        self.pragmas.features = features;
+        self.lexer.features = features;
+    }
+
     // ── Token access ──────────────────────────────────────────
 
     /// Peek at the current token without consuming it.  Lexes on demand if no token is cached.

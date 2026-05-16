@@ -4,6 +4,7 @@ use super::*;
 
 fn lex_all(src: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(src.as_bytes());
+    lexer.features = Features::ALL;
     let mut term_context = true; // start of statement is term context
     let mut tokens = Vec::new();
     loop {

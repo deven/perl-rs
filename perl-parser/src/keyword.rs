@@ -553,6 +553,8 @@ static KEYWORDS: phf::Map<&'static [u8], Keyword> = phf_map! {
 pub fn lookup_keyword(name: &[u8], features: Features) -> Option<Keyword> {
     let &kw = KEYWORDS.get(name)?;
     let needed = match kw {
+        Keyword::Say => Some(Features::SAY),
+        Keyword::State => Some(Features::STATE),
         Keyword::Try | Keyword::Catch | Keyword::Finally => Some(Features::TRY),
         Keyword::Defer => Some(Features::DEFER),
         Keyword::Given | Keyword::When | Keyword::Default | Keyword::Break => Some(Features::SWITCH),
