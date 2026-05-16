@@ -2246,10 +2246,6 @@ impl Parser {
                 }
             }
 
-            // Logical EOF from __DATA__/__END__/^D/^Z mid-expression — silently terminate.  The Pratt loop will see
-            // Eof on the next peek and exit, so the surrounding expression terminates with whatever was collected.
-            Token::Eof if self.lexer.logical_eof => Ok(Expr { kind: ExprKind::Undef, span }),
-
             other => Err(ParseError::new(format!("expected expression, got {other:?}"), span)),
         }
     }

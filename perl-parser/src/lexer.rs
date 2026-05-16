@@ -130,7 +130,7 @@ pub(crate) struct Lexer {
     case_mod_ucfirst: bool,
     /// Set by `lex_word` when `__DATA__` or `__END__` triggers logical end-of-source, or by the `^D`/`^Z` handler.
     /// When true, `lex_normal_token` returns `Eof` immediately.
-    pub(crate) logical_eof: bool,
+    logical_eof: bool,
     /// Set when `__DATA__` or `__END__` triggers logical EOF.  Stores the keyword and the byte offset where trailing
     /// data begins (for the `<DATA>` filehandle).  The parser reads this after the statement loop exits.
     pub(crate) data_end_info: Option<(Keyword, u32)>,
@@ -913,6 +913,10 @@ impl Lexer {
             match self.peek_byte(false) {
                 Some(b' ') | Some(b'\t') | Some(b'\n') => self.skip(1),
                 Some(b'#') => {
+                    // Check for `# line N "file"` directive at column 0, same as skip_ws_and_comments.
+                    if self.line_pos() == 0 {
+                        self.try_line_directive();
+                    }
                     self.current_line = None;
                 }
                 _ => break,
@@ -2052,6 +2056,22 @@ impl Lexer {
             _ => {}
         }
 
+        // `x=` compound assignment: when the identifier is exactly "x" and the immediately next byte (no whitespace —
+        // scan_ident stopped at a non-ident char) is `=` not followed by `>` (which would be `x =>`, a fat comma), emit
+        // RepeatEq.  Must be before at_fat_comma which consumes whitespace and would break the adjacency check.
+        if name == "x" && self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) != Some(b'>') {
+            self.skip(1); // consume =
+            return Ok(Token::Assign(AssignOp::RepeatEq));
+        }
+
+        // Fat-comma autoquoting: `if => 1`, `foo => 1`, `v5 => 1`, `__PACKAGE__ => 1`, etc.  The four tokens above
+        // (__DATA__, __END__, __FILE__, __LINE__) already handled their own fat-comma checks; everything else goes
+        // through here.  Must be before the v-string check so that `v5 => 1` autoquotes as "v5" instead of producing
+        // VersionLit("v5").
+        if self.at_fat_comma() {
+            return Ok(Token::StrLit(name));
+        }
+
         // v-strings: v5, v5.26, v5.26.0 etc.
         if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|b| b.is_ascii_digit()) {
             let mut vstr = name.clone();
@@ -2070,20 +2090,6 @@ impl Lexer {
                 }
             }
             return Ok(Token::VersionLit(vstr));
-        }
-
-        // `x=` compound assignment: when the identifier is exactly "x" and the immediately next byte (no whitespace —
-        // scan_ident stopped at a non-ident char) is `=` not followed by `>` (which would be `x =>`, a fat comma), emit
-        // RepeatEq.
-        if name == "x" && self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) != Some(b'>') {
-            self.skip(1); // consume =
-            return Ok(Token::Assign(AssignOp::RepeatEq));
-        }
-
-        // Fat-comma autoquoting: `if => 1`, `foo => 1`, `__PACKAGE__ => 1`, etc.  The four tokens above (__DATA__,
-        // __END__, __FILE__, __LINE__) already handled their own fat-comma checks; everything else goes through here.
-        if self.at_fat_comma() {
-            return Ok(Token::StrLit(name));
         }
 
         // Keywords — check feature gating for conditional keywords.

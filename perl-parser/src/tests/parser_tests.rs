@@ -2707,6 +2707,26 @@ fn parse_hash_expr_not_autoquoted() {
 // ── -bareword fat comma autoquoting ───────────────────────
 
 #[test]
+fn parse_vstring_before_fat_comma_autoquotes() {
+    // v5 => 1 — Perl autoquotes "v5" as a plain string, NOT a v-string.  Fat-comma autoquoting takes precedence.
+    let e = parse_expr_str("v5 => 1;");
+    match &e.kind {
+        ExprKind::List(items) => {
+            assert!(matches!(items[0].kind, ExprKind::StringLit(ref s) if s == "v5"), "expected StringLit(\"v5\"), got {:?}", items[0].kind);
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_qualified_name_before_fat_comma() {
+    // Foo::Bar => 1 — Perl autoquotes the full qualified name "Foo::Bar".  The lexer must not autoquote just "Bar"
+    // when it sees => after it, because "Bar" is part of the qualified name "Foo::Bar".
+    let prog = parse("my %h = (Foo::Bar => 1);\n");
+    assert_eq!(prog.statements.len(), 1);
+}
+
+#[test]
 fn parse_neg_bareword_fat_comma() {
     // -key => 42 — the lexer autoquotes `key` to StrLit("key"), the parser wraps in Negate.  At runtime, string
     // negation of "key" produces "-key".  (A future optimization could collapse this to StringLit("-key") at parse

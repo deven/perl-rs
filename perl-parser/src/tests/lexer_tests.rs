@@ -1508,6 +1508,28 @@ fn lex_end_with_fat_comma_autoquotes() {
 }
 
 #[test]
+fn lex_file_preserves_value_when_fat_comma_crosses_line_directive() {
+    // __FILE__ followed by a `# line` directive on the next line, then a non-=> token.  at_fat_comma skips past the
+    // directive while searching for `=>`, but __FILE__'s value must be the ORIGINAL filename (saved before the scan).
+    let tokens = lex_all("__FILE__\n# line 100 \"changed.pl\"\n, __FILE__;\n");
+    // First __FILE__: saved before at_fat_comma crossed the directive.
+    assert!(matches!(&tokens[0], Token::SourceFile(f) if f != "changed.pl"), "first __FILE__ should be original filename, got {:?}", tokens[0]);
+    // Second __FILE__: after the directive took effect.
+    let second_file = tokens.iter().filter(|t| matches!(t, Token::SourceFile(_))).nth(1);
+    assert!(matches!(second_file, Some(Token::SourceFile(f)) if f == "changed.pl"), "second __FILE__ should be \"changed.pl\", got {:?}", second_file);
+}
+
+#[test]
+fn lex_line_preserves_value_when_fat_comma_crosses_newlines() {
+    // __LINE__ on line 1, followed by newlines.  at_fat_comma skips past them, but __LINE__ must report line 1.
+    let tokens = lex_all("__LINE__\n\n\n, __LINE__;\n");
+    assert!(matches!(&tokens[0], Token::SourceLine(1)), "first __LINE__ should be 1, got {:?}", tokens[0]);
+    // Second __LINE__ should be on line 4 (after three newlines).
+    let second_line = tokens.iter().filter(|t| matches!(t, Token::SourceLine(_))).nth(1);
+    assert!(matches!(second_line, Some(Token::SourceLine(n)) if *n == 4), "second __LINE__ should be 4, got {:?}", second_line);
+}
+
+#[test]
 fn lex_ctrl_d_eof() {
     // ^D triggers logical EOF — tokens before it are collected, everything after is ignored.
     let tokens = lex_all("1;\x04more stuff");
