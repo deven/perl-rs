@@ -4407,6 +4407,68 @@ fn parse_indirect_with_var() {
     }
 }
 
+#[test]
+fn indirect_without_feature_is_bareword() {
+    // Without the indirect feature (dropped from :5.36+), `new Foo(1)` is NOT an indirect method call.
+    // `new` is a plain bareword.
+    let e = parse_expr_str("use v5.36; new Foo(1);");
+    assert!(!matches!(e.kind, ExprKind::IndirectMethodCall(..)), "without indirect feature, `new Foo(1)` should not be IndirectMethodCall, got {:?}", e.kind);
+}
+
+#[test]
+fn bareword_filehandle_without_feature_is_first_arg() {
+    // Without bareword_filehandles (dropped from :5.38+), `print STDERR "hello"` treats STDERR as the first argument,
+    // not a filehandle.
+    let e = parse_expr_str("use v5.38; print STDERR;");
+    match &e.kind {
+        ExprKind::PrintOp(_, fh, _) => {
+            assert!(fh.is_none(), "without bareword_filehandles, STDERR should not be a filehandle, got {:?}", fh);
+        }
+        other => panic!("expected PrintOp, got {other:?}"),
+    }
+}
+
+#[test]
+fn bareword_filehandle_with_feature_works() {
+    // With the feature (in :default), `print STDERR "hello"` recognizes STDERR as a filehandle.
+    let e = parse_expr_str("print STDERR 'hello';");
+    match &e.kind {
+        ExprKind::PrintOp(_, fh, _) => {
+            assert!(fh.is_some(), "with bareword_filehandles, STDERR should be a filehandle");
+        }
+        other => panic!("expected PrintOp, got {other:?}"),
+    }
+}
+
+#[test]
+fn multidimensional_hash_with_feature() {
+    // With the feature (in :default), `$h{1,2,3}` is transformed to `$h{join($;, 1, 2, 3)}`.
+    let prog = parse("$h{1,2,3};");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::HashElem(_, key), .. }) => {
+            assert!(
+                matches!(key.kind, ExprKind::FuncCall(ref name, _) if name == "CORE::join"),
+                "with multidimensional, expected join transformation, got {:?}",
+                key.kind
+            );
+        }
+        other => panic!("expected HashElem, got {other:?}"),
+    }
+}
+
+#[test]
+fn multidimensional_hash_without_feature() {
+    // Without the feature (dropped from :5.36+), `$h{1,2,3}` is left as a comma-list — no join transformation.
+    // The compiler emits "Multidimensional hash lookup is disabled".
+    let prog = parse("use v5.36; $h{1,2,3};");
+    match &prog.statements[1].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::HashElem(_, key), .. }) => {
+            assert!(matches!(key.kind, ExprKind::List(_)), "without multidimensional, expected List (no join), got {:?}", key.kind);
+        }
+        other => panic!("expected HashElem, got {other:?}"),
+    }
+}
+
 // ── Heredoc interpolation tests ───────────────────────────
 
 #[test]

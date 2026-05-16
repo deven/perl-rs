@@ -2373,56 +2373,59 @@ impl Parser {
         // Indirect object syntax: METHOD CLASS ARGS
         // e.g. new Foo(args), new Foo args
         // Heuristic: bareword followed by a capitalized bareword or $var.
-        match self.peek_token() {
-            Token::Ident(class_name) if class_name.starts_with(|c: char| c.is_ascii_uppercase()) => {
-                let class_name = class_name.clone();
-                let class_span = self.peek_span();
-                self.next_token()?; // eat class name
-                let class_expr = Expr { kind: ExprKind::Bareword(class_name), span: class_span };
+        // Requires `use feature 'indirect'` (in :default, dropped from :5.36+).
+        if self.pragmas.features.contains(Features::INDIRECT) {
+            match self.peek_token() {
+                Token::Ident(class_name) if class_name.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                    let class_name = class_name.clone();
+                    let class_span = self.peek_span();
+                    self.next_token()?; // eat class name
+                    let class_expr = Expr { kind: ExprKind::Bareword(class_name), span: class_span };
 
-                // Optional args
-                let mut args = Vec::new();
-                if self.at(&Token::LeftParen)? {
-                    self.next_token()?;
-                    while !self.at(&Token::RightParen)? && !self.at_eof()? {
-                        args.push(self.parse_expr(PREC_COMMA + 1)?);
-                        if !self.eat(&Token::Comma)? {
-                            break;
+                    // Optional args
+                    let mut args = Vec::new();
+                    if self.at(&Token::LeftParen)? {
+                        self.next_token()?;
+                        while !self.at(&Token::RightParen)? && !self.at_eof()? {
+                            args.push(self.parse_expr(PREC_COMMA + 1)?);
+                            if !self.eat(&Token::Comma)? {
+                                break;
+                            }
                         }
+                        let end = self.peek_span();
+                        self.expect_token(&Token::RightParen)?;
+                        return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(end) });
                     }
-                    let end = self.peek_span();
-                    self.expect_token(&Token::RightParen)?;
-                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(end) });
+
+                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(class_span) });
                 }
+                Token::ScalarVar(_) => {
+                    let var_span = self.peek_span();
+                    let var = match self.next_token()?.token {
+                        Token::ScalarVar(n) => n,
+                        _ => unreachable!(),
+                    };
+                    let invocant = Expr { kind: ExprKind::ScalarVar(var), span: var_span };
 
-                return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(class_span) });
-            }
-            Token::ScalarVar(_) => {
-                let var_span = self.peek_span();
-                let var = match self.next_token()?.token {
-                    Token::ScalarVar(n) => n,
-                    _ => unreachable!(),
-                };
-                let invocant = Expr { kind: ExprKind::ScalarVar(var), span: var_span };
-
-                let mut args = Vec::new();
-                if self.at(&Token::LeftParen)? {
-                    self.next_token()?;
-                    while !self.at(&Token::RightParen)? && !self.at_eof()? {
-                        args.push(self.parse_expr(PREC_COMMA + 1)?);
-                        if !self.eat(&Token::Comma)? {
-                            break;
+                    let mut args = Vec::new();
+                    if self.at(&Token::LeftParen)? {
+                        self.next_token()?;
+                        while !self.at(&Token::RightParen)? && !self.at_eof()? {
+                            args.push(self.parse_expr(PREC_COMMA + 1)?);
+                            if !self.eat(&Token::Comma)? {
+                                break;
+                            }
                         }
+                        let end = self.peek_span();
+                        self.expect_token(&Token::RightParen)?;
+                        return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(end) });
                     }
-                    let end = self.peek_span();
-                    self.expect_token(&Token::RightParen)?;
-                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(end) });
-                }
 
-                return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(var_span) });
+                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(var_span) });
+                }
+                _ => {}
             }
-            _ => {}
-        }
+        } // INDIRECT feature gate
 
         // Bare identifier — not followed by ( or indirect object context.
         Ok(Expr { kind: ExprKind::Bareword(name), span })
@@ -2843,7 +2846,7 @@ impl Parser {
         let mut filehandle: Option<Box<Expr>> = None;
         let mut first_arg: Option<Expr> = None;
 
-        let is_bareword = matches!(self.peek_token(), Token::Ident(_));
+        let is_bareword = matches!(self.peek_token(), Token::Ident(_)) && self.pragmas.features.contains(Features::BAREWORD_FILEHANDLES);
         let is_scalar = matches!(self.peek_token(), Token::ScalarVar(_));
 
         if is_bareword {
@@ -3007,7 +3010,18 @@ impl Parser {
         if let Some((name, span)) = self.lexer.try_autoquoted_subscript_key() {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
-        self.parse_expr(PREC_LOW)
+        let key = self.parse_expr(PREC_LOW)?;
+        // Multidimensional hash emulation: `$h{1,2,3}` → `$h{join($;, 1, 2, 3)}`.  When the feature is off, the
+        // comma-list is left as-is for the compiler to diagnose ("Multidimensional hash lookup is disabled").
+        if let ExprKind::List(items) = &key.kind
+            && self.pragmas.features.contains(Features::MULTIDIMENSIONAL)
+        {
+            let span = key.span;
+            let mut args = vec![Expr { kind: ExprKind::SpecialVar(";".to_string()), span }];
+            args.extend(items.iter().cloned());
+            return Ok(Expr { kind: ExprKind::FuncCall("CORE::join".to_string(), args), span });
+        }
+        Ok(key)
     }
 
     /// Check for `%hash{keys}` (kv hash slice) or `%array[indices]` (kv array slice) subscripts on a hash-sigil
