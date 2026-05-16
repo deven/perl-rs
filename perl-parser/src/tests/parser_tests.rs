@@ -3663,19 +3663,13 @@ fn refalias_list_form() {
     let e = parse_expr_stmt("use feature 'refaliasing'; no warnings 'experimental::refaliasing'; (\\$a, \\$b) = (\\$c, \\$d);");
     match e.kind {
         ExprKind::Assign(AssignOp::Eq, lhs, _) => {
-            // LHS should be a list / paren containing Refs.
+            // LHS should be a list containing Refs.
             match &lhs.kind {
-                ExprKind::Paren(inner) => match &inner.kind {
-                    ExprKind::List(items) => {
-                        assert_eq!(items.len(), 2);
-                        assert!(items.iter().all(|e| matches!(e.kind, ExprKind::Ref(_))));
-                    }
-                    other => panic!("expected List inside Paren, got {other:?}"),
-                },
                 ExprKind::List(items) => {
+                    assert_eq!(items.len(), 2);
                     assert!(items.iter().all(|e| matches!(e.kind, ExprKind::Ref(_))));
                 }
-                other => panic!("expected List/Paren on LHS, got {other:?}"),
+                other => panic!("expected List on LHS, got {other:?}"),
             }
         }
         other => panic!("expected Assign, got {other:?}"),
@@ -4689,12 +4683,8 @@ fn torture_ref_to_expr_in_interp() {
             // Outer is Ref(\...).
             match &e.kind {
                 ExprKind::Ref(inner) => {
-                    // Inner is the paren-wrapped addition.
-                    let actual_add = match &inner.kind {
-                        ExprKind::Paren(p) => p,
-                        other => panic!("expected Paren inside Ref, got {other:?}"),
-                    };
-                    assert!(matches!(actual_add.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add, got {:?}", actual_add.kind);
+                    // Inner is the addition (parens are syntactic-only, not in the AST).
+                    assert!(matches!(inner.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add, got {:?}", inner.kind);
                 }
                 other => panic!("expected Ref, got {other:?}"),
             }
@@ -6699,14 +6689,9 @@ fn parse_fat_comma_keyword_cross_line() {
 
 // ── Autoquote in fat-comma context ────────────────────────
 
-/// Parse `(KEYWORD => 1);` and return the first list element.  Handles the outer Paren wrapping produced by the
-/// `(...)`.
+/// Parse `(KEYWORD => 1);` and return the first list element.
 fn parse_kw_fat_comma(src: &str) -> Expr {
-    let mut e = parse_expr_str(src);
-    // Unwrap a single-level Paren — `(k => v)` parses as Paren(List([k, v])) rather than bare List.
-    if let ExprKind::Paren(inner) = e.kind {
-        e = *inner;
-    }
+    let e = parse_expr_str(src);
     match e.kind {
         ExprKind::List(mut items) => {
             assert!(!items.is_empty(), "expected non-empty list for {src:?}");
@@ -7888,12 +7873,7 @@ fn hard_assign_paren_comma() {
     let e = parse_expr_str("$a = ($b, $c);");
     match &e.kind {
         ExprKind::Assign(_, _, rhs) => {
-            // RHS should be a List (possibly wrapped in Paren).
-            let inner = match &rhs.kind {
-                ExprKind::Paren(inner) => &inner.kind,
-                other => other,
-            };
-            assert!(matches!(inner, ExprKind::List(_)), "expected List on RHS, got {inner:?}");
+            assert!(matches!(rhs.kind, ExprKind::List(_)), "expected List on RHS, got {:?}", rhs.kind);
         }
         other => panic!("expected Assign, got {other:?}"),
     }
@@ -8007,6 +7987,76 @@ fn hard_regex_brace_delim() {
         }
         other => panic!("expected Binding, got {other:?}"),
     }
+}
+
+#[test]
+fn regex_escaped_delimiter() {
+    // `m/foo\/bar/` — escaped forward slash inside regex.
+    let e = parse_expr_str(r#"m/foo\/bar/;"#);
+    match &e.kind {
+        ExprKind::Regex(_, pat, _) => {
+            let s = pat_str(pat);
+            assert!(s.contains('/') || s.contains("\\/"), "expected escaped slash in pattern, got {s:?}");
+        }
+        other => panic!("expected Regex, got {other:?}"),
+    }
+}
+
+#[test]
+fn regex_escaped_delimiter_at_end() {
+    // `m/\//` — the pattern is just an escaped slash.
+    let e = parse_expr_str(r#"m/\//;"#);
+    assert!(matches!(e.kind, ExprKind::Regex(_, _, _)), "expected Regex, got {:?}", e.kind);
+}
+
+#[test]
+fn subst_escaped_delimiters_both_halves() {
+    // `s/foo\/bar/baz\/qux/` — escaped slashes in both pattern and replacement.
+    let e = parse_expr_str(r#"s/foo\/bar/baz\/qux/;"#);
+    assert!(matches!(e.kind, ExprKind::Subst(_, _, _)), "expected Subst, got {:?}", e.kind);
+}
+
+#[test]
+fn regex_brace_delim_no_escape_needed() {
+    // `m{foo/bar}` — with brace delimiters, `/` doesn't need escaping.
+    let e = parse_expr_str("m{foo/bar};");
+    match &e.kind {
+        ExprKind::Regex(_, pat, _) => {
+            let s = pat_str(pat);
+            assert!(s.contains('/'), "expected literal / in pattern, got {s:?}");
+        }
+        other => panic!("expected Regex, got {other:?}"),
+    }
+}
+
+#[test]
+fn depth_parens_are_iterative() {
+    // Deeply nested parens are handled iteratively and don't produce nested AST nodes (parens are syntactic-only).
+    // No recursion in parsing or dropping.
+    let depth = 100_000;
+    let src = format!("{}1{};", "(".repeat(depth), ")".repeat(depth));
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_ok(), "deeply nested parens should be iterative, got: {:?}", result.err());
+}
+
+#[test]
+fn depth_array_refs_are_iterative() {
+    // Deeply nested array refs `[[[[1]]]]` are parsed iteratively, but the AST is deeply nested (AnonArray wrapping
+    // AnonArray), so Rust's recursive Drop limits the practical depth.  10,000 levels is safe for an 8MB stack.
+    let depth = 10_000;
+    let src = format!("{}1{};", "[".repeat(depth), "]".repeat(depth));
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_ok(), "deeply nested array refs should be iterative, got: {:?}", result.err());
+}
+
+#[test]
+fn depth_prefix_ops_are_iterative() {
+    // Deeply nested prefix ops `-(-(-(1)))` are parsed iteratively, but the AST is deeply nested (UnaryOp wrapping
+    // UnaryOp), so Drop limits practical depth.
+    let depth = 10_000;
+    let src = format!("{}1{};", "-(".repeat(depth), ")".repeat(depth));
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_ok(), "deeply nested prefix ops should be iterative, got: {:?}", result.err());
 }
 
 // ── Combined nightmare cases ──────────────────────────────
@@ -8241,12 +8291,7 @@ fn hard_my_in_parens() {
     let prog = parse("(my $x) = @list;");
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
-            // LHS should contain a Decl (possibly wrapped in Paren).
-            let inner = match &lhs.kind {
-                ExprKind::Paren(inner) => &inner.kind,
-                other => other,
-            };
-            assert!(matches!(inner, ExprKind::Decl(DeclScope::My, _)), "expected Decl on LHS, got {inner:?}");
+            assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::My, _)), "expected Decl on LHS, got {:?}", lhs.kind);
         }
         other => panic!("expected Assign, got {other:?}"),
     }
@@ -10910,12 +10955,11 @@ fn nfc_escape_sequences_must_not_be_normalized() {
 fn nfc_fat_comma_autoquote_verified() {
     // Fat comma with NFD bareword — verify the autoquoted string is NFC.
     let rhs = first_assign_rhs(&parse("use utf8; my %h = (cafe\u{0301} => 1);"));
-    // RHS is Paren(List([StringLit("café"), Int(1)])) or List([...]).
+    // RHS is List([StringLit("café"), Int(1)]).
     fn find_nfc_key(e: &Expr) -> bool {
         match &e.kind {
             ExprKind::StringLit(s) => s == "caf\u{00E9}",
             ExprKind::List(items) => items.iter().any(find_nfc_key),
-            ExprKind::Paren(inner) => find_nfc_key(inner),
             _ => false,
         }
     }

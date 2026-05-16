@@ -25,6 +25,45 @@ pub type ParseDepth = u16;
 
 const MAX_DEPTH: ParseDepth = 10_000;
 
+/// Continuation frame for the iterative expression parser.  Each frame captures what to do with a sub-expression after
+/// the forward phase (which consumed a prefix operator or opening delimiter) completes.
+enum ExprFrame {
+    /// Simple prefix unary: wrap result in UnaryOp.
+    Unary { op: UnaryOp, span: Span, min_prec: Precedence },
+    /// Negate prefix: `-expr`, with string negation collapse.
+    Negate { span: Span, min_prec: Precedence },
+    /// Reference: `\expr`.
+    Ref { span: Span, min_prec: Precedence },
+    /// `local expr` — dynamically scopes any lvalue.
+    Local { span: Span, min_prec: Precedence },
+    /// Prefix `++`/`--` with lvalue validation.
+    PreIncDec { op: UnaryOp, span: Span, min_prec: Precedence },
+    /// Parenthesized expression: expect `)`, wrap in Paren, check for postfix subscript.
+    Paren { span: Span, min_prec: Precedence },
+    /// Anonymous array ref `[elem, ...]`: accumulating elements.
+    ArrayRef { elems: Vec<Expr>, span: Span, min_prec: Precedence },
+    /// Anonymous hash constructor `{key => val, ...}`: accumulating elements.
+    HashRef { elems: Vec<Expr>, span: Span, min_prec: Precedence },
+}
+
+/// Result of `try_prefix`: either a frame to push (prefix op consumed, continue looking for more), a complete leaf
+/// expression (no further prefix processing needed), or None (not a prefix — proceed to `parse_term`).
+enum PrefixResult {
+    /// Consumed a prefix op; push this frame and continue.  The second element is the inner precedence for the
+    /// sub-expression.
+    Frame(ExprFrame, Precedence),
+    /// Consumed a complete leaf expression (e.g. filetest, -bareword).
+    Leaf(Expr),
+}
+
+/// Result of applying a continuation frame.
+enum FrameResult {
+    /// Frame fully applied — here's the result expression and the outer precedence to restore.
+    Done(Expr, Precedence),
+    /// Frame needs more elements (array/hash accumulation) — re-push and re-enter the forward phase.
+    Continue(ExprFrame, Precedence),
+}
+
 // ── Precedence constants ──────────────────────────────────────
 // Gaps of 2 to allow plugin operators at intermediate levels.
 
@@ -1621,11 +1660,226 @@ impl Parser {
 
     // ── Expression parsing (Pratt) ────────────────────────────
 
+    /// Parse an expression at the given minimum precedence.  The forward phase consumes prefix operators and opening
+    /// parens iteratively (no recursion) until a leaf term is reached.  The backward phase applies saved frames,
+    /// running the infix continuation loop at each precedence level.  This eliminates the recursive `parse_expr` →
+    /// `parse_term` → `parse_expr` chain that previously caused stack overflow on deeply nested input.
     fn parse_expr(&mut self, min_prec: Precedence) -> Result<Expr, ParseError> {
-        self.with_descent(|this| {
-            let left = this.parse_term()?;
-            this.parse_expr_continuation(left, min_prec)
-        })
+        let mut stack: Vec<ExprFrame> = Vec::new();
+        let mut current_prec = min_prec;
+
+        // Forward phase: consume prefix operators, parens, and opening delimiters iteratively.
+        let mut left = self.parse_expr_forward(&mut stack, &mut current_prec)?;
+
+        // Backward phase: run the infix loop at each level, then apply the saved frame.
+        loop {
+            left = self.parse_expr_continuation(left, current_prec)?;
+            match stack.pop() {
+                None => return Ok(left),
+                Some(frame) => match self.apply_expr_frame(frame, left)? {
+                    FrameResult::Done(expr, prec) => {
+                        left = expr;
+                        current_prec = prec;
+                    }
+                    FrameResult::Continue(frame, inner_prec) => {
+                        // Accumulator frame needs more elements — re-push and re-enter forward phase.
+                        stack.push(frame);
+                        current_prec = inner_prec;
+                        left = self.parse_expr_forward(&mut stack, &mut current_prec)?;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Forward phase: consume prefix operators and opening delimiters, pushing continuation frames.
+    fn parse_expr_forward(&mut self, stack: &mut Vec<ExprFrame>, current_prec: &mut Precedence) -> Result<Expr, ParseError> {
+        loop {
+            match self.try_prefix(*current_prec)? {
+                Some(PrefixResult::Frame(frame, inner_prec)) => {
+                    stack.push(frame);
+                    *current_prec = inner_prec;
+                }
+                Some(PrefixResult::Leaf(expr)) => return Ok(expr),
+                None => return self.parse_term(),
+            }
+        }
+    }
+
+    /// Try to consume a prefix operator or opening paren.  Returns `Frame` to push and continue, `Leaf` for a complete
+    /// term that doesn't recurse, or `None` if the current token is not a prefix.
+    fn try_prefix(&mut self, outer_prec: Precedence) -> Result<Option<PrefixResult>, ParseError> {
+        let span = self.peek_span();
+        match self.peek_token().clone() {
+            Token::LeftParen => {
+                self.next_token()?;
+                if self.at(&Token::RightParen)? {
+                    self.next_token()?;
+                    let expr = Expr { kind: ExprKind::List(vec![]), span };
+                    return Ok(Some(PrefixResult::Leaf(self.maybe_postfix_subscript(expr)?)));
+                }
+                Ok(Some(PrefixResult::Frame(ExprFrame::Paren { span, min_prec: outer_prec }, PREC_LOW)))
+            }
+            Token::Minus => {
+                self.next_token()?;
+                // Filetest: -f, -d, etc.  In fat-comma context, lex_filetest_after_minus returns StrLit.
+                match self.lexer.lex_filetest_after_minus() {
+                    Some(Token::Filetest(b)) => {
+                        let end = self.peek_span();
+                        return Ok(Some(PrefixResult::Leaf(self.parse_filetest(b, span.merge(end))?)));
+                    }
+                    Some(Token::StrLit(s)) => {
+                        return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::StringLit(s), span })));
+                    }
+                    _ => {}
+                }
+                // -bareword (not followed by parens) → StringLit("-bareword")
+                if let Token::Ident(name) = self.peek_token().clone() {
+                    let ident_span = self.peek_span();
+                    self.next_token()?;
+                    if matches!(self.peek_token(), Token::LeftParen) {
+                        // -func(...) → unary minus on function call
+                        let func = self.parse_ident_term(name, ident_span)?;
+                        return Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(func.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(func)) })));
+                    }
+                    return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(ident_span) })));
+                }
+                // General negate: -expr
+                Ok(Some(PrefixResult::Frame(ExprFrame::Negate { span, min_prec: outer_prec }, PREC_UNARY)))
+            }
+            Token::Plus => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::Unary { op: UnaryOp::NumPositive, span, min_prec: outer_prec }, PREC_UNARY)))
+            }
+            Token::Bang => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::Unary { op: UnaryOp::LogNot, span, min_prec: outer_prec }, PREC_UNARY)))
+            }
+            Token::Tilde => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::Unary { op: UnaryOp::BitNot, span, min_prec: outer_prec }, PREC_UNARY)))
+            }
+            Token::StringBitNot => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::Unary { op: UnaryOp::StringBitNot, span, min_prec: outer_prec }, PREC_UNARY)))
+            }
+            Token::Backslash => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::Ref { span, min_prec: outer_prec }, PREC_UNARY)))
+            }
+            Token::Keyword(Keyword::Not) => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::Unary { op: UnaryOp::Not, span, min_prec: outer_prec }, PREC_NOT_LOW)))
+            }
+            Token::PlusPlus => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::PreIncDec { op: UnaryOp::PreInc, span, min_prec: outer_prec }, PREC_INC)))
+            }
+            Token::MinusMinus => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::PreIncDec { op: UnaryOp::PreDec, span, min_prec: outer_prec }, PREC_INC)))
+            }
+            Token::Keyword(Keyword::Local) => {
+                self.next_token()?;
+                Ok(Some(PrefixResult::Frame(ExprFrame::Local { span, min_prec: outer_prec }, PREC_UNARY)))
+            }
+            Token::LeftBracket => {
+                self.next_token()?;
+                if self.at(&Token::RightBracket)? {
+                    self.next_token()?;
+                    return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::AnonArray(vec![]), span })));
+                }
+                Ok(Some(PrefixResult::Frame(ExprFrame::ArrayRef { elems: vec![], span, min_prec: outer_prec }, PREC_COMMA + 1)))
+            }
+            Token::LeftBrace => {
+                self.next_token()?;
+                if self.at(&Token::RightBrace)? {
+                    self.next_token()?;
+                    return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::AnonHash(vec![]), span })));
+                }
+                Ok(Some(PrefixResult::Frame(ExprFrame::HashRef { elems: vec![], span, min_prec: outer_prec }, PREC_COMMA + 1)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Apply a saved continuation frame to the completed sub-expression.
+    fn apply_expr_frame(&mut self, frame: ExprFrame, operand: Expr) -> Result<FrameResult, ParseError> {
+        match frame {
+            ExprFrame::Unary { op, span, min_prec } => {
+                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(op, Box::new(operand)) }, min_prec))
+            }
+            ExprFrame::Negate { span, min_prec } => {
+                // String negation collapse: -"foo" → "-foo", -"-foo" → "+foo", -"+foo" → "-foo".
+                if let ExprKind::StringLit(ref s) = operand.kind {
+                    let negated = if let Some(rest) = s.strip_prefix('-') {
+                        format!("+{rest}")
+                    } else if let Some(rest) = s.strip_prefix('+') {
+                        format!("-{rest}")
+                    } else {
+                        format!("-{s}")
+                    };
+                    Ok(FrameResult::Done(Expr { kind: ExprKind::StringLit(negated), span: span.merge(operand.span) }, min_prec))
+                } else {
+                    Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(operand)) }, min_prec))
+                }
+            }
+            ExprFrame::Ref { span, min_prec } => {
+                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::Ref(Box::new(operand)) }, min_prec))
+            }
+            ExprFrame::Local { span, min_prec } => {
+                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::Local(Box::new(operand)) }, min_prec))
+            }
+            ExprFrame::PreIncDec { op, span, min_prec } => {
+                if !Self::is_valid_lvalue(&operand) {
+                    let op_name = if op == UnaryOp::PreInc { "++" } else { "--" };
+                    return Err(ParseError::new(format!("invalid operand for prefix {op_name}"), operand.span));
+                }
+                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(op, Box::new(operand)) }, min_prec))
+            }
+            ExprFrame::Paren { span, min_prec } => {
+                let end = self.peek_span();
+                self.expect_token(&Token::RightParen)?;
+                // Don't wrap in ExprKind::Paren — parentheses are purely syntactic grouping, and the tree structure
+                // already captures precedence.  Avoiding the wrapper prevents recursive-Drop overflow on deeply nested
+                // parens.  Update the span to include the parens.
+                let expr = Expr { span: span.merge(end), ..operand };
+                let expr = self.maybe_postfix_subscript(expr)?;
+                Ok(FrameResult::Done(expr, min_prec))
+            }
+            ExprFrame::ArrayRef { mut elems, span, min_prec } => {
+                elems.push(operand);
+                if self.eat(&Token::Comma)? {
+                    if self.at(&Token::RightBracket)? {
+                        // Trailing comma: `[1, 2, 3,]`
+                        let end = self.peek_span();
+                        self.next_token()?;
+                        return Ok(FrameResult::Done(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) }, min_prec));
+                    }
+                    // More elements — re-enter forward phase.
+                    return Ok(FrameResult::Continue(ExprFrame::ArrayRef { elems, span, min_prec }, PREC_COMMA + 1));
+                }
+                let end = self.peek_span();
+                self.expect_token(&Token::RightBracket)?;
+                Ok(FrameResult::Done(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) }, min_prec))
+            }
+            ExprFrame::HashRef { mut elems, span, min_prec } => {
+                elems.push(operand);
+                if self.eat(&Token::Comma)? || self.eat(&Token::FatComma)? {
+                    if self.at(&Token::RightBrace)? {
+                        // Trailing comma: `{a => 1, b => 2,}`
+                        let end = self.peek_span();
+                        self.next_token()?;
+                        return Ok(FrameResult::Done(Expr { kind: ExprKind::AnonHash(elems), span: span.merge(end) }, min_prec));
+                    }
+                    // More elements — re-enter forward phase.
+                    return Ok(FrameResult::Continue(ExprFrame::HashRef { elems, span, min_prec }, PREC_COMMA + 1));
+                }
+                let end = self.peek_span();
+                self.expect_token(&Token::RightBrace)?;
+                Ok(FrameResult::Done(Expr { kind: ExprKind::AnonHash(elems), span: span.merge(end) }, min_prec))
+            }
+        }
     }
 
     /// Continue parsing an expression from a pre-built left-hand side.  Runs the Pratt operator loop without calling
@@ -1644,6 +1898,12 @@ impl Parser {
     // ── Term parsing ──────────────────────────────────────────
 
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
+        // Depth guard for remaining recursive cases (array refs, hash constructors, eval, etc.).  Prefix operators
+        // and parentheses are handled iteratively by parse_expr and don't recurse through here.
+        self.with_descent(|this| this.parse_term_inner())
+    }
+
+    fn parse_term_inner(&mut self) -> Result<Expr, ParseError> {
         let spanned = self.next_token()?;
         let span = spanned.span;
 
@@ -1902,87 +2162,6 @@ impl Parser {
             Token::Keyword(Keyword::Undef) => Ok(Expr { kind: ExprKind::Undef, span }),
             Token::Keyword(Keyword::Wantarray) => Ok(Expr { kind: ExprKind::Wantarray, span }),
 
-            // Prefix unary operators
-            Token::Minus => {
-                // -f, -d, -r, etc. → filetest operator (single letter not followed by word-continuation char).
-                // In fat-comma context (`-f => val`), lex_filetest_after_minus returns StrLit("-f") directly.
-                match self.lexer.lex_filetest_after_minus() {
-                    Some(Token::Filetest(b)) => {
-                        let end = self.peek_span();
-                        return self.parse_filetest(b, span.merge(end));
-                    }
-                    Some(Token::StrLit(s)) => {
-                        return Ok(Expr { kind: ExprKind::StringLit(s), span });
-                    }
-                    _ => {}
-                }
-                // -bareword (not followed by parens) → StringLit("-bareword")
-                // Perl: unary minus on an identifier always returns "-identifier".
-                if let Token::Ident(name) = self.peek_token().clone() {
-                    let ident_span = self.peek_span();
-                    self.next_token()?; // consume the ident
-                    if matches!(self.peek_token(), Token::LeftParen) {
-                        // -func(...) → unary minus on function call.
-                        let func = self.parse_ident_term(name, ident_span)?;
-                        return Ok(Expr { span: span.merge(func.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(func)) });
-                    }
-                    // -bareword → StringLit("-bareword")
-                    return Ok(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(ident_span) });
-                }
-                let operand = self.parse_expr(PREC_UNARY)?;
-                // String negation collapse: -"foo" → "-foo", -"-foo" → "+foo", -"+foo" → "-foo".  Matches Perl's
-                // compile-time folding of unary minus on string literals.
-                if let ExprKind::StringLit(ref s) = operand.kind {
-                    let negated = if let Some(rest) = s.strip_prefix('-') {
-                        format!("+{rest}")
-                    } else if let Some(rest) = s.strip_prefix('+') {
-                        format!("-{rest}")
-                    } else {
-                        format!("-{s}")
-                    };
-                    return Ok(Expr { kind: ExprKind::StringLit(negated), span: span.merge(operand.span) });
-                }
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(operand)) })
-            }
-            Token::Plus => {
-                let operand = self.parse_expr(PREC_UNARY)?;
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::NumPositive, Box::new(operand)) })
-            }
-            Token::Bang => {
-                let operand = self.parse_expr(PREC_UNARY)?;
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::LogNot, Box::new(operand)) })
-            }
-            Token::Tilde => {
-                let operand = self.parse_expr(PREC_UNARY)?;
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::BitNot, Box::new(operand)) })
-            }
-            Token::StringBitNot => {
-                let operand = self.parse_expr(PREC_UNARY)?;
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::StringBitNot, Box::new(operand)) })
-            }
-            Token::Backslash => {
-                let operand = self.parse_expr(PREC_UNARY)?;
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Ref(Box::new(operand)) })
-            }
-            Token::Keyword(Keyword::Not) => {
-                let operand = self.parse_expr(PREC_NOT_LOW)?;
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Not, Box::new(operand)) })
-            }
-            Token::PlusPlus => {
-                let operand = self.parse_expr(PREC_INC)?;
-                if !Self::is_valid_lvalue(&operand) {
-                    return Err(ParseError::new("invalid operand for prefix ++", operand.span));
-                }
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::PreInc, Box::new(operand)) })
-            }
-            Token::MinusMinus => {
-                let operand = self.parse_expr(PREC_INC)?;
-                if !Self::is_valid_lvalue(&operand) {
-                    return Err(ParseError::new("invalid operand for prefix --", operand.span));
-                }
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::PreDec, Box::new(operand)) })
-            }
-
             // Declaration in expression context: my $x, our ($a, $b), state $x
             Token::Keyword(Keyword::My) | Token::Keyword(Keyword::Our) | Token::Keyword(Keyword::State) => {
                 let scope = match spanned.token {
@@ -1992,13 +2171,6 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 self.parse_decl_expr(scope, span)
-            }
-
-            // local is different — it dynamically scopes any lvalue, not just bare variables: local $hash{key}, local
-            // $/, local *GLOB
-            Token::Keyword(Keyword::Local) => {
-                let operand = self.parse_expr(PREC_UNARY)?;
-                Ok(Expr { span: span.merge(operand.span), kind: ExprKind::Local(Box::new(operand)) })
             }
 
             // Anonymous sub: sub { ... } or sub ($x) { ... }
@@ -2075,51 +2247,6 @@ impl Parser {
 
             // List operators
             Token::Keyword(kw) if keyword::is_list_op(kw) => self.parse_list_op(kw, span),
-
-            // Parenthesized expression or list
-            Token::LeftParen => {
-                if self.at(&Token::RightParen)? {
-                    self.next_token()?;
-                    let expr = Expr { kind: ExprKind::List(vec![]), span };
-                    self.maybe_postfix_subscript(expr)
-                } else {
-                    let inner = self.parse_expr(PREC_LOW)?;
-                    let end = self.peek_span();
-                    self.expect_token(&Token::RightParen)?;
-                    let expr = Expr { kind: ExprKind::Paren(Box::new(inner)), span: span.merge(end) };
-                    // `(LIST)[idx]` and `(LIST){key}` are list/hash slices — valid postfix subscripts on parens.
-                    self.maybe_postfix_subscript(expr)
-                }
-            }
-
-            // Anonymous array ref [...]
-            Token::LeftBracket => {
-                let mut elems = Vec::new();
-                while !self.at(&Token::RightBracket)? && !self.at_eof()? {
-                    elems.push(self.parse_expr(PREC_COMMA + 1)?);
-                    if !self.eat(&Token::Comma)? {
-                        break;
-                    }
-                }
-                let end = self.peek_span();
-                self.expect_token(&Token::RightBracket)?;
-                Ok(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) })
-            }
-
-            // Anonymous hash constructor: {key => val, ...}
-            // In term position, `{` is always a hash constructor.
-            Token::LeftBrace => {
-                let mut elems = Vec::new();
-                while !self.at(&Token::RightBrace)? && !self.at_eof()? {
-                    elems.push(self.parse_expr(PREC_COMMA + 1)?);
-                    if !self.eat(&Token::Comma)? && !self.eat(&Token::FatComma)? {
-                        break;
-                    }
-                }
-                let end = self.peek_span();
-                self.expect_token(&Token::RightBrace)?;
-                Ok(Expr { kind: ExprKind::AnonHash(elems), span: span.merge(end) })
-            }
 
             Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
 

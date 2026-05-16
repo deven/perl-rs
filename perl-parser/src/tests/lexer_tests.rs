@@ -734,6 +734,58 @@ fn lex_scientific_pos_exponent() {
     assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 2e5).abs() < 1.0));
 }
 
+#[test]
+#[ignore = "lexer doesn't handle leading-dot floats yet — `.` is lexed as Dot before checking for trailing digits"]
+fn lex_leading_dot_float() {
+    // `.5` — leading dot is a valid float literal in Perl.
+    let tokens = lex_all(".5");
+    assert_eq!(tokens.len(), 1);
+    assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 0.5).abs() < 1e-15));
+}
+
+#[test]
+#[ignore = "lexer doesn't handle leading-dot floats yet — `.` is lexed as Dot before checking for trailing digits"]
+fn lex_leading_dot_float_with_exponent() {
+    let tokens = lex_all(".5e2");
+    assert_eq!(tokens.len(), 1);
+    assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 50.0).abs() < 1e-10));
+}
+
+#[test]
+fn lex_trailing_dot_is_int_then_concat() {
+    // `0.` — in Perl, this is `0` followed by `.` (concat).  NOT a float.
+    let tokens = lex_all("0 .");
+    assert_eq!(tokens, vec![Token::IntLit(0), Token::Dot]);
+}
+
+#[test]
+fn lex_scientific_no_fraction() {
+    // `1e10` — integer with exponent, no decimal point.
+    let tokens = lex_all("1e10");
+    assert_eq!(tokens.len(), 1);
+    assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 1e10).abs() < 1.0));
+}
+
+#[test]
+fn lex_scientific_uppercase_e() {
+    let tokens = lex_all("1.5E3");
+    assert_eq!(tokens.len(), 1);
+    assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 1500.0).abs() < 1e-10));
+}
+
+#[test]
+fn lex_float_underscore_in_fraction() {
+    let tokens = lex_all("1.23_456");
+    assert_eq!(tokens.len(), 1);
+    assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 1.23456).abs() < 1e-10));
+}
+
+#[test]
+fn lex_hex_upper_and_lower() {
+    let tokens = lex_all("0xDeAdBeEf");
+    assert_eq!(tokens, vec![Token::IntLit(0xDEADBEEF)]);
+}
+
 // ── String / quote edge cases ─────────────────────────────
 
 #[test]
