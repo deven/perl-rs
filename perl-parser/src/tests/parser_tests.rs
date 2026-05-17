@@ -8270,6 +8270,140 @@ fn iter_single_elem_array_no_comma() {
 // ── Combined nightmare cases ──────────────────────────────
 
 #[test]
+fn iter_deref_block_scalar() {
+    // `${$ref}` — DerefBlock(Scalar) frame.
+    let e = parse_expr_str("${$ref};");
+    assert!(matches!(e.kind, ExprKind::Deref(Sigil::Scalar, _)), "expected Deref(Scalar), got {:?}", e.kind);
+}
+
+#[test]
+fn iter_deref_block_nested() {
+    // `${${$ref}}` — two DerefBlock frames stacked.
+    let e = parse_expr_str("${${$ref}};");
+    match &e.kind {
+        ExprKind::Deref(Sigil::Scalar, inner) => {
+            assert!(matches!(inner.kind, ExprKind::Deref(Sigil::Scalar, _)), "expected nested Deref, got {:?}", inner.kind);
+        }
+        other => panic!("expected Deref(Scalar), got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_deref_block_with_subscript() {
+    // `${$ref}[0]` — DerefBlock applies, then maybe_postfix_subscript attaches the array element.
+    let e = parse_expr_str("${$ref}[0];");
+    assert!(matches!(e.kind, ExprKind::ArrayElem(_, _)), "expected ArrayElem, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_deref_block_code_with_args() {
+    // `&{$coderef}(1, 2)` — DerefBlock(Code) frame, then maybe_call_args produces MethodCall.
+    let e = parse_expr_str("&{$coderef}(1, 2);");
+    assert!(matches!(e.kind, ExprKind::MethodCall(_, _, _)), "expected MethodCall, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_deref_array_block() {
+    // `@{$ref}` — DerefBlock(Array) frame.
+    let e = parse_expr_str("@{$ref};");
+    assert!(matches!(e.kind, ExprKind::Deref(Sigil::Array, _)), "expected Deref(Array), got {:?}", e.kind);
+}
+
+#[test]
+fn iter_deref_hash_block() {
+    // `%{$ref}` — DerefBlock(Hash) frame.
+    let e = parse_expr_str("%{$ref};");
+    assert!(matches!(e.kind, ExprKind::Deref(Sigil::Hash, _)), "expected Deref(Hash), got {:?}", e.kind);
+}
+
+#[test]
+fn iter_deref_glob_block() {
+    // `*{$ref}` — DerefBlock(Glob) frame.
+    let e = parse_expr_str("*{$ref};");
+    assert!(matches!(e.kind, ExprKind::Deref(Sigil::Glob, _)), "expected Deref(Glob), got {:?}", e.kind);
+}
+
+#[test]
+fn iter_deref_inside_array_ref() {
+    // `[${$x}, @{$y}]` — deref frames nested inside an ArrayRef accumulator.
+    let e = parse_expr_str("[${$x}, @{$y}];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].kind, ExprKind::Deref(Sigil::Scalar, _)));
+            assert!(matches!(elems[1].kind, ExprKind::Deref(Sigil::Array, _)));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_eval_expr_vs_block() {
+    // `eval "code"` — EvalExpr frame.
+    let e = parse_expr_str("eval '1+1';");
+    assert!(matches!(e.kind, ExprKind::EvalExpr(_)), "expected EvalExpr, got {:?}", e.kind);
+
+    // `eval { code }` — NOT a frame, returns Leaf with EvalBlock.
+    let prog = parse("eval { 1 };");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => assert!(matches!(e.kind, ExprKind::EvalBlock(_)), "expected EvalBlock, got {:?}", e.kind),
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_do_expr_vs_block() {
+    // `do "file.pl"` — DoExpr frame.
+    let e = parse_expr_str("do 'file.pl';");
+    assert!(matches!(e.kind, ExprKind::DoExpr(_)), "expected DoExpr, got {:?}", e.kind);
+}
+
+#[test]
+fn iter_return_with_value() {
+    let e = parse_expr_str("return 42;");
+    match &e.kind {
+        ExprKind::FuncCall(name, args) => {
+            assert_eq!(name, "CORE::return");
+            assert_eq!(args.len(), 1);
+        }
+        other => panic!("expected FuncCall(return), got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_return_bare() {
+    let e = parse_expr_str("return;");
+    match &e.kind {
+        ExprKind::FuncCall(name, args) => {
+            assert_eq!(name, "CORE::return");
+            assert!(args.is_empty());
+        }
+        other => panic!("expected FuncCall(return), got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_negate_deref_block() {
+    // `-${$x}` — Negate frame then DerefBlock(Scalar) frame stacked.
+    let e = parse_expr_str("-${$x};");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Negate, inner) => {
+            assert!(matches!(inner.kind, ExprKind::Deref(Sigil::Scalar, _)), "expected Deref inside Negate, got {:?}", inner.kind);
+        }
+        other => panic!("expected Negate, got {other:?}"),
+    }
+}
+
+#[test]
+fn iter_deeply_nested_deref_blocks() {
+    // 100 levels of `${...}` nesting — all iterative via DerefBlock frames.
+    let depth = 100;
+    let src = format!("{}$x{};", "${".repeat(depth), "}".repeat(depth));
+    let result = crate::parse(src.as_bytes());
+    assert!(result.is_ok(), "100 nested deref blocks should be iterative, got: {:?}", result.err());
+}
+
+#[test]
 fn hard_nightmare_map_ternary_hash() {
     // `map { /x/ ? { a => 1 } : { b => 2 } } @list;`
     // Exercises: block-vs-hash, regex-vs-division, ternary grouping.
