@@ -5885,6 +5885,100 @@ fn parse_assign_shift_r() {
 // ═══════════════════════════════════════════════════════════
 // Precedence verification
 // ═══════════════════════════════════════════════════════════
+//
+// Systematic coverage of every adjacent precedence level.  Each test verifies that the higher-precedence operator binds
+// tighter by checking the AST shape.  Levels from perlop (low → high):
+//
+//   or/xor (2) < and (4) < not (6) < comma (10) < assign (12) < ternary (14) < range (16) < || // ^^ (18) < && (20)
+//   < | ^ (22) < & (24) < == != (26) < < > (28) < << >> (32) < + - . (34) < * / % x (36) < =~ !~ (38)
+//   < ! ~ \ (40 prefix) < ** (42) < ++ -- (44 postfix) < -> (46)
+
+// ── or (2) vs and (4) ────────────────────────────────────
+
+#[test]
+fn prec_or_low_vs_and_low() {
+    // `$a or $b and $c` → LowOr($a, LowAnd($b, $c))
+    let e = parse_expr_str("$a or $b and $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::LowOr, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::LowAnd, _, _)), "expected LowAnd on RHS of LowOr, got {:?}", rhs.kind);
+        }
+        other => panic!("expected LowOr, got {other:?}"),
+    }
+}
+
+// ── and (4) vs not (6) ───────────────────────────────────
+
+#[test]
+fn prec_not_low_vs_and_low() {
+    let e = parse_expr_str("not $a and $b;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::LowAnd, left, _) => {
+            assert!(matches!(left.kind, ExprKind::UnaryOp(UnaryOp::Not, _)));
+        }
+        other => panic!("expected LowAnd(Not(..), ..), got {other:?}"),
+    }
+}
+
+// ── comma (10) vs assign (12) ────────────────────────────
+
+#[test]
+fn prec_comma_vs_assign() {
+    // `$a = 1, $b = 2` → List(Assign($a, 1), Assign($b, 2)) — assign binds tighter than comma.
+    let e = parse_expr_str("$a = 1, $b = 2;");
+    match &e.kind {
+        ExprKind::List(items) => {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0].kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+            assert!(matches!(items[1].kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+        }
+        other => panic!("expected List of two Assigns, got {other:?}"),
+    }
+}
+
+// ── assign (12) vs ternary (14) ──────────────────────────
+
+#[test]
+fn prec_assign_vs_ternary() {
+    // `$a = $b ? 1 : 0` → Assign($a, Ternary($b, 1, 0)) — ternary binds tighter.
+    let e = parse_expr_str("$a = $b ? 1 : 0;");
+    match &e.kind {
+        ExprKind::Assign(AssignOp::Eq, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::Ternary(_, _, _)), "expected Ternary on RHS of Assign, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+// ── ternary (14) vs range (16) ───────────────────────────
+
+#[test]
+fn prec_ternary_vs_range() {
+    // `1 .. 2 ? 3 : 4` → Ternary(Range(1, 2), 3, 4) — range binds tighter.
+    let e = parse_expr_str("1 .. 2 ? 3 : 4;");
+    match &e.kind {
+        ExprKind::Ternary(cond, _, _) => {
+            assert!(matches!(cond.kind, ExprKind::Range(_, _)), "expected Range as condition, got {:?}", cond.kind);
+        }
+        other => panic!("expected Ternary, got {other:?}"),
+    }
+}
+
+// ── range (16) vs || (18) ────────────────────────────────
+
+#[test]
+fn prec_range_vs_or() {
+    // `$a || $b .. $c` → Range(Or($a, $b), $c) — || binds tighter than range.
+    let e = parse_expr_str("$a || $b .. $c;");
+    match &e.kind {
+        ExprKind::Range(lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Or, _, _)), "expected Or on LHS of Range, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Range, got {other:?}"),
+    }
+}
+
+// ── || (18) vs && (20) ──────────────────────────────────
 
 #[test]
 fn prec_and_binds_tighter_than_or() {
@@ -5896,6 +5990,176 @@ fn prec_and_binds_tighter_than_or() {
         other => panic!("expected Or(And(..), ..), got {other:?}"),
     }
 }
+
+// ── && (20) vs | (22) ───────────────────────────────────
+
+#[test]
+fn prec_and_vs_bit_or() {
+    // `$a && $b | $c` → And($a, BitOr($b, $c)) — bitwise or binds tighter.
+    let e = parse_expr_str("$a && $b | $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::And, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::BitOr, _, _)), "expected BitOr on RHS of And, got {:?}", rhs.kind);
+        }
+        other => panic!("expected And, got {other:?}"),
+    }
+}
+
+// ── | (22) vs & (24) ────────────────────────────────────
+
+#[test]
+fn prec_bit_or_vs_bit_and() {
+    // `$a | $b & $c` → BitOr($a, BitAnd($b, $c)) — bitwise and binds tighter.
+    let e = parse_expr_str("$a | $b & $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::BitOr, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::BitAnd, _, _)), "expected BitAnd on RHS of BitOr, got {:?}", rhs.kind);
+        }
+        other => panic!("expected BitOr, got {other:?}"),
+    }
+}
+
+// ── & (24) vs == (26) ───────────────────────────────────
+
+#[test]
+fn prec_bit_and_vs_eq() {
+    // `$a & $b == $c` → BitAnd($a, NumEq($b, $c)) — equality binds tighter.
+    let e = parse_expr_str("$a & $b == $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::BitAnd, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::NumEq, _, _)), "expected NumEq on RHS of BitAnd, got {:?}", rhs.kind);
+        }
+        other => panic!("expected BitAnd, got {other:?}"),
+    }
+}
+
+// ── == (26) vs < (28) ───────────────────────────────────
+
+#[test]
+fn prec_eq_vs_rel() {
+    // `$a == $b < $c` → NumEq($a, NumLt($b, $c)) — relational binds tighter.
+    let e = parse_expr_str("$a == $b < $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::NumEq, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::NumLt, _, _)), "expected NumLt on RHS of NumEq, got {:?}", rhs.kind);
+        }
+        other => panic!("expected NumEq, got {other:?}"),
+    }
+}
+
+// ── < (28) vs << (32) ───────────────────────────────────
+
+#[test]
+fn prec_rel_vs_shift() {
+    // `$a < $b << $c` → NumLt($a, ShiftLeft($b, $c)) — shift binds tighter.
+    let e = parse_expr_str("$a < $b << $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::NumLt, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::ShiftLeft, _, _)), "expected ShiftLeft on RHS of NumLt, got {:?}", rhs.kind);
+        }
+        other => panic!("expected NumLt, got {other:?}"),
+    }
+}
+
+// ── << (32) vs + (34) ───────────────────────────────────
+
+#[test]
+fn prec_shift_vs_add() {
+    // `$a << $b + $c` → ShiftLeft($a, Add($b, $c)) — addition binds tighter.
+    let e = parse_expr_str("$a << $b + $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::ShiftLeft, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add on RHS of ShiftLeft, got {:?}", rhs.kind);
+        }
+        other => panic!("expected ShiftLeft, got {other:?}"),
+    }
+}
+
+// ── + (34) vs * (36) ────────────────────────────────────
+
+#[test]
+fn prec_add_vs_mul() {
+    // `$a + $b * $c` → Add($a, Mul($b, $c)) — multiplication binds tighter.
+    let e = parse_expr_str("$a + $b * $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Mul, _, _)), "expected Mul on RHS of Add, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+// ── * (36) vs =~ (38) ───────────────────────────────────
+
+#[test]
+fn prec_mul_vs_binding() {
+    // `$a * $b =~ /x/` → Mul($a, Binding($b, Regex)) — binding binds tighter.
+    let e = parse_expr_str("$a * $b =~ /x/;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Mul, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Binding, _, _)), "expected Binding on RHS of Mul, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Mul, got {other:?}"),
+    }
+}
+
+// ── =~ (38) vs prefix ! (40) ────────────────────────────
+
+#[test]
+fn prec_binding_vs_unary() {
+    // `!$a =~ /x/` → Binding(Not($a), Regex) — prefix `!` binds tighter than `=~`.
+    let e = parse_expr_str("!$a =~ /x/;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Binding, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::UnaryOp(UnaryOp::LogNot, _)), "expected LogNot on LHS of Binding, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Binding, got {other:?}"),
+    }
+}
+
+// ── prefix - (40) vs ** (42) ─────────────────────────────
+
+#[test]
+fn prec_unary_vs_pow() {
+    // `-$a ** 2` → Negate(Pow($a, 2)) — exponentiation binds tighter than unary minus.
+    let e = parse_expr_str("-$a ** 2;");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Negate, inner) => {
+            assert!(matches!(inner.kind, ExprKind::BinOp(BinOp::Pow, _, _)), "expected Pow inside Negate, got {:?}", inner.kind);
+        }
+        other => panic!("expected Negate, got {other:?}"),
+    }
+}
+
+// ── ** (42) vs postfix ++ (44) ───────────────────────────
+
+#[test]
+fn prec_pow_vs_postinc() {
+    // `$a++ ** 2` → Pow(PostInc($a), 2) — postfix ++ binds tighter than **.
+    let e = parse_expr_str("$a++ ** 2;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Pow, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::PostfixOp(PostfixOp::Inc, _)), "expected PostInc on LHS of Pow, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Pow, got {other:?}"),
+    }
+}
+
+// ── postfix ++ (44) vs -> (46) ───────────────────────────
+
+#[test]
+fn prec_postinc_vs_arrow() {
+    // `$a->[0]++` → PostInc(ArrowDeref($a, [0])) — arrow binds tighter.  Array element via arrow is a valid lvalue.
+    let e = parse_expr_str("$a->[0]++;");
+    match &e.kind {
+        ExprKind::PostfixOp(PostfixOp::Inc, inner) => {
+            assert!(matches!(inner.kind, ExprKind::ArrowDeref(_, _)), "expected ArrowDeref inside PostInc, got {:?}", inner.kind);
+        }
+        other => panic!("expected PostfixOp(Inc), got {other:?}"),
+    }
+}
+
+// ── Associativity ────────────────────────────────────────
 
 #[test]
 fn prec_assign_right_assoc() {
@@ -5921,13 +6185,52 @@ fn prec_ternary_nested() {
 }
 
 #[test]
-fn prec_binding_tighter_than_concat() {
-    let e = parse_expr_str("$x =~ /foo/ . 'bar';");
+fn prec_pow_right_assoc() {
+    // `2 ** 3 ** 4` → Pow(2, Pow(3, 4)) — right-associative.
+    let e = parse_expr_str("2 ** 3 ** 4;");
     match &e.kind {
-        ExprKind::BinOp(BinOp::Concat, left, _) => {
-            assert!(matches!(left.kind, ExprKind::BinOp(BinOp::Binding, _, _)));
+        ExprKind::BinOp(BinOp::Pow, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Pow, _, _)), "expected Pow on RHS, got {:?}", rhs.kind);
         }
-        other => panic!("expected Concat(Binding(..), ..), got {other:?}"),
+        other => panic!("expected Pow, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_add_left_assoc() {
+    // `1 + 2 + 3` → Add(Add(1, 2), 3) — left-associative.
+    let e = parse_expr_str("1 + 2 + 3;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add on LHS, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+// ── Same-level different-op interactions ─────────────────
+
+#[test]
+fn prec_or_same_level_as_defined_or() {
+    // `$a || $b // $c` → DefinedOr(Or($a, $b), $c) — same precedence, left-associative.
+    let e = parse_expr_str("$a || $b // $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::DefinedOr, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Or, _, _)), "expected Or on LHS of DefinedOr, got {:?}", lhs.kind);
+        }
+        other => panic!("expected DefinedOr, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_sub_same_level_as_concat() {
+    // `$a - $b . $c` → Concat(Sub($a, $b), $c) — both at PREC_ADD, left-associative.
+    let e = parse_expr_str("$a - $b . $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Concat, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Sub, _, _)), "expected Sub on LHS of Concat, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Concat, got {other:?}"),
     }
 }
 
@@ -5943,13 +6246,358 @@ fn prec_low_or_loosest() {
 }
 
 #[test]
-fn prec_not_low_vs_and_low() {
-    let e = parse_expr_str("not $a and $b;");
+fn prec_binding_tighter_than_concat() {
+    let e = parse_expr_str("$x =~ /foo/ . 'bar';");
     match &e.kind {
-        ExprKind::BinOp(BinOp::LowAnd, left, _) => {
-            assert!(matches!(left.kind, ExprKind::UnaryOp(UnaryOp::Not, _)));
+        ExprKind::BinOp(BinOp::Concat, left, _) => {
+            assert!(matches!(left.kind, ExprKind::BinOp(BinOp::Binding, _, _)));
         }
-        other => panic!("expected LowAnd(Not(..), ..), got {other:?}"),
+        other => panic!("expected Concat(Binding(..), ..), got {other:?}"),
+    }
+}
+
+// ── not vs || (classic Perl gotcha) ──────────────────────
+
+#[test]
+fn prec_not_low_absorbs_or() {
+    // `not $a || $b` → Not(Or($a, $b)) — not is at PREC_NOT_LOW (6), || at PREC_OR (18).  Since || is higher, it
+    // gets consumed inside the not.  This is a classic Perl gotcha: `not $x || $y` means `not($x || $y)`.
+    let e = parse_expr_str("not $a || $b;");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Not, inner) => {
+            assert!(matches!(inner.kind, ExprKind::BinOp(BinOp::Or, _, _)), "expected Or inside Not, got {:?}", inner.kind);
+        }
+        other => panic!("expected Not, got {other:?}"),
+    }
+}
+
+// ── String comparison at correct level ───────────────────
+
+#[test]
+fn prec_str_eq_same_level_as_num_eq() {
+    // `$a eq $b == $c` — eq and == are both at PREC_EQ, non-associative → ChainedCmp.
+    let e = parse_expr_str("$a eq $b == $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+#[test]
+fn prec_str_rel_same_level_as_num_rel() {
+    // `$a lt $b < $c` — lt and < are both at PREC_REL, non-associative → ChainedCmp.
+    let e = parse_expr_str("$a lt $b < $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+// ── x (repeat) at PREC_MUL ──────────────────────────────
+
+#[test]
+fn prec_repeat_at_mul_level() {
+    // `$a + "ab" x 3` → Add($a, Repeat("ab", 3)) — x is at PREC_MUL, same as *.
+    let e = parse_expr_str("$a + \"ab\" x 3;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Repeat, _, _)), "expected Repeat on RHS of Add, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+// ── Mixed prefix/infix same token ────────────────────────
+
+#[test]
+fn prec_prefix_minus_then_infix_minus() {
+    // `-$a - $b` → Sub(Negate($a), $b) — first - is prefix (try_prefix), second is infix (Pratt loop).
+    let e = parse_expr_str("-$a - $b;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Sub, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::UnaryOp(UnaryOp::Negate, _)), "expected Negate on LHS of Sub, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Sub, got {other:?}"),
+    }
+}
+
+// ── // (defined-or) vs && ────────────────────────────────
+
+#[test]
+fn prec_defined_or_vs_and() {
+    // `$a // $b && $c` → DefinedOr($a, And($b, $c)) — && binds tighter than //.
+    let e = parse_expr_str("$a // $b && $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::DefinedOr, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::And, _, _)), "expected And on RHS of DefinedOr, got {:?}", rhs.kind);
+        }
+        other => panic!("expected DefinedOr, got {other:?}"),
+    }
+}
+
+// ── !~ at PREC_BINDING ──────────────────────────────────
+
+#[test]
+fn prec_not_binding_same_as_binding() {
+    // `$a !~ /x/ . "y"` → Concat(NotBinding($a, Regex), "y") — !~ at same level as =~.
+    let e = parse_expr_str("$a !~ /x/ . 'y';");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Concat, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::NotBinding, _, _)), "expected NotBinding on LHS of Concat, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Concat, got {other:?}"),
+    }
+}
+
+// ── Low xor at same level as or ─────────────────────────
+
+#[test]
+fn prec_low_xor_same_as_low_or() {
+    // `$a or $b xor $c` → LowXor(LowOr($a, $b), $c) — same level, left-associative.
+    let e = parse_expr_str("$a or $b xor $c;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::LowXor, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::LowOr, _, _)), "expected LowOr on LHS of LowXor, got {:?}", lhs.kind);
+        }
+        other => panic!("expected LowXor, got {other:?}"),
+    }
+}
+
+// ── Non-associative chaining ─────────────────────────────
+
+#[test]
+fn prec_non_assoc_comparison_chains() {
+    // `$a == $b == $c` — non-associative comparisons produce ChainedCmp, not left-associative binary ops.
+    let e = parse_expr_str("$a == $b == $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+// ── Prefix always consumed in forward phase ──────────────
+
+#[test]
+fn prec_pow_vs_unary_minus_literal() {
+    // `-2 ** 4` → Negate(Pow(2, 4)) = -(2**4) = -16, NOT (-2)**4 = 16.  ** binds tighter than unary minus.
+    // This is the classic perlop precedence gotcha for exponentiation.
+    let e = parse_expr_str("-2 ** 4;");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Negate, inner) => {
+            assert!(matches!(inner.kind, ExprKind::BinOp(BinOp::Pow, _, _)), "expected Pow inside Negate, got {:?}", inner.kind);
+        }
+        other => panic!("expected Negate(Pow(..)), got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_ref_then_infix() {
+    // `\$a + $b` → Add(Ref($a), $b) — ref at PREC_UNARY (40) captures just $a, then + at PREC_ADD (34) takes over.
+    let e = parse_expr_str("\\$a + $b;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::Ref(_)), "expected Ref on LHS of Add, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_prefix_in_rhs_of_assign() {
+    // `$a = not $b` — assign RHS parsed at PREC_ASSIGN (12); `not` pushes frame at PREC_NOT_LOW (6).
+    // Prefix ops always run in the forward phase regardless of min_prec.
+    let e = parse_expr_str("$a = not $b;");
+    match &e.kind {
+        ExprKind::Assign(AssignOp::Eq, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::UnaryOp(UnaryOp::Not, _)), "expected Not on RHS of Assign, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+// ── Arrow chaining ──────────────────────────────────────
+
+#[test]
+fn prec_arrow_left_assoc() {
+    // `$a->b->c` → MethodCall(MethodCall($a, b), c) — left-associative.
+    let e = parse_expr_str("$a->b->c;");
+    match &e.kind {
+        ExprKind::MethodCall(invocant, name, _) => {
+            assert_eq!(name, "c");
+            assert!(matches!(invocant.kind, ExprKind::MethodCall(_, _, _)), "expected MethodCall on invocant, got {:?}", invocant.kind);
+        }
+        other => panic!("expected MethodCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_arrow_tighter_than_mul() {
+    // `$a->length * 2` → Mul(MethodCall($a, length), 2) — arrow binds tighter.
+    let e = parse_expr_str("$a->length * 2;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Mul, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::MethodCall(_, _, _)), "expected MethodCall on LHS of Mul, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Mul, got {other:?}"),
+    }
+}
+
+// ── Ternary with assignment in branches ──────────────────
+
+#[test]
+fn prec_assign_inside_ternary() {
+    // `$a ? $b = 1 : 0` — assign inside the true-branch of ternary.  The `:` stops the middle at PREC_LOW,
+    // so `$b = 1` is fully consumed as the true-branch.
+    let e = parse_expr_str("$a ? $b = 1 : 0;");
+    match &e.kind {
+        ExprKind::Ternary(_, middle, _) => {
+            assert!(matches!(middle.kind, ExprKind::Assign(AssignOp::Eq, _, _)), "expected Assign in true-branch, got {:?}", middle.kind);
+        }
+        other => panic!("expected Ternary, got {other:?}"),
+    }
+}
+
+// ── Multiple prefix ops stack correctly ──────────────────
+
+#[test]
+fn prec_stacked_prefix_ops() {
+    // `not !-$a` → Not(LogNot(Negate($a))) — three prefix ops stacked.
+    let e = parse_expr_str("not !-$a;");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Not, inner) => match &inner.kind {
+            ExprKind::UnaryOp(UnaryOp::LogNot, inner2) => {
+                assert!(matches!(inner2.kind, ExprKind::UnaryOp(UnaryOp::Negate, _)), "expected Negate, got {:?}", inner2.kind);
+            }
+            other => panic!("expected LogNot, got {other:?}"),
+        },
+        other => panic!("expected Not, got {other:?}"),
+    }
+}
+
+// ── Ternary right-assoc from the else branch ─────────────
+
+#[test]
+fn prec_ternary_right_assoc_else() {
+    // `$a ? $b : $c ? $d : $e` → Ternary($a, $b, Ternary($c, $d, $e)) — right-associative: the second `?:` nests
+    // inside the else branch of the first, NOT as `Ternary(Ternary($a, $b, $c), $d, $e)`.
+    let e = parse_expr_str("$a ? $b : $c ? $d : $e;");
+    match &e.kind {
+        ExprKind::Ternary(_, middle, else_branch) => {
+            // Middle is just $b, not a nested ternary.
+            assert!(matches!(middle.kind, ExprKind::ScalarVar(_)), "expected ScalarVar in middle, got {:?}", middle.kind);
+            // Else branch is the nested ternary.
+            assert!(matches!(else_branch.kind, ExprKind::Ternary(_, _, _)), "expected Ternary in else branch, got {:?}", else_branch.kind);
+        }
+        other => panic!("expected Ternary, got {other:?}"),
+    }
+}
+
+// ── Non-associative operators produce ChainedCmp ─────────
+
+#[test]
+fn prec_chained_cmp_three_way() {
+    // `$a < $b < $c` — relational operators chain into ChainedCmp for Perl's chained comparison support.
+    let e = parse_expr_str("$a < $b < $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+#[test]
+fn prec_chained_cmp_mixed_ops() {
+    // `$a <= $b >= $c` — mixed relational ops chain into ChainedCmp.
+    let e = parse_expr_str("$a <= $b >= $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+// ── Pratt loop adversarial cases ─────────────────────────
+
+#[test]
+fn pratt_infix_after_array_ref() {
+    // `[1, 2] . [3]` — concat of two array refs.  The `.` infix must be consumed after the ArrayRef frame completes.
+    let e = parse_expr_str("[1, 2] . [3];");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Concat, lhs, rhs) => {
+            assert!(matches!(lhs.kind, ExprKind::AnonArray(_)));
+            assert!(matches!(rhs.kind, ExprKind::AnonArray(_)));
+        }
+        other => panic!("expected Concat of two AnonArrays, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_infix_after_hash_ref() {
+    // `$x = {a => 1} || 0` — hash ref on RHS of assignment, then logical or.  The `{` is in expression context so
+    // it's unambiguously a hash ref (at statement level, `{` would be a block).
+    let e = parse_expr_str("$x = {a => 1} || 0;");
+    match &e.kind {
+        ExprKind::Assign(_, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Or, _, _)), "expected Or on RHS of Assign, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_infix_inside_accumulator() {
+    // `[1 + 2, 3 * 4]` — infix ops at different precedences inside array ref accumulator elements.
+    let e = parse_expr_str("[1 + 2, 3 * 4];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].kind, ExprKind::BinOp(BinOp::Add, _, _)));
+            assert!(matches!(elems[1].kind, ExprKind::BinOp(BinOp::Mul, _, _)));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_not_absorbs_ternary() {
+    // `not $a ? 1 : 0` → Not(Ternary($a, 1, 0)) — not at PREC_NOT_LOW (6) absorbs the entire ternary (14).
+    let e = parse_expr_str("not $a ? 1 : 0;");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Not, inner) => {
+            assert!(matches!(inner.kind, ExprKind::Ternary(_, _, _)), "expected Ternary inside Not, got {:?}", inner.kind);
+        }
+        other => panic!("expected Not, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_every_frame_type_stacked() {
+    // `not \-([1])` — stacks four different frame types: Not, Ref, Negate, Paren (with nested ArrayRef).
+    // Verifies the continuation stack handles diverse frame types in a single expression without confusion.
+    let e = parse_expr_str("not \\-([1]);");
+    // Outer is Not.
+    assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::Not, _)), "expected Not, got {:?}", e.kind);
+}
+
+#[test]
+fn pratt_min_prec_restored_after_container() {
+    // `1 + [2] * 3` — after ArrayRef frame completes with min_prec from the `+`'s RHS (PREC_ADD+1=35),
+    // the `*` at PREC_MUL (36) >= 35 must be consumed.  Result: Add(1, Mul([2], 3)).
+    let e = parse_expr_str("1 + [2] * 3;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::BinOp(BinOp::Mul, _, _)), "expected Mul on RHS of Add, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_continue_then_nested_frames() {
+    // `[$a = 1, -$b]` — first element triggers Continue, second element has a Negate prefix frame.
+    let e = parse_expr_str("[$a = 1, -$b];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 2);
+            assert!(matches!(elems[0].kind, ExprKind::Assign(AssignOp::Eq, _, _)));
+            assert!(matches!(elems[1].kind, ExprKind::UnaryOp(UnaryOp::Negate, _)));
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_deref_block_with_infix_inside() {
+    // `${$a . $b}` — DerefBlock frame with infix concat inside the block expression.
+    let e = parse_expr_str("${$a . $b};");
+    match &e.kind {
+        ExprKind::Deref(Sigil::Scalar, inner) => {
+            assert!(matches!(inner.kind, ExprKind::BinOp(BinOp::Concat, _, _)), "expected Concat inside Deref, got {:?}", inner.kind);
+        }
+        other => panic!("expected Deref(Scalar), got {other:?}"),
     }
 }
 
