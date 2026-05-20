@@ -5889,9 +5889,10 @@ fn parse_assign_shift_r() {
 // Systematic coverage of every adjacent precedence level.  Each test verifies that the higher-precedence operator binds
 // tighter by checking the AST shape.  Levels from perlop (low → high):
 //
-//   or/xor (2) < and (4) < not (6) < comma (10) < assign (12) < ternary (14) < range (16) < || // ^^ (18) < && (20)
-//   < | ^ (22) < & (24) < == != (26) < < > (28) < << >> (32) < + - . (34) < * / % x (36) < =~ !~ (38)
-//   < ! ~ \ (40 prefix) < ** (42) < ++ -- (44 postfix) < -> (46)
+//   or/xor (100) < and (200) < not (300) < comma (500) < assign (600) < ternary (700) < range (800)
+//   < || // ^^ (900) < && (1000) < | ^ (1100) < & (1200) < == != (1300) < < > (1400) < isa (1500)
+//   < named unary (1600) < << >> (1700) < + - . (1800) < * / % x (1900) < =~ !~ (2000)
+//   < ! ~ \ (2100 prefix) < ** (2200) < ++ -- (2300 postfix) < -> (2400)
 
 // ── or (2) vs and (4) ────────────────────────────────────
 
@@ -6260,7 +6261,7 @@ fn prec_binding_tighter_than_concat() {
 
 #[test]
 fn prec_not_low_absorbs_or() {
-    // `not $a || $b` → Not(Or($a, $b)) — not is at PREC_NOT_LOW (6), || at PREC_OR (18).  Since || is higher, it
+    // `not $a || $b` → Not(Or($a, $b)) — not is at PREC_NOT_LOW (300), || at PREC_OR (900).  Since || is higher, it
     // gets consumed inside the not.  This is a classic Perl gotcha: `not $x || $y` means `not($x || $y)`.
     let e = parse_expr_str("not $a || $b;");
     match &e.kind {
@@ -6383,7 +6384,7 @@ fn prec_pow_vs_unary_minus_literal() {
 
 #[test]
 fn prec_ref_then_infix() {
-    // `\$a + $b` → Add(Ref($a), $b) — ref at PREC_UNARY (40) captures just $a, then + at PREC_ADD (34) takes over.
+    // `\$a + $b` → Add(Ref($a), $b) — ref at PREC_UNARY (2100) captures just $a, then + at PREC_ADD (1800) takes over.
     let e = parse_expr_str("\\$a + $b;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Add, lhs, _) => {
@@ -6395,7 +6396,7 @@ fn prec_ref_then_infix() {
 
 #[test]
 fn prec_prefix_in_rhs_of_assign() {
-    // `$a = not $b` — assign RHS parsed at PREC_ASSIGN (12); `not` pushes frame at PREC_NOT_LOW (6).
+    // `$a = not $b` — assign RHS parsed at PREC_ASSIGN (600); `not` pushes frame at PREC_NOT_LOW (300).
     // Prefix ops always run in the forward phase regardless of min_prec.
     let e = parse_expr_str("$a = not $b;");
     match &e.kind {
@@ -6499,6 +6500,44 @@ fn prec_chained_cmp_mixed_ops() {
     assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
 }
 
+#[test]
+#[ignore = "parser doesn't reject non-associative chaining yet — treats as left-associative"]
+fn prec_range_non_assoc_is_error() {
+    // `$x .. $y .. $z` — range is non-associative, chaining is a syntax error.
+    let result = crate::parse(b"$x .. $y .. $z;");
+    assert!(result.is_err(), "chained range should be a syntax error");
+}
+
+#[test]
+#[ignore = "parser doesn't reject non-associative chaining yet — treats as left-associative"]
+fn prec_spaceship_non_assoc_is_error() {
+    // `$x <=> $y <=> $z` — three-way comparison is non-associative (chain/na), chaining is a syntax error.
+    let result = crate::parse(b"$x <=> $y <=> $z;");
+    assert!(result.is_err(), "chained <=> should be a syntax error");
+}
+
+#[test]
+#[ignore = "parser doesn't reject non-associative chaining yet — treats as left-associative"]
+fn prec_cmp_non_assoc_is_error() {
+    // `$x cmp $y cmp $z` — string three-way comparison is non-associative.
+    let result = crate::parse(b"$x cmp $y cmp $z;");
+    assert!(result.is_err(), "chained cmp should be a syntax error");
+}
+
+#[test]
+fn prec_equality_chains() {
+    // `$a == $b != $c` — equality operators chain (not error).
+    let e = parse_expr_str("$a == $b != $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+#[test]
+fn prec_str_equality_chains() {
+    // `$a eq $b ne $c` — string equality operators chain.
+    let e = parse_expr_str("$a eq $b ne $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
 // ── Pratt loop adversarial cases ─────────────────────────
 
 #[test]
@@ -6543,7 +6582,7 @@ fn pratt_infix_inside_accumulator() {
 
 #[test]
 fn pratt_not_absorbs_ternary() {
-    // `not $a ? 1 : 0` → Not(Ternary($a, 1, 0)) — not at PREC_NOT_LOW (6) absorbs the entire ternary (14).
+    // `not $a ? 1 : 0` → Not(Ternary($a, 1, 0)) — not at PREC_NOT_LOW (300) absorbs the entire ternary (700).
     let e = parse_expr_str("not $a ? 1 : 0;");
     match &e.kind {
         ExprKind::UnaryOp(UnaryOp::Not, inner) => {
@@ -6564,8 +6603,8 @@ fn pratt_every_frame_type_stacked() {
 
 #[test]
 fn pratt_min_prec_restored_after_container() {
-    // `1 + [2] * 3` — after ArrayRef frame completes with min_prec from the `+`'s RHS (PREC_ADD+1=35),
-    // the `*` at PREC_MUL (36) >= 35 must be consumed.  Result: Add(1, Mul([2], 3)).
+    // `1 + [2] * 3` — after ArrayRef frame completes with min_prec from the `+`'s RHS (PREC_ADD+1=1801),
+    // the `*` at PREC_MUL (1900) >= 1801 must be consumed.  Result: Add(1, Mul([2], 3)).
     let e = parse_expr_str("1 + [2] * 3;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Add, _, rhs) => {
@@ -6598,6 +6637,205 @@ fn pratt_deref_block_with_infix_inside() {
             assert!(matches!(inner.kind, ExprKind::BinOp(BinOp::Concat, _, _)), "expected Concat inside Deref, got {:?}", inner.kind);
         }
         other => panic!("expected Deref(Scalar), got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "comma handler doesn't absorb consecutive commas — needs parse_term → Option<Expr> refactor"]
+fn pratt_consecutive_commas_in_list() {
+    // Perl silently drops consecutive commas: `(1, 3, , , 5)` → `(1, 3, 5)`.
+    let e = parse_expr_str("(1, 3, , , 5);");
+    match &e.kind {
+        ExprKind::List(items) => {
+            assert_eq!(items.len(), 3, "expected 3 elements (consecutive commas dropped), got {:?}", items);
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "comma handler doesn't absorb consecutive commas — needs parse_term → Option<Expr> refactor"]
+fn pratt_consecutive_commas_in_array_ref() {
+    // `[1, , , 3]` — consecutive commas inside array ref, elements silently dropped.
+    let e = parse_expr_str("[1, , , 3];");
+    match &e.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 2, "expected 2 elements (consecutive commas dropped), got {:?}", elems);
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_trailing_comma_only() {
+    // `(1,)` — trailing comma, single-element list.
+    let e = parse_expr_str("(1,);");
+    // In Perl, `(1,)` is the same as `(1)` — the trailing comma is a no-op.
+    // The parser may produce IntLit(1) or List([1]) — either is acceptable.
+    assert!(matches!(e.kind, ExprKind::IntLit(1) | ExprKind::List(_)), "expected IntLit or List, got {:?}", e.kind);
+}
+
+#[test]
+fn pratt_c_comma_rhs_of_binding() {
+    // `("test", $_) =~ /foo/` — C comma semantics.  The comma expression inside parens binds to `=~` as a whole.
+    // Perl evaluates "test" in void context and binds $_ to the regex.  At the parser level, the comma still produces
+    // a List (context is a semantic concern, not syntactic), and =~ binds to the entire paren result.
+    let e = parse_expr_str("(\"test\", $_ ) =~ /foo/;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Binding, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::List(_)), "expected List on LHS of Binding, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Binding, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_c_comma_in_scalar_assign() {
+    // `$x = (1, 2, 3)` — comma in scalar context.  At the parser level, the RHS is a List node; the compiler/runtime
+    // evaluates it in scalar context to produce 3 (last element).
+    let e = parse_expr_str("$x = (1, 2, 3);");
+    match &e.kind {
+        ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+            ExprKind::List(items) => assert_eq!(items.len(), 3),
+            _ => panic!("expected List on RHS, got {:?}", rhs.kind),
+        },
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "comma handler doesn't absorb consecutive commas — needs parse_term → Option<Expr> refactor"]
+fn pratt_consecutive_commas_scalar_context() {
+    // `$x = (1, , , 3)` — consecutive commas in scalar context.  The empty comma positions are no-ops; Perl evaluates
+    // to 3 (last element in scalar context).  The parser should produce a 2-element List (or Comma chain), not error.
+    let e = parse_expr_str("$x = (1, , , 3);");
+    match &e.kind {
+        ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+            ExprKind::List(items) => assert_eq!(items.len(), 2, "expected 2 elements, got {:?}", items),
+            _ => panic!("expected List on RHS, got {:?}", rhs.kind),
+        },
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn pratt_trailing_comma_scalar_context() {
+    // `$x = (1, 2,)` — trailing comma in scalar context.  The trailing comma is a no-op.
+    let e = parse_expr_str("$x = (1, 2,);");
+    match &e.kind {
+        ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+            ExprKind::List(items) => assert_eq!(items.len(), 2, "expected 2 elements, got {:?}", items),
+            _ => panic!("expected List on RHS, got {:?}", rhs.kind),
+        },
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "comma handler doesn't absorb consecutive commas — needs parse_term → Option<Expr> refactor"]
+fn pratt_consecutive_commas_lhs_list_assign() {
+    // `my ($x,,$y) = (2, 4, 6)` — consecutive commas on LHS of list assignment are no-ops.
+    // `($x,,$y)` is the same as `($x,$y)`: $x=2, $y=4.  No placeholder slot is created.
+    let prog = parse("my ($x,,$y) = (2, 4, 6);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => match &lhs.kind {
+            ExprKind::Decl(_, vars) => {
+                assert_eq!(vars.len(), 2, "expected 2 variables (consecutive commas dropped), got {:?}", vars);
+            }
+            other => panic!("expected Decl on LHS, got {other:?}"),
+        },
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "parse_decl_expr doesn't accept undef as a placeholder in parenthesized declarations"]
+fn pratt_undef_placeholder_in_list_assign() {
+    // `my ($x, undef, $y) = (2, 4, 6)` — explicit `undef` placeholder occupies a slot.
+    // $x=2, undef absorbs 4, $y=6.  Contrast with `($x,,$y)` where the extra comma is a no-op.
+    let prog = parse("my ($x, undef, $y) = (2, 4, 6);");
+    match &prog.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
+            match &lhs.kind {
+                ExprKind::Decl(_, vars) => {
+                    // 3 slots: $x, undef placeholder, $y — but Decl may only track the named variables.
+                    // The key point is the list has 3 elements, not 2.
+                    assert!(vars.len() >= 2, "expected at least 2 declared vars, got {:?}", vars);
+                }
+                ExprKind::List(items) => {
+                    assert_eq!(items.len(), 3, "expected 3 elements (including undef placeholder), got {:?}", items);
+                }
+                other => panic!("expected Decl or List on LHS, got {other:?}"),
+            }
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+// ── Scalar vs list context from LHS declaration ──────────
+
+#[test]
+#[ignore = "parser doesn't distinguish my $x (scalar) from my ($x) (list) — both produce identical Decl nodes"]
+fn context_scalar_decl_vs_list_decl() {
+    // `my $x = (2, 4, 6)` → scalar context.  $x = 6 (C comma, last value).
+    // `my ($x) = (2, 4, 6)` → list context.  $x = 2 (first element of list).
+    // The parser must distinguish these: the LHS form determines the context of the RHS.
+    //
+    // The Decl node (or assignment node) should carry context information so the compiler knows whether
+    // to apply scalar or list semantics to the RHS.
+    let prog1 = parse("my $x = (2, 4, 6);");
+    let prog2 = parse("my ($x) = (2, 4, 6);");
+
+    let lhs1 = match &prog1.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => lhs,
+        other => panic!("stmt 1: expected Assign, got {other:?}"),
+    };
+    let lhs2 = match &prog2.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => lhs,
+        other => panic!("stmt 2: expected Assign, got {other:?}"),
+    };
+
+    // The LHS nodes should differ structurally (ignoring spans).  `my $x` is a scalar declaration;
+    // `my ($x)` is a list-context declaration.  Currently both produce `Decl(My, [VarDecl])`.
+    assert!(
+        std::mem::discriminant(&lhs1.kind) != std::mem::discriminant(&lhs2.kind)
+            || format!("{:?}", lhs1.kind).contains("List") != format!("{:?}", lhs2.kind).contains("List"),
+        "my $x and my ($x) should produce structurally different LHS nodes"
+    );
+}
+
+// ── Prototype-dependent comma parsing ────────────────────
+
+#[test]
+#[ignore = "parser doesn't consult prototypes when parsing call arguments — needs prototype-aware context propagation"]
+fn proto_scalar_slot_parses_c_comma() {
+    // `($@)` prototype: first slot is scalar context, so `(2,4,6)` is C commas → result is 6.
+    // The parser should produce 3 args: [6, 8, 10], not [List(2,4,6), 8, 10].
+    let prog = parse("sub f ($@) {} f((2,4,6),8,10);");
+    // Find the function call statement.
+    let call = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("no expression statement found");
+    match &call.kind {
+        ExprKind::FuncCall(_, args) => {
+            // With scalar context for first arg, (2,4,6) evaluates to 6.
+            // The first arg should NOT be a List node.
+            assert!(!matches!(args[0].kind, ExprKind::List(_)), "first arg should be scalar (C comma), not List — got {:?}", args[0].kind);
+        }
+        other => panic!("expected FuncCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn proto_no_prototype_parses_list() {
+    // Without prototype, all args are list context.  `(2,4,6)` is a list that flattens.
+    // The parser produces 3 args: [List(2,4,6), 8, 10].  Flattening to 5 args is the compiler's job.
+    let prog = parse("sub g {} g((2,4,6),8,10);");
+    let call = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("no expression statement found");
+    match &call.kind {
+        ExprKind::FuncCall(_, args) => {
+            assert_eq!(args.len(), 3, "expected 3 args (List, 8, 10), got {:?}", args);
+            assert!(matches!(args[0].kind, ExprKind::List(_)), "first arg should be List(2,4,6), got {:?}", args[0].kind);
+        }
+        other => panic!("expected FuncCall, got {other:?}"),
     }
 }
 

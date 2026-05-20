@@ -18,13 +18,9 @@ use crate::token::*;
 mod tests;
 
 /// Precedence levels (u8 with gaps for plugin insertion).  Maps to Perl 5's precedence table from perly.y.
-pub type Precedence = u8;
+pub type Precedence = u16;
 
 /// Parse depth counter for nesting limit.
-pub type ParseDepth = u16;
-
-const MAX_DEPTH: ParseDepth = 10_000;
-
 /// Continuation frame for the iterative expression parser.  Each frame captures what to do with a sub-expression after
 /// the forward phase (which consumed a prefix operator or opening delimiter) completes.
 enum ExprFrame {
@@ -77,39 +73,39 @@ enum FrameResult {
 }
 
 // ── Precedence constants ──────────────────────────────────────
-// Gaps of 2 to allow plugin operators at intermediate levels.
+// Multiples of 100 to allow plugin operators at intermediate levels (99 slots between each pair).
 
 const PREC_LOW: Precedence = 0; // statement boundary
-const PREC_OR_LOW: Precedence = 2; // or
-const PREC_AND_LOW: Precedence = 4; // and
-const PREC_NOT_LOW: Precedence = 6; // not (prefix)
+const PREC_OR_LOW: Precedence = 100; // or xor
+const PREC_AND_LOW: Precedence = 200; // and
+const PREC_NOT_LOW: Precedence = 300; // not (prefix)
 #[allow(dead_code)]
-const PREC_LIST: Precedence = 8; // list operators
-const PREC_COMMA: Precedence = 10; // , =>
-const PREC_ASSIGN: Precedence = 12; // = += -= etc.
-const PREC_TERNARY: Precedence = 14; // ?:
-const PREC_RANGE: Precedence = 16; // .. ...
-const PREC_OR: Precedence = 18; // || //
-const PREC_AND: Precedence = 20; // &&
-const PREC_BIT_OR: Precedence = 22; // |
-const PREC_BIT_AND: Precedence = 24; // &
-const PREC_EQ: Precedence = 26; // == != eq ne <=> cmp
-const PREC_REL: Precedence = 28; // < > <= >= lt gt le ge
+const PREC_LIST: Precedence = 400; // list operators
+const PREC_COMMA: Precedence = 500; // , =>
+const PREC_ASSIGN: Precedence = 600; // = += -= etc.
+const PREC_TERNARY: Precedence = 700; // ?:
+const PREC_RANGE: Precedence = 800; // .. ...
+const PREC_OR: Precedence = 900; // || // ^^
+const PREC_AND: Precedence = 1000; // &&
+const PREC_BIT_OR: Precedence = 1100; // | ^
+const PREC_BIT_AND: Precedence = 1200; // &
+const PREC_EQ: Precedence = 1300; // == != eq ne <=> cmp
+const PREC_REL: Precedence = 1400; // < > <= >= lt gt le ge
 /// `isa` — class-instance infix operator (5.32+).  Non-associative.  Tighter than relational, looser than named unary:
 /// `$x isa Foo < 1` parses as `($x isa Foo) < 1`, while `foo $x isa Bar` parses as `foo($x isa Bar)`.
-const PREC_ISA: Precedence = 29;
+const PREC_ISA: Precedence = 1500;
 /// Named unary operators and prototyped subs with a scalar-ish slot (`$`, `_`, `+`, `\X`, `\[...]`, etc.).  Sits
 /// between isa and shift: `foo $a < 1` parses as `foo($a) < 1`, while `foo $a << 1` parses as `foo($a << 1)`.
 /// Non-associative.
-const PREC_NAMED_UNARY: Precedence = 30;
-const PREC_SHIFT: Precedence = 32; // << >>
-const PREC_ADD: Precedence = 34; // + - .
-const PREC_MUL: Precedence = 36; // * / % x
-const PREC_BINDING: Precedence = 38; // =~ !~
-const PREC_UNARY: Precedence = 40; // ! ~ \ - + (prefix)
-const PREC_POW: Precedence = 42; // **
-const PREC_INC: Precedence = 44; // ++ -- (postfix)
-const PREC_ARROW: Precedence = 46; // ->
+const PREC_NAMED_UNARY: Precedence = 1600;
+const PREC_SHIFT: Precedence = 1700; // << >>
+const PREC_ADD: Precedence = 1800; // + - .
+const PREC_MUL: Precedence = 1900; // * / % x
+const PREC_BINDING: Precedence = 2000; // =~ !~
+const PREC_UNARY: Precedence = 2100; // ! ~ \ - + (prefix)
+const PREC_POW: Precedence = 2200; // **
+const PREC_INC: Precedence = 2300; // ++ -- (postfix)
+const PREC_ARROW: Precedence = 2400; // ->
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Assoc {
@@ -144,7 +140,6 @@ pub struct Parser {
     current: Option<Spanned>,
     /// Stored lexer error — surfaced by next_token().
     lexer_error: Option<ParseError>,
-    depth: ParseDepth,
     /// Symbol table of all packages, subs, and imports seen so far.  Populated as sub declarations and (eventually)
     /// `use` statements are parsed; consulted at call sites for prototype-aware argument parsing.
     symbols: SymbolTable,
@@ -175,7 +170,6 @@ impl Parser {
             lexer,
             current: None,
             lexer_error: None,
-            depth: 0,
             symbols: SymbolTable::new(),
             current_package: std::sync::Arc::from("main"),
             pragmas: Pragmas::new(),
@@ -275,26 +269,6 @@ impl Parser {
             return Err(e);
         }
         Ok(matches!(self.peek_token(), Token::Eof))
-    }
-
-    // ── Depth control ─────────────────────────────────────────
-
-    /// Increment the recursion-depth counter, invoke `f`, then decrement unconditionally — even if `f` returns an
-    /// error.  This is the closure-based alternative to RAII descent guards (which would conflict with `&mut self`
-    /// re-borrows inside `f`).
-    ///
-    /// If entering would exceed `MAX_DEPTH`, returns an error without calling `f`.
-    fn with_descent<T, F>(&mut self, f: F) -> Result<T, ParseError>
-    where
-        F: FnOnce(&mut Self) -> Result<T, ParseError>,
-    {
-        if self.depth + 1 >= MAX_DEPTH {
-            return Err(ParseError::new("nesting too deep", self.peek_span()));
-        }
-        self.depth += 1;
-        let result = f(self);
-        self.depth -= 1;
-        result
     }
 
     // ── Flag validation ───────────────────────────────────────
@@ -414,10 +388,8 @@ impl Parser {
                             };
                             (kind, false)
                         } else {
-                            let expr = self.with_descent(|this| {
-                                let initial = this.parse_decl_expr(scope, kw_span)?;
-                                this.parse_expr_continuation(initial, PREC_LOW)
-                            })?;
+                            let initial = self.parse_decl_expr(scope, kw_span)?;
+                            let expr = self.parse_expr_continuation(initial, PREC_LOW)?;
                             let kind = self.maybe_postfix_control(expr)?;
                             let terminated = self.eat(&Token::Semi)?;
                             (kind, terminated)
@@ -534,10 +506,8 @@ impl Parser {
                     (StmtKind::Labeled(name, Box::new(stmt)), false)
                 } else {
                     // Expression starting with an identifier.
-                    let expr = self.with_descent(|this| {
-                        let initial = this.parse_ident_term(name, ident_span)?;
-                        this.parse_expr_continuation(initial, PREC_LOW)
-                    })?;
+                    let initial = self.parse_ident_term(name, ident_span)?;
+                    let expr = self.parse_expr_continuation(initial, PREC_LOW)?;
                     let kind = self.maybe_postfix_control(expr)?;
                     let terminated = self.eat(&Token::Semi)?;
                     (kind, terminated)
@@ -1633,34 +1603,32 @@ impl Parser {
     // ── Block parsing ─────────────────────────────────────────
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
-        self.with_descent(|this| {
-            // Pragmas and current_package are lexically scoped: any `use feature`, `use utf8`, or `package Name;`
-            // inside this block doesn't leak out.  Save state before parsing, restore after.
-            let saved_pragmas = this.pragmas;
-            let saved_package = this.current_package.clone();
+        // Pragmas and current_package are lexically scoped: any `use feature`, `use utf8`, or `package Name;`
+        // inside this block doesn't leak out.  Save state before parsing, restore after.
+        let saved_pragmas = self.pragmas;
+        let saved_package = self.current_package.clone();
 
-            let start = this.peek_span();
-            let result = (|this: &mut Parser| -> Result<Block, ParseError> {
-                this.expect_token(&Token::LeftBrace)?;
+        let start = self.peek_span();
+        let result = (|this: &mut Parser| -> Result<Block, ParseError> {
+            this.expect_token(&Token::LeftBrace)?;
 
-                let mut statements = Vec::new();
-                while !this.at(&Token::RightBrace)? && !this.at_eof()? {
-                    statements.push(this.parse_statement()?);
-                }
+            let mut statements = Vec::new();
+            while !this.at(&Token::RightBrace)? && !this.at_eof()? {
+                statements.push(this.parse_statement()?);
+            }
 
-                let end = this.peek_span();
-                this.expect_token(&Token::RightBrace)?;
+            let end = this.peek_span();
+            this.expect_token(&Token::RightBrace)?;
 
-                Ok(Block { statements, span: start.merge(end) })
-            })(this);
+            Ok(Block { statements, span: start.merge(end) })
+        })(self);
 
-            this.pragmas = saved_pragmas;
-            this.current_package = saved_package;
-            // Sync shared state with the restored lexical scope.
-            this.lexer.set_utf8_mode(this.pragmas.utf8);
-            this.lexer.features = this.pragmas.features;
-            result
-        })
+        self.pragmas = saved_pragmas;
+        self.current_package = saved_package;
+        // Sync shared state with the restored lexical scope.
+        self.lexer.set_utf8_mode(self.pragmas.utf8);
+        self.lexer.features = self.pragmas.features;
+        result
     }
 
     fn parse_paren_expr(&mut self) -> Result<Expr, ParseError> {
@@ -2085,12 +2053,6 @@ impl Parser {
     // ── Term parsing ──────────────────────────────────────────
 
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
-        // Depth guard for remaining recursive cases (array refs, hash constructors, eval, etc.).  Prefix operators
-        // and parentheses are handled iteratively by parse_expr and don't recurse through here.
-        self.with_descent(|this| this.parse_term_inner())
-    }
-
-    fn parse_term_inner(&mut self) -> Result<Expr, ParseError> {
         let spanned = self.next_token()?;
         let span = spanned.span;
 
@@ -2992,10 +2954,8 @@ impl Parser {
             };
             if matches!(self.peek_token(), Token::Comma) {
                 // Bareword followed by comma → first argument, not filehandle.  `print CONSTANT, "hello"`.
-                let expr = self.with_descent(|this| {
-                    let initial = this.parse_ident_term(fh_name, fh_span)?;
-                    this.parse_expr_continuation(initial, PREC_COMMA + 1)
-                })?;
+                let initial = self.parse_ident_term(fh_name, fh_span)?;
+                let expr = self.parse_expr_continuation(initial, PREC_COMMA + 1)?;
                 first_arg = Some(expr);
             } else {
                 // Bareword not followed by comma → filehandle.  `print STDERR "hello"`.
@@ -3033,11 +2993,9 @@ impl Parser {
                 filehandle = Some(Box::new(Expr { kind: ExprKind::ScalarVar(var_name), span: var_span }));
             } else {
                 // `print $x + 1` → not filehandle, first argument.
-                let expr = self.with_descent(|this| {
-                    let var_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
-                    let initial = this.maybe_postfix_subscript(var_expr)?;
-                    this.parse_expr_continuation(initial, PREC_COMMA + 1)
-                })?;
+                let var_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
+                let initial = self.maybe_postfix_subscript(var_expr)?;
+                let expr = self.parse_expr_continuation(initial, PREC_COMMA + 1)?;
                 first_arg = Some(expr);
             }
         }

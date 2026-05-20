@@ -1630,47 +1630,166 @@ terminology.
 #### 6.1.1 Core components on `Parser`:
 
 `parse_expr(min_prec)` — the main entry point for expressions.
-Increments the recursion depth guard (`with_descent`), calls
-`parse_term()` to get the initial left-hand side, then delegates to
-`parse_expr_continuation` for the operator loop.
+Iterative: the forward phase consumes prefix operators and opening
+delimiters by pushing `ExprFrame` continuations onto a heap-allocated
+`Vec`.  The backward phase applies frames, running the infix
+continuation loop at each precedence level.  No recursion occurs
+for prefix operators, parenthesized expressions, anonymous array
+refs, anonymous hash constructors, sigil deref blocks, or keyword
+expressions (eval, do, return, goto, dump).
+
+`parse_expr_forward(stack, current_prec)` — the forward phase.
+Calls `try_prefix` in a loop, pushing frames until a leaf term is
+reached.  No depth limit on the iterative loop — nesting depth is
+bounded only by available heap memory.
+
+`try_prefix(outer_prec)` — inspects the current token and returns
+`Some(PrefixResult::Frame(frame, inner_prec))` if a prefix operator
+or opening delimiter was consumed, `Some(PrefixResult::Leaf(expr))`
+if a complete term was produced (e.g. filetest, -bareword, empty
+container), or `None` if the token is not a prefix (proceed to
+`parse_term`).
+
+Prefix cases handled iteratively by `try_prefix`:
+
+| Token | Frame variant | Inner prec |
+|-------|---------------|------------|
+| `(` | Paren | PREC_LOW |
+| `-` (general) | Negate | PREC_UNARY |
+| `+` | Unary(NumPositive) | PREC_UNARY |
+| `!` | Unary(LogNot) | PREC_UNARY |
+| `~` | Unary(BitNot) | PREC_UNARY |
+| `~.` | Unary(StringBitNot) | PREC_UNARY |
+| `\` | Ref | PREC_UNARY |
+| `not` | Unary(Not) | PREC_NOT_LOW |
+| `++` | PreIncDec(PreInc) | PREC_INC |
+| `--` | PreIncDec(PreDec) | PREC_INC |
+| `local` | Local | PREC_UNARY |
+| `[` | ArrayRef (accumulator) | PREC_COMMA + 1 |
+| `{` | HashRef (accumulator) | PREC_COMMA + 1 |
+| `$` + `{` | DerefBlock(Scalar) | PREC_LOW |
+| `@` + `{` | DerefBlock(Array) | PREC_LOW |
+| `%` + `{` | DerefBlock(Hash) | PREC_LOW |
+| `&` + `{` | DerefBlock(Code) | PREC_LOW |
+| `*` + `{` | DerefBlock(Glob) | PREC_LOW |
+| `eval` (not `{`) | EvalExpr | PREC_COMMA |
+| `do` (not `{`) | DoExpr | PREC_UNARY |
+| `return` | ReturnExpr | PREC_COMMA |
+| `goto` | GotoExpr | PREC_COMMA |
+| `dump` | DumpExpr | PREC_COMMA |
+
+Several prefix tokens produce `Leaf` directly for non-recursive
+sub-cases: `-bareword` → StringLit, `-f` → filetest, `[]` → empty
+AnonArray, `{}` → empty AnonHash, `$$ref` → Deref(Scalar), `&foo`
+→ FuncCall, `*foo` → GlobVar, `eval { ... }` → EvalBlock,
+`do { ... }` → DoBlock, `return;` → bare return.
+
+`apply_expr_frame(frame, operand)` — applies a saved frame to the
+completed sub-expression.  Returns `FrameResult::Done(expr, prec)`
+for most frames, or `FrameResult::Continue(frame, inner_prec)` for
+accumulator frames (ArrayRef, HashRef) that need more elements.
+
+Frame application includes:
+
+- **Negate**: string negation collapse (`-"foo"` → `"-foo"`,
+  `-"-foo"` → `"+foo"`).
+- **PreIncDec**: lvalue validation on the operand.
+- **Paren**: does not wrap in `ExprKind::Paren` — parentheses are
+  purely syntactic grouping captured by tree structure.  Calls
+  `maybe_postfix_subscript` for `(LIST)[idx]` and `(LIST){key}`.
+- **ArrayRef/HashRef**: pushes the operand, checks for comma/closing
+  delimiter.  Trailing commas are handled by checking for the closing
+  delimiter after consuming a comma.  Returns `Continue` if more
+  elements follow.
+- **DerefBlock**: expects `}`, wraps in `Deref(sigil, expr)`.  Calls
+  `maybe_postfix_subscript` for Scalar, `maybe_call_args` for Code.
 
 `parse_expr_continuation(left, min_prec)` — the Pratt operator loop.
-Separated from `parse_expr` so the parser can pass a pre-consumed
-left-hand side (e.g. when a consumed identifier turns out to be the
-first term of an expression rather than a label or filehandle).
+Consumes infix and postfix operators as long as they bind tightly
+enough.  This loop is already iterative — left-associative chains
+add zero stack depth.  Right-associative operators call
+`parse_expr(right_prec)` for the RHS, which is itself iterative.
 
-`parse_term` — called when the parser expects the start of an
-expression.  Dispatches on the current token via a match: literals
-return AST nodes directly, prefix operators recurse into
-`parse_expr`, keywords like `if` and `sub` call dedicated helper
-methods.  Complex arms call out to helpers (`parse_if_stmt`,
-`parse_while`, `parse_sub_decl`, etc.) for readability.
+`parse_term` — called when the forward phase exhausts prefix cases
+and needs a leaf term.  Returns `Ok(Option<Expr>)` — `None` means no term was present at
+the current position (the token is left unconsumed), distinct from
+`Err(...)` which means a malformed construct was encountered.
+
+The `Option` return is fundamental to comma handling: consecutive
+commas `(1, , , 3)` call `parse_term` after each comma, get `None`
+for the empty positions, and skip them.  Trailing commas see `None`
+before the closing delimiter.  No special-case delimiter checks are
+needed.
 
 `parse_operator` — called when the parser has a left-hand expression
 and the next token is an infix/postfix operator that binds tightly
-enough.  Dispatches on the operator token: binary operators recurse
-into `parse_expr` for the right operand, postfix operators like `++`
-wrap the left operand, ternary `?:` parses the middle and right
-branches, `->` dispatches to method call or dereference parsing.
+enough.  Dispatches on the operator token: binary operators call
+`parse_expr` for the right operand (which is iterative), postfix
+operators wrap the left operand, ternary `?:` parses the middle and
+right branches, `->` dispatches to method call or dereference
+parsing.
 
-`peek_op_info` — inspects the lookahead token in operator position and
-returns `Option<OpInfo>`.  `None` means the token is not valid in
-operator position (the expression ends here).  `Some(info)` provides
-the precedence and associativity for the precedence comparison.
+`peek_op_info` — inspects the lookahead token in operator position
+and returns `Option<OpInfo>`.  `None` means the token is not valid
+in operator position (the expression ends here).  `Some(info)`
+provides the precedence and associativity for the precedence
+comparison.
 
 #### 6.1.2 The expression loop:
 
 ```rust
-type Precedence = u8;
+type Precedence = u16;
 
 fn parse_expr(
     &mut self,
     min_prec: Precedence,
+) -> Result<Option<Expr>, ParseError> {
+    let mut stack: Vec<ExprFrame> = Vec::new();
+    let mut current_prec = min_prec;
+
+    // Forward phase: consume prefix operators and opening
+    // delimiters iteratively.
+    let mut left = self.parse_expr_forward(
+        &mut stack, &mut current_prec)?;
+
+    // Backward phase: run the infix loop at each level,
+    // then apply the saved frame.
+    loop {
+        left = self.parse_expr_continuation(left, current_prec)?;
+        match stack.pop() {
+            None => return Ok(left),
+            Some(frame) => match self.apply_expr_frame(
+                    frame, left)? {
+                FrameResult::Done(expr, prec) => {
+                    left = expr;
+                    current_prec = prec;
+                }
+                FrameResult::Continue(frame, inner_prec) => {
+                    stack.push(frame);
+                    current_prec = inner_prec;
+                    left = self.parse_expr_forward(
+                        &mut stack, &mut current_prec)?;
+                }
+            },
+        }
+    }
+}
+
+fn parse_expr_forward(
+    &mut self,
+    stack: &mut Vec<ExprFrame>,
+    current_prec: &mut Precedence,
 ) -> Result<Expr, ParseError> {
-    self.with_descent(|this| {
-        let left = this.parse_term()?;
-        this.parse_expr_continuation(left, min_prec)
-    })
+    loop {
+        match self.try_prefix(*current_prec)? {
+            Some(PrefixResult::Frame(frame, inner_prec)) => {
+                stack.push(frame);
+                *current_prec = inner_prec;
+            }
+            Some(PrefixResult::Leaf(expr)) => return Ok(expr),
+            None => return self.parse_term(),
+        }
+    }
 }
 
 fn parse_expr_continuation(
@@ -1688,11 +1807,12 @@ fn parse_expr_continuation(
 }
 ```
 
-This is recursive.  Each recursive call adds one stack frame for
-the right operand of an operator or a sub-expression inside a
-prefix construct.  Left-associative operator chains (`$a + $b + $c`)
-are handled by the loop, not by recursion — they add zero stack
-depth regardless of chain length.
+Left-associative operator chains (`$a + $b + $c`) are handled by
+the `parse_expr_continuation` loop, not by recursion — they add
+zero stack depth regardless of chain length.  Prefix chains
+(`not !-$a`) are handled by the forward phase loop, also without
+recursion.  Deeply nested containers (`[[[1]]]`, `((((1))))`,
+`${${$ref}}`) push frames onto the heap-allocated stack.
 
 `parse_operator` always parses the right-hand side using
 `right_prec()` from the operator's `OpInfo`, regardless of whether
@@ -1708,30 +1828,28 @@ a token that might be a label, filehandle, or first term, it can
 pass the already-built expression into `parse_expr_continuation`
 instead of rewinding and re-parsing.
 
-#### 6.1.3 Nesting depth control:
+#### 6.1.3 Nesting depth:
 
-A `ParseDepth` counter (`u16`) is incremented on every recursive
-entry via `with_descent`.  If the counter would exceed `MAX_DEPTH`
-(10,000), the parser returns an error without recursing — this
-prevents stack overflow on adversarial input (deeply nested
-expressions, blocks within blocks).  `MAX_DEPTH` is set high enough
-to exceed Perl 5's actual limits (`YYMAXDEPTH = 10,000`).
+The iterative expression parser has no arbitrary depth limit for
+prefix operators, parentheses, containers, and deref blocks.
+Nesting depth is bounded only by available heap memory.  100,000
+nested parentheses parse and produce a flat result (parentheses are
+syntactic-only, not AST nodes).
 
-```rust
-pub type ParseDepth = u16;
-const MAX_DEPTH: ParseDepth = 10_000;
+There is no `with_descent` guard or `MAX_DEPTH` constant.  The
+remaining recursive paths (block nesting via `parse_block` →
+`parse_statement` → `parse_block`, slice element loops) are bounded
+by actual source structure.  Real Perl code does not nest thousands
+of blocks deep, and Perl itself imposes no block nesting limit.
+The OS stack is the natural limit for pathological input.
 
-fn with_descent<T, F>(&mut self, f: F) -> Result<T, ParseError>
-where F: FnOnce(&mut Self) -> Result<T, ParseError> {
-    if self.depth + 1 >= MAX_DEPTH {
-        return Err(ParseError::new("expression too deeply nested", ...));
-    }
-    self.depth += 1;
-    let result = f(self);
-    self.depth -= 1;
-    result
-}
-```
+Note: deeply nested containers (`[[[...]]]`, `-(-(-(...)))`)
+produce deeply nested AST trees.  While parsing is iterative,
+Rust's recursive `Drop` implementation limits practical depth for
+these to ~10,000 levels in debug builds.  This is not a parsing
+limitation — it's a Rust-side memory management constraint that
+can be addressed with arena allocation or iterative Drop if needed.
+Parentheses do not have this issue since they produce no AST nodes.
 
 #### 6.1.4 Precedence and associativity table:
 
@@ -1743,7 +1861,8 @@ algorithm are derived mechanically:
 enum Assoc {
     Left,    // right_prec = prec + 1
     Right,   // right_prec = prec
-    Non,     // right_prec = prec + 1, error if chained
+    Non,     // right_prec = prec + 1, chaining is a syntax error
+    Chain,   // right_prec = prec + 1, chaining produces ChainedCmp
 }
 
 struct OpInfo {
@@ -1755,10 +1874,10 @@ impl OpInfo {
     fn left_prec(self) -> Precedence {
         self.prec
     }
-
     fn right_prec(self) -> Precedence {
         match self.assoc {
-            Assoc::Left | Assoc::Non => self.prec + 1,
+            Assoc::Left | Assoc::Non | Assoc::Chain
+                => self.prec + 1,
             Assoc::Right => self.prec,
         }
     }
@@ -1774,55 +1893,150 @@ same-precedence operators are consumed by recursion (attaching to
 the right).
 
 Non-associative: same mechanics as left-associative, but
-`parse_operator` detects chaining by inspecting the left operand's
-top-level operator node (ignoring transparent grouping such as
-parentheses) — if it is the same non-associative operator, the
-parser reports a syntax error (e.g., `$a == $b == $c` is rejected).
+`parse_operator` detects chaining and reports a syntax error.
+Applies to range (`..`, `...`), `isa`, named unary operators,
+`++`/`--`, and list operators (rightward).
 
-The precedence table is a match expression in `peek_op_info`,
-returning `OpInfo` with one number and one keyword per operator.
-Precedence values use even numbers so that `right_prec` (which adds
-1 for left/non-associative) fits cleanly:
+Chained: same mechanics as left-associative, but `parse_operator`
+detects chaining and produces `ChainedCmp` nodes.  `$x < $y <= $z`
+becomes `ChainedCmp([Lt, Le], [$x, $y, $z])`, which short-circuits
+like `$x < $y && $y <= $z` but evaluates `$y` only once.  Applies
+to relational operators (`<`, `>`, `<=`, `>=`, `lt`, `gt`, `le`,
+`ge`) and equality operators (`==`, `!=`, `eq`, `ne`).  The
+three-way comparison operators (`<=>`, `cmp`) and smartmatch (`~~`)
+at the equality precedence level are non-associative, not chained —
+`$x <=> $y <=> $z` is a syntax error.  This mixed behavior at a
+single precedence level (`chain/na` in perlop) is handled by
+per-operator associativity in the `peek_op_info` table.
+
+Precedence values use `u16` with gaps of 100 between adjacent
+levels, providing 99 slots between each pair for plugin operators.
+This is wide enough for multiple plugins to coexist at intermediate
+levels without renumbering.
 
 ```rust
-const PREC_LOW: Precedence = 0;           // statement boundary
-const PREC_OR_LOW: Precedence = 2;        // or, xor
-const PREC_AND_LOW: Precedence = 4;       // and
-const PREC_NOT_LOW: Precedence = 6;       // not (prefix)
-const PREC_LIST: Precedence = 8;          // list operators
-const PREC_COMMA: Precedence = 10;        // , =>
-const PREC_ASSIGN: Precedence = 12;       // = += -= etc.
-const PREC_TERNARY: Precedence = 14;      // ?:
-const PREC_RANGE: Precedence = 16;        // .. ...
-const PREC_OR: Precedence = 18;           // || // ^^
-const PREC_AND: Precedence = 20;          // &&
-const PREC_BIT_OR: Precedence = 22;       // | ^ ~| ~^
-const PREC_BIT_AND: Precedence = 24;      // & ~&
-const PREC_EQ: Precedence = 26;           // == != eq ne <=> cmp ~~
-const PREC_REL: Precedence = 28;          // < > <= >= lt gt le ge
-const PREC_ISA: Precedence = 29;          // isa (feature-gated)
-const PREC_NAMED_UNARY: Precedence = 30;  // named unary operators
-const PREC_SHIFT: Precedence = 32;        // << >>
-const PREC_ADD: Precedence = 34;          // + - .
-const PREC_MUL: Precedence = 36;          // * / % x
-const PREC_BINDING: Precedence = 38;      // =~ !~
-const PREC_UNARY: Precedence = 40;        // ! ~ \ - + (prefix)
-const PREC_POW: Precedence = 42;          // **
-const PREC_INC: Precedence = 44;          // ++ -- (postfix)
-const PREC_ARROW: Precedence = 46;        // ->
+const PREC_LOW: Precedence = 0;
+const PREC_OR_LOW: Precedence = 100;       // or xor
+const PREC_AND_LOW: Precedence = 200;      // and
+const PREC_NOT_LOW: Precedence = 300;      // not (prefix)
+const PREC_LIST: Precedence = 400;         // list operators
+const PREC_COMMA: Precedence = 500;        // , =>
+const PREC_ASSIGN: Precedence = 600;       // = += -= etc.
+const PREC_TERNARY: Precedence = 700;      // ?:
+const PREC_RANGE: Precedence = 800;        // .. ...
+const PREC_OR: Precedence = 900;           // || // ^^
+const PREC_AND: Precedence = 1000;         // &&
+const PREC_BIT_OR: Precedence = 1100;      // | ^
+const PREC_BIT_AND: Precedence = 1200;     // &
+const PREC_EQ: Precedence = 1300;          // == != eq ne <=> cmp
+const PREC_REL: Precedence = 1400;         // < > <= >= lt gt le ge
+const PREC_ISA: Precedence = 1500;         // isa
+const PREC_NAMED_UNARY: Precedence = 1600; // named unary ops
+const PREC_SHIFT: Precedence = 1700;       // << >>
+const PREC_ADD: Precedence = 1800;         // + - .
+const PREC_MUL: Precedence = 1900;         // * / % x
+const PREC_BINDING: Precedence = 2000;     // =~ !~
+const PREC_UNARY: Precedence = 2100;       // ! ~ \ - + (prefix)
+const PREC_POW: Precedence = 2200;         // **
+const PREC_INC: Precedence = 2300;         // ++ -- (postfix)
+const PREC_ARROW: Precedence = 2400;       // ->
 ```
 
-`PREC_ISA` (29, odd) sits between relational and shift, matching
-Perl 5.32+'s `isa` operator placement.  `PREC_NAMED_UNARY` (30)
-gives named unary operators (`defined`, `ref`, `chomp`, etc.)
-their correct precedence.
+Prefix operators do not have associativity — they have only an
+inner precedence that controls how tightly they bind to their
+operand.  This is used inside `try_prefix`, not part of the infix
+precedence table.
 
-Prefix operators do not have associativity — they have only a right
-precedence that controls how tightly they bind to their operand.
-This is a separate lookup used inside `parse_term`, not part of the
-infix precedence table.
+#### 6.1.5 Context propagation:
 
-#### 6.1.5 Layer separation:
+The parser tracks evaluation context — scalar, list, or void —
+and propagates it through the expression tree.  Context determines
+how the comma operator behaves and how the AST is constructed.
+
+Context is determined at parse time by the surrounding syntax:
+
+| Syntax | Context | Why |
+|--------|---------|-----|
+| `$x = ...` | scalar | scalar sigil on LHS |
+| `@arr = ...` | list | array sigil on LHS |
+| `%hash = ...` | list | hash sigil on LHS |
+| `my $x = ...` | scalar | scalar declaration |
+| `my ($x, $y) = ...` | list | parenthesized declaration |
+| `my @arr = ...` | list | array declaration |
+| `print ...` | list | list operator |
+| `push @a, ...` | list | list operator |
+| `defined ...` | scalar | named unary |
+| `$x ? ... : ...` | propagated | branches inherit outer context |
+| `foo(...)` | prototype-dependent | see §6.3 |
+
+The critical distinction: `my $x = (2, 4, 6)` is scalar context
+(result is 6, the last value via C comma semantics), while
+`my ($x) = (2, 4, 6)` is list context (result is 2, the first
+element of the list).  The parentheses on the LHS change the
+declaration from scalar form to list form, and the parser must
+encode this difference in the AST.
+
+Context flows inward from the LHS of assignment, from list
+operators, from prototypes, and from declaration forms.  The parser
+has all the information it needs — sigils, keywords, parenthesized
+vs bare declaration syntax, prototype slots — to determine context
+at every position.
+
+#### 6.1.6 The comma operator and list construction:
+
+The comma token (`,`) has fundamentally different semantics
+depending on context.  The parser distinguishes them by consulting
+the active context:
+
+**List context — list construction.**  When a list operator
+(at PREC_LIST) or a list-form declaration is active, commas at
+PREC_COMMA add elements to the list under construction.  The list
+operator creates the `List` node, and commas populate it.
+`parse_expr` returns `None` for empty positions (consecutive
+commas `(1, , , 3)` skip the empty slots), and the list operator
+collects only `Some` values.
+
+**Scalar context — C comma operator.**  Outside list context,
+commas sequence side effects.  `$x = (2, 4, 6)` evaluates 2 and
+4 in void context, then produces 6.  The parser produces
+`ExprKind::Comma(lhs, rhs)` — a distinct AST node from
+`ExprKind::List`.
+
+The trailing-comma handling that was previously a special case
+in the comma handler falls out naturally from `parse_term`
+returning `None`: after a comma, if the next token is a closing
+delimiter, `parse_term` returns `None`, and the list accumulation
+loop stops.  No explicit delimiter checks needed.
+
+#### 6.1.7 List operators and PREC_LIST:
+
+List operators (`print`, `sort`, `map`, `push`, `chomp`, etc.)
+participate in the Pratt loop at `PREC_LIST` (400).  This gives
+them a dual-precedence nature, as described in `perlop`:
+
+**Rightward (low)**: the list operator at PREC_LIST gobbles
+everything to its right — commas at PREC_COMMA (500) are consumed
+as part of the argument list because PREC_COMMA > PREC_LIST.
+
+**Leftward (high)**: once the list operator finishes, its result
+is a simple term in the enclosing expression.  `(print $foo), exit`
+evaluates print first because print's result acts as a term to
+the outer comma.
+
+When a list operator is followed by `(`, the parentheses promote
+it to term-level precedence — the argument list is delimited by
+the parens, and anything after `)` is part of the enclosing
+expression.  This is the `print($foo & 255) + 1` gotcha from
+`perlop`: the parens make `print(...)` a term, so `+ 1` binds
+to print's return value.
+
+List operators with special argument parsing (`sort BLOCK LIST`,
+`map BLOCK LIST`, `print FILEHANDLE LIST`) handle their
+first-argument quirks before handing off to standard list argument
+collection.  The Pratt loop handles where the argument list *ends*;
+the special parsing handles how arguments are *collected*.
+
+#### 6.1.8 Layer separation:
 
 The parser operates on three cleanly separated layers:
 
@@ -1832,26 +2046,27 @@ The parser operates on three cleanly separated layers:
    same token regardless of parser context.
 
 2. **Parser position** (term vs operator) determines which parse
-   method is called and how each token is interpreted.  `parse_term`
-   handles tokens at the start of an expression (so `Token::Slash`
-   means regex).  `parse_operator` handles tokens after a left-hand
-   expression (so `Token::Slash` means division).  `peek_op_info`
-   determines whether an operator binds in the current context.
+   method is called and how each token is interpreted.  The forward
+   phase (`try_prefix`, `parse_term`) handles tokens at the start
+   of an expression (so `Token::Slash` means regex).
+   `parse_operator` handles tokens after a left-hand expression
+   (so `Token::Slash` means division).  `peek_op_info` determines
+   whether an operator binds in the current context.
 
 3. **Construct-specific parsing** handles the interior of each
-   syntactic form.  `parse_if_stmt`, `parse_while`, `parse_sub_decl`,
-   and similar helpers are plain recursive descent, called from
-   `parse_term` arms.  They call `parse_expr` for sub-expressions,
-   completing the mutual recursion.  Some make decisions after
-   recursive calls return — for example, `try_reclassify_as_hash`
-   inspects a parsed block to determine whether it should be
-   reinterpreted as a hash constructor.  This post-hoc
-   reclassification is impossible in Perl 5's LALR(1) grammar,
-   which must decide before the production is entered.
+   syntactic form.  `parse_if_stmt`, `parse_while`,
+   `parse_sub_decl`, and similar helpers are plain recursive
+   descent, called from `parse_term` arms.  They call `parse_expr`
+   for sub-expressions, completing the mutual recursion.  Some make
+   decisions after recursive calls return — for example,
+   `try_reclassify_as_hash` inspects a parsed block to determine
+   whether it should be reinterpreted as a hash constructor.  This
+   post-hoc reclassification is impossible in Perl 5's LALR(1)
+   grammar, which must decide before the production is entered.
 
-Parser position determines which parse method is called.
-A parse method does not inspect any shared lexer state — the parser's
-own call stack is the context.
+Parser position determines which parse method is called.  A parse
+method does not inspect any shared lexer state — the parser's own
+call stack is the context.
 
 ### 6.2 Parser–Lexer Communication
 
@@ -1888,16 +2103,38 @@ This happens at `use`/`no` declarations and at block exit when
 saved pragmas are restored.  The lexer reads these fields for
 Unicode identifier support and paired delimiter lookup.
 
-### 6.3 Prototype-Guided Parsing
+### 6.3 Prototype-Guided Parsing and Context
 
 When the parser encounters a known subroutine name, it checks the
 sub's prototype (if any) in the symbol table to determine how to
-parse the argument list.  Prototypes change the parsing:
+parse the argument list.  Prototypes change both the parsing
+structure and the context of each argument position:
 
-- `sub foo ($)` — expects one scalar argument
-- `sub foo (&@)` — first arg is a block, rest is a list
-- `sub foo ()` — takes no arguments, so `foo + 1` is `foo() + 1`
-- no prototype — standard list operator parsing
+- `sub foo ($)` — first arg is scalar context; `foo((2,4,6),8)`
+  applies C comma semantics to `(2,4,6)`, producing 6 as the
+  first argument.
+- `sub foo (&@)` — first arg is a block, rest is a list.
+- `sub foo ()` — takes no arguments, so `foo + 1` is `foo() + 1`.
+- no prototype — standard list operator parsing; all arguments
+  are in list context.
+
+This is not merely a runtime concern.  The prototype determines
+how the parser interprets commas inside the argument list at parse
+time.  Consider two calls to otherwise-identical subroutines:
+
+```perl
+sub without_prototype { ... }
+sub with_prototype ($@) { ... }
+
+without_prototype((2,4,6),8,10);  # 5 args: 2,4,6,8,10
+with_prototype((2,4,6),8,10);     # 3 args: 6,8,10
+```
+
+Without a prototype, `(2,4,6)` is a list that flattens — five
+arguments.  With `($@)`, the first slot is scalar context, so
+`(2,4,6)` is C commas — the result is 6, producing three
+arguments.  The same source text produces different ASTs because
+the prototype changes the context in which commas are parsed.
 
 The parser registers sub declarations (with prototypes) in the
 symbol table as they are parsed, so subsequent call sites can
@@ -1908,11 +2145,24 @@ sequence to decide how each argument position should be parsed
 (scalar context, block, slurpy list, etc.).
 
 Prototyped subs with a scalar-ish first slot (`$`, `_`, `+`,
-`\X`, `\[...]`) use `PREC_NAMED_UNARY` (30) for their argument
+`\X`, `\[...]`) use `PREC_NAMED_UNARY` (1600) for their argument
 precedence, sitting between `isa` and shift — so `foo $a < 1`
 parses as `foo($a) < 1`, while `foo $a << 1` parses as
 `foo($a << 1)`.  Subs with an empty prototype `()` consume no
 arguments at all.
+
+Context propagation from prototypes interacts with the comma
+handler: each prototype slot sets the context for its argument
+position, and the comma handler consults this context to determine
+whether to build a List node (list slot) or produce a Comma node
+(scalar slot).
+
+The return context of a function call — what `wantarray` reports —
+is determined at compile time by the call site's surrounding syntax.
+`my $x = foo()` marks the call as scalar context; `my @a = foo()`
+marks it as list context.  This is fully resolved at parse time and
+recorded in the AST.  `wantarray` inside the sub body reads this
+context at runtime, but it was established by the parser.
 
 ### 6.4 Syntax Extension API (Planned)
 
@@ -1940,7 +2190,7 @@ The Perl 5 C implementation provides three mechanisms:
    `parse_arithexpr`, etc.  These let plugins manipulate the lexer
    buffer and recursively invoke the parser to parse sub-expressions.
 
-The Rust implementation will provide all three, redesigned as
+The Rust implementation provides all three, redesigned as
 trait-based APIs rather than global function pointers.
 
 #### 6.4.1 Keyword extension trait:
@@ -1981,7 +2231,10 @@ entirely by the core parser.
 
 Precedence and associativity are provided at registration time, not
 as a trait method — this makes operator metadata explicit at the
-registration point and decouples it from parse behavior.
+registration point and decouples it from parse behavior.  The 99
+slots between each adjacent built-in precedence level provide ample
+room for multiple plugins to register at distinct intermediate
+levels.
 
 ### 6.5 Forward-Only Parsing
 
@@ -2047,14 +2300,14 @@ it could be a block (`{ print 1; print 2 }`) or an anonymous hash
 constructor (`{ key => "value" }`).  In Perl 5, the LALR(1) parser
 requires a distinct token type before it can select a grammar
 production, so `toke.c` runs a ~200-line byte-level heuristic
-(`yyl_leftcurly`, lines 6304–6507 in v5.42.2) that scans ahead through the raw
-source, manually skipping whitespace, comments, string literals,
-q-quotes with paired/unpaired delimiters, and barewords.  It then
-checks whether the first term is followed by `,` or `=>` to guess
-hash vs block.  This heuristic is fragile, cannot see past the
-current line reliably, and disagrees with programmer intent in edge
-cases (e.g. `{@pairs}` at statement level is classified as a block
-even when a hash constructor was intended).
+(`yyl_leftcurly`, lines 6304–6507 in v5.42.2) that scans ahead
+through the raw source, manually skipping whitespace, comments,
+string literals, q-quotes with paired/unpaired delimiters, and
+barewords.  It then checks whether the first term is followed by
+`,` or `=>` to guess hash vs block.  This heuristic is fragile,
+cannot see past the current line reliably, and disagrees with
+programmer intent in edge cases (e.g. `{@pairs}` at statement level
+is classified as a block even when a hash constructor was intended).
 
 **The implementation: parse as block, reclassify.**  The recursive
 descent parser is not constrained by LALR(1) token-driven dispatch.
@@ -2067,8 +2320,8 @@ cannot be a hash.  This asymmetry enables a simple strategy:
    `HashBrace` token — the lexer never pre-decides brace meaning.
 
 2. In term position (`$x = {`, `foo({`, after `,`, after `=>`),
-   `parse_term` sees `LeftBrace` and calls hash constructor parsing
-   directly.  No heuristic needed — context is unambiguous.
+   `try_prefix` sees `LeftBrace` and pushes a HashRef accumulator
+   frame.  No heuristic needed — context is unambiguous.
 
 3. In block position (`if (...) {`, `sub name {`, `eval {`),
    `parse_block` is called directly.  Also unambiguous.
@@ -2103,8 +2356,8 @@ cannot be a hash.  This asymmetry enables a simple strategy:
 **The `+{...}` idiom.**  Perl programmers force hash constructor
 interpretation with `+{ ... }`, where the unary `+` is a no-op that
 places `{` in term position.  This works automatically: `+` is a
-prefix operator, `parse_term` is called for its operand, sees
-`LeftBrace`, and parses as a hash constructor.  No special case
+prefix in `try_prefix`, which then sees `LeftBrace` in the forward
+phase and pushes a HashRef accumulator frame.  No special case
 needed.
 
 **Bug-for-bug compatibility.**  The reclassification heuristic is
