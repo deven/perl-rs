@@ -735,23 +735,6 @@ fn lex_scientific_pos_exponent() {
 }
 
 #[test]
-#[ignore = "lexer doesn't handle leading-dot floats yet — `.` is lexed as Dot before checking for trailing digits"]
-fn lex_leading_dot_float() {
-    // `.5` — leading dot is a valid float literal in Perl.
-    let tokens = lex_all(".5");
-    assert_eq!(tokens.len(), 1);
-    assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 0.5).abs() < 1e-15));
-}
-
-#[test]
-#[ignore = "lexer doesn't handle leading-dot floats yet — `.` is lexed as Dot before checking for trailing digits"]
-fn lex_leading_dot_float_with_exponent() {
-    let tokens = lex_all(".5e2");
-    assert_eq!(tokens.len(), 1);
-    assert!(matches!(tokens[0], Token::FloatLit(f) if (f - 50.0).abs() < 1e-10));
-}
-
-#[test]
 fn lex_trailing_dot_is_int_then_concat() {
     // `0.` — in Perl, this is `0` followed by `.` (concat).  NOT a float.
     let tokens = lex_all("0 .");

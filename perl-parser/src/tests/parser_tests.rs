@@ -6839,6 +6839,76 @@ fn proto_no_prototype_parses_list() {
     }
 }
 
+// ── Leading-dot float and v-string disambiguation ─────────
+
+#[test]
+fn parse_leading_dot_float() {
+    // `.5` in term position → FloatLit(0.5).
+    let e = parse_expr_str(".5;");
+    assert!(matches!(e.kind, ExprKind::FloatLit(f) if (f - 0.5).abs() < 1e-15), "expected FloatLit(0.5), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_float_with_exponent() {
+    let e = parse_expr_str(".5e2;");
+    assert!(matches!(e.kind, ExprKind::FloatLit(f) if (f - 50.0).abs() < 1e-10), "expected FloatLit(50.0), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_vstring() {
+    // `.5.6` → VersionLit("0.5.6") — two dots means v-string.
+    let e = parse_expr_str(".5.6;");
+    assert!(matches!(&e.kind, ExprKind::VersionLit(v) if v == "0.5.6"), "expected VersionLit(\"0.5.6\"), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_float_in_expr() {
+    // `.5 + 1` → Add(FloatLit(0.5), IntLit(1)).
+    let e = parse_expr_str(".5 + 1;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::FloatLit(f) if (f - 0.5).abs() < 1e-15), "expected FloatLit(0.5) on LHS, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_dot_in_operator_position_is_concat() {
+    // `$x .5` → Concat($x, IntLit(5)).  The `.` is concat in operator position, not a leading-dot float.
+    let e = parse_expr_str("$x .5;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Concat, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::IntLit(5)), "expected IntLit(5) on RHS of Concat, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Concat, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_dot_in_operator_position_concat_float() {
+    // `$x .5.6` → Concat($x, FloatLit(5.6)).  First `.` is concat, `5.6` is a float.
+    let e = parse_expr_str("$x .5.6;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Concat, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::FloatLit(f) if (f - 5.6).abs() < 1e-10), "expected FloatLit(5.6) on RHS of Concat, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Concat, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_dot_in_operator_position_concat_vstring() {
+    // `$x .5.6.7` → Concat($x, VersionLit("5.6.7")).  First `.` is concat, `5.6.7` is a v-string.
+    let e = parse_expr_str("$x .5.6.7;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Concat, _, rhs) => {
+            assert!(matches!(&rhs.kind, ExprKind::VersionLit(v) if v == "5.6.7"), "expected VersionLit(\"5.6.7\") on RHS of Concat, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Concat, got {other:?}"),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Operators with AST verification
 // ═══════════════════════════════════════════════════════════

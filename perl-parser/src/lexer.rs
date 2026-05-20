@@ -3055,6 +3055,39 @@ impl Lexer {
         }
     }
 
+    /// Called by the parser after consuming a `Dot` token in term position.  If the next byte is a digit, scans a
+    /// leading-dot float (`.5`, `.5e2`) or v-string (`.5.6` → `v0.5.6`).  Returns `Some(FloatLit(n))` or
+    /// `Some(VersionLit(s))` if found, `None` otherwise (the dot is not the start of a numeric literal).
+    pub fn lex_leading_dot_float(&mut self) -> Result<Option<Token>, ParseError> {
+        if !self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+            return Ok(None);
+        }
+        let start = self.line_pos();
+        self.scan_digits();
+
+        // Check for v-string: `.5.6` has a second dot+digit → VersionLit("0.5.6").
+        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+            let mut vstr = format!("0.{}", self.line_slice_str(start)?);
+            while self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+                vstr.push('.');
+                self.skip(1);
+                let seg_start = self.line_pos();
+                while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+                    self.skip(1);
+                }
+                vstr.push_str(self.line_slice_str(seg_start)?);
+            }
+            return Ok(Some(Token::VersionLit(vstr)));
+        }
+
+        // Not a v-string — float with optional exponent.
+        self.scan_exponent();
+        let s = self.line_slice_str(start)?;
+        let s = format!("0.{}", s.replace('_', ""));
+        let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
+        Ok(Some(Token::FloatLit(n)))
+    }
+
     /// Called by the parser after consuming a `Minus` token in term position.  Returns `Some(Filetest(b))` if the next
     /// byte is a single letter not followed by a word-continuation char (e.g. `-f $file`, `-d "/tmp"`).  Returns `None`
     /// otherwise.

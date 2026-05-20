@@ -2356,6 +2356,20 @@ impl Parser {
                 }
             }
 
+            // `.` in term position: try leading-dot float (`.5`, `.5e2`) or v-string (`.5.6`).  In operator position,
+            // `.` is concat (handled by peek_op_info) — same disambiguation pattern as `/` (regex vs division).
+            Token::Dot => match self.lexer.lex_leading_dot_float()? {
+                Some(Token::FloatLit(n)) => {
+                    let end = self.peek_span().start;
+                    Ok(Expr { kind: ExprKind::FloatLit(n), span: Span::new(span.start, end) })
+                }
+                Some(Token::VersionLit(v)) => {
+                    let end = self.peek_span().start;
+                    Ok(Expr { kind: ExprKind::VersionLit(v), span: Span::new(span.start, end) })
+                }
+                _ => Err(ParseError::new("expected expression, got Dot", span)),
+            },
+
             other => Err(ParseError::new(format!("expected expression, got {other:?}"), span)),
         }
     }
