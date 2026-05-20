@@ -6596,6 +6596,74 @@ fn prec_different_non_ops_at_same_level_is_error() {
     assert!(result.is_err(), "different non-assoc ops at same precedence should be a syntax error");
 }
 
+#[test]
+fn prec_single_chain_op_is_binop() {
+    // `$a < $b` alone — single chainable operator produces BinOp, not ChainedCmp.
+    let e = parse_expr_str("$a < $b;");
+    assert!(matches!(e.kind, ExprKind::BinOp(BinOp::NumLt, _, _)), "expected BinOp(NumLt), got {:?}", e.kind);
+}
+
+#[test]
+fn prec_single_non_op_is_binop() {
+    // `$a <=> $b` alone — single Non operator produces BinOp, no error.
+    let e = parse_expr_str("$a <=> $b;");
+    assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Spaceship, _, _)), "expected BinOp(Spaceship), got {:?}", e.kind);
+}
+
+#[test]
+fn prec_chain_with_higher_prec_inside() {
+    // `$a < $b + 1 < $c` — addition is higher precedence, consumed inside the chain operand.
+    let e = parse_expr_str("$a < $b + 1 < $c;");
+    match &e.kind {
+        ExprKind::ChainedCmp(ops, operands) => {
+            assert_eq!(ops.len(), 2);
+            assert_eq!(operands.len(), 3);
+            // Middle operand should be Add($b, 1), not just $b.
+            assert!(matches!(operands[1].kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add as middle operand, got {:?}", operands[1].kind);
+        }
+        other => panic!("expected ChainedCmp, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_chain_with_parens_inside() {
+    // `$a < ($b == $c) < $d` — parenthesized comparison is a term inside the chain.
+    let e = parse_expr_str("$a < ($b == $c) < $d;");
+    match &e.kind {
+        ExprKind::ChainedCmp(ops, operands) => {
+            assert_eq!(ops.len(), 2);
+            assert_eq!(operands.len(), 3);
+            // Middle operand is the parenthesized equality (no Paren wrapper in AST).
+            assert!(matches!(operands[1].kind, ExprKind::BinOp(BinOp::NumEq, _, _)), "expected NumEq as middle operand, got {:?}", operands[1].kind);
+        }
+        other => panic!("expected ChainedCmp, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_chain_in_ternary_condition() {
+    // `$a < $b < $c ? 1 : 0` — chain stops at `?` (lower precedence), becomes the ternary condition.
+    let e = parse_expr_str("$a < $b < $c ? 1 : 0;");
+    match &e.kind {
+        ExprKind::Ternary(cond, _, _) => {
+            assert!(matches!(cond.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp as ternary condition, got {:?}", cond.kind);
+        }
+        other => panic!("expected Ternary, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_chain_as_rhs_of_assign() {
+    // `$x = $a < $b < $c` — chain is the RHS of assignment.
+    let e = parse_expr_str("$x = $a < $b < $c;");
+    match &e.kind {
+        ExprKind::Assign(AssignOp::Eq, _, rhs) => {
+            assert!(matches!(rhs.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp on RHS of Assign, got {:?}", rhs.kind);
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
 // ── Pratt loop adversarial cases ─────────────────────────
 
 #[test]
