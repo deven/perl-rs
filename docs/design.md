@@ -1615,33 +1615,39 @@ struct.
 ### 5.9 Lexer API Methods
 
 The lexer exposes a structured API for the parser.  Methods fall
-into three categories: tokenization, consumption, and
-construct-specific scanning.  There is no shared mutable
+into three categories: tokenization (three methods, one per
+grammatical position), consumption (conditional token matching),
+and construct-specific scanning.  There is no shared mutable
 disambiguation state — the parser communicates context by choosing
-which method to call.
+which method to call.  The parser has no one-token lookahead cache
+and no `peek_token()` / `next_token()` helpers; all token access
+goes through the lexer API directly.
 
 #### 5.9.1 Tokenization methods:
 
-**`lex_token()`** — the primary tokenization method.  Produces
-simple, position-independent tokens.  Ambiguous byte sequences are
-resolved to the operator-position interpretation:
+Three methods, one per grammatical context:
 
-- `/` → `Token::Slash` (division, not regex)
+**`lex_token()`** — position-independent tokenization.  Produces
+simple tokens with ambiguous byte sequences resolved to their
+neutral interpretation:
+
+- `/` → `Token::Slash` (not regex)
 - `//` → `Token::DefinedOr` (not empty regex)
-- `.` → `Token::Dot` (concatenation, not leading-dot float)
-- `<` → `Token::NumLt` (less-than, not readline)
-- `<<` → `Token::ShiftLeft` (shift, not heredoc)
-- `-` → `Token::Minus` (subtraction, not filetest)
-- `x5` → `Token::Ident("x5")` (identifier, not repeat)
+- `.` → `Token::Dot` (not leading-dot float)
+- `<` → `Token::NumLt` (not readline)
+- `<<` → `Token::ShiftLeft` (not heredoc)
+- `-` → `Token::Minus` (not filetest)
+- `x5` → `Token::Ident("x5")` (not repeat)
 
-This is the safe default.  The parser calls `lex_token()` for
-structural checks (`at`, `consume`, `expect`), for `peek_op_info`
-in operator position, and for any context where the token is
-unambiguous regardless of position.
+This is the safe default.  The parser calls `lex_token()` inside
+`consume()`, `expect()`, and other infrastructure methods that
+check for unambiguous structural tokens — closing delimiters,
+semicolons, commas, keywords.  These tokens are the same regardless
+of grammatical position.
 
 **`lex_term()`** — term-position tokenization.  Performs additional
 scanning to resolve ambiguities where the same byte sequence means
-something different in term position:
+something different at the start of an expression:
 
 | Byte(s) | `lex_token()` | `lex_term()` |
 |---------|---------------|--------------|
@@ -1652,45 +1658,68 @@ something different in term position:
 | `<STDIN>` | `NumLt` | `Readline("STDIN")` |
 | `<<TAG` | `ShiftLeft` | heredoc initiation |
 | `-f` | `Minus` | `Filetest(b'f')` |
-| `x` (alone) | `Ident("x")` | `Ident("x")` |
 
 `lex_term()` subsumes several specialized callback methods that
 previously existed as separate API:
 
-- `lex_leading_dot_float()` — now handled internally by `lex_term()`
-  when the first byte is `.` followed by a digit.
-- `lex_filetest_after_minus()` — now handled internally when the
-  first byte is `-` followed by a single letter.
+- `lex_leading_dot_float()` — now handled internally when `.` is
+  followed by a digit.
+- `lex_filetest_after_minus()` — now handled internally when `-` is
+  followed by a single letter.
 - `lex_readline_after_lt()` — now handled internally when `<` is
   followed by a filehandle name or glob pattern.
 - `lex_heredoc_after_shift_left()` — now handled internally when
   `<<` is followed by a heredoc tag.
-
-The `x` operator is a unique special case.  In operator position,
-`x` adjacent to a digit (`x5`) must be recognized as the repeat
-operator (`Token::Keyword(Keyword::X)`) followed by an integer
-operand, not as the identifier `x5`.  Only `x` has this behavior —
-all other keyword operators (`or`, `and`, `eq`, `lt`, etc.) are
-multi-letter and are always lexed as complete identifiers regardless
-of what follows.  `lex_token()` in operator context handles this by
-checking for `x` as a single-character keyword before scanning a
-full identifier.
+- `lex_hash_var_after_percent()` — now handled internally when `%`
+  is followed by an identifier.
 
 The parser calls `lex_term()` from `parse_term` and `try_prefix` —
-the two entry points that know they are in term position.  All other
-tokenization goes through `lex_token()`.
+the two entry points that know they are in term position — and
+from `parse_operator` when parsing the right-hand side of a binary
+operator.
+
+**`lex_operator(min_prec: Precedence) -> Option<(Token, OpInfo)>`**
+— operator-position tokenization with precedence gating.  Peeks at
+the next token, maps it to an `OpInfo` (precedence and
+associativity).  Three outcomes collapse into `Option`:
+
+- Not an operator token → returns `None`, consumes nothing.
+- Operator but `left_prec < min_prec` → returns `None`, consumes
+  nothing.  The operator is left for the outer Pratt loop level.
+- Operator with `left_prec >= min_prec` → consumes the token and
+  returns `Some((token, info))`.
+
+This method drives the Pratt operator loop entirely:
+
+```rust
+while let Some((token, info)) = self.lexer.lex_operator(min_prec) {
+    left = self.parse_operator(left, token, info)?;
+}
+```
+
+No separate `peek_op_info()` method is needed on the parser.  The
+precedence check, token consumption, and operator dispatch are a
+single step.
+
+The `x` repeat operator is a unique special case handled by
+`lex_operator()`.  In operator position, `x` adjacent to a digit
+(`x5`) must be recognized as the repeat operator followed by an
+integer operand, not as the identifier `x5`.  `lex_operator()`
+checks for `x` as a single-character keyword before scanning a
+full identifier.  Only `x` has this behavior — all other keyword
+operators (`or`, `and`, `eq`, `lt`, etc.) are multi-letter and are
+always lexed as complete identifiers regardless of what follows.
 
 #### 5.9.2 Token consumption methods:
 
 These methods conditionally or unconditionally consume the next
-token.  They operate on tokens produced by `lex_token()` — the
-tokens they check for are unambiguous regardless of position.
+token.  They operate on tokens produced internally by `lex_token()`
+— the tokens they check for are unambiguous regardless of position.
 
 **`consume(expected: &Token) -> bool`** — peeks at the next token;
 if it matches `expected`, consumes and returns `true`.  Otherwise
 leaves the token unconsumed and returns `false`.  Uses exact
 matching — `consume(&Token::Comma)` matches only `,`, not `=>`.
-This is the replacement for the parser-side `eat()` method.
 
 **`consume_comma() -> bool`** — greedily consumes one or more
 consecutive commas (either `Token::Comma` or `Token::FatComma`).
@@ -1856,19 +1885,13 @@ which resolves ambiguous tokens (`/` as regex, `.` as leading-dot
 float, `<` as readline, `<<` as heredoc) in term position.  A token
 that cannot begin a term is a parse error.
 
-`parse_operator` — called when the parser has a left-hand expression
-and the next token is an infix/postfix operator that binds tightly
-enough.  Dispatches on the operator token: binary operators call
-`parse_expr` for the right operand (which is iterative), postfix
-operators wrap the left operand, ternary `?:` parses the middle and
-right branches, `->` dispatches to method call or dereference
-parsing.
-
-`peek_op_info` — inspects the lookahead token in operator position
-and returns `Option<OpInfo>`.  `None` means the token is not valid
-in operator position (the expression ends here).  `Some(info)`
-provides the precedence and associativity for the precedence
-comparison.
+`parse_operator(left, token, info)` — called when `lex_operator()`
+has consumed an infix/postfix operator.  Receives the already-
+consumed operator token and its `OpInfo`.  Dispatches on the token:
+binary operators call `parse_expr` for the right operand (which
+calls `lex_term()` internally), postfix operators wrap the left
+operand, ternary `?:` parses the middle and right branches, `->`
+dispatches to method call or dereference parsing.
 
 #### 6.1.2 The expression loop:
 
@@ -1932,11 +1955,9 @@ fn parse_expr_continuation(
     mut left: Expr,
     min_prec: Precedence,
 ) -> Result<Expr, ParseError> {
-    while let Some(info) = self.peek_op_info() {
-        if info.left_prec() < min_prec {
-            break;
-        }
-        left = self.parse_operator(left, info)?;
+    while let Some((token, info)) =
+            self.lexer.lex_operator(min_prec) {
+        left = self.parse_operator(left, token, info)?;
     }
     Ok(left)
 }
@@ -1948,6 +1969,13 @@ zero stack depth regardless of chain length.  Prefix chains
 (`not !-$a`) are handled by the forward phase loop, also without
 recursion.  Deeply nested containers (`[[[1]]]`, `((((1))))`,
 `${${$ref}}`) push frames onto the heap-allocated stack.
+
+`lex_operator(min_prec)` (§5.9.1) handles the entire peek-check-
+consume cycle: it peeks at the next token, maps it to an `OpInfo`,
+checks `left_prec >= min_prec`, and either consumes and returns
+`Some((token, info))` or returns `None` without consuming.  The
+parser has no `peek_op_info()` method and no one-token lookahead
+cache — `lex_operator()` encapsulates the operator dispatch.
 
 `parse_operator` always parses the right-hand side using
 `right_prec()` from the operator's `OpInfo`, regardless of whether
@@ -2042,7 +2070,7 @@ three-way comparison operators (`<=>`, `cmp`) and smartmatch (`~~`)
 at the equality precedence level are non-associative, not chained —
 `$x <=> $y <=> $z` is a syntax error.  This mixed behavior at a
 single precedence level (`chain/na` in perlop) is handled by
-per-operator associativity in the `peek_op_info` table.
+per-operator associativity in the `lex_operator()` table.
 
 Precedence values use `u16` with gaps of 100 between adjacent
 levels, providing 99 slots between each pair for plugin operators.
@@ -2221,20 +2249,19 @@ the special parsing handles how arguments are *collected*.
 
 The parser operates on three cleanly separated layers:
 
-1. **Tokenization** produces tokens via two lexer methods:
-   `lex_token()` for simple/operator-position tokens, and
-   `lex_term()` for term-position tokens that may need complex
-   scanning (§6.2).  `lex_token()` is position-independent — a `/`
-   is always `Token::Slash`, a `.` is always `Token::Dot`.
-   `lex_term()` resolves ambiguities where the same byte sequence
-   means different things in term vs operator position.
+1. **Tokenization** produces tokens via three lexer methods:
+   `lex_term()` for term-position tokens (regex, leading-dot float,
+   readline, heredoc, filetest), `lex_operator(min_prec)` for
+   operator-position tokens with precedence gating, and
+   `lex_token()` for position-independent structural tokens used by
+   `consume()`, `expect()`, and other infrastructure methods (§5.9).
 
 2. **Parser position** (term vs operator) determines which lexer
-   method and which parse method is called.  The forward phase
-   (`try_prefix`, `parse_term`) calls `lex_term()` for tokens at
-   the start of an expression (so `Token::Slash` triggers regex
-   scanning).  `parse_operator` and `peek_op_info` use tokens from
-   `lex_token()` (so `Token::Slash` means division).
+   method is called.  The forward phase (`try_prefix`, `parse_term`)
+   calls `lex_term()`.  The Pratt loop calls `lex_operator()`.
+   Infrastructure methods call `lex_token()` through `consume()`
+   and `expect()`.  No shared disambiguation state exists — the
+   parser's call site determines the lexer method.
 
 3. **Construct-specific parsing** handles the interior of each
    syntactic form.  `parse_if_stmt`, `parse_while`,
@@ -2247,98 +2274,42 @@ The parser operates on three cleanly separated layers:
    post-hoc reclassification is impossible in Perl 5's LALR(1)
    grammar, which must decide before the production is entered.
 
-Parser position determines which lexer method and parse method are
-called.  No shared mutable disambiguation state exists between the
-lexer and parser — position context is communicated by calling the
-appropriate lexer method.
+The parser has no one-token lookahead cache.  Each lexer method
+handles its own peek-and-conditionally-consume logic internally.
 
 ### 6.2 Parser–Lexer Communication
 
 The parser communicates with the lexer through explicit method
-calls.  There is no shared mutable state, no `Expect` enum, and no
-re-lexing.
+calls.  There is no shared mutable state, no `Expect` enum, no
+re-lexing, and no one-token lookahead cache on the parser.
 
-#### 6.2.1 Two-method tokenization:
+#### 6.2.1 Three-method tokenization:
 
-The lexer provides two primary tokenization methods:
+The lexer provides three tokenization methods, one per grammatical
+context (§5.9.1):
 
-**`lex_token()`** — produces simple, position-independent tokens.
-A `/` is always `Token::Slash`, a `.` is always `Token::Dot`, `x5`
-is always `Token::Ident("x5")`.  Used by `peek_op_info` in
-operator position and by infrastructure methods (`at`, `consume`,
-`expect`) that check for unambiguous structural tokens.
+**`lex_term()`** — called by `parse_term` and `try_prefix` for
+term-position tokens.  Resolves `/` as regex, `.5` as float, `<`
+as readline, `<<` as heredoc, `-f` as filetest.
 
-**`lex_term()`** — produces term-position tokens, resolving
-ambiguities where the same character sequence has different meanings
-in term vs operator position:
+**`lex_operator(min_prec)`** — called by `parse_expr_continuation`
+for the Pratt operator loop.  Returns `Some((token, info))` if the
+next token is an operator with `left_prec >= min_prec`, consuming
+it.  Returns `None` otherwise, consuming nothing.  Handles the `x`
+repeat special case (breaking `x5` into operator `x` and operand
+`5` in operator position).
 
-| Byte(s) | `lex_token()` | `lex_term()` |
-|---------|---------------|--------------|
-| `/pattern/` | `Slash` | regex sublexing |
-| `//flags` | `DefinedOr` | empty regex |
-| `.5` | `Dot` | `FloatLit(0.5)` |
-| `.5.6` | `Dot` | `VersionLit("0.5.6")` |
-| `<STDIN>` | `NumLt` | `Readline("STDIN")` |
-| `<<TAG` | `ShiftLeft` | heredoc initiation |
-| `-f` | `Minus` | `Filetest(b'f')` |
-| `x` (alone) | `Ident("x")` | `Ident("x")` |
+**`lex_token()`** — called internally by `consume()`, `expect()`,
+and `consume_comma()` for position-independent structural tokens.
+The parser never calls `lex_token()` directly.
 
-In operator position, `lex_token()` is correct: `/` is division,
-`.` is concat, `<` is less-than, `<<` is shift-left, `-` is
-minus, `x5` is an identifier.  In term position, `lex_term()`
-performs the additional scanning to produce the correct term token.
+#### 6.2.2 Token consumption methods (§5.9.2):
 
-The `x` operator is a unique special case: in operator position,
-`x` adjacent to a digit (`x5`) must be recognized as the repeat
-operator followed by an integer operand, not as the identifier
-`x5`.  Only `x` has this behavior — all other keyword operators
-(`or`, `and`, `eq`, `lt`, etc.) are multi-letter and are always
-lexed as full identifiers.
+**`consume(expected)`** — conditional single-token consumption.
+**`consume_comma()`** — greedy comma consumption with trailing
+detection.  **`expect(expected)`** — required token or error.
 
-#### 6.2.2 Token consumption methods:
-
-The lexer provides methods for conditional and unconditional token
-consumption:
-
-**`consume(expected)`** — peeks at the next token; if it matches
-`expected`, consumes and returns `true`.  Otherwise leaves the
-token unconsumed and returns `false`.  Uses exact matching —
-`consume(&Token::Comma)` matches only `,`, not `=>`.
-
-**`consume_comma()`** — greedily consumes one or more consecutive
-commas (either `,` or `=>`), then peeks at the next non-whitespace
-byte.  Returns `true` if commas were consumed and more content
-follows.  Returns `false` in two cases: no comma was present, or
-commas were consumed but the next byte is a closing delimiter
-(`)`, `]`, `}`), semicolon, or EOF — indicating trailing commas.
-The caller cannot distinguish "no comma" from "trailing comma" and
-does not need to — both mean "stop, no more elements."  This is
-the standard method for list element separation.  Subroutine
-signatures use `consume(&Token::Comma)` instead, since `=>` is
-not accepted in that context.
-
-#### 6.2.3 Peek audit:
-
-An audit of the parser's 55 `peek_token` call sites found that
-only **3 out of 55** need term-vs-operator context:
-
-- `try_prefix()` — term position dispatch (1 call)
-- `peek_op_info()` — operator position dispatch (1 call)
-- `peek_chain_continues()` — operator position (1 call)
-
-The remaining 52 calls check for unambiguous structural tokens:
-closing delimiters (`}`, `)`, `]`), `Semi`, `Comma`, `Colon`,
-`Eof`, `LeftBrace`, `LeftParen`, `Ident(_)`, `Keyword(_)`,
-`ScalarVar(_)`, etc.  These tokens are the same regardless of
-position, so `lex_token()` is correct for all of them.
-
-The infrastructure methods (`at`, `consume`, `expect`, `at_eof`)
-account for 259 calls total (via `at`: 97, `consume`: 76,
-`at_eof`: 30, `expect`: 56).  Of these, 236 (91%) check for
-single unambiguous bytes that could be resolved by a byte peek
-without full tokenization.
-
-#### 6.2.4 Remaining specialized callbacks:
+#### 6.2.3 Remaining specialized callbacks:
 
 A few lexer methods are not replaced by `lex_term()` because they
 are construct-specific rather than position-dependent:
@@ -2348,10 +2319,8 @@ are construct-specific rather than position-dependent:
 - `start_subst_replacement(delim)` — partition substitution body
 - `scan_adjacent_word_chars()` — collect regex modifier flags
 - `try_autoquoted_bareword_subscript()` — check for `$hash{word}`
-- `set_utf8_mode(bool)` — sync UTF-8 pragma state
-- `.features = ...` — sync feature flags from `Pragmas`
 
-#### 6.2.5 Pragma and feature state:
+#### 6.2.4 Pragma and feature state:
 
 The parser syncs pragma and feature state to the lexer at
 pragma change points:
