@@ -3484,24 +3484,35 @@ impl Parser {
 
                 match info.assoc {
                     Assoc::Chain => {
-                        // Check if more Chain operators follow at the same precedence.
+                        // Check if more operators follow at the same precedence.
                         if let Some(next_info) = self.peek_op_info()
                             && next_info.prec == info.prec
-                            && next_info.assoc == Assoc::Chain
                         {
-                            let mut ops = vec![binop];
-                            let start_span = left.span;
-                            let mut operands = vec![left, right];
-                            while let Some(next_info) = self.peek_op_info() {
-                                if next_info.prec != info.prec || next_info.assoc != Assoc::Chain {
-                                    break;
+                            if next_info.assoc == Assoc::Chain {
+                                // More chainable operators — build ChainedCmp.
+                                let mut ops = vec![binop];
+                                let start_span = left.span;
+                                let mut operands = vec![left, right];
+                                while let Some(next_info) = self.peek_op_info()
+                                    && next_info.prec == info.prec
+                                    && next_info.assoc == Assoc::Chain
+                                {
+                                    let next_tok = self.next_token()?;
+                                    ops.push(token_to_binop(&next_tok.token)?);
+                                    operands.push(self.parse_expr(right_prec)?);
                                 }
-                                let next_tok = self.next_token()?;
-                                ops.push(token_to_binop(&next_tok.token)?);
-                                operands.push(self.parse_expr(right_prec)?);
+                                // After the chain, reject a trailing Non at the same level (e.g. `$a == $b != $c <=> $d`).
+                                if let Some(trail) = self.peek_op_info()
+                                    && trail.prec == info.prec
+                                {
+                                    return Err(ParseError::new("non-associative operator cannot be chained", operands.last().map_or(start_span, |e| e.span)));
+                                }
+                                let end_span = operands.last().map_or(start_span, |e| e.span);
+                                return Ok(Expr { span: start_span.merge(end_span), kind: ExprKind::ChainedCmp(ops, operands) });
+                            } else {
+                                // Non-chainable operator at same precedence (e.g. `$a == $b <=> $c`).
+                                return Err(ParseError::new("non-associative operator cannot be chained", right.span));
                             }
-                            let end_span = operands.last().map_or(start_span, |e| e.span);
-                            return Ok(Expr { span: start_span.merge(end_span), kind: ExprKind::ChainedCmp(ops, operands) });
                         }
                         Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
                     }

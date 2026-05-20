@@ -6535,6 +6535,67 @@ fn prec_str_equality_chains() {
     assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
 }
 
+#[test]
+fn prec_mixed_numeric_string_relational_chains() {
+    // `$a < $b le $c` — numeric and string relational operators are both Chain at PREC_REL.
+    let e = parse_expr_str("$a < $b le $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+#[test]
+fn prec_mixed_numeric_string_equality_chains() {
+    // `$a == $b eq $c` — numeric and string equality operators are both Chain at PREC_EQ.
+    let e = parse_expr_str("$a == $b eq $c;");
+    assert!(matches!(e.kind, ExprKind::ChainedCmp(_, _)), "expected ChainedCmp, got {:?}", e.kind);
+}
+
+#[test]
+fn prec_long_relational_chain() {
+    // `$a < $b < $c < $d < $e` — four chained operators, five operands.
+    let e = parse_expr_str("$a < $b < $c < $d < $e;");
+    match &e.kind {
+        ExprKind::ChainedCmp(ops, operands) => {
+            assert_eq!(ops.len(), 4, "expected 4 operators, got {}", ops.len());
+            assert_eq!(operands.len(), 5, "expected 5 operands, got {}", operands.len());
+        }
+        other => panic!("expected ChainedCmp, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_long_equality_chain() {
+    // `$a == $b != $c == $d` — three chained equality ops, four operands.
+    let e = parse_expr_str("$a == $b != $c == $d;");
+    match &e.kind {
+        ExprKind::ChainedCmp(ops, operands) => {
+            assert_eq!(ops.len(), 3, "expected 3 operators, got {}", ops.len());
+            assert_eq!(operands.len(), 4, "expected 4 operands, got {}", operands.len());
+        }
+        other => panic!("expected ChainedCmp, got {other:?}"),
+    }
+}
+
+#[test]
+fn prec_chain_then_non_at_same_level_is_error() {
+    // `$a == $b <=> $c` — Chain (==) then Non (<=>) at PREC_EQ → error.
+    let result = crate::parse(b"$a == $b <=> $c;");
+    assert!(result.is_err(), "chain-then-non at same precedence should be a syntax error");
+}
+
+#[test]
+fn prec_non_then_chain_at_same_level_is_error() {
+    // `$a <=> $b == $c` — Non (<=>) then Chain (==) at PREC_EQ → error.
+    let result = crate::parse(b"$a <=> $b == $c;");
+    assert!(result.is_err(), "non-then-chain at same precedence should be a syntax error");
+}
+
+#[test]
+fn prec_different_non_ops_at_same_level_is_error() {
+    // `$a .. $b ... $c` — two different Non operators at PREC_RANGE → error.
+    let result = crate::parse(b"$a .. $b ... $c;");
+    assert!(result.is_err(), "different non-assoc ops at same precedence should be a syntax error");
+}
+
 // ── Pratt loop adversarial cases ─────────────────────────
 
 #[test]
