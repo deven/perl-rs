@@ -20,7 +20,6 @@ mod tests;
 /// Precedence levels (u8 with gaps for plugin insertion).  Maps to Perl 5's precedence table from perly.y.
 pub type Precedence = u16;
 
-/// Parse depth counter for nesting limit.
 /// Continuation frame for the iterative expression parser.  Each frame captures what to do with a sub-expression after
 /// the forward phase (which consumed a prefix operator or opening delimiter) completes.
 enum ExprFrame {
@@ -112,6 +111,7 @@ enum Assoc {
     Left,
     Right,
     Non,
+    Chain,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,7 +127,7 @@ impl OpInfo {
 
     fn right_prec(self) -> Precedence {
         match self.assoc {
-            Assoc::Left | Assoc::Non => self.prec + 1,
+            Assoc::Left | Assoc::Non | Assoc::Chain => self.prec + 1,
             Assoc::Right => self.prec,
         }
     }
@@ -3324,9 +3324,10 @@ impl Parser {
             Token::StringBitXor => Some(OpInfo { prec: PREC_BIT_OR, assoc: Assoc::Left }),
             Token::BitAnd => Some(OpInfo { prec: PREC_BIT_AND, assoc: Assoc::Left }),
             Token::StringBitAnd => Some(OpInfo { prec: PREC_BIT_AND, assoc: Assoc::Left }),
-            Token::NumEq | Token::NumNe | Token::Spaceship => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
+            Token::NumEq | Token::NumNe => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Chain }),
+            Token::Spaceship => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
             Token::SmartMatch if smartmatch_active => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
-            Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non }),
+            Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe => Some(OpInfo { prec: PREC_REL, assoc: Assoc::Chain }),
             Token::ShiftLeft | Token::ShiftRight => Some(OpInfo { prec: PREC_SHIFT, assoc: Assoc::Left }),
             Token::Plus => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
             Token::Minus => Some(OpInfo { prec: PREC_ADD, assoc: Assoc::Left }),
@@ -3347,9 +3348,10 @@ impl Parser {
             Token::MinusMinus => Some(OpInfo { prec: PREC_INC, assoc: Assoc::Non }),
             // Word operators (always emitted as Keyword tokens): eq/ne/cmp at == precedence, lt/gt/le/ge at relational,
             // x at multiplicative, xor at low-logical.
-            Token::Keyword(Keyword::Eq) | Token::Keyword(Keyword::Ne) | Token::Keyword(Keyword::Cmp) => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
+            Token::Keyword(Keyword::Eq) | Token::Keyword(Keyword::Ne) => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Chain }),
+            Token::Keyword(Keyword::Cmp) => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Non }),
             Token::Keyword(Keyword::Lt) | Token::Keyword(Keyword::Gt) | Token::Keyword(Keyword::Le) | Token::Keyword(Keyword::Ge) => {
-                Some(OpInfo { prec: PREC_REL, assoc: Assoc::Non })
+                Some(OpInfo { prec: PREC_REL, assoc: Assoc::Chain })
             }
             Token::Keyword(Keyword::X) => Some(OpInfo { prec: PREC_MUL, assoc: Assoc::Left }),
             Token::Keyword(Keyword::Xor) => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
@@ -3463,13 +3465,15 @@ impl Parser {
                 Ok(Expr { kind: ExprKind::List(items), span })
             }
 
-            // Range
+            // Range — non-associative, reject chaining.
             Token::DotDot => {
                 let right = self.parse_expr(right_prec)?;
+                self.reject_non_assoc_chaining(info, &right)?;
                 Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::Range(Box::new(left), Box::new(right)) })
             }
             Token::DotDotDot => {
                 let right = self.parse_expr(right_prec)?;
+                self.reject_non_assoc_chaining(info, &right)?;
                 Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::FlipFlop(Box::new(left), Box::new(right)) })
             }
 
@@ -3478,32 +3482,48 @@ impl Parser {
                 let binop = token_to_binop(&token)?;
                 let right = self.parse_expr(right_prec)?;
 
-                // Chained comparisons: `$x < $y <= $z` produces ChainedCmp([<, <=], [x, y, z]).  Only operators in the
-                // same chain group can chain together.
-                let group = chain_group(&binop);
-                if group.is_some() && self.peek_chain_continues(group) {
-                    let mut ops = vec![binop];
-                    let start_span = left.span;
-                    let mut operands = vec![left, right];
-                    while self.peek_chain_continues(group) {
-                        let next_tok = self.next_token()?;
-                        let next_op = token_to_binop(&next_tok.token)?;
-                        ops.push(next_op);
-                        operands.push(self.parse_expr(right_prec)?);
+                match info.assoc {
+                    Assoc::Chain => {
+                        // Check if more Chain operators follow at the same precedence.
+                        if let Some(next_info) = self.peek_op_info()
+                            && next_info.prec == info.prec
+                            && next_info.assoc == Assoc::Chain
+                        {
+                            let mut ops = vec![binop];
+                            let start_span = left.span;
+                            let mut operands = vec![left, right];
+                            while let Some(next_info) = self.peek_op_info() {
+                                if next_info.prec != info.prec || next_info.assoc != Assoc::Chain {
+                                    break;
+                                }
+                                let next_tok = self.next_token()?;
+                                ops.push(token_to_binop(&next_tok.token)?);
+                                operands.push(self.parse_expr(right_prec)?);
+                            }
+                            let end_span = operands.last().map_or(start_span, |e| e.span);
+                            return Ok(Expr { span: start_span.merge(end_span), kind: ExprKind::ChainedCmp(ops, operands) });
+                        }
+                        Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
                     }
-                    let end_span = operands.last().map_or(start_span, |e| e.span);
-                    let span = start_span.merge(end_span);
-                    Ok(Expr { span, kind: ExprKind::ChainedCmp(ops, operands) })
-                } else {
-                    Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
+                    Assoc::Non => {
+                        self.reject_non_assoc_chaining(info, &right)?;
+                        Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
+                    }
+                    _ => Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) }),
                 }
             }
         }
     }
 
-    /// Check whether the next token continues a chained comparison in the given chain group.
-    fn peek_chain_continues(&mut self, group: Option<u8>) -> bool {
-        group.is_some() && token_chain_group(self.peek_token()) == group
+    /// After parsing the RHS of a non-associative operator, check if another operator at the same precedence level
+    /// follows.  If so, it's a chaining error like `$x .. $y .. $z` or `$x <=> $y <=> $z`.
+    fn reject_non_assoc_chaining(&mut self, info: OpInfo, right: &Expr) -> Result<(), ParseError> {
+        if let Some(next_info) = self.peek_op_info()
+            && next_info.prec == info.prec
+        {
+            return Err(ParseError::new("non-associative operator cannot be chained", right.span));
+        }
+        Ok(())
     }
 
     fn parse_arrow_rhs(&mut self, left: Expr) -> Result<Expr, ParseError> {
@@ -3838,31 +3858,6 @@ fn token_to_binop(token: &Token) -> Result<BinOp, ParseError> {
         Token::Keyword(Keyword::Ge) => Ok(BinOp::StrGe),
         Token::Keyword(Keyword::Cmp) => Ok(BinOp::StrCmp),
         other => Err(ParseError::new(format!("not a binary operator: {other:?}"), Span::DUMMY)),
-    }
-}
-
-/// Returns a chain-group identifier for operators that participate in chained comparisons, or `None` for non-chainable
-/// ops.
-///
-/// Group 1: relational (`< > <= >= lt gt le ge`) — chain with each other.
-/// Group 2: equality (`== != eq ne`) — chain with each other.
-/// `<=>`, `cmp`, and `~~` are non-associative and do NOT chain.
-fn chain_group(op: &BinOp) -> Option<u8> {
-    match op {
-        BinOp::NumLt | BinOp::NumGt | BinOp::NumLe | BinOp::NumGe | BinOp::StrLt | BinOp::StrGt | BinOp::StrLe | BinOp::StrGe => Some(1),
-        BinOp::NumEq | BinOp::NumNe | BinOp::StrEq | BinOp::StrNe => Some(2),
-        _ => None,
-    }
-}
-
-/// Check whether a token would produce a chainable BinOp in the given chain group.
-fn token_chain_group(token: &Token) -> Option<u8> {
-    match token {
-        Token::NumLt | Token::NumGt | Token::NumLe | Token::NumGe => Some(1),
-        Token::Keyword(Keyword::Lt) | Token::Keyword(Keyword::Gt) | Token::Keyword(Keyword::Le) | Token::Keyword(Keyword::Ge) => Some(1),
-        Token::NumEq | Token::NumNe => Some(2),
-        Token::Keyword(Keyword::Eq) | Token::Keyword(Keyword::Ne) => Some(2),
-        _ => None,
     }
 }
 

@@ -6501,7 +6501,6 @@ fn prec_chained_cmp_mixed_ops() {
 }
 
 #[test]
-#[ignore = "parser doesn't reject non-associative chaining yet — treats as left-associative"]
 fn prec_range_non_assoc_is_error() {
     // `$x .. $y .. $z` — range is non-associative, chaining is a syntax error.
     let result = crate::parse(b"$x .. $y .. $z;");
@@ -6509,7 +6508,6 @@ fn prec_range_non_assoc_is_error() {
 }
 
 #[test]
-#[ignore = "parser doesn't reject non-associative chaining yet — treats as left-associative"]
 fn prec_spaceship_non_assoc_is_error() {
     // `$x <=> $y <=> $z` — three-way comparison is non-associative (chain/na), chaining is a syntax error.
     let result = crate::parse(b"$x <=> $y <=> $z;");
@@ -6517,7 +6515,6 @@ fn prec_spaceship_non_assoc_is_error() {
 }
 
 #[test]
-#[ignore = "parser doesn't reject non-associative chaining yet — treats as left-associative"]
 fn prec_cmp_non_assoc_is_error() {
     // `$x cmp $y cmp $z` — string three-way comparison is non-associative.
     let result = crate::parse(b"$x cmp $y cmp $z;");
