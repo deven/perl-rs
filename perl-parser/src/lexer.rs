@@ -1211,7 +1211,7 @@ impl Lexer {
         // Decimal integer or float
         self.scan_digits();
 
-        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit() || b == b'_') {
             // Before committing to float: check if this is a v-string without the `v` prefix.  If there are 2+ dots
             // (e.g. 102.111.111), it's a v-string per perldata.
             let saved_pos = self.line_pos();

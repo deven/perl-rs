@@ -6909,6 +6909,116 @@ fn parse_dot_in_operator_position_concat_vstring() {
     }
 }
 
+#[test]
+fn parse_leading_dot_float_underscore() {
+    // `.5_000` — underscore in fractional part.
+    let e = parse_expr_str(".5_000;");
+    assert!(matches!(e.kind, ExprKind::FloatLit(f) if (f - 0.5).abs() < 1e-10), "expected FloatLit(0.5), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_float_neg_exponent() {
+    // `.5e-3` → FloatLit(0.0005).
+    let e = parse_expr_str(".5e-3;");
+    assert!(matches!(e.kind, ExprKind::FloatLit(f) if (f - 0.0005).abs() < 1e-15), "expected FloatLit(0.0005), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_float_uppercase_e() {
+    // `.5E2` → FloatLit(50.0).
+    let e = parse_expr_str(".5E2;");
+    assert!(matches!(e.kind, ExprKind::FloatLit(f) if (f - 50.0).abs() < 1e-10), "expected FloatLit(50.0), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_negate() {
+    // `-.5` → Negate(FloatLit(0.5)).  Prefix minus on leading-dot float.
+    let e = parse_expr_str("-.5;");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::Negate, inner) => {
+            assert!(matches!(inner.kind, ExprKind::FloatLit(f) if (f - 0.5).abs() < 1e-15), "expected FloatLit(0.5) inside Negate, got {:?}", inner.kind);
+        }
+        other => panic!("expected Negate, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_leading_dot_vstring_four_segments() {
+    // `.5.6.7.8` → VersionLit("0.5.6.7.8").
+    let e = parse_expr_str(".5.6.7.8;");
+    assert!(matches!(&e.kind, ExprKind::VersionLit(v) if v == "0.5.6.7.8"), "expected VersionLit(\"0.5.6.7.8\"), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_float_then_concat() {
+    // `.5 . "hello"` → Concat(FloatLit(0.5), StringLit("hello")).
+    // The first `.5` is a leading-dot float (term position), the second `.` is concat (operator position).
+    let e = parse_expr_str(".5 . 'hello';");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Concat, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::FloatLit(f) if (f - 0.5).abs() < 1e-15), "expected FloatLit(0.5) on LHS of Concat, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Concat, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_leading_dot_underscore_before_digit_is_error() {
+    // `._5` — underscore before the first digit is a syntax error in Perl.  The `.` is Dot (not a float start)
+    // and `_5` is a bareword, so this fails in term position.
+    let result = crate::parse(b"._5;");
+    assert!(result.is_err(), "._5 should be a syntax error or non-float parse, got: {:?}", result);
+}
+
+#[test]
+fn parse_underscore_after_dot_in_number() {
+    // `0._5` → Perl treats this as 0.5 (underscore after dot is accepted in the fractional part).
+    let e = parse_expr_str("0._5;");
+    assert!(matches!(e.kind, ExprKind::FloatLit(f) if (f - 0.5).abs() < 1e-10), "expected FloatLit(0.5), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_leading_dot_multiple_underscores() {
+    // `.5_5_5` → FloatLit(0.555).
+    let e = parse_expr_str(".5_5_5;");
+    assert!(matches!(e.kind, ExprKind::FloatLit(f) if (f - 0.555).abs() < 1e-10), "expected FloatLit(0.555), got {:?}", e.kind);
+}
+
+#[test]
+#[ignore = "x5 lexed as identifier, not repeat-then-5 — lexer doesn't know operator position"]
+fn parse_underscore_after_dot_then_repeat() {
+    // `0._x5` → Perl parses as `0.0 x 5` → "00000".  The `_` enters the float fractional path, is stripped,
+    // leaving float 0.0.  Then `x5` is the repeat operator (x is not followed by a word char in x5 since 5 is a digit,
+    // but `x` adjacent to a digit is repeat).
+    let e = parse_expr_str("0._x5;");
+    assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Repeat, _, _)), "expected Repeat, got {:?}", e.kind);
+}
+
+#[test]
+#[ignore = "parser doesn't reject bareword in operator position — needs operator-position validation"]
+fn parse_underscore_after_dot_then_bareword_is_error() {
+    // `0._a` → Perl: "Bareword found where operator expected".  Float 0.0, then `a` is a bareword in operator
+    // position.
+    let result = crate::parse(b"0._a;");
+    assert!(result.is_err(), "0._a should be a syntax error, got: {:?}", result);
+}
+
+#[test]
+#[ignore = "parser doesn't reject bareword in operator position — needs operator-position validation"]
+fn parse_underscore_after_dot_digit_then_bareword_is_error() {
+    // `0._0a` → Float 0.0 (fractional `_0` → `0`), then `a` is bareword where operator expected.
+    let result = crate::parse(b"0._0a;");
+    assert!(result.is_err(), "0._0a should be a syntax error, got: {:?}", result);
+}
+
+#[test]
+#[ignore = "parser doesn't reject bareword in operator position — needs operator-position validation"]
+fn parse_underscore_after_dot_x_bareword_is_error() {
+    // `0._x_y` → Float 0.0, then `x_y` is a bareword (x followed by word char is not repeat operator).
+    let result = crate::parse(b"0._x_y;");
+    assert!(result.is_err(), "0._x_y should be a syntax error, got: {:?}", result);
+}
+
 // ═══════════════════════════════════════════════════════════
 // Operators with AST verification
 // ═══════════════════════════════════════════════════════════
