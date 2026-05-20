@@ -408,33 +408,122 @@ impl Token {
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Literals
             Token::Eof => write!(f, "EOF"),
             Token::IntLit(n) => write!(f, "{n}"),
             Token::FloatLit(n) => write!(f, "{n}"),
             Token::StrLit(s) => write!(f, "'{s}'"),
             Token::VersionLit(s) => write!(f, "{s}"),
+
+            // Identifiers and variables
             Token::Ident(s) => write!(f, "{s}"),
+            Token::Label(s) => write!(f, "{s}:"),
             Token::ScalarVar(s) => write!(f, "${s}"),
             Token::ArrayVar(s) => write!(f, "@{s}"),
             Token::HashVar(s) => write!(f, "%{s}"),
+            Token::GlobVar(s) => write!(f, "*{s}"),
+            Token::ArrayLen(s) => write!(f, "$#{s}"),
             Token::SpecialVar(s) => write!(f, "${s}"),
             Token::SpecialArrayVar(s) => write!(f, "@{s}"),
             Token::SpecialHashVar(s) => write!(f, "%{s}"),
-            Token::Semi => write!(f, ";"),
+            Token::Keyword(kw) => write!(f, "{}", <&str>::from(*kw)),
+            Token::Filetest(b) => write!(f, "-{}", *b as char),
+
+            // Arithmetic
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
             Token::Star => write!(f, "*"),
             Token::Slash => write!(f, "/"),
-            Token::Assign(AssignOp::Eq) => write!(f, "="),
+            Token::Percent => write!(f, "%"),
+            Token::Power => write!(f, "**"),
+
+            // String
+            Token::Dot => write!(f, "."),
+            Token::DotDot => write!(f, ".."),
+            Token::DotDotDot => write!(f, "..."),
+
+            // Comparison
+            Token::NumEq => write!(f, "=="),
+            Token::NumNe => write!(f, "!="),
+            Token::NumLt => write!(f, "<"),
+            Token::NumGt => write!(f, ">"),
+            Token::NumLe => write!(f, "<="),
+            Token::NumGe => write!(f, ">="),
+            Token::Spaceship => write!(f, "<=>"),
+
+            // Logical
+            Token::AndAnd => write!(f, "&&"),
+            Token::OrOr => write!(f, "||"),
+            Token::DefinedOr => write!(f, "//"),
+            Token::LogicalXor => write!(f, "^^"),
+            Token::Bang => write!(f, "!"),
+
+            // Bitwise
+            Token::BitAnd => write!(f, "&"),
+            Token::BitOr => write!(f, "|"),
+            Token::BitXor => write!(f, "^"),
+            Token::Tilde => write!(f, "~"),
+            Token::StringBitAnd => write!(f, "&."),
+            Token::StringBitOr => write!(f, "|."),
+            Token::StringBitXor => write!(f, "^."),
+            Token::StringBitNot => write!(f, "~."),
+            Token::SmartMatch => write!(f, "~~"),
+            Token::ShiftLeft => write!(f, "<<"),
+            Token::ShiftRight => write!(f, ">>"),
+
+            // Binding
+            Token::Binding => write!(f, "=~"),
+            Token::NotBinding => write!(f, "!~"),
+
+            // Increment/decrement
+            Token::PlusPlus => write!(f, "++"),
+            Token::MinusMinus => write!(f, "--"),
+
+            // Assignment
+            Token::Assign(op) => match op {
+                AssignOp::Eq => write!(f, "="),
+                AssignOp::AddEq => write!(f, "+="),
+                AssignOp::SubEq => write!(f, "-="),
+                AssignOp::MulEq => write!(f, "*="),
+                AssignOp::DivEq => write!(f, "/="),
+                AssignOp::ModEq => write!(f, "%="),
+                AssignOp::PowEq => write!(f, "**="),
+                AssignOp::ConcatEq => write!(f, ".="),
+                AssignOp::AndEq => write!(f, "&&="),
+                AssignOp::OrEq => write!(f, "||="),
+                AssignOp::DefinedOrEq => write!(f, "//="),
+                AssignOp::LogicalXorEq => write!(f, "^^="),
+                AssignOp::BitAndEq => write!(f, "&="),
+                AssignOp::BitOrEq => write!(f, "|="),
+                AssignOp::BitXorEq => write!(f, "^="),
+                AssignOp::StringBitAndEq => write!(f, "&.="),
+                AssignOp::StringBitOrEq => write!(f, "|.="),
+                AssignOp::StringBitXorEq => write!(f, "^.="),
+                AssignOp::ShiftLeftEq => write!(f, "<<="),
+                AssignOp::ShiftRightEq => write!(f, ">>="),
+                AssignOp::RepeatEq => write!(f, "x="),
+            },
+
+            // Punctuation
+            Token::Arrow => write!(f, "->"),
+            Token::Backslash => write!(f, "\\"),
+            Token::Question => write!(f, "?"),
+            Token::Colon => write!(f, ":"),
+            Token::Comma => write!(f, ","),
+            Token::FatComma => write!(f, "=>"),
+            Token::Semi => write!(f, ";"),
             Token::LeftParen => write!(f, "("),
             Token::RightParen => write!(f, ")"),
             Token::LeftBrace => write!(f, "{{"),
             Token::RightBrace => write!(f, "}}"),
             Token::LeftBracket => write!(f, "["),
             Token::RightBracket => write!(f, "]"),
-            Token::Comma => write!(f, ","),
-            Token::Arrow => write!(f, "->"),
-            Token::Keyword(kw) => write!(f, "{kw:?}"),
+            Token::Dollar => write!(f, "$"),
+            Token::At => write!(f, "@"),
+            Token::HashSign => write!(f, "#"),
+            Token::YadaYada => write!(f, "..."),
+
+            // Everything else (sublexing, heredoc, format, interpolation tokens) uses Debug.
             _ => write!(f, "{self:?}"),
         }
     }
