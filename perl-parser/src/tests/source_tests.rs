@@ -166,7 +166,8 @@ fn heredoc_basic() {
         pos: 13, // pointing at ` . "suffix";`
         ascii_only: true,
     });
-    source.start_heredoc(Bytes::from_static(b"END"), &mut current_line).unwrap();
+    source.line = current_line.take();
+    source.start_heredoc(Bytes::from_static(b"END")).unwrap();
     assert!(current_line.is_none());
 
     // Next line: heredoc body.
@@ -193,7 +194,8 @@ fn heredoc_empty_body() {
     let decl = source.next_line(false).unwrap().unwrap();
 
     let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5, ascii_only: true });
-    source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_heredoc(Bytes::from_static(b"END")).unwrap();
 
     // Immediate terminator → None.
     assert!(source.next_line(false).unwrap().is_none());
@@ -206,7 +208,8 @@ fn heredoc_unterminated() {
     let decl = source.next_line(false).unwrap().unwrap();
 
     let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5, ascii_only: true });
-    source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_heredoc(Bytes::from_static(b"END")).unwrap();
 
     // Read body lines.
     source.next_line(false).unwrap().unwrap(); // hello
@@ -239,7 +242,8 @@ fn heredoc_stacked() {
         pos: 4, // after "<<A"
         ascii_only: true,
     });
-    source.start_heredoc(Bytes::from_static(b"A"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_heredoc(Bytes::from_static(b"A")).unwrap();
 
     // A's body.
     let body_a = source.next_line(false).unwrap().unwrap();
@@ -261,7 +265,8 @@ fn heredoc_stacked() {
         pos: 10, // after ", <<B"
         ascii_only: true,
     });
-    source.start_heredoc(Bytes::from_static(b"B"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_heredoc(Bytes::from_static(b"B")).unwrap();
 
     // B's body.
     let body_b = source.next_line(false).unwrap().unwrap();
@@ -288,7 +293,8 @@ fn heredoc_indented() {
     let decl = source.next_line(false).unwrap().unwrap();
 
     let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6, ascii_only: true });
-    source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_indented_heredoc(Bytes::from_static(b"END")).unwrap();
 
     // Body lines with indent stripped.
     // Source: "<<~END;\n    hello\n    world\n    END\n"
@@ -313,7 +319,8 @@ fn heredoc_indented_empty_lines() {
     let decl = source.next_line(false).unwrap().unwrap();
 
     let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6, ascii_only: true });
-    source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_indented_heredoc(Bytes::from_static(b"END")).unwrap();
 
     let l1 = source.next_line(false).unwrap().unwrap();
     assert_eq!(&l1.line[..], b"hello");
@@ -332,7 +339,8 @@ fn heredoc_indented_mismatch() {
     let decl = source.next_line(false).unwrap().unwrap();
 
     let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 6, ascii_only: true });
-    source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_indented_heredoc(Bytes::from_static(b"END")).unwrap();
 
     let l1 = source.next_line(false).unwrap().unwrap();
     assert_eq!(&l1.line[..], b"hello");
@@ -356,7 +364,8 @@ fn heredoc_non_indented_inside_indented() {
 
     // Start <<~OUTER
     let mut current = Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 9, ascii_only: true });
-    source.start_indented_heredoc(Bytes::from_static(b"OUTER"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_indented_heredoc(Bytes::from_static(b"OUTER")).unwrap();
 
     // First body line of OUTER (indent stripped).
     let l1 = source.next_line(false).unwrap().unwrap();
@@ -371,7 +380,8 @@ fn heredoc_non_indented_inside_indented() {
         pos: 14, // after "prefix <<INNER"
         ascii_only: true,
     });
-    source.start_heredoc(Bytes::from_static(b"INNER"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_heredoc(Bytes::from_static(b"INNER")).unwrap();
 
     // INNER body (outer indent still stripped).
     let inner_body = source.next_line(false).unwrap().unwrap();
@@ -496,7 +506,8 @@ fn ascii_only_heredoc_body_lines() {
     // Start heredoc.
     let mut current =
         Some(LexerLine { number: decl.number, offset: decl.offset, line: decl.line, terminated: decl.terminated, pos: 5, ascii_only: decl.ascii_only });
-    source.start_heredoc(Bytes::from_static(b"END"), &mut current).unwrap();
+    source.line = current.take();
+    source.start_heredoc(Bytes::from_static(b"END")).unwrap();
 
     // First body line: ASCII.
     let body1 = source.next_line(false).unwrap().unwrap();
@@ -517,7 +528,8 @@ fn heredoc_terminator_at_eof_without_newline() {
     let src = b"<<END\nbody\nEND";
     let mut source = LexerSource::new(src);
     let line = source.next_line(false).unwrap().unwrap();
-    source.start_heredoc(Bytes::from("END"), &mut Some(line)).unwrap();
+    source.line = Some(line);
+    source.start_heredoc(Bytes::from("END")).unwrap();
 
     let body = source.next_line(false).unwrap().unwrap();
     assert_eq!(&body.line[..], b"body");
@@ -532,7 +544,8 @@ fn source_peeked_heredoc_terminator_stays_pending_until_consumed() {
 
     let mut current_line = Some(LexerLine { number: 999, offset: 123, line: Bytes::from_static(b"saved"), terminated: false, pos: 0, ascii_only: true });
 
-    source.start_heredoc(Bytes::from_static(b"END"), &mut current_line).unwrap();
+    source.line = current_line.take();
+    source.start_heredoc(Bytes::from_static(b"END")).unwrap();
 
     let body = source.next_line(false).unwrap().unwrap();
     assert_eq!(&body.line[..], b"body");
@@ -558,7 +571,8 @@ fn subst_body_virtual_eof_restores_remainder() {
 
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"bar/e + 1"), terminated: false, pos: 0, ascii_only: true });
 
-    let flags = source.start_subst_body('/', false, &mut current_line).unwrap();
+    source.line = current_line.take();
+    let flags = source.start_subst_body('/', false).unwrap();
     assert_eq!(flags.as_deref(), Some("e"));
 
     let body = source.next_line(false).unwrap().unwrap();
@@ -577,7 +591,8 @@ fn subst_body_captures_multiple_flags_and_restores_remainder() {
     let mut source = LexerSource::new(b"");
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"bar/msix + 1"), terminated: false, pos: 0, ascii_only: true });
 
-    let flags = source.start_subst_body('/', false, &mut current_line).unwrap();
+    source.line = current_line.take();
+    let flags = source.start_subst_body('/', false).unwrap();
     assert_eq!(flags.as_deref(), Some("msix"));
 
     let body = source.next_line(false).unwrap().unwrap();
@@ -594,7 +609,8 @@ fn subst_body_with_paired_delimiter_nesting() {
     let mut source = LexerSource::new(b"");
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"a{b}c}r"), terminated: false, pos: 0, ascii_only: true });
 
-    let flags = source.start_subst_body('{', false, &mut current_line).unwrap();
+    source.line = current_line.take();
+    let flags = source.start_subst_body('{', false).unwrap();
     assert_eq!(flags.as_deref(), Some("r"));
 
     let body = source.next_line(false).unwrap().unwrap();
@@ -608,7 +624,8 @@ fn subst_body_errors_on_eof() {
     let mut source = LexerSource::new(b"");
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"unterminated"), terminated: false, pos: 0, ascii_only: true });
 
-    let err = source.start_subst_body('/', false, &mut current_line).unwrap_err();
+    source.line = current_line.take();
+    let err = source.start_subst_body('/', false).unwrap_err();
     assert!(err.message.contains("unterminated substitution"));
 }
 
@@ -618,7 +635,8 @@ fn indented_heredoc_errors_on_mismatched_indent_after_start() {
     let mut current_line = Some(LexerLine { number: 1, offset: 0, line: Bytes::from_static(b"saved"), terminated: false, pos: 0, ascii_only: true });
 
     // Terminator has no indent, so required indent becomes empty.
-    source.start_indented_heredoc(Bytes::from_static(b"END"), &mut current_line).unwrap();
+    source.line = current_line.take();
+    source.start_indented_heredoc(Bytes::from_static(b"END")).unwrap();
 
     // First body line should still come through.
     let body = source.next_line(false).unwrap().unwrap();

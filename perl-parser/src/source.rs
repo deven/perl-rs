@@ -121,6 +121,9 @@ pub(crate) struct LexerSource {
     filename: String,
     /// Current byte position for reading the next line.
     cursor: usize,
+    /// The line currently being scanned, if any.  `None` forces a fresh `next_line` read on the next `peek_byte`.
+    /// Moved here from `Lexer` so the cursor and the line-delivery machinery live on one struct.
+    pub(crate) line: Option<LexerLine>,
     /// Next line number to assign (1-based).
     line_number: usize,
     /// Stack of active heredoc contexts.
@@ -170,6 +173,7 @@ impl LexerSource {
             src: src_bytes,
             filename: filename.into(),
             cursor: 0,
+            line: None,
             line_number: 1,
             heredoc_stack: Vec::new(),
             queued_lines: VecDeque::new(),
@@ -271,6 +275,7 @@ impl LexerSource {
             src,
             filename: "(script)".into(),
             cursor: 0,
+            line: None,
             line_number: 1,
             heredoc_stack: Vec::new(),
             queued_lines: VecDeque::new(),
@@ -400,8 +405,8 @@ impl LexerSource {
     ///
     /// Scans ahead to find the terminator, sets the required indentation from its whitespace prefix.  The current line
     /// is taken from the Option (setting it to None) and saved internally for restoration when the terminator is found.
-    pub fn start_indented_heredoc(&mut self, tag: Bytes, current_line: &mut Option<LexerLine>) -> Result<(), ParseError> {
-        let line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_indented_heredoc called without a current line", Span::DUMMY))?;
+    pub fn start_indented_heredoc(&mut self, tag: Bytes) -> Result<(), ParseError> {
+        let line = self.line.take().ok_or_else(|| ParseError::new("internal error: start_indented_heredoc called without a current line", Span::DUMMY))?;
         let prev_indent = self.required_indent.clone();
 
         // Scan ahead for the terminator to determine indentation.
@@ -418,8 +423,8 @@ impl LexerSource {
     ///
     /// The current line is taken from the Option (setting it to None) and saved internally for restoration when the
     /// terminator is found.  Does not change the required indentation.
-    pub fn start_heredoc(&mut self, tag: Bytes, current_line: &mut Option<LexerLine>) -> Result<(), ParseError> {
-        let line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_heredoc called without a current line", Span::DUMMY))?;
+    pub fn start_heredoc(&mut self, tag: Bytes) -> Result<(), ParseError> {
+        let line = self.line.take().ok_or_else(|| ParseError::new("internal error: start_heredoc called without a current line", Span::DUMMY))?;
         let prev_indent = self.required_indent.clone();
 
         self.heredoc_stack.push(HeredocContext { tag, saved_line: line, prev_indent });
@@ -433,8 +438,8 @@ impl LexerSource {
     /// after the EOF.
     ///
     /// Returns the captured flags (or None if no flags).
-    pub fn start_subst_body(&mut self, delim: char, extra_paired: bool, current_line: &mut Option<LexerLine>) -> Result<Option<String>, ParseError> {
-        let mut line = current_line.take().ok_or_else(|| ParseError::new("internal error: start_subst_body called without a current line", Span::DUMMY))?;
+    pub fn start_subst_body(&mut self, delim: char, extra_paired: bool) -> Result<Option<String>, ParseError> {
+        let mut line = self.line.take().ok_or_else(|| ParseError::new("internal error: start_subst_body called without a current line", Span::DUMMY))?;
 
         let (open, close) = matching_delimiter(delim, extra_paired);
         let close_len = close.len_utf8();
