@@ -1686,6 +1686,46 @@ A line matches the heredoc tag only if the entire line content
 match with the tag.  Trailing spaces, tabs, or any other content
 cause the line to be treated as body content, not a terminator.
 
+#### 5.6.8 Virtual EOF and body teardown:
+
+Heredoc and substitution bodies end not at a delimiter byte but when
+the line stream runs out of body content — the heredoc terminator
+line is read, or the queued substitution body lines are exhausted.
+This boundary is a *virtual EOF*: `next_line()` returns no line
+(`self.line` becomes `None`), but it is not the real end of the
+source.  Normal lexing within the body sees the virtual EOF the same
+way it would see end of input.
+
+The virtual EOF is *idempotent*.  Once the body is exhausted,
+`next_line()` keeps reporting no current line — it does not read
+ahead into whatever follows the body — until the consumer explicitly
+asks to move past it.  The current line stays `None`, and only
+`next_line_after_eof()` advances out of that state (delivering the
+saved remainder of the line that introduced the body, or the next
+real line).  This separates *detecting* the end of a body (a
+repeatable observation) from *committing* to it (a single explicit
+step), without a deferral flag bridging the two across calls.
+
+The teardown that a body's end requires — popping the heredoc
+context and restoring the previous indentation, or queueing a
+substitution's saved remainder — is performed by `finish_body()`, a
+`LexerSource` method called at the point the body's `SublexEnd` token
+is emitted.  The lexer already tears down its own per-body state
+(the context stack, case-modification state) at that point; calling
+`finish_body()` alongside it co-locates the full commit at the one
+site that knows the body has definitively ended.  `finish_body()`
+manipulates only `LexerSource`-internal state (the heredoc stack,
+the queued lines, the saved remainders); the lexer never reaches
+into those directly.
+
+This is a deliberate change from an earlier design in which the
+teardown was a side effect of the line read that detected the
+terminator, remembered across calls by a `terminator_pending` flag
+and a peek-versus-consume parameter on `next_line()`.  Folding the
+teardown into the `SublexEnd` emission removes both: detection is a
+plain idempotent `None`, and the commit is an explicit call where the
+body is known to be over.
+
 ### 5.7 Token Categories
 
 The lexer emits tokens that reflect context-sensitive disambiguation
