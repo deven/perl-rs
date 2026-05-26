@@ -22,7 +22,7 @@ use std::sync::Arc;
 #[path = "tests/symbol_tests.rs"]
 mod tests;
 
-// ─── Prototype representation ─────────────────────────────────────
+// ── Prototype representation ─────────────────────────────────────
 /// A parsed Perl subroutine prototype.
 ///
 /// Perl stores prototypes as raw strings like `"$$"`, `"\@;@"`, `"&@"`.  We parse once at declaration time into a
@@ -237,7 +237,7 @@ fn ref_kind_from_byte(b: u8) -> Option<RefKind> {
     }
 }
 
-// ─── Sub information ──────────────────────────────────────────────
+// ── Sub information ──────────────────────────────────────────────
 /// Everything the parser knows about a subroutine.
 ///
 /// `name` is the bare name (no `Foo::` prefix); the containing package is implicit from which `Namespace` holds this
@@ -253,7 +253,7 @@ pub struct SubInfo {
     pub forward_declaration: bool,
 }
 
-// ─── Import target ────────────────────────────────────────────────
+// ── Import target ────────────────────────────────────────────────
 /// The target a local name resolves to in another package.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportTarget {
@@ -261,7 +261,7 @@ pub struct ImportTarget {
     pub name: Arc<str>,
 }
 
-// ─── Single-package namespace ─────────────────────────────────────
+// ── Single-package namespace ─────────────────────────────────────
 /// One Perl package's stash: its locally-declared subs and its imports.
 #[derive(Clone, Debug, Default)]
 pub struct Namespace {
@@ -294,7 +294,7 @@ impl Namespace {
     }
 }
 
-// ─── Symbol table: tree of all packages ───────────────────────────
+// ── Symbol table: tree of all packages ───────────────────────────
 #[derive(Clone, Debug, Default)]
 pub struct SymbolTable {
     namespaces: HashMap<Arc<str>, Namespace>,

@@ -323,12 +323,10 @@ pub enum ExprKind {
 /// `lstat`, or filetest."
 #[derive(Clone, Debug)]
 pub enum StatTarget {
-    /// An expression: `-f $file`, `-d "/tmp"`, `stat $fh`, or stacked
-    /// filetests like `-f -r $file`.
+    /// An expression: `-f $file`, `-d "/tmp"`, `stat $fh`, or stacked filetests like `-f -r $file`.
     Expr(Box<Expr>),
 
-    /// The bare `_` filehandle — reuse the cached stat buffer from the
-    /// most recent `stat`, `lstat`, or filetest call.
+    /// The bare `_` filehandle — reuse the cached stat buffer from the most recent `stat`, `lstat`, or filetest call.
     StatCache,
 
     /// Implicit `$_` — when no operand is given (`-e;`).

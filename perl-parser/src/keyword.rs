@@ -548,8 +548,8 @@ static KEYWORDS: phf::Map<&'static [u8], Keyword> = phf_map! {
 };
 
 /// Look up a keyword by name, respecting feature gating.  Returns `None` for unknown names and for feature-gated
-/// keywords whose feature is not active (they are plain identifiers in that context).  Takes `&[u8]` since all
-/// keywords are ASCII — callers working with raw bytes avoid unnecessary UTF-8 validation.
+/// keywords whose feature is not active (they are plain identifiers in that context).  Takes `&[u8]` since all keywords
+/// are ASCII — callers working with raw bytes avoid unnecessary UTF-8 validation.
 pub fn lookup_keyword(name: &[u8], features: Features) -> Option<Keyword> {
     let &kw = KEYWORDS.get(name)?;
     let needed = match kw {

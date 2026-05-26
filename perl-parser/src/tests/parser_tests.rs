@@ -6476,8 +6476,8 @@ fn prec_arrow_tighter_than_mul() {
 
 #[test]
 fn prec_assign_inside_ternary() {
-    // `$a ? $b = 1 : 0` — assign inside the true-branch of ternary.  The `:` stops the middle at PREC_LOW,
-    // so `$b = 1` is fully consumed as the true-branch.
+    // `$a ? $b = 1 : 0` — assign inside the true-branch of ternary.  The `:` stops the middle at PREC_LOW, so `$b = 1`
+    // is fully consumed as the true-branch.
     let e = parse_expr_str("$a ? $b = 1 : 0;");
     match &e.kind {
         ExprKind::Ternary(_, middle, _) => {
@@ -6508,8 +6508,8 @@ fn prec_stacked_prefix_ops() {
 
 #[test]
 fn prec_ternary_right_assoc_else() {
-    // `$a ? $b : $c ? $d : $e` → Ternary($a, $b, Ternary($c, $d, $e)) — right-associative: the second `?:` nests
-    // inside the else branch of the first, NOT as `Ternary(Ternary($a, $b, $c), $d, $e)`.
+    // `$a ? $b : $c ? $d : $e` → Ternary($a, $b, Ternary($c, $d, $e)) — right-associative: the second `?:` nests inside
+    // the else branch of the first, NOT as `Ternary(Ternary($a, $b, $c), $d, $e)`.
     let e = parse_expr_str("$a ? $b : $c ? $d : $e;");
     match &e.kind {
         ExprKind::Ternary(_, middle, else_branch) => {
@@ -6722,8 +6722,8 @@ fn pratt_infix_after_array_ref() {
 
 #[test]
 fn pratt_infix_after_hash_ref() {
-    // `$x = {a => 1} || 0` — hash ref on RHS of assignment, then logical or.  The `{` is in expression context so
-    // it's unambiguously a hash ref (at statement level, `{` would be a block).
+    // `$x = {a => 1} || 0` — hash ref on RHS of assignment, then logical or.  The `{` is in expression context so it's
+    // unambiguously a hash ref (at statement level, `{` would be a block).
     let e = parse_expr_str("$x = {a => 1} || 0;");
     match &e.kind {
         ExprKind::Assign(_, _, rhs) => {
@@ -6761,17 +6761,18 @@ fn pratt_not_absorbs_ternary() {
 
 #[test]
 fn pratt_every_frame_type_stacked() {
-    // `not \-([1])` — stacks four different frame types: Not, Ref, Negate, Paren (with nested ArrayRef).
-    // Verifies the continuation stack handles diverse frame types in a single expression without confusion.
+    // `not \-([1])` — stacks four different frame types: Not, Ref, Negate, Paren (with nested ArrayRef).  Verifies the
+    // continuation stack handles diverse frame types in a single expression without confusion.
     let e = parse_expr_str("not \\-([1]);");
+
     // Outer is Not.
     assert!(matches!(e.kind, ExprKind::UnaryOp(UnaryOp::Not, _)), "expected Not, got {:?}", e.kind);
 }
 
 #[test]
 fn pratt_min_prec_restored_after_container() {
-    // `1 + [2] * 3` — after ArrayRef frame completes with min_prec from the `+`'s RHS (PREC_ADD+1=1801),
-    // the `*` at PREC_MUL (1900) >= 1801 must be consumed.  Result: Add(1, Mul([2], 3)).
+    // `1 + [2] * 3` — after ArrayRef frame completes with min_prec from the `+`'s RHS (PREC_ADD+1=1801), the `*` at
+    // PREC_MUL (1900) >= 1801 must be consumed.  Result: Add(1, Mul([2], 3)).
     let e = parse_expr_str("1 + [2] * 3;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Add, _, rhs) => {
@@ -6837,16 +6838,17 @@ fn pratt_consecutive_commas_in_array_ref() {
 fn pratt_trailing_comma_only() {
     // `(1,)` — trailing comma, single-element list.
     let e = parse_expr_str("(1,);");
-    // In Perl, `(1,)` is the same as `(1)` — the trailing comma is a no-op.
-    // The parser may produce IntLit(1) or List([1]) — either is acceptable.
+
+    // In Perl, `(1,)` is the same as `(1)` — the trailing comma is a no-op.  The parser may produce IntLit(1) or
+    // List([1]) — either is acceptable.
     assert!(matches!(e.kind, ExprKind::IntLit(1) | ExprKind::List(_)), "expected IntLit or List, got {:?}", e.kind);
 }
 
 #[test]
 fn pratt_c_comma_rhs_of_binding() {
-    // `("test", $_) =~ /foo/` — C comma semantics.  The comma expression inside parens binds to `=~` as a whole.
-    // Perl evaluates "test" in void context and binds $_ to the regex.  At the parser level, the comma still produces
-    // a List (context is a semantic concern, not syntactic), and =~ binds to the entire paren result.
+    // `("test", $_) =~ /foo/` — C comma semantics.  The comma expression inside parens binds to `=~` as a whole.  Perl
+    // evaluates "test" in void context and binds $_ to the regex.  At the parser level, the comma still produces a List
+    // (context is a semantic concern, not syntactic), and =~ binds to the entire paren result.
     let e = parse_expr_str("(\"test\", $_ ) =~ /foo/;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Binding, lhs, _) => {
@@ -6901,8 +6903,8 @@ fn pratt_trailing_comma_scalar_context() {
 #[test]
 #[ignore = "comma handler doesn't absorb consecutive commas — needs parse_term → Option<Expr> refactor"]
 fn pratt_consecutive_commas_lhs_list_assign() {
-    // `my ($x,,$y) = (2, 4, 6)` — consecutive commas on LHS of list assignment are no-ops.
-    // `($x,,$y)` is the same as `($x,$y)`: $x=2, $y=4.  No placeholder slot is created.
+    // `my ($x,,$y) = (2, 4, 6)` — consecutive commas on LHS of list assignment are no-ops.  `($x,,$y)` is the same as
+    // `($x,$y)`: $x=2, $y=4.  No placeholder slot is created.
     let prog = parse("my ($x,,$y) = (2, 4, 6);");
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => match &lhs.kind {
@@ -6918,15 +6920,15 @@ fn pratt_consecutive_commas_lhs_list_assign() {
 #[test]
 #[ignore = "parse_decl_expr doesn't accept undef as a placeholder in parenthesized declarations"]
 fn pratt_undef_placeholder_in_list_assign() {
-    // `my ($x, undef, $y) = (2, 4, 6)` — explicit `undef` placeholder occupies a slot.
-    // $x=2, undef absorbs 4, $y=6.  Contrast with `($x,,$y)` where the extra comma is a no-op.
+    // `my ($x, undef, $y) = (2, 4, 6)` — explicit `undef` placeholder occupies a slot.  $x=2, undef absorbs 4, $y=6.
+    // Contrast with `($x,,$y)` where the extra comma is a no-op.
     let prog = parse("my ($x, undef, $y) = (2, 4, 6);");
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => {
             match &lhs.kind {
                 ExprKind::Decl(_, vars) => {
-                    // 3 slots: $x, undef placeholder, $y — but Decl may only track the named variables.
-                    // The key point is the list has 3 elements, not 2.
+                    // 3 slots: $x, undef placeholder, $y — but Decl may only track the named variables.  The key point
+                    // is the list has 3 elements, not 2.
                     assert!(vars.len() >= 2, "expected at least 2 declared vars, got {:?}", vars);
                 }
                 ExprKind::List(items) => {
@@ -6948,8 +6950,8 @@ fn context_scalar_decl_vs_list_decl() {
     // `my ($x) = (2, 4, 6)` → list context.  $x = 2 (first element of list).
     // The parser must distinguish these: the LHS form determines the context of the RHS.
     //
-    // The Decl node (or assignment node) should carry context information so the compiler knows whether
-    // to apply scalar or list semantics to the RHS.
+    // The Decl node (or assignment node) should carry context information so the compiler knows whether to apply scalar
+    // or list semantics to the RHS.
     let prog1 = parse("my $x = (2, 4, 6);");
     let prog2 = parse("my ($x) = (2, 4, 6);");
 
@@ -6962,8 +6964,8 @@ fn context_scalar_decl_vs_list_decl() {
         other => panic!("stmt 2: expected Assign, got {other:?}"),
     };
 
-    // The LHS nodes should differ structurally (ignoring spans).  `my $x` is a scalar declaration;
-    // `my ($x)` is a list-context declaration.  Currently both produce `Decl(My, [VarDecl])`.
+    // The LHS nodes should differ structurally (ignoring spans).  `my $x` is a scalar declaration; `my ($x)` is a list-
+    // context declaration.  Currently both produce `Decl(My, [VarDecl])`.
     assert!(
         std::mem::discriminant(&lhs1.kind) != std::mem::discriminant(&lhs2.kind)
             || format!("{:?}", lhs1.kind).contains("List") != format!("{:?}", lhs2.kind).contains("List"),
@@ -6976,15 +6978,15 @@ fn context_scalar_decl_vs_list_decl() {
 #[test]
 #[ignore = "parser doesn't consult prototypes when parsing call arguments — needs prototype-aware context propagation"]
 fn proto_scalar_slot_parses_c_comma() {
-    // `($@)` prototype: first slot is scalar context, so `(2,4,6)` is C commas → result is 6.
-    // The parser should produce 3 args: [6, 8, 10], not [List(2,4,6), 8, 10].
+    // `($@)` prototype: first slot is scalar context, so `(2,4,6)` is C commas → result is 6.  The parser should
+    // produce 3 args: [6, 8, 10], not [List(2,4,6), 8, 10].
     let prog = parse("sub f ($@) {} f((2,4,6),8,10);");
+
     // Find the function call statement.
     let call = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("no expression statement found");
     match &call.kind {
         ExprKind::FuncCall(_, args) => {
-            // With scalar context for first arg, (2,4,6) evaluates to 6.
-            // The first arg should NOT be a List node.
+            // With scalar context for first arg, (2,4,6) evaluates to 6.  The first arg should NOT be a List node.
             assert!(!matches!(args[0].kind, ExprKind::List(_)), "first arg should be scalar (C comma), not List — got {:?}", args[0].kind);
         }
         other => panic!("expected FuncCall, got {other:?}"),
@@ -6993,8 +6995,8 @@ fn proto_scalar_slot_parses_c_comma() {
 
 #[test]
 fn proto_no_prototype_parses_list() {
-    // Without prototype, all args are list context.  `(2,4,6)` is a list that flattens.
-    // The parser produces 3 args: [List(2,4,6), 8, 10].  Flattening to 5 args is the compiler's job.
+    // Without prototype, all args are list context.  `(2,4,6)` is a list that flattens.  The parser produces 3 args:
+    // [List(2,4,6), 8, 10].  Flattening to 5 args is the compiler's job.
     let prog = parse("sub g {} g((2,4,6),8,10);");
     let call = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("no expression statement found");
     match &call.kind {
@@ -7118,8 +7120,8 @@ fn parse_leading_dot_vstring_four_segments() {
 
 #[test]
 fn parse_leading_dot_float_then_concat() {
-    // `.5 . "hello"` → Concat(FloatLit(0.5), StringLit("hello")).
-    // The first `.5` is a leading-dot float (term position), the second `.` is concat (operator position).
+    // `.5 . "hello"` → Concat(FloatLit(0.5), StringLit("hello")).  The first `.5` is a leading-dot float (term
+    // position), the second `.` is concat (operator position).
     let e = parse_expr_str(".5 . 'hello';");
     match &e.kind {
         ExprKind::BinOp(BinOp::Concat, lhs, _) => {
@@ -7131,8 +7133,8 @@ fn parse_leading_dot_float_then_concat() {
 
 #[test]
 fn parse_leading_dot_underscore_before_digit_is_error() {
-    // `._5` — underscore before the first digit is a syntax error in Perl.  The `.` is Dot (not a float start)
-    // and `_5` is a bareword, so this fails in term position.
+    // `._5` — underscore before the first digit is a syntax error in Perl.  The `.` is Dot (not a float start) and `_5`
+    // is a bareword, so this fails in term position.
     let result = crate::parse(b"._5;");
     assert!(result.is_err(), "._5 should be a syntax error or non-float parse, got: {:?}", result);
 }
@@ -7154,9 +7156,9 @@ fn parse_leading_dot_multiple_underscores() {
 #[test]
 #[ignore = "x5 lexed as identifier, not repeat-then-5 — lexer doesn't know operator position"]
 fn parse_underscore_after_dot_then_repeat() {
-    // `0._x5` → Perl parses as `0.0 x 5` → "00000".  The `_` enters the float fractional path, is stripped,
-    // leaving float 0.0.  Then `x5` is the repeat operator (x is not followed by a word char in x5 since 5 is a digit,
-    // but `x` adjacent to a digit is repeat).
+    // `0._x5` → Perl parses as `0.0 x 5` → "00000".  The `_` enters the float fractional path, is stripped, leaving
+    // float 0.0.  Then `x5` is the repeat operator (x is not followed by a word char in x5 since 5 is a digit, but `x`
+    // adjacent to a digit is repeat).
     let e = parse_expr_str("0._x5;");
     assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Repeat, _, _)), "expected Repeat, got {:?}", e.kind);
 }
@@ -7164,8 +7166,7 @@ fn parse_underscore_after_dot_then_repeat() {
 #[test]
 #[ignore = "parser doesn't reject bareword in operator position — needs operator-position validation"]
 fn parse_underscore_after_dot_then_bareword_is_error() {
-    // `0._a` → Perl: "Bareword found where operator expected".  Float 0.0, then `a` is a bareword in operator
-    // position.
+    // `0._a` → Perl: "Bareword found where operator expected".  Float 0.0, then `a` is a bareword in operator position.
     let result = crate::parse(b"0._a;");
     assert!(result.is_err(), "0._a should be a syntax error, got: {:?}", result);
 }
@@ -7621,8 +7622,7 @@ fn parse_anon_hash() {
 
 #[test]
 fn parse_anon_hash_at_stmt_level() {
-    // {key => 'val'} at statement level — the heuristic should
-    // detect => after bareword and route to AnonHash.
+    // {key => 'val'} at statement level — the heuristic should detect => after bareword and route to AnonHash.
     let prog = parse("{key => 'val'};");
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::AnonHash(elems), .. }) => {
@@ -9054,8 +9054,7 @@ fn hard_eval_block_vs_expr() {
 
 #[test]
 fn hard_ternary_right_associative() {
-    // `$a ? $b : $c ? $d : $e;` — right-associative.
-    // Must group as: Ternary($a, $b, Ternary($c, $d, $e))
+    // `$a ? $b : $c ? $d : $e;` — right-associative.  Must group as: Ternary($a, $b, Ternary($c, $d, $e))
     let e = parse_expr_str("$a ? $b : $c ? $d : $e;");
     match &e.kind {
         ExprKind::Ternary(_, then, else_) => {
@@ -9094,8 +9093,7 @@ fn hard_ternary_then_has_plus() {
 
 #[test]
 fn hard_assign_comma_precedence() {
-    // `$a = $b, $c;` — comma is lower than assignment.
-    // Must group as: List([Assign($a, $b), $c])
+    // `$a = $b, $c;` — comma is lower than assignment.  Must group as: List([Assign($a, $b), $c])
     let e = parse_expr_str("$a = $b, $c;");
     match &e.kind {
         ExprKind::List(items) => {
@@ -9273,8 +9271,8 @@ fn regex_brace_delim_no_escape_needed() {
 
 #[test]
 fn depth_parens_are_iterative() {
-    // Deeply nested parens are handled iteratively and don't produce nested AST nodes (parens are syntactic-only).
-    // No recursion in parsing or dropping.
+    // Deeply nested parens are handled iteratively and don't produce nested AST nodes (parens are syntactic-only).  No
+    // recursion in parsing or dropping.
     let depth = 100_000;
     let src = format!("{}1{};", "(".repeat(depth), ")".repeat(depth));
     let result = crate::parse(src.as_bytes());
@@ -11108,8 +11106,8 @@ fn postfix_when_modifier_explicit_feature() {
 
 #[test]
 fn postfix_when_without_feature() {
-    // Without the switch feature, `when` is demoted to a bare identifier.  `$abc = 1 when ...` would parse `when` as
-    // a bareword function call — the expression becomes `1 when(...)` which is NOT a postfix modifier.  Just verify it
+    // Without the switch feature, `when` is demoted to a bare identifier.  `$abc = 1 when ...` would parse `when` as a
+    // bareword function call — the expression becomes `1 when(...)` which is NOT a postfix modifier.  Just verify it
     // doesn't produce PostfixKind::When.
     let prog = parse("$abc = 1; when(/^abc/);");
 
@@ -14216,8 +14214,8 @@ fn named_char_in_heredoc() {
 
 #[test]
 fn named_char_invalid_hex_in_u_plus_silent_fffd() {
-    // \N{U+SNOWMAN} — "SNOWMAN" is not valid hexadecimal.  The parser silently produces U+FFFD via unwrap_or instead
-    // of reporting an error.  This is silent data corruption.
+    // \N{U+SNOWMAN} — "SNOWMAN" is not valid hexadecimal.  The parser silently produces U+FFFD via unwrap_or instead of
+    // reporting an error.  This is silent data corruption.
     let result = crate::parse(b"my $x = \"\\N{U+SNOWMAN}\";");
     assert!(result.is_err(), "\\N{{U+SNOWMAN}} should error, not silently produce U+FFFD");
 }
