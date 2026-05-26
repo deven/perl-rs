@@ -989,14 +989,36 @@ the lexer through parser method calls in the sections where both
 cooperate (e.g. `lex_word` produces `Token::Ident`, and the parser
 then consults the symbol table to decide how to parse the arguments).
 
-### 5.4 Source Layer (`LexerSource`)
+### 5.4 Source Layer
 
-The lexer does not read source bytes directly.  A dedicated
-`LexerSource` type manages line-oriented source delivery, CRLF
-normalization, heredoc body sequencing, substitution body partitioning,
-and indentation stripping.  The lexer receives one line at a time and
-scans bytes within it, never dealing with line boundaries, newline
-encoding, or heredoc line reordering.
+The lexer does not read source bytes directly.  A dedicated *source
+layer* manages line-oriented source delivery, CRLF normalization,
+heredoc body sequencing, substitution body partitioning, and
+indentation stripping.  The rest of the lexer receives one line at a
+time and scans bytes within it, never dealing with line boundaries,
+newline encoding, or heredoc line reordering.
+
+The source layer is not a separate type.  Its fields live directly on
+`Lexer` and its methods are `impl Lexer` methods, organized into their
+own module (`source.rs`) for conceptual clarity.  Earlier the layer
+was a distinct `LexerSource` struct held as a field, but the lexer and
+its source are in strict one-to-one correspondence and share mutable
+state intimately — every token scan coordinates current-line position,
+the context stack, and the line-delivery queues together.  A separate
+type is the textbook arrangement, but here it imposed a real cost: a
+borrow boundary that forced constant ownership negotiations (which
+struct owns the current line, the context stack, the saved
+remainders), `self.source.` indirection on hot paths, and methods that
+genuinely needed both sides at once.  None of the usual justifications
+for the split applied — there is no many-to-one relationship, no reuse
+of the source without the lexer, no trait-based substitution, and no
+invariant that needs protecting from the lexer itself.  Internal
+encapsulation is protection from oneself; the encapsulation that
+matters is at the crate boundary, which `pub(crate)`/`pub` markers on
+the lexer's API provide regardless of internal structure.  Keeping the
+module (`source.rs`) preserves the organizational clarity of the
+source layer without paying for a type boundary that returned less
+than it cost.
 
 #### 5.4.1 Why a source layer:
 
@@ -1008,14 +1030,9 @@ save/restore stacks, and terminator detection interleaved with
 content scanning.  These are all line-level concerns forced into a
 byte-level API, resulting in significant accidental complexity.
 
-`LexerSource` is purpose-built for the lexer's needs — not a
-general-purpose abstraction.  A future general `Source` type for
-other uses (e.g. error reporting, IDE integration) could underlie
-`LexerSource` as a wrapper.
-
 #### 5.4.2 Dependencies:
 
-`perl-parser` depends on the `bytes` crate.  `LexerSource` uses
+`perl-parser` depends on the `bytes` crate.  The source layer uses
 `Bytes` for zero-copy reference-counted slices of the source buffer.
 Line slicing, heredoc remainder saving, and indentation prefixes are
 all `Bytes` handles into the same underlying allocation — no copying.
@@ -1076,16 +1093,16 @@ restoring a line (e.g. for heredoc remainder) automatically preserves
 the cursor position within that line.  The lexer transparently
 resumes mid-line without any special-case logic.
 
-#### 5.4.4 `LexerSource` internal architecture:
+#### 5.4.4 Source layer internal architecture:
 
-`LexerSource` maintains a line queue (`VecDeque<LexerLine>`) and a
+The source layer maintains a line queue (`VecDeque<LexerLine>`) and a
 push-back mechanism for line reordering.  When heredoc bodies or
 substitution bodies need to be served before the continuation of the
 current line, the relevant lines are queued and the saved remainder
 is pushed back for delivery after the body is consumed.
 
 ```rust
-impl LexerSource {
+impl Lexer {
     /// Get the next line.  Serves queued lines (heredoc bodies,
     /// substitution bodies) first, then reads from the source.
     /// Returns `Ok(None)` for virtual EOF (heredoc/subst body
@@ -1099,33 +1116,23 @@ impl LexerSource {
     /// Begin processing a non-indented heredoc body.  Takes the
     /// current line (saving its remainder for later), queues body
     /// lines until the terminator is found.
-    fn start_heredoc(
-        &mut self,
-        tag: Bytes,
-        current_line: &mut Option<LexerLine>,
-    ) -> Result<(), ParseError>;
+    fn start_heredoc(&mut self, tag: Bytes)
+        -> Result<(), ParseError>;
 
     /// Begin processing an indented heredoc body (`<<~`).  Scans
     /// ahead to find the terminator, extracts its whitespace prefix
     /// as the required indentation, and strips that prefix from all
     /// body lines.
-    fn start_indented_heredoc(
-        &mut self,
-        tag: Bytes,
-        current_line: &mut Option<LexerLine>,
-    ) -> Result<(), ParseError>;
+    fn start_indented_heredoc(&mut self, tag: Bytes)
+        -> Result<(), ParseError>;
 
     /// Partition a substitution replacement body.  Scans forward
-    /// from the current position in the given line to find the
+    /// from the current position in the current line to find the
     /// closing delimiter (tracking nesting depth for paired
     /// delimiters), queues the body content as lines with a
     /// virtual EOF, extracts flags, and saves the remainder.
-    fn start_subst_body(
-        &mut self,
-        delim: char,
-        extra_paired: bool,
-        current_line: &mut Option<LexerLine>,
-    ) -> Result<Option<String>, ParseError>;
+    fn start_subst_body(&mut self, delim: char, extra_paired: bool)
+        -> Result<Option<String>, ParseError>;
 
     /// Override line numbering for `# line` directives.
     fn set_line_number(&mut self, n: usize);
@@ -1190,7 +1197,7 @@ of terminated lines via `peek_byte`.
 #### 5.4.8 `# line` directive processing:
 
 The lexer recognizes `# line N "file"` directives (when `#` is at
-column 0) via `try_line_directive()`, updating `LexerSource`'s line
+column 0) via `try_line_directive()`, updating the source layer's line
 number and optional filename override.  These affect `__LINE__` and
 `__FILE__` resolution and diagnostic messages.  The directive is
 consumed as a comment — no token is emitted.
@@ -1207,9 +1214,10 @@ directive.
 
 The lexer's token-production loop never manages heredoc line ordering,
 CRLF normalization, indent stripping, substitution body partitioning,
-or position save/restore.  These are fully encapsulated in
-`LexerSource`.  The lexer simply calls `peek_byte`, which auto-loads
-lines as needed through `next_line()`.
+or position save/restore.  These are fully encapsulated in the source
+layer.  The rest of the lexer simply calls `next_line()` as necessary
+to get each line, without needing to worry about complexities such as
+heredoc interleaving.
 
 #### 5.4.10 Zero-copy flow from source to runtime:
 
@@ -1226,7 +1234,7 @@ and regex literal fragments.
 
 The same `Bytes` sharing works in reverse for `eval STRING` — the
 string being evaluated is already a `Bytes` (or trivially freezable
-to one), so `LexerSource` can lex directly from it with zero-copy
+to one), so the source layer can lex directly from it with zero-copy
 line slicing.  No need to copy the string into a separate source
 buffer.
 
@@ -1242,7 +1250,7 @@ position or commit to where the scan ended, without disturbing the
 heredoc interleaving machinery.
 
 The mechanism is built entirely on the existing line-delivery
-queue.  `LexerSource` gains three fields:
+queue.  The source layer gains three fields:
 
 ```rust
 /// Lines pulled during an active lookahead, captured for replay.
@@ -1329,7 +1337,7 @@ Sublexing is the core architectural requirement.  The implementation
 uses an explicit context stack (`Vec<LexContext>`) on the `Lexer`
 struct.  This stack tracks the lexer's current mode within the line
 it is scanning — it does not manage source positioning or line
-sequencing (those are `LexerSource` concerns; see §5.4).
+sequencing (those are source-layer concerns; see §5.4).
 
 Unlike the enum-based `LexMode` design considered early on,
 `LexContext` is a single struct with boolean flags that control
@@ -1339,7 +1347,7 @@ covers all scanning modes:
 ```rust
 struct LexContext {
     /// Opening delimiter character.  `None` for heredocs (end
-    /// signaled by LexerSource returning `None` from `next_line`).
+    /// signaled by the source layer returning `None` from `next_line`).
     delim: Option<char>,
     /// Delimiter nesting depth (for paired delimiters like `{}`).
     depth: u32,
@@ -1381,7 +1389,7 @@ regex)`:
 Delimiter types are `char`, not `u8`, to support the Unicode paired
 delimiter table (§5.8).  `delim` is `None` for heredocs and
 substitution replacement bodies, where end-of-content is signaled by
-`LexerSource` returning `Ok(None)` from `next_line()` rather than by
+the source layer returning `Ok(None)` from `next_line()` rather than by
 a delimiter byte in the content stream.
 
 #### 5.5.1 Incremental sublexing:
@@ -1540,7 +1548,7 @@ manpage rather than the interpreter is how subtle bugs creep in:
 
 ### 5.6 Heredoc Handling
 
-Heredocs are handled by the cooperation of `LexerSource` (§5.4) and
+Heredocs are handled by the source layer (§5.4) and the rest of
 the lexer's token-production loop.  The source layer manages all line
 ordering, indentation, and save/restore.  The lexer's only heredoc
 awareness is recognizing `<<TAG` and framing the body as
@@ -1573,7 +1581,7 @@ END
    been found.  The lexer pops `LexContext` from the context stack
    and emits `SublexEnd`.
 
-4. On the next `source.next_line()` call, `LexerSource` returns the
+4. On the next `next_line()` call, the source layer returns the
    saved `LexerLine` — the remainder ` . "suffix";`.  Because
    `LexerLine` carries the cursor position, the lexer transparently
    resumes scanning mid-line.
@@ -1599,7 +1607,7 @@ This falls out naturally from the save/restore mechanism:
    Lexer emits `SublexEnd`.
 6. Next `source.next_line()` returns `);`.
 
-No special stacking logic in the lexer.  `LexerSource`'s line queue
+No special stacking logic needed.  The source layer's line queue
 and push-back mechanism handle all the line sequencing.
 
 #### 5.6.3 Indented heredocs (`<<~`):
@@ -1611,7 +1619,7 @@ my $x = <<~END;
 ```
 
 The lexer calls `source.start_indented_heredoc(tag, current_line)`.
-`LexerSource` scans ahead to find the terminator line, extracts its
+The source layer scans ahead to find the terminator line, extracts its
 full whitespace prefix (`"    "` in this example), and sets that as
 the required indentation.  Subsequent body lines are delivered with
 the prefix stripped.  When the terminator is found, the previous
@@ -1638,7 +1646,7 @@ The lexer recognizes several heredoc tag forms:
 
 Expression interpolation in heredocs (`${...}`) increments
 `expr_depth`, switching the lexer to normal code mode.  If
-a nested heredoc appears inside the expression, `LexerSource`
+a nested heredoc appears inside the expression, the source layer
 handles the nesting correctly:
 
 ```perl
@@ -1653,7 +1661,7 @@ my $x = <<~OUTER;
 
 - `<<~OUTER` sets required indent to `"    "` (from terminator).
 - Body lines are served with 4-space indent stripped.
-- Inside `${\(...)}`, the lexer encounters `<<A`.  `LexerSource`
+- Inside `${\(...)}`, the lexer encounters `<<A`.  The source layer
   saves the remainder and starts A's body.  A is non-indented, but
   the required indent (`"    "`) is still active — A's body lines
   `"    1\n"` have the prefix stripped, yielding `"1\n"`.  The
@@ -1676,7 +1684,7 @@ initiating line, matching Perl's compile-time execution order.
 Literal heredocs (`<<'TAG'`, `<<\TAG`, `<<~'TAG'`) do not
 interpolate.  The lexer collects the body into a single
 `ConstSegment` token rather than producing a sub-token stream with
-interpolation breaks.  `LexerSource` manages the line sequencing
+interpolation breaks.  The source layer manages the line sequencing
 identically.
 
 #### 5.6.7 Heredoc terminator matching:
@@ -1709,12 +1717,12 @@ step), without a deferral flag bridging the two across calls.
 The teardown that a body's end requires — popping the heredoc
 context and restoring the previous indentation, or queueing a
 substitution's saved remainder — is performed by `finish_body()`, a
-`LexerSource` method called at the point the body's `SublexEnd` token
+source-layer method called at the point the body's `SublexEnd` token
 is emitted.  The lexer already tears down its own per-body state
 (the context stack, case-modification state) at that point; calling
 `finish_body()` alongside it co-locates the full commit at the one
 site that knows the body has definitively ended.  `finish_body()`
-manipulates only `LexerSource`-internal state (the heredoc stack,
+manipulates only source-layer-internal state (the heredoc stack,
 the queued lines, the saved remainders); the lexer never reaches
 into those directly.
 
@@ -1819,7 +1827,7 @@ choices collapse most of the above complexity:
 - *Per-`LexerLine` delivery, no packed buffer.*  Every line —
   top-level or heredoc-body — reaches the lexer as its own
   `LexerLine` with `pos` starting at 0 of its content (post-strip for
-  `<<~`); `LexerSource` interleaves heredoc-body lines with
+  `<<~`); the source layer interleaves heredoc-body lines with
   surrounding code so interpolated code inside a body is lexed *for
   the first time*, not re-lexed out of a saved buffer.  Consequently
   Perl's two-condition line-start test collapses to a single check:
@@ -7772,7 +7780,7 @@ perl-runtime/
 perl-parser/
     src/
         lib.rs           # Public API: "give me source, get an AST"
-        source.rs        # LexerSource, LexerLine, CRLF normalization
+        source.rs        # source layer (impl Lexer), LexerLine, CRLF
         token.rs         # Token enum, spans
         lexer.rs         # Tokenizer, sublexing, delimiter tables
         parser.rs        # Pratt parser, AST construction
