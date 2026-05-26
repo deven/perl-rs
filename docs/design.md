@@ -1518,6 +1518,95 @@ Core token categories:
 - Keywords (control flow, declaration, special forms)
 - Heredoc markers
 - Special tokens (end of input, format lines, `__END__`/`__DATA__`)
+- `EqOrPod` — a POD-eligible `=` (§5.7.1)
+
+### 5.7.1 POD Recognition
+
+POD (`=head1` ... `=cut` documentation blocks) is the one place
+where `=` at the start of a line might begin documentation rather
+than an operator.  Getting this right requires understanding what
+Perl actually does, which is subtler than the descriptions in
+`perlpod`/`perlpodspec` suggest — those specify POD for *formatters*
+(pod2html and friends), not for the `perl` interpreter's skip logic.
+Only `toke.c` is authoritative.
+
+**The canonical predicate (`toke.c` ~9359).**  Perl recognizes a POD
+block start when three conditions all hold:
+
+1. `PL_expect == XSTATE` — the parser is at a point where a
+   statement could begin.  POD recognition is *grammatically gated*,
+   not purely lexical.
+2. `isALPHA(tmp)` — the byte after `=` is an ASCII letter.  Not a
+   digit (`=1`), not underscore (`=_x`), not another operator char
+   (`==`, `=~`, `=>`).  Specifically `[A-Za-z]`.
+3. `s == PL_linestart+1 || s[-2] == '\n'` — the `=` is at the start
+   of a line.  Two conditions because Perl packs source into a buffer:
+   the first catches a `=` at the very start of the lex buffer (the
+   normal single-line-from-file case, where no preceding newline byte
+   exists); the second catches a `=` that begins an *interior* line
+   of a multi-line buffer (sublexed bodies, string-eval, interpolated
+   code), detected by the literal newline byte before it.  The `||`
+   short-circuits so the second never reads before the buffer.
+
+**Termination (`toke.c` ~7328, ~9370).**  A POD block ends at a line
+matching `=cut` where the character at offset 4 is *not* an
+identifier-continuation character (`!isIDCONT_A(s[4])`, i.e. not
+`[A-Za-z0-9_]`).  So `=cut2`, `=cute`, `=cut_x` do *not* terminate —
+they are ordinary POD command paragraphs.  (This is the behavior of
+GitHub issue #22759, confirmed from the code.)
+
+**Two skip paths (`toke.c` 9363 vs 9385).**  When sublexing
+(`PL_lex_state != LEX_NORMAL`) or in a string eval with no real
+filehandle, Perl scans for `=cut` *within the current buffer*.
+Otherwise it sets `PL_in_pod = 1` and lets the line reader skip
+file lines.  Both use the same `=cut` predicate.
+
+**Heredoc interaction.**  A heredoc *literal* body is collected by
+`scan_heredoc` as raw bytes (a `memchr`-newline copy); it is never
+lexed as code, so a `=pod`-looking line in literal body text is
+literal — `PL_expect` is never `XSTATE` for it.  But *interpolated
+code* regions within a heredoc body (`${ ... }`, `@{[ ... ]}`) are
+real code: POD is recognized there at statement boundaries, via the
+in-buffer skip path.  For an indented heredoc (`<<~`), the indent is
+stripped first and under-indented body lines are a hard error
+(*before* POD is considered), so POD inside a `<<~` body must be
+indented to match the terminator — it sits at *virtual* column 0
+(post-strip), not physical column 0.
+
+**How PerlOxide differs — and why it is simpler.**  Two architectural
+choices collapse most of the above complexity:
+
+- *No `PL_expect` in the lexer.*  The lexer is position-independent
+  (§5.2), so it *cannot* make the `XSTATE` judgment.  POD recognition
+  must therefore involve the parser.  The lexer emits a `Token::EqOrPod`
+  whenever it lexes a `=` that is POD-*eligible* — i.e. at line start
+  with an ASCII letter following.  The token *is* just the `=`; the
+  letter is lookahead verification, left unconsumed.  The parser
+  supplies the `XSTATE` judgment: if it receives `EqOrPod` while
+  expecting a statement, it calls `self.lexer.skip_pod()` to advance
+  past the block through `=cut`; otherwise it treats `EqOrPod` as a
+  synonym for `Token::Eq` (the following identifier then lexes
+  normally, since it was never consumed).  This works recursively —
+  interpolated code is parsed at its own statement boundaries, so the
+  parser applies the same judgment there for free.
+
+- *Per-`LexerLine` delivery, no packed buffer.*  Every line —
+  top-level or heredoc-body — reaches the lexer as its own
+  `LexerLine` with `pos` starting at 0 of its content (post-strip for
+  `<<~`); `LexerSource` interleaves heredoc-body lines with
+  surrounding code so interpolated code inside a body is lexed *for
+  the first time*, not re-lexed out of a saved buffer.  Consequently
+  Perl's two-condition line-start test collapses to a single check:
+  the `=` is at line start iff `pos == 1` immediately after consuming
+  it (equivalently, the `=` was at `pos == 0`).  No `PL_linestart`
+  analog, no `\n`-lookback, and the indented-heredoc case "just
+  works" because the `LexerLine` already holds the post-strip slice,
+  making virtual column 0 identical to `pos == 0`.
+
+**Consequence for the whitespace skipper.**  Because POD is a token
+(`EqOrPod`) handled by the parser, it is not a whitespace-skipping
+concern.  The lexer has a single `skip_ws_and_comments` that skips
+whitespace and comments only.
 
 ### 5.8 Unicode Support
 
