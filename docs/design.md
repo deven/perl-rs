@@ -1230,6 +1230,99 @@ to one), so `LexerSource` can lex directly from it with zero-copy
 line slicing.  No need to copy the string into a separate source
 buffer.
 
+#### 5.4.11 Lookahead:
+
+Some lexing decisions require seeing *future* lines before the
+current token is finished — most notably fat-comma autoquoting
+(`at_fat_comma`), where a bareword's interpretation depends on
+whether the next non-whitespace token is `=>`, which may sit several
+whitespace/comment lines ahead.  `lookahead()` lets a consumer scan
+forward across line boundaries and then either rewind to the starting
+position or commit to where the scan ended, without disturbing the
+heredoc interleaving machinery.
+
+The mechanism is built entirely on the existing line-delivery
+queue.  `LexerSource` gains three fields:
+
+```rust
+/// Lines pulled during an active lookahead, captured for replay.
+lookahead: VecDeque<LexerLine>,
+/// Position where the most recent lookahead ended, if a
+/// `consume_lookahead` is still valid.  `Some` between guard drop
+/// and the window closing; taken (set `None`) by consume, and
+/// cleared when `next_line` falls back past the lookahead region.
+lookahead_pos: Option<usize>,
+/// True while a lookahead guard is alive.  Suppresses `# line`
+/// directive side effects (see below) and enables line capture.
+lookahead_mode: bool,
+```
+
+`next_line` becomes three-tier: it serves the `lookahead` queue
+first, then the regular queued lines (heredoc/subst bodies,
+push-back), then the interleaving algorithm.  Lines re-delivered from
+the `lookahead` queue have their `pos` reset to 0.  While
+`lookahead_mode` is set, each line `next_line` displaces from the
+current slot is captured into the `lookahead` queue (in order), so
+the consumer never tracks intervening lines itself.
+
+**The guard.**  `lookahead()` returns an RAII guard.  On creation it
+closes out any still-open prior lookahead: it sets
+`lookahead_pos = None` and moves any leftover `lookahead` lines to
+the front of the regular queue, so the `lookahead` queue is always
+empty when a fresh guard is returned.  The guard records the entry
+position (`self.line`'s `pos`) and sets `lookahead_mode = true`.
+
+On drop, the guard:
+
+- saves the final position into `lookahead_pos`;
+- if the `lookahead` queue is non-empty, pushes the current line onto
+  its back and pops its front into `self.line` — restoring the
+  original current line (the first line displaced, hence the front);
+- restores `self.line`'s `pos` to the recorded entry position;
+- rewinds the line-number counter to `self.line.number + 1` (the
+  restored current line is not re-baked, so the counter points one
+  past it);
+- clears `lookahead_mode`.
+
+The remaining captured lines stay in the `lookahead` queue, pending
+re-delivery by future `next_line` calls — transparently, in order.
+
+**Consuming a lookahead.**  `consume_lookahead()` runs *after* the
+guard has dropped, when the consumer has decided to commit to where
+the scan ended rather than rewind.  It takes `lookahead_pos` (leaving
+`None`, so it is single-shot).  If the `lookahead` queue is non-empty
+it pops the *last* line, discards the rest (they are consumed), and
+installs the popped line as the current line at the saved position.
+If the queue is empty, the current line already *is* the line the
+lookahead ended on, and its position advances to the saved position
+(a no-op when already exactly there).
+
+`consume_lookahead` returns an error ("consume_lookahead called with
+no active lookahead window") when the lookahead window has expired,
+which covers two cases that mean the same thing: there is no
+active lookahead (`lookahead_pos` is `None` — never opened, already
+consumed, or drained), or the current line has already advanced
+*past* the saved position (`pos > saved`), so consuming would rewind
+over bytes already processed.  Only forward motion to the lookahead
+limit (or staying exactly at it) is allowed.  `next_line` sets
+`lookahead_pos = None` whenever it falls back past the `lookahead`
+queue (the queue drains empty), closing the consume window once
+normal lexing has moved on.
+
+**Line numbering and `# line` directives.**  Line numbers are
+assigned at delivery — `next_line` stamps each delivered line's
+`number` from the counter and advances it, for queued and freshly
+read lines alike.  Because the guard rewinds the counter on drop,
+lines replayed from the `lookahead` queue are re-stamped from the
+restored counter, so a `# line` directive that was passed over during
+the speculative scan takes effect correctly on the real pass.  With
+no directives present, re-stamping reproduces the original numbers
+exactly — a no-op.  To keep the speculative scan from applying
+directives early (a line that looks like `# line` might turn out to
+be heredoc body text, and must not renumber anything until really
+reached), `set_line_number` and `set_filename` are no-ops while
+`lookahead_mode` is set.
+
 ### 5.5 Sublexing and the Context Stack
 
 Sublexing is the core architectural requirement.  The implementation
