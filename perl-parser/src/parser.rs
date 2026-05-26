@@ -25,30 +25,43 @@ pub type Precedence = u16;
 enum ExprFrame {
     /// Simple prefix unary: wrap result in UnaryOp.
     Unary { op: UnaryOp, span: Span, min_prec: Precedence },
+
     /// Negate prefix: `-expr`, with string negation collapse.
     Negate { span: Span, min_prec: Precedence },
+
     /// Reference: `\expr`.
     Ref { span: Span, min_prec: Precedence },
+
     /// `local expr` — dynamically scopes any lvalue.
     Local { span: Span, min_prec: Precedence },
+
     /// Prefix `++`/`--` with lvalue validation.
     PreIncDec { op: UnaryOp, span: Span, min_prec: Precedence },
+
     /// Parenthesized expression: expect `)`, wrap in Paren, check for postfix subscript.
     Paren { span: Span, min_prec: Precedence },
+
     /// Anonymous array ref `[elem, ...]`: accumulating elements.
     ArrayRef { elems: Vec<Expr>, span: Span, min_prec: Precedence },
+
     /// Anonymous hash constructor `{key => val, ...}`: accumulating elements.
     HashRef { elems: Vec<Expr>, span: Span, min_prec: Precedence },
+
     /// Dereference block: `${expr}`, `@{expr}`, `%{expr}`, `&{expr}`, `*{expr}`.
     DerefBlock { sigil: Sigil, span: Span, min_prec: Precedence },
+
     /// `eval EXPR` (not eval BLOCK).
     EvalExpr { span: Span, min_prec: Precedence },
+
     /// `do EXPR` (not do BLOCK).
     DoExpr { span: Span, min_prec: Precedence },
+
     /// `return EXPR`.
     ReturnExpr { span: Span, min_prec: Precedence },
+
     /// `goto EXPR`.
     GotoExpr { span: Span, min_prec: Precedence },
+
     /// `dump EXPR`.
     DumpExpr { span: Span, min_prec: Precedence },
 }
@@ -59,6 +72,7 @@ enum PrefixResult {
     /// Consumed a prefix op; push this frame and continue.  The second element is the inner precedence for the
     /// sub-expression.
     Frame(ExprFrame, Precedence),
+
     /// Consumed a complete leaf expression (e.g. filetest, -bareword).
     Leaf(Expr),
 }
@@ -67,6 +81,7 @@ enum PrefixResult {
 enum FrameResult {
     /// Frame fully applied — here's the result expression and the outer precedence to restore.
     Done(Expr, Precedence),
+
     /// Frame needs more elements (array/hash accumulation) — re-push and re-enter the forward phase.
     Continue(ExprFrame, Precedence),
 }
@@ -90,9 +105,11 @@ const PREC_BIT_OR: Precedence = 1100; // | ^
 const PREC_BIT_AND: Precedence = 1200; // &
 const PREC_EQ: Precedence = 1300; // == != eq ne <=> cmp
 const PREC_REL: Precedence = 1400; // < > <= >= lt gt le ge
+
 /// `isa` — class-instance infix operator (5.32+).  Non-associative.  Tighter than relational, looser than named unary:
 /// `$x isa Foo < 1` parses as `($x isa Foo) < 1`, while `foo $x isa Bar` parses as `foo($x isa Bar)`.
 const PREC_ISA: Precedence = 1500;
+
 /// Named unary operators and prototyped subs with a scalar-ish slot (`$`, `_`, `+`, `\X`, `\[...]`, etc.).  Sits
 /// between isa and shift: `foo $a < 1` parses as `foo($a) < 1`, while `foo $a << 1` parses as `foo($a << 1)`.
 /// Non-associative.
@@ -136,16 +153,21 @@ impl OpInfo {
 /// The combined parser/lexer.
 pub struct Parser {
     lexer: Lexer,
+
     /// Cached current token.  `None` means no token is cached — the next peek/next will lex one.
     current: Option<Spanned>,
+
     /// Stored lexer error — surfaced by next_token().
     lexer_error: Option<ParseError>,
+
     /// Symbol table of all packages, subs, and imports seen so far.  Populated as sub declarations and (eventually)
     /// `use` statements are parsed; consulted at call sites for prototype-aware argument parsing.
     symbols: SymbolTable,
+
     /// Name of the package currently being parsed.  Updated by `package Name;` and the block form `package Name
     /// { ... }`.
     current_package: std::sync::Arc<str>,
+
     /// Lexically-scoped pragma state (`use feature`, `use utf8`, version bundles).  Saved/restored across block
     /// boundaries by `parse_block`.
     pragmas: Pragmas,
@@ -153,7 +175,6 @@ pub struct Parser {
 
 impl Parser {
     // ── Construction ──────────────────────────────────────────
-
     pub fn new(src: &[u8]) -> Result<Self, ParseError> {
         Self::from_lexer(Lexer::new(src))
     }
@@ -195,7 +216,6 @@ impl Parser {
     }
 
     // ── Token access ──────────────────────────────────────────
-
     /// Peek at the current token without consuming it.  Lexes on demand if no token is cached.
     fn peek_token(&mut self) -> &Token {
         if self.current.is_none() {
@@ -207,6 +227,7 @@ impl Parser {
                 }
             });
         }
+
         // self.current is Some by construction above.
         match &self.current {
             Some(s) => &s.token,
@@ -272,7 +293,6 @@ impl Parser {
     }
 
     // ── Flag validation ───────────────────────────────────────
-
     /// Validate regex modifier flags.  Returns an error for any unrecognized modifier character.
     fn validate_regex_flags(flags: &str, span: Span) -> Result<(), ParseError> {
         for ch in flags.chars() {
@@ -305,7 +325,6 @@ impl Parser {
     }
 
     // ── Public entry point ────────────────────────────────────
-
     /// Parse a complete program.
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let start = self.peek_span();
@@ -334,7 +353,6 @@ impl Parser {
     }
 
     // ── Statement parsing ─────────────────────────────────────
-
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let start = self.peek_span();
 
@@ -360,6 +378,7 @@ impl Parser {
                             Keyword::State => DeclScope::State,
                             _ => unreachable!(),
                         };
+
                         // `my sub foo { }`, `state sub foo { }`, `our sub foo { }`
                         if self.eat(&Token::Keyword(Keyword::Sub))? {
                             if matches!(self.peek_token(), Token::Ident(_) | Token::Keyword(_)) {
@@ -376,6 +395,7 @@ impl Parser {
                             } else {
                                 return Err(ParseError::new("expected sub name after my/our/state sub", self.peek_span()));
                             }
+
                         // `my method foo { }`, `state method foo { }`
                         } else if self.eat(&Token::Keyword(Keyword::Method))? {
                             let kind = self.parse_method(kw_span)?;
@@ -567,7 +587,6 @@ impl Parser {
     }
 
     // ── Variable declarations ─────────────────────────────────
-
     fn parse_single_var_decl(&mut self) -> Result<VarDecl, ParseError> {
         let span = self.peek_span();
 
@@ -597,7 +616,6 @@ impl Parser {
     }
 
     // ── Sub declaration ───────────────────────────────────────
-
     /// Parse the body of a named sub declaration after `sub` has already been consumed.  `start` is the span of the
     /// `sub` keyword.
     ///
@@ -613,6 +631,7 @@ impl Parser {
     fn parse_sub_decl_body(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(name) => name,
+
             // Keywords are valid sub names: `sub send { }`, `sub print { }`.
             Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected sub name, got {other:?}"), start)),
@@ -652,6 +671,7 @@ impl Parser {
         if self.eat(&Token::Semi)? {
             let attr_names: Vec<String> = attributes.iter().map(|a| a.name.clone()).collect();
             self.symbols.entry(&self.current_package.clone()).declare_sub(&name, prototype_parsed, attr_names, true);
+
             // Represent as a SubDecl with an empty body for now; an optional `body: None` variant would be cleaner, but
             // that's a separate AST change.
             let span = start.merge(self.peek_span());
@@ -705,6 +725,7 @@ impl Parser {
         let start_span = open.span;
 
         let mut params = Vec::new();
+
         // Track the span of the first slurpy parameter (if any) so we can reject anything that follows it.
         let mut slurpy_span: Option<Span> = None;
 
@@ -739,6 +760,7 @@ impl Parser {
             if !self.eat(&Token::Comma)? {
                 break;
             }
+
             // Trailing comma is allowed.
         }
         let close = self.expect_token(&Token::RightParen)?;
@@ -775,6 +797,7 @@ impl Parser {
                     // `$=)` or `$=,` — no default expression.
                     return Ok(SigParam::AnonScalar { default: Some((SigDefaultKind::Eq, Expr { kind: ExprKind::Undef, span })), span });
                 }
+
                 // `$ = expr` — has default expression.
                 let default_expr = self.parse_expr(PREC_COMMA + 1)?;
                 return Ok(SigParam::AnonScalar { default: Some((SigDefaultKind::Eq, default_expr)), span: span.merge(self.peek_span()) });
@@ -784,6 +807,7 @@ impl Parser {
                 b')' => Token::RightParen,
                 _ => unreachable!(),
             };
+
             // Push the delimiter into the lookahead cache so the outer loop in parse_signature sees it next.
             self.current = Some(Spanned { token: delim_tok, span });
             return Ok(SigParam::AnonScalar { default: None, span });
@@ -838,6 +862,7 @@ impl Parser {
         while self.at(&Token::Colon)? {
             let attr_start = self.peek_span();
             self.next_token()?; // eat ':'
+
             // Attribute names can be identifiers or keywords (e.g. :method, :lvalue)
             let name = match self.peek_token().clone() {
                 Token::Ident(s) => Some(s),
@@ -847,6 +872,7 @@ impl Parser {
             if let Some(name) = name {
                 let name_span = self.peek_span();
                 self.next_token()?; // eat the name
+
                 // Optional parenthesized args.  For `:prototype(...)` specifically, the body is Perl prototype syntax
                 // (containing `$`, `@`, `%`, `\`, etc.) which must be read as raw bytes — token-by-token reconstruction
                 // via Display impls loses fidelity.  Other attributes use the general token-reconstruction path.
@@ -954,7 +980,6 @@ impl Parser {
     }
 
     // ── Control flow statements ───────────────────────────────
-
     fn parse_if_stmt(&mut self) -> Result<StmtKind, ParseError> {
         let condition = self.parse_paren_expr()?;
         let then_block = self.parse_block()?;
@@ -1102,10 +1127,10 @@ impl Parser {
     }
 
     // ── Package and use ───────────────────────────────────────
-
     fn parse_package_decl(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(n) => n,
+
             // Keywords are valid package names: `package send;`
             Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected package name, got {other:?}"), start)),
@@ -1142,6 +1167,7 @@ impl Parser {
         let first = self.next_token()?;
         let module = match first.token {
             Token::Ident(n) => n,
+
             // Bare version: `use 5.020;` / `use v5.36;` — module slot gets the version; no further version or imports.
             Token::IntLit(n) => {
                 // Apply the matching bundle to pragma state.  `use 5.036` / `use 5036` → major=5, minor=36.
@@ -1167,6 +1193,7 @@ impl Parser {
                 n
             }
             Token::StrLit(n) => n,
+
             // Keywords can be module names: `use if`, `use open`, etc.
             Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected module name or version, got {other:?}"), start)),
@@ -1183,6 +1210,7 @@ impl Parser {
                     _ => unreachable!(),
                 })
             }
+
             // v-string literal like v5.26.0.
             Token::VersionLit(_) => {
                 let tok = self.next_token()?;
@@ -1246,14 +1274,12 @@ impl Parser {
     }
 
     // ── Phaser blocks ─────────────────────────────────────────
-
     fn parse_phaser(&mut self, kind: PhaserKind) -> Result<StmtKind, ParseError> {
         let block = self.parse_block()?;
         Ok(StmtKind::Phaser(kind, block))
     }
 
     // ── given/when ────────────────────────────────────────────
-
     fn parse_given(&mut self) -> Result<StmtKind, ParseError> {
         let expr = self.parse_paren_expr()?;
         let block = self.parse_block()?;
@@ -1267,7 +1293,6 @@ impl Parser {
     }
 
     // ── try/catch/finally ─────────────────────────────────────
-
     fn parse_try(&mut self) -> Result<StmtKind, ParseError> {
         let body = self.parse_block()?;
 
@@ -1292,7 +1317,6 @@ impl Parser {
     }
 
     // ── format ────────────────────────────────────────────────
-
     fn parse_format(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         // Optional name (defaults to STDOUT)
         let name = match self.peek_token() {
@@ -1300,6 +1324,7 @@ impl Parser {
                 Token::Ident(s) => s,
                 _ => unreachable!(),
             },
+
             // Keywords are valid format names: `format send = ...`.
             Token::Keyword(_) => match self.next_token()?.token {
                 Token::Keyword(kw) => <&str>::from(kw).to_string(),
@@ -1320,6 +1345,7 @@ impl Parser {
         let here = self.lexer.pos() as u32;
         let begin_span = start.merge(Span::new(here, here));
         self.lexer.start_format(name.clone(), begin_span);
+
         // Clear any cached current-token so the Parser re-fetches.
         self.current = None;
 
@@ -1388,6 +1414,7 @@ impl Parser {
         if braced {
             self.next_token()?; // consume `{`
             self.lexer.format_args_enter_braced();
+
             // Clear any cached token — the mode switch may affect how the next token is produced.
             self.current = None;
         }
@@ -1405,6 +1432,7 @@ impl Parser {
                 break;
             }
         }
+
         // Consume FormatArgsEnd.
         let end = self.next_token()?;
         if !matches!(end.token, Token::FormatArgsEnd) {
@@ -1415,7 +1443,6 @@ impl Parser {
     }
 
     // ── class / field / method (5.38+ Corinna) ────────────────
-
     fn parse_class(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(n) => n,
@@ -1464,6 +1491,7 @@ impl Parser {
     fn parse_method(&mut self, start: Span) -> Result<StmtKind, ParseError> {
         let name = match self.next_token()?.token {
             Token::Ident(n) => n,
+
             // Keywords are valid method names: `method send { }`.
             Token::Keyword(kw) => <&str>::from(kw).to_string(),
             other => return Err(ParseError::new(format!("expected method name, got {other:?}"), start)),
@@ -1488,7 +1516,6 @@ impl Parser {
     }
 
     // ── Expression statements ─────────────────────────────────
-
     fn parse_expr_statement(&mut self) -> Result<(StmtKind, bool), ParseError> {
         let expr = self.parse_expr(PREC_LOW)?;
 
@@ -1500,7 +1527,6 @@ impl Parser {
     }
 
     // ── Block-to-hash reclassification ─────────────────────────
-
     /// Inspect a block parsed at statement level and determine if it should be reclassified as an anonymous hash
     /// constructor.
     ///
@@ -1550,6 +1576,7 @@ impl Parser {
                 StmtKind::Expr(e) => e,
                 _ => unreachable!(),
             };
+
             // Flatten List into individual AnonHash elements to match the structure produced by parse_term for hash
             // constructors in term position.
             let elems = match expr.kind {
@@ -1579,29 +1606,34 @@ impl Parser {
                 match items.first().map(|e| &e.kind) {
                     // String literal — covers autoquoted barewords from fat comma, explicit strings, q//.
                     Some(ExprKind::StringLit(_)) => true,
+
                     // Numeric literals.
                     Some(ExprKind::IntLit(_)) => true,
                     Some(ExprKind::FloatLit(_)) => true,
+
                     // Variables — `$x => 1` or `$x, 1`.  Perl's heuristic: `$` is not lowercase → hash.
                     Some(ExprKind::ScalarVar(_)) => true,
                     Some(ExprKind::ArrayVar(_)) => true,
                     Some(ExprKind::HashVar(_)) => true,
+
                     // Unary prefix on a variable — `-$x => 1`.
                     Some(ExprKind::UnaryOp(_, _)) => true,
+
                     // Non-lowercase bareword — `Foo, 1`.
                     Some(ExprKind::Bareword(name)) => name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_'),
+
                     // Lowercase bareword looks like `func arg, arg`.  Anything else (function calls, complex exprs) →
                     // block.
                     _ => false,
                 }
             }
+
             // No commas at all — not hash-like.
             _ => false,
         }
     }
 
     // ── Block parsing ─────────────────────────────────────────
-
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         // Pragmas and current_package are lexically scoped: any `use feature`, `use utf8`, or `package Name;`
         // inside this block doesn't leak out.  Save state before parsing, restore after.
@@ -1625,6 +1657,7 @@ impl Parser {
 
         self.pragmas = saved_pragmas;
         self.current_package = saved_package;
+
         // Sync shared state with the restored lexical scope.
         self.lexer.set_utf8_mode(self.pragmas.utf8);
         self.lexer.features = self.pragmas.features;
@@ -1639,7 +1672,6 @@ impl Parser {
     }
 
     // ── Expression parsing (Pratt) ────────────────────────────
-
     /// Parse an expression at the given minimum precedence.  The forward phase consumes prefix operators and opening
     /// parens iteratively (no recursion) until a leaf term is reached.  The backward phase applies saved frames,
     /// running the infix continuation loop at each precedence level.  This eliminates the recursive `parse_expr` →
@@ -1702,6 +1734,7 @@ impl Parser {
             }
             Token::Minus => {
                 self.next_token()?;
+
                 // Filetest: -f, -d, etc.  In fat-comma context, lex_filetest_after_minus returns StrLit.
                 match self.lexer.lex_filetest_after_minus() {
                     Some(Token::Filetest(b)) => {
@@ -1713,6 +1746,7 @@ impl Parser {
                     }
                     _ => {}
                 }
+
                 // -bareword (not followed by parens) → StringLit("-bareword")
                 if let Token::Ident(name) = self.peek_token().clone() {
                     let ident_span = self.peek_span();
@@ -1724,6 +1758,7 @@ impl Parser {
                     }
                     return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(ident_span) })));
                 }
+
                 // General negate: -expr
                 Ok(Some(PrefixResult::Frame(ExprFrame::Negate { span, min_prec: outer_prec }, PREC_UNARY)))
             }
@@ -1779,6 +1814,7 @@ impl Parser {
                 }
                 Ok(Some(PrefixResult::Frame(ExprFrame::HashRef { elems: vec![], span, min_prec: outer_prec }, PREC_COMMA + 1)))
             }
+
             // ── Sigil-prefix dereference ──
             // ${expr}, $$ref → Token::Dollar; @{expr}, @$ref → Token::At; etc.
             // The {expr} path pushes a DerefBlock frame; everything else is a complete Leaf.
@@ -1884,6 +1920,7 @@ impl Parser {
                     Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Glob, Box::new(operand)) })))
                 }
             }
+
             // ── Keyword expressions that recurse into parse_expr ──
             Token::Keyword(Keyword::Eval) => {
                 self.next_token()?;
@@ -1964,6 +2001,7 @@ impl Parser {
             ExprFrame::Paren { span, min_prec } => {
                 let end = self.peek_span();
                 self.expect_token(&Token::RightParen)?;
+
                 // Don't wrap in ExprKind::Paren — parentheses are purely syntactic grouping, and the tree structure
                 // already captures precedence.  Avoiding the wrapper prevents recursive-Drop overflow on deeply nested
                 // parens.  Update the span to include the parens.
@@ -1980,6 +2018,7 @@ impl Parser {
                         self.next_token()?;
                         return Ok(FrameResult::Done(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) }, min_prec));
                     }
+
                     // More elements — re-enter forward phase.
                     return Ok(FrameResult::Continue(ExprFrame::ArrayRef { elems, span, min_prec }, PREC_COMMA + 1));
                 }
@@ -1996,6 +2035,7 @@ impl Parser {
                         self.next_token()?;
                         return Ok(FrameResult::Done(Expr { kind: ExprKind::AnonHash(elems), span: span.merge(end) }, min_prec));
                     }
+
                     // More elements — re-enter forward phase.
                     return Ok(FrameResult::Continue(ExprFrame::HashRef { elems, span, min_prec }, PREC_COMMA + 1));
                 }
@@ -2051,7 +2091,6 @@ impl Parser {
     }
 
     // ── Term parsing ──────────────────────────────────────────
-
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
         let spanned = self.next_token()?;
         let span = spanned.span;
@@ -2098,6 +2137,7 @@ impl Parser {
                         })
                     }
                     Some(Token::HeredocLit(_kind, _tag, body)) => Ok(Expr { kind: ExprKind::StringLit(body), span }),
+
                     // <<>> double diamond — safe version of <>.
                     Some(Token::Readline(content, safe)) => Self::readline_expr(content, safe, span),
                     Some(other) => unreachable!("unexpected heredoc token: {other:?}"),
@@ -2146,6 +2186,7 @@ impl Parser {
             }
             Token::GlobVar(name) => {
                 let expr = Expr { kind: ExprKind::GlobVar(name), span };
+
                 // *foo{THING} — typeglob slot access
                 if self.at(&Token::LeftBrace)? {
                     self.next_token()?;
@@ -2207,6 +2248,7 @@ impl Parser {
                     Token::Keyword(Keyword::Redo) => "CORE::redo",
                     _ => unreachable!(),
                 };
+
                 // Optional label argument
                 if let Token::Ident(_) = self.peek_token() {
                     let label_span = self.peek_span();
@@ -2256,6 +2298,7 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::Regex(kind, pattern, flags), span })
             }
+
             // // in term position is an empty regex, not defined-or.
             Token::DefinedOr => {
                 let flags = self.lexer.scan_adjacent_word_chars();
@@ -2264,6 +2307,7 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![]), flags), span })
             }
+
             // / in term position is a regex, not division.
             Token::Slash => {
                 let pattern = self.lexer.lex_body_str('/', true)?;
@@ -2273,6 +2317,7 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span })
             }
+
             // /= in term position: = is the first character of the regex pattern, not a division-assignment operator.
             Token::Assign(AssignOp::DivEq) => {
                 self.lexer.rewind(1);
@@ -2619,6 +2664,7 @@ impl Parser {
                         self.parse_expr(PREC_NAMED_UNARY)?
                     };
                     args.push(arg);
+
                     // Optional comma between slots.
                     if i + 1 < proto.slots.len() {
                         self.eat(&Token::Comma)?;
@@ -2886,6 +2932,7 @@ impl Parser {
         if self.at(&Token::LeftParen)? {
             self.next_token()?;
             let mut args = Vec::new();
+
             // Check for block as first arg inside parens
             if self.at(&Token::LeftBrace)? {
                 let block = self.parse_block()?;
@@ -3018,6 +3065,7 @@ impl Parser {
         let mut args = Vec::new();
         if let Some(arg) = first_arg {
             args.push(arg);
+
             // Consume comma after the first arg if present.
             if !self.eat(&Token::Comma)? {
                 // No comma — this was the only argument.
@@ -3074,6 +3122,7 @@ impl Parser {
             Token::SpecialVar(name) => Ok(Expr { kind: ExprKind::SpecialVar(name), span }),
             Token::SpecialArrayVar(name) => Ok(Expr { kind: ExprKind::SpecialArrayVar(name), span }),
             Token::SpecialHashVar(name) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
+
             // Recursive: $$$ref
             Token::Dollar => {
                 let inner = self.parse_deref_operand()?;
@@ -3118,6 +3167,7 @@ impl Parser {
             return Ok(Expr { kind: ExprKind::StringLit(name), span });
         }
         let key = self.parse_expr(PREC_LOW)?;
+
         // Multidimensional hash emulation: `$h{1,2,3}` → `$h{join($;, 1, 2, 3)}`.  When the feature is off, the
         // comma-list is left as-is for the compiler to diagnose ("Multidimensional hash lookup is disabled").
         if let ExprKind::List(items) = &key.kind
@@ -3187,7 +3237,6 @@ impl Parser {
     }
 
     // ── Interpolated string assembly ──────────────────────────
-
     /// Collect sub-tokens after a `QuoteSublexBegin`/`RegexSublexBegin`/`SubstSublexBegin` into an `Interpolated`.  The
     /// caller decides how to wrap it in an AST node.
     fn parse_interpolated(&mut self) -> Result<Interpolated, ParseError> {
@@ -3307,7 +3356,6 @@ impl Parser {
     }
 
     // ── Operator parsing ──────────────────────────────────────
-
     fn peek_op_info(&mut self) -> Option<OpInfo> {
         // Snapshot feature bits we may consult before the match on self.peek_token() — that call takes a mutable borrow
         // of self, which we can't hold across further field access.
@@ -3346,6 +3394,7 @@ impl Parser {
             Token::Keyword(Keyword::Or) => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
             Token::PlusPlus => Some(OpInfo { prec: PREC_INC, assoc: Assoc::Non }),
             Token::MinusMinus => Some(OpInfo { prec: PREC_INC, assoc: Assoc::Non }),
+
             // Word operators (always emitted as Keyword tokens): eq/ne/cmp at == precedence, lt/gt/le/ge at relational,
             // x at multiplicative, xor at low-logical.
             Token::Keyword(Keyword::Eq) | Token::Keyword(Keyword::Ne) => Some(OpInfo { prec: PREC_EQ, assoc: Assoc::Chain }),
@@ -3361,7 +3410,6 @@ impl Parser {
     }
 
     // ── Semantic validation helpers ──────────────────────────────
-
     /// Check whether an expression is a valid assignment target (lvalue).
     fn is_valid_lvalue(expr: &Expr) -> bool {
         match &expr.kind {
@@ -3388,11 +3436,14 @@ impl Parser {
         match &expr.kind {
             // The canonical aliasing form: `\<variable>`.
             ExprKind::Ref(inner) => Self::is_valid_lvalue(inner),
+
             // Parenthesized aliasing: `(\$x) = ...`.
             ExprKind::Paren(inner) => Self::is_ref_alias_target(inner),
+
             // List: `(\$x, \@y) = ...`.  Mixed lists (some ref, some not) are syntactically valid — semantics is a
             // later concern.
             ExprKind::List(items) => items.iter().any(Self::is_ref_alias_target),
+
             // `my \$x = ...` — the Decl already carries the `is_ref` flag on each VarDecl.
             ExprKind::Decl(_, vars) => vars.iter().any(|v| v.is_ref),
             _ => false,
@@ -3449,6 +3500,7 @@ impl Parser {
                     return Ok(left);
                 }
                 let right = self.parse_expr(right_prec)?;
+
                 // Flatten comma lists
                 let mut items = match left.kind {
                     ExprKind::List(items) => items,
@@ -3501,6 +3553,7 @@ impl Parser {
                                     ops.push(token_to_binop(&next_tok.token)?);
                                     operands.push(self.parse_expr(right_prec)?);
                                 }
+
                                 // After the chain, reject a trailing Non at the same level (e.g. `$a == $b != $c <=> $d`).
                                 if let Some(trail) = self.peek_op_info()
                                     && trail.prec == info.prec
@@ -3547,6 +3600,7 @@ impl Parser {
         };
         if let Some(name) = method_name {
             self.next_token()?;
+
             // Method call: ->method(...)
             if self.at(&Token::LeftParen)? {
                 self.next_token()?;
@@ -3572,6 +3626,7 @@ impl Parser {
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBracket)?;
                 let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArrayElem(Box::new(idx))) };
+
                 // Handle chained subscripts: $ref->[0][1], $ref->[0]{key}
                 self.maybe_postfix_subscript(expr)
             }
@@ -3581,6 +3636,7 @@ impl Parser {
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBrace)?;
                 let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::HashElem(Box::new(key))) };
+
                 // Handle chained subscripts: $ref->{a}{b}, $ref->{a}[0]
                 self.maybe_postfix_subscript(expr)
             }
@@ -3598,6 +3654,7 @@ impl Parser {
                 self.expect_token(&Token::RightParen)?;
                 Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), String::new(), args) })
             }
+
             // Dynamic method dispatch: ->$method or ->$method(args)
             Token::ScalarVar(var_name) => {
                 let var_span = self.peek_span();
@@ -3622,6 +3679,7 @@ impl Parser {
                     })
                 }
             }
+
             // Postfix dereference: ->@*, ->%*, ->$*, ->&*, ->**, plus slice forms ->@[...], ->@{...}, ->%[...],
             // ->%{...}.
             //
@@ -3649,6 +3707,7 @@ impl Parser {
             }
             Token::Dollar => {
                 self.next_token()?;
+
                 // `->$#*` — postderef last-index.  The lexer would otherwise tokenize the `#` as a comment start, so we
                 // peek+consume the two raw bytes here before the next token is lexed.
                 if self.lexer.try_consume_hash_star() {
@@ -3679,6 +3738,7 @@ impl Parser {
                     Err(ParseError::new("expected *, [indices], or {keys} after ->%", self.peek_span()))
                 }
             }
+
             // `->&*` — code-ref postfix deref.  `->&method` or `->&method(args)` — lexical method invocation (resolved
             // at compile time, not via package inheritance).  The `&` prefix in the name signals lexical resolution to
             // the compiler.
@@ -3712,6 +3772,7 @@ impl Parser {
                     }
                 }
             }
+
             // `->**` — glob deref.  Two consecutive `*`s; the lexer emits `Power` (`**`) for that pair.
             Token::Power => {
                 self.next_token()?;
@@ -3723,7 +3784,6 @@ impl Parser {
 }
 
 // ── Pragma application helpers ────────────────────────────────
-
 /// Apply the side effects of a `use` or `no` statement whose module name is a known pragma.  Unknown modules are
 /// ignored.
 fn apply_pragma(pragmas: &mut Pragmas, module: &str, is_no: bool, imports: Option<&Vec<Expr>>) {
@@ -3791,6 +3851,7 @@ fn parse_int_version(n: i64) -> Option<(u32, u32)> {
         return None;
     }
     let n = n as u64;
+
     // Historically, `use 5008001;` → 5.008.001 (major.minor.patch).  For phase 1 we handle the common pattern `5NNN`
     // where NNN is the minor version, which matches `use 5036`.
     if n >= 1000 {
@@ -3809,6 +3870,7 @@ fn parse_float_version(n: f64) -> Option<(u32, u32)> {
         return None;
     }
     let major = n.trunc() as u32;
+
     // Extract three decimal digits as the minor.  `5.036` → 36.
     let frac = n - n.trunc();
     let minor = (frac * 1000.0).round() as u32;

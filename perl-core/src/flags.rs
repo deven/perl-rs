@@ -16,7 +16,6 @@ pub struct ScalarFlags(u16);
 
 impl ScalarFlags {
     // ── Validity flags ────────────────────────────────────────────
-
     /// Integer representation is valid.
     pub const INT_VALID: ScalarFlags = ScalarFlags(1 << 0);
 
@@ -30,7 +29,6 @@ impl ScalarFlags {
     pub const REF_VALID: ScalarFlags = ScalarFlags(1 << 3);
 
     // ── Metadata flags ────────────────────────────────────────────
-
     /// Value is read-only (Internals::SvREADONLY).
     pub const READONLY: ScalarFlags = ScalarFlags(1 << 4);
 
@@ -48,7 +46,6 @@ impl ScalarFlags {
     pub const WEAK: ScalarFlags = ScalarFlags(1 << 8);
 
     // ── Compound masks ────────────────────────────────────────────
-
     /// Any numeric representation is valid.
     pub const ANY_NUM: ScalarFlags = ScalarFlags(Self::INT_VALID.0 | Self::NUM_VALID.0);
 
@@ -59,12 +56,10 @@ impl ScalarFlags {
     pub const ALL_VALID: ScalarFlags = ScalarFlags(Self::INT_VALID.0 | Self::NUM_VALID.0 | Self::STR_VALID.0 | Self::REF_VALID.0);
 
     // ── Empty ─────────────────────────────────────────────────────
-
     /// No flags set.
     pub const EMPTY: ScalarFlags = ScalarFlags(0);
 
     // ── Operations ────────────────────────────────────────────────
-
     /// Test whether all bits in `other` are set in `self`.
     #[inline]
     pub const fn contains(self, other: ScalarFlags) -> bool {
@@ -148,7 +143,6 @@ impl std::ops::Not for ScalarFlags {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;

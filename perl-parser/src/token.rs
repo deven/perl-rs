@@ -54,34 +54,45 @@ pub enum Token {
     // ── Literals ──────────────────────────────────────────────
     /// Integer literal (decimal, hex, octal, binary).
     IntLit(i64),
+
     /// Float literal.
     FloatLit(f64),
+
     /// Single-quoted string (no interpolation, fully resolved).
     StrLit(String),
+
     /// Version string (v5.42.2 or 5.042_002).
     VersionLit(String),
 
     // ── Identifiers ───────────────────────────────────────────
     /// Bare identifier (may be package-qualified: `Foo::Bar::baz`).
     Ident(String),
+
     /// Label (`LOOP:`, `OUTER:`).  Name without the colon.
     Label(String),
 
     // ── Variables ─────────────────────────────────────────────
     /// `$name` — scalar variable.
     ScalarVar(String),
+
     /// `@name` — array variable.
     ArrayVar(String),
+
     /// `%name` — hash variable.
     HashVar(String),
+
     /// `*name` — glob.
     GlobVar(String),
+
     /// `$#name` — array last index.
     ArrayLen(String),
+
     /// `$$`, `$!`, `$@`, `$_`, `$0`, `$/`, `$\`, `$^W`, `${^MATCH}`, etc.
     SpecialVar(String),
+
     /// `@+`, `@-`, `@{^CAPTURE}`, etc.
     SpecialArrayVar(String),
+
     /// `%!`, `%+`, `%-`, `%{^CAPTURE}`, etc.
     SpecialHashVar(String),
 
@@ -119,6 +130,7 @@ pub enum Token {
     BitAnd, // &
     BitOr,  // |
     BitXor, // ^
+
     // String-bitwise (feature 'bitwise')
     StringBitAnd, // &.
     StringBitOr,  // |.
@@ -177,30 +189,40 @@ pub enum Token {
     // ── Quote/interpolation sub-tokens (§5.4) ─────────────────
     /// Start of a quote-like construct.  Contains quote type and delimiter.
     QuoteSublexBegin(QuoteKind, char),
+
     /// End of a quote-like construct.
     SublexEnd,
+
     /// Literal segment inside a quote.
     ConstSegment(String),
+
     /// `$name` or `${name}` interpolation inside a quote.  Emitted when the sigil+name isn't followed by a subscript
     /// starter — the simple case.
     InterpScalar(String),
+
     /// `@name` interpolation inside a quote (array in string).
     InterpArray(String),
+
     /// `${expr}` expression interpolation — lexer switches to normal code mode.  Parser calls parse_expr(), then
     /// expect_token(RightBrace).
     InterpScalarExprStart,
+
     /// `@{expr}` expression interpolation — lexer switches to normal code mode.
     InterpArrayExprStart,
+
     /// `$name` followed by one or more subscripts inside a quote (e.g. `"$h->{key}"`, `"$a[0]"`, `"$h->{k}[0]"`).
     /// Carries the variable name.  The lexer then emits normal code tokens for the subscript chain, terminated by
     /// `InterpChainEnd`.
     InterpScalarChainStart(String),
+
     /// `@name` followed by a subscript — array slice or chained subscript interpolation (e.g. `"@a[1..3]"`,
     /// `"@a{'k'}"`).
     InterpArrayChainStart(String),
+
     /// End marker for a subscript chain started by either of the `ChainStart` tokens above.  Emitted when the lexer
     /// determines the chain is complete (closing bracket at depth 0 with no continuation).
     InterpChainEnd,
+
     /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character inside a string.  Emitted as a separate token (like
     /// interpolation) so the AST preserves the original name for tooling.  The resolved character is in `codepoint`.
     NamedChar {
@@ -211,8 +233,10 @@ pub enum Token {
     // ── Regex sub-tokens ──────────────────────────────────────
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.
     RegexSublexBegin(RegexKind, char),
+
     /// `(?{` — embedded code block in a regex pattern.  Lexer switches to normal code mode until `}`.
     RegexCodeStart,
+
     /// `(??{` — postponed regex code block.  Lexer switches to normal code mode until `}`.
     RegexCondCodeStart,
 
@@ -220,20 +244,24 @@ pub enum Token {
     /// Start of a substitution.  The delimiter char is carried so the parser can pass it back to
     /// `start_subst_replacement`.  Pattern body tokens follow until SublexEnd.
     SubstSublexBegin(char),
+
     /// Complete transliteration: `tr/from/to/flags` or `y/from/to/flags`.
     TranslitLit(String, String, Option<String>),
 
     // ── Heredoc ───────────────────────────────────────────────
     /// `<<TAG`, `<<"TAG"`, `<<'TAG'`.
     HeredocBegin(HeredocKind, String),
+
     /// Body of a heredoc (sub-tokens if interpolating).
     HeredocEnd,
+
     /// Complete heredoc with body already collected (bootstrap).  Fields: kind, tag, body.
     HeredocLit(HeredocKind, String, String),
 
     // ── Special compile-time tokens ───────────────────────────
     /// `__FILE__` — current source filename.  Captured at lex time from `LexerSource::filename()`.
     SourceFile(String),
+
     /// `__LINE__` — current source line number.  Captured at lex time.
     SourceLine(u32),
 
@@ -241,37 +269,48 @@ pub enum Token {
     /// Opens a `format NAME = ... .` body.  `name` is the format name (defaults to `STDOUT` when omitted at the call
     /// site).  The sublex context ends with `SublexEnd` at the `.` terminator.
     FormatSublexBegin(String),
+
     /// `# ...` — comment line inside a format (column-0 `#`).
     FormatComment(String),
+
     /// Whitespace-only line inside a format.
     FormatBlankLine,
+
     /// A picture line containing no field specifiers.  Emitted instead of the `FormatPictureBegin` / … /
     /// `FormatPictureEnd` stream when the line has only literal text (tildes normalized to spaces).
     FormatLiteralLine(RepeatKind, String),
+
     /// Start of a picture line that contains one or more fields.  Followed by alternating `FormatLiteral` and
     /// `FormatField` tokens, then `FormatPictureEnd`, then `FormatArgsBegin`.
     FormatPictureBegin(RepeatKind),
+
     /// Literal run of text between or around fields inside a picture line.  Tildes have already been replaced with
     /// spaces; the `RepeatKind` is on the enclosing `FormatPictureBegin`.
     FormatLiteral(String),
+
     /// One field specifier in a picture line.
     FormatField(FieldKind),
+
     /// Closes a picture line.  Always followed by `FormatArgsBegin`.
     FormatPictureEnd,
+
     /// Start of the argument line following a picture.  The lexer emits normal code tokens until `FormatArgsEnd`.  Two
     /// modes:
     ///   * Line mode (default): newline terminates the args.
     ///   * Braced mode: if the parser sees a `{` as the first token and calls `lexer.format_args_enter_braced()`,
     ///     matching `}` terminates instead (expressions may span multiple lines).
     FormatArgsBegin,
+
     /// Closes the argument line.  Next token resumes format body scanning.
     FormatArgsEnd,
 
     // ── Special ───────────────────────────────────────────────
     /// `qw/.../` — list of words.
     QwList(Vec<String>),
+
     /// Yada yada yada (`...` as a statement).
     YadaYada,
+
     /// `<STDIN>`, `<$fh>`, `<*.txt>` — readline or glob.  The bool is `true` for `<<>>` (safe double diamond, 3-arg
     /// open).
     Readline(String, bool),
@@ -282,10 +321,13 @@ pub enum Token {
 pub enum QuoteKind {
     /// `'...'` or `q//`
     Single,
+
     /// `"..."` or `qq//`
     Double,
+
     /// Backtick or `qx//`
     Backtick,
+
     /// Interpolating heredoc body (`<<TAG`, `<<"TAG"`)
     Heredoc,
 }
@@ -295,10 +337,13 @@ pub enum QuoteKind {
 pub enum RegexKind {
     /// `m//` or bare `//`
     Match,
+
     /// `qr//`
     Qr,
+
     /// `s///`
     Subst,
+
     /// `tr///` or `y///`
     Translit,
 }
@@ -308,10 +353,13 @@ pub enum RegexKind {
 pub enum HeredocKind {
     /// `<<TAG` or `<<"TAG"` — interpolating.
     Interpolating,
+
     /// `<<'TAG'` — literal.
     Literal,
+
     /// `<<~TAG` — indented (5.26+).
     Indented,
+
     /// `<<~'TAG'` — indented literal.
     IndentedLiteral,
 }
@@ -321,8 +369,10 @@ pub enum HeredocKind {
 pub enum RepeatKind {
     /// No `~` on the line.
     None,
+
     /// At least one `~` on the line: suppress the line if all fields produce empty output.
     Suppress,
+
     /// `~~` anywhere on the line: repeat the line until all fields are exhausted (become undef).
     Repeat,
 }
@@ -337,20 +387,25 @@ pub enum FieldKind {
     /// `@<<<<` — text, left-justified.  `truncate_ellipsis` is set when the field ends with `...` (shown in output when
     /// the value was truncated).
     LeftJustify { width: u32, truncate_ellipsis: bool },
+
     /// `@>>>>` — text, right-justified.
     RightJustify { width: u32, truncate_ellipsis: bool },
+
     /// `@||||` — text, centered.
     Center { width: u32, truncate_ellipsis: bool },
 
     /// `^<<<<` — fill mode, left-justified (word-wraps, chops the source scalar).
     FillLeft { width: u32, truncate_ellipsis: bool },
+
     /// `^>>>>` — fill mode, right-justified.
     FillRight { width: u32, truncate_ellipsis: bool },
+
     /// `^||||` — fill mode, centered.
     FillCenter { width: u32, truncate_ellipsis: bool },
 
     /// `@*` — variable-width multi-line field.
     MultiLine,
+
     /// `^*` — variable-width, one line at a time; chops the source scalar.
     FillMultiLine,
 
@@ -546,14 +601,19 @@ impl CaseMod {
 
     /// `\L` — lowercase until `\E`.
     pub const LOWER: CaseMod = CaseMod(1 << 0);
+
     /// `\U` — uppercase until `\E`.
     pub const UPPER: CaseMod = CaseMod(1 << 1);
+
     /// `\F` — foldcase until `\E`.
     pub const FOLD: CaseMod = CaseMod(1 << 2);
+
     /// `\Q` — quotemeta until `\E`.
     pub const QUOTEMETA: CaseMod = CaseMod(1 << 3);
+
     /// `\l` — lowercase next character only (one-shot).
     pub const LCFIRST: CaseMod = CaseMod(1 << 4);
+
     /// `\u` — titlecase next character only (one-shot).
     pub const UCFIRST: CaseMod = CaseMod(1 << 5);
 

@@ -38,21 +38,29 @@ mod tests;
 struct LexContext {
     /// Opening delimiter character.  `None` for heredocs (end signaled by LexerSource).
     delim: Option<char>,
+
     /// Delimiter nesting depth (for paired delimiters like `{}`).
     depth: u32,
+
     /// Brace depth inside `${expr}` or `@{expr}`.  When > 0, the lexer produces normal code tokens.  When 0, it
     /// produces string body tokens via `lex_body`.
     expr_depth: u32,
+
     /// Whether `$`/`@` trigger interpolation.
     interpolating: bool,
+
     /// Whether escapes pass through raw (for regex, tr, prototypes).
     raw: bool,
+
     /// Whether to detect `(?{...})` code blocks (regex mode).
     regex: bool,
+
     /// Inside a subscript chain (see type-level doc).
     chain_active: bool,
+
     /// Bracket/brace nesting inside the chain.
     chain_depth: u32,
+
     /// Chain end detected; emit `InterpChainEnd` on the next call.
     chain_end_pending: bool,
 }
@@ -81,15 +89,19 @@ struct FormatState {
 enum FormatMode {
     /// Read and classify the next line.  Default mode.
     Body,
+
     /// Emit normal code tokens until a newline at depth 0.  Entered after emitting `FormatArgsBegin` when no `{` is
     /// consumed.
     ArgsLine,
+
     /// Emit normal code tokens until `}` brings `depth` to 0.  Entered after the parser consumes the opening `{` and
     /// calls `format_args_enter_braced`.  `depth` starts at 1.
     ArgsBraced { depth: u32 },
+
     /// Pending FormatArgsBegin — next `lex_token` call emits it and transitions to `ArgsLine` (or the parser may call
     /// `format_args_enter_braced` first).
     PendingArgsBegin,
+
     /// Format body has been terminated by `.`; the SublexEnd has been queued.  After it's drained, the format state is
     /// torn down.
     Finished,
@@ -105,31 +117,41 @@ enum FormatMode {
 pub(crate) struct Lexer {
     source: LexerSource,
     context_stack: Vec<LexContext>,
+
     /// Deferred error from auto-loading in `peek_byte`.  Surfaced on the next call to `lex_token`.
     pending_error: Option<ParseError>,
+
     /// Active format sublex state, if we're inside a format body.  `Some` between `start_format` and the `.`
     /// terminator's `SublexEnd`.
     format_state: Option<FormatState>,
+
     /// Whether `use utf8` is active.  Written by the parser when processing `use utf8` / `no utf8` and when restoring
     /// pragma state at block boundaries.  Read by the lexer for error diagnostics on high bytes outside strings.
     pub(crate) utf8_mode: bool,
+
     /// Fast-path composite: `utf8_mode && !source.line.ascii_only`.  When false, the current line is pure ASCII and
     /// all UTF-8 decoding, XID checks, and NFC normalization can be skipped.  Updated whenever `utf8_mode` changes or a
     /// new line is loaded.
     pub(crate) effective_utf8: bool,
+
     /// Feature flags synced from the parser's `Pragmas::features`.  Written by the parser when features change or when
     /// restoring pragma state at block boundaries.
     pub(crate) features: Features,
+
     /// Stacked cumulative case-modification flags.  Each `\L`/`\U`/`\F`/`\Q` pushes the current flags ORed with the new
     /// mode; `\E` pops, reverting to the enclosing flags.
     case_mod_stack: Vec<CaseMod>,
+
     /// `\l` pending — lowercase the very next character only.
     case_mod_lcfirst: bool,
+
     /// `\u` pending — titlecase the very next character only.
     case_mod_ucfirst: bool,
+
     /// Set by `lex_word` when `__DATA__` or `__END__` triggers logical end-of-source, or by the `^D`/`^Z` handler.
     /// When true, `lex_normal_token` returns `Eof` immediately.
     logical_eof: bool,
+
     /// Set when `__DATA__` or `__END__` triggers logical EOF.  Stores the keyword and the byte offset where trailing
     /// data begins (for the `<DATA>` filehandle).  The parser reads this after the statement loop exits.
     pub(crate) data_end_info: Option<(Keyword, u32)>,
@@ -207,6 +229,7 @@ impl Lexer {
             // ASCII or empty — caller should handle directly.
             return None;
         }
+
         // Determine how many bytes this UTF-8 lead byte claims.
         let len = match r[0] {
             0xC0..=0xDF => 2,
@@ -320,7 +343,6 @@ impl Lexer {
     }
 
     // ── Byte access (auto-loading) ──────────────────────────
-
     /// Peek at the current byte without advancing.  Auto-loads the next line when the current one is exhausted.
     /// Returns `b'\n'` for a terminated line ending.  Returns `None` only at true EOF (or heredoc end in peek mode).
     ///
@@ -333,6 +355,7 @@ impl Lexer {
         {
             return Some(b);
         }
+
         // No line or line exhausted.  Try to load a new one.  On success, replace the old line.  On failure, keep the
         // old line so callers can still use line_slice etc.
         match self.source.next_line(peek_heredoc) {
@@ -372,7 +395,6 @@ impl Lexer {
     }
 
     // ── Position and span helpers ─────────────────────────────
-
     /// Current position within the current line (line-local).
     fn line_pos(&self) -> usize {
         self.source.line.as_ref().map_or(0, |l| l.pos)
@@ -434,6 +456,7 @@ impl Lexer {
             return;
         }
         let rest = &rest[4..];
+
         // Must have whitespace after "line"
         if rest.is_empty() || !rest[0].is_ascii_whitespace() {
             return;
@@ -518,6 +541,7 @@ impl Lexer {
         let has_dash = r.get(i).copied() == Some(b'-');
         if has_dash {
             i += 1;
+
             // Skip whitespace between `-` and identifier.
             while i < r.len() && matches!(r[i], b' ' | b'\t') {
                 i += 1;
@@ -682,6 +706,7 @@ impl Lexer {
         };
         let offset = line.offset;
         let bytes = line.line.clone();
+
         // Drop the consumed line from source-tracking state.
         self.source.line = None;
 
@@ -750,10 +775,12 @@ impl Lexer {
                     literal_start = i;
                     continue;
                 }
+
                 // `@` or `^` not followed by valid pad chars: pass through as literal text.
             }
             i += 1;
         }
+
         // Trailing literal run.
         if literal_start < normalized.len() {
             let lit: String = String::from_utf8_lossy(&normalized[literal_start..]).into_owned();
@@ -788,9 +815,11 @@ impl Lexer {
     fn format_lex_args_line(&mut self) -> Result<Spanned, ParseError> {
         // Skip in-line whitespace but NOT newlines — a newline terminates this args line.
         self.format_skip_inline_ws();
+
         // If at end of current source line, or at EOF, end args.
         if self.peek_byte(false).is_none_or(|b| b == b'\n') {
             let pos_start = self.span_pos();
+
             // Consume the newline (if any) so we're positioned on the next line for further format scanning.
             if self.peek_byte(false) == Some(b'\n') {
                 self.skip(1);
@@ -801,6 +830,7 @@ impl Lexer {
             let pos_end = self.span_pos();
             return Ok(Spanned { token: Token::FormatArgsEnd, span: Span::new(pos_start, pos_end) });
         }
+
         // Normal code token.
         self.lex_normal_token()
     }
@@ -847,7 +877,6 @@ impl Lexer {
     }
 
     // ── Skip whitespace and comments ──────────────────────────
-
     fn skip_ws_and_comments(&mut self) -> Result<(), ParseError> {
         loop {
             // peek_byte auto-loads lines. \n is a byte, skipped as whitespace.
@@ -858,6 +887,7 @@ impl Lexer {
                     if self.line_pos() == 0 {
                         self.try_line_directive();
                     }
+
                     // Comment — drop entire line.
                     self.source.line = None;
                 }
@@ -925,7 +955,6 @@ impl Lexer {
     }
 
     // ── Main tokenization entry point ─────────────────────────
-
     /// Lex the next token.  When inside a sublexing context (interpolating string, etc.), dispatches to the appropriate
     /// sub-lexer instead.
     pub fn lex_token(&mut self) -> Result<Spanned, ParseError> {
@@ -975,6 +1004,7 @@ impl Lexer {
                             false
                         }
                     }
+
                     // Postderef forms `->@*`, `->%*`, `->$*`, `->&*` end with `Star`; `->**` ends with `Power`.  At
                     // depth 0 these complete the postderef — probe for continuation just like a closing bracket would.
                     Token::Star | Token::Power => self.context_stack.last().is_some_and(|ctx| ctx.chain_depth == 0),
@@ -991,6 +1021,7 @@ impl Lexer {
             Some(ctx) if ctx.expr_depth > 0 => {
                 // Normal code lexing inside ${expr} or @{expr}.
                 let result = self.lex_normal_token()?;
+
                 // Track brace depth to find the closing }.
                 match &result.token {
                     Token::LeftBrace => {
@@ -1196,7 +1227,6 @@ impl Lexer {
     }
 
     // ── Number literals ───────────────────────────────────────
-
     fn lex_number(&mut self) -> Result<Token, ParseError> {
         let start = self.line_pos();
 
@@ -1233,6 +1263,7 @@ impl Lexer {
                 }
                 return Ok(Token::VersionLit(vstr));
             }
+
             // Not a v-string — rewind and parse as float.
             if let Some(line) = self.source.line.as_mut() {
                 line.pos = saved_pos;
@@ -1269,6 +1300,7 @@ impl Lexer {
             // Integer
             let s = self.line_slice_str(start)?;
             let s = s.replace('_', "");
+
             // Leading zero means octal in Perl 5.
             if s.len() > 1 && s.starts_with('0') {
                 // Check for illegal octal digits (8, 9).
@@ -1387,6 +1419,7 @@ impl Lexer {
                 break;
             }
         }
+
         // Check for illegal binary digits (2-9)
         if let Some(b) = self.peek_byte(false)
             && b.is_ascii_digit()
@@ -1432,6 +1465,7 @@ impl Lexer {
                 break;
             }
         }
+
         // Check for illegal octal digits (8, 9)
         if let Some(b) = self.peek_byte(false)
             && (b == b'8' || b == b'9')
@@ -1467,7 +1501,6 @@ impl Lexer {
     }
 
     // ── Variables ($, @, %) ───────────────────────────────────
-
     fn lex_dollar(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip $
 
@@ -1493,6 +1526,7 @@ impl Lexer {
             if !name.is_empty() {
                 return Ok(Token::ArrayLen(name));
             }
+
             // Not a valid identifier — rewind past the #.
             self.rewind(1);
         }
@@ -1518,6 +1552,7 @@ impl Lexer {
                 if !name.is_empty() {
                     return Ok(Token::ScalarVar(name));
                 }
+
                 // Not a valid identifier — fall through to Dollar.
             }
             Some(b'{') => {
@@ -1539,6 +1574,7 @@ impl Lexer {
                     }
                     return Ok(Token::SpecialVar(name));
                 }
+
                 // ${name} — variable with brace disambiguation
                 // ${$ref} or ${expr} — dereference block (return Dollar, let parser handle {})
                 if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
@@ -1549,6 +1585,7 @@ impl Lexer {
                     }
                     return Ok(Token::ScalarVar(name));
                 }
+
                 // Not a simple identifier — deref block
                 return Ok(Token::Dollar);
             }
@@ -1603,6 +1640,7 @@ impl Lexer {
                     let name = format!("^{}", next as char);
                     return Ok(Token::SpecialVar(name));
                 }
+
                 // Bare $^ — format_top_name.
                 self.skip(1);
                 return Ok(Token::SpecialVar("^".into()));
@@ -1643,6 +1681,7 @@ impl Lexer {
                 self.skip(1);
                 return Ok(Token::SpecialVar("&".into()));
             }
+
             // ── perlvar: remaining punctuation special variables ──
             Some(b'"') => {
                 // $" — list separator for array interpolation
@@ -1678,6 +1717,7 @@ impl Lexer {
                     let rest = self.scan_ident();
                     return Ok(Token::ScalarVar(format!("::{rest}")));
                 }
+
                 // $' — postmatch string
                 self.skip(1);
                 return Ok(Token::SpecialVar("'".into()));
@@ -1796,6 +1836,7 @@ impl Lexer {
                 let name = self.scan_ident();
                 if !name.is_empty() { Ok(Token::ArrayVar(name)) } else { Ok(Token::At) }
             }
+
             // @'ident — apostrophe as package separator.
             Some(b'\'')
                 if self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
@@ -1888,6 +1929,7 @@ impl Lexer {
                 let name = self.scan_ident();
                 if !name.is_empty() { Ok(Some(Token::HashVar(name))) } else { Ok(None) }
             }
+
             // %'ident — apostrophe as package separator.
             Some(b'\'')
                 if self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
@@ -1913,6 +1955,7 @@ impl Lexer {
         let r = self.remaining();
         if r.len() >= 2 && r[0] == b'#' && r[1] == b'*' {
             self.skip(2);
+
             // When inside a subscript-chain in a string body, the `#*` completes a `->$#*` postderef last-index.  Probe
             // for continuation and mark chain_end_pending so the next lex_token emits InterpChainEnd — just like a
             // closing bracket at depth 0 would.  Without this, the next lex_token call in chain mode would route to
@@ -1931,7 +1974,6 @@ impl Lexer {
     }
 
     // ── Identifiers ───────────────────────────────────────────
-
     fn scan_ident(&mut self) -> String {
         let start = self.line_pos();
         let mut first = true;
@@ -1946,6 +1988,7 @@ impl Lexer {
             } else if b == b'\''
                 && !first
                 && self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
+
                 // Don't consume ' when it's the close delimiter of the current string context (e.g. qq'$Foo'bar — the
                 // ' after Foo closes the string, not a package separator).
                 && self.context_stack.last().and_then(|ctx| ctx.delim).is_none_or(|d| d != '\'')
@@ -1962,6 +2005,7 @@ impl Lexer {
                         break;
                     }
                 }
+
                 // Apostrophe as package separator: Foo'Bar → Foo::Bar
                 self.skip(1);
                 first = true; // next char starts a new segment
@@ -1984,6 +2028,7 @@ impl Lexer {
             }
         }
         let name = String::from_utf8_lossy(self.line_slice(start)).into_owned();
+
         // Normalize apostrophe separators to :: so the AST always uses :: regardless of which separator the source
         // used.  ASCII 0x27 cannot appear inside UTF-8 multi-byte sequences, so a simple replace is safe.
         let name = if name.contains('\'') { name.replace('\'', "::") } else { name };
@@ -2113,7 +2158,6 @@ impl Lexer {
     }
 
     // ── Strings ───────────────────────────────────────────────
-
     fn lex_single_quoted_string(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip opening '
         let s = self.lex_body_str('\'', false)?;
@@ -2121,7 +2165,6 @@ impl Lexer {
     }
 
     // ── Unified string/regex body scanner (§5.4) ──────────────────
-
     /// Scan one token from a string/regex body.
     ///
     /// In interpolating mode (called repeatedly via context stack): returns one sub-token per call — `ConstSegment`,
@@ -2190,6 +2233,7 @@ impl Lexer {
             if b == b'@' {
                 return self.lex_interp_array(start);
             }
+
             // \N{CHARNAME} — named Unicode character.  Handled here (not in process_escape) so it emits a separate
             // NamedChar token, like interpolation.  The \N{U+XXXX} hex form stays in process_escape since it's just a
             // hex escape with no name to preserve.
@@ -2351,6 +2395,7 @@ impl Lexer {
                             // lex_body_str mode: consume the closing delimiter.
                             self.skip(close_len);
                         }
+
                         // Incremental mode: leave the delimiter for the SublexEnd fast dispatch on the next call.
                         break;
                     } else {
@@ -2377,6 +2422,7 @@ impl Lexer {
 
             match b {
                 b'$' | b'@' if interpolating => break,
+
                 // Regex code block lookahead: break so fast dispatch handles it on the next call.
                 b'(' if regex
                     && (self.peek_byte_at(1) == Some(b'?')
@@ -2488,6 +2534,7 @@ impl Lexer {
             Token::ConstSegment(s) => s,
             _ => unreachable!("lex_body in non-interpolating mode should return ConstSegment"),
         };
+
         // `lex_body` only auto-consumes the closing delimiter when the context stack is empty — its incremental-sublex
         // protocol leaves the delim in place so the next `lex_token` call can emit `SublexEnd`.  When we're called from
         // inside a sublex context (e.g. a single-quoted subscript key inside a `"..."` interpolation, or the second
@@ -2687,6 +2734,7 @@ impl Lexer {
                     s.push(c);
                 }
             }
+
             // Case-modification escapes.  These affect subsequent characters until \E.  For now we consume the markers
             // and apply the transformations inline.
             Some(b'l') => {
@@ -2742,6 +2790,7 @@ impl Lexer {
         // ${...} form
         if self.peek_byte(false) == Some(b'{') {
             self.skip(1); // skip {
+
             // Simple identifier: ${name}
             let next_byte = self.peek_byte(false);
             let is_ident = next_byte.is_some_and(|b| self.is_ident_start(b));
@@ -2752,11 +2801,13 @@ impl Lexer {
                     self.skip(1);
                     return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
                 }
+
                 // Not a simple ${name} — backtrack and scan as expression
                 if let Some(line) = self.source.line.as_mut() {
                     line.pos = saved_pos;
                 }
             }
+
             // Expression interpolation: ${\ expr}, ${$ref}, etc.  Enter expression-parsing mode — normal code until }.
             if let Some(ctx) = self.context_stack.last_mut() {
                 ctx.expr_depth = 1;
@@ -2769,6 +2820,7 @@ impl Lexer {
         let is_name = next_byte.is_some_and(|b| self.is_ident_start(b));
         if is_name {
             let name = self.scan_ident();
+
             // Check for subscript chain: [idx], {key}, ->[idx], ->{key}.  Only start a chain if a valid continuer is
             // actually present; a bare `->` (with nothing useful after) is treated as literal text.
             if self.peek_chain_starter() {
@@ -2832,6 +2884,7 @@ impl Lexer {
         let is_name = next_byte.is_some_and(|b| self.is_ident_start(b));
         if is_name {
             let name = self.scan_ident();
+
             // Chain detection same as the scalar case: `@a[1..3]`, `@a{'k1','k2'}`, `@a->[...]` / `@a->{...}`.  The
             // semantics for arrays are slice-oriented but the lexical shape is the same.
             if self.peek_chain_starter() {
@@ -2870,10 +2923,12 @@ impl Lexer {
     /// chain continuation (after a closing bracket at depth 0).
     fn peek_chain_starter(&self) -> bool {
         let r = self.remaining();
+
         // Direct subscript: [idx] or {key}.
         matches!(r.first(), Some(b'[') | Some(b'{'))
             || (r.len() >= 3 && r[0] == b'-' && r[1] == b'>' && {
                 let c = r[2];
+
                 // Subscript forms: ->[idx], ->{key} — always valid in interpolation.
                 matches!(c, b'[' | b'{')
                     // Postderef forms require `use feature 'postderef_qq'`.
@@ -2882,10 +2937,12 @@ impl Lexer {
                         (r.len() >= 4
                             && matches!(c, b'@' | b'%' | b'$' | b'&' | b'*')
                             && r[3] == b'*')
+
                         // Postderef slices: ->@[, ->@{, ->%[, ->%{.
                         || (r.len() >= 4
                             && matches!(c, b'@' | b'%')
                             && matches!(r[3], b'[' | b'{'))
+
                         // Postderef last-index: ->$#*.
                         || (r.len() >= 5
                             && c == b'$'
@@ -2896,7 +2953,6 @@ impl Lexer {
     }
 
     // ── q// qq// qw// ─────────────────────────────────────────
-
     fn lex_q_string(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
         let s = self.lex_body_str(delim, false)?;
@@ -2917,6 +2973,7 @@ impl Lexer {
 
     fn lex_qw(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
+
         // qw is documented as equivalent to split(' ', q/.../).  Use literal (q//) escape mode: \\ → \, \delim → delim.
         let body = self.lex_body_str(delim, false)?;
         let words: Vec<String> = body.split_whitespace().map(String::from).collect();
@@ -2924,7 +2981,6 @@ impl Lexer {
     }
 
     // ── Regex and friends ─────────────────────────────────────
-
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
@@ -3022,7 +3078,6 @@ impl Lexer {
     }
 
     // ── Operators ─────────────────────────────────────────────
-
     fn lex_plus(&mut self) -> Token {
         self.skip(1);
         match self.peek_byte(false) {
@@ -3098,11 +3153,13 @@ impl Lexer {
         if !b.is_ascii_alphabetic() {
             return None;
         }
+
         // Must not be followed by a word-continuation char.
         if self.peek_byte_at(1).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
             return None;
         }
         self.skip(1);
+
         // Fat-comma autoquoting: `-f => val` → StrLit("-f").  This function is always called after a minus, so the
         // "-" prefix is implicit.
         if self.at_fat_comma() {
@@ -3263,6 +3320,7 @@ impl Lexer {
                 self.skip(1);
                 return Ok(Some(Token::Readline(String::new(), true)));
             }
+
             // Single `>` after `<<` — not a valid heredoc or diamond.  Rewind.
             if let Some(line) = self.source.line.as_mut() {
                 line.pos = saved;
@@ -3288,6 +3346,7 @@ impl Lexer {
         match self.peek_byte(false) {
             // Quoted tags: whitespace before them is fine.
             Some(b'"') | Some(b'\'') | Some(b'\\') | Some(b'`') => Ok(Some(self.lex_heredoc(indented)?)),
+
             // Bare tags: must be adjacent (no whitespace).
             Some(b) if !had_whitespace && (b == b'_' || b.is_ascii_alphanumeric() || (self.effective_utf8 && b >= 0x80)) => {
                 Ok(Some(self.lex_heredoc(indented)?))
@@ -3564,6 +3623,7 @@ pub fn matching_delimiter(delim: char, extra_paired: bool) -> (Option<char>, cha
     let needle = delim.encode_utf8(&mut buf);
     if let Some(pos) = memchr::memmem::find(haystack, needle.as_bytes()) {
         let close_bytes = &DELIM_CLOSE.as_bytes()[pos..];
+
         // SAFETY: DELIM_CLOSE is a valid &str, and `pos` is a char boundary (same offset as a char boundary in
         // DELIM_OPEN, and all pairs have the same UTF-8 byte length).
         let close_str = std::str::from_utf8(close_bytes).unwrap_or("");
@@ -3589,7 +3649,6 @@ fn hex_digit(b: u8) -> u8 {
 }
 
 // ── Format-body helpers ───────────────────────────────────────
-
 /// True if `bytes` is a format terminator line: column-0 `.` optionally followed by whitespace and/or a line ending.
 fn is_format_terminator(bytes: &[u8]) -> bool {
     if bytes.first() != Some(&b'.') {
@@ -3659,12 +3718,14 @@ fn parse_field(bytes: &[u8], start: usize) -> Option<(FieldKind, usize)> {
             while i < bytes.len() && bytes[i] == pad {
                 i += 1;
             }
+
             // Optional `...` truncation suffix.
             let mut truncate_ellipsis = false;
             if i + 2 < bytes.len() && &bytes[i..i + 3] == b"..." {
                 truncate_ellipsis = true;
                 i += 3;
             }
+
             // Width counts from `@`/`^` through the pad chars only (not the ellipsis, which just annotates the field).
             let width = (i - start - if truncate_ellipsis { 3 } else { 0 }) as u32;
             let kind = match (caret, pad) {
@@ -3690,12 +3751,14 @@ fn parse_field(bytes: &[u8], start: usize) -> Option<(FieldKind, usize)> {
                 }
                 i += 1;
             }
+
             // Integer `#`s.
             let int_start = i;
             while i < bytes.len() && bytes[i] == b'#' {
                 i += 1;
             }
             let integer_digits = (i - int_start + if leading_zeros { 1 } else { 0 }) as u32;
+
             // Optional `.` followed by decimal `#`s.
             let mut decimal_digits: Option<u32> = None;
             if i < bytes.len() && bytes[i] == b'.' {
@@ -3712,6 +3775,7 @@ fn parse_field(bytes: &[u8], start: usize) -> Option<(FieldKind, usize)> {
                     decimal_digits = Some((i - dec_start) as u32);
                 }
             }
+
             // Must have at least one digit somewhere.
             if integer_digits == 0 && decimal_digits.is_none() {
                 return None;

@@ -12,6 +12,7 @@ fn lex_all(src: &str) -> Vec<Token> {
         if matches!(spanned.token, Token::Eof) {
             break;
         }
+
         // In term context, ShiftLeft may introduce a heredoc — mimic what the parser does by calling the heredoc hook.
         if matches!(spanned.token, Token::ShiftLeft)
             && term_context
@@ -19,6 +20,7 @@ fn lex_all(src: &str) -> Vec<Token> {
         {
             spanned.token = tok;
         }
+
         // In term context, Percent may introduce a hash variable.
         if matches!(spanned.token, Token::Percent)
             && term_context
@@ -26,6 +28,7 @@ fn lex_all(src: &str) -> Vec<Token> {
         {
             spanned.token = tok;
         }
+
         // In term context, Minus may introduce a filetest operator.
         if matches!(spanned.token, Token::Minus)
             && term_context
@@ -33,6 +36,7 @@ fn lex_all(src: &str) -> Vec<Token> {
         {
             spanned.token = tok;
         }
+
         // In term context, NumLt may introduce a readline/glob.
         if matches!(spanned.token, Token::NumLt)
             && term_context
@@ -40,6 +44,7 @@ fn lex_all(src: &str) -> Vec<Token> {
         {
             spanned.token = tok;
         }
+
         // In term context, quote keywords start sublexing — mimic the parser's `parse_quote_keyword` by skipping
         // whitespace and calling `begin_quote_sublex`.  Fat-comma autoquoting (`q => 1`) is handled by the lexer, which
         // returns StrLit instead of the keyword.
@@ -53,6 +58,7 @@ fn lex_all(src: &str) -> Vec<Token> {
                 spanned.token = tok;
             }
         }
+
         // Update term/operator state based on the token.
         match &spanned.token {
             Token::IntLit(_)
@@ -85,6 +91,7 @@ fn lex_all(src: &str) -> Vec<Token> {
             | Token::Keyword(Keyword::__CLASS__) => {
                 term_context = false;
             }
+
             // Sub-tokens inside strings/regex don't change context.
             Token::QuoteSublexBegin(_, _)
             | Token::RegexSublexBegin(_, _)
@@ -131,14 +138,17 @@ fn lex_cr_only_not_treated_as_newline() {
     // start and the heredoc is unterminated — matching Perl's behavior.
     let src = b"<<END;\nhello\rEND\n";
     let mut lexer = Lexer::new(src);
+
     // Consume ShiftLeft, then call the heredoc hook.
     let tok = lexer.lex_token().unwrap();
     assert_eq!(tok.token, Token::ShiftLeft);
     let heredoc_tok = lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
     assert_eq!(heredoc_tok, Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
+
     // Body line "hello\rEND\n" is not a terminator — returned as content.
     let tok = lexer.lex_token().unwrap();
     assert!(matches!(tok.token, Token::ConstSegment(_)));
+
     // Next call surfaces the deferred unterminated heredoc error.
     let result = lexer.lex_token();
     assert!(result.is_err(), "expected unterminated heredoc error");
@@ -151,9 +161,11 @@ fn lex_indented_heredoc_mismatch_croaks() {
     // Body line with wrong indentation should error.
     let src = "<<~END;\n    hello\n  bad indent\n    END\n";
     let mut lexer = Lexer::new(src.as_bytes());
+
     // Consume ShiftLeft, then call the heredoc hook.
     lexer.lex_token().unwrap();
     lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
+
     // Consume tokens until we hit the error.
     let mut got_error = false;
     for _ in 0..20 {
@@ -194,6 +206,7 @@ fn lex_indented_heredoc_tabs_vs_spaces_croaks() {
 
 #[test]
 fn lex_indented_heredoc_empty_line_ok() {
+
     // Empty lines (just \n) are allowed without indentation.
     let src = "<<~END;\n    hello\n\n    world\n    END\n";
     let tokens = lex_all(src);
@@ -352,6 +365,7 @@ fn lex_comment() {
 #[test]
 fn lex_fat_comma() {
     let tokens = lex_all("foo => 42");
+
     // "foo" before => is autoquoted to StrLit by the lexer.
     assert_eq!(tokens, vec![Token::StrLit("foo".into()), Token::FatComma, Token::IntLit(42),]);
 }
@@ -572,6 +586,7 @@ fn lex_heredoc_single_quoted() {
 fn lex_heredoc_multiline_body() {
     let src = "<<END;\nline 1\nline 2\nline 3\nEND\n";
     let tokens = lex_all(src);
+
     // Heredoc body is returned as a single ConstSegment covering all lines, same as regular strings.
     assert_eq!(
         tokens,
@@ -604,6 +619,7 @@ fn lex_heredoc_indented() {
     let src = "<<~END;\n    hello\n    world\n    END\n";
     let tokens = lex_all(src);
     assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
+
     // Indent (4 spaces) should be stripped from each line.
     let body: String = tokens.iter().filter_map(|t| if let Token::ConstSegment(s) = t { Some(s.as_str()) } else { None }).collect();
     assert_eq!(body, "hello\nworld\n");
@@ -614,6 +630,7 @@ fn lex_heredoc_then_code() {
     // Code after the heredoc terminator should be lexed normally.
     let src = "my $x = <<END;\nhello\nEND\nmy $y = 1;\n";
     let tokens = lex_all(src);
+
     // Should contain: my $x = <<END ; my $y = 1 ;
     assert!(tokens.contains(&Token::Keyword(Keyword::My)));
     assert_eq!(tokens.iter().filter(|t| matches!(t, Token::Keyword(Keyword::My))).count(), 2);
@@ -628,6 +645,7 @@ fn lex_heredoc_spliced_inside_q_string() {
 
     // First tokens: heredoc body
     assert_eq!(tokens[0], Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
+
     // Collect heredoc body content.
     let mut i = 1;
     let mut body = String::new();
@@ -1434,6 +1452,7 @@ fn lex_subst_pattern_interp() {
     assert_eq!(tokens[0], Token::SubstSublexBegin('/'));
     assert_eq!(tokens[1], Token::ConstSegment("foo".into()));
     assert_eq!(tokens[2], Token::InterpScalar("bar".into()));
+
     // ConstSegment("") before SublexEnd for the empty segment after the interpolation.
     assert!(tokens.contains(&Token::SublexEnd));
 }
@@ -1548,8 +1567,10 @@ fn lex_file_preserves_value_when_fat_comma_crosses_line_directive() {
     // __FILE__ followed by a `# line` directive on the next line, then a non-=> token.  at_fat_comma skips past the
     // directive while searching for `=>`, but __FILE__'s value must be the ORIGINAL filename (saved before the scan).
     let tokens = lex_all("__FILE__\n# line 100 \"changed.pl\"\n, __FILE__;\n");
+
     // First __FILE__: saved before at_fat_comma crossed the directive.
     assert!(matches!(&tokens[0], Token::SourceFile(f) if f != "changed.pl"), "first __FILE__ should be original filename, got {:?}", tokens[0]);
+
     // Second __FILE__: after the directive took effect.
     let second_file = tokens.iter().filter(|t| matches!(t, Token::SourceFile(_))).nth(1);
     assert!(matches!(second_file, Some(Token::SourceFile(f)) if f == "changed.pl"), "second __FILE__ should be \"changed.pl\", got {:?}", second_file);
@@ -1560,6 +1581,7 @@ fn lex_line_preserves_value_when_fat_comma_crosses_newlines() {
     // __LINE__ on line 1, followed by newlines.  at_fat_comma skips past them, but __LINE__ must report line 1.
     let tokens = lex_all("__LINE__\n\n\n, __LINE__;\n");
     assert!(matches!(&tokens[0], Token::SourceLine(1)), "first __LINE__ should be 1, got {:?}", tokens[0]);
+
     // Second __LINE__ should be on line 4 (after three newlines).
     let second_line = tokens.iter().filter(|t| matches!(t, Token::SourceLine(_))).nth(1);
     assert!(matches!(second_line, Some(Token::SourceLine(n)) if *n == 4), "second __LINE__ should be 4, got {:?}", second_line);
@@ -1636,6 +1658,7 @@ fn quote_op_q_with_equals_delim() {
 fn quote_op_y_with_rbrace_delim() {
     // `y}abc}xyz}` — transliteration with `}` as delimiter.  Shouldn't error out as unterminated.
     let tokens = lex_all("y}abc}xyz};");
+
     // tr/y produces a Subst-like token tree; exact shape depends on the implementation.  The key thing is no error, and
     // the first token is NOT a lone Ident("y").
     assert!(!matches!(tokens[0], Token::Ident(ref s) if s == "y"), "y should be a quote op here, got Ident(y): {tokens:?}");
@@ -2031,6 +2054,7 @@ fn pod_not_triggered_in_delim_scan_qq() {
     // `testing`, blank lines, and the closing `=`.  Body is everything between the two `=` delimiters.
     let src = "qq\n\n=pod\n\ntesting\n\n=;";
     let tokens = lex_all(src);
+
     // Body starts with "pod" (the `=` is the delim, not part of the body).  qq interpolates but the body here has no
     // variables, so we expect a plain StrLit or an InterpolatedString whose constant part is "pod\n\ntesting\n\n".
     // Assert the first token isn't an Ident("qq") autoquote.
@@ -2347,6 +2371,7 @@ fn matching_delimiter_non_paired_ascii() {
 fn matching_delimiter_guillemets_with_feature() {
     // « → » when extra_paired is on.
     assert_eq!(matching_delimiter('\u{00AB}', true), (Some('\u{00AB}'), '\u{00BB}'));
+
     // » → « (reverse pair).
     assert_eq!(matching_delimiter('\u{00BB}', true), (Some('\u{00BB}'), '\u{00AB}'));
 }
@@ -2361,6 +2386,7 @@ fn matching_delimiter_guillemets_without_feature() {
 fn matching_delimiter_cjk_brackets() {
     // 「 → 」 (CJK corner brackets).
     assert_eq!(matching_delimiter('\u{300C}', true), (Some('\u{300C}'), '\u{300D}'));
+
     // 《 → 》 (CJK double angle brackets).
     assert_eq!(matching_delimiter('\u{300A}', true), (Some('\u{300A}'), '\u{300B}'));
 }
@@ -2369,6 +2395,7 @@ fn matching_delimiter_cjk_brackets() {
 fn matching_delimiter_math_angle_brackets() {
     // ⟨ → ⟩ (mathematical angle brackets).
     assert_eq!(matching_delimiter('\u{27E8}', true), (Some('\u{27E8}'), '\u{27E9}'));
+
     // ⟪ → ⟫ (mathematical double angle brackets).
     assert_eq!(matching_delimiter('\u{27EA}', true), (Some('\u{27EA}'), '\u{27EB}'));
 }
@@ -2377,6 +2404,7 @@ fn matching_delimiter_math_angle_brackets() {
 fn matching_delimiter_ornamental_brackets() {
     // ❨ → ❩
     assert_eq!(matching_delimiter('\u{2768}', true), (Some('\u{2768}'), '\u{2769}'));
+
     // ❴ → ❵ (medium curly bracket ornament).
     assert_eq!(matching_delimiter('\u{2774}', true), (Some('\u{2774}'), '\u{2775}'));
 }
@@ -2385,6 +2413,7 @@ fn matching_delimiter_ornamental_brackets() {
 fn matching_delimiter_fullwidth_brackets() {
     // （ → ）
     assert_eq!(matching_delimiter('\u{FF08}', true), (Some('\u{FF08}'), '\u{FF09}'));
+
     // ［ → ］
     assert_eq!(matching_delimiter('\u{FF3B}', true), (Some('\u{FF3B}'), '\u{FF3D}'));
 }
@@ -2393,6 +2422,7 @@ fn matching_delimiter_fullwidth_brackets() {
 fn matching_delimiter_smp_musical_barlines() {
     // 𝄃 → 𝄂 (4-byte UTF-8, SMP).
     assert_eq!(matching_delimiter('\u{1D103}', true), (Some('\u{1D103}'), '\u{1D102}'));
+
     // 𝄆 → 𝄇
     assert_eq!(matching_delimiter('\u{1D106}', true), (Some('\u{1D106}'), '\u{1D107}'));
 }
@@ -2407,6 +2437,7 @@ fn matching_delimiter_smp_pointing_hands() {
 fn matching_delimiter_arrows() {
     // → → ← (rightwards/leftwards arrow).
     assert_eq!(matching_delimiter('\u{2192}', true), (Some('\u{2192}'), '\u{2190}'));
+
     // ⇒ → ⇐ (double arrow).
     assert_eq!(matching_delimiter('\u{21D2}', true), (Some('\u{21D2}'), '\u{21D0}'));
 }
@@ -2581,6 +2612,7 @@ fn apos_scan_ident_stops_at_close_delimiter() {
     // qq'$Foo'bar — the ' after Foo is the close delimiter of the qq string, not a package separator.  scan_ident must
     // not consume past it.
     let tokens = lex_all("qq'$Foo'bar;");
+
     // Tokens should be: QuoteSublexBegin, InterpScalar("Foo"), SublexEnd, Ident("bar"), Semi
     assert!(
         tokens.iter().any(|t| matches!(t, Token::InterpScalar(s) if s == "Foo")),

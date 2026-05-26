@@ -108,9 +108,11 @@ fn lexer_line_peek_and_advance() {
     assert_eq!(line.peek_byte(), Some(b'b'));
     assert_eq!(line.advance_byte(), Some(b'b'));
     assert_eq!(line.advance_byte(), Some(b'c'));
+
     // Terminated line delivers \n as the last byte.
     assert_eq!(line.peek_byte(), Some(b'\n'));
     assert_eq!(line.advance_byte(), Some(b'\n'));
+
     // Now truly exhausted.
     assert_eq!(line.advance_byte(), None);
     assert_eq!(line.peek_byte(), None);
@@ -552,6 +554,7 @@ fn source_peeked_heredoc_terminator_stays_pending_until_consumed() {
 
     // Peek sees end-of-heredoc but does not consume it.
     assert!(matches!(source.next_line(true), Ok(None)));
+
     // Repeated peeks still see pending end.
     assert!(matches!(source.next_line(true), Ok(None)));
 
@@ -650,6 +653,7 @@ fn indented_heredoc_errors_on_mismatched_indent_after_start() {
 fn filename_is_preserved() {
     let source = LexerSource::with_filename(b"1;\n", "foo.pl");
     assert_eq!(source.filename(), "foo.pl");
+
     // Default filename should be a sensible default.
     let default = LexerSource::new(b"1;\n");
     assert!(!default.filename().is_empty(), "default filename should not be empty");

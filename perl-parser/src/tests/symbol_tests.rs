@@ -176,6 +176,7 @@ fn symtab_lookup_miss() {
 fn symtab_lookup_wrong_package() {
     let mut st = SymbolTable::new();
     st.entry("Foo").declare_sub("bar", None, vec![], false);
+
     // Bare "bar" looked up in "main" must not find Foo::bar.
     assert!(st.lookup("bar", "main").is_none());
 }
@@ -185,6 +186,7 @@ fn symtab_forward_then_full_declaration() {
     let mut st = SymbolTable::new();
     let proto = SubPrototype::parse("$$").unwrap();
     st.entry("main").declare_sub("foo", Some(proto.clone()), vec![], true);
+
     // Second declaration replaces the forward-decl entry.
     st.entry("main").declare_sub("foo", Some(proto), vec![], false);
     let info = st.lookup("foo", "main").unwrap();
@@ -207,10 +209,13 @@ fn symtab_declare_with_prototype() {
 #[test]
 fn symtab_import_basic() {
     let mut st = SymbolTable::new();
+
     // Source has the real sub.
     st.entry("Source").declare_sub("helper", None, vec![], false);
+
     // Import it into User.
     st.import("User", "helper", "Source", "helper");
+
     // Looking up "helper" in User follows the import.
     let info = st.lookup("helper", "User").expect("should resolve via import");
     assert_eq!(info.name.as_ref(), "helper");
@@ -228,6 +233,7 @@ fn symtab_import_with_rename() {
 #[test]
 fn symtab_import_chain() {
     let mut st = SymbolTable::new();
+
     // A → B → C, where C has the real sub.
     st.entry("C").declare_sub("helper", None, vec![], false);
     st.import("B", "helper", "C", "helper");
@@ -239,6 +245,7 @@ fn symtab_import_chain() {
 #[test]
 fn symtab_import_cycle_returns_none() {
     let mut st = SymbolTable::new();
+
     // A imports from B imports from A — infinite loop without a visited guard.
     st.import("A", "x", "B", "x");
     st.import("B", "x", "A", "x");
@@ -248,6 +255,7 @@ fn symtab_import_cycle_returns_none() {
 #[test]
 fn symtab_import_to_unknown_target() {
     let mut st = SymbolTable::new();
+
     // Importing from a package that has no such sub → lookup fails.
     st.import("User", "helper", "NoSuchPackage", "helper");
     assert!(st.lookup("helper", "User").is_none());
@@ -258,10 +266,12 @@ fn symtab_local_overrides_import() {
     let mut st = SymbolTable::new();
     st.entry("Source").declare_sub("helper", None, vec![], false);
     st.import("User", "helper", "Source", "helper");
+
     // Now User also declares its own helper; local wins.
     let proto = SubPrototype::parse("$").unwrap();
     st.entry("User").declare_sub("helper", Some(proto), vec![], false);
     let info = st.lookup("helper", "User").unwrap();
+
     // Should find the local one with the prototype, not the import.
     assert!(info.prototype.is_some());
 }
@@ -269,12 +279,15 @@ fn symtab_local_overrides_import() {
 #[test]
 fn symtab_fqn_does_not_follow_default_imports() {
     let mut st = SymbolTable::new();
+
     // Default package has an import; explicit FQN to another package should ignore it.
     st.entry("Real").declare_sub("x", None, vec![], false);
     st.import("Shadow", "x", "Real", "x");
+
     // Looking up "Shadow::x" resolves via Shadow's imports → Real::x.  Looking up "Real::x" finds it directly.
     assert!(st.lookup("Shadow::x", "Other").is_some());
     assert!(st.lookup("Real::x", "Other").is_some());
+
     // But "x" (bare) in Other finds nothing.
     assert!(st.lookup("x", "Other").is_none());
 }

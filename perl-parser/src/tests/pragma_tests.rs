@@ -61,6 +61,7 @@ fn resolve_bundle_all_and_default() {
 #[test]
 fn resolve_bundle_version() {
     assert_eq!(resolve_feature_name(":5.36"), Some(version_bundle(5, 36)));
+
     // Sub-version ignored per perlfeature.
     assert_eq!(resolve_feature_name(":5.36.0"), Some(version_bundle(5, 36)));
     assert_eq!(resolve_feature_name(":5.36.1"), Some(version_bundle(5, 36)));

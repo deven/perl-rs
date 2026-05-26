@@ -28,7 +28,6 @@ pub struct PerlString {
 
 impl PerlString {
     // ── Constructors ──────────────────────────────────────────────
-
     /// Create an empty Perl string (no UTF-8 flag).
     pub fn new() -> Self {
         PerlString { buf: Bytes::new(), is_utf8: false }
@@ -64,7 +63,6 @@ impl PerlString {
     }
 
     // ── Accessors ─────────────────────────────────────────────────
-
     /// Zero-cost `&str` view when the UTF-8 flag is set.  Returns `None` if the string is not flagged as UTF-8.
     pub fn as_str(&self) -> Option<&str> {
         if self.is_utf8 {
@@ -104,7 +102,6 @@ impl PerlString {
     }
 
     // ── Mutation ──────────────────────────────────────────────────
-
     /// Append bytes from a `&str`.  Preserves UTF-8 flag if already set (appending valid UTF-8 to valid UTF-8 is valid
     /// UTF-8).
     pub fn push_str(&mut self, s: &str) {
@@ -176,7 +173,6 @@ impl PerlString {
     }
 
     // ── Conversion ────────────────────────────────────────────────
-
     /// Consume the PerlString and return the underlying `Bytes` buffer.  This is O(1) — no data is copied.
     pub fn into_bytes(self) -> Bytes {
         self.buf
@@ -197,7 +193,6 @@ impl PerlString {
     }
 
     // ── Numeric parsing (for SV coercion) ─────────────────────────
-
     /// Attempt to parse the string as an i64.  Follows Perl's numeric conversion rules: leading whitespace is skipped,
     /// trailing non-numeric characters are ignored, and an empty or non-numeric string yields 0.
     pub fn parse_iv(&self) -> i64 {
@@ -242,7 +237,6 @@ impl PerlString {
 }
 
 // ── Perl-style numeric parsing helpers ────────────────────────────
-
 /// Parse as much of the leading portion of `s` as a valid integer.  Returns 0 if no leading digits.
 fn perl_atoi(s: &str) -> i64 {
     let s = s.trim_start();
@@ -331,7 +325,6 @@ fn perl_atof(s: &str) -> f64 {
 }
 
 // ── Trait impls ───────────────────────────────────────────────────
-
 impl Default for PerlString {
     fn default() -> Self {
         Self::new()
@@ -380,7 +373,6 @@ impl From<PerlString> for Bytes {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,7 +550,6 @@ mod tests {
     }
 
     // ── Bytes-specific tests ──────────────────────────────────
-
     #[test]
     fn clone_is_shared() {
         let a = PerlString::from_str("hello world, this is a longer string");

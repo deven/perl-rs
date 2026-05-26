@@ -11,7 +11,6 @@ use crate::scalar::Scalar;
 use crate::{PerlString, SMALL_STRING_MAX, SmallString};
 
 // ── Type aliases ─────────────────────────────────────────────────
-
 /// A shared scalar — the full Perl SV behind Arc<RwLock<>>.
 pub type Sv = Arc<RwLock<Scalar>>;
 
@@ -38,7 +37,6 @@ pub struct CompiledRegex {
 use std::collections::HashMap;
 
 // ── The Value enum ───────────────────────────────────────────────
-
 /// A Perl value.
 ///
 /// The compact variants (`Int`, `Float`, `SmallStr`, `Str`) are inline — no heap allocation, no `Arc`, no locking.
@@ -93,7 +91,6 @@ pub enum Value {
 
 impl Value {
     // ── Type testing ──────────────────────────────────────────
-
     /// Whether this value is undef.
     pub fn is_undef(&self) -> bool {
         matches!(self, Value::Undef)
@@ -125,7 +122,6 @@ impl Value {
     }
 
     // ── Truthiness ────────────────────────────────────────────
-
     /// Perl truthiness.
     ///
     /// False values: `undef`, `0`, `0.0`, `""`, `"0"`, empty arrays, empty hashes.  True values: nonzero numbers,
@@ -151,7 +147,6 @@ impl Value {
     }
 
     // ── Upgrade to full Scalar ────────────────────────────────
-
     /// Upgrade this value to a full `Scalar` behind `Arc<RwLock<>>`.
     ///
     /// If already a `Scalar`, returns a clone of the `Sv` (refcount bump).  Otherwise, creates a new `Scalar` from the
@@ -357,7 +352,6 @@ impl Value {
     }
 
     // ── String concatenation ──────────────────────────────────
-
     /// Concatenation (`$a . $b`).
     ///
     /// Coerces both sides to their string representation and concatenates.
@@ -407,7 +401,6 @@ impl Value {
     }
 
     // ── Comparison ────────────────────────────────────────────
-
     /// Numeric comparison (`$a <=> $b`).  Returns -1, 0, or 1 as a Value::Int.
     pub fn num_cmp(&self, other: &Value) -> Value {
         let a = self.coerce_to_num();
@@ -498,7 +491,6 @@ impl Value {
     }
 
     // ── Stringification ───────────────────────────────────────
-
     /// Convert this value to its Perl string representation.
     ///
     /// This is the operation that happens when a value is used in string context: `print`, `.` concatenation, `"$x"`
@@ -578,7 +570,6 @@ impl Value {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
 /// Perl string falseness check on raw bytes.  Empty (`b""`) and the string `"0"` (`b"0"`) are false.
 #[inline]
 fn bytes_are_false(bytes: &[u8]) -> bool {
@@ -586,7 +577,6 @@ fn bytes_are_false(bytes: &[u8]) -> bool {
 }
 
 // ── Trait impls ──────────────────────────────────────────────────
-
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -670,7 +660,6 @@ impl From<bool> for Value {
 }
 
 // ── Tests ────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,7 +761,6 @@ mod tests {
     }
 
     // ── Truthiness tests ──────────────────────────────────────
-
     #[test]
     fn undef_is_false() {
         assert!(Value::Undef.is_false());
@@ -877,7 +865,6 @@ mod tests {
     }
 
     // ── Stringification tests ─────────────────────────────────
-
     #[test]
     fn stringify_undef() {
         let v = Value::Undef;
@@ -983,7 +970,6 @@ mod tests {
     }
 
     // ── Coercion tests ────────────────────────────────────────
-
     #[test]
     fn coerce_undef_to_numeric() {
         assert_eq!(Value::Undef.coerce_to_int(), 0);
@@ -1005,7 +991,6 @@ mod tests {
     }
 
     // ── Arithmetic tests ──────────────────────────────────────
-
     #[test]
     fn add_integers() {
         let r = Value::Int(2).add(&Value::Int(3));
@@ -1106,7 +1091,6 @@ mod tests {
     }
 
     // ── Concatenation tests ───────────────────────────────────
-
     #[test]
     fn concat_strings() {
         let r = Value::from("hello").concat(&Value::from(" world"));
@@ -1144,7 +1128,6 @@ mod tests {
     }
 
     // ── Comparison tests ──────────────────────────────────────
-
     #[test]
     fn num_eq_basic() {
         assert!(Value::Int(42).num_eq(&Value::Int(42)));

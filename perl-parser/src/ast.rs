@@ -19,6 +19,7 @@ pub struct Program {
 pub struct Statement {
     pub kind: StmtKind,
     pub span: Span,
+
     /// Whether the statement was followed by a semicolon.  Used to distinguish `{ expr }` (hash constructor candidate)
     /// from `{ expr; }` (block) at statement level.
     pub terminated: bool,
@@ -44,14 +45,19 @@ pub enum StmtKind {
 
     /// `if (...) { ... } elsif ... else { ... }`.
     If(IfStmt),
+
     /// `unless (...) { ... }`.
     Unless(UnlessStmt),
+
     /// `while (...) { ... }`.
     While(WhileStmt),
+
     /// `until (...) { ... }`.
     Until(UntilStmt),
+
     /// C-style `for (init; cond; step) { ... }`.
     For(ForStmt),
+
     /// `for/foreach VAR (LIST) { ... }`.
     ForEach(ForEachStmt),
 
@@ -67,11 +73,13 @@ pub enum StmtKind {
 
     /// `given (EXPR) { when ... }`.
     Given(Expr, Block),
+
     /// `when (EXPR) { ... }` (inside given).
     When(Expr, Block),
 
     /// `try { ... } catch ($e) { ... } finally { ... }`.
     Try(TryStmt),
+
     /// `defer { ... }`.
     Defer(Block),
 
@@ -87,8 +95,10 @@ pub enum StmtKind {
 
     /// `class Name :attrs { ... }` (5.38+ Corinna).
     ClassDecl(ClassDecl),
+
     /// `field $var :attrs = default;` (inside class).
     FieldDecl(FieldDecl),
+
     /// `method name(params) { ... }` (inside class).
     MethodDecl(SubDecl),
 }
@@ -106,13 +116,18 @@ pub enum ExprKind {
     IntLit(i64),
     FloatLit(f64),
     StringLit(String),
+
     /// Version object literal: `v5.36.0`, `v5.26`.
     VersionLit(String),
+
     /// Interpolated string: sequence of constant and interpolated parts.
     InterpolatedString(Interpolated),
+
     /// `qw/.../`.
     QwList(Vec<String>),
+
     Undef,
+
     /// Regex literal: `m/.../flags`, `/.../flags`, or `qr/.../flags`.
     Regex(RegexKind, Interpolated, Option<String>),
 
@@ -122,10 +137,13 @@ pub enum ExprKind {
     HashVar(String),
     GlobVar(String),
     ArrayLen(String),
+
     /// `$!`, `$^W`, `${^MATCH}`, `$/`, etc.
     SpecialVar(String),
+
     /// `@+`, `@-`, `@{^CAPTURE}`, etc.
     SpecialArrayVar(String),
+
     /// `%!`, `%+`, `%-`, `%{^CAPTURE}`, etc.
     SpecialHashVar(String),
 
@@ -138,11 +156,13 @@ pub enum ExprKind {
     /// `my $x`, `our ($a, $b)`, `state $x` in expression context.  The Pratt parser handles `= expr` as normal
     /// assignment wrapping this.
     Decl(DeclScope, Vec<VarDecl>),
+
     /// `local LVALUE` — localize any lvalue (hash elem, glob, etc.).
     Local(Box<Expr>),
 
     // ── Binary operations ─────────────────────────────────────
     BinOp(BinOp, Box<Expr>, Box<Expr>),
+
     /// Chained comparison: `$x < $y <= $z` → ops [<, <=], operands [x, y, z].  Semantics: compare each adjacent pair,
     /// results implicitly ANDed, interior operands evaluated at most once.  `operands.len() == ops.len() + 1`.
     ChainedCmp(Vec<BinOp>, Vec<Expr>),
@@ -164,30 +184,39 @@ pub enum ExprKind {
     // ── Subscripting ──────────────────────────────────────────
     /// `$array[$idx]` — array element.
     ArrayElem(Box<Expr>, Box<Expr>),
+
     /// `$hash{$key}` — hash element.
     HashElem(Box<Expr>, Box<Expr>),
+
     /// `@array[$idx1, $idx2]` — array slice.
     ArraySlice(Box<Expr>, Vec<Expr>),
+
     /// `@hash{$k1, $k2}` — hash slice.
     HashSlice(Box<Expr>, Vec<Expr>),
+
     /// `%array[$idx1, $idx2]` — index/value array slice (5.20+).
     KvArraySlice(Box<Expr>, Vec<Expr>),
+
     /// `%hash{$k1, $k2}` — key/value hash slice (5.20+).
     KvHashSlice(Box<Expr>, Vec<Expr>),
 
     // ── Dereference ───────────────────────────────────────────
     /// `$$ref`, `@$ref`, `%$ref`.
     Deref(Sigil, Box<Expr>),
+
     /// `$ref->[idx]`, `$ref->{key}`.
     ArrowDeref(Box<Expr>, ArrowTarget),
 
     // ── References ────────────────────────────────────────────
     /// `\$x`, `\@a`, `\%h`, `\&sub`.
     Ref(Box<Expr>),
+
     /// `[...]` — anonymous array ref.
     AnonArray(Vec<Expr>),
+
     /// `{...}` — anonymous hash ref (when disambiguated from block).
     AnonHash(Vec<Expr>),
+
     /// `sub { ... }` — anonymous sub.  Fields: prototype (raw bytes), signature (parsed 5.20+ signatures syntax), body.
     /// Prototype, attributes, and signature are parsed per the `signatures` feature: with signatures, attrs come before
     /// the paren-form; without, prototype comes before attrs.
@@ -199,8 +228,10 @@ pub enum ExprKind {
     // ── Calls ─────────────────────────────────────────────────
     /// Named function call: `foo(...)` or `foo ...`.
     FuncCall(String, Vec<Expr>),
+
     /// Method call: `$obj->method(...)`.
     MethodCall(Box<Expr>, String, Vec<Expr>),
+
     /// Indirect method call: `new Foo(...)` → invocant, method, args.
     IndirectMethodCall(Box<Expr>, String, Vec<Expr>),
 
@@ -222,6 +253,7 @@ pub enum ExprKind {
     // ── Regex operations ──────────────────────────────────────
     /// `s/pattern/replacement/flags`.
     Subst(Interpolated, Interpolated, Option<String>),
+
     /// `tr/from/to/flags` or `y/from/to/flags`.
     Translit(String, String, Option<String>),
 
@@ -231,10 +263,13 @@ pub enum ExprKind {
 
     /// `do BLOCK`.
     DoBlock(Block),
+
     /// `do EXPR` (do file).
     DoExpr(Box<Expr>),
+
     /// `eval BLOCK`.
     EvalBlock(Block),
+
     /// `eval EXPR`.
     EvalExpr(Box<Expr>),
 
@@ -251,15 +286,19 @@ pub enum ExprKind {
     // ── Compile-time constants ────────────────────────────────
     /// `__FILE__` — source filename at parse time.
     SourceFile(String),
+
     /// `__LINE__` — source line number at parse time (1-based).
     SourceLine(u32),
+
     /// `__PACKAGE__` — name of the package in effect when this expression was parsed.  Filled by the parser from its
     /// `current_package` state.
     CurrentPackage(String),
+
     /// `__SUB__` — reference to the current subroutine, or `undef` if outside any sub.  Resolved at runtime; no
     /// compile-time data.  Emitted only when the `current_sub` feature is active; otherwise the token falls through as
     /// a bareword.
     CurrentSub,
+
     /// `__CLASS__` — name of the class being constructed during field initializers and ADJUST blocks (5.38+, Corinna).
     /// Resolved at runtime (may differ from the compile-time class if a subclass inherits the field).
     CurrentClass,
@@ -267,10 +306,13 @@ pub enum ExprKind {
     // ── Placeholder for incremental development ───────────────
     /// `...` — yada yada yada (unimplemented placeholder).
     YadaYada,
+
     /// `-e $file`, `-d "/tmp"`, `-f _` — filetest operator.
     Filetest(char, StatTarget),
+
     /// `stat $file`, `stat _`, `stat` — stat call.
     Stat(StatTarget),
+
     /// `lstat $file`, `lstat _`, `lstat` — lstat call.
     Lstat(StatTarget),
 }
@@ -284,9 +326,11 @@ pub enum StatTarget {
     /// An expression: `-f $file`, `-d "/tmp"`, `stat $fh`, or stacked
     /// filetests like `-f -r $file`.
     Expr(Box<Expr>),
+
     /// The bare `_` filehandle — reuse the cached stat buffer from the
     /// most recent `stat`, `lstat`, or filetest call.
     StatCache,
+
     /// Implicit `$_` — when no operand is given (`-e;`).
     Default,
 }
@@ -324,17 +368,23 @@ impl Interpolated {
 #[derive(Clone, Debug)]
 pub enum InterpPart {
     Const(String),
+
     /// `$var`, `$var[0]`, `$var->{k}`, `$var->[0]{k}`, etc.  Wraps the full subscripted expression — not just a name —
     /// so chained subscripts (`$h->{k}[0]->{x}`) are parsed into real AST rather than stringified literally.
     ScalarInterp(Box<Expr>),
+
     /// `@var`, `@var[1..3]`, `@var{'a','b'}` — whole-array or slice interpolation.  Like `ScalarInterp`, holds the full
     /// expression.
     ArrayInterp(Box<Expr>),
+
     ExprInterp(Box<Expr>),
+
     /// `(?{code})` — raw text for stringification + parsed code.
     RegexCode(String, Box<Expr>),
+
     /// `(??{code})` — postponed regex code block.
     RegexCondCode(String, Box<Expr>),
+
     /// `\N{CHARNAME}` or `\N{U+XXXX}` — named Unicode character.  Preserves the original name for tooling (formatters,
     /// linters) while storing the resolved code point.  The string content already contains the resolved character in
     /// the surrounding `Const` segments; this variant exists for round-trip fidelity and will be emitted when the body
@@ -355,9 +405,11 @@ pub enum BinOp {
     Div,
     Mod,
     Pow,
+
     // String
     Concat,
     Repeat,
+
     // Numeric comparison
     NumEq,
     NumNe,
@@ -366,6 +418,7 @@ pub enum BinOp {
     NumLe,
     NumGe,
     Spaceship,
+
     // String comparison
     StrEq,
     StrNe,
@@ -374,31 +427,41 @@ pub enum BinOp {
     StrLe,
     StrGe,
     StrCmp,
+
     /// `isa` — class-instance test (feature-gated).
     Isa,
+
     /// `~~` — smartmatch (experimental, feature-gated).
     SmartMatch,
+
     // Logical
     And,
     Or,
     DefinedOr,
+
     /// `^^` — logical exclusive or.
     LogicalXor,
     LowAnd,
     LowOr,
     LowXor,
+
     // Bitwise
     BitAnd,
     BitOr,
     BitXor,
+
     /// `&.` — string-bitwise AND (feature 'bitwise').
     StringBitAnd,
+
     /// `|.` — string-bitwise OR.
     StringBitOr,
+
     /// `^.` — string-bitwise XOR.
     StringBitXor,
+
     ShiftLeft,
     ShiftRight,
+
     // Binding
     Binding,
     NotBinding,
@@ -433,26 +496,37 @@ pub enum ArrowTarget {
     ArrayElem(Box<Expr>),
     HashElem(Box<Expr>),
     MethodCall(String, Vec<Expr>),
+
     /// `$ref->@*` — whole-array postfix deref.
     DerefArray,
+
     /// `$ref->%*` — whole-hash postfix deref.
     DerefHash,
+
     /// `$ref->$*` — scalar postfix deref.
     DerefScalar,
+
     /// `$ref->&*` — code postfix deref.
     DerefCode,
+
     /// `$ref->**` — glob postfix deref.
     DerefGlob,
+
     /// `$ref->@[indices]` — array slice by positions.
     ArraySliceIndices(Box<Expr>),
+
     /// `$ref->@{keys}` — slice of hash returning values as array.
     ArraySliceKeys(Box<Expr>),
+
     /// `$ref->%[indices]` — key/value pairs from an array (indices paired with values).
     KvSliceIndices(Box<Expr>),
+
     /// `$ref->%{keys}` — key/value pairs from a hash.
     KvSliceKeys(Box<Expr>),
+
     /// `$obj->$method(args)` dynamic method dispatch.
     DynMethod(Box<Expr>, Vec<Expr>),
+
     /// `$ref->$#*` — postfix last-index of an array reference, equivalent to `$#{$ref}`.  Requires coordinated lexer
     /// handling: the sequence `$#*` after `->` is consumed as a unit because the lexer otherwise treats the `#` as the
     /// start of a comment.
@@ -496,6 +570,7 @@ pub enum PhaserKind {
     Init,
     Check,
     Unitcheck,
+
     /// `ADJUST { ... }` — runs during object construction (5.38+, Corinna).
     Adjust,
 }
@@ -513,8 +588,10 @@ pub struct VarDecl {
     pub sigil: Sigil,
     pub name: String,
     pub span: Span,
+
     /// Attributes on the variable declaration: `my $x : Foo`.
     pub attributes: Vec<Attribute>,
+
     /// Reference-declaration form: `my \$x` binds `$x` as an alias (via the `declared_refs` feature, 5.26+).  The RHS
     /// of the enclosing assignment must be a matching reference.  When `false`, this is a normal copy-initialized
     /// variable.
@@ -525,16 +602,21 @@ pub struct VarDecl {
 #[derive(Clone, Debug)]
 pub struct SubDecl {
     pub name: String,
+
     /// Lexical scope for `my sub`, `state sub`, `our sub`.  `None` for regular package subs.
     pub scope: Option<DeclScope>,
+
     /// Paren-form prototype from pre-signatures Perl (e.g. `($$)`, `(\@\%)`).  Stored as raw bytes.  Mutually exclusive
     /// with `signature` (the `signatures` feature controls which path parses the paren-form).  A `:prototype(...)`
     /// attribute shows up in `attributes` and coexists with either.
     pub prototype: Option<String>,
+
     pub attributes: Vec<Attribute>,
+
     /// Parsed parameter signature from 5.20+ signatures syntax.  Present when the `signatures` feature is active at the
     /// declaration site.
     pub signature: Option<Signature>,
+
     pub body: Block,
     pub span: Span,
 }
@@ -555,15 +637,20 @@ pub enum SigParam {
     /// `$name`, `$name = DEFAULT`, `$name //= DEFAULT`, `$name ||= DEFAULT`.  Positional.  When `default` is `None`,
     /// the parameter is required.
     Scalar { name: String, default: Option<(SigDefaultKind, Expr)>, span: Span },
+
     /// `@name` — slurpy, captures all remaining positional arguments.  Must appear last if at all.
     SlurpyArray { name: String, span: Span },
+
     /// `%name` — slurpy, captures remaining name/value pairs.  Must appear last if at all.
     SlurpyHash { name: String, span: Span },
+
     /// `$` — anonymous scalar placeholder; accepts a value without binding it.  Optional `default` for `$ = expr` or
     /// `$=` forms.
     AnonScalar { default: Option<(SigDefaultKind, Expr)>, span: Span },
+
     /// `@` — anonymous slurpy array (consumes remaining positional args without binding).
     AnonArray { span: Span },
+
     /// `%` — anonymous slurpy hash.
     AnonHash { span: Span },
 }
@@ -573,8 +660,10 @@ pub enum SigParam {
 pub enum SigDefaultKind {
     /// `= expr` — use default when argument is not provided.
     Eq,
+
     /// `//= expr` — use default when argument is missing or undef (5.38+).
     DefinedOr,
+
     /// `||= expr` — use default when argument is missing or false (5.38+).
     LogicalOr,
 }
@@ -707,6 +796,7 @@ pub enum FormatLine {
 pub enum FormatPart {
     /// Run of literal text (tildes already normalized to spaces).
     Literal(String),
+
     /// Field specifier.
     Field(FormatField),
 }
@@ -724,8 +814,10 @@ pub struct ClassDecl {
     pub name: String,
     pub version: Option<String>,
     pub attributes: Vec<Attribute>,
+
     /// `None` for statement form (`class Foo;`).
     pub body: Option<Block>,
+
     pub span: Span,
 }
 
@@ -734,7 +826,9 @@ pub struct ClassDecl {
 pub struct FieldDecl {
     pub var: VarDecl,
     pub attributes: Vec<Attribute>,
+
     /// Default expression with operator kind (`=`, `//=`, `||=`).
     pub default: Option<(SigDefaultKind, Expr)>,
+
     pub span: Span,
 }

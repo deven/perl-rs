@@ -29,7 +29,6 @@ pub struct SmallString {
 
 impl SmallString {
     // ── Constructors ──────────────────────────────────────────────
-
     /// Create an empty `SmallString`.
     pub fn new() -> Self {
         SmallString { buf: [0; SMALL_STRING_MAX], len: 0, is_utf8: false }
@@ -68,7 +67,6 @@ impl SmallString {
     }
 
     // ── Accessors ─────────────────────────────────────────────────
-
     /// The string content as a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
@@ -100,7 +98,6 @@ impl SmallString {
     }
 
     // ── Conversion to heap-allocated PerlString ───────────────────
-
     /// Promote to a heap-allocated `PerlString`.  This is a one-way operation — used when the string needs to grow
     /// beyond [`SMALL_STRING_MAX`] bytes or when a `PerlString` is required.
     pub fn to_perl_string(&self) -> PerlString {
@@ -109,7 +106,6 @@ impl SmallString {
     }
 
     // ── Numeric parsing (delegates to PerlString logic) ───────────
-
     /// Parse as i64 with Perl's numeric conversion rules.
     pub fn parse_iv(&self) -> i64 {
         // Re-use PerlString's parsing by creating a temporary.  This is a cold path — numeric conversion of a
@@ -124,7 +120,6 @@ impl SmallString {
 }
 
 // ── Trait impls ───────────────────────────────────────────────────
-
 impl Default for SmallString {
     fn default() -> Self {
         Self::new()
@@ -159,7 +154,6 @@ impl From<SmallString> for Bytes {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;

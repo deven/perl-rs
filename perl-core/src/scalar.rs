@@ -75,7 +75,6 @@ pub struct Scalar {
 
 impl Scalar {
     // ── Constructors ──────────────────────────────────────────────
-
     /// Create an undef scalar (no flags set, no valid representations).
     pub fn new_undef() -> Self {
         Scalar { flags: ScalarFlags::EMPTY, int: 0, num: 0.0, bytes: PerlStringSlot::None, reference: None, magic: None, stash: None }
@@ -111,7 +110,6 @@ impl Scalar {
     }
 
     // ── Flag accessors ────────────────────────────────────────────
-
     /// The current flags.
     pub fn flags(&self) -> ScalarFlags {
         self.flags
@@ -180,7 +178,6 @@ impl Scalar {
     }
 
     // ── Integer access (with lazy coercion) ───────────────────────
-
     /// Get the integer value, coercing from other representations if needed.  Caches the result by setting INT_VALID.
     pub fn get_int(&mut self) -> i64 {
         if self.flags.contains(ScalarFlags::INT_VALID) {
@@ -218,7 +215,6 @@ impl Scalar {
     }
 
     // ── Float access (with lazy coercion) ─────────────────────────
-
     /// Get the float value, coercing from other representations if needed.  Caches the result by setting NUM_VALID.
     pub fn get_num(&mut self) -> f64 {
         if self.flags.contains(ScalarFlags::NUM_VALID) {
@@ -253,7 +249,6 @@ impl Scalar {
     }
 
     // ── String access (with lazy coercion) ────────────────────────
-
     /// Get a string view, coercing from other representations if needed.  Caches the result by setting STR_VALID.
     /// Returns `None` only for undef.
     pub fn get_bytes(&mut self) -> Option<&[u8]> {
@@ -318,7 +313,6 @@ impl Scalar {
     }
 
     // ── Reference access ──────────────────────────────────────────
-
     /// Get the reference target, if this is a reference.
     pub fn get_rv(&self) -> Option<&Value> {
         if self.flags.contains(ScalarFlags::REF_VALID) { self.reference.as_ref() } else { None }
@@ -334,7 +328,6 @@ impl Scalar {
     }
 
     // ── Magic ─────────────────────────────────────────────────────
-
     /// Attach a magic chain.  Sets MAGICAL flag.
     pub fn set_magic(&mut self, magic: MagicChain) {
         self.magic = Some(Box::new(magic));
@@ -342,7 +335,6 @@ impl Scalar {
     }
 
     // ── Blessing ──────────────────────────────────────────────────
-
     /// Bless this scalar into a package.
     pub fn bless(&mut self, stash: Arc<Stash>) {
         self.stash = Some(stash);
@@ -354,7 +346,6 @@ impl Scalar {
     }
 
     // ── Read-only ─────────────────────────────────────────────────
-
     /// Mark this scalar as read-only.
     pub fn set_readonly(&mut self) {
         self.flags.insert(ScalarFlags::READONLY);
@@ -362,7 +353,6 @@ impl Scalar {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
 /// Format a float the way Perl does.  Perl uses Gconvert which is essentially `sprintf("%.15g", n)` — shortest
 /// representation that round-trips.  Rust doesn't have %g, so we approximate: use Display (which gives shortest round-
 /// trip representation), falling back to LowerExp for very large/small values.
@@ -385,7 +375,6 @@ fn string_is_false(slot: &PerlStringSlot) -> bool {
 }
 
 // ── Trait impls ──────────────────────────────────────────────────
-
 impl fmt::Debug for Scalar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("Scalar");
@@ -413,7 +402,6 @@ impl fmt::Debug for Scalar {
 }
 
 // ── Tests ────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,7 +534,6 @@ mod tests {
     }
 
     // ── Truthiness tests ──────────────────────────────────────
-
     #[test]
     fn undef_is_false() {
         let sv = Scalar::new_undef();
@@ -635,7 +622,6 @@ mod tests {
     }
 
     // ── Stringification tests ─────────────────────────────────
-
     #[test]
     fn stringify_undef() {
         let mut sv = Scalar::new_undef();

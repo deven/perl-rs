@@ -8,6 +8,7 @@
 pub struct Span {
     /// Byte offset of the first character.
     pub start: u32,
+
     /// Byte offset one past the last character.
     pub end: u32,
 }

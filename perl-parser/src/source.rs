@@ -18,7 +18,6 @@ use std::collections::VecDeque;
 mod tests;
 
 // ── LexerLine ─────────────────────────────────────────────────────
-
 /// A single line of source code with a byte-scanning cursor.
 ///
 /// The lexer's working unit.  All fields are `pub(crate)` — the lexer freely reads and writes `pos` for cursor control,
@@ -27,15 +26,20 @@ mod tests;
 pub(crate) struct LexerLine {
     /// 1-based line number in the original source.
     pub number: usize,
+
     /// Byte offset of the start of this line in the original source.
     pub offset: usize,
+
     /// Line content without line ending.  When inside an indented heredoc, the required indentation prefix has been
     /// stripped.
     pub line: Bytes,
+
     /// Whether this line was terminated by a newline in the source.
     pub terminated: bool,
+
     /// Current scanning position within `line`.
     pub pos: usize,
+
     /// Whether the line contains only ASCII bytes (all < 0x80).  Computed for free during newline scanning and used to
     /// skip UTF-8 decoding and NFC normalization for all-ASCII lines.
     pub ascii_only: bool,
@@ -99,7 +103,6 @@ impl LexerLine {
 }
 
 // ── LexerSource ───────────────────────────────────────────────────
-
 /// Internal heredoc context saved when entering a heredoc body.
 struct HeredocContext {
     tag: Bytes,
@@ -212,6 +215,7 @@ impl LexerSource {
                 return (Bytes::from(utf8), true);
             }
         }
+
         // Heuristic: check for UTF-16 without BOM by looking at the first few bytes for a null-interleaving pattern.
         if src.len() >= 4 {
             let looks_le = src[1] == 0 && src[3] == 0 && src[0] != 0 && src[2] != 0;
@@ -225,6 +229,7 @@ impl LexerSource {
                 return (Bytes::from(utf8), true);
             }
         }
+
         // No BOM, not UTF-16 — pass through unchanged (zero-copy).
         (src, false)
     }
@@ -255,6 +260,7 @@ impl LexerSource {
             } else {
                 unit as u32
             };
+
             // Encode code point as UTF-8.
             if let Some(c) = char::from_u32(cp) {
                 let mut buf = [0u8; 4];
@@ -530,7 +536,6 @@ impl LexerSource {
     }
 
     // ── Internal methods ──────────────────────────────────────────
-
     /// Read the next raw line from the source buffer.
     ///
     /// Splits on `\n`, strips `\r` before `\n` (CRLF normalization).  Standalone `\r` not followed by `\n` is preserved

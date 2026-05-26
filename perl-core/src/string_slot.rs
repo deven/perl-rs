@@ -34,7 +34,6 @@ pub enum PerlStringSlot {
 
 impl PerlStringSlot {
     // ── Constructors ──────────────────────────────────────────────
-
     /// Set the cache from a `&str`.  Uses `Inline` if it fits.
     pub fn set_str(&mut self, s: &str) {
         if s.len() <= SLOT_INLINE_MAX {
@@ -69,7 +68,6 @@ impl PerlStringSlot {
     }
 
     // ── Accessors ─────────────────────────────────────────────────
-
     /// Whether a string is cached.
     pub fn is_some(&self) -> bool {
         !matches!(self, PerlStringSlot::None)
@@ -140,7 +138,6 @@ impl PerlStringSlot {
 }
 
 // ── Trait impls ───────────────────────────────────────────────────
-
 impl fmt::Debug for PerlStringSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -159,7 +156,6 @@ impl fmt::Debug for PerlStringSlot {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;

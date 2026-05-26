@@ -34,71 +34,96 @@ impl Features {
     pub const EMPTY: Features = Features(0);
 
     // ── Individual features ───────────────────────────────────
-
     /// `say` — makes `say` a keyword (5.10+).
     pub const SAY: Features = Features(1 << 0);
+
     /// `state` — makes `state` a keyword (5.10+).
     pub const STATE: Features = Features(1 << 1);
+
     /// `switch` — enables `given`/`when`/`default` (5.10, removed from the `:5.36` bundle and later).
     pub const SWITCH: Features = Features(1 << 2);
+
     /// `smartmatch` — the `~~` operator.  Enabled by default through the `:5.40` bundle, removed from `:5.42`.
     pub const SMARTMATCH: Features = Features(1 << 3);
+
     /// `evalbytes` — makes `evalbytes` a keyword (5.16+).
     pub const EVALBYTES: Features = Features(1 << 4);
+
     /// `current_sub` — makes `__SUB__` work (5.16+).
     pub const CURRENT_SUB: Features = Features(1 << 5);
+
     /// `fc` — makes `fc` a keyword (5.16+).
     pub const FC: Features = Features(1 << 6);
+
     /// `postderef` — the historical name for postfix dereference syntax *outside* interpolating strings.  As of Perl
     /// 5.24 the syntax is always on regardless of this flag, so the bit is effectively cosmetic: enabling or disabling
     /// it has no parsing effect.  Kept as a distinct flag from [`Features::POSTDEREF_QQ`] so that `use feature
     /// 'postderef';` doesn't accidentally enable the qq extension.
     pub const POSTDEREF: Features = Features(1 << 7);
+
     /// `postderef_qq` — postfix dereference inside interpolating strings (5.20+, stable in `:5.24`+).  This is the flag
     /// that actually gates parsing behavior; plain `postderef` is a no-op but distinct.
     pub const POSTDEREF_QQ: Features = Features(1 << 27);
+
     /// `signatures` — `sub foo ($x, $y) { ... }` parses as a signature rather than a prototype (stable in `:5.36`+).
     pub const SIGNATURES: Features = Features(1 << 8);
+
     /// `refaliasing` — `\$x = \$y;` (experimental, 5.22+).
     pub const REFALIASING: Features = Features(1 << 9);
+
     /// `declared_refs` — `my \$x = \$y;` (5.26+).
     pub const DECLARED_REFS: Features = Features(1 << 10);
+
     /// `isa` — the `isa` infix operator (stable in `:5.36`+).
     pub const ISA: Features = Features(1 << 11);
+
     /// `try` — `try { ... } catch ($e) { ... }` (enters the `:5.40` bundle).
     pub const TRY: Features = Features(1 << 12);
+
     /// `defer` — `defer { ... }` (experimental, 5.36+).
     pub const DEFER: Features = Features(1 << 13);
+
     /// `class` — `class Name { field $x; method ... }` (experimental, 5.38+).
     pub const CLASS: Features = Features(1 << 14);
+
     /// `extra_paired_delimiters` — more delimiter pairs for quote-like operators (experimental, 5.36+).
     pub const EXTRA_PAIRED_DELIMITERS: Features = Features(1 << 15);
+
     /// `bareword_filehandles` — bareword filehandles recognized; in `:default`, dropped from `:5.38` and later.
     pub const BAREWORD_FILEHANDLES: Features = Features(1 << 16);
+
     /// `indirect` — indirect method call syntax (`new Foo`); in `:default`, dropped from `:5.36` and later.
     pub const INDIRECT: Features = Features(1 << 17);
+
     /// `apostrophe_as_package_separator` — `'` acts as `::` in source-level names.  In `:default`, dropped from
     /// `:5.42`.
     pub const APOSTROPHE_AS_PACKAGE_SEPARATOR: Features = Features(1 << 18);
+
     /// `multidimensional` — `$h{a,b}` lookup emulation; in `:default`, dropped from `:5.36` and later.
     pub const MULTIDIMENSIONAL: Features = Features(1 << 19);
+
     /// `unicode_strings` (5.12+).
     pub const UNICODE_STRINGS: Features = Features(1 << 20);
+
     /// `unicode_eval` (5.16+).
     pub const UNICODE_EVAL: Features = Features(1 << 21);
+
     /// `bitwise` — numeric vs. string-bitwise op selection (stable in `:5.28`+).
     pub const BITWISE: Features = Features(1 << 22);
+
     /// `module_true` — modules don't need an explicit trailing true value (enters the `:5.38` bundle).
     pub const MODULE_TRUE: Features = Features(1 << 23);
+
     /// `lexical_subs` — `my sub` etc.  Enabled unconditionally since 5.26, tracked here for pre-5.26 source.
     pub const LEXICAL_SUBS: Features = Features(1 << 24);
+
     /// `keyword_any` — experimental `any` operator.
     pub const KEYWORD_ANY: Features = Features(1 << 25);
+
     /// `keyword_all` — experimental `all` operator.
     pub const KEYWORD_ALL: Features = Features(1 << 26);
 
     // ── Pre-made bundles ──────────────────────────────────────
-
     /// The `:default` bundle — features active before any `use feature` or `use vN.M` declaration.
     pub const DEFAULT: Features =
         Features(Self::INDIRECT.0 | Self::MULTIDIMENSIONAL.0 | Self::BAREWORD_FILEHANDLES.0 | Self::APOSTROPHE_AS_PACKAGE_SEPARATOR.0 | Self::SMARTMATCH.0);
@@ -136,7 +161,6 @@ impl Features {
     );
 
     // ── Predicates / mutation ─────────────────────────────────
-
     /// True if all features in `other` are also in `self`.
     pub const fn contains(self, other: Features) -> bool {
         (self.0 & other.0) == other.0
@@ -177,6 +201,7 @@ pub fn resolve_feature_name(name: &str) -> Option<Features> {
         "evalbytes" => Features::EVALBYTES,
         "current_sub" => Features::CURRENT_SUB,
         "fc" => Features::FC,
+
         // `postderef` and `postderef_qq` are distinct.  Plain `postderef` is historical and effectively cosmetic
         // (syntax is always on since 5.24); `postderef_qq` is the flag that actually gates interpolation behavior.
         "postderef" => Features::POSTDEREF,
@@ -214,10 +239,12 @@ fn resolve_bundle_alias(tail: &str) -> Option<Features> {
         "default" => return Some(Features::DEFAULT),
         _ => {}
     }
+
     // `5.N` or `5.N.M` — parse first two dotted components.
     let mut it = tail.split('.');
     let major: u32 = it.next()?.parse().ok()?;
     let minor: u32 = it.next()?.parse().ok()?;
+
     // Third component, if present, is ignored per perlfeature.
     Some(version_bundle(major, minor))
 }
@@ -234,6 +261,7 @@ fn version_bundle(major: u32, minor: u32) -> Features {
         // Unknown major — fall back to latest known.
         return bundle_5_42();
     }
+
     // Odd minors map to the prior even minor.
     let minor = if minor % 2 == 1 { minor - 1 } else { minor };
     match minor {
@@ -311,7 +339,6 @@ fn bundle_5_42() -> Features {
 }
 
 // ── Bit-op traits ─────────────────────────────────────────────
-
 impl BitOr for Features {
     type Output = Features;
     fn bitor(self, rhs: Features) -> Features {
@@ -346,7 +373,6 @@ impl Not for Features {
 }
 
 // ── Pragmas aggregate ─────────────────────────────────────────
-
 /// All parser-visible pragma state for the current lexical scope.
 ///
 /// Currently tracks the `feature` pragma (via [`Features`]) and the `utf8` pragma.  Future pragmas that affect parsing
@@ -354,6 +380,7 @@ impl Not for Features {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pragmas {
     pub features: Features,
+
     /// `use utf8` — source treated as UTF-8.  Identifiers may contain non-ASCII characters, string literal bytes are
     /// interpreted as Unicode code points.
     pub utf8: bool,

@@ -23,7 +23,6 @@ use std::sync::Arc;
 mod tests;
 
 // ─── Prototype representation ─────────────────────────────────────
-
 /// A parsed Perl subroutine prototype.
 ///
 /// Perl stores prototypes as raw strings like `"$$"`, `"\@;@"`, `"&@"`.  We parse once at declaration time into a
@@ -32,9 +31,11 @@ mod tests;
 pub struct SubPrototype {
     /// The raw prototype string as written in the source.  Preserved for round-tripping and diagnostics.
     pub raw: String,
+
     /// Number of required slots at the front of `slots`.  The remaining `slots.len() - required` slots are optional
     /// (after the `;` separator in the raw prototype).
     pub required: usize,
+
     /// Ordered list of argument slots.
     pub slots: Vec<ProtoSlot>,
 }
@@ -44,20 +45,28 @@ pub struct SubPrototype {
 pub enum ProtoSlot {
     /// `$` — scalar expression.
     Scalar,
+
     /// `_` — scalar expression, defaults to `$_` if omitted.
     DefaultedScalar,
+
     /// `&` — block or coderef.
     Block,
+
     /// `*` — typeglob.
     Glob,
+
     /// `+` — array or hash (Perl 5.14+).  Not auto-referenced.
     ArrayOrHash,
+
     /// `\X` — auto-reference the argument, which must be of the given reference kind.
     AutoRef(RefKind),
+
     /// `\[...]` — auto-reference, with the argument allowed to be any one of the listed kinds.
     AutoRefOneOf(Vec<RefKind>),
+
     /// `@` — absorb all remaining arguments as a list.  Always last.
     SlurpyList,
+
     /// `%` — absorb all remaining arguments as key-value pairs.  Always last.
     SlurpyHash,
 }
@@ -67,12 +76,16 @@ pub enum ProtoSlot {
 pub enum RefKind {
     /// `$` — scalar
     Scalar,
+
     /// `@` — array
     Array,
+
     /// `%` — hash
     Hash,
+
     /// `&` — subroutine
     Sub,
+
     /// `*` — typeglob
     Glob,
 }
@@ -81,6 +94,7 @@ pub enum RefKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrototypeError {
     pub message: String,
+
     /// Byte offset into the prototype string where the error was detected.
     pub position: usize,
 }
@@ -224,7 +238,6 @@ fn ref_kind_from_byte(b: u8) -> Option<RefKind> {
 }
 
 // ─── Sub information ──────────────────────────────────────────────
-
 /// Everything the parser knows about a subroutine.
 ///
 /// `name` is the bare name (no `Foo::` prefix); the containing package is implicit from which `Namespace` holds this
@@ -234,13 +247,13 @@ pub struct SubInfo {
     pub name: Arc<str>,
     pub prototype: Option<SubPrototype>,
     pub attributes: Vec<String>,
+
     /// `true` if we've only seen a forward declaration so far (`sub foo ($$);` without a body).  Cleared when a full
     /// definition is encountered.
     pub forward_declaration: bool,
 }
 
 // ─── Import target ────────────────────────────────────────────────
-
 /// The target a local name resolves to in another package.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportTarget {
@@ -249,13 +262,14 @@ pub struct ImportTarget {
 }
 
 // ─── Single-package namespace ─────────────────────────────────────
-
 /// One Perl package's stash: its locally-declared subs and its imports.
 #[derive(Clone, Debug, Default)]
 pub struct Namespace {
     pub name: Arc<str>,
+
     /// Subs declared in this package, keyed by bare name.
     pub subs: BTreeMap<Arc<str>, SubInfo>,
+
     /// Imports pulled into this package: local_name → (target_package, target_name).  Populated by `use` (not yet
     /// implemented; API ready for it).
     pub imports: BTreeMap<Arc<str>, ImportTarget>,
@@ -281,7 +295,6 @@ impl Namespace {
 }
 
 // ─── Symbol table: tree of all packages ───────────────────────────
-
 #[derive(Clone, Debug, Default)]
 pub struct SymbolTable {
     namespaces: HashMap<Arc<str>, Namespace>,

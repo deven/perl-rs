@@ -9,6 +9,7 @@ fn parse(src: &str) -> Program {
 
 fn parse_expr_str(src: &str) -> Expr {
     let prog = parse(src);
+
     // Find the first expression statement (skipping use/no declarations from `use feature` etc.).
     for stmt in &prog.statements {
         if let StmtKind::Expr(e) = &stmt.kind {
@@ -353,6 +354,7 @@ fn parse_postfix_if() {
 #[test]
 fn parse_string_concat() {
     let e = parse_expr_str(r#""hello" . " " . "world";"#);
+
     // Should be left-associative: ("hello" . " ") . "world"
     match &e.kind {
         ExprKind::BinOp(BinOp::Concat, _, right) => {
@@ -451,6 +453,7 @@ fn parse_package() {
 fn parse_multiple_statements() {
     let prog = parse("my $x = 1; my $y = 2; $x + $y;");
     assert_eq!(prog.statements.len(), 3);
+
     // First two are `my` declarations with initializers, so Stmt::Expr wrapping Assign(Decl, ...).
     let (_s0, _v0) = decl_vars(&prog.statements[0]);
     let (_s1, _v1) = decl_vars(&prog.statements[1]);
@@ -469,6 +472,7 @@ fn parse_prefix_negation() {
 #[test]
 fn parse_logical_operators() {
     let e = parse_expr_str("$a && $b || $c;");
+
     // || is lower precedence than &&, so: ($a && $b) || $c
     assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Or, _, _)));
 }
@@ -633,6 +637,7 @@ fn interp_parts(src: &str) -> Vec<InterpPart> {
     let e = parse_expr_str(src);
     match e.kind {
         ExprKind::InterpolatedString(Interpolated(parts)) => parts,
+
         // Some single-subscript strings collapse via merge into a non-interpolated StringLit in degenerate cases —
         // callers pass non-degenerate sources.
         other => panic!("expected InterpolatedString, got {other:?} for {src:?}"),
@@ -660,6 +665,7 @@ fn interp_hash_elem_arrow() {
     match &e.kind {
         ExprKind::ArrowDeref(recv, ArrowTarget::HashElem(k)) => {
             assert!(matches!(recv.kind, ExprKind::ScalarVar(ref n) if n == "h"));
+
             // Key is a bareword (autoquoted by the subscript rule in the parser).
             assert!(matches!(k.kind, ExprKind::StringLit(ref s) if s == "key"));
         }
@@ -717,6 +723,7 @@ fn interp_chain_two_hash_levels() {
     // "$h->{a}{b}" — arrow before first, implicit between.  Hash elem wrapped in hash elem.
     let parts = interp_parts(r#""$h->{a}{b}";"#);
     let e = scalar_part(&parts, 0);
+
     // Outer: HashElem(ArrowDeref(..., HashElem(h, a)), b)
     match &e.kind {
         ExprKind::HashElem(inner, k2) => {
@@ -772,6 +779,7 @@ fn interp_chain_three_levels() {
     // "$h->{a}->{b}->{c}" — three arrow-hashes.
     let parts = interp_parts(r#""$h->{a}->{b}->{c}";"#);
     let e = scalar_part(&parts, 0);
+
     // Triple-nested ArrowDeref(HashElem).
     fn unwrap_hash_arrow(expr: &Expr) -> (&Expr, &Expr) {
         match &expr.kind {
@@ -903,6 +911,7 @@ fn interp_chain_mid_string() {
     let parts = interp_parts(r#""a $h->{key} b";"#);
     assert_eq!(parts.len(), 3);
     assert!(matches!(&parts[0], InterpPart::Const(s) if s == "a "));
+
     // Middle is the chain.
     let e = scalar_part(&parts, 1);
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, ArrowTarget::HashElem(_))));
@@ -955,6 +964,7 @@ fn interp_plain_scalar_no_subscript() {
 fn interp_trailing_literal_bracket() {
     // "$a [0]" — space before `[` means it's NOT a subscript.  The literal `[` and `]` stay as ConstSegment.
     let parts = interp_parts(r#""$a [0]";"#);
+
     // Parts: ScalarInterp(a), Const(" [0]").
     assert_eq!(parts.len(), 2);
     assert_eq!(scalar_interp_name(&parts[0]), Some("a"));
@@ -1097,6 +1107,7 @@ fn regex_interp_subscript() {
     match &e.kind {
         ExprKind::Regex(_, pat, _) => {
             let parts = &pat.0;
+
             // Expect at least one ScalarInterp with the chain.
             let has_chain = parts.iter().any(|p| {
                 matches!(
@@ -1240,6 +1251,7 @@ fn interp_array_expr_form_with_chain_inside() {
             _ => None,
         })
         .expect("expected an ExprInterp part");
+
     // Inside: anonymous array ref containing the chain.  AnonArray([ArrowDeref(h, HashElem(k))])
     match &expr_part.kind {
         ExprKind::AnonArray(items) => {
@@ -1468,6 +1480,7 @@ fn parse_empty_regex_space_not_flags() {
         },
         other => panic!("expected Binding, got {other:?}"),
     }
+
     // But with space: flags are NOT consumed.
     let e2 = parse_expr_str("$x =~ // gi;");
     match &e2.kind {
@@ -2129,6 +2142,7 @@ fn parse_defer() {
 fn parse_end_stops_parsing() {
     let src = "my $x = 1;\n__END__\nThis is not code.\n";
     let prog = parse(src);
+
     // Should have 2 statements: my decl and DataEnd
     assert_eq!(prog.statements.len(), 2);
     match &prog.statements[1].kind {
@@ -2240,6 +2254,7 @@ fn parse_end_autoquoted_fat_comma() {
     // __END__ => val — autoquoted as a string, does NOT trigger EOF.
     let prog = parse("my %h = (__END__ => 1);\n");
     assert_eq!(prog.statements.len(), 1);
+
     // Should be a my declaration with a hash assignment, not EOF.
     assert!(matches!(prog.statements[0].kind, StmtKind::Expr(_)));
 }
@@ -2319,6 +2334,7 @@ fn parse_minus_line_in_hash_subscript_autoquotes() {
 #[test]
 fn parse_pod_skipped() {
     let prog = parse("my $x = 1;\n\n=pod\n\nThis is pod.\n\n=cut\n\nmy $y = 2;\n");
+
     // Should see both my declarations, pod is invisible.  Each is Stmt::Expr wrapping Assign(Decl(My), _).
     let my_count = prog
         .statements
@@ -2444,6 +2460,7 @@ fn parse_decl_in_expr_context() {
 #[test]
 fn parse_qx_string() {
     let e = parse_expr_str("qx{ls -la};");
+
     // qx produces an interpolated string (backtick kind)
     assert!(matches!(e.kind, ExprKind::InterpolatedString(_) | ExprKind::StringLit(_)));
 }
@@ -2622,6 +2639,7 @@ fn parse_glob_deref() {
 #[test]
 fn parse_chained_arrow_calls() {
     let e = parse_expr_str("$obj->foo->bar->baz;");
+
     // Should be deeply nested MethodCall(MethodCall(MethodCall(...)))
     match &e.kind {
         ExprKind::MethodCall(inner, name, _) => {
@@ -2851,6 +2869,7 @@ fn parse_pragmas(src: &str) -> crate::pragma::Pragmas {
 #[test]
 fn pragma_default_has_default_bundle() {
     let p = parse_pragmas("my $x = 1;");
+
     // Pre-`use feature` state: the `:default` bundle (indirect, multidimensional, bareword_filehandles,
     // apostrophe_as_package_separator, smartmatch).
     assert_eq!(p.features, Features::DEFAULT);
@@ -2863,8 +2882,10 @@ fn pragma_default_has_default_bundle() {
 fn pragma_use_feature_single() {
     let p = parse_pragmas("use feature 'signatures';");
     assert!(p.features.contains(Features::SIGNATURES));
+
     // Other non-default features untouched.
     assert!(!p.features.contains(Features::SAY));
+
     // :default features still present (use feature just adds).
     assert!(p.features.contains(Features::INDIRECT));
 }
@@ -2881,6 +2902,7 @@ fn pragma_no_feature_removes_specific() {
     // Enable a non-default feature, then disable it.
     let p = parse_pragmas("use feature 'signatures';\nno feature 'signatures';\n");
     assert!(!p.features.contains(Features::SIGNATURES));
+
     // :default still intact.
     assert!(p.features.contains(Features::INDIRECT));
 }
@@ -3139,6 +3161,7 @@ fn sig_with_prototype_attribute() {
     let s = parse_sub("use feature 'signatures'; sub f :prototype($$) ($x, $y) { }");
     let sig = s.signature.expect("signature present");
     assert_eq!(sig.params.len(), 2);
+
     // Attribute is captured too.
     let has_proto_attr = s.attributes.iter().any(|a| a.name == "prototype" && a.value.as_deref() == Some("$$"));
     assert!(has_proto_attr, "prototype attribute should be present");
@@ -3168,6 +3191,7 @@ sub inner ($) { 2 }
 }
 ";
     let prog = parse(src);
+
     // Find `outer` at top level.
     let outer = prog
         .statements
@@ -3203,6 +3227,7 @@ sub inner ($) { 2 }
 #[test]
 fn sig_anon_sub_with_signature() {
     let prog = parse("use feature 'signatures'; my $f = sub ($x) { $x };");
+
     // Find the AnonSub expression in the statements.
     let mut found = false;
     for stmt in &prog.statements {
@@ -3567,6 +3592,7 @@ fn class_is_bareword_without_feature() {
 fn try_is_ident_without_feature() {
     // `my $try = try();` — `try` as a function call.
     let prog = parse("my $try = try();");
+
     // Should parse as a normal expression statement (Decl assignment with FuncCall).  The inner expression is
     // FuncCall("try", []), not a Try statement.
     assert!(!prog.statements.iter().any(|s| matches!(s.kind, StmtKind::Try(_))), "must not parse as Try without feature");
@@ -3814,6 +3840,7 @@ fn format_terminator_with_trailing_ws() {
 fn format_indented_dot_does_not_terminate() {
     // A `.` not in column 0 is just literal content.
     let f = parse_fmt("format X =\n hello\n .\n.\n");
+
     // Two content lines (one " hello", one " ."), then the real `.` terminates.
     assert_eq!(f.lines.len(), 2);
     match &f.lines[1] {
@@ -4512,6 +4539,7 @@ fn parse_heredoc_two_stacked() {
     let src = "print <<A, <<B;\nbody A\nA\nbody B\nB\nafter\n";
     let prog = parse(src);
     assert_eq!(prog.statements.len(), 2);
+
     // First statement: print with two heredoc args.
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::PrintOp(name, _, args), .. }) => {
@@ -4550,8 +4578,10 @@ fn parse_heredoc_stacked_mixed_quoting() {
             assert_eq!(args.len(), 3);
             // <<A interpolates (A's body has $x).
             assert!(matches!(&args[0].kind, ExprKind::InterpolatedString(_)));
+
             // <<'B' does not interpolate.
             assert!(matches!(&args[1].kind, ExprKind::StringLit(s) if s == "B: $x\n"));
+
             // <<"C" interpolates.
             assert!(matches!(&args[2].kind, ExprKind::InterpolatedString(_)));
         }
@@ -4623,6 +4653,7 @@ fn parse_heredoc_with_concat_then_heredoc() {
     let src = "my $x = <<A . <<B;\nalpha\nA\nbeta\nB\n";
     let prog = parse(src);
     let init = decl_init(&prog.statements[0]);
+
     // Should be a Concat of two StringLits.
     match &init.kind {
         ExprKind::BinOp(BinOp::Concat, left, right) => {
@@ -4654,6 +4685,7 @@ fn torture_heredoc_arithmetic_stacked() {
     let src = "my $x = <<A + <<B + <<C;\n1\nA\n2\nB\n3\nC\n";
     let prog = parse(src);
     let init = decl_init(&prog.statements[0]);
+
     // Shape: Add(Add(heredoc_A, heredoc_B), heredoc_C).
     match &init.kind {
         ExprKind::BinOp(BinOp::Add, left, right) => {
@@ -4676,6 +4708,7 @@ fn torture_ref_to_expr_in_interp() {
     // `"${\(1 + 2)}"` — `${...}` with `\(expr)` inside.  This is a common Perl idiom for embedding arbitrary
     // expressions in interpolated strings.
     let parts = interp_parts(r#""${\(1 + 2)}";"#);
+
     // Expect: ExprInterp containing Ref(Paren(Add(1, 2))) or Ref(Add(1, 2)) — depends on paren handling.
     assert_eq!(parts.len(), 1);
     match &parts[0] {
@@ -4733,6 +4766,7 @@ OUTER\n";
     let prog = parse(src);
     assert!(!prog.statements.is_empty(), "should parse without error");
     let init = decl_init(&prog.statements[0]);
+
     // Outer is an InterpolatedString (heredoc with interpolation).
     assert!(matches!(init.kind, ExprKind::InterpolatedString(_)), "expected InterpolatedString for heredoc, got {:?}", init.kind);
 }
@@ -4851,6 +4885,7 @@ fn heredoc_backslash_form() {
     let src = "my $x = <<\\EOF;\nHello \\$name!\nEOF\n";
     let prog = parse(src);
     let init = decl_init(&prog.statements[0]);
+
     // Non-interpolating: `$name` stays literal.
     assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s.contains("$name")), "expected literal $name in body, got {:?}", init.kind);
 }
@@ -5221,6 +5256,7 @@ fn special_var_in_interpolation() {
 #[test]
 fn nested_ternary() {
     let e = parse_expr_str("$a ? $b ? 1 : 2 : 3;");
+
     // Right-associative: `$a ? ($b ? 1 : 2) : 3`.
     match &e.kind {
         ExprKind::Ternary(_, then_expr, else_expr) => {
@@ -5246,6 +5282,7 @@ fn until_loop() {
 #[test]
 fn chained_method_calls() {
     let e = parse_expr_str("$obj->method1->method2->method3;");
+
     // Outer: MethodCall(MethodCall(MethodCall($obj, "method1", []), "method2", []), "method3", []).
     // Note: `->method` produces MethodCall, not ArrowDeref.
     fn depth(e: &Expr) -> usize {
@@ -5335,6 +5372,7 @@ fn require_version() {
 fn data_section() {
     let src = "my $x = 1;\n__DATA__\nThis is data.\nMore data.\n";
     let prog = parse(src);
+
     // Should have at least 2 statements: my decl and DataEnd.
     assert!(prog.statements.len() >= 2);
     let has_data_end = prog.statements.iter().any(|s| matches!(s.kind, StmtKind::DataEnd(_, _)));
@@ -6477,6 +6515,7 @@ fn prec_ternary_right_assoc_else() {
         ExprKind::Ternary(_, middle, else_branch) => {
             // Middle is just $b, not a nested ternary.
             assert!(matches!(middle.kind, ExprKind::ScalarVar(_)), "expected ScalarVar in middle, got {:?}", middle.kind);
+
             // Else branch is the nested ternary.
             assert!(matches!(else_branch.kind, ExprKind::Ternary(_, _, _)), "expected Ternary in else branch, got {:?}", else_branch.kind);
         }
@@ -6618,6 +6657,7 @@ fn prec_chain_with_higher_prec_inside() {
         ExprKind::ChainedCmp(ops, operands) => {
             assert_eq!(ops.len(), 2);
             assert_eq!(operands.len(), 3);
+
             // Middle operand should be Add($b, 1), not just $b.
             assert!(matches!(operands[1].kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected Add as middle operand, got {:?}", operands[1].kind);
         }
@@ -6633,6 +6673,7 @@ fn prec_chain_with_parens_inside() {
         ExprKind::ChainedCmp(ops, operands) => {
             assert_eq!(ops.len(), 2);
             assert_eq!(operands.len(), 3);
+
             // Middle operand is the parenthesized equality (no Paren wrapper in AST).
             assert!(matches!(operands[1].kind, ExprKind::BinOp(BinOp::NumEq, _, _)), "expected NumEq as middle operand, got {:?}", operands[1].kind);
         }
@@ -8071,6 +8112,7 @@ fn postderef_nested_actually_nested() {
     // Original `postderef_nested_slice` test claimed to cover chaining but only had one level.  This one actually
     // chains: slice followed by arrow-array-elem.
     let e = parse_expr_stmt("$r->@[0, 1]->[0];");
+
     // Outer is ArrowDeref(_, ArrayElem(0)); inner is ArrowDeref($r, ArraySliceIndices([0, 1])).
     match &e.kind {
         ExprKind::ArrowDeref(inner, ArrowTarget::ArrayElem(idx)) => {
@@ -8109,12 +8151,14 @@ fn fc_named_unary_precedence() {
 #[test]
 fn catch_reactivates_with_try_feature() {
     let prog = parse("use feature 'try'; try { 1; } catch ($e) { 2; }");
+
     // Try stmt captured with a catch clause.
     let try_stmt = prog.statements.iter().find_map(|s| match &s.kind {
         StmtKind::Try(t) => Some(t),
         _ => None,
     });
     assert!(try_stmt.is_some(), "Try stmt must exist with feature active");
+
     // And the Try must have a catch clause with var $e.
     let try_ = try_stmt.unwrap();
     assert!(try_.catch_block.is_some(), "catch clause must be attached");
@@ -8157,6 +8201,7 @@ fn current_sub_inside_named_sub() {
             _ => None,
         })
         .expect("sub f");
+
     // Body contains a CurrentSub expression somewhere.
     let body_has_current_sub = sub.body.statements.iter().any(|s| match &s.kind {
         StmtKind::Expr(e) => matches!(e.kind, ExprKind::CurrentSub),
@@ -8842,6 +8887,7 @@ fn hard_map_outer_brace_is_block() {
     match &e.kind {
         ExprKind::ListOp(name, args) => {
             assert_eq!(name, "CORE::map");
+
             // First arg is the block (as AnonSub).
             assert!(matches!(args[0].kind, ExprKind::AnonSub(..)), "expected AnonSub block, got {:?}", args[0].kind);
         }
@@ -8856,11 +8902,13 @@ fn hard_map_nested_brace_is_hash() {
     match &e.kind {
         ExprKind::ListOp(name, args) => {
             assert_eq!(name, "CORE::map");
+
             // Outer: AnonSub wrapping the block.
             let body = match &args[0].kind {
                 ExprKind::AnonSub(_, _, _, block) => block,
                 other => panic!("expected AnonSub, got {other:?}"),
             };
+
             // Block body's single statement is an AnonHash expression.
             assert_eq!(body.statements.len(), 1);
             match &body.statements[0].kind {
@@ -9083,6 +9131,7 @@ fn hard_arrow_method_call() {
 fn hard_arrow_hash_deref() {
     // `$obj->{key};` — hash element via arrow.
     let e = parse_expr_str("$obj->{key};");
+
     // Either ArrowDeref(_, Hash("key")) or HashElem form — both are valid.
     assert!(matches!(e.kind, ExprKind::ArrowDeref(_, _) | ExprKind::HashElem(_, _)), "expected ArrowDeref or HashElem, got {:?}", e.kind);
 }
@@ -9104,6 +9153,7 @@ fn hard_arrow_chained_method() {
 fn hard_arrow_method_then_hash() {
     // `$obj->method()->{key};` — index on method call result.
     let e = parse_expr_str("$obj->method()->{key};");
+
     // The outermost should be the hash index, inner should be MethodCall.
     let inner = match &e.kind {
         ExprKind::ArrowDeref(target, _) => &target.kind,
@@ -9691,6 +9741,7 @@ fn hard_my_assign_comma_grouping() {
     match &prog.statements[0].kind {
         StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
             assert_eq!(items.len(), 2, "expected 2 list items, got {}", items.len());
+
             // First item: Assign(Decl(My, [$x]), $a)
             match &items[0].kind {
                 ExprKind::Assign(_, lhs, rhs) => {
@@ -9699,6 +9750,7 @@ fn hard_my_assign_comma_grouping() {
                 }
                 other => panic!("expected Assign as first list item, got {other:?}"),
             }
+
             // Second item: $b
             assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)), "expected ScalarVar as second item, got {:?}", items[1].kind);
         }
@@ -9729,6 +9781,7 @@ fn hard_our_assign_comma_grouping() {
 fn hard_state_assign_comma_grouping() {
     // `state $x = $a, $b;` — same behavior as `my` with a different scope.
     let prog = parse("use feature 'state'; state $x = $a, $b;");
+
     // statements[0] is the `use` declaration; the expression is statements[1].
     match &prog.statements[1].kind {
         StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
@@ -10052,6 +10105,7 @@ fn proto_respects_package_scope() {
     // A proto declared in Foo shouldn't affect bare calls in main.  package Foo; sub bar (); package main; bar + 1;
     // The bare `bar` in main isn't found → falls through to Bareword + BinOp.
     let prog = parse("package Foo; sub bar (); package main; bar + 1;");
+
     // Find the last statement (the `bar + 1` call).
     let last = prog.statements.last().expect("at least one stmt");
     match &last.kind {
@@ -10119,6 +10173,7 @@ fn proto_underscore_distinct_from_explicit_dollar_underscore() {
     match &e.kind {
         ExprKind::FuncCall(_, args) => {
             assert_eq!(args.len(), 1);
+
             // Note: $_ may be represented as SpecialVar or ScalarVar depending on the lexer; either is fine, as long as
             // it's NOT DefaultVar.
             assert!(!matches!(args[0].kind, ExprKind::DefaultVar), "explicit $_ should not become DefaultVar");
@@ -10353,6 +10408,7 @@ fn proto_amp_slot_accepts_backslash_sub_ref() {
         ExprKind::FuncCall(name, args) => {
             assert_eq!(name, "main::foo");
             assert_eq!(args.len(), 2);
+
             // First arg is a ref-take around something naming `bar`.
             assert!(matches!(args[0].kind, ExprKind::Ref(_)), "expected Ref(...), got {:?}", args[0].kind);
             assert!(matches!(args[1].kind, ExprKind::ArrayVar(_)), "expected @list, got {:?}", args[1].kind);
@@ -10570,6 +10626,7 @@ fn proto_auto_ref_mixed_with_slurpy() {
     match &e.kind {
         ExprKind::FuncCall(_, args) => {
             assert_eq!(args.len(), 3);
+
             // First arg is the ref'd array.
             match &args[0].kind {
                 ExprKind::Ref(inner) => {
@@ -10577,6 +10634,7 @@ fn proto_auto_ref_mixed_with_slurpy() {
                 }
                 other => panic!("expected Ref(ArrayVar) first, got {other:?}"),
             }
+
             // Remaining two are scalar slurpy args, not ref'd.
             assert!(matches!(args[1].kind, ExprKind::ScalarVar(_)));
             assert!(matches!(args[2].kind, ExprKind::ScalarVar(_)));
@@ -10862,6 +10920,7 @@ fn smartmatch_disabled_without_feature() {
     // A full solution would need lexer-level token demotion (splitting SmartMatch back into two Tildes), similar to
     // keyword demotion.  For now, verify the program doesn't produce a SmartMatch BinOp.
     let prog = parse("no feature ':all'; ~$b;");
+
     // Just confirms the feature removal doesn't break normal `~` (bitwise not).
     assert!(!prog.statements.is_empty());
 }
@@ -11002,6 +11061,7 @@ fn utf8_lexical_scoping() {
     // `use utf8` is lexically scoped: inside a `no utf8` block, UTF-8 identifiers are rejected again.
     let src = "use utf8; my $café = 1; { no utf8; my $x = 1; }";
     let prog = parse(src);
+
     // The program parses — $café is in utf8 scope, $x is in no-utf8 scope (ASCII only, fine).
     assert!(prog.statements.len() >= 2);
 }
@@ -11052,8 +11112,10 @@ fn postfix_when_without_feature() {
     // a bareword function call — the expression becomes `1 when(...)` which is NOT a postfix modifier.  Just verify it
     // doesn't produce PostfixKind::When.
     let prog = parse("$abc = 1; when(/^abc/);");
+
     // Without switch, `when` is a function call, not a keyword.  The program parses as two separate statements.
     assert!(prog.statements.len() >= 2);
+
     // Verify the first statement is NOT a postfix-when.
     let not_postfix_when = !matches!(&prog.statements[0].kind, StmtKind::Expr(Expr { kind: ExprKind::PostfixControl(PostfixKind::When, _, _), .. }));
     assert!(not_postfix_when, "when should not be a postfix modifier without the switch feature");
@@ -11408,6 +11470,7 @@ fn case_mod_interp_uppercase() {
         ExprKind::InterpolatedString(interp) => {
             // First part: constant "TEST" (uppercased at lex time).
             assert!(matches!(&interp.0[0], InterpPart::Const(s) if s == "TEST"), "first part should be Const(TEST), got {:?}", interp.0[0]);
+
             // Second part: $x wrapped in uc().
             match &interp.0[1] {
                 InterpPart::ScalarInterp(expr) => {
@@ -12080,6 +12143,7 @@ fn utf8_sub_with_unicode_param() {
     let prog = parse("use utf8; use feature 'signatures'; sub grüß($naïve) { $naïve }");
     let sub = prog.statements.iter().find_map(|s| if let StmtKind::SubDecl(sd) = &s.kind { Some(sd) } else { None }).expect("should find sub declaration");
     assert_eq!(sub.name, "gr\u{00FC}\u{00DF}", "sub name should be 'grüß'");
+
     // Verify parameter name.
     let sig = sub.signature.as_ref().expect("should have signature");
     match &sig.params[0] {
@@ -12211,6 +12275,7 @@ fn nfc_sub_name_normalized() {
         .iter()
         .find_map(|s| if let StmtKind::SubDecl(sd) = &s.kind { Some(sd.name.clone()) } else { None })
         .expect("should find sub declaration");
+
     // ï in NFC is U+00EF
     assert_eq!(sub_name, "na\u{00EF}ve", "sub name should be NFC-normalized");
 }
@@ -12222,6 +12287,7 @@ fn nfc_package_name_normalized() {
     let prog = parse(src);
     let pkg =
         prog.statements.iter().find_map(|s| if let StmtKind::PackageDecl(pd) = &s.kind { Some(pd) } else { None }).expect("should find package declaration");
+
     // Mödule: o + U+0308 → ö (U+00F6) in NFC
     assert_eq!(pkg.name, "Caf\u{00E9}::M\u{00F6}dule", "package name should be NFC-normalized");
 }
@@ -12303,6 +12369,7 @@ fn memchr_paired_delimiter_depth_content() {
 fn memchr_content_before_interpolation_trigger() {
     // Verify the ConstSegment content before a $ trigger.
     let tokens = collect_tokens("\"hello world $x\"");
+
     // Should have: QuoteSublexBegin, ConstSegment("hello world "), InterpScalar("x"), SublexEnd
     let seg = tokens.iter().find_map(|t| if let Token::ConstSegment(s) = t { Some(s.clone()) } else { None }).expect("should find ConstSegment");
     assert_eq!(seg, "hello world ", "content before $ trigger should be exact");
@@ -12426,6 +12493,7 @@ fn nfc_consistent_across_all_sigils() {
     let tokens = collect_tokens_utf8("use utf8; $cafe\u{0301}; @cafe\u{0301}; %cafe\u{0301};");
     let scalar = tokens.iter().find_map(|t| if let Token::ScalarVar(n) = t { Some(n.as_str()) } else { None }).unwrap();
     let array = tokens.iter().find_map(|t| if let Token::ArrayVar(n) = t { Some(n.as_str()) } else { None }).unwrap();
+
     // Hash comes through lex_hash_var_after_percent path.
     assert_eq!(scalar, "caf\u{00E9}", "scalar name NFC");
     assert_eq!(array, "caf\u{00E9}", "array name NFC");
@@ -12489,6 +12557,7 @@ fn nfc_escape_sequences_must_not_be_normalized() {
 fn nfc_fat_comma_autoquote_verified() {
     // Fat comma with NFD bareword — verify the autoquoted string is NFC.
     let rhs = first_assign_rhs(&parse("use utf8; my %h = (cafe\u{0301} => 1);"));
+
     // RHS is List([StringLit("café"), Int(1)]).
     fn find_nfc_key(e: &Expr) -> bool {
         match &e.kind {
@@ -12576,6 +12645,7 @@ fn utf8_digit_after_package_separator_is_error() {
     // `Foo::3bar` — 3 is XID_Continue but NOT XID_Start.  After ::, the next segment needs XID_Start.
     let src = "use utf8; Foo::3bar;";
     let mut p = Parser::new(src.as_bytes()).unwrap();
+
     // This should either error or parse 3 as a number, not as part of the identifier.
     let result = p.parse_program();
     if let Ok(prog) = result {
@@ -12586,6 +12656,7 @@ fn utf8_digit_after_package_separator_is_error() {
             assert!(!matches!(&e.kind, ExprKind::Bareword(name) if name == "Foo::3bar"), "3 after :: should not be accepted as XID_Start in identifier");
         }
     }
+
     // Either an error or a non-single-identifier parse is acceptable.
 }
 
@@ -12694,6 +12765,7 @@ fn memchr_interpolating_string() {
     // Interpolating string with mixed content — verify structure.
     let src = r#"my $name = "world"; my $x = "hello $name, done";"#;
     let prog = parse(src);
+
     // Second assignment RHS should be an interpolated string.
     let stmts: Vec<_> = prog.statements.iter().filter(|s| matches!(&s.kind, StmtKind::Expr(Expr { kind: ExprKind::Assign(_, _, _), .. }))).collect();
     assert!(stmts.len() >= 2, "should have at least 2 assignments");
@@ -12709,6 +12781,7 @@ fn memchr_regex_with_code_block() {
     // Regex with code block — memchr must detect ( trigger.
     let src = "use feature 'all'; my $x = 'abc'; $x =~ m/foo(?{ 1 + 2 })bar/;";
     let prog = parse(src);
+
     // Should parse without errors and contain a regex.
     let has_regex =
         prog.statements.iter().any(|s| if let StmtKind::Expr(e) = &s.kind { matches!(e.kind, ExprKind::BinOp(BinOp::Binding, _, _)) } else { false });
@@ -12989,6 +13062,7 @@ fn q_guillemets_paired() {
     let prog = parse("use utf8; use feature 'extra_paired_delimiters'; my $x = q\u{00AB}hello\u{00BB};");
     let name = first_decl_name(&prog);
     assert_eq!(name, "x");
+
     // Verify the string content.
     match &prog.statements[2].kind {
         StmtKind::Expr(e) => match &e.kind {
@@ -13199,6 +13273,7 @@ fn heredoc_backslash_unicode_tag() {
     // <<\café under use utf8 — backslash form with Unicode tag.
     let prog = parse("use utf8; my $x = <<\\caf\u{00E9};\nhello $world\ncaf\u{00E9}\n");
     let init = first_assign_rhs(&prog);
+
     // Backslash form suppresses interpolation.
     assert!(matches!(init.kind, ExprKind::StringLit(ref s) if s == "hello $world\n"), "expected literal heredoc, got {:?}", init.kind);
 }
@@ -13638,6 +13713,7 @@ fn tibetan_delim_devanagari_nukta_in_body() {
     let src = b"use utf8; my $x = q\xE0\xBC\xBA\xE0\xA4\xA8\xE0\xA4\xBC\xE0\xBC\xBB;";
     let result = crate::parse(src);
     assert!(result.is_ok(), "Tibetan delim with Devanagari nukta should parse: {:?}", result.err());
+
     // TODO: verify ConstSegment contains composed ऩ (E0 A4 A9), not decomposed न + ़ (E0 A4 A8 E0 A4 BC).
 }
 
@@ -13707,6 +13783,7 @@ fn body_nfc_normalizes_raw_decomposed() {
     let src = b"use utf8; my $x = \"n\xCC\x83\";";
     let result = crate::parse(src);
     assert!(result.is_ok(), "decomposed char in string should parse: {:?}", result.err());
+
     // TODO: verify ConstSegment contains C3 B1, not 6E CC 83.
 }
 
@@ -13716,6 +13793,7 @@ fn body_escape_chars_not_normalized() {
     // produced, not raw source characters.
     let prog = parse("use utf8; my $x = \"\\x{6e}\\x{303}\";");
     assert!(!prog.statements.is_empty());
+
     // TODO: verify the string contains 6E CC 83 (decomposed), NOT C3 B1 (composed).
 }
 
@@ -13735,6 +13813,7 @@ fn body_no_nfc_without_utf8() {
     let src = b"my $x = \"n\xCC\x83\";";
     let result = crate::parse(src);
     assert!(result.is_ok(), "bytes without `use utf8` should pass through: {:?}", result.err());
+
     // TODO: verify the bytes are preserved exactly as-is.
 }
 
@@ -13756,6 +13835,7 @@ fn ident_nfc_composed_and_decomposed_are_same_variable() {
     let src = b"use utf8; my $caf\xC3\xA9 = 1; $cafe\xCC\x81 = 2;";
     let result = crate::parse(src);
     assert!(result.is_ok(), "composed and decomposed should be same variable: {:?}", result.err());
+
     // TODO: verify both produce ScalarVar("café") with composed é.
 }
 
@@ -13788,6 +13868,7 @@ fn source_encoding_ascii_allows_escapes() {
     // restricted.  First verify ascii mode IS active by confirming raw non-ASCII is rejected:
     let src = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src).is_err(), "source::encoding 'ascii' should reject raw non-ASCII");
+
     // Then verify escapes still work:
     let prog = parse("use source::encoding 'ascii'; my $x = \"caf\\x{e9}\";");
     assert!(!prog.statements.is_empty());
@@ -13808,6 +13889,7 @@ fn no_source_encoding_disables() {
     // `no source::encoding` disables both UTF-8 and ASCII modes.  First verify ascii mode IS active:
     let src1 = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src1).is_err(), "ascii should reject non-ASCII before 'no'");
+
     // Then verify `no source::encoding` allows non-ASCII again:
     let src2 = b"use source::encoding 'ascii'; no source::encoding; my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src2).is_ok(), "no source::encoding should allow non-ASCII: {:?}", crate::parse(src2).err());
@@ -13819,6 +13901,7 @@ fn source_encoding_ascii_is_lexically_scoped() {
     // Inside block: ascii should reject non-ASCII.
     let src1 = b"{ use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\"; }";
     assert!(crate::parse(src1).is_err(), "ascii should reject inside block");
+
     // Outside block: non-ASCII should be allowed again.
     let src2 = b"{ use source::encoding 'ascii'; } my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src2).is_ok(), "ascii should not leak out of block: {:?}", crate::parse(src2).err());
@@ -13846,6 +13929,7 @@ fn source_encoding_utf8_clears_ascii() {
     // First verify ascii mode IS rejecting:
     let src1 = b"use source::encoding 'ascii'; my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src1).is_err(), "ascii should reject non-ASCII before switching");
+
     // Then verify switching to utf8 clears ascii and allows UTF-8:
     let src2 = b"use source::encoding 'ascii'; use source::encoding 'utf8'; my $x = \"caf\xC3\xA9\";";
     assert!(crate::parse(src2).is_ok(), "switching from ascii to utf8 should allow UTF-8: {:?}", crate::parse(src2).err());
@@ -14224,6 +14308,7 @@ fn not_utf16_binary_garbage() {
     // Random bytes that happen to start with 00 should not be misdetected as UTF-16BE if the pattern doesn't hold.
     let src = b"\x00\x01\x02\x03";
     let result = crate::parse(src);
+
     // This might error for other reasons, but shouldn't crash from a UTF-16 transcode attempt.
     let _ = result;
 }
@@ -15189,6 +15274,7 @@ fn named_unary_lc_concat_precedence() {
             ExprKind::FuncCall(name, args) => {
                 assert_eq!(name, "CORE::lc");
                 assert_eq!(args.len(), 1);
+
                 // The single arg should be a Concat binop.
                 assert!(matches!(args[0].kind, ExprKind::BinOp(BinOp::Concat, _, _)));
             }
@@ -15257,6 +15343,7 @@ fn keyword_xor_as_infix_operator() {
 fn keyword_isa_as_infix_operator() {
     // `$obj isa Foo` — class-instance test (feature-gated).
     let prog = parse("use feature 'isa'; $obj isa Foo;");
+
     // Find the isa expression (second statement)
     let stmt = &prog.statements[1];
     match &stmt.kind {
@@ -15535,6 +15622,7 @@ fn weak_keyword_abs_overridden_by_use_subs() {
         StmtKind::Expr(e) => match &e.kind {
             ExprKind::FuncCall(name, args) => {
                 assert_eq!(name, "main::abs");
+
                 // The ternary is INSIDE the args — list op consumed it.
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0].kind, ExprKind::Ternary(_, _, _)), "arg should be ternary, got {:?}", args[0].kind);
