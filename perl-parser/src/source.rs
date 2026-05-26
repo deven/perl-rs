@@ -6,13 +6,11 @@
 //!
 //! See design document §5.4 for the full design rationale.
 
-use std::collections::VecDeque;
-
-use bytes::Bytes;
-
 use crate::error::ParseError;
 use crate::lexer::matching_delimiter;
 use crate::span::Span;
+use bytes::Bytes;
+use std::collections::VecDeque;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

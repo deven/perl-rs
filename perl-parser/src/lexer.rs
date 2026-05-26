@@ -7,17 +7,17 @@
 //! This module implements the core tokenization loop.  Quote-like sublexing, heredocs, and regex scanning are handled
 //! by helper methods.
 
-use bytes::Bytes;
-use memchr::{memchr, memchr2, memchr3};
-use unicode_normalization::UnicodeNormalization;
-use unicode_xid::UnicodeXID;
-
 use crate::error::ParseError;
 use crate::keyword::{self, Keyword};
 use crate::pragma::Features;
 use crate::source::LexerSource;
 use crate::span::Span;
 use crate::token::*;
+use bytes::Bytes;
+use memchr::{memchr, memchr2, memchr3};
+use std::collections::VecDeque;
+use unicode_normalization::UnicodeNormalization;
+use unicode_xid::UnicodeXID;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -73,7 +73,7 @@ impl LexContext {
 /// (the default) or brace-matched (entered via `format_args_enter_braced`).
 struct FormatState {
     /// Pre-tokenized spans queued for emission.  Drained before reading more lines.
-    queue: std::collections::VecDeque<Spanned>,
+    queue: VecDeque<Spanned>,
     mode: FormatMode,
 }
 
@@ -615,7 +615,7 @@ impl Lexer {
         // Drop the rest of the `=` line — the format body starts
         // on the next source line.
         self.source.line = None;
-        let mut queue = std::collections::VecDeque::new();
+        let mut queue = VecDeque::new();
         queue.push_back(Spanned { token: Token::FormatSublexBegin(name), span: begin_span });
         self.format_state = Some(FormatState { queue, mode: FormatMode::Body });
     }
