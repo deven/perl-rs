@@ -1,13 +1,13 @@
 //! Line-oriented source delivery for the lexer.
 //!
-//! `LexerSource` manages line splitting, CRLF normalization, heredoc body sequencing, and indentation stripping.  The
-//! lexer receives one line at a time via `LexerLine` and scans bytes within it, never dealing with line boundaries,
+//! The source layer manages line splitting, CRLF normalization, heredoc body sequencing, and indentation stripping.
+//! The lexer receives one line at a time via `LexerLine` and scans bytes within it, never dealing with line boundaries,
 //! newline encoding, or heredoc line reordering.
 //!
 //! See design document §5.4 for the full design rationale.
 
 use crate::error::ParseError;
-use crate::lexer::matching_delimiter;
+use crate::lexer::{Lexer, matching_delimiter};
 use crate::span::Span;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -102,51 +102,12 @@ impl LexerLine {
     }
 }
 
-// ── LexerSource ───────────────────────────────────────────────────
+// ── Source layer (impl Lexer) ──────────────────────────────────────────────────────────────────────────────────────
 /// Internal heredoc context saved when entering a heredoc body.
-struct HeredocContext {
+pub(crate) struct HeredocContext {
     tag: Bytes,
     saved_line: LexerLine,
     prev_indent: Option<Bytes>,
-}
-
-/// Line-oriented source for the lexer.
-///
-/// Provides lines to the lexer via `next_line()`, handling CRLF normalization, heredoc body sequencing, and indentation
-/// stripping.  The lexer never manages these concerns directly.
-pub(crate) struct LexerSource {
-    /// The complete source buffer.
-    src: Bytes,
-    /// Name of the source — used for `__FILE__` resolution and diagnostic messages.  Defaults to `"(script)"` when the
-    /// caller doesn't supply one (e.g., `Parser::new(src)`).
-    filename: String,
-    /// Current byte position for reading the next line.
-    cursor: usize,
-    /// The line currently being scanned, if any.  `None` forces a fresh `next_line` read on the next `peek_byte`.
-    /// Moved here from `Lexer` so the cursor and the line-delivery machinery live on one struct.
-    pub(crate) line: Option<LexerLine>,
-    /// Next line number to assign (1-based).
-    line_number: usize,
-    /// Stack of active heredoc contexts.
-    heredoc_stack: Vec<HeredocContext>,
-    /// Lines queued for delivery by future `next_line()` calls.  Used for heredoc remainder delivery, push_back, and
-    /// subst bodies.
-    queued_lines: VecDeque<LexerLine>,
-    /// Indentation prefix to strip from every non-empty line.  Set by `start_indented_heredoc`, restored when the
-    /// heredoc finishes.
-    required_indent: Option<Bytes>,
-    /// Set when a heredoc terminator was found during a peek call.  The next consuming call will pop the heredoc
-    /// context.
-    terminator_pending: bool,
-    /// Set when the queued body lines of a substitution have been delivered.  The next `next_line` returns `None`
-    /// (virtual EOF), then delivers the saved remainder.
-    subst_eof_pending: bool,
-    /// Line to deliver after the virtual EOF of a subst body.  Contains the remainder of the source line after the
-    /// flags.
-    subst_saved_line: Option<LexerLine>,
-    /// Set when a UTF-8 BOM, UTF-16 BOM, or UTF-16 heuristic was detected at the start of the source.  The Lexer uses
-    /// this to enable `utf8_mode` automatically.
-    pub(crate) bom_utf8: bool,
 }
 
 /// A raw line read from the source buffer before indent processing.
@@ -158,34 +119,7 @@ struct RawLine {
     ascii_only: bool,
 }
 
-impl LexerSource {
-    /// Create a new `LexerSource` from a byte slice, using the default placeholder filename `"(script)"`.
-    ///
-    /// The bytes are copied into a `Bytes` buffer once.  All subsequent line slicing is zero-copy.
-    pub fn new(src: &[u8]) -> Self {
-        Self::with_filename(src, "(script)")
-    }
-
-    /// Create a new `LexerSource` with a specific filename.  The filename is surfaced via [`Self::filename`] and used
-    /// for `__FILE__` resolution.
-    pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
-        let (src_bytes, bom_utf8) = Self::detect_and_transcode(Bytes::copy_from_slice(src));
-        LexerSource {
-            src: src_bytes,
-            filename: filename.into(),
-            cursor: 0,
-            line: None,
-            line_number: 1,
-            heredoc_stack: Vec::new(),
-            queued_lines: VecDeque::new(),
-            required_indent: None,
-            terminator_pending: false,
-            subst_eof_pending: false,
-            subst_saved_line: None,
-            bom_utf8,
-        }
-    }
-
+impl Lexer {
     /// Detect BOM or UTF-16 encoding at the start of a source buffer and transcode to UTF-8 if needed.  Returns the
     /// (possibly transcoded) source bytes and whether UTF-8 mode should be enabled.
     ///
@@ -198,7 +132,7 @@ impl LexerSource {
     /// - `FE FF`    → UTF-16BE BOM: strip + transcode to UTF-8
     /// - `00 xx` pattern → heuristic UTF-16BE (no BOM)
     /// - `xx 00` pattern → heuristic UTF-16LE (no BOM)
-    fn detect_and_transcode(src: Bytes) -> (Bytes, bool) {
+    pub(crate) fn detect_and_transcode(src: Bytes) -> (Bytes, bool) {
         if src.len() >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
             // UTF-8 BOM — strip it, enable utf8 mode.
             return (src.slice(3..), true);
@@ -268,27 +202,6 @@ impl LexerSource {
             }
         }
         out
-    }
-
-    /// Create a new `LexerSource` from an existing `Bytes` buffer.  Zero-copy — just a refcount bump.  Uses the default
-    /// placeholder filename.
-    #[allow(dead_code)]
-    pub fn from_bytes(src: Bytes) -> Self {
-        let (src, bom_utf8) = Self::detect_and_transcode(src);
-        LexerSource {
-            src,
-            filename: "(script)".into(),
-            cursor: 0,
-            line: None,
-            line_number: 1,
-            heredoc_stack: Vec::new(),
-            queued_lines: VecDeque::new(),
-            required_indent: None,
-            terminator_pending: false,
-            subst_eof_pending: false,
-            subst_saved_line: None,
-            bom_utf8,
-        }
     }
 
     /// Current byte position in the source buffer.  Used for global position when no current line is active.

@@ -259,7 +259,7 @@ pub enum Token {
     HeredocLit(HeredocKind, String, String),
 
     // ── Special compile-time tokens ───────────────────────────
-    /// `__FILE__` — current source filename.  Captured at lex time from `LexerSource::filename()`.
+    /// `__FILE__` — current source filename.  Captured at lex time from `Lexer::filename()`.
     SourceFile(String),
 
     /// `__LINE__` — current source line number.  Captured at lex time.

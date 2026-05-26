@@ -362,15 +362,15 @@ impl Parser {
         }
 
         let (kind, terminated) = match self.peek_token().clone() {
-            // Statement-level keywords: consume first, then dispatch to handler.  Fat-comma autoquoting (e.g. `if => 1`)
-            // is handled by the lexer, which returns StrLit instead of Keyword.
+            // Statement-level keywords: consume first, then dispatch to handler.  Fat-comma autoquoting
+            // (e.g. `if => 1`) is handled by the lexer, which returns StrLit instead of Keyword.
             Token::Keyword(kw) if keyword::is_statement_keyword(kw) => {
                 let kw_span = self.peek_span();
                 self.next_token()?; // consume the keyword
                 match kw {
-                    // my/our/state are expressions, not statements.  The keyword has already been consumed;
-                    // construct the Decl expression and run the Pratt loop to pick up optional `= expr` assignment
-                    // and trailing `, $other` list members.
+                    // my/our/state are expressions, not statements.  The keyword has already been consumed; construct
+                    // the Decl expression and run the Pratt loop to pick up optional `= expr` assignment and trailing
+                    // `, $other` list members.
                     Keyword::My | Keyword::Our | Keyword::State => {
                         let scope = match kw {
                             Keyword::My => DeclScope::My,
@@ -442,9 +442,8 @@ impl Parser {
                     Keyword::ADJUST => (self.parse_phaser(PhaserKind::Adjust)?, false),
 
                     // AUTOLOAD/DESTROY — implicit sub declarations.  `AUTOLOAD { ... }` is `sub AUTOLOAD { ... }`.
-                    // `AUTOLOAD;` is `sub AUTOLOAD;` (forward decl).  `AUTOLOAD()` is `sub AUTOLOAD ();`
-                    // (prototype).  They are NEVER function calls — Perl always treats them as implicit sub
-                    // declarations.
+                    // `AUTOLOAD;` is `sub AUTOLOAD;` (forward decl).  `AUTOLOAD()` is `sub AUTOLOAD ();` (prototype).
+                    // They are NEVER function calls — Perl always treats them as implicit sub declarations.
                     Keyword::AUTOLOAD | Keyword::DESTROY => {
                         let name: &str = kw.into();
                         (self.parse_sub_decl_with_name(name.to_string(), kw_span)?, false)
@@ -1635,8 +1634,8 @@ impl Parser {
 
     // ── Block parsing ─────────────────────────────────────────
     fn parse_block(&mut self) -> Result<Block, ParseError> {
-        // Pragmas and current_package are lexically scoped: any `use feature`, `use utf8`, or `package Name;`
-        // inside this block doesn't leak out.  Save state before parsing, restore after.
+        // Pragmas and current_package are lexically scoped: any `use feature`, `use utf8`, or `package Name;` inside
+        // this block doesn't leak out.  Save state before parsing, restore after.
         let saved_pragmas = self.pragmas;
         let saved_package = self.current_package.clone();
 
@@ -2436,8 +2435,8 @@ impl Parser {
         self.dispatch_quote_result(kw, span)
     }
 
-    /// Enter sublexing for a quote keyword and dispatch the resulting token.  The lexer must be positioned at (or before
-    /// whitespace preceding) the delimiter byte.
+    /// Enter sublexing for a quote keyword and dispatch the resulting token.  The lexer must be positioned at (or
+    /// before whitespace preceding) the delimiter byte.
     fn dispatch_quote_result(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
         let token = self.lexer.begin_quote_sublex(kw)?;
         match token {
@@ -3168,8 +3167,8 @@ impl Parser {
         }
         let key = self.parse_expr(PREC_LOW)?;
 
-        // Multidimensional hash emulation: `$h{1,2,3}` → `$h{join($;, 1, 2, 3)}`.  When the feature is off, the
-        // comma-list is left as-is for the compiler to diagnose ("Multidimensional hash lookup is disabled").
+        // Multidimensional hash emulation: `$h{1,2,3}` → `$h{join($;, 1, 2, 3)}`.  When the feature is off, the comma-
+        // list is left as-is for the compiler to diagnose ("Multidimensional hash lookup is disabled").
         if let ExprKind::List(items) = &key.kind
             && self.pragmas.features.contains(Features::MULTIDIMENSIONAL)
         {
@@ -3554,7 +3553,8 @@ impl Parser {
                                     operands.push(self.parse_expr(right_prec)?);
                                 }
 
-                                // After the chain, reject a trailing Non at the same level (e.g. `$a == $b != $c <=> $d`).
+                                // After the chain, reject a trailing Non at the same level
+                                // (e.g. `$a == $b != $c <=> $d`).
                                 if let Some(trail) = self.peek_op_info()
                                     && trail.prec == info.prec
                                 {

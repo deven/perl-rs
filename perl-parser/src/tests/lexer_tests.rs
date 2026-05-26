@@ -113,7 +113,7 @@ fn lex_all(src: &str) -> Vec<Token> {
 }
 
 // ── CR normalization ────────────────────────────────────────
-// Note: normalize_crlf is now handled by LexerSource.  Low-level tests are in source.rs; these test high-level
+// Note: CRLF normalization is handled by the source layer.  Low-level tests are in source.rs; these test high-level
 // behavior.
 
 #[test]
@@ -206,7 +206,6 @@ fn lex_indented_heredoc_tabs_vs_spaces_croaks() {
 
 #[test]
 fn lex_indented_heredoc_empty_line_ok() {
-
     // Empty lines (just \n) are allowed without indentation.
     let src = "<<~END;\n    hello\n\n    world\n    END\n";
     let tokens = lex_all(src);

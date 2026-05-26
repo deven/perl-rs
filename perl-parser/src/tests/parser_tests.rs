@@ -3507,7 +3507,7 @@ fn source_file_captured_at_lex_time() {
 
 #[test]
 fn source_file_uses_custom_filename() {
-    // `Parser::with_filename` / `parse_with_filename` plumbs the filename through to `LexerSource::filename()`, which
+    // `Parser::with_filename` / `parse_with_filename` plumbs the filename through to `Lexer::filename()`, which
     // `__FILE__` reads at lex time.
     let prog = crate::parse_with_filename(b"__FILE__;", "my_script.pl").expect("parse should succeed");
     let expr = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e.clone()) } else { None }).expect("expression statement");

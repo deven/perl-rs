@@ -10,7 +10,7 @@
 use crate::error::ParseError;
 use crate::keyword::{self, Keyword};
 use crate::pragma::Features;
-use crate::source::LexerSource;
+use crate::source::{HeredocContext, LexerLine};
 use crate::span::Span;
 use crate::token::*;
 use bytes::Bytes;
@@ -36,7 +36,7 @@ mod tests;
 /// `InterpChainEnd` and clears the chain state.
 #[derive(Clone, Debug, Default)]
 struct LexContext {
-    /// Opening delimiter character.  `None` for heredocs (end signaled by LexerSource).
+    /// Opening delimiter character.  `None` for heredocs (end signaled by the source layer).
     delim: Option<char>,
 
     /// Delimiter nesting depth (for paired delimiters like `{}`).
@@ -109,13 +109,53 @@ enum FormatMode {
 
 /// Lexer state, owned by the `Parser`.
 ///
-/// The lexer operates on lines delivered by `LexerSource`.  The context stack tracks sublexing modes (interpolating
-/// strings, regex patterns, heredocs).  Context-sensitive disambiguation (e.g. heredoc vs shift-left for `<<`) is
-/// driven by the parser via explicit hook methods.
+/// The lexer operates on lines delivered by the source layer (the source-layer fields and methods below and in
+/// `source.rs`).  The context stack tracks sublexing modes (interpolating strings, regex patterns, heredocs).  Context-
+/// sensitive disambiguation (e.g. heredoc vs shift-left for `<<`) is driven by the parser via explicit hook methods.
 ///
-/// CRLF normalization is handled by `LexerSource` at the line level.
+/// CRLF normalization is handled by the source layer at the line level.
 pub(crate) struct Lexer {
-    source: LexerSource,
+    // ── Source layer (line delivery, heredoc/subst interleaving, CRLF; see source.rs) ──
+    /// The complete source buffer.
+    pub(crate) src: Bytes,
+
+    /// Name of the source — used for `__FILE__` resolution and diagnostic messages.  Defaults to `"(script)"` when the
+    /// caller doesn't supply one (e.g., `Parser::new(src)`).
+    pub(crate) filename: String,
+
+    /// Current byte position for reading the next line.
+    pub(crate) cursor: usize,
+
+    /// The line currently being scanned, if any.  `None` forces a fresh `next_line` read on the next `peek_byte`.
+    pub(crate) line: Option<LexerLine>,
+
+    /// Next line number to assign (1-based).
+    pub(crate) line_number: usize,
+
+    /// Stack of active heredoc contexts.
+    pub(crate) heredoc_stack: Vec<HeredocContext>,
+
+    /// Lines queued for delivery by future `next_line()` calls.  Used for heredoc remainder delivery, push_back, and
+    /// subst bodies.
+    pub(crate) queued_lines: VecDeque<LexerLine>,
+
+    /// Indentation prefix to strip from every non-empty line.  Set by `start_indented_heredoc`, restored when the
+    /// heredoc finishes.
+    pub(crate) required_indent: Option<Bytes>,
+
+    /// Set when a heredoc terminator was found during a peek call.  The next consuming call will pop the heredoc
+    /// context.
+    pub(crate) terminator_pending: bool,
+
+    /// Set when the queued body lines of a substitution have been delivered.  The next `next_line` returns `None`
+    /// (virtual EOF), then delivers the saved remainder.
+    pub(crate) subst_eof_pending: bool,
+
+    /// Line to deliver after the virtual EOF of a subst body.  Contains the remainder of the source line after the
+    /// flags.
+    pub(crate) subst_saved_line: Option<LexerLine>,
+
+    // ── Tokenization ──
     context_stack: Vec<LexContext>,
 
     /// Deferred error from auto-loading in `peek_byte`.  Surfaced on the next call to `lex_token`.
@@ -159,35 +199,39 @@ pub(crate) struct Lexer {
 
 impl Lexer {
     pub fn new(src: &[u8]) -> Self {
-        let source = LexerSource::new(src);
-        let bom = source.bom_utf8;
-        Lexer {
-            source,
-            context_stack: Vec::new(),
-            pending_error: None,
-            format_state: None,
-            utf8_mode: bom,
-            effective_utf8: false,
-            features: Features::DEFAULT,
-            case_mod_stack: Vec::new(),
-            case_mod_lcfirst: false,
-            case_mod_ucfirst: false,
-            logical_eof: false,
-            data_end_info: None,
-        }
+        Self::build(Bytes::copy_from_slice(src), "(script)".into())
     }
 
     /// Construct with an explicit filename (used for `__FILE__` and diagnostic messages).  Equivalent to `Lexer::new`
     /// when the caller doesn't care about filename reporting.
     pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Self {
-        let source = LexerSource::with_filename(src, filename);
-        let bom = source.bom_utf8;
+        Self::build(Bytes::copy_from_slice(src), filename.into())
+    }
+
+    /// Shared constructor: detect/transcode any BOM or UTF-16 encoding, then initialize all source-layer and
+    /// tokenization state.  The source bytes are copied into a `Bytes` buffer once (by the caller); all subsequent line
+    /// slicing is zero-copy.
+    fn build(src: Bytes, filename: String) -> Self {
+        let (src, bom_utf8) = Self::detect_and_transcode(src);
         Lexer {
-            source,
+            // Source layer.
+            src,
+            filename,
+            cursor: 0,
+            line: None,
+            line_number: 1,
+            heredoc_stack: Vec::new(),
+            queued_lines: VecDeque::new(),
+            required_indent: None,
+            terminator_pending: false,
+            subst_eof_pending: false,
+            subst_saved_line: None,
+
+            // Tokenization.
             context_stack: Vec::new(),
             pending_error: None,
             format_state: None,
-            utf8_mode: bom,
+            utf8_mode: bom_utf8,
             effective_utf8: false,
             features: Features::DEFAULT,
             case_mod_stack: Vec::new(),
@@ -200,9 +244,9 @@ impl Lexer {
 
     /// Global byte position in the original source.
     pub fn pos(&self) -> usize {
-        match &self.source.line {
+        match &self.line {
             Some(line) => line.offset + line.pos,
-            None => self.source.cursor(),
+            None => self.cursor(),
         }
     }
 
@@ -350,7 +394,7 @@ impl Lexer {
     /// `true` inside body scanning loops, `false` at entry points.
     fn peek_byte(&mut self, peek_heredoc: bool) -> Option<u8> {
         // Check current line for available bytes.
-        if let Some(line) = &self.source.line
+        if let Some(line) = &self.line
             && let Some(b) = line.peek_byte()
         {
             return Some(b);
@@ -358,11 +402,11 @@ impl Lexer {
 
         // No line or line exhausted.  Try to load a new one.  On success, replace the old line.  On failure, keep the
         // old line so callers can still use line_slice etc.
-        match self.source.next_line(peek_heredoc) {
+        match self.next_line(peek_heredoc) {
             Ok(Some(new_line)) => {
                 let b = new_line.peek_byte();
                 let ascii = new_line.ascii_only;
-                self.source.line = Some(new_line);
+                self.line = Some(new_line);
                 self.effective_utf8 = self.utf8_mode && !ascii;
                 b
             }
@@ -376,19 +420,19 @@ impl Lexer {
 
     /// Peek at a byte at an offset from the current position.  Does NOT auto-load — only valid within the current line.
     pub(crate) fn peek_byte_at(&self, offset: usize) -> Option<u8> {
-        self.source.line.as_ref()?.peek_byte_at(offset)
+        self.line.as_ref()?.peek_byte_at(offset)
     }
 
     /// Set the UTF-8 pragma mode and recompute `effective_utf8` based on the current line's `ascii_only` flag.  Called
     /// by the parser when processing `use utf8` / `no utf8` and when restoring pragma state at block boundaries.
     pub(crate) fn set_utf8_mode(&mut self, on: bool) {
         self.utf8_mode = on;
-        self.effective_utf8 = on && self.source.line.as_ref().is_some_and(|l| !l.ascii_only);
+        self.effective_utf8 = on && self.line.as_ref().is_some_and(|l| !l.ascii_only);
     }
 
     /// Remaining bytes in the current line (not including synthetic \n).
     pub fn remaining(&self) -> &[u8] {
-        match &self.source.line {
+        match &self.line {
             Some(line) => line.remaining(),
             None => &[],
         }
@@ -397,24 +441,24 @@ impl Lexer {
     // ── Position and span helpers ─────────────────────────────
     /// Current position within the current line (line-local).
     fn line_pos(&self) -> usize {
-        self.source.line.as_ref().map_or(0, |l| l.pos)
+        self.line.as_ref().map_or(0, |l| l.pos)
     }
 
     /// Global position as u32 for span construction.
     fn span_pos(&self) -> u32 {
-        match &self.source.line {
+        match &self.line {
             Some(line) => line.global_pos(),
-            None => self.source.cursor() as u32,
+            None => self.cursor() as u32,
         }
     }
 
     /// Build a `Span` from a line-local start position to the current cursor position.  Both positions are on the
     /// current line.
     fn span_from(&self, local_start: usize) -> Span {
-        match &self.source.line {
+        match &self.line {
             Some(line) => Span::new((line.offset + local_start) as u32, line.global_pos()),
             None => {
-                let pos = self.source.cursor() as u32;
+                let pos = self.cursor() as u32;
                 Span::new(pos, pos)
             }
         }
@@ -422,7 +466,7 @@ impl Lexer {
 
     /// Advance the cursor by `n` bytes within the current line.
     fn skip(&mut self, n: usize) {
-        if let Some(line) = self.source.line.as_mut() {
+        if let Some(line) = self.line.as_mut() {
             line.pos += n;
         }
     }
@@ -430,20 +474,18 @@ impl Lexer {
     /// Rewind the cursor by `n` bytes within the current line.  The caller must ensure `n` does not exceed the current
     /// position.
     pub fn rewind(&mut self, n: usize) {
-        if let Some(line) = self.source.line.as_mut() {
+        if let Some(line) = self.line.as_mut() {
             line.pos -= n;
         }
     }
 
-    /// Check for a `# line N "file"` directive and apply it.  Called when `#` is at column 0.  Updates the source's
-    /// line number (and optionally filename) so that `__LINE__` and `__FILE__` reflect the override on subsequent
-    /// lines.
+    /// Check for a `# line N "file"` directive and apply it.  Called when `#` is at column 0.  Updates the lexer's line
+    /// number (and optionally filename) so that `__LINE__` and `__FILE__` reflect the override on subsequent lines.
     fn try_line_directive(&mut self) {
-        // Clone the line's bytes (a cheap `Bytes` refcount bump) so the parse below borrows the clone, not
-        // `self.source.line`.  This frees `self.source` for the `set_line_number` / `set_filename` mutations at the end
-        // — otherwise the immutable borrow of `self.source.line` would still be live across them (the `rest` slices are
-        // derived from it).
-        let bytes = match &self.source.line {
+        // Clone the line's bytes (a cheap `Bytes` refcount bump) so the parse below borrows the clone, not `self.line`.
+        // This frees `self` for the `set_line_number` / `set_filename` mutations at the end — otherwise the immutable
+        // borrow of `self.line` would still be live across them (the `rest` slices are derived from it).
+        let bytes = match &self.line {
             Some(line) => line.line.clone(),
             None => return,
         };
@@ -477,7 +519,7 @@ impl Lexer {
         };
 
         // Apply line number — the NEXT line will be this number.
-        self.source.set_line_number(line_num);
+        self.set_line_number(line_num);
 
         // Optional filename
         let rest = Self::trim_ascii_start(&rest[digit_end..]);
@@ -486,7 +528,7 @@ impl Lexer {
             if let Some(end_quote) = rest.iter().position(|&b| b == b'"')
                 && let Ok(filename) = std::str::from_utf8(&rest[..end_quote])
             {
-                self.source.set_filename(filename.to_string());
+                self.set_filename(filename.to_string());
             }
         }
     }
@@ -498,7 +540,7 @@ impl Lexer {
 
     /// Byte slice from line-local `start` to current cursor position.
     fn line_slice(&self, start: usize) -> &[u8] {
-        match &self.source.line {
+        match &self.line {
             Some(line) => &line.line[start..line.pos],
             None => &[],
         }
@@ -513,7 +555,7 @@ impl Lexer {
 
     /// Raw slice of the source buffer.  For rare operations that need global byte access (e.g. format body extraction).
     pub fn slice(&self, start: usize, end: usize) -> &[u8] {
-        self.source.src_slice(start, end)
+        self.src_slice(start, end)
     }
 
     /// Byte-level scan for hash subscript autoquoting.  Called by the parser immediately after consuming `{` in a hash
@@ -528,7 +570,7 @@ impl Lexer {
     /// `$h{__FILE__}`, `$h{-__END__}`, `$h{q}`, etc.  Keywords and special tokens are treated as plain identifiers at
     /// the byte level — the parser doesn't need to intercept them individually.
     pub fn try_autoquoted_subscript_key(&mut self) -> Option<(String, Span)> {
-        let line = self.source.line.as_ref()?;
+        let line = self.line.as_ref()?;
         let r = line.remaining();
         let mut i = 0;
 
@@ -615,7 +657,7 @@ impl Lexer {
         let end_global = (offset + pos + ident_end) as u32;
 
         // Advance the lexer past the identifier and trailing whitespace (up to but not including `}`).
-        let mline = self.source.line.as_mut()?;
+        let mline = self.line.as_mut()?;
         mline.pos += i;
 
         Some((name, Span::new(start_global, end_global)))
@@ -636,9 +678,8 @@ impl Lexer {
     /// `name` is the format name (empty string defaults to STDOUT at the parser level before this is called).
     /// `begin_span` is the span of the `format` keyword through the `=`.
     pub fn start_format(&mut self, name: String, begin_span: Span) {
-        // Drop the rest of the `=` line — the format body starts
-        // on the next source line.
-        self.source.line = None;
+        // Drop the rest of the `=` line — the format body starts on the next source line.
+        self.line = None;
         let mut queue = VecDeque::new();
         queue.push_back(Spanned { token: Token::FormatSublexBegin(name), span: begin_span });
         self.format_state = Some(FormatState { queue, mode: FormatMode::Body });
@@ -690,8 +731,8 @@ impl Lexer {
     /// Read the next source line and classify it, enqueuing the appropriate tokens.
     fn format_read_line(&mut self) -> Result<Spanned, ParseError> {
         // Ensure any in-progress line is dropped; we read raw lines.
-        self.source.line = None;
-        let line = match self.source.next_line(false) {
+        self.line = None;
+        let line = match self.next_line(false) {
             Ok(Some(l)) => l,
             Ok(None) | Err(_) => {
                 // EOF inside a format — emit SublexEnd and finish.
@@ -708,7 +749,7 @@ impl Lexer {
         let bytes = line.line.clone();
 
         // Drop the consumed line from source-tracking state.
-        self.source.line = None;
+        self.line = None;
 
         let offset_u32 = offset as u32;
         let line_end_u32 = (offset + bytes.len()) as u32;
@@ -889,7 +930,7 @@ impl Lexer {
                     }
 
                     // Comment — drop entire line.
-                    self.source.line = None;
+                    self.line = None;
                 }
                 Some(b'=') if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphabetic()) && self.line_pos() == 0 => {
                     self.skip_pod()?;
@@ -925,7 +966,7 @@ impl Lexer {
                     if self.line_pos() == 0 {
                         self.try_line_directive();
                     }
-                    self.source.line = None;
+                    self.line = None;
                 }
                 _ => break,
             }
@@ -937,16 +978,16 @@ impl Lexer {
     /// line, followed by a non-alphabetic character (or EOF).
     fn skip_pod(&mut self) -> Result<(), ParseError> {
         // Skip the current =word line.
-        self.source.line = None;
+        self.line = None;
+
         // Read lines until =cut at start of line.
         loop {
             // peek_byte auto-loads the next line.
             if self.peek_byte(false).is_none() {
                 break; // EOF inside pod — not an error per Perl
             }
-            let is_cut =
-                self.source.line.as_ref().is_some_and(|line| line.line.starts_with(b"=cut") && !line.line.get(4).is_some_and(|b| b.is_ascii_alphabetic()));
-            self.source.line = None; // skip this line
+            let is_cut = self.line.as_ref().is_some_and(|line| line.line.starts_with(b"=cut") && !line.line.get(4).is_some_and(|b| b.is_ascii_alphabetic()));
+            self.line = None; // skip this line
             if is_cut {
                 break;
             }
@@ -1265,7 +1306,7 @@ impl Lexer {
             }
 
             // Not a v-string — rewind and parse as float.
-            if let Some(line) = self.source.line.as_mut() {
+            if let Some(line) = self.line.as_mut() {
                 line.pos = saved_pos;
             }
 
@@ -1999,7 +2040,7 @@ impl Lexer {
                 // Don't consume ' as a package separator if the identifier scanned so far is an active keyword.  Quote-
                 // like operators use ' as a delimiter; unconditional keywords (print, grep, die, etc.) always stop;
                 // feature-gated keywords (given, any, try, etc.) stop only when their feature is active.
-                if let Some(line) = &self.source.line {
+                if let Some(line) = &self.line {
                     let so_far = &line.line[start..line.pos];
                     if self.is_active_keyword(so_far) {
                         break;
@@ -2053,24 +2094,24 @@ impl Lexer {
                 if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
                     return Ok(Token::StrLit(name));
                 }
-                self.source.line = None;
-                let offset = match self.source.next_line(false) {
+                self.line = None;
+                let offset = match self.next_line(false) {
                     Ok(Some(line)) => line.offset as u32,
-                    _ => self.source.cursor() as u32,
+                    _ => self.cursor() as u32,
                 };
                 self.data_end_info = Some((kw, offset));
                 self.logical_eof = true;
                 return Ok(Token::Eof);
             }
             "__FILE__" => {
-                let saved_filename = self.source.filename().to_string();
+                let saved_filename = self.filename().to_string();
                 if self.at_fat_comma() {
                     return Ok(Token::StrLit(name));
                 }
                 return Ok(Token::SourceFile(saved_filename));
             }
             "__LINE__" => {
-                let saved_line_no = self.source.line.as_ref().map(|l| l.number).unwrap_or(0) as u32;
+                let saved_line_no = self.line.as_ref().map(|l| l.number).unwrap_or(0) as u32;
                 if self.at_fat_comma() {
                     return Ok(Token::StrLit(name));
                 }
@@ -2124,8 +2165,8 @@ impl Lexer {
         Ok(Token::Ident(name))
     }
 
-    /// Start sublexing for a quote-like operator.  The cursor must be positioned at (or before whitespace preceding) the
-    /// delimiter byte.  Called by the parser after it decides a quote keyword should enter sublexing rather than
+    /// Start sublexing for a quote-like operator.  The cursor must be positioned at (or before whitespace preceding)
+    /// the delimiter byte.  Called by the parser after it decides a quote keyword should enter sublexing rather than
     /// autoquoting.
     pub fn begin_quote_sublex(&mut self, kw: Keyword) -> Result<Token, ParseError> {
         match kw {
@@ -2179,7 +2220,7 @@ impl Lexer {
     /// - `raw`: passthrough (backslash prevents delimiter matching but both bytes are kept).  For `m//`, `tr//`.
     /// - `regex`: detect `(?{...})` code blocks (future).
     fn lex_body(&mut self, delim: Option<char>, depth: u32, interpolating: bool, regex: bool, raw: bool) -> Result<Spanned, ParseError> {
-        // Compute open/close from the delimiter.  None means heredoc (no delimiter — end signaled by LexerSource).
+        // Compute open/close from the delimiter.  None means heredoc (no delimiter — end signaled by the source layer).
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
         let (open, close) = match delim {
             Some(d) => {
@@ -2803,7 +2844,7 @@ impl Lexer {
                 }
 
                 // Not a simple ${name} — backtrack and scan as expression
-                if let Some(line) = self.source.line.as_mut() {
+                if let Some(line) = self.line.as_mut() {
                     line.pos = saved_pos;
                 }
             }
@@ -3016,7 +3057,7 @@ impl Lexer {
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
         let repl_delim = if is_paired(pattern_delim, extra) { self.read_quote_delimiter()? } else { pattern_delim };
 
-        let flags = self.source.start_subst_body(repl_delim, extra)?;
+        let flags = self.start_subst_body(repl_delim, extra)?;
         let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
 
         // Push context for the replacement body.  delim is None — the body ends at the virtual EOF set up by
@@ -3160,8 +3201,8 @@ impl Lexer {
         }
         self.skip(1);
 
-        // Fat-comma autoquoting: `-f => val` → StrLit("-f").  This function is always called after a minus, so the
-        // "-" prefix is implicit.
+        // Fat-comma autoquoting: `-f => val` → StrLit("-f").  This function is always called after a minus, so the "-"
+        // prefix is implicit.
         if self.at_fat_comma() {
             return Some(Token::StrLit(format!("-{}", b as char)));
         }
@@ -3298,7 +3339,7 @@ impl Lexer {
             Some(Token::Readline(content, false))
         } else {
             // Not a readline — rewind.
-            if let Some(line) = self.source.line.as_mut() {
+            if let Some(line) = self.line.as_mut() {
                 line.pos = start_pos;
             }
             None
@@ -3322,7 +3363,7 @@ impl Lexer {
             }
 
             // Single `>` after `<<` — not a valid heredoc or diamond.  Rewind.
-            if let Some(line) = self.source.line.as_mut() {
+            if let Some(line) = self.line.as_mut() {
                 line.pos = saved;
             }
             return Ok(None);
@@ -3353,7 +3394,7 @@ impl Lexer {
             }
             _ => {
                 // No valid tag — rewind to just after << so the parser can proceed with a normal shift-left.
-                if let Some(line) = self.source.line.as_mut() {
+                if let Some(line) = self.line.as_mut() {
                     line.pos = saved;
                 }
                 Ok(None)
@@ -3361,8 +3402,8 @@ impl Lexer {
         }
     }
 
-    /// Lex a heredoc tag and start body processing via LexerSource.  Position is after `<<` (and optional `~`), at the
-    /// tag start.
+    /// Lex a heredoc tag and start body processing via the source layer.  Position is after `<<` (and optional `~`), at
+    /// the tag start.
     fn lex_heredoc(&mut self, indented: bool) -> Result<Token, ParseError> {
         // Determine quoting style and extract tag.  `command` tracks backtick quoting (interpolated + executed).
         let (kind, tag, command) = match self.peek_byte(false) {
@@ -3439,30 +3480,31 @@ impl Lexer {
 
         match kind {
             HeredocKind::Interpolating => {
-                self.source.start_heredoc(tag_bytes)?;
+                self.start_heredoc(tag_bytes)?;
                 self.context_stack.push(LexContext::new(None, true, false, false));
                 Ok(Token::QuoteSublexBegin(quote_kind, '\0'))
             }
             HeredocKind::Indented => {
-                self.source.start_indented_heredoc(tag_bytes)?;
+                self.start_indented_heredoc(tag_bytes)?;
                 self.context_stack.push(LexContext::new(None, true, false, false));
                 Ok(Token::QuoteSublexBegin(quote_kind, '\0'))
             }
             HeredocKind::Literal => {
-                self.source.start_heredoc(tag_bytes)?;
+                self.start_heredoc(tag_bytes)?;
                 self.collect_heredoc_literal(&tag, false)
             }
             HeredocKind::IndentedLiteral => {
-                self.source.start_indented_heredoc(tag_bytes)?;
+                self.start_indented_heredoc(tag_bytes)?;
                 self.collect_heredoc_literal(&tag, true)
             }
         }
     }
 
-    /// Collect a literal heredoc body as a raw string.  LexerSource handles terminator detection and indent stripping.
+    /// Collect a literal heredoc body as a raw string.  The source layer handles terminator detection and indent
+    /// stripping.
     fn collect_heredoc_literal(&mut self, tag: &str, indented: bool) -> Result<Token, ParseError> {
         let mut body = String::new();
-        while let Some(line) = self.source.next_line(false)? {
+        while let Some(line) = self.next_line(false)? {
             body.push_str(&String::from_utf8_lossy(&line.line));
             body.push('\n');
         }
