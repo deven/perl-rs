@@ -1445,6 +1445,99 @@ positives (other characters sharing the same lead byte), which are
 handled safely by the byte-by-byte fallback that verifies the full
 UTF-8 sequence.
 
+#### 5.5.5 Format lexing:
+
+A `format NAME = ... .` declaration opens a line-oriented sublex
+region.  Despite being line-oriented rather than delimiter-oriented,
+it is *not* a parallel mechanism: it is a `LexContext` on the same
+context stack as string, regex, and heredoc sublexing, reached
+through the ordinary `lex_token` dispatch and torn down with the same
+`SublexEnd` plus `finish_body()` model (§5.6.8).  Heredocs already
+demonstrate that a line-oriented, source-signaled sublex mode belongs
+on the context stack (`delim: None`); formats are no different.  The
+format context carries the small amount of format-specific state the
+mode needs: which phase it is in (accumulating a picture run, or
+lexing an argument list) and, in the argument phase, a bracket-depth
+counter.
+
+A format body alternates between *picture runs* and *argument lists*,
+ending at a `.` terminator line:
+
+- A picture run accumulates consecutive text lines until the first
+  line containing a field (`@` or `^`).  Comment lines (`#` at the
+  start of the line) are skipped during accumulation.  All the
+  leading literal text up to the first field is one block; the field
+  line itself is where fields appear.
+- Fields are tokenized as they are scanned — `FormatField` for each
+  `@`/`^` specifier, `FormatLiteral` for the runs of literal text
+  between them.  This is a deliberate divergence from perl (see
+  below): perl emits the raw picture text and defers field parsing to
+  the runtime format compiler, whereas tokenizing fields in the lexer
+  gives a structured token stream that the parser and downstream
+  tooling can consume directly.
+- If a picture run contained any field, an argument list follows on
+  the next line.  The arguments are ordinary code, lexed by
+  delegating to the normal token path, with a bracket-depth counter
+  tracking `()`, `[]`, and `{}`.  A newline ends the argument list
+  only at depth 0; an open bracket suspends that termination (and the
+  argument list spans newlines) until the bracket closes.  A `}` that
+  would drive the depth below 0 is an unbalanced-bracket error, not a
+  format close.
+- A leading `{` on an argument line is a `do` block: its contents are
+  a list that flattens into the argument list, and the list continues
+  with whatever follows the matching `}`.  A `{` anywhere other than
+  the start of the argument list is ordinary hash-reference
+  construction.  This positional distinction is a parser
+  interpretation of the token stream; the lexer emits brace tokens
+  uniformly and only tracks depth.
+- The terminator is a line whose first byte is `.`, followed by only
+  whitespace and then a newline or end of input.  It is recognized
+  only at the format's base bracket depth — an open bracket on an
+  argument line suspends terminator recognition, so a `.` inside an
+  unterminated `do` block is just code, not the end of the format.
+  Reaching the terminator ends the format sublex region.
+
+##### Where perl's implementation diverges from `perlform`:
+
+The `perlform` manpage specifies formats for the *user*, and perl's
+actual lexer (`toke.c`, `scan_formline`) does several things the
+manpage does not make explicit — worth recording because matching the
+manpage rather than the interpreter is how subtle bugs creep in:
+
+- **Picture text is slurped, not parsed, by the lexer.**  perl
+  accumulates the picture lines as raw text into a single string and
+  leaves field interpretation to the runtime format compiler.  The
+  manpage describes fields as though they are a parsed grammar; in the
+  interpreter they are not parsed until format execution.  PerlOxide
+  parts ways here on purpose by tokenizing fields in the lexer.
+- **The brace argument form is literally a `do` block.**  The manpage
+  presents `@<<<` followed by a brace-delimited argument form as a
+  notational option; the interpreter forces a `do` block (`KW_DO`,
+  expression-block context) for a leading `{`.  This is why a leading
+  brace flattens a list and the argument list continues after the
+  closing brace (a behavior easy to get wrong if the braces are
+  treated as mere argument delimiters that end the list at `}`).
+- **The argument line continues past a closing brace.**  Following
+  from the `do`-block framing, `{1,2,3}, 4, 5, 6` on an argument line
+  yields six arguments, not three — the manpage's description of the
+  brace form does not make this obvious.
+- **The format's open and close reuse the brace machinery with a
+  discriminant.**  perl enters via its left-curly handler tagged as a
+  format brace and closes via its right-curly handler tagged as the
+  `.`-terminator-where-arguments-were-expected case, so the format
+  region is bracket-accounted even though no literal braces delimit
+  it.  A stray `}` starting an argument line does *not* close the
+  format (the close is the `.` terminator, not a literal brace); it is
+  a syntax error.  PerlOxide reaches the same observable behavior by
+  recognizing the `.` terminator explicitly rather than routing the
+  format close through brace handling.
+- **Comments and blank lines behave by depth.**  A comment or blank
+  line is skipped while accumulating a picture run and is inert inside
+  an open argument bracket, but a comment or blank line where an
+  argument list is expected (at depth 0, before any argument content)
+  is not skipped to find the arguments — the picture run receives no
+  arguments and the line is processed on its own.
+
 ### 5.6 Heredoc Handling
 
 Heredocs are handled by the cooperation of `LexerSource` (§5.4) and
