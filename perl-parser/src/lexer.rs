@@ -400,16 +400,11 @@ impl Lexer {
             return Some(b);
         }
 
-        // No line or line exhausted.  Try to load a new one.  On success, replace the old line.  On failure, keep the
-        // old line so callers can still use line_slice etc.
+        // No line or line exhausted.  Try to load a new one.  `next_line` installs the new line (and recomputes
+        // `effective_utf8`) on success; on EOF it returns `&None` and leaves the old line in place so callers can
+        // still use line_slice etc.
         match self.next_line(peek_heredoc) {
-            Ok(Some(new_line)) => {
-                let b = new_line.peek_byte();
-                let ascii = new_line.ascii_only;
-                self.line = Some(new_line);
-                self.effective_utf8 = self.utf8_mode && !ascii;
-                b
-            }
+            Ok(Some(line)) => line.peek_byte(),
             Ok(None) => None,
             Err(e) => {
                 self.pending_error = Some(e);
@@ -732,18 +727,18 @@ impl Lexer {
     fn format_read_line(&mut self) -> Result<Spanned, ParseError> {
         // Ensure any in-progress line is dropped; we read raw lines.
         self.line = None;
-        let line = match self.next_line(false) {
-            Ok(Some(l)) => l,
-            Ok(None) | Err(_) => {
-                // EOF inside a format — emit SublexEnd and finish.
-                let pos = self.span_pos();
-                let span = Span::new(pos, pos);
-                if let Some(state) = &mut self.format_state {
-                    state.mode = FormatMode::Finished;
-                }
-                self.format_state = None; // tear down immediately
-                return Ok(Spanned { token: Token::SublexEnd, span });
+        // Advance to the next line.  An error or end of input both finish the format.
+        let got_line = self.next_line(false).map(|l| l.is_some()).unwrap_or(false);
+        let line = if got_line { self.line.take() } else { None };
+        let Some(line) = line else {
+            // EOF (or read error) inside a format — emit SublexEnd and finish.
+            let pos = self.span_pos();
+            let span = Span::new(pos, pos);
+            if let Some(state) = &mut self.format_state {
+                state.mode = FormatMode::Finished;
             }
+            self.format_state = None; // tear down immediately
+            return Ok(Spanned { token: Token::SublexEnd, span });
         };
         let offset = line.offset;
         let bytes = line.line.clone();
@@ -3504,10 +3499,16 @@ impl Lexer {
     /// stripping.
     fn collect_heredoc_literal(&mut self, tag: &str, indented: bool) -> Result<Token, ParseError> {
         let mut body = String::new();
-        while let Some(line) = self.next_line(false)? {
-            body.push_str(&String::from_utf8_lossy(&line.line));
-            body.push('\n');
+        while self.next_line(false)?.is_some() {
+            if let Some(line) = &self.line {
+                body.push_str(&String::from_utf8_lossy(&line.line));
+                body.push('\n');
+            }
         }
+        // `next_line` installs each body line into `self.line` and, on the terminator's virtual EOF, leaves the last
+        // one in place (the keep-old-line contract).  Clear it so the queued tag-line remainder — saved by
+        // `start_heredoc` and re-queued when the terminator was consumed — is delivered when lexing resumes.
+        self.line = None;
         let kind = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
         Ok(Token::HeredocLit(kind, tag.to_string(), body))
     }

@@ -245,13 +245,16 @@ impl Lexer {
 
     /// Get the next line.
     ///
-    /// Returns `Ok(Some(line))` for content, `Ok(None)` when a heredoc body is finished (the saved remainder will be
-    /// returned by the next call), or `Err` for real errors (unterminated heredoc, indentation mismatch).
+    /// On success, installs the line as the current line (`self.line`), recomputes `effective_utf8`, and returns
+    /// `Ok(&self.line)` (a borrow of the freshly-installed `Some`).  On end of input — real EOF, a finished heredoc
+    /// body, or a finished substitution body — returns `Ok(&None)` and leaves `self.line` untouched, so callers that
+    /// still need the previous line's position (e.g. `span_pos` at a virtual EOF) see it unchanged.  Returns `Err` for
+    /// real errors (unterminated heredoc, indentation mismatch).
     ///
-    /// `peek_heredoc`: when true and a heredoc terminator is found, returns `Ok(None)` without consuming the signal —
+    /// `peek_heredoc`: when true and a heredoc terminator is found, returns `Ok(&None)` without consuming the signal —
     /// the heredoc context stays on the stack and `queued_lines` is not modified.  The next call with
     /// `peek_heredoc=false` will consume it.
-    pub fn next_line(&mut self, peek_heredoc: bool) -> Result<Option<LexerLine>, ParseError> {
+    pub fn next_line(&mut self, peek_heredoc: bool) -> Result<&Option<LexerLine>, ParseError> {
         // 0. If a terminator was found during a previous peek call, handle it without reading another line.
         if self.terminator_pending {
             if !peek_heredoc {
@@ -262,13 +265,13 @@ impl Lexer {
                     self.queued_lines.push_back(ctx.saved_line);
                 }
             }
-            return Ok(None);
+            return Ok(&None);
         }
 
         // 1. Return queued line if present (from heredoc remainder, push_back, or subst body — not subject to
         //    terminator check).
         if let Some(line) = self.queued_lines.pop_front() {
-            return Ok(Some(line));
+            return Ok(self.install_line(line));
         }
 
         // 1b. Subst body virtual EOF — all body lines delivered.
@@ -280,7 +283,7 @@ impl Lexer {
                     self.queued_lines.push_back(saved);
                 }
             }
-            return Ok(None);
+            return Ok(&None);
         }
 
         // 2. Read next raw line from source.
@@ -292,7 +295,7 @@ impl Lexer {
                     let tag = String::from_utf8_lossy(&ctx.tag).into_owned();
                     return Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(0, self.src.len() as u32)));
                 }
-                return Ok(None); // Normal EOF.
+                return Ok(&None); // Normal EOF.
             }
         };
 
@@ -312,10 +315,25 @@ impl Lexer {
                     self.queued_lines.push_back(ctx.saved_line);
                 }
             }
-            return Ok(None);
+            return Ok(&None);
         }
 
-        Ok(Some(stripped))
+        Ok(self.install_line(stripped))
+    }
+
+    /// Install `line` as the current line, recompute `effective_utf8`, and return a borrow of `self.line` (always the
+    /// freshly-installed `Some`).  Centralizes the bookkeeping that line-producing paths in `next_line` share.
+    fn install_line(&mut self, line: LexerLine) -> &Option<LexerLine> {
+        self.effective_utf8 = self.utf8_mode && !line.ascii_only;
+        self.line = Some(line);
+        &self.line
+    }
+
+    /// TEMPORARY: owned-clone wrapper around `next_line`, for the source tests which still consume lines by value.
+    /// Remove once those tests are updated to the borrowing API.
+    #[cfg(test)]
+    pub(crate) fn temp_next_line(&mut self, peek_heredoc: bool) -> Result<Option<LexerLine>, ParseError> {
+        self.next_line(peek_heredoc).cloned()
     }
 
     /// Begin processing an indented heredoc body (`<<~TAG`).
@@ -376,7 +394,9 @@ impl Lexer {
             if pos >= line.line.len() {
                 // Line exhausted — queue it as a body line.
                 body_lines.push_back(line);
-                match self.next_line(false)? {
+                // Advance to the next line; take ownership of whatever next_line installed.
+                self.next_line(false)?;
+                match self.line.take() {
                     Some(next) => {
                         line = next;
                         pos = 0;
