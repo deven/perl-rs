@@ -2541,10 +2541,10 @@ fn parse_fat_comma_autoquote() {
     // key => value — key should be a StringLit, not a FuncCall
     let e = parse_expr_str("key => 42;");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert!(matches!(items[0].kind, ExprKind::StringLit(_)));
         }
-        other => panic!("expected List with StringLit first, got {other:?}"),
+        other => panic!("expected Comma with StringLit first, got {other:?}"),
     }
 }
 
@@ -2731,10 +2731,10 @@ fn parse_vstring_before_fat_comma_autoquotes() {
     // v5 => 1 — Perl autoquotes "v5" as a plain string, NOT a v-string.  Fat-comma autoquoting takes precedence.
     let e = parse_expr_str("v5 => 1;");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert!(matches!(items[0].kind, ExprKind::StringLit(ref s) if s == "v5"), "expected StringLit(\"v5\"), got {:?}", items[0].kind);
         }
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -2752,10 +2752,10 @@ fn parse_neg_bareword_fat_comma() {
     // StringLit("-key"), matching Perl's compile-time folding.
     let e = parse_expr_str("-key => 42;");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert!(matches!(items[0].kind, ExprKind::StringLit(ref s) if s == "-key"), "expected StringLit(\"-key\"), got {:?}", items[0].kind);
         }
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -3691,11 +3691,11 @@ fn refalias_list_form() {
         ExprKind::Assign(AssignOp::Eq, lhs, _) => {
             // LHS should be a list containing Refs.
             match &lhs.kind {
-                ExprKind::List(items) => {
+                ExprKind::Comma(items) => {
                     assert_eq!(items.len(), 2);
                     assert!(items.iter().all(|e| matches!(e.kind, ExprKind::Ref(_))));
                 }
-                other => panic!("expected List on LHS, got {other:?}"),
+                other => panic!("expected Comma on LHS, got {other:?}"),
             }
         }
         other => panic!("expected Assign, got {other:?}"),
@@ -4484,7 +4484,7 @@ fn multidimensional_hash_without_feature() {
     let prog = parse("use v5.36; $h{1,2,3};");
     match &prog.statements[1].kind {
         StmtKind::Expr(Expr { kind: ExprKind::HashElem(_, key), .. }) => {
-            assert!(matches!(key.kind, ExprKind::List(_)), "without multidimensional, expected List (no join), got {:?}", key.kind);
+            assert!(matches!(key.kind, ExprKind::Comma(_)), "without multidimensional, expected Comma (no join), got {:?}", key.kind);
         }
         other => panic!("expected HashElem, got {other:?}"),
     }
@@ -5425,10 +5425,10 @@ fn fat_comma_numeric_key() {
     // `123 => "val"` — numbers are NOT autoquoted.
     let e = parse_expr_str("123 => 'val';");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert!(matches!(items[0].kind, ExprKind::IntLit(123)), "numeric key should stay IntLit, got {:?}", items[0].kind);
         }
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -5605,11 +5605,11 @@ fn parse_filetest_letter_fat_comma_autoquotes() {
     // -f => value — NOT a filetest, autoquotes as StringLit("-f")
     let e = parse_expr_str("-f => 1;");
     match &e.kind {
-        ExprKind::List(items) => match &items[0].kind {
+        ExprKind::Comma(items) => match &items[0].kind {
             ExprKind::StringLit(s) => assert_eq!(s, "-f"),
             other => panic!("expected StringLit('-f'), got {other:?}"),
         },
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -5963,15 +5963,15 @@ fn prec_not_low_vs_and_low() {
 
 #[test]
 fn prec_comma_vs_assign() {
-    // `$a = 1, $b = 2` → List(Assign($a, 1), Assign($b, 2)) — assign binds tighter than comma.
+    // `$a = 1, $b = 2` → Comma(Assign($a, 1), Assign($b, 2)) — assign binds tighter than comma.
     let e = parse_expr_str("$a = 1, $b = 2;");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert_eq!(items.len(), 2);
             assert!(matches!(items[0].kind, ExprKind::Assign(AssignOp::Eq, _, _)));
             assert!(matches!(items[1].kind, ExprKind::Assign(AssignOp::Eq, _, _)));
         }
-        other => panic!("expected List of two Assigns, got {other:?}"),
+        other => panic!("expected Comma of two Assigns, got {other:?}"),
     }
 }
 
@@ -6814,10 +6814,10 @@ fn pratt_consecutive_commas_in_list() {
     // Perl silently drops consecutive commas: `(1, 3, , , 5)` → `(1, 3, 5)`.
     let e = parse_expr_str("(1, 3, , , 5);");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert_eq!(items.len(), 3, "expected 3 elements (consecutive commas dropped), got {:?}", items);
         }
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -6840,19 +6840,19 @@ fn pratt_trailing_comma_only() {
     let e = parse_expr_str("(1,);");
 
     // In Perl, `(1,)` is the same as `(1)` — the trailing comma is a no-op.  The parser may produce IntLit(1) or
-    // List([1]) — either is acceptable.
-    assert!(matches!(e.kind, ExprKind::IntLit(1) | ExprKind::List(_)), "expected IntLit or List, got {:?}", e.kind);
+    // Comma([1]) — either is acceptable.
+    assert!(matches!(e.kind, ExprKind::IntLit(1) | ExprKind::Comma(_)), "expected IntLit or Comma, got {:?}", e.kind);
 }
 
 #[test]
 fn pratt_c_comma_rhs_of_binding() {
     // `("test", $_) =~ /foo/` — C comma semantics.  The comma expression inside parens binds to `=~` as a whole.  Perl
-    // evaluates "test" in void context and binds $_ to the regex.  At the parser level, the comma still produces a List
+    // evaluates "test" in void context and binds $_ to the regex.  At the parser level, the comma still produces a Comma
     // (context is a semantic concern, not syntactic), and =~ binds to the entire paren result.
     let e = parse_expr_str("(\"test\", $_ ) =~ /foo/;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Binding, lhs, _) => {
-            assert!(matches!(lhs.kind, ExprKind::List(_)), "expected List on LHS of Binding, got {:?}", lhs.kind);
+            assert!(matches!(lhs.kind, ExprKind::Comma(_)), "expected Comma on LHS of Binding, got {:?}", lhs.kind);
         }
         other => panic!("expected Binding, got {other:?}"),
     }
@@ -6860,13 +6860,13 @@ fn pratt_c_comma_rhs_of_binding() {
 
 #[test]
 fn pratt_c_comma_in_scalar_assign() {
-    // `$x = (1, 2, 3)` — comma in scalar context.  At the parser level, the RHS is a List node; the compiler/runtime
+    // `$x = (1, 2, 3)` — comma in scalar context.  At the parser level, the RHS is a Comma node; the compiler/runtime
     // evaluates it in scalar context to produce 3 (last element).
     let e = parse_expr_str("$x = (1, 2, 3);");
     match &e.kind {
         ExprKind::Assign(_, _, rhs) => match &rhs.kind {
-            ExprKind::List(items) => assert_eq!(items.len(), 3),
-            _ => panic!("expected List on RHS, got {:?}", rhs.kind),
+            ExprKind::Comma(items) => assert_eq!(items.len(), 3),
+            _ => panic!("expected Comma on RHS, got {:?}", rhs.kind),
         },
         other => panic!("expected Assign, got {other:?}"),
     }
@@ -6876,12 +6876,12 @@ fn pratt_c_comma_in_scalar_assign() {
 #[ignore = "comma handler doesn't absorb consecutive commas — needs parse_term → Option<Expr> refactor"]
 fn pratt_consecutive_commas_scalar_context() {
     // `$x = (1, , , 3)` — consecutive commas in scalar context.  The empty comma positions are no-ops; Perl evaluates
-    // to 3 (last element in scalar context).  The parser should produce a 2-element List (or Comma chain), not error.
+    // to 3 (last element in scalar context).  The parser should produce a 2-element Comma, not error.
     let e = parse_expr_str("$x = (1, , , 3);");
     match &e.kind {
         ExprKind::Assign(_, _, rhs) => match &rhs.kind {
-            ExprKind::List(items) => assert_eq!(items.len(), 2, "expected 2 elements, got {:?}", items),
-            _ => panic!("expected List on RHS, got {:?}", rhs.kind),
+            ExprKind::Comma(items) => assert_eq!(items.len(), 2, "expected 2 elements, got {:?}", items),
+            _ => panic!("expected Comma on RHS, got {:?}", rhs.kind),
         },
         other => panic!("expected Assign, got {other:?}"),
     }
@@ -6893,8 +6893,8 @@ fn pratt_trailing_comma_scalar_context() {
     let e = parse_expr_str("$x = (1, 2,);");
     match &e.kind {
         ExprKind::Assign(_, _, rhs) => match &rhs.kind {
-            ExprKind::List(items) => assert_eq!(items.len(), 2, "expected 2 elements, got {:?}", items),
-            _ => panic!("expected List on RHS, got {:?}", rhs.kind),
+            ExprKind::Comma(items) => assert_eq!(items.len(), 2, "expected 2 elements, got {:?}", items),
+            _ => panic!("expected Comma on RHS, got {:?}", rhs.kind),
         },
         other => panic!("expected Assign, got {other:?}"),
     }
@@ -6931,10 +6931,10 @@ fn pratt_undef_placeholder_in_list_assign() {
                     // is the list has 3 elements, not 2.
                     assert!(vars.len() >= 2, "expected at least 2 declared vars, got {:?}", vars);
                 }
-                ExprKind::List(items) => {
+                ExprKind::Comma(items) => {
                     assert_eq!(items.len(), 3, "expected 3 elements (including undef placeholder), got {:?}", items);
                 }
-                other => panic!("expected Decl or List on LHS, got {other:?}"),
+                other => panic!("expected Decl or Comma on LHS, got {other:?}"),
             }
         }
         other => panic!("expected Assign, got {other:?}"),
@@ -6979,15 +6979,15 @@ fn context_scalar_decl_vs_list_decl() {
 #[ignore = "parser doesn't consult prototypes when parsing call arguments — needs prototype-aware context propagation"]
 fn proto_scalar_slot_parses_c_comma() {
     // `($@)` prototype: first slot is scalar context, so `(2,4,6)` is C commas → result is 6.  The parser should
-    // produce 3 args: [6, 8, 10], not [List(2,4,6), 8, 10].
+    // produce 3 args: [6, 8, 10], not [Comma(2,4,6), 8, 10].
     let prog = parse("sub f ($@) {} f((2,4,6),8,10);");
 
     // Find the function call statement.
     let call = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("no expression statement found");
     match &call.kind {
         ExprKind::FuncCall(_, args) => {
-            // With scalar context for first arg, (2,4,6) evaluates to 6.  The first arg should NOT be a List node.
-            assert!(!matches!(args[0].kind, ExprKind::List(_)), "first arg should be scalar (C comma), not List — got {:?}", args[0].kind);
+            // With scalar context for first arg, (2,4,6) evaluates to 6.  The first arg should NOT be a Comma node.
+            assert!(!matches!(args[0].kind, ExprKind::Comma(_)), "first arg should be scalar (C comma), not List — got {:?}", args[0].kind);
         }
         other => panic!("expected FuncCall, got {other:?}"),
     }
@@ -6996,13 +6996,13 @@ fn proto_scalar_slot_parses_c_comma() {
 #[test]
 fn proto_no_prototype_parses_list() {
     // Without prototype, all args are list context.  `(2,4,6)` is a list that flattens.  The parser produces 3 args:
-    // [List(2,4,6), 8, 10].  Flattening to 5 args is the compiler's job.
+    // [Comma(2,4,6), 8, 10].  Flattening to 5 args is the compiler's job.
     let prog = parse("sub g {} g((2,4,6),8,10);");
     let call = prog.statements.iter().find_map(|s| if let StmtKind::Expr(e) = &s.kind { Some(e) } else { None }).expect("no expression statement found");
     match &call.kind {
         ExprKind::FuncCall(_, args) => {
-            assert_eq!(args.len(), 3, "expected 3 args (List, 8, 10), got {:?}", args);
-            assert!(matches!(args[0].kind, ExprKind::List(_)), "first arg should be List(2,4,6), got {:?}", args[0].kind);
+            assert_eq!(args.len(), 3, "expected 3 args (Comma, 8, 10), got {:?}", args);
+            assert!(matches!(args[0].kind, ExprKind::Comma(_)), "first arg should be Comma(2,4,6), got {:?}", args[0].kind);
         }
         other => panic!("expected FuncCall, got {other:?}"),
     }
@@ -7886,11 +7886,11 @@ fn parse_labeled_bare_block() {
 fn parse_fat_comma_with_keyword() {
     let e = parse_expr_str("if => 1;");
     match &e.kind {
-        ExprKind::List(items) => match &items[0].kind {
+        ExprKind::Comma(items) => match &items[0].kind {
             ExprKind::StringLit(s) => assert_eq!(s, "if"),
             other => panic!("expected StringLit('if'), got {other:?}"),
         },
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -7899,11 +7899,11 @@ fn parse_fat_comma_keyword_cross_line() {
     // Keyword on one line, => on the next — should still autoquote.
     let e = parse_expr_str("my\n  => 1;");
     match &e.kind {
-        ExprKind::List(items) => match &items[0].kind {
+        ExprKind::Comma(items) => match &items[0].kind {
             ExprKind::StringLit(s) => assert_eq!(s, "my"),
             other => panic!("expected StringLit('my'), got {other:?}"),
         },
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -7926,11 +7926,11 @@ fn parse_fat_comma_keyword_cross_line() {
 fn parse_kw_fat_comma(src: &str) -> Expr {
     let e = parse_expr_str(src);
     match e.kind {
-        ExprKind::List(mut items) => {
+        ExprKind::Comma(mut items) => {
             assert!(!items.is_empty(), "expected non-empty list for {src:?}");
             items.remove(0)
         }
-        other => panic!("expected List, got {other:?} for {src:?}"),
+        other => panic!("expected Comma, got {other:?} for {src:?}"),
     }
 }
 
@@ -8060,14 +8060,14 @@ fn postderef_array_slice_indices_content() {
         ArrowTarget::ArraySliceIndices(idx) => {
             // Index expr is a comma-list of three ints.
             match &idx.kind {
-                ExprKind::List(items) => {
+                ExprKind::Comma(items) => {
                     assert_eq!(items.len(), 3);
                     assert!(matches!(items[0].kind, ExprKind::IntLit(0)));
                     assert!(matches!(items[1].kind, ExprKind::IntLit(1)));
                     assert!(matches!(items[2].kind, ExprKind::IntLit(2)));
                 }
                 ExprKind::IntLit(n) => panic!("single IntLit({n}) — expected 3-element List; would mean slice dropped items"),
-                other => panic!("expected List of 3, got {other:?}"),
+                other => panic!("expected Comma of 3, got {other:?}"),
             }
         }
         other => panic!("expected ArraySliceIndices, got {other:?}"),
@@ -8079,13 +8079,13 @@ fn postderef_array_slice_keys_content() {
     let e = parse_expr_stmt(r#"$r->@{"a", "b", "c"};"#);
     match arrow_target(&e) {
         ArrowTarget::ArraySliceKeys(keys) => match &keys.kind {
-            ExprKind::List(items) => {
+            ExprKind::Comma(items) => {
                 assert_eq!(items.len(), 3);
                 for (i, want) in ["a", "b", "c"].iter().enumerate() {
                     assert!(matches!(items[i].kind, ExprKind::StringLit(ref s) if s == want), "item {i}: expected StringLit({want}), got {:?}", items[i].kind);
                 }
             }
-            other => panic!("expected List of 3 strings, got {other:?}"),
+            other => panic!("expected Comma of 3 strings, got {other:?}"),
         },
         other => panic!("expected ArraySliceKeys, got {other:?}"),
     }
@@ -8096,12 +8096,12 @@ fn postderef_kv_slice_indices_content() {
     let e = parse_expr_stmt("$r->%[0, 1];");
     match arrow_target(&e) {
         ArrowTarget::KvSliceIndices(idx) => match &idx.kind {
-            ExprKind::List(items) => {
+            ExprKind::Comma(items) => {
                 assert_eq!(items.len(), 2);
                 assert!(matches!(items[0].kind, ExprKind::IntLit(0)));
                 assert!(matches!(items[1].kind, ExprKind::IntLit(1)));
             }
-            other => panic!("expected List of 2 ints, got {other:?}"),
+            other => panic!("expected Comma of 2 ints, got {other:?}"),
         },
         other => panic!("expected KvSliceIndices, got {other:?}"),
     }
@@ -9093,15 +9093,15 @@ fn hard_ternary_then_has_plus() {
 
 #[test]
 fn hard_assign_comma_precedence() {
-    // `$a = $b, $c;` — comma is lower than assignment.  Must group as: List([Assign($a, $b), $c])
+    // `$a = $b, $c;` — comma is lower than assignment.  Must group as: Comma([Assign($a, $b), $c])
     let e = parse_expr_str("$a = $b, $c;");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert_eq!(items.len(), 2);
             assert!(matches!(items[0].kind, ExprKind::Assign(_, _, _)), "expected Assign as first list item, got {:?}", items[0].kind);
             assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)));
         }
-        other => panic!("expected List, got {other:?}"),
+        other => panic!("expected Comma, got {other:?}"),
     }
 }
 
@@ -9111,7 +9111,7 @@ fn hard_assign_paren_comma() {
     let e = parse_expr_str("$a = ($b, $c);");
     match &e.kind {
         ExprKind::Assign(_, _, rhs) => {
-            assert!(matches!(rhs.kind, ExprKind::List(_)), "expected List on RHS, got {:?}", rhs.kind);
+            assert!(matches!(rhs.kind, ExprKind::Comma(_)), "expected Comma on RHS, got {:?}", rhs.kind);
         }
         other => panic!("expected Assign, got {other:?}"),
     }
@@ -9416,7 +9416,7 @@ fn iter_nested_paren_ref() {
     let e = parse_expr_str("\\(1, 2);");
     match &e.kind {
         ExprKind::Ref(inner) => {
-            assert!(matches!(inner.kind, ExprKind::List(_)), "expected List inside Ref, got {:?}", inner.kind);
+            assert!(matches!(inner.kind, ExprKind::Comma(_)), "expected Comma inside Ref, got {:?}", inner.kind);
         }
         other => panic!("expected Ref, got {other:?}"),
     }
@@ -9734,10 +9734,10 @@ fn hard_parses_paren_grouping() {
 #[test]
 fn hard_my_assign_comma_grouping() {
     // `my $x = $a, $b;` — Perl parses as `(my $x = $a), $b`.
-    // Since `my` is an expression, the whole thing is a List with an Assign(Decl(My), $a) first, then $b.
+    // Since `my` is an expression, the whole thing is a Comma with an Assign(Decl(My), $a) first, then $b.
     let prog = parse("my $x = $a, $b;");
     match &prog.statements[0].kind {
-        StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+        StmtKind::Expr(Expr { kind: ExprKind::Comma(items), .. }) => {
             assert_eq!(items.len(), 2, "expected 2 list items, got {}", items.len());
 
             // First item: Assign(Decl(My, [$x]), $a)
@@ -9761,7 +9761,7 @@ fn hard_our_assign_comma_grouping() {
     // `our $x = $a, $b;` — same behavior as `my` with a different scope.
     let prog = parse("our $x = $a, $b;");
     match &prog.statements[0].kind {
-        StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+        StmtKind::Expr(Expr { kind: ExprKind::Comma(items), .. }) => {
             assert_eq!(items.len(), 2);
             match &items[0].kind {
                 ExprKind::Assign(_, lhs, _) => {
@@ -9782,7 +9782,7 @@ fn hard_state_assign_comma_grouping() {
 
     // statements[0] is the `use` declaration; the expression is statements[1].
     match &prog.statements[1].kind {
-        StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+        StmtKind::Expr(Expr { kind: ExprKind::Comma(items), .. }) => {
             assert_eq!(items.len(), 2);
             match &items[0].kind {
                 ExprKind::Assign(_, lhs, _) => {
@@ -9799,10 +9799,10 @@ fn hard_state_assign_comma_grouping() {
 #[test]
 fn hard_local_assign_comma_grouping() {
     // `local $x = $a, $b;` — local is an expression too; the trailing comma must NOT be absorbed into the Local
-    // operand.  Must group as `(local $x = $a), $b`, giving List([Assign(Local($x), $a), $b]).
+    // operand.  Must group as `(local $x = $a), $b`, giving Comma([Assign(Local($x), $a), $b]).
     let prog = parse("local $x = $a, $b;");
     match &prog.statements[0].kind {
-        StmtKind::Expr(Expr { kind: ExprKind::List(items), .. }) => {
+        StmtKind::Expr(Expr { kind: ExprKind::Comma(items), .. }) => {
             assert_eq!(items.len(), 2, "expected 2 list items, got {}", items.len());
             match &items[0].kind {
                 ExprKind::Assign(_, lhs, rhs) => {
@@ -9989,10 +9989,10 @@ fn proto_single_scalar_takes_one_expr() {
 fn proto_single_scalar_comma_terminates_arg() {
     // sub foo ($); foo $a, $b;
     // One-scalar proto: `$a` is the arg; comma ends the call, and `$b` is a separate list element.  Expected:
-    // List([FuncCall("foo", [$a]), $b]).
+    // Comma([FuncCall("foo", [$a]), $b]).
     let e = parse_call_with_proto("sub foo ($); foo $a, $b;");
     match &e.kind {
-        ExprKind::List(items) => {
+        ExprKind::Comma(items) => {
             assert_eq!(items.len(), 2);
             match &items[0].kind {
                 ExprKind::FuncCall(name, args) => {
@@ -10004,7 +10004,7 @@ fn proto_single_scalar_comma_terminates_arg() {
             }
             assert!(matches!(items[1].kind, ExprKind::ScalarVar(_)));
         }
-        other => panic!("expected List with foo call and $b, got {other:?}"),
+        other => panic!("expected Comma with foo call and $b, got {other:?}"),
     }
 }
 
@@ -12556,11 +12556,11 @@ fn nfc_fat_comma_autoquote_verified() {
     // Fat comma with NFD bareword — verify the autoquoted string is NFC.
     let rhs = first_assign_rhs(&parse("use utf8; my %h = (cafe\u{0301} => 1);"));
 
-    // RHS is List([StringLit("café"), Int(1)]).
+    // RHS is Comma([StringLit("café"), Int(1)]).
     fn find_nfc_key(e: &Expr) -> bool {
         match &e.kind {
             ExprKind::StringLit(s) => s == "caf\u{00E9}",
-            ExprKind::List(items) => items.iter().any(find_nfc_key),
+            ExprKind::Comma(items) => items.iter().any(find_nfc_key),
             _ => false,
         }
     }
@@ -12946,7 +12946,7 @@ fn hard_block_vs_hash_in_map() {
             | ExprKind::EvalExpr(inner)
             | ExprKind::Local(inner) => expr_contains_anon_hash(inner),
             ExprKind::Ternary(c, t, f) => expr_contains_anon_hash(c) || expr_contains_anon_hash(t) || expr_contains_anon_hash(f),
-            ExprKind::FuncCall(_, args) | ExprKind::ListOp(_, args) | ExprKind::List(args) | ExprKind::AnonArray(args) => {
+            ExprKind::FuncCall(_, args) | ExprKind::ListOp(_, args) | ExprKind::Comma(args) | ExprKind::AnonArray(args) => {
                 args.iter().any(expr_contains_anon_hash)
             }
             _ => false,

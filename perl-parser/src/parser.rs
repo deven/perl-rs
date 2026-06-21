@@ -1575,10 +1575,10 @@ impl Parser {
                 _ => unreachable!(),
             };
 
-            // Flatten List into individual AnonHash elements to match the structure produced by parse_term for hash
+            // Flatten Comma into individual AnonHash elements to match the structure produced by parse_term for hash
             // constructors in term position.
             let elems = match expr.kind {
-                ExprKind::List(items) => items,
+                ExprKind::Comma(items) => items,
                 _ => vec![expr],
             };
             Ok(Expr::new(ExprKind::AnonHash(elems), span))
@@ -1596,11 +1596,11 @@ impl Parser {
     /// - A non-list expression (no commas) is block-like.
     ///
     /// Fat comma (`=>`) autoquotes barewords to StringLit before we see them, so `key => val` appears as
-    /// `List([StringLit, val])`.
+    /// `Comma([StringLit, val])`.
     fn looks_like_hash_expr(expr: &Expr) -> bool {
         match &expr.kind {
             // A comma-list: check the first element.
-            ExprKind::List(items) => {
+            ExprKind::Comma(items) => {
                 match items.first().map(|e| &e.kind) {
                     // String literal — covers autoquoted barewords from fat comma, explicit strings, q//.
                     Some(ExprKind::StringLit(_)) => true,
@@ -1725,7 +1725,7 @@ impl Parser {
                 self.next_token()?;
                 if self.at(&Token::RightParen)? {
                     self.next_token()?;
-                    let expr = Expr::new(ExprKind::List(vec![]), span);
+                    let expr = Expr::new(ExprKind::Comma(vec![]), span);
                     return Ok(Some(PrefixResult::Leaf(self.maybe_postfix_subscript(expr)?)));
                 }
                 Ok(Some(PrefixResult::Frame(ExprFrame::Paren { span, min_prec: outer_prec }, PREC_LOW)))
@@ -3184,7 +3184,7 @@ impl Parser {
 
         // Multidimensional hash emulation: `$h{1,2,3}` → `$h{join($;, 1, 2, 3)}`.  When the feature is off, the comma-
         // list is left as-is for the compiler to diagnose ("Multidimensional hash lookup is disabled").
-        if let ExprKind::List(items) = &key.kind
+        if let ExprKind::Comma(items) = &key.kind
             && self.pragmas.features.contains(Features::MULTIDIMENSIONAL)
         {
             let span = key.span;
@@ -3437,7 +3437,7 @@ impl Parser {
             ExprKind::Local(_) => true,
             ExprKind::Decl(_, _) => true,
             ExprKind::Paren(inner) => Self::is_valid_lvalue(inner),
-            ExprKind::List(items) => items.iter().all(Self::is_valid_lvalue),
+            ExprKind::Comma(items) => items.iter().all(Self::is_valid_lvalue),
             ExprKind::Undef => true, // (undef, $x) = (1, 2)
             _ => false,
         }
@@ -3456,9 +3456,9 @@ impl Parser {
             // Parenthesized aliasing: `(\$x) = ...`.
             ExprKind::Paren(inner) => Self::is_ref_alias_target(inner),
 
-            // List: `(\$x, \@y) = ...`.  Mixed lists (some ref, some not) are syntactically valid — semantics is a
+            // Comma: `(\$x, \@y) = ...`.  Mixed lists (some ref, some not) are syntactically valid — semantics is a
             // later concern.
-            ExprKind::List(items) => items.iter().any(Self::is_ref_alias_target),
+            ExprKind::Comma(items) => items.iter().any(Self::is_ref_alias_target),
 
             // `my \$x = ...` — the Decl already carries the `is_ref` flag on each VarDecl.
             ExprKind::Decl(_, vars) => vars.iter().any(|v| v.is_ref),
@@ -3523,18 +3523,18 @@ impl Parser {
 
                 // Flatten comma lists
                 let mut items = match left.kind {
-                    ExprKind::List(items) => items,
+                    ExprKind::Comma(items) => items,
                     _ => vec![left],
                 };
                 match right.kind {
-                    ExprKind::List(more) => items.extend(more),
+                    ExprKind::Comma(more) => items.extend(more),
                     _ => items.push(right),
                 };
                 let span = match (items.first(), items.last()) {
                     (Some(f), Some(l)) => f.span.merge(l.span),
                     _ => Span::new(0, 0),
                 };
-                Ok(Expr::new(ExprKind::List(items), span))
+                Ok(Expr::new(ExprKind::Comma(items), span))
             }
 
             // Range — non-associative, reject chaining.

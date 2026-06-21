@@ -414,9 +414,16 @@ pub enum ExprKind {
     /// `eval EXPR`.
     EvalExpr(Box<Expr>),
 
-    // ── Comma / list ──────────────────────────────────────────
-    /// Comma-separated list of expressions.
-    List(Vec<Expr>),
+    // ── Comma sequence ────────────────────────────────────────
+    /// Expressions joined by comma (or fat-comma) operators.  This is the
+    /// comma *operator*, parameterized by evaluation context (§6.2.2): in
+    /// list context it constructs a list (every operand in list context);
+    /// in scalar or void context it is the C-comma (operands before the
+    /// last in void context, the last inheriting the node's context).  The
+    /// vector is flat — `a, b, c` is `Comma([a, b, c])`, not a nested
+    /// chain — and list-construction-vs-C-comma is the `ctx` tag, not the
+    /// node's identity.
+    Comma(Vec<Expr>),
 
     // ── Parenthesized ─────────────────────────────────────────
     Paren(Box<Expr>),
