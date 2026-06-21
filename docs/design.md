@@ -2503,17 +2503,59 @@ not context; context is stamped afterward (§6.2.5).
 
 #### 6.2.1 The tagging model
 
-Every expression in Perl is evaluated in one of three **evaluation
-contexts** — scalar, list, or void.  Context is not a parse-time
-*parameter* threaded through the Pratt loop; it is a *post-construction
-annotation* on the AST.  Each `Expr` carries an `Option<Context>` field
-(`ctx`), born `None` at construction and resolved to `Some(_)` by a
-stamping pass (§6.2.5).
+Every expression in Perl is evaluated in an **evaluation context**.  At the
+language level there are three — scalar, list, and void (`wantarray`'s
+three-way view) — but the model carries a slightly finer set, because the
+optree itself distinguishes a boolean (truth-tested) refinement of scalar
+and because some positions' context is not knowable until runtime.  Context
+is not a parse-time *parameter* threaded through the Pratt loop; it is a
+*post-construction annotation* on the AST.  Each `Expr` carries an
+`Option<Context>` field (`ctx`), born `None` at construction and resolved
+to `Some(_)` by a stamping pass (§6.2.5).
 
 ```rust
-enum Context { Scalar, List, Void }
+enum Context {
+    // Static — fixed by the grammar, known at parse time.
+    Scalar,   // a single value
+    List,     // flattened into a list
+    Void,     // value discarded
+    Boolean,  // a single value consumed as a truth test — a refinement of
+              // Scalar carrying the OPpTRUEBOOL fact (B::Concise: sK/BOOL
+              // vs sK/1).  Language-indistinguishable from Scalar
+              // (wantarray is three-way); the distinction is ours / the
+              // optree's, and preserving it keeps the IR as expressive as
+              // the reference optree.
+
+    // Dynamic — a function of the runtime frame context W, used only for
+    // positions whose context is unknown until the enclosing sub or file
+    // is entered (a return operand, a sub body's tail, the program's final
+    // statement).
+    Runtime,             // the node's context *is* W (a value-forwarding
+                         // position: a forwarded short-circuit right
+                         // operand, a ternary branch, a block tail).
+    RuntimeTruthTested,  // truth_tested(W): a short-circuit operator's left
+                         // operand whose enclosing context is W-dependent.
+}
 struct Expr { kind: ExprKind, span: Span, ctx: Option<Context> }
 ```
+
+`W` is *four*-valued — list, scalar, boolean, or void — because boolean
+context propagates *through* a call into the callee's return value (a sub
+called in boolean context evaluates its return expression in boolean
+context; verifiable by overload).  `wantarray` is a *lossy* three-way view
+of `W` that collapses boolean into scalar; the boolean bit is nonetheless
+real and affects evaluation.  Crucially, `W`-dependence reaches only the
+thin value-forwarding spine: everything reachable through a context-fixing
+operator (call args, arithmetic operands, conditions, `!`/`xor` operands,
+slice subscripts) is *static*, because *forcing* a fixed context erases the
+`W`-dependence.  This is why only two dynamic variants are needed rather
+than a `Runtime`-parameterized copy of every static context: an operation
+that imposes a fixed context regardless of `W` (`!`/`xor` always impose
+`Boolean`, arithmetic always `Scalar`, a call always `List`) is static, so
+its result does not vary with `W`; the *only* mapping whose result still
+varies with `W` is `truth_tested` (the short-circuit gate — see §6.2.5),
+hence the sole `RuntimeTruthTested`.  There is no
+`RuntimeBoolean`/`RuntimeScalar`/`RuntimeVoid`.
 
 The rationale for tag-over-thread: context does not influence *parsing*
 (precedence threads through the Pratt loop; context does not).  It
@@ -2798,83 +2840,128 @@ operand of a `ListSlice` is in list context.
 
 #### 6.2.5 The stamping pass: `save_context`
 
-Context resolution is a single method each node implements, plus
-construction-time stamping in the constructors.  The two together uphold a
-strict ownership contract.
+Context resolution is a top-down pass that stamps every node, composed with
+optional construction-time stamping for nodes whose context is fixed by
+their parent's kind.  The two compose under a **first-writer-wins** rule.
 
-**The ownership contract.**  Each child is stamped by exactly one event —
-*construction* or its parent's `save_context` — never both.  At
-construction, a node stamps `Some(_)` on exactly the children whose
-context is determinable from its own kind (context-*independent*), and
-leaves `None` on the children whose context depends on the node's own,
-not-yet-known context (context-*dependent*).
+**First-writer-wins.**  Each node's `ctx` is set exactly once and never
+overwritten.  A node never sets its *own* context at construction — a
+node's context is imposed by its consumer (its parent), which does not
+exist yet when the node is built bottom-up.  What *can* happen at
+construction is a *parent* stamping a *child* whose context is fixed by the
+parent's own kind, regardless of the parent's (not-yet-known) context — for
+example a comparison stamps both operands `Scalar`, a `scalar(E)` stamps its
+operand `Scalar`.  Everything else is stamped by this pass.  When the pass
+reaches a node whose `ctx` is already `Some(_)`, it stops there: it neither
+re-stamps the node nor descends into its children.  This is the mechanism by
+which construction-time stamping and the descent compose — the parent stamps
+the child subtree it knows for certain, and the descent fills in everything
+else, *bouncing off* whatever is already stamped.  (Because the descent
+always re-pushes a node's children, the first-writer guard is precisely what
+prevents the descent from overwriting a construction-time stamp; there is no
+node-stamps-itself constructor.)
 
-- **Context-independent → stamped at construction.**  Knowable from the
-  parent's kind regardless of the parent's own context.  `scalar(E)`'s
-  child is always `Scalar` (in any outer context).  An assignment's RHS is
-  always by-LHS-kind (`List` for an aggregate/`Paren`/`Comma` LHS,
-  `Scalar` for a bare scalar LHS) — fixed at construction, independent of
-  the assignment's own later-determined context.  The refgen operand's
-  parens-fact is stamped here (see below).
-- **Context-dependent → left `None`, stamped during descent.**  The comma
-  operands (list → all list; scalar/void → all-but-last void, last
-  inherited) and the ternary branches (inherit the ternary's own context)
-  depend on the node's own context, unknown until a consumer supplies it.
-
-**The method.**
+**The driver and the per-node step.**  The pass is *iterative*, driven by an
+explicit work queue of `(expression, context)` pairs rather than by
+recursion, so that arbitrarily deep expression nesting (a long
+unary-operator chain, a deeply nested anonymous aggregate) cannot overflow
+the call stack — the same depth-independence the iterative parser holds
+(§6.1).  The public driver seeds the queue with the root and drains it; each
+node's `save_context_step` stamps the node and *pushes* its `Expr` children
+(each with the context it is evaluated in) onto the queue without recursing
+into them:
 
 ```rust
-fn save_context(&mut self, ctx: Context) {
-    debug_assert!(self.ctx.is_none(),
-        "save_context twice / on a non-deferred node");
+// Driver (on Expr; the whole-program driver on Program is analogous).
+pub fn save_context(&mut self, ctx: Context) {
+    let mut queue: Vec<(&mut Expr, Context)> = vec![(self, ctx)];
+    while let Some((node, node_ctx)) = queue.pop() {
+        node.save_context_step(node_ctx, &mut queue);
+    }
+}
+
+// Per-node step: first-writer-wins guard, stamp, push children.
+fn save_context_step<'a>(&'a mut self, ctx: Context,
+                         queue: &mut Vec<(&'a mut Expr, Context)>) {
+    if self.ctx.is_some() {
+        return;                 // already stamped — do not re-stamp or recurse
+    }
     self.ctx = Some(ctx);
-    // recurse into exactly the children DEFERRED to None at construction,
-    // per this node's rule; never revisit children already stamped.
+    // push each Expr child with its appropriate context; non-Expr children
+    // (blocks, interpolation parts, arrow targets, sub bodies) are pushed
+    // by their own routers onto the same queue.
 }
 ```
 
-Traversal begins `program.save_context(Void)`.  A node recurses only into
-the children it deferred — it knows statically which those are; it does
-*not* probe `child.ctx.is_none()`.  The `debug_assert!` (not `assert!`,
-not a tolerant early return) is correct precisely because, under the
-contract, entering `save_context` on an already-`Some` node can only mean
-a stamping-logic bug — never anything triggerable by Perl source.  It is a
-debug-build tripwire at the point of violation and compiles out of
-release, consistent with the #177 stance of not adding runtime machinery
-to defend against what only a code defect can cause.
+The early-return guard (rather than a `debug_assert!(self.ctx.is_none())`)
+is *load-bearing*, not defensive: because the step unconditionally re-pushes
+every child, a child that a constructor stamped at construction is still
+pushed by its parent and must be skipped when popped — the guard is what
+makes first-writer-wins work.  It also makes the pass idempotent and lets
+deferred arms (see below) be filled in by a later mechanism without the pass
+fighting them.
 
-**Why the method drives its own children (returns nothing).**  A single
+Statement nesting — which is shallow and not adversarial — is still handled
+by ordinary recursion in a set of statement/block routers (`save_context_body`,
+`Statement::save_context`, `Block::save_context`, and the
+signature/arrow/interpolation routers), which thread the same queue and push
+the expressions they reach onto it rather than recursing into them.  The
+whole-program driver, `Program::save_context(ctx)` (called with `Runtime`,
+the program-body seed), runs that statement recursion first (filling the
+queue with every top-level expression) and then drains the queue.
+
+**Seed contexts.**  The driver supplies the context of the *root* — the one
+node with no parent to stamp it.  The whole program is a body evaluated like
+a subroutine: its value is produced in the caller's runtime context (void if
+the file is run directly, scalar if it is `require`d), so the root is seeded
+**`Runtime`** — not `Void` (a specific static guess the root has no business
+making) and not left `None` (unstamped).  The body-forwarding rule then
+distributes that: a body forwards its context to its tail statement and
+`Void` to the rest, so the program's final statement is `Runtime` and the
+earlier statements are `Void`.  A subroutine/anonymous-sub body is likewise
+`Runtime` at its tail.  Conditions are seeded `Boolean`; a `foreach` list
+`List`; the C-style `for(init; cond; step)` clauses void/scalar/void;
+value-bearing compound statements (if/unless/try/given/when/bare block)
+forward their context into their value sub-blocks, while loops — not
+value-bearing — force their bodies `Void` regardless.
+
+**Why the step drives its own children (pushes, returns nothing).**  A single
 operator can impose *different* contexts on different argument positions.
 `splice(@a, OFFSET, LENGTH, LIST)` imposes scalar on the offset and length
-but list on the replacement arguments (verified vs Perl); the same holds
-for any mixed-prototype builtin or user sub — `sprintf`/`pack` (scalar
-format, list rest), a `($$@)`-prototyped sub (two scalar slots, then
-list).  A `save_context` that *returned* one context for a uniform caller
-loop could not express "scalar to slots 1–2, list to slot 3+."  So the
-method returns nothing and stamps each child per-slot itself.
+but list on the replacement arguments (verified vs Perl); the same holds for
+any mixed-prototype builtin or user sub — `sprintf`/`pack` (scalar format,
+list rest), a `($$@)`-prototyped sub (two scalar slots, then list).  A step
+that *returned* one context for a uniform caller loop could not express
+"scalar to slots 1–2, list to slot 3+."  So the step pushes each child with
+its own per-slot context and returns nothing.
 
 Storage is uniform: every node sets `self.ctx`, so every node answers
 `.context()` after the pass, for one byte.
 
-**Per-node bodies.**
+**Per-node bodies (representative).**
 
 - *Leaves / inherent nodes:* set `self.ctx`; no children.
-- *`scalar(E)`:* ignores the received `ctx`; its child was stamped
-  `Scalar` at construction, so it recurses into nothing.  (`@a = scalar(p())`
-  — the `scalar` node's own ctx is `List`, but it imposed `Scalar` on its
-  child; own-context and imposed-context legitimately differ.)
-- *`Comma`:* in `List`, stamp every element `List`; in `Scalar`/`Void`,
-  stamp `[0..n-1]` `Void` and `[n-1]` the node's own (inherited) ctx.  The
-  void-on-early-operands originates *inside* the comma, so there is no
-  tension with the descent — it stamps `None` operands.
-- *Ternary:* the condition was stamped `Some(Scalar)` at construction (its
-  guard returns); recurse into the two branches with the inherited ctx.
-- *Assignment:* the RHS was stamped by-LHS-kind at construction; the
-  assignment's own ctx (set by whoever consumes it — possibly `Void`, as
-  in `@x = a, b, c`) is independent.
-- *Consumers initiate:* `parse_statement` → `Void`; `if`/`while`/`until`
-  conditions → `Scalar`; `foreach` list → `List`; the C-style `for(init;
-  cond; step)` clauses → void/scalar/void (verified).
+- *Unary `!`/`not`, and `xor`:* impose `Boolean` on their operand(s)
+  regardless of the node's own context (a context-fixing truth-test).  Every
+  other unary operator imposes `Scalar`.
+- *Short-circuit `&&`/`||`/`//`/`and`/`or`:* the left operand is the
+  truth-tested gate — `ctx.truth_tested()` (Boolean when the enclosing
+  context discards or only truth-tests the value, Scalar when it keeps it;
+  `RuntimeTruthTested` when the enclosing context is itself runtime-dependent);
+  the right operand forwards the node's value and inherits the node's context
+  verbatim (including list, where it flattens).
+- *Arithmetic/comparison/string/bitwise binops:* both operands `Scalar`.
+- *`Comma`:* in `List`, push every element `List`; in `Scalar`/`Void`/`Boolean`,
+  push `[0..n-1]` `Void` and `[n-1]` the node's own (inherited) context.
+- *Ternary:* condition `Boolean`; the two branches inherit the node's context.
+- *`return`:* the operand is the caller's context — intrinsically `Runtime`,
+  independent of the node's own (vestigial) context, even when nested under
+  an operator (`5 + return $x` evaluates `$x` in the caller's context).
+- *Calls / list ops:* arguments `List` (per-slot prototype refinement is a
+  later refinement); slice subscripts `List`; element-access bases and
+  indices `Scalar`.
+- *Assignment, refgen:* see below — the LHS-kind rule and the
+  parens-fact-as-`Context::List` stamp.
 
 **Refgen and the parens distinction, via construction-time stamping.**
 `\@a` references the array as a whole; `\(@a)` flattens it and references
@@ -2885,6 +2972,17 @@ descent pass (which never sees parens) and does not require a separate
 context from the parens-fact it has in hand (via the transient `Paren`):
 `\@a` stamps the operand `Context::Scalar`, `\(@a)` stamps it
 `Context::List`.
+
+> Implementation status.  This refgen stamping, and the assignment
+> LHS-kind rule below, are the *design target*; they depend on the
+> transient `Paren` (§6.2.3), which the parser does not yet construct.  In
+> the current code the `save_context` step leaves the `Assign` and `Ref`
+> arms **deferred** (their children unstamped), so no construction-time
+> stamping happens yet — every node is stamped by the descent.  When these
+> arms land, the parent constructor will stamp the intrinsic-context child
+> subtree directly (e.g. the refgen operand from the parens-fact); the
+> first-writer-wins guard (above) is what lets that construction-time stamp
+> survive the descent.
 
 Behavior is then a function of *the operand's tag* (the parens-fact) **and
 the operand's node kind** (its container-ness), combined at lowering:
@@ -3463,6 +3561,13 @@ enum Context {
     List,
 }
 ```
+
+This is the *IR-level* context, distinct from the parser's `ast::Context`
+(§6.2.1): by the time the AST is lowered, the optree-level `Boolean`
+refinement has collapsed back into `Scalar` (it informs optimization, not
+the value shape), and the runtime-dependent `Runtime`/`RuntimeTruthTested`
+positions have been resolved against the frame, so the IR needs only the
+three value shapes.
 
 This is not inferred at execution time.  The lowering pass propagates
 context from consumers to producers and encodes it in the IR.  This

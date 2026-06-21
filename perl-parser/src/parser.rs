@@ -351,9 +351,10 @@ impl Parser {
         let end = self.peek_span();
         let mut program = Program { statements, span: start.merge(end) };
 
-        // Stamp evaluation context across the whole tree (§6.2.5).  Every top-level statement is void except the last,
-        // whose context is load-determined and left to the runtime.
-        program.save_context();
+        // Stamp evaluation context across the whole tree (§6.2.5).  The program is a body evaluated in the caller's
+        // runtime context, so its final statement is Runtime (load-determined, resolved at runtime) and every earlier
+        // statement is Void.
+        program.save_context(Context::Runtime);
 
         Ok(program)
     }

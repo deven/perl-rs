@@ -226,11 +226,6 @@ impl Expr {
         Expr { kind, span, ctx: None }
     }
 
-    /// Construct an expression with its context already known (context-independent nodes set this at construction).
-    pub fn with_context(kind: ExprKind, span: Span, ctx: Context) -> Self {
-        Expr { kind, span, ctx: Some(ctx) }
-    }
-
     // ── Operand-bearing constructors ──────────────────────────────────────────────────────────────────────────────
     //
     // These box their `Expr` operands internally so call sites never write `Box::new`.  The node's `span` is computed
@@ -589,17 +584,17 @@ impl Expr {
 impl Program {
     /// Root the evaluation-context stamping pass over the whole program (§6.2.5) — the driver for the whole tree.
     ///
-    /// The program's top level is a body, evaluated like a subroutine: every statement is void **except the last**,
-    /// whose context is the runtime context (`wantarray`) — void if the file is run directly, scalar if it is
-    /// `require`d.  We stamp that tail statement `Runtime` and let the runtime resolve it; `Runtime` flows down the
-    /// tail statement's value-forwarding spine while everything off the spine is stamped statically.
+    /// `ctx` is the context the program's *value* is produced in: the program is a body evaluated like a subroutine,
+    /// so its value is the caller's runtime context — callers pass `Context::Runtime` (void if the file is run
+    /// directly, scalar if it is `require`d, resolved at runtime).  The body-forwarding rule then stamps the final
+    /// statement `ctx` and every earlier statement `Void`.
     ///
     /// Statements recurse (their nesting is shallow and not adversarial), pushing each expression they reach onto a
     /// shared work queue; once the statement phase returns, the queue holds every top-level expression, which are then
     /// drained iteratively so deep *expression* nesting never recurses on the stack.
-    pub fn save_context(&mut self) {
+    pub fn save_context(&mut self, ctx: Context) {
         let mut queue: Vec<(&mut Expr, Context)> = Vec::new();
-        save_context_body(&mut self.statements, Context::Runtime, &mut queue);
+        save_context_body(&mut self.statements, ctx, &mut queue);
         while let Some((node, node_ctx)) = queue.pop() {
             node.save_context_step(node_ctx, &mut queue);
         }
