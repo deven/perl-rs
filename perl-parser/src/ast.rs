@@ -103,19 +103,85 @@ pub enum StmtKind {
     MethodDecl(SubDecl),
 }
 
-/// Evaluation context — scalar, list, or void (§6.1.5).
+/// Evaluation context — the context an expression is evaluated in (§6.2.1).
 ///
 /// This is the *evaluation* context an expression is in, distinct from its grammatical category.  It is stamped onto
-/// AST nodes after parsing via [`Expr::save_context`]; see the module docs and design §6.1.5 for the full model.
+/// AST nodes after parsing via [`Expr::save_context`]; see the module docs and design §6.2 for the full model.
+///
+/// Most variants are *static* — fixed by the grammar, known at parse time:
 ///
 /// - `Scalar` — the expression produces a single value (the ambient default for most positions).
-/// - `List`   — the expression is flattened into a list (a genuine stack operation; marked by an interposed list build).
+/// - `List`   — the expression is flattened into a list.
 /// - `Void`   — the expression's value is discarded.
+/// - `Boolean` — a single value consumed as a truth test.  This is a *refinement* of scalar context (a boolean is
+///   still a scalar): it carries the additional fact that the value will be truth-tested, which Perl's optree tracks
+///   via the `OPpTRUEBOOL` flag (`B::Concise` renders it `sK/BOOL` vs `sK/1`).  Preserving it keeps our IR as
+///   expressive as the reference optree and enables later optimizations.  At the language level it is indistinguishable
+///   from scalar (`wantarray` is three-way); the distinction is only ours / the optree's.
+///
+/// Two variants are *dynamic* — a function of the runtime context `W` (the dynamic frame's context).  `W` is
+/// four-valued — list, scalar, boolean, or void — because boolean context propagates *through* a call into the
+/// callee's return value (verifiable by overload: a sub called in boolean context evaluates its return expression in
+/// boolean context).  Note `wantarray` is a *lossy* three-way view of `W` that collapses boolean into scalar; the
+/// boolean bit is nonetheless real and affects evaluation.  These variants are used for positions whose context is
+/// only known once the enclosing subroutine or file is entered (a `return` operand, a subroutine body's tail, the
+/// program's final statement).  `W`-dependence reaches only the thin value-forwarding spine; everything reachable
+/// through a context-fixing operator (call args, arithmetic operands, conditions, `!`/`xor` operands, slice
+/// subscripts) is static — *forcing* a fixed context erases the `W`-dependence, so only operations whose result still
+/// varies with `W` stay dynamic.
+///
+/// - `Runtime` — the node's context *is* `W` (a value-forwarding position: a forwarded short-circuit right operand, a
+///   ternary branch, a block tail).  Resolved to `W` at runtime; may be any of list/scalar/boolean/void.
+/// - `RuntimeTruthTested` — `truth_tested(W)`: a short-circuit operator's *left* operand whose enclosing context is
+///   runtime-dependent.  The left operand is *always* truth-tested (the short-circuit gate is intrinsic — the RHS's
+///   side effects must be gated on the LHS even when the whole result is discarded).  Its context is `Boolean` when
+///   the enclosing context does not keep the operand's value (`Void` discards it; `Boolean` only truth-tests it) and
+///   `Scalar` when the enclosing context keeps the value (`Scalar`/`List` — the operand may be forwarded as the scalar
+///   result).  So `truth_tested(W)` resolves to **`Boolean` when `W` is void or boolean, otherwise `Scalar`** — a
+///   result that still varies with `W`, so it stays dynamic; at runtime it is resolved by applying that same mapping
+///   to the resolved `W`.  (It is the *only* dynamic mapping: an operation that imposes a *fixed* context regardless of
+///   `W` — `!`/`xor` always impose `Boolean`, arithmetic always `Scalar`, a call always `List` — is static, because
+///   its result does not vary with `W`.  That is why there is no `RuntimeBoolean`/`RuntimeScalar`/`RuntimeVoid`.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Context {
     Scalar,
     List,
     Void,
+    Boolean,
+    Runtime,
+    RuntimeTruthTested,
+}
+
+impl Context {
+    /// Whether this is a *statically* scalar-valued context.  True for `Scalar` and `Boolean` (a boolean is a scalar
+    /// too — `Scalar` plus a truth-test flag, mirroring `OPf_WANT_SCALAR | OPpTRUEBOOL`) and for `RuntimeTruthTested`
+    /// (a truth-tested context resolves to `Boolean` or `Scalar`, both scalar-valued).  For `Runtime` the answer is not
+    /// known statically (it could resolve to `List`), so this returns `false` — callers needing certainty must resolve
+    /// the runtime context first.
+    pub fn is_scalar(self) -> bool {
+        matches!(self, Context::Scalar | Context::Boolean | Context::RuntimeTruthTested)
+    }
+
+    /// The context imposed on a short-circuit operator's *left* operand in this enclosing context.  That operand is
+    /// always truth-tested (the gate is intrinsic — the RHS's side effects must be gated on the LHS even when the whole
+    /// result is discarded).  When the enclosing context keeps the operand's scalar *value* (the operand may be
+    /// forwarded as the result), it is `Scalar`; when the enclosing context does not keep the value — it is discarded
+    /// (`Void`) or already only truth-tested (`Boolean`) — the operand is a pure `Boolean` truth-test:
+    ///
+    /// - `Void`    → `Boolean`  (value discarded; pure truth-test gate)
+    /// - `Boolean` → `Boolean`  (value would itself be truth-tested)
+    /// - `Scalar`  → `Scalar`   (value may be forwarded as the scalar result)
+    /// - `List`    → `Scalar`   (value forwarded as a scalar if it wins; never a list)
+    ///
+    /// The dynamic contexts map to `RuntimeTruthTested`; at runtime that resolves by applying this very same mapping to
+    /// the resolved runtime context `W`.
+    pub fn truth_tested(self) -> Context {
+        match self {
+            Context::Void | Context::Boolean => Context::Boolean,
+            Context::Scalar | Context::List => Context::Scalar,
+            Context::Runtime | Context::RuntimeTruthTested => Context::RuntimeTruthTested,
+        }
+    }
 }
 
 /// Which spelling of the range/flip-flop operator was written: `..` or `...`.
@@ -169,7 +235,7 @@ impl Expr {
     //
     // These box their `Expr` operands internally so call sites never write `Box::new`.  The node's `span` is computed
     // by the caller and passed last (uniformly across all constructors — no constructor computes a span merge itself).
-    // Passing operands by value also makes these the seam where the context-stamping ownership contract (§6.1.5) is
+    // Passing operands by value also makes these the seam where the context-stamping ownership contract (§6.2) is
     // applied to context-independent children.
 
     /// `left OP right` — binary operator.
@@ -265,6 +331,455 @@ impl Expr {
     /// `method { ... }` — anonymous method (5.38+).
     pub fn anon_method(attrs: Vec<Attribute>, sig: Option<Signature>, block: Block, span: Span) -> Expr {
         Expr::new(ExprKind::AnonMethod(attrs, sig, block), span)
+    }
+
+    // ── Evaluation-context stamping (§6.2) ────────────────────────────────────────────────────────────────────────
+
+    /// Stamp this expression subtree with evaluation contexts (the driver).
+    ///
+    /// **First-writer wins.**  Each node's context is set once: by its own constructor (for a child whose context is
+    /// fixed by the parent's kind, e.g. a comparison's operands) or by this pass.  A node already stamped is skipped —
+    /// not re-stamped, and its children are not re-enqueued — so construction-time stamping and the pass compose: the
+    /// constructor stamps what it knows for certain, and the pass fills in everything else, bouncing off whatever is
+    /// already stamped.
+    ///
+    /// Children are stamped with *their own* appropriate context, which may differ from this node's (a ternary in list
+    /// context still imposes scalar/boolean on its condition).  A node passes `Boolean` to a child only where the
+    /// child's value is consumed as a truth test (conditions, `!`/`xor`, a short-circuit gate); operators that
+    /// transform their operands (arithmetic, comparison, string ops) impose `Scalar` regardless of their own context,
+    /// because the operand is consumed as a value, not a truth.  Positions whose context is only known at runtime — a
+    /// subroutine body's tail and the program's final statement (`wantarray`/load-determined) — are stamped `Runtime`
+    /// (or `RuntimeTruthTested`), not left unstamped; the runtime resolves them against the dynamic frame context.
+    ///
+    /// **Iterative.**  To preserve the parser's depth-independence, the descent is driven by an explicit work queue of
+    /// `(expression, context)` pairs rather than by recursion: this allocates the queue, seeds it with this node, and
+    /// drains it via [`save_context_step`](Expr::save_context_step), so an arbitrarily deep operator or
+    /// anonymous-aggregate chain does not recurse on the call stack.  (Statement nesting, which is shallow, is still
+    /// handled by ordinary recursion in the statement routers, which push the expressions they reach onto the queue.)
+    pub fn save_context(&mut self, ctx: Context) {
+        let mut queue: Vec<(&mut Expr, Context)> = vec![(self, ctx)];
+        while let Some((node, node_ctx)) = queue.pop() {
+            node.save_context_step(node_ctx, &mut queue);
+        }
+    }
+
+    /// Process a single expression node: stamp its context (first-writer-wins) and push its `Expr` children — each with
+    /// the context it is evaluated in — onto the work `queue`, *without recursing into them*.  Non-`Expr` children
+    /// (blocks, interpolation parts, arrow targets, sub bodies) are handled by their own routers, which push their
+    /// contained expressions onto the same queue.  The driver [`save_context`](Expr::save_context) drains the queue.
+    fn save_context_step<'a>(&'a mut self, ctx: Context, queue: &mut Vec<(&'a mut Expr, Context)>) {
+        if self.ctx.is_some() {
+            return;
+        }
+        self.ctx = Some(ctx);
+
+        match &mut self.kind {
+            // ── Leaves: no children to recurse into. ──
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::StringLit(_)
+            | ExprKind::VersionLit(_)
+            | ExprKind::QwList(_)
+            | ExprKind::Undef
+            | ExprKind::ScalarVar(_)
+            | ExprKind::ArrayVar(_)
+            | ExprKind::HashVar(_)
+            | ExprKind::GlobVar(_)
+            | ExprKind::ArrayLen(_)
+            | ExprKind::SpecialVar(_)
+            | ExprKind::SpecialArrayVar(_)
+            | ExprKind::SpecialHashVar(_)
+            | ExprKind::DefaultVar
+            | ExprKind::Bareword(_)
+            | ExprKind::EmptyList
+            | ExprKind::Wantarray
+            | ExprKind::SourceFile(_)
+            | ExprKind::SourceLine(_)
+            | ExprKind::CurrentPackage(_)
+            | ExprKind::CurrentSub
+            | ExprKind::CurrentClass
+            | ExprKind::YadaYada => {}
+
+            // ── Interpolated / regex / transliteration: interpolated sub-expressions carry their own context
+            // (scalar-interp is scalar, array-interp is list); push them onto the queue. ──
+            ExprKind::InterpolatedString(parts) => parts.save_context(queue),
+            ExprKind::Regex(_, parts, _) => parts.save_context(queue),
+            ExprKind::Subst(pat, repl, _) => {
+                pat.save_context(queue);
+                repl.save_context(queue);
+            }
+            ExprKind::Translit(_, _, _) => {}
+
+            // ── Declarations: VarDecls are not Expr children (no context). ──
+            ExprKind::Decl(_, _) => {}
+
+            // ── Unary operators.  `!`/`not` always truth-test their operand, so the operand is always Boolean —
+            // independent of this node's own context (a context-fixing position, like a condition).  Every other unary
+            // operator imposes Scalar (the operand is consumed as a value, not a truth). ──
+            ExprKind::UnaryOp(op, operand) => {
+                let c = match op {
+                    UnaryOp::LogNot | UnaryOp::Not => Context::Boolean,
+                    _ => Context::Scalar,
+                };
+                queue.push((operand, c));
+            }
+            ExprKind::PostfixOp(_, operand) => queue.push((operand, Context::Scalar)),
+
+            // ── Local: `local EXPR` — the localized lvalue inherits this node's context. ──
+            ExprKind::Local(inner) => queue.push((inner, ctx)),
+
+            // ── Binary operators. ──
+            ExprKind::BinOp(op, left, right) => match op {
+                // Short-circuit `&&`/`||`/`//` and their low-precedence `and`/`or` forms: the left operand is
+                // truth-tested as the short-circuit gate (`ctx.truth_tested()` — Boolean when the enclosing context
+                // discards or truth-tests the value, Scalar when it keeps it); the right forwards this node's value and
+                // inherits our context verbatim (including list, where it flattens).
+                BinOp::And | BinOp::Or | BinOp::DefinedOr | BinOp::LowAnd | BinOp::LowOr => {
+                    queue.push((left, ctx.truth_tested()));
+                    queue.push((right, ctx));
+                }
+                // Logical xor (`^^`, `xor`) always truth-tests both operands (the result is a fresh boolean, never a
+                // forwarded operand value), so both operands are Boolean — independent of this node's context.  (Perl's
+                // optree happens to flag the two operands asymmetrically, `sK/1` vs `sK/BOOL`, which is a codegen
+                // optimization detail; we model the behavioral truth-test, where both are boolean.)
+                BinOp::LogicalXor | BinOp::LowXor => {
+                    queue.push((left, Context::Boolean));
+                    queue.push((right, Context::Boolean));
+                }
+                // Everything else — arithmetic, comparison, string, bitwise, shifts, binding, isa, smartmatch — consumes
+                // both operands as values → Scalar.
+                _ => {
+                    queue.push((left, Context::Scalar));
+                    queue.push((right, Context::Scalar));
+                }
+            },
+            ExprKind::ChainedCmp(_, operands) => {
+                for operand in operands {
+                    queue.push((operand, Context::Scalar));
+                }
+            }
+
+            // ── Assignment: DEFERRED.  The LHS-kind → RHS-context rule (and the transient-Paren `($x) =` case) lands
+            // with the Paren commit; leave both children unstamped for now. ──
+            ExprKind::Assign(_, _, _) => {}
+
+            // ── Ternary: condition is always boolean (a pure truth-test); branches forward this node's value and
+            // inherit our context verbatim. ──
+            ExprKind::Ternary(cond, then_expr, else_expr) => {
+                queue.push((cond, Context::Boolean));
+                queue.push((then_expr, ctx));
+                queue.push((else_expr, ctx));
+            }
+
+            // ── Range / flip-flop: endpoints are scalar; the node itself takes our context (which selects range vs
+            // flip-flop at lowering). ──
+            ExprKind::Range(left, right, _) => {
+                queue.push((left, Context::Scalar));
+                queue.push((right, Context::Scalar));
+            }
+
+            // ── Element access: base and index are scalar (single-value access). ──
+            ExprKind::ArrayElem(base, index) | ExprKind::HashElem(base, index) => {
+                queue.push((base, Context::Scalar));
+                queue.push((index, Context::Scalar));
+            }
+
+            // ── Slices: the base is scalar-ish; the subscript list is in list context. ──
+            ExprKind::ArraySlice(base, indices)
+            | ExprKind::HashSlice(base, indices)
+            | ExprKind::KvArraySlice(base, indices)
+            | ExprKind::KvHashSlice(base, indices) => {
+                queue.push((base, Context::Scalar));
+                for idx in indices {
+                    queue.push((idx, Context::List));
+                }
+            }
+
+            // ── Dereference: the reference operand is a single scalar. ──
+            ExprKind::Deref(_, operand) => queue.push((operand, Context::Scalar)),
+            ExprKind::ArrowDeref(base, target) => {
+                queue.push((base, Context::Scalar));
+                target.save_context(queue);
+            }
+
+            // ── Reference (refgen `\`): DEFERRED.  Operand context is set at construction from the parens-fact (the
+            // transient-Paren tagging), which lands with the Paren commit. ──
+            ExprKind::Ref(_) => {}
+
+            // ── Anonymous aggregate constructors: elements are in list context. ──
+            ExprKind::AnonArray(elems) | ExprKind::AnonHash(elems) => {
+                for e in elems {
+                    queue.push((e, Context::List));
+                }
+            }
+
+            // ── Subroutine/method bodies: the body is a container evaluated in the caller's context — its tail
+            // statement is in runtime context (wantarray), earlier statements void.  The sub *expression* itself is a
+            // scalar coderef value (this node's own context, already stamped above). ──
+            ExprKind::AnonSub(_, _, _, body) | ExprKind::AnonMethod(_, _, body) => body.save_context(Context::Runtime, queue),
+
+            // ── Calls: arguments are in list context (per-slot prototype refinement is deferred to §6.4). ──
+            ExprKind::FuncCall(_, args) | ExprKind::ListOp(_, args) => {
+                for a in args {
+                    queue.push((a, Context::List));
+                }
+            }
+            ExprKind::MethodCall(invocant, _, args) | ExprKind::IndirectMethodCall(invocant, _, args) => {
+                queue.push((invocant, Context::Scalar));
+                for a in args {
+                    queue.push((a, Context::List));
+                }
+            }
+            ExprKind::PrintOp(_, filehandle, args) => {
+                if let Some(fh) = filehandle {
+                    queue.push((fh, Context::Scalar));
+                }
+                for a in args {
+                    queue.push((a, Context::List));
+                }
+            }
+
+            // ── Postfix control: `EXPR if COND` — COND is a truth-test (boolean); EXPR forwards this node's context. ──
+            ExprKind::PostfixControl(_, expr, cond) => {
+                queue.push((expr, ctx));
+                queue.push((cond, Context::Boolean));
+            }
+
+            // ── do/eval BLOCK: the block is evaluated as a value in this node's context — its final statement inherits
+            // the context, earlier statements are void.  (Handled by the container's own save_context.) ──
+            ExprKind::DoBlock(block) | ExprKind::EvalBlock(block) => block.save_context(ctx, queue),
+
+            // ── do/eval EXPR: the operand is a scalar (a filename for `do`, a string for `eval`). ──
+            ExprKind::DoExpr(operand) | ExprKind::EvalExpr(operand) => queue.push((operand, Context::Scalar)),
+
+            // ── Comma: the C-comma vs list-construction distinction.  In list context every operand is list; in
+            // scalar/void/boolean context all but the last operand are void and the last inherits our context. ──
+            ExprKind::Comma(items) => {
+                if ctx == Context::List {
+                    for item in items {
+                        queue.push((item, Context::List));
+                    }
+                } else if let Some((last, rest)) = items.split_last_mut() {
+                    for item in rest {
+                        queue.push((item, Context::Void));
+                    }
+                    queue.push((last, ctx));
+                }
+            }
+
+            // ── Parenthesized: DEFERRED.  The transient `Paren` node is introduced and consumed in the Paren commit;
+            // it does not persist in a fully-parsed tree today. ──
+            ExprKind::Paren(inner) => queue.push((inner, ctx)),
+
+            // ── Filetest / stat: the operand is a scalar (a filehandle or path). ──
+            ExprKind::Filetest(_, target) | ExprKind::Stat(target) | ExprKind::Lstat(target) => target.save_context(queue),
+        }
+    }
+}
+
+impl Program {
+    /// Root the evaluation-context stamping pass over the whole program (§6.2.5) — the driver for the whole tree.
+    ///
+    /// The program's top level is a body, evaluated like a subroutine: every statement is void **except the last**,
+    /// whose context is the runtime context (`wantarray`) — void if the file is run directly, scalar if it is
+    /// `require`d.  We stamp that tail statement `Runtime` and let the runtime resolve it; `Runtime` flows down the
+    /// tail statement's value-forwarding spine while everything off the spine is stamped statically.
+    ///
+    /// Statements recurse (their nesting is shallow and not adversarial), pushing each expression they reach onto a
+    /// shared work queue; once the statement phase returns, the queue holds every top-level expression, which are then
+    /// drained iteratively so deep *expression* nesting never recurses on the stack.
+    pub fn save_context(&mut self) {
+        let mut queue: Vec<(&mut Expr, Context)> = Vec::new();
+        save_context_body(&mut self.statements, Context::Runtime, &mut queue);
+        while let Some((node, node_ctx)) = queue.pop() {
+            node.save_context_step(node_ctx, &mut queue);
+        }
+    }
+}
+
+/// Stamp a statement list that is evaluated as a body (the program top level, a subroutine body, a `do`/`eval` block,
+/// a bare block): the final statement is evaluated in context `ctx` (the body's value), every earlier statement in
+/// void context (its value discarded).  Expressions reached are pushed onto `queue`.
+fn save_context_body<'a>(statements: &'a mut [Statement], ctx: Context, queue: &mut Vec<(&'a mut Expr, Context)>) {
+    if let Some((last, rest)) = statements.split_last_mut() {
+        for stmt in rest {
+            stmt.save_context(Context::Void, queue);
+        }
+        last.save_context(ctx, queue);
+    }
+}
+
+impl Statement {
+    /// Stamp this statement in context `ctx` — the context the statement's *value* is in.  For an ordinary statement
+    /// `ctx` is `Void`; for the final statement of a value-producing body it is the body's context (which may be
+    /// `Runtime`).  Value-bearing compound statements (if/unless/try/given/when/bare block) forward `ctx` to their
+    /// value-bearing sub-blocks, so a value-bearing statement in tail position propagates the tail context into its
+    /// branches; their conditions are always boolean and their non-value parts void.  Loops are not value-bearing, so
+    /// their bodies are always void regardless of `ctx`.  Expressions reached are pushed onto `queue`.
+    pub fn save_context<'a>(&'a mut self, ctx: Context, queue: &mut Vec<(&'a mut Expr, Context)>) {
+        match &mut self.kind {
+            // An ordinary expression statement: the expression is in the statement's context.
+            StmtKind::Expr(e) => queue.push((e, ctx)),
+
+            // Conditionals are value-bearing: the executed branch is the value, so each branch block inherits `ctx`.
+            // Conditions are always boolean.
+            StmtKind::If(s) => {
+                queue.push((&mut s.condition, Context::Boolean));
+                s.then_block.save_context(ctx, queue);
+                for (cond, block) in &mut s.elsif_clauses {
+                    queue.push((cond, Context::Boolean));
+                    block.save_context(ctx, queue);
+                }
+                if let Some(block) = &mut s.else_block {
+                    block.save_context(ctx, queue);
+                }
+            }
+            StmtKind::Unless(s) => {
+                queue.push((&mut s.condition, Context::Boolean));
+                s.then_block.save_context(ctx, queue);
+                for (cond, block) in &mut s.elsif_clauses {
+                    queue.push((cond, Context::Boolean));
+                    block.save_context(ctx, queue);
+                }
+                if let Some(block) = &mut s.else_block {
+                    block.save_context(ctx, queue);
+                }
+            }
+
+            // Loops are not value-bearing (they evaluate to an empty list regardless of context): condition boolean,
+            // body and continue void.
+            StmtKind::While(s) => {
+                queue.push((&mut s.condition, Context::Boolean));
+                s.body.save_context(Context::Void, queue);
+                if let Some(block) = &mut s.continue_block {
+                    block.save_context(Context::Void, queue);
+                }
+            }
+            StmtKind::Until(s) => {
+                queue.push((&mut s.condition, Context::Boolean));
+                s.body.save_context(Context::Void, queue);
+                if let Some(block) = &mut s.continue_block {
+                    block.save_context(Context::Void, queue);
+                }
+            }
+            StmtKind::For(s) => {
+                if let Some(init) = &mut s.init {
+                    queue.push((init, Context::Void));
+                }
+                if let Some(cond) = &mut s.condition {
+                    queue.push((cond, Context::Boolean));
+                }
+                if let Some(step) = &mut s.step {
+                    queue.push((step, Context::Void));
+                }
+                s.body.save_context(Context::Void, queue);
+            }
+            StmtKind::ForEach(s) => {
+                queue.push((&mut s.list, Context::List));
+                s.body.save_context(Context::Void, queue);
+                if let Some(block) = &mut s.continue_block {
+                    block.save_context(Context::Void, queue);
+                }
+            }
+
+            // given/when are value-bearing (the matched block is the value): topic/match expr scalar, block inherits.
+            StmtKind::Given(e, block) => {
+                queue.push((e, Context::Scalar));
+                block.save_context(ctx, queue);
+            }
+            StmtKind::When(e, block) => {
+                queue.push((e, Context::Scalar));
+                block.save_context(ctx, queue);
+            }
+
+            // try is value-bearing: the body (or catch, on exception) is the value.  finally is evaluated for effect
+            // only — void.
+            StmtKind::Try(s) => {
+                s.body.save_context(ctx, queue);
+                if let Some(block) = &mut s.catch_block {
+                    block.save_context(ctx, queue);
+                }
+                if let Some(block) = &mut s.finally_block {
+                    block.save_context(Context::Void, queue);
+                }
+            }
+
+            // Bare block is value-bearing (it evaluates to its last statement); its optional continue is void.
+            StmtKind::Block(block, cont) => {
+                block.save_context(ctx, queue);
+                if let Some(c) = cont {
+                    c.save_context(Context::Void, queue);
+                }
+            }
+
+            // defer / phaser blocks are evaluated for effect — void.
+            StmtKind::Defer(block) => block.save_context(Context::Void, queue),
+            StmtKind::Phaser(_, block) => block.save_context(Context::Void, queue),
+
+            // Labeled statement: the labeled statement is in the same context.
+            StmtKind::Labeled(_, inner) => inner.save_context(ctx, queue),
+
+            // Subroutine / method declarations: the body is evaluated in the caller's context (its tail is runtime
+            // context).  Signature parameter defaults are evaluated in the caller's invocation (scalar).
+            StmtKind::SubDecl(s) | StmtKind::MethodDecl(s) => {
+                if let Some(sig) = &mut s.signature {
+                    sig.save_context(queue);
+                }
+                s.body.save_context(Context::Runtime, queue);
+            }
+
+            // package NAME { ... } / class NAME { ... }: the block is a body evaluated for effect — void.
+            StmtKind::PackageDecl(s) => {
+                if let Some(block) = &mut s.block {
+                    block.save_context(Context::Void, queue);
+                }
+            }
+            StmtKind::ClassDecl(s) => {
+                if let Some(block) = &mut s.body {
+                    block.save_context(Context::Void, queue);
+                }
+            }
+
+            // field $x = DEFAULT;  — the default is evaluated in scalar context.
+            StmtKind::FieldDecl(s) => {
+                if let Some((_, default)) = &mut s.default {
+                    queue.push((default, Context::Scalar));
+                }
+            }
+
+            // use/no Module LIST — the import list is in list context.
+            StmtKind::UseDecl(s) => {
+                if let Some(imports) = &mut s.imports {
+                    for e in imports {
+                        queue.push((e, Context::List));
+                    }
+                }
+            }
+
+            // No expression children to stamp.
+            StmtKind::FormatDecl(_) | StmtKind::Empty | StmtKind::DataEnd(_, _) => {}
+        }
+    }
+}
+
+impl Block {
+    /// Stamp this block as a body evaluated in context `ctx`: the final statement is in `ctx` (the block's value),
+    /// earlier statements are void.  An ordinary (non-value) block is stamped with `ctx = Void`, which makes every
+    /// statement void.  Expressions reached are pushed onto `queue`.
+    pub fn save_context<'a>(&'a mut self, ctx: Context, queue: &mut Vec<(&'a mut Expr, Context)>) {
+        save_context_body(&mut self.statements, ctx, queue);
+    }
+}
+
+impl Signature {
+    /// Push parameter default expressions (evaluated in the caller's invocation → scalar) onto `queue`.
+    pub fn save_context<'a>(&'a mut self, queue: &mut Vec<(&'a mut Expr, Context)>) {
+        for param in &mut self.params {
+            match param {
+                SigParam::Scalar { default: Some((_, e)), .. } | SigParam::AnonScalar { default: Some((_, e)), .. } => queue.push((e, Context::Scalar)),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -514,9 +1029,40 @@ pub enum StatTarget {
     Default,
 }
 
+impl StatTarget {
+    /// Push the operand expression (a filehandle or path → scalar) onto `queue`.  The cache/default forms have no
+    /// expression.
+    pub fn save_context<'a>(&'a mut self, queue: &mut Vec<(&'a mut Expr, Context)>) {
+        if let StatTarget::Expr(e) = self {
+            queue.push((e, Context::Scalar));
+        }
+    }
+}
+
 /// A sequence of interpolated parts — used for strings, regex patterns, and substitution replacements.
 #[derive(Clone, Debug)]
 pub struct Interpolated(pub Vec<InterpPart>);
+
+impl Interpolated {
+    /// Push any interpolated sub-expressions onto `queue`.  A `$scalar` interpolation is scalar; an `@array`/slice
+    /// interpolation is list (it is join-flattened); embedded regex-code blocks are their own scalar-ish expressions.
+    /// Constant and named-char segments have no sub-expression.
+    pub fn save_context<'a>(&'a mut self, queue: &mut Vec<(&'a mut Expr, Context)>) {
+        for part in &mut self.0 {
+            match part {
+                InterpPart::Const(_) | InterpPart::NamedChar { .. } => {}
+                InterpPart::ScalarInterp(e) => queue.push((e, Context::Scalar)),
+                InterpPart::ArrayInterp(e) => queue.push((e, Context::List)),
+                // `ExprInterp` is produced by both `${ EXPR }` (scalar block) and `@{ EXPR }` (array block); the variant
+                // does not currently record which sigil introduced it, so we cannot distinguish scalar from list here.
+                // Stamp the inner expression scalar (the `${...}` form); revisit when the variant carries the sigil.
+                // TODO: split `ExprInterp` by sigil so `@{ EXPR }` can be stamped list.
+                InterpPart::ExprInterp(e) => queue.push((e, Context::Scalar)),
+                InterpPart::RegexCode(_, e) | InterpPart::RegexCondCode(_, e) => queue.push((e, Context::Scalar)),
+            }
+        }
+    }
+}
 
 impl Interpolated {
     /// If this contains only constant parts (no runtime interpolation), return the plain string.  `Const` and
@@ -713,6 +1259,35 @@ pub enum ArrowTarget {
 }
 
 impl ArrowTarget {
+    /// Stamp the evaluation context of any expressions inside this arrow target: an element key/index is scalar; a
+    /// slice's subscript list is list; method-call arguments are list.  The whole-deref and last-index variants carry
+    /// no expression.
+    pub fn save_context<'a>(&'a mut self, queue: &mut Vec<(&'a mut Expr, Context)>) {
+        match self {
+            ArrowTarget::ArrayElem(idx) | ArrowTarget::HashElem(idx) => queue.push((idx, Context::Scalar)),
+            ArrowTarget::MethodCall(_, args) => {
+                for a in args {
+                    queue.push((a, Context::List));
+                }
+            }
+            ArrowTarget::DynMethod(method, args) => {
+                queue.push((method, Context::Scalar));
+                for a in args {
+                    queue.push((a, Context::List));
+                }
+            }
+            ArrowTarget::ArraySliceIndices(e) | ArrowTarget::ArraySliceKeys(e) | ArrowTarget::KvSliceIndices(e) | ArrowTarget::KvSliceKeys(e) => {
+                queue.push((e, Context::List))
+            }
+            ArrowTarget::DerefArray
+            | ArrowTarget::DerefHash
+            | ArrowTarget::DerefScalar
+            | ArrowTarget::DerefCode
+            | ArrowTarget::DerefGlob
+            | ArrowTarget::LastIndex => {}
+        }
+    }
+
     // Constructors for the boxed-payload variants: each boxes its `Expr` payload internally so call sites never write
     // `Box::new`.  Nullary variants (`DerefArray`, `DerefHash`, etc.) carry no payload and are used directly.
 

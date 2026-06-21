@@ -15951,3 +15951,538 @@ fn hash_subscript_minus_strong_keyword_autoquotes() {
         other => panic!("expected Expr, got {other:?}"),
     }
 }
+
+// ═══════════════════════════════════════════════════════════
+// Evaluation-context stamping (save_context, §6.2)
+// ═══════════════════════════════════════════════════════════
+
+/// Parse a program and return its statements, for inspecting stamped contexts.
+fn parse_stmts(src: &str) -> Vec<Statement> {
+    parse(src).statements
+}
+
+/// Parse `src` as a non-final expression statement (by appending a trailing `1;`) and return it.  The expression is
+/// then in void context at the top level (rather than the load-deferred `None` of a program's final statement), while
+/// all of its sub-expression contexts are stamped as usual.
+fn parse_nonfinal_expr(src: &str) -> Expr {
+    let with_tail = format!("{src}; 1;");
+    let prog = parse(&with_tail);
+    match &prog.statements[0].kind {
+        StmtKind::Expr(e) => e.clone(),
+        other => panic!("expected first statement to be Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_program_final_statement_is_runtime() {
+    // The program's final statement is evaluated in the runtime context (void if run directly, scalar if require'd),
+    // stamped Runtime and resolved at runtime — it is NOT left None.
+    let stmts = parse_stmts("42;");
+    match &stmts[0].kind {
+        StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Runtime), "final statement is in runtime context"),
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_nonfinal_statement_is_void() {
+    // A non-final top-level statement is in void context.
+    let stmts = parse_stmts("42; 1;");
+    match &stmts[0].kind {
+        StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Void)),
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_arithmetic_operands_are_scalar() {
+    // `3 - 4`: both operands scalar, regardless of the node's own context.
+    let e = parse_nonfinal_expr("3 - 4");
+    match &e.kind {
+        ExprKind::BinOp(_, l, r) => {
+            assert_eq!(l.ctx, Some(Context::Scalar));
+            assert_eq!(r.ctx, Some(Context::Scalar));
+        }
+        other => panic!("expected BinOp, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_ternary_condition_is_boolean_branches_inherit() {
+    // `(3 - 3) ? $a : $b` in void context: condition is boolean; branches forward the node's (void) context; the
+    // condition's own operands are still scalar.
+    let e = parse_nonfinal_expr("(3 - 3) ? $a : $b");
+    match &e.kind {
+        ExprKind::Ternary(cond, then_e, else_e) => {
+            assert_eq!(cond.ctx, Some(Context::Boolean), "ternary condition must be boolean");
+            assert_eq!(then_e.ctx, Some(Context::Void), "branch inherits node context (void)");
+            assert_eq!(else_e.ctx, Some(Context::Void), "branch inherits node context (void)");
+            // The condition is a BinOp whose operands remain scalar even though the BinOp itself is boolean.
+            match &cond.kind {
+                ExprKind::BinOp(_, l, r) => {
+                    assert_eq!(l.ctx, Some(Context::Scalar));
+                    assert_eq!(r.ctx, Some(Context::Scalar));
+                }
+                other => panic!("expected BinOp condition, got {other:?}"),
+            }
+        }
+        other => panic!("expected Ternary, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_short_circuit_left_scalar_right_inherits() {
+    // `@a || @b` in list context: left operand is scalar (truth-tested), right inherits list (it flattens).  Reached
+    // via a foreach iteration list, which is a list-context position.
+    let stmts = parse_stmts("foreach (@a || @b) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::ForEach(s) => match &s.list.kind {
+            ExprKind::BinOp(BinOp::Or, l, r) => {
+                assert_eq!(l.ctx, Some(Context::Scalar), "|| left operand is scalar (truth-tested)");
+                assert_eq!(r.ctx, Some(Context::List), "|| right operand inherits list context");
+            }
+            other => panic!("expected BinOp(Or), got {other:?}"),
+        },
+        other => panic!("expected ForEach, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_short_circuit_in_boolean_both_boolean() {
+    // `if (@a || @b)`: the || is in boolean context; left is boolean (scalar-test refined), right inherits boolean.
+    let stmts = parse_stmts("if (@a || @b) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::If(s) => match &s.condition.kind {
+            ExprKind::BinOp(BinOp::Or, l, r) => {
+                assert_eq!(l.ctx, Some(Context::Boolean));
+                assert_eq!(r.ctx, Some(Context::Boolean));
+            }
+            other => panic!("expected BinOp(Or) condition, got {other:?}"),
+        },
+        other => panic!("expected If, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_if_condition_is_boolean() {
+    let stmts = parse_stmts("if ($x) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::If(s) => assert_eq!(s.condition.ctx, Some(Context::Boolean)),
+        other => panic!("expected If, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_while_condition_is_boolean() {
+    let stmts = parse_stmts("while ($x) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::While(s) => assert_eq!(s.condition.ctx, Some(Context::Boolean)),
+        other => panic!("expected While, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_foreach_list_is_list() {
+    let stmts = parse_stmts("foreach (@a) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::ForEach(s) => assert_eq!(s.list.ctx, Some(Context::List)),
+        other => panic!("expected ForEach, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_c_for_clauses() {
+    // C-style for: init void, condition boolean, step void.
+    let stmts = parse_stmts("for ($i = 0; $i < 10; $i++) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::For(s) => {
+            assert_eq!(s.init.as_ref().unwrap().ctx, Some(Context::Void));
+            assert_eq!(s.condition.as_ref().unwrap().ctx, Some(Context::Boolean));
+            assert_eq!(s.step.as_ref().unwrap().ctx, Some(Context::Void));
+        }
+        other => panic!("expected For, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_func_args_are_list() {
+    // `foo($a, $b)` in void context: the call's args are list.
+    let e = parse_nonfinal_expr("foo($a, $b)");
+    match &e.kind {
+        ExprKind::FuncCall(_, args) => {
+            for a in args {
+                assert_eq!(a.ctx, Some(Context::List));
+            }
+        }
+        other => panic!("expected FuncCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_array_slice_indices_are_list() {
+    // `@a[$i, $j]`: base scalar, indices list.
+    let e = parse_nonfinal_expr("@a[$i, $j]");
+    match &e.kind {
+        ExprKind::ArraySlice(base, indices) => {
+            assert_eq!(base.ctx, Some(Context::Scalar));
+            for idx in indices {
+                assert_eq!(idx.ctx, Some(Context::List));
+            }
+        }
+        other => panic!("expected ArraySlice, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_array_elem_index_is_scalar() {
+    // `$a[$i]`: base and index scalar.
+    let e = parse_nonfinal_expr("$a[$i]");
+    match &e.kind {
+        ExprKind::ArrayElem(base, index) => {
+            assert_eq!(base.ctx, Some(Context::Scalar));
+            assert_eq!(index.ctx, Some(Context::Scalar));
+        }
+        other => panic!("expected ArrayElem, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_not_operand_is_always_boolean() {
+    // `!`/`not` always truth-test their operand, so the operand is Boolean regardless of the `!` node's own context.
+    // Here `!$x` is in void context (a non-final statement), yet the operand is still Boolean.
+    let e = parse_nonfinal_expr("!$x");
+    match &e.kind {
+        ExprKind::UnaryOp(UnaryOp::LogNot, operand) => {
+            assert_eq!(operand.ctx, Some(Context::Boolean), "! operand is always boolean");
+        }
+        other => panic!("expected UnaryOp(LogNot), got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_not_operand_boolean_in_boolean_context_too() {
+    // `if (!$x)`: the `!` is in boolean context; the operand is boolean here as well (it always is).
+    let stmts = parse_stmts("if (!$x) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::If(s) => match &s.condition.kind {
+            ExprKind::UnaryOp(UnaryOp::LogNot, operand) => {
+                assert_eq!(operand.ctx, Some(Context::Boolean));
+            }
+            other => panic!("expected UnaryOp(LogNot), got {other:?}"),
+        },
+        other => panic!("expected If, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_xor_operands_are_boolean() {
+    // `xor`/`^^` always truth-test both operands, so both are boolean regardless of the node's context.  Reached via a
+    // non-final statement (void context).
+    let e = parse_nonfinal_expr("$a xor $b");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::LowXor, l, r) => {
+            assert_eq!(l.ctx, Some(Context::Boolean), "xor left operand is boolean");
+            assert_eq!(r.ctx, Some(Context::Boolean), "xor right operand is boolean");
+        }
+        other => panic!("expected BinOp(LowXor), got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_sub_body_tail_is_runtime() {
+    // A subroutine body is evaluated in the caller's context; its tail statement is in runtime context (wantarray),
+    // stamped Runtime and resolved per call site.
+    let stmts = parse_stmts("sub f { $x }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Runtime), "sub body tail is runtime context"),
+            other => panic!("expected Expr in body, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_sub_body_non_tail_is_void() {
+    // A non-tail statement in a sub body is in void context (its value is discarded), exactly like a file's non-final
+    // statement.
+    let stmts = parse_stmts("sub f { $x; $y }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Void), "non-tail sub-body statement is void"),
+            other => panic!("expected Expr in body, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_anon_sub_body_tail_is_runtime() {
+    // Same for an anonymous sub used as a value: the sub expression has its own context, but the body is a container
+    // whose tail is in runtime context.
+    let e = parse_nonfinal_expr("sub { $x }");
+    match &e.kind {
+        ExprKind::AnonSub(_, _, _, body) => match &body.statements[0].kind {
+            StmtKind::Expr(inner) => assert_eq!(inner.ctx, Some(Context::Runtime), "anon sub body tail is runtime"),
+            other => panic!("expected Expr in body, got {other:?}"),
+        },
+        other => panic!("expected AnonSub, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_comma_in_list_all_list() {
+    // A comma list in list context: every operand is list.  Reach it via a foreach list.
+    let stmts = parse_stmts("foreach ($a, $b, $c) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::ForEach(s) => match &s.list.kind {
+            ExprKind::Comma(items) => {
+                for item in items {
+                    assert_eq!(item.ctx, Some(Context::List));
+                }
+            }
+            other => panic!("expected Comma, got {other:?}"),
+        },
+        other => panic!("expected ForEach, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_range_endpoints_are_scalar() {
+    // `1 .. 10`: endpoints scalar; reach via a foreach list (list context → the node is a range).
+    let stmts = parse_stmts("foreach (1 .. 10) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::ForEach(s) => match &s.list.kind {
+            ExprKind::Range(l, r, _) => {
+                assert_eq!(l.ctx, Some(Context::Scalar));
+                assert_eq!(r.ctx, Some(Context::Scalar));
+            }
+            other => panic!("expected Range, got {other:?}"),
+        },
+        other => panic!("expected ForEach, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_is_scalar_predicate() {
+    // Scalar, Boolean, and RuntimeTruthTested are scalar-valued; List and Void are not; Runtime is not statically
+    // scalar (it may resolve to List).
+    assert!(Context::Scalar.is_scalar());
+    assert!(Context::Boolean.is_scalar());
+    assert!(Context::RuntimeTruthTested.is_scalar());
+    assert!(!Context::List.is_scalar());
+    assert!(!Context::Void.is_scalar());
+    assert!(!Context::Runtime.is_scalar());
+}
+
+#[test]
+fn ctx_truth_tested_mapping() {
+    // truth_tested gives a short-circuit left operand's context: Void/Boolean → Boolean (value not kept, pure gate),
+    // Scalar/List → Scalar (value may be forwarded); the runtime contexts → RuntimeTruthTested (idempotently).
+    assert_eq!(Context::Void.truth_tested(), Context::Boolean);
+    assert_eq!(Context::Boolean.truth_tested(), Context::Boolean);
+    assert_eq!(Context::Scalar.truth_tested(), Context::Scalar);
+    assert_eq!(Context::List.truth_tested(), Context::Scalar);
+    assert_eq!(Context::Runtime.truth_tested(), Context::RuntimeTruthTested);
+    assert_eq!(Context::RuntimeTruthTested.truth_tested(), Context::RuntimeTruthTested);
+}
+
+#[test]
+fn ctx_tail_if_branches_inherit_runtime() {
+    // A subroutine whose body's tail statement is an `if`: the if is value-bearing, so its branches inherit the body's
+    // runtime context.  The condition stays boolean.
+    let stmts = parse_stmts("sub f { if ($c) { $a } else { $b } }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::If(if_s) => {
+                assert_eq!(if_s.condition.ctx, Some(Context::Boolean), "if condition is boolean");
+                match &if_s.then_block.statements[0].kind {
+                    StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Runtime), "then-branch tail inherits runtime"),
+                    other => panic!("expected Expr in then-branch, got {other:?}"),
+                }
+                let else_block = if_s.else_block.as_ref().expect("else block");
+                match &else_block.statements[0].kind {
+                    StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Runtime), "else-branch tail inherits runtime"),
+                    other => panic!("expected Expr in else-branch, got {other:?}"),
+                }
+            }
+            other => panic!("expected If as body tail, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_non_tail_if_branches_are_void() {
+    // The same `if`, but NOT in tail position (a statement follows it): its branches are in void context.
+    let stmts = parse_stmts("sub f { if ($c) { $a } else { $b } 1 }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::If(if_s) => match &if_s.then_block.statements[0].kind {
+                StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Void), "non-tail then-branch is void"),
+                other => panic!("expected Expr, got {other:?}"),
+            },
+            other => panic!("expected If, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_tail_short_circuit_propagates_runtime() {
+    // A sub whose tail is `@a || @b`: the || node is in runtime context, so its right operand inherits Runtime and its
+    // left operand is the truth-tested runtime context (RuntimeTruthTested).
+    let stmts = parse_stmts("sub f { @a || @b }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::BinOp(BinOp::Or, l, r) => {
+                    assert_eq!(l.ctx, Some(Context::RuntimeTruthTested), "|| left is truth-tested runtime");
+                    assert_eq!(r.ctx, Some(Context::Runtime), "|| right inherits runtime");
+                }
+                other => panic!("expected BinOp(Or), got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_short_circuit_left_in_void_is_boolean() {
+    // A `||` as a non-final (void) statement: the left operand is a pure truth-test gate → Boolean (the value is
+    // discarded, so it is not kept as a scalar).  The right inherits the void context.
+    let stmts = parse_stmts("@a || @b; 1;");
+    match &stmts[0].kind {
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::BinOp(BinOp::Or, l, r) => {
+                assert_eq!(l.ctx, Some(Context::Boolean), "void || left is a boolean gate");
+                assert_eq!(r.ctx, Some(Context::Void), "void || right inherits void");
+            }
+            other => panic!("expected BinOp(Or), got {other:?}"),
+        },
+        other => panic!("expected Expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_short_circuit_left_in_scalar_is_scalar() {
+    // A `||` in scalar context (here as the left operand of `+`, which imposes scalar): the `||` left operand may be
+    // forwarded as the scalar result, so it is Scalar — not a pure boolean gate.  Reached via arithmetic rather than
+    // assignment (assignment context is deferred).
+    let e = parse_nonfinal_expr("($a || $b) + 1");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, or_node, _) => match &or_node.kind {
+            ExprKind::BinOp(BinOp::Or, l, _) => {
+                assert_eq!(or_node.ctx, Some(Context::Scalar), "the || node itself is scalar (+ operand)");
+                assert_eq!(l.ctx, Some(Context::Scalar), "scalar-context || left is scalar");
+            }
+            other => panic!("expected Or as + left operand, got {other:?}"),
+        },
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_tail_ternary_branches_inherit_runtime() {
+    // A sub whose tail is `$c ? $a : $b`: condition boolean, branches inherit the runtime context.
+    let stmts = parse_stmts("sub f { $c ? $a : $b }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::Ternary(cond, then_e, else_e) => {
+                    assert_eq!(cond.ctx, Some(Context::Boolean));
+                    assert_eq!(then_e.ctx, Some(Context::Runtime));
+                    assert_eq!(else_e.ctx, Some(Context::Runtime));
+                }
+                other => panic!("expected Ternary, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_tail_call_args_are_list_not_runtime() {
+    // Even in a runtime-context tail, a call's arguments are list context — the runtime-dependence does not reach past
+    // the context-fixing call boundary.
+    let stmts = parse_stmts("sub f { foo($a, $b) }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::FuncCall(_, args) => {
+                    for a in args {
+                        assert_eq!(a.ctx, Some(Context::List), "call args are list even in a runtime tail");
+                    }
+                }
+                other => panic!("expected FuncCall, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_tail_arithmetic_operands_are_scalar_not_runtime() {
+    // Arithmetic operands are scalar even when the operator node is in a runtime tail — the spine ends at the
+    // context-fixing operator.
+    let stmts = parse_stmts("sub f { $a + $b }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::BinOp(_, l, r) => {
+                    assert_eq!(l.ctx, Some(Context::Scalar));
+                    assert_eq!(r.ctx, Some(Context::Scalar));
+                }
+                other => panic!("expected BinOp, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_loop_body_is_void_even_in_tail() {
+    // A loop is not value-bearing: as a sub's tail statement, its body is still void (the loop returns empty
+    // regardless of context).
+    let stmts = parse_stmts("sub f { while ($c) { $x } }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::While(w) => {
+                assert_eq!(w.condition.ctx, Some(Context::Boolean));
+                match &w.body.statements[0].kind {
+                    StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Void), "loop body is void even in tail"),
+                    other => panic!("expected Expr in loop body, got {other:?}"),
+                }
+            }
+            other => panic!("expected While, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_do_block_tail_inherits_context() {
+    // `do { $a; $b }` in a list-context position (foreach list): the block's last statement inherits list, earlier
+    // statements are void.
+    let stmts = parse_stmts("foreach (do { $a; $b }) { } 1;");
+    match &stmts[0].kind {
+        StmtKind::ForEach(s) => match &s.list.kind {
+            ExprKind::DoBlock(block) => {
+                match &block.statements[0].kind {
+                    StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::Void), "non-tail do-block statement is void"),
+                    other => panic!("expected Expr, got {other:?}"),
+                }
+                match &block.statements[1].kind {
+                    StmtKind::Expr(e) => assert_eq!(e.ctx, Some(Context::List), "do-block tail inherits list"),
+                    other => panic!("expected Expr, got {other:?}"),
+                }
+            }
+            other => panic!("expected DoBlock, got {other:?}"),
+        },
+        other => panic!("expected ForEach, got {other:?}"),
+    }
+}

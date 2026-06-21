@@ -349,7 +349,13 @@ impl Parser {
         }
 
         let end = self.peek_span();
-        Ok(Program { statements, span: start.merge(end) })
+        let mut program = Program { statements, span: start.merge(end) };
+
+        // Stamp evaluation context across the whole tree (§6.2.5).  Every top-level statement is void except the last,
+        // whose context is load-determined and left to the runtime.
+        program.save_context();
+
+        Ok(program)
     }
 
     // ── Statement parsing ─────────────────────────────────────
