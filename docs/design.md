@@ -982,7 +982,7 @@ resolve:
 
 Prototype knowledge in particular affects not just lexical
 classification but also how the parser subsequently handles the
-argument list (see §6.3).
+argument list (see §6.4).
 
 The symbol table lives on the `Parser` struct and is accessible to
 the lexer through parser method calls in the sections where both
@@ -2118,7 +2118,39 @@ Expression parsing uses precedence climbing (the Pratt algorithm)
 with clear naming that avoids the original paper's cryptic
 terminology.
 
-#### 6.1.1 Core components on `Parser`:
+#### 6.1.1 Parser layer separation:
+
+The parser operates on three cleanly separated layers:
+
+1. **Tokenization** produces tokens via three lexer methods:
+   `lex_term()` for term-position tokens (regex, leading-dot float,
+   readline, heredoc, filetest), `lex_operator(min_prec)` for
+   operator-position tokens with precedence gating, and
+   `lex_token()` for position-independent structural tokens used by
+   `consume()`, `expect()`, and other infrastructure methods (§5.9).
+
+2. **Parser position** (term vs operator) determines which lexer
+   method is called.  The forward phase (`try_prefix`, `parse_term`)
+   calls `lex_term()`.  The Pratt loop calls `lex_operator()`.
+   Infrastructure methods call `lex_token()` through `consume()`
+   and `expect()`.  No shared disambiguation state exists — the
+   parser's call site determines the lexer method.
+
+3. **Construct-specific parsing** handles the interior of each
+   syntactic form.  `parse_if_stmt`, `parse_while`,
+   `parse_sub_decl`, and similar helpers are plain recursive
+   descent, called from `parse_term` arms.  They call `parse_expr`
+   for sub-expressions, completing the mutual recursion.  Some make
+   decisions after recursive calls return — for example,
+   `try_reclassify_as_hash` inspects a parsed block to determine
+   whether it should be reinterpreted as a hash constructor.  This
+   post-hoc reclassification is impossible in Perl 5's LALR(1)
+   grammar, which must decide before the production is entered.
+
+The parser has no one-token lookahead cache.  Each lexer method
+handles its own peek-and-conditionally-consume logic internally.
+
+#### 6.1.2 Core components on `Parser`:
 
 `parse_expr(min_prec)` — the main entry point for expressions.
 Iterative: the forward phase consumes prefix operators and opening
@@ -2203,7 +2235,7 @@ add zero stack depth.  Right-associative operators call
 
 `parse_term` — called when the forward phase exhausts prefix cases
 and needs a leaf term.  Returns `Result<Expr, ParseError>`.  Handles
-position-dependent disambiguation by calling `lex_term()` (§6.2)
+position-dependent disambiguation by calling `lex_term()` (§6.3)
 which resolves ambiguous tokens (`/` as regex, `.` as leading-dot
 float, `<` as readline, `<<` as heredoc) in term position.  A token
 that cannot begin a term is a parse error.
@@ -2216,7 +2248,7 @@ calls `lex_term()` internally), postfix operators wrap the left
 operand, ternary `?:` parses the middle and right branches, `->`
 dispatches to method call or dereference parsing.
 
-#### 6.1.2 The expression loop:
+#### 6.1.3 The expression loop:
 
 ```rust
 type Precedence = u16;
@@ -2309,12 +2341,12 @@ precedence and associativity are enforced uniformly across all
 operators.
 
 The split into `parse_expr` and `parse_expr_continuation` enables
-the forward-only parsing pattern (§6.5): when the parser consumes
+the forward-only parsing pattern (§6.6): when the parser consumes
 a token that might be a label, filehandle, or first term, it can
 pass the already-built expression into `parse_expr_continuation`
 instead of rewinding and re-parsing.
 
-#### 6.1.3 Nesting depth:
+#### 6.1.4 Nesting depth:
 
 The iterative expression parser has no arbitrary depth limit for
 prefix operators, parentheses, containers, and deref blocks.
@@ -2337,7 +2369,7 @@ limitation — it's a Rust-side memory management constraint that
 can be addressed with arena allocation or iterative Drop if needed.
 Parentheses do not have this issue since they produce no AST nodes.
 
-#### 6.1.4 Precedence and associativity table:
+#### 6.1.5 Precedence and associativity table:
 
 Each infix operator has a single precedence number and an explicit
 associativity.  The left and right precedence values used by the
@@ -2433,114 +2465,7 @@ inner precedence that controls how tightly they bind to their
 operand.  This is used inside `try_prefix`, not part of the infix
 precedence table.
 
-#### 6.1.5 Context propagation:
-
-The parser tracks evaluation context — scalar, list, or void —
-and propagates it through the expression tree.  Context determines
-how the comma operator behaves and how the AST is constructed.
-
-Context is determined at parse time by the surrounding syntax:
-
-| Syntax | Context | Why |
-|--------|---------|-----|
-| `$x = ...` | scalar | scalar sigil on LHS |
-| `@arr = ...` | list | array sigil on LHS |
-| `%hash = ...` | list | hash sigil on LHS |
-| `my $x = ...` | scalar | scalar declaration |
-| `my ($x, $y) = ...` | list | parenthesized declaration |
-| `my @arr = ...` | list | array declaration |
-| `print ...` | list | list operator |
-| `push @a, ...` | list | list operator |
-| `defined ...` | scalar | named unary |
-| `$x ? ... : ...` | propagated | branches inherit outer context |
-| `foo(...)` | prototype-dependent | see §6.3 |
-
-The critical distinction: `my $x = (2, 4, 6)` is scalar context
-(result is 6, the last value via C comma semantics), while
-`my ($x) = (2, 4, 6)` is list context (result is 2, the first
-element of the list).  The parentheses on the LHS change the
-declaration from scalar form to list form, and the parser must
-encode this difference in the AST.
-
-Context flows inward from the LHS of assignment, from list
-operators, from prototypes, and from declaration forms.  The parser
-has all the information it needs — sigils, keywords, parenthesized
-vs bare declaration syntax, prototype slots — to determine context
-at every position.
-
-The return context of a function call — what `wantarray` reports —
-is determined at compile time by the call site's surrounding syntax.
-`my $x = foo()` marks the call as scalar context; `my @a = foo()`
-marks it as list context.  This is fully resolved at parse time and
-recorded in the AST.  `wantarray` inside the sub body reads this
-context at runtime, but it was established by the parser.
-
-#### 6.1.6 The comma operator and list construction:
-
-The comma token (`,` and `=>`) has fundamentally different semantics
-depending on context.  The parser distinguishes them by consulting
-the active context:
-
-**List context — list construction.**  When a list operator
-(at PREC_LIST) or a list-form declaration is active, commas at
-PREC_COMMA add elements to the list under construction.  The list
-operator creates the `List` node, and commas populate it.
-
-**Scalar context — C comma operator.**  Outside list context,
-commas sequence side effects.  `$x = (2, 4, 6)` evaluates 2 and
-4 in void context, then produces 6.  The parser produces
-`ExprKind::Comma(lhs, rhs)` — a distinct AST node from
-`ExprKind::List`.
-
-**Comma consumption.**  The lexer provides `consume_comma()` (§6.2)
-which greedily consumes one or more consecutive commas (either `,`
-or `=>`), then peeks at the next non-whitespace byte.  If it's a
-closing delimiter (`)`, `]`, `}`), semicolon, or EOF, the commas
-were trailing — `consume_comma()` returns `false`.  Otherwise it
-returns `true`, indicating more elements follow.  This handles
-three cases in one mechanism:
-
-- Normal separation: `(1, 2, 3)` — one comma between each element,
-  `consume_comma()` returns `true` each time.
-- Consecutive commas: `(1, , , 3)` — `consume_comma()` eats all
-  three commas at once, returns `true` (more content follows).
-- Trailing commas: `(1, 2, 3,)` — after the last element,
-  `consume_comma()` eats the trailing comma, sees `)`, returns
-  `false`.
-
-Leading commas are rejected naturally: `(, 1)` fails because `,`
-is not a valid term start.  Perl rejects leading commas as a syntax
-error.
-
-The Pratt comma handler is minimal:
-
-```rust
-Token::Comma | Token::FatComma => {
-    if !self.lexer.consume_comma() {
-        return Ok(left); // trailing comma, done
-    }
-    let right = self.parse_expr(right_prec)?;
-    // extend list...
-}
-```
-
-No delimiter peeking in the parser — `consume_comma()` handles it
-internally with a byte-level peek on the lexer.
-
-**Fat comma (`=>`) and comma (`,`).**  Both `Token::Comma` and
-`Token::FatComma` remain as separate token variants.  The only
-difference is autoquoting: `=>` causes the preceding bareword to be
-autoquoted as a string literal, which the lexer handles before the
-token is emitted.  For separation purposes, `consume_comma()`
-treats them interchangeably — Perl accepts `=>` anywhere `,` is
-accepted in list context.  The one exception is subroutine
-signatures (`use feature 'signatures'`), where only `,` is
-accepted and `=>` is a syntax error; signature parsing uses
-`consume(&Token::Comma)` which matches only `,`.  Prototypes are
-not affected — they are scanned as raw strings by `lex_body_str()`
-and never tokenized.
-
-#### 6.1.7 List operators and PREC_LIST:
+#### 6.1.6 List operators and PREC_LIST:
 
 List operators (`print`, `sort`, `map`, `push`, `chomp`, etc.)
 participate in the Pratt loop at `PREC_LIST` (400).  This gives
@@ -2568,45 +2493,452 @@ first-argument quirks before handing off to standard list argument
 collection.  The Pratt loop handles where the argument list *ends*;
 the special parsing handles how arguments are *collected*.
 
-#### 6.1.8 Layer separation:
+### 6.2 Evaluation Context and the Stamping Model
 
-The parser operates on three cleanly separated layers:
+This section specifies PerlOxide's model of Perl evaluation context —
+scalar, list, and void — and the post-parse pass that resolves it onto
+the AST.  Context is a *semantic* annotation, distinct from the
+expression-parsing *mechanism* of §6.1: the Pratt loop threads precedence,
+not context; context is stamped afterward (§6.2.5).
 
-1. **Tokenization** produces tokens via three lexer methods:
-   `lex_term()` for term-position tokens (regex, leading-dot float,
-   readline, heredoc, filetest), `lex_operator(min_prec)` for
-   operator-position tokens with precedence gating, and
-   `lex_token()` for position-independent structural tokens used by
-   `consume()`, `expect()`, and other infrastructure methods (§5.9).
+#### 6.2.1 The tagging model
 
-2. **Parser position** (term vs operator) determines which lexer
-   method is called.  The forward phase (`try_prefix`, `parse_term`)
-   calls `lex_term()`.  The Pratt loop calls `lex_operator()`.
-   Infrastructure methods call `lex_token()` through `consume()`
-   and `expect()`.  No shared disambiguation state exists — the
-   parser's call site determines the lexer method.
+Every expression in Perl is evaluated in one of three **evaluation
+contexts** — scalar, list, or void.  Context is not a parse-time
+*parameter* threaded through the Pratt loop; it is a *post-construction
+annotation* on the AST.  Each `Expr` carries an `Option<Context>` field
+(`ctx`), born `None` at construction and resolved to `Some(_)` by a
+stamping pass (§6.2.5).
 
-3. **Construct-specific parsing** handles the interior of each
-   syntactic form.  `parse_if_stmt`, `parse_while`,
-   `parse_sub_decl`, and similar helpers are plain recursive
-   descent, called from `parse_term` arms.  They call `parse_expr`
-   for sub-expressions, completing the mutual recursion.  Some make
-   decisions after recursive calls return — for example,
-   `try_reclassify_as_hash` inspects a parsed block to determine
-   whether it should be reinterpreted as a hash constructor.  This
-   post-hoc reclassification is impossible in Perl 5's LALR(1)
-   grammar, which must decide before the production is entered.
+```rust
+enum Context { Scalar, List, Void }
+struct Expr { kind: ExprKind, span: Span, ctx: Option<Context> }
+```
 
-The parser has no one-token lookahead cache.  Each lexer method
-handles its own peek-and-conditionally-consume logic internally.
+The rationale for tag-over-thread: context does not influence *parsing*
+(precedence threads through the Pratt loop; context does not).  It
+influences only *semantics* — what the comma operator does, whether a
+function call's return is a list or a count, how an aggregate behaves on
+the RHS of an assignment.  Those are downstream concerns.  The parser's
+job is to record the syntactic shape faithfully and stamp the context
+each position imposes; lowering and evaluation read the tags.
 
-### 6.2 Parser–Lexer Communication
+**Why a tag and not extra node types.**  An earlier model reified some
+contextual facts as dedicated AST nodes — a `build_list`/list-construction
+node for list context, a separate binary `Comma(lhs, rhs)` for the
+C-comma.  Both are rejected.  List *construction* is already structural
+(the comma node, §6.2.2); list *context* is an imposition that applies
+uniformly to all three contexts and is therefore better expressed as the
+same one-byte tag that scalar and void already use.  Reifying list context
+as a node makes it the odd one out among the three contexts, multiplies
+traversal cases, and — for an *interposed* wrapper — risks the
+recursive-`Drop` overflow that the iterative parser refactor (#172–#177)
+removed.  The tag carries the full semantic content; any list-coercion op
+the backend wants (mirroring Perl's optree `pushmark`/`list`) is derivable
+from the `List` tags at lowering, which is where Perl itself introduces
+them — in the optree, not the syntax tree.
+
+**Context determined by surrounding syntax.**  The context a position is
+in is fixed by the construct that encloses it, all knowable at parse time:
+
+| Syntax | Context imposed | Source |
+|--------|-----------------|--------|
+| top-level statement | void | statement position |
+| `$x = RHS` | RHS scalar | scalar lvalue LHS |
+| `@a = RHS`, `%h = RHS` | RHS list | aggregate lvalue LHS |
+| `($x) = RHS` | RHS list | parenthesized scalar LHS (§6.2.3) |
+| `my $x = RHS` | RHS scalar | scalar declaration |
+| `my ($x) = RHS`, `my @a = RHS` | RHS list | list-form / aggregate declaration |
+| `COND ? A : B` | COND scalar; A,B inherit | ternary (§6.2.5) |
+| `if (E)`, `while (E)`, `until (E)` | E scalar | boolean condition |
+| `for (LIST)` | LIST list | foreach iterates a list |
+| `print …`, `push @a, …` | args list | list operator (§6.1.6) |
+| `defined …`, `ref …` | arg scalar | named unary |
+| `scalar(E)` | E scalar | the explicit scalar coercion |
+| `foo(…)` | per prototype | §6.4 |
+
+**Context is grammar-determined — with one runtime exception.**  Every
+entry in the table above is resolved *statically*, from the syntactic
+shape alone: the parser always knows, at every position, which context
+that position is in, because context is imposed by the enclosing
+construct and the construct is visible in the grammar.  This is true even
+of a function call's *arguments* (the prototype, known at the call site,
+fixes them) and of the call's *return context as seen at that call site*
+(`my $x = foo()` is a scalar-context call; `my @a = foo()` is a
+list-context call — each fixed by the call site's own syntax).
+
+The single thing that is *not* statically resolvable is the context a
+**subroutine body** runs in.  A call site determines context for *that
+call*, but the *same* sub body is reachable from many call sites, each
+with its own grammar-determined context — `$x = foo()` here, `@a = foo()`
+there, `foo();` as a bare statement elsewhere.  The body is shared; the
+contexts are not.  No static analysis of the body can collapse those
+varying call-site contexts into one answer, because the answer genuinely
+differs per call.  This is precisely the gap `wantarray` fills: it is the
+runtime query by which a body reads the context its *current* caller
+imposed.  Each call site's context is still fixed at parse time and
+recorded on the call's AST node (and propagated as the callee's
+return-context for that invocation); `wantarray` simply reads that
+recorded context at runtime.  So context is static everywhere it *can*
+be — and `wantarray` exists for the one place it inherently cannot be,
+the many-call-sites-one-body asymmetry of subroutine return context.
+
+#### 6.2.2 The comma operator and the `Comma` node
+
+**One operator, context-parameterized.**  The comma (`,`) is a single
+operator whose behavior is parameterized by its own evaluation context —
+not two operators sharing a token.  Its context fixes both what it imposes
+on its operands and what it does as an operator:
+
+- **List context** → imposes **list on every operand**; the operator
+  *constructs a list* (flattening each operand into it).
+  `@x = (p(), p())` with `p()` returning `(10,20)` yields a four-element
+  `(10,20,10,20)` — the left operand flattened, so it received list
+  context, not void.
+- **Scalar or void context** → imposes **void on every operand except the
+  last**, and the **inherited context on the last**; the operator is the
+  *C-comma* (evaluate-and-discard all but the last, evaluate-and-return
+  the last).  `$x = (a, b, c)` evaluates `a`, `b` in void and returns `c`
+  in scalar; a bare `(a, b, c);` statement evaluates all three in void.
+
+The imposition *follows from* the action: list construction keeps every
+operand (so all are list), the C-comma discards all but the last (so those
+are void, "value discarded" = void by definition), and the last operand
+carries whatever context the comma itself was in (scalar or void —
+"inherited", which unifies the two sub-cases).  This was verified against
+real Perl for flat lists of arbitrary length:
+
+| Form | Context of `a, b, c, d` |
+|------|-------------------------|
+| `$x = (a,b,c,d)` | a,b,c **void**; d **scalar** |
+| `(a,b,c,d);` (bare) | all four **void** |
+| `@x = (a,b,c,d)` | all four **list** |
+
+There is no such thing as "a C-comma in list context": a C-comma *is* a
+comma in scalar/void context.  The context simply *is* one or the other
+and the operator follows; the two are never in tension.
+
+**`,` and `=>` are the same operator.**  Downstream of the lexer they are
+identical — same precedence (PREC_COMMA), same associativity, same
+context-parameterized behavior.  `=>` adds exactly one thing, in the
+*lexer*: autoquoting of an immediately-preceding bareword (the #157–#168
+autoquoting work).  The parser matches `Token::Comma | Token::FatComma`
+in one handler.  (Exception: subroutine signatures accept only `,`; that
+is a signature-parsing rule, not a property of the operator.)
+
+**The `Comma(Vec<Expr>)` node.**  A comma sequence is represented by a
+single flat node — `ExprKind::Comma(Vec<Expr>)` — *not* a nested chain of
+binary comma nodes, and *not* a node named `List`.
+
+- *Flat, not nested.*  The Pratt comma handler flattens eagerly: when it
+  combines `left, right`, if `left` is already a `Comma` it extends that
+  vector rather than nesting.  `a, b, c, d` → `Comma([a, b, c, d])`.  The
+  flatten is non-recursive (top-level kind only) and breaks correctly at
+  sub-expression boundaries: `($x = (a, b), c)` → `Comma([assign(...), c])`,
+  not `Comma([a, b, c])`, because the assignment node interrupts the
+  chain.  Verified: in that form `a` is void, `b` scalar (the scalar
+  assignment's C-comma RHS), `c` list.
+- *`Comma`, not `List`.*  The node represents "expressions joined by comma
+  operators."  In scalar/void context it is *not* constructing a list —
+  it is the C-comma, returning its last operand.  The debugger proof:
+  `scalar((2,4,6))` → **6** (C-comma returns the last operand), whereas
+  `scalar(foo(2,4,6))` → **3** (a genuine list in scalar context yields
+  its count).  A node named `List` would misdescribe the scalar-context
+  case; `Comma` names the operator that is actually present, and
+  list-construction-vs-C-comma is the `ctx` tag.
+
+The `Comma` node's stamping body (§6.2.5): in list context every element
+is stamped list; in scalar/void context elements `[0..n-1]` are stamped
+void and element `[n-1]` is stamped the node's own (inherited) context.
+
+**Trailing and consecutive commas are null.**  A comma separates operands;
+a comma with no operand on one side contributes no operand.  `(1,)` has
+operands `[1]`; `($x, , $y)` has operands `[$x, $y]` (no empty slot — an
+explicit `undef` placeholder is required to occupy a slot).  The lexer's
+`consume_comma()` (§6.3) eats one-or-more consecutive commas and reports,
+by a byte-level peek, whether more content follows (distinguishing
+separators from a trailing comma before a closing delimiter).  Leading
+commas are rejected naturally, since `,` is not a valid term start.
+
+Crucially, a trailing comma does **not** promote a single operand to a
+list or impose list context.  `sub bar { (3,) }` returns `3`, and
+`scalar bar` is `3` (the value), *not* `1` (a count) — `(3,)` is the
+scalar `3`, the trailing comma inert, parens transparent (§6.2.3).  So
+`(@a,)` is the *same* single-operand parenthesized expression as `(@a)`,
+not a `Comma([@a])`.
+
+#### 6.2.3 Parentheses: transparent to grouping, significant to context
+
+Parentheses are **not wrapped in a persistent AST node** — the tree
+structure already captures precedence, and a per-paren wrapper nests on
+`(((…)))` and reintroduces the recursive-`Drop` overflow removed in #172.
+But parentheses are **not uniformly inert**: in two positions they carry
+semantics that pure grouping does not.  The unifying principle is that
+*their entire consequence reduces to evaluation context*, recorded as a
+construction-time `ctx` stamp — never as a durable structural marker.
+
+**Most paren "effects" are precedence, already structural.**  Because `=`
+binds tighter than `,`, parens that regroup a comma relative to an
+assignment change *what the `=` operates on*, which the Pratt loop captures
+natively as a different tree:
+
+- LHS: `($a, $b) = …` → `assign(Comma([$a,$b]), …)` vs `$a, $b = …` →
+  `comma($a, assign($b, …))`.
+- RHS: `… = (2,4,6)` → the assignment's RHS is the whole list, vs
+  `… = 2, 4, 6` → the RHS is just `2`, with `4, 6` as trailing void
+  C-comma operands.  Verified via the discriminator `((@a,$b)=2),4,6`,
+  which matches the no-RHS-paren behavior.
+
+No flag is needed for any of these — different trees encode them.
+
+**The one genuinely non-precedence, non-inert case: a single parenthesized
+scalar lvalue on an assignment LHS.**  `($x) = f()` is a *list* assignment
+(both sides list context; `$x` gets the first element); `$x = f()` is a
+*scalar* assignment (`$x` gets the count).  Verified: `($b) = foo(2,4,6)`
+→ `$b == 2`; `$b = foo(2,4,6)` → `$b == 3`.  There is no comma to regroup,
+so the trees are otherwise identical; the parens are the sole
+differentiator and they flip the assignment kind.
+
+This is narrow.  Parens matter on an assignment LHS **iff** the target is
+a *single scalar*: `(@a) =` and `(%h) =` are inert (arrays and hashes are
+already list-assignment targets), and `($x)` in *rvalue* position is inert
+(`$c = (@a)` → scalar count).  A bare `subcall()` LHS is a scalar
+assignment; `(subcall())` is a list assignment — the parens promote it,
+exactly like `($x)` (verified, including that an array-lvalue sub errors
+under bare `subcall() =` scalar context but succeeds under `(subcall()) =`
+list context).
+
+**The mechanism: transient `Paren`, resolved at construction.**  The
+parser produces a *transient* `ExprKind::Paren(Box<Expr>)` at paren-close
+(reviving a variant that already exists in the enum but was previously
+never constructed).  It is consumed before the AST is finalized:
+
+- The Pratt operand-combination choke point (`apply_expr_frame`) unwraps a
+  `Paren` operand by default — grouping parens are transparent, so
+  `(a + b) * c` resolves the `Paren` away and yields `binop(*, binop(+,
+  a, b), c)` with no wrapper.
+- The `=` handler, finding a `Paren` LHS, recognizes a list assignment,
+  unwraps the `Paren`, and stamps the unwrapped LHS (and the RHS)
+  `Context::List`.  A bare scalar LHS stamps `Context::Scalar`.
+- Other consuming constructs (the list slice of §6.2.3, the refgen of
+  §6.2.4's operand discussion) likewise consume the `Paren`.
+
+The parser is designed not to retain `Paren` nodes in the returned AST.
+This is a design invariant of the parser, not a type-level prohibition —
+the variant may exist transiently — and it is verified by targeted tests
+that each construct unwraps or consumes the `Paren` appropriately, rather
+than by a runtime assertion (a stray `Paren` would be benign, since the
+remaining consumers — e.g. `is_valid_lvalue` — already see through it).
+
+**The assignment list-vs-scalar rule.**  The `=` handler classifies the
+assignment by LHS kind (after seeing through any `Paren`):
+
+- **List assignment** (RHS and list-targets stamped `Context::List`) iff
+  the LHS is an inherent aggregate target — `ArrayVar`, `HashVar`, an
+  array/hash slice, a deref-array/hash (`@$r`, `@{…}`, `%$r`, …), `Comma`
+  — **or** was wrapped in `Paren` (the single-scalar promotion).
+- **Scalar assignment** (RHS stamped `Context::Scalar`) otherwise — bare
+  `ScalarVar`, `ArrayElem`, `HashElem`, scalar deref (`$$r`), `FuncCall`,
+  `MethodCall`.
+
+The `Paren` wrapper is the *single* additional input that catches `($x) =`;
+all other list-assignment LHS kinds are recognized by their own node kind.
+The classification is fully parse-time decidable — even for lvalue subs,
+because `subcall()` is unconditionally a scalar-assignment form and the
+parens (not the sub's runtime return type) decide list-vs-scalar.
+
+Because `=` binds tighter than `,`, the `=` handler never sees a *bare*
+`Comma` as its LHS (the comma would be above the assignment); it sees a
+`Comma` only by unwrapping a `Paren(Comma([…]))`.  The unwrapping is the
+`=` handler's responsibility; the comma handler builds the `Comma` inside
+the parens before paren-close wraps it.
+
+**The empty list `()`.**  Bare `()` is `ExprKind::EmptyList`, a dedicated
+node — not `Comma([])` (a phantom comma with no comma present) and not an
+`Option`-wrapped operand.  This mirrors Perl's own grammar, which builds
+`()` with a dedicated `newNULLLIST()` (and has a dedicated empty-list-slice
+production).  "Empty list" is preferred over Perl's internal "null list"
+naming, which risks confusion with `undef`.  `EmptyList` is reused as the
+operand of an empty-list slice (§6.2.3).
+
+#### 6.2.4 List slices: `(LIST)[indices]`
+
+A list slice selects elements positionally from a *list literal*.  It is a
+distinct operation from array-element access (`$a[i]`), represented by a
+distinct node:
+
+```rust
+ExprKind::ListSlice(Box<Expr> /* operand */, Vec<Expr> /* indices */)
+```
+
+This mirrors Perl, which has three dedicated grammar productions all
+building `newSLICEOP` — `(LIST)[i]`, `QWLIST[i]`, and `()[i]` — separate
+from the `aelem` production for `$array[i]`.  The current implementation's
+representation of `(1,2,3)[1]` as `ArrayElem` is incorrect (it conflates a
+list slice with array-element access) and is corrected by `ListSlice`.
+
+The slice attaches **only to a list literal**, enforced at parse time — a
+syntactic rule, not a context imposition (it is *not* the case that `[…]`
+"forces list context" on an arbitrary preceding term).  The accepted
+operand forms, each verified against Perl:
+
+1. `Comma([…])` — `(a, b, c)[i]`.
+2. `QwList` — `qw[a b c][i]` (slices bare, no surrounding parens needed,
+   because `qw` is its own primary term — Perl's `QWLIST` token).
+3. `EmptyList` — `()[i]` (Perl's dedicated empty-list-slice production,
+   `newSLICEOP(0, $expr, NULL)`).
+4. a single parenthesized list expression — `(expr)[i]` where `expr` is a
+   single term tagged `Context::List` (the parens make it a list to
+   slice; not a separate wrapper node, just the inner `Expr` with the
+   list tag).
+
+General terms must be parenthesized to be sliced: `foo(1,2,3)[1]` is a
+syntax error, `(foo(1,2,3))[1]` is valid; `map`/`sort` likewise.  The
+operand of a `ListSlice` is in list context.
+
+#### 6.2.5 The stamping pass: `save_context`
+
+Context resolution is a single method each node implements, plus
+construction-time stamping in the constructors.  The two together uphold a
+strict ownership contract.
+
+**The ownership contract.**  Each child is stamped by exactly one event —
+*construction* or its parent's `save_context` — never both.  At
+construction, a node stamps `Some(_)` on exactly the children whose
+context is determinable from its own kind (context-*independent*), and
+leaves `None` on the children whose context depends on the node's own,
+not-yet-known context (context-*dependent*).
+
+- **Context-independent → stamped at construction.**  Knowable from the
+  parent's kind regardless of the parent's own context.  `scalar(E)`'s
+  child is always `Scalar` (in any outer context).  An assignment's RHS is
+  always by-LHS-kind (`List` for an aggregate/`Paren`/`Comma` LHS,
+  `Scalar` for a bare scalar LHS) — fixed at construction, independent of
+  the assignment's own later-determined context.  The refgen operand's
+  parens-fact is stamped here (see below).
+- **Context-dependent → left `None`, stamped during descent.**  The comma
+  operands (list → all list; scalar/void → all-but-last void, last
+  inherited) and the ternary branches (inherit the ternary's own context)
+  depend on the node's own context, unknown until a consumer supplies it.
+
+**The method.**
+
+```rust
+fn save_context(&mut self, ctx: Context) {
+    debug_assert!(self.ctx.is_none(),
+        "save_context twice / on a non-deferred node");
+    self.ctx = Some(ctx);
+    // recurse into exactly the children DEFERRED to None at construction,
+    // per this node's rule; never revisit children already stamped.
+}
+```
+
+Traversal begins `program.save_context(Void)`.  A node recurses only into
+the children it deferred — it knows statically which those are; it does
+*not* probe `child.ctx.is_none()`.  The `debug_assert!` (not `assert!`,
+not a tolerant early return) is correct precisely because, under the
+contract, entering `save_context` on an already-`Some` node can only mean
+a stamping-logic bug — never anything triggerable by Perl source.  It is a
+debug-build tripwire at the point of violation and compiles out of
+release, consistent with the #177 stance of not adding runtime machinery
+to defend against what only a code defect can cause.
+
+**Why the method drives its own children (returns nothing).**  A single
+operator can impose *different* contexts on different argument positions.
+`splice(@a, OFFSET, LENGTH, LIST)` imposes scalar on the offset and length
+but list on the replacement arguments (verified vs Perl); the same holds
+for any mixed-prototype builtin or user sub — `sprintf`/`pack` (scalar
+format, list rest), a `($$@)`-prototyped sub (two scalar slots, then
+list).  A `save_context` that *returned* one context for a uniform caller
+loop could not express "scalar to slots 1–2, list to slot 3+."  So the
+method returns nothing and stamps each child per-slot itself.
+
+Storage is uniform: every node sets `self.ctx`, so every node answers
+`.context()` after the pass, for one byte.
+
+**Per-node bodies.**
+
+- *Leaves / inherent nodes:* set `self.ctx`; no children.
+- *`scalar(E)`:* ignores the received `ctx`; its child was stamped
+  `Scalar` at construction, so it recurses into nothing.  (`@a = scalar(p())`
+  — the `scalar` node's own ctx is `List`, but it imposed `Scalar` on its
+  child; own-context and imposed-context legitimately differ.)
+- *`Comma`:* in `List`, stamp every element `List`; in `Scalar`/`Void`,
+  stamp `[0..n-1]` `Void` and `[n-1]` the node's own (inherited) ctx.  The
+  void-on-early-operands originates *inside* the comma, so there is no
+  tension with the descent — it stamps `None` operands.
+- *Ternary:* the condition was stamped `Some(Scalar)` at construction (its
+  guard returns); recurse into the two branches with the inherited ctx.
+- *Assignment:* the RHS was stamped by-LHS-kind at construction; the
+  assignment's own ctx (set by whoever consumes it — possibly `Void`, as
+  in `@x = a, b, c`) is independent.
+- *Consumers initiate:* `parse_statement` → `Void`; `if`/`while`/`until`
+  conditions → `Scalar`; `foreach` list → `List`; the C-style `for(init;
+  cond; step)` clauses → void/scalar/void (verified).
+
+**Refgen and the parens distinction, via construction-time stamping.**
+`\@a` references the array as a whole; `\(@a)` flattens it and references
+each element.  The operand is the same `ArrayVar` node in both — the
+parens are the only difference — so the distinction cannot come from the
+descent pass (which never sees parens) and does not require a separate
+`RefList` node.  Instead the `Ref` *constructor* stamps the operand's
+context from the parens-fact it has in hand (via the transient `Paren`):
+`\@a` stamps the operand `Context::Scalar`, `\(@a)` stamps it
+`Context::List`.
+
+Behavior is then a function of *the operand's tag* (the parens-fact) **and
+the operand's node kind** (its container-ness), combined at lowering:
+
+- A **named container** operand (`ArrayVar`, `HashVar`, deref-array/hash)
+  with a `Scalar` tag → reference the container whole (`\@a`, `\%h`,
+  `\@$r`).
+- A named container with a `List` tag → flatten to elements (`\(@a)`).
+  This is Perl's "treat `\(@foo)` like an ordinary list" path; in op.c the
+  parens-flag (`OPf_PARENS`) is consulted *only* for array/hash operands
+  (`OP_RV2AV`/`OP_RV2HV`/`OP_PADAV`/`OP_PADHV`), because that is the only
+  case where a whole-reference is the alternative the parens defeat.
+- A **non-container** operand (`QwList`, `FuncCall`, slice, literal) →
+  reference each value it produces, *regardless* of tag, since there is no
+  container to reference whole.  This is why `\qw[…]` and `\(qw[…])` are
+  identical (and `\foo(…)` flattens with no surrounding parens):
+  container-ness, not parens, decides whether a whole-reference is even
+  possible; the parens only matter where it is.
+- A **`Comma`** operand (`\(@a, $b)`) carries the `List` tag meaning
+  "reference each top-level item"; each item is then referenced by *its
+  own* kind — a container item whole, a non-container item per-value.
+  `\(@a, qw[…])` → `@a` whole, the `qw` flattened.
+
+The `Ref` node and the operand's construction-time tag suffice for the
+AST; the container-vs-non-container interpretation and the
+sole-aggregate-flattens-vs-multi-item-each-whole rule live in refgen
+*lowering*, which reads tag + operand kind.  No `RefList` node and no
+per-element tags are needed.
+
+> Note on verification status.  The refgen rule above is confirmed against
+> Perl 5.38 behavior and the op.c `OPf_PARENS`/SREFGEN paths for the cases
+> enumerated here.  The finer corners — empty `\()`, deeply mixed operands,
+> nested derefs — should be re-verified against Perl 5.42 before the refgen
+> lowering is implemented; the rule is intricate enough that the
+> verify-against-real-Perl discipline applies to those corners specifically.
+
+**What persists in the AST.**  The entire parenthesization investigation
+adds *no* new structural node beyond the small set already named —
+`Comma`, `EmptyList`, `ListSlice`, and the *transient* `Paren`.  The
+single-parenthesized cases (`($x) =`, `(expr)[i]`, `\(@a)`) are all
+handled by construction-time `Context::List` stamping plus operand kind;
+`ListExpr` and `RefList` were considered and are unnecessary.  This is the
+unifying result: parentheses, where they are semantically significant,
+impose context, and context is a tag — so the parser records the tag at
+construction (where it sees the parens) and the descent stops at the
+stamped node.
+
+### 6.3 Parser–Lexer Communication
 
 The parser communicates with the lexer through explicit method
 calls.  There is no shared mutable state, no `Expect` enum, no
 re-lexing, and no one-token lookahead cache on the parser.
 
-#### 6.2.1 Three-method tokenization:
+#### 6.3.1 Three-method tokenization:
 
 The lexer provides three tokenization methods, one per grammatical
 context (§5.9.1):
@@ -2626,13 +2958,13 @@ repeat special case (breaking `x5` into operator `x` and operand
 and `consume_comma()` for position-independent structural tokens.
 The parser never calls `lex_token()` directly.
 
-#### 6.2.2 Token consumption methods (§5.9.2):
+#### 6.3.2 Token consumption methods (§5.9.2):
 
 **`consume(expected)`** — conditional single-token consumption.
 **`consume_comma()`** — greedy comma consumption with trailing
 detection.  **`expect(expected)`** — required token or error.
 
-#### 6.2.3 Remaining specialized callbacks:
+#### 6.3.3 Remaining specialized callbacks:
 
 A few lexer methods are not replaced by `lex_term()` because they
 are construct-specific rather than position-dependent:
@@ -2643,7 +2975,7 @@ are construct-specific rather than position-dependent:
 - `scan_adjacent_word_chars()` — collect regex modifier flags
 - `try_autoquoted_bareword_subscript()` — check for `$hash{word}`
 
-#### 6.2.4 Pragma and feature state:
+#### 6.3.4 Pragma and feature state:
 
 The parser syncs pragma and feature state to the lexer at
 pragma change points:
@@ -2658,7 +2990,7 @@ saved pragmas are restored.  The lexer reads these fields for
 Unicode identifier support, feature-gated keywords, and paired
 delimiter lookup.
 
-### 6.3 Prototype-Guided Parsing and Context
+### 6.4 Prototype-Guided Parsing and Context
 
 When the parser encounters a known subroutine name, it checks the
 sub's prototype (if any) in the symbol table to determine how to
@@ -2712,7 +3044,7 @@ position.  In scalar slots, `consume_comma()` still handles
 separation, but the enclosed commas produce C comma semantics
 (ExprKind::Comma) rather than list construction (ExprKind::List).
 
-### 6.4 Syntax Extension API (Planned)
+### 6.5 Syntax Extension API (Planned)
 
 Perl 5 modules like `Syntax::Keyword::Try`, `Syntax::Keyword::Match`,
 `Object::Pad`, `Syntax::Operator::ExistsOr`, and
@@ -2741,7 +3073,7 @@ The Perl 5 C implementation provides three mechanisms:
 The Rust implementation provides all three, redesigned as
 trait-based APIs rather than global function pointers.
 
-#### 6.4.1 Keyword extension trait:
+#### 6.5.1 Keyword extension trait:
 
 ```rust
 trait KeywordPlugin: Send + Sync {
@@ -2752,7 +3084,7 @@ trait KeywordPlugin: Send + Sync {
 }
 ```
 
-#### 6.4.2 Infix operator extension trait:
+#### 6.5.2 Infix operator extension trait:
 
 ```rust
 trait InfixPlugin: Send + Sync {
@@ -2784,7 +3116,7 @@ slots between each adjacent built-in precedence level provide ample
 room for multiple plugins to register at distinct intermediate
 levels.
 
-### 6.5 Forward-Only Parsing
+### 6.6 Forward-Only Parsing
 
 The parser never backtracks.  Every ambiguity is resolved by
 consuming the current token and branching on what follows.  No
@@ -2841,7 +3173,7 @@ this directly — it inspects the bytes after `<<` and either
 initiates heredoc scanning or returns `ShiftLeft`.  No callback
 needed.
 
-### 6.6 Brace Disambiguation
+### 6.7 Brace Disambiguation
 
 **The problem.** When the parser encounters `{` at statement level,
 it could be a block (`{ print 1; print 2 }`) or an anonymous hash
