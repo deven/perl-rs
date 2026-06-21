@@ -454,7 +454,7 @@ impl Parser {
                     Keyword::When => (self.parse_when()?, false),
                     Keyword::Default => {
                         let block = self.parse_block()?;
-                        (StmtKind::When(Expr { kind: ExprKind::IntLit(1), span: kw_span }, block), false)
+                        (StmtKind::When(Expr::new(ExprKind::IntLit(1), kw_span), block), false)
                     }
 
                     // try/catch/finally/defer
@@ -545,41 +545,38 @@ impl Parser {
             Token::Keyword(Keyword::If) => {
                 self.next_token()?;
                 let cond = self.parse_expr(PREC_LOW)?;
-                Ok(StmtKind::Expr(Expr { span: expr.span.merge(cond.span), kind: ExprKind::PostfixControl(PostfixKind::If, Box::new(expr), Box::new(cond)) }))
+                let span = expr.span.merge(cond.span);
+                Ok(StmtKind::Expr(Expr::postfix_control(PostfixKind::If, expr, cond, span)))
             }
             Token::Keyword(Keyword::Unless) => {
                 self.next_token()?;
                 let cond = self.parse_expr(PREC_LOW)?;
-                Ok(StmtKind::Expr(Expr {
-                    span: expr.span.merge(cond.span),
-                    kind: ExprKind::PostfixControl(PostfixKind::Unless, Box::new(expr), Box::new(cond)),
-                }))
+                let span = expr.span.merge(cond.span);
+                Ok(StmtKind::Expr(Expr::postfix_control(PostfixKind::Unless, expr, cond, span)))
             }
             Token::Keyword(Keyword::While) => {
                 self.next_token()?;
                 let cond = self.parse_expr(PREC_LOW)?;
-                Ok(StmtKind::Expr(Expr {
-                    span: expr.span.merge(cond.span),
-                    kind: ExprKind::PostfixControl(PostfixKind::While, Box::new(expr), Box::new(cond)),
-                }))
+                let span = expr.span.merge(cond.span);
+                Ok(StmtKind::Expr(Expr::postfix_control(PostfixKind::While, expr, cond, span)))
             }
             Token::Keyword(Keyword::Until) => {
                 self.next_token()?;
                 let cond = self.parse_expr(PREC_LOW)?;
-                Ok(StmtKind::Expr(Expr {
-                    span: expr.span.merge(cond.span),
-                    kind: ExprKind::PostfixControl(PostfixKind::Until, Box::new(expr), Box::new(cond)),
-                }))
+                let span = expr.span.merge(cond.span);
+                Ok(StmtKind::Expr(Expr::postfix_control(PostfixKind::Until, expr, cond, span)))
             }
             Token::Keyword(Keyword::For) | Token::Keyword(Keyword::Foreach) => {
                 self.next_token()?;
                 let list = self.parse_expr(PREC_LOW)?;
-                Ok(StmtKind::Expr(Expr { span: expr.span.merge(list.span), kind: ExprKind::PostfixControl(PostfixKind::For, Box::new(expr), Box::new(list)) }))
+                let span = expr.span.merge(list.span);
+                Ok(StmtKind::Expr(Expr::postfix_control(PostfixKind::For, expr, list, span)))
             }
             Token::Keyword(Keyword::When) => {
                 self.next_token()?;
                 let cond = self.parse_expr(PREC_LOW)?;
-                Ok(StmtKind::Expr(Expr { span: expr.span.merge(cond.span), kind: ExprKind::PostfixControl(PostfixKind::When, Box::new(expr), Box::new(cond)) }))
+                let span = expr.span.merge(cond.span);
+                Ok(StmtKind::Expr(Expr::postfix_control(PostfixKind::When, expr, cond, span)))
             }
             _ => Ok(StmtKind::Expr(expr)),
         }
@@ -794,7 +791,7 @@ impl Parser {
                 // `$=` — nameless optional.  Check for default expr.
                 if self.at(&Token::RightParen)? || self.at(&Token::Comma)? {
                     // `$=)` or `$=,` — no default expression.
-                    return Ok(SigParam::AnonScalar { default: Some((SigDefaultKind::Eq, Expr { kind: ExprKind::Undef, span })), span });
+                    return Ok(SigParam::AnonScalar { default: Some((SigDefaultKind::Eq, Expr::new(ExprKind::Undef, span))), span });
                 }
 
                 // `$ = expr` — has default expression.
@@ -933,7 +930,7 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            Ok(Expr { kind: ExprKind::Decl(scope, vars), span: span.merge(end) })
+            Ok(Expr::new(ExprKind::Decl(scope, vars), span.merge(end)))
         } else {
             // Single variable: my $x, my @arr, my %hash
             // Optional attributes: my $x : Foo
@@ -944,7 +941,7 @@ impl Parser {
             }
             let end = var.span;
             vars.push(var);
-            Ok(Expr { kind: ExprKind::Decl(scope, vars), span: span.merge(end) })
+            Ok(Expr::new(ExprKind::Decl(scope, vars), span.merge(end)))
         }
     }
 
@@ -966,7 +963,8 @@ impl Parser {
 
         let body = self.parse_block()?;
 
-        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonSub(prototype, attributes, signature, body) })
+        let span = span.merge(body.span);
+        Ok(Expr::anon_sub(prototype, attributes, signature, body, span))
     }
 
     fn parse_anon_method(&mut self, span: Span) -> Result<Expr, ParseError> {
@@ -975,7 +973,8 @@ impl Parser {
         let sig = self.parse_signature()?;
         let body = self.parse_block()?;
 
-        Ok(Expr { span: span.merge(body.span), kind: ExprKind::AnonMethod(attrs, sig, body) })
+        let span = span.merge(body.span);
+        Ok(Expr::anon_method(attrs, sig, body, span))
     }
 
     // ── Control flow statements ───────────────────────────────
@@ -1544,7 +1543,7 @@ impl Parser {
     fn try_reclassify_as_hash(block: Block) -> Result<Expr, Block> {
         // Empty block → empty hash (matching Perl's toke.c line 6368).
         if block.statements.is_empty() {
-            return Ok(Expr { kind: ExprKind::AnonHash(Vec::new()), span: block.span });
+            return Ok(Expr::new(ExprKind::AnonHash(Vec::new()), block.span));
         }
 
         // Multiple statements → definitely a block.
@@ -1582,7 +1581,7 @@ impl Parser {
                 ExprKind::List(items) => items,
                 _ => vec![expr],
             };
-            Ok(Expr { kind: ExprKind::AnonHash(elems), span })
+            Ok(Expr::new(ExprKind::AnonHash(elems), span))
         } else {
             Err(block)
         }
@@ -1726,7 +1725,7 @@ impl Parser {
                 self.next_token()?;
                 if self.at(&Token::RightParen)? {
                     self.next_token()?;
-                    let expr = Expr { kind: ExprKind::List(vec![]), span };
+                    let expr = Expr::new(ExprKind::List(vec![]), span);
                     return Ok(Some(PrefixResult::Leaf(self.maybe_postfix_subscript(expr)?)));
                 }
                 Ok(Some(PrefixResult::Frame(ExprFrame::Paren { span, min_prec: outer_prec }, PREC_LOW)))
@@ -1741,7 +1740,7 @@ impl Parser {
                         return Ok(Some(PrefixResult::Leaf(self.parse_filetest(b, span.merge(end))?)));
                     }
                     Some(Token::StrLit(s)) => {
-                        return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::StringLit(s), span })));
+                        return Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::StringLit(s), span))));
                     }
                     _ => {}
                 }
@@ -1753,9 +1752,10 @@ impl Parser {
                     if matches!(self.peek_token(), Token::LeftParen) {
                         // -func(...) → unary minus on function call
                         let func = self.parse_ident_term(name, ident_span)?;
-                        return Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(func.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(func)) })));
+                        let span = span.merge(func.span);
+                        return Ok(Some(PrefixResult::Leaf(Expr::unary(UnaryOp::Negate, func, span))));
                     }
-                    return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::StringLit(format!("-{name}")), span: span.merge(ident_span) })));
+                    return Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::StringLit(format!("-{name}")), span.merge(ident_span)))));
                 }
 
                 // General negate: -expr
@@ -1801,7 +1801,7 @@ impl Parser {
                 self.next_token()?;
                 if self.at(&Token::RightBracket)? {
                     self.next_token()?;
-                    return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::AnonArray(vec![]), span })));
+                    return Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::AnonArray(vec![]), span))));
                 }
                 Ok(Some(PrefixResult::Frame(ExprFrame::ArrayRef { elems: vec![], span, min_prec: outer_prec }, PREC_COMMA + 1)))
             }
@@ -1809,7 +1809,7 @@ impl Parser {
                 self.next_token()?;
                 if self.at(&Token::RightBrace)? {
                     self.next_token()?;
-                    return Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::AnonHash(vec![]), span })));
+                    return Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::AnonHash(vec![]), span))));
                 }
                 Ok(Some(PrefixResult::Frame(ExprFrame::HashRef { elems: vec![], span, min_prec: outer_prec }, PREC_COMMA + 1)))
             }
@@ -1824,7 +1824,8 @@ impl Parser {
                     Ok(Some(PrefixResult::Frame(ExprFrame::DerefBlock { sigil: Sigil::Scalar, span, min_prec: outer_prec }, PREC_LOW)))
                 } else {
                     let operand = self.parse_deref_operand()?;
-                    let expr = Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Scalar, Box::new(operand)) };
+                    let span = span.merge(operand.span);
+                    let expr = Expr::deref(Sigil::Scalar, operand, span);
                     Ok(Some(PrefixResult::Leaf(self.maybe_postfix_subscript(expr)?)))
                 }
             }
@@ -1835,17 +1836,18 @@ impl Parser {
                     Ok(Some(PrefixResult::Frame(ExprFrame::DerefBlock { sigil: Sigil::Array, span, min_prec: outer_prec }, PREC_LOW)))
                 } else {
                     let operand = self.parse_deref_operand()?;
-                    Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Array, Box::new(operand)) })))
+                    let span = span.merge(operand.span);
+                    Ok(Some(PrefixResult::Leaf(Expr::deref(Sigil::Array, operand, span))))
                 }
             }
             Token::Percent => {
                 self.next_token()?;
                 match self.lexer.lex_hash_var_after_percent()? {
                     Some(Token::HashVar(name)) => {
-                        let recv = Expr { kind: ExprKind::HashVar(name), span };
+                        let recv = Expr::new(ExprKind::HashVar(name), span);
                         Ok(Some(PrefixResult::Leaf(self.maybe_kv_slice(recv, span)?)))
                     }
-                    Some(Token::SpecialHashVar(name)) => Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::SpecialHashVar(name), span }))),
+                    Some(Token::SpecialHashVar(name)) => Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::SpecialHashVar(name), span)))),
                     Some(other) => unreachable!("unexpected hash token: {other:?}"),
                     None => {
                         if self.at(&Token::LeftBrace)? {
@@ -1853,7 +1855,8 @@ impl Parser {
                             Ok(Some(PrefixResult::Frame(ExprFrame::DerefBlock { sigil: Sigil::Hash, span, min_prec: outer_prec }, PREC_LOW)))
                         } else {
                             let operand = self.parse_deref_operand()?;
-                            Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Hash, Box::new(operand)) })))
+                            let span = span.merge(operand.span);
+                            Ok(Some(PrefixResult::Leaf(Expr::deref(Sigil::Hash, operand, span))))
                         }
                     }
                 }
@@ -1880,13 +1883,14 @@ impl Parser {
                         }
                         let end = self.peek_span();
                         self.expect_token(&Token::RightParen)?;
-                        Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::FuncCall(self.qualify_sub_name(&name), args), span: span.merge(end) })))
+                        Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::FuncCall(self.qualify_sub_name(&name), args), span.merge(end)))))
                     } else {
-                        Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::FuncCall(self.qualify_sub_name(&name), vec![]), span: span.merge(name_span) })))
+                        Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::FuncCall(self.qualify_sub_name(&name), vec![]), span.merge(name_span)))))
                     }
                 } else {
                     let operand = self.parse_deref_operand()?;
-                    let deref = Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Code, Box::new(operand)) };
+                    let span = span.merge(operand.span);
+                    let deref = Expr::deref(Sigil::Code, operand, span);
                     Ok(Some(PrefixResult::Leaf(self.maybe_call_args(deref)?)))
                 }
             }
@@ -1901,22 +1905,20 @@ impl Parser {
                         Token::Ident(s) => s,
                         _ => unreachable!(),
                     };
-                    let expr = Expr { kind: ExprKind::GlobVar(name), span: span.merge(name_span) };
+                    let expr = Expr::new(ExprKind::GlobVar(name), span.merge(name_span));
                     if self.at(&Token::LeftBrace)? {
                         self.next_token()?;
                         let key = self.parse_hash_subscript_key()?;
                         let end = self.peek_span();
                         self.expect_token(&Token::RightBrace)?;
-                        Ok(Some(PrefixResult::Leaf(Expr {
-                            span: span.merge(end),
-                            kind: ExprKind::ArrowDeref(Box::new(expr), ArrowTarget::HashElem(Box::new(key))),
-                        })))
+                        Ok(Some(PrefixResult::Leaf(Expr::arrow_deref(expr, ArrowTarget::hash_elem(key), span.merge(end)))))
                     } else {
                         Ok(Some(PrefixResult::Leaf(expr)))
                     }
                 } else {
                     let operand = self.parse_deref_operand()?;
-                    Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(operand.span), kind: ExprKind::Deref(Sigil::Glob, Box::new(operand)) })))
+                    let span = span.merge(operand.span);
+                    Ok(Some(PrefixResult::Leaf(Expr::deref(Sigil::Glob, operand, span))))
                 }
             }
 
@@ -1925,7 +1927,8 @@ impl Parser {
                 self.next_token()?;
                 if self.at(&Token::LeftBrace)? {
                     let block = self.parse_block()?;
-                    Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(block.span), kind: ExprKind::EvalBlock(block) })))
+                    let span = span.merge(block.span);
+                    Ok(Some(PrefixResult::Leaf(Expr::eval_block(block, span))))
                 } else {
                     Ok(Some(PrefixResult::Frame(ExprFrame::EvalExpr { span, min_prec: outer_prec }, PREC_COMMA)))
                 }
@@ -1934,7 +1937,8 @@ impl Parser {
                 self.next_token()?;
                 if self.at(&Token::LeftBrace)? {
                     let block = self.parse_block()?;
-                    Ok(Some(PrefixResult::Leaf(Expr { span: span.merge(block.span), kind: ExprKind::DoBlock(block) })))
+                    let span = span.merge(block.span);
+                    Ok(Some(PrefixResult::Leaf(Expr::do_block(block, span))))
                 } else {
                     Ok(Some(PrefixResult::Frame(ExprFrame::DoExpr { span, min_prec: outer_prec }, PREC_UNARY)))
                 }
@@ -1942,7 +1946,7 @@ impl Parser {
             Token::Keyword(Keyword::Return) => {
                 self.next_token()?;
                 if self.at(&Token::Semi)? || self.at(&Token::RightBrace)? || self.at_eof()? {
-                    Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::FuncCall("CORE::return".into(), vec![]), span })))
+                    Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::FuncCall("CORE::return".into(), vec![]), span))))
                 } else {
                     Ok(Some(PrefixResult::Frame(ExprFrame::ReturnExpr { span, min_prec: outer_prec }, PREC_COMMA)))
                 }
@@ -1954,7 +1958,7 @@ impl Parser {
             Token::Keyword(Keyword::Dump) => {
                 self.next_token()?;
                 if self.at_eof()? || self.at(&Token::Semi)? {
-                    Ok(Some(PrefixResult::Leaf(Expr { kind: ExprKind::FuncCall("CORE::dump".into(), vec![]), span })))
+                    Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::FuncCall("CORE::dump".into(), vec![]), span))))
                 } else {
                     Ok(Some(PrefixResult::Frame(ExprFrame::DumpExpr { span, min_prec: outer_prec }, PREC_COMMA)))
                 }
@@ -1967,7 +1971,8 @@ impl Parser {
     fn apply_expr_frame(&mut self, frame: ExprFrame, operand: Expr) -> Result<FrameResult, ParseError> {
         match frame {
             ExprFrame::Unary { op, span, min_prec } => {
-                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(op, Box::new(operand)) }, min_prec))
+                let span = span.merge(operand.span);
+                Ok(FrameResult::Done(Expr::unary(op, operand, span), min_prec))
             }
             ExprFrame::Negate { span, min_prec } => {
                 // String negation collapse: -"foo" → "-foo", -"-foo" → "+foo", -"+foo" → "-foo".
@@ -1979,23 +1984,27 @@ impl Parser {
                     } else {
                         format!("-{s}")
                     };
-                    Ok(FrameResult::Done(Expr { kind: ExprKind::StringLit(negated), span: span.merge(operand.span) }, min_prec))
+                    Ok(FrameResult::Done(Expr::new(ExprKind::StringLit(negated), span.merge(operand.span)), min_prec))
                 } else {
-                    Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(UnaryOp::Negate, Box::new(operand)) }, min_prec))
+                    let span = span.merge(operand.span);
+                    Ok(FrameResult::Done(Expr::unary(UnaryOp::Negate, operand, span), min_prec))
                 }
             }
             ExprFrame::Ref { span, min_prec } => {
-                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::Ref(Box::new(operand)) }, min_prec))
+                let span = span.merge(operand.span);
+                Ok(FrameResult::Done(Expr::reference(operand, span), min_prec))
             }
             ExprFrame::Local { span, min_prec } => {
-                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::Local(Box::new(operand)) }, min_prec))
+                let span = span.merge(operand.span);
+                Ok(FrameResult::Done(Expr::local(operand, span), min_prec))
             }
             ExprFrame::PreIncDec { op, span, min_prec } => {
                 if !Self::is_valid_lvalue(&operand) {
                     let op_name = if op == UnaryOp::PreInc { "++" } else { "--" };
                     return Err(ParseError::new(format!("invalid operand for prefix {op_name}"), operand.span));
                 }
-                Ok(FrameResult::Done(Expr { span: span.merge(operand.span), kind: ExprKind::UnaryOp(op, Box::new(operand)) }, min_prec))
+                let span = span.merge(operand.span);
+                Ok(FrameResult::Done(Expr::unary(op, operand, span), min_prec))
             }
             ExprFrame::Paren { span, min_prec } => {
                 let end = self.peek_span();
@@ -2015,7 +2024,7 @@ impl Parser {
                         // Trailing comma: `[1, 2, 3,]`
                         let end = self.peek_span();
                         self.next_token()?;
-                        return Ok(FrameResult::Done(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) }, min_prec));
+                        return Ok(FrameResult::Done(Expr::new(ExprKind::AnonArray(elems), span.merge(end)), min_prec));
                     }
 
                     // More elements — re-enter forward phase.
@@ -2023,7 +2032,7 @@ impl Parser {
                 }
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBracket)?;
-                Ok(FrameResult::Done(Expr { kind: ExprKind::AnonArray(elems), span: span.merge(end) }, min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::AnonArray(elems), span.merge(end)), min_prec))
             }
             ExprFrame::HashRef { mut elems, span, min_prec } => {
                 elems.push(operand);
@@ -2032,7 +2041,7 @@ impl Parser {
                         // Trailing comma: `{a => 1, b => 2,}`
                         let end = self.peek_span();
                         self.next_token()?;
-                        return Ok(FrameResult::Done(Expr { kind: ExprKind::AnonHash(elems), span: span.merge(end) }, min_prec));
+                        return Ok(FrameResult::Done(Expr::new(ExprKind::AnonHash(elems), span.merge(end)), min_prec));
                     }
 
                     // More elements — re-enter forward phase.
@@ -2040,12 +2049,13 @@ impl Parser {
                 }
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBrace)?;
-                Ok(FrameResult::Done(Expr { kind: ExprKind::AnonHash(elems), span: span.merge(end) }, min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::AnonHash(elems), span.merge(end)), min_prec))
             }
             ExprFrame::DerefBlock { sigil, span, min_prec } => {
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBrace)?;
-                let mut expr = Expr { span: span.merge(end), kind: ExprKind::Deref(sigil, Box::new(operand)) };
+                let span = span.merge(end);
+                let mut expr = Expr::deref(sigil, operand, span);
                 match sigil {
                     Sigil::Scalar => expr = self.maybe_postfix_subscript(expr)?,
                     Sigil::Code => expr = self.maybe_call_args(expr)?,
@@ -2055,23 +2065,23 @@ impl Parser {
             }
             ExprFrame::EvalExpr { span, min_prec } => {
                 let end = span.merge(operand.span);
-                Ok(FrameResult::Done(Expr { kind: ExprKind::EvalExpr(Box::new(operand)), span: end }, min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::EvalExpr(Box::new(operand)), end), min_prec))
             }
             ExprFrame::DoExpr { span, min_prec } => {
                 let end = span.merge(operand.span);
-                Ok(FrameResult::Done(Expr { kind: ExprKind::DoExpr(Box::new(operand)), span: end }, min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::DoExpr(Box::new(operand)), end), min_prec))
             }
             ExprFrame::ReturnExpr { span, min_prec } => {
                 let end = span.merge(operand.span);
-                Ok(FrameResult::Done(Expr { kind: ExprKind::FuncCall("CORE::return".into(), vec![operand]), span: end }, min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::FuncCall("CORE::return".into(), vec![operand]), end), min_prec))
             }
             ExprFrame::GotoExpr { span, min_prec } => {
                 let end = span.merge(operand.span);
-                Ok(FrameResult::Done(Expr { kind: ExprKind::FuncCall("CORE::goto".into(), vec![operand]), span: end }, min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::FuncCall("CORE::goto".into(), vec![operand]), end), min_prec))
             }
             ExprFrame::DumpExpr { span, min_prec } => {
                 let end = span.merge(operand.span);
-                Ok(FrameResult::Done(Expr { kind: ExprKind::FuncCall("CORE::dump".into(), vec![operand]), span: end }, min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::FuncCall("CORE::dump".into(), vec![operand]), end), min_prec))
             }
         }
     }
@@ -2115,10 +2125,10 @@ impl Parser {
         }
 
         match spanned.token {
-            Token::IntLit(n) => Ok(Expr { kind: ExprKind::IntLit(n), span }),
-            Token::FloatLit(n) => Ok(Expr { kind: ExprKind::FloatLit(n), span }),
-            Token::StrLit(s) => Ok(Expr { kind: ExprKind::StringLit(s), span }),
-            Token::VersionLit(s) => Ok(Expr { kind: ExprKind::VersionLit(s), span }),
+            Token::IntLit(n) => Ok(Expr::new(ExprKind::IntLit(n), span)),
+            Token::FloatLit(n) => Ok(Expr::new(ExprKind::FloatLit(n), span)),
+            Token::StrLit(s) => Ok(Expr::new(ExprKind::StringLit(s), span)),
+            Token::VersionLit(s) => Ok(Expr::new(ExprKind::VersionLit(s), span)),
 
             // Interpolating string: collect sub-tokens into AST.
             Token::QuoteSublexBegin(_, _) => self.parse_interpolated_string(span),
@@ -2135,7 +2145,7 @@ impl Parser {
                             e
                         })
                     }
-                    Some(Token::HeredocLit(_kind, _tag, body)) => Ok(Expr { kind: ExprKind::StringLit(body), span }),
+                    Some(Token::HeredocLit(_kind, _tag, body)) => Ok(Expr::new(ExprKind::StringLit(body), span)),
 
                     // <<>> double diamond — safe version of <>.
                     Some(Token::Readline(content, safe)) => Self::readline_expr(content, safe, span),
@@ -2145,7 +2155,7 @@ impl Parser {
             }
 
             Token::ScalarVar(name) => {
-                let expr = Expr { kind: ExprKind::ScalarVar(name), span };
+                let expr = Expr::new(ExprKind::ScalarVar(name), span);
                 self.maybe_postfix_subscript(expr)
             }
             Token::ArrayVar(name) => {
@@ -2161,7 +2171,7 @@ impl Parser {
                     }
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBracket)?;
-                    Ok(Expr { span: span.merge(end), kind: ExprKind::ArraySlice(Box::new(Expr { kind: ExprKind::ArrayVar(name), span }), indices) })
+                    Ok(Expr::new(ExprKind::ArraySlice(Box::new(Expr::new(ExprKind::ArrayVar(name), span)), indices), span.merge(end)))
                 } else if self.at(&Token::LeftBrace)? {
                     self.next_token()?;
                     let mut keys = Vec::new();
@@ -2173,18 +2183,18 @@ impl Parser {
                     }
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
-                    Ok(Expr { span: span.merge(end), kind: ExprKind::HashSlice(Box::new(Expr { kind: ExprKind::ArrayVar(name), span }), keys) })
+                    Ok(Expr::new(ExprKind::HashSlice(Box::new(Expr::new(ExprKind::ArrayVar(name), span)), keys), span.merge(end)))
                 } else {
-                    Ok(Expr { kind: ExprKind::ArrayVar(name), span })
+                    Ok(Expr::new(ExprKind::ArrayVar(name), span))
                 }
             }
             Token::HashVar(name) => {
                 // %hash{keys} → kv hash slice; %hash[indices] → kv array slice (5.20+)
-                let recv = Expr { kind: ExprKind::HashVar(name), span };
+                let recv = Expr::new(ExprKind::HashVar(name), span);
                 self.maybe_kv_slice(recv, span)
             }
             Token::GlobVar(name) => {
-                let expr = Expr { kind: ExprKind::GlobVar(name), span };
+                let expr = Expr::new(ExprKind::GlobVar(name), span);
 
                 // *foo{THING} — typeglob slot access
                 if self.at(&Token::LeftBrace)? {
@@ -2192,35 +2202,36 @@ impl Parser {
                     let key = self.parse_hash_subscript_key()?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
-                    Ok(Expr { span: span.merge(end), kind: ExprKind::ArrowDeref(Box::new(expr), ArrowTarget::HashElem(Box::new(key))) })
+                    let span = span.merge(end);
+                    Ok(Expr::arrow_deref(expr, ArrowTarget::hash_elem(key), span))
                 } else {
                     Ok(expr)
                 }
             }
-            Token::ArrayLen(name) => Ok(Expr { kind: ExprKind::ArrayLen(name), span }),
+            Token::ArrayLen(name) => Ok(Expr::new(ExprKind::ArrayLen(name), span)),
             Token::SpecialVar(name) => {
-                let expr = Expr { kind: ExprKind::SpecialVar(name), span };
+                let expr = Expr::new(ExprKind::SpecialVar(name), span);
                 self.maybe_postfix_subscript(expr)
             }
-            Token::SpecialArrayVar(name) => Ok(Expr { kind: ExprKind::SpecialArrayVar(name), span }),
-            Token::SpecialHashVar(name) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
+            Token::SpecialArrayVar(name) => Ok(Expr::new(ExprKind::SpecialArrayVar(name), span)),
+            Token::SpecialHashVar(name) => Ok(Expr::new(ExprKind::SpecialHashVar(name), span)),
 
             Token::Ident(name) => self.parse_ident_term(name, span),
 
             // Compile-time special literals.  SourceFile/SourceLine carry lex-time values; __PACKAGE__ is resolved from
             // the parser's state.  __SUB__ and __CLASS__ are feature-gated — the lexer only emits them as keywords when
             // the feature is active (otherwise they become Ident, falling through to the arm above).
-            Token::SourceFile(path) => Ok(Expr { kind: ExprKind::SourceFile(path), span }),
-            Token::SourceLine(n) => Ok(Expr { kind: ExprKind::SourceLine(n), span }),
+            Token::SourceFile(path) => Ok(Expr::new(ExprKind::SourceFile(path), span)),
+            Token::SourceLine(n) => Ok(Expr::new(ExprKind::SourceLine(n), span)),
             Token::Keyword(Keyword::__PACKAGE__) => {
                 let pkg = self.current_package.to_string();
-                Ok(Expr { kind: ExprKind::CurrentPackage(pkg), span })
+                Ok(Expr::new(ExprKind::CurrentPackage(pkg), span))
             }
-            Token::Keyword(Keyword::__SUB__) => Ok(Expr { kind: ExprKind::CurrentSub, span }),
-            Token::Keyword(Keyword::__CLASS__) => Ok(Expr { kind: ExprKind::CurrentClass, span }),
+            Token::Keyword(Keyword::__SUB__) => Ok(Expr::new(ExprKind::CurrentSub, span)),
+            Token::Keyword(Keyword::__CLASS__) => Ok(Expr::new(ExprKind::CurrentClass, span)),
 
-            Token::Keyword(Keyword::Undef) => Ok(Expr { kind: ExprKind::Undef, span }),
-            Token::Keyword(Keyword::Wantarray) => Ok(Expr { kind: ExprKind::Wantarray, span }),
+            Token::Keyword(Keyword::Undef) => Ok(Expr::new(ExprKind::Undef, span)),
+            Token::Keyword(Keyword::Wantarray) => Ok(Expr::new(ExprKind::Wantarray, span)),
 
             // Declaration in expression context: my $x, our ($a, $b), state $x
             Token::Keyword(Keyword::My) | Token::Keyword(Keyword::Our) | Token::Keyword(Keyword::State) => {
@@ -2256,18 +2267,18 @@ impl Parser {
                         _ => unreachable!(),
                     };
                     let end = span.merge(label_span);
-                    Ok(Expr { kind: ExprKind::FuncCall(name.into(), vec![Expr { kind: ExprKind::StringLit(label), span: label_span }]), span: end })
+                    Ok(Expr::new(ExprKind::FuncCall(name.into(), vec![Expr::new(ExprKind::StringLit(label), label_span)]), end))
                 } else {
-                    Ok(Expr { kind: ExprKind::FuncCall(name.into(), vec![]), span })
+                    Ok(Expr::new(ExprKind::FuncCall(name.into(), vec![]), span))
                 }
             }
 
             // break — exits a given/when block.  No label argument.
-            Token::Keyword(Keyword::Break) => Ok(Expr { kind: ExprKind::FuncCall("CORE::break".into(), vec![]), span }),
+            Token::Keyword(Keyword::Break) => Ok(Expr::new(ExprKind::FuncCall("CORE::break".into(), vec![]), span)),
 
             // continue — falls through to the next when in a given block.  Different from `continue BLOCK` after loops,
             // which is handled at statement level.
-            Token::Keyword(Keyword::Continue) => Ok(Expr { kind: ExprKind::FuncCall("CORE::continue".into(), vec![]), span }),
+            Token::Keyword(Keyword::Continue) => Ok(Expr::new(ExprKind::FuncCall("CORE::continue".into(), vec![]), span)),
 
             // `x` is a weak keyword: in prefix position it acts as an identifier (function call / bareword).  In infix
             // position the Pratt parser handles it as the repeat operator.
@@ -2286,7 +2297,7 @@ impl Parser {
             // List operators
             Token::Keyword(kw) if keyword::is_list_op(kw) => self.parse_list_op(kw, span),
 
-            Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
+            Token::QwList(words) => Ok(Expr::new(ExprKind::QwList(words), span)),
 
             // Regex, substitution, transliteration
             Token::RegexSublexBegin(kind, _delim) => {
@@ -2295,7 +2306,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(kind, pattern, flags), span })
+                Ok(Expr::new(ExprKind::Regex(kind, pattern, flags), span))
             }
 
             // // in term position is an empty regex, not defined-or.
@@ -2304,7 +2315,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![]), flags), span })
+                Ok(Expr::new(ExprKind::Regex(RegexKind::Match, Interpolated(vec![]), flags), span))
             }
 
             // / in term position is a regex, not division.
@@ -2314,7 +2325,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span })
+                Ok(Expr::new(ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span))
             }
 
             // /= in term position: = is the first character of the regex pattern, not a division-assignment operator.
@@ -2325,7 +2336,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span })
+                Ok(Expr::new(ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span))
             }
             Token::SubstSublexBegin(delim) => {
                 // Collect pattern body tokens until SublexEnd.
@@ -2353,7 +2364,7 @@ impl Parser {
                     let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
                     let expr = match prog.statements.into_iter().next() {
                         Some(Statement { kind: StmtKind::Expr(expr), .. }) => expr,
-                        _ => Expr { kind: ExprKind::StringLit(raw), span },
+                        _ => Expr::new(ExprKind::StringLit(raw), span),
                     };
                     Interpolated(vec![InterpPart::ExprInterp(Box::new(expr))])
                 } else {
@@ -2361,18 +2372,18 @@ impl Parser {
                     self.parse_interpolated()?
                 };
                 let end = self.peek_span();
-                Ok(Expr { kind: ExprKind::Subst(pattern, replacement, flags), span: span.merge(end) })
+                Ok(Expr::new(ExprKind::Subst(pattern, replacement, flags), span.merge(end)))
             }
             Token::TranslitLit(from, to, flags) => {
                 if let Some(ref f) = flags {
                     Self::validate_tr_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Translit(from, to, flags), span })
+                Ok(Expr::new(ExprKind::Translit(from, to, flags), span))
             }
 
             // Heredoc (body already collected by lexer).  Literal heredocs (body collected by lexer as raw string).
             // Interpolating heredocs come through QuoteSublexBegin → tokens → SublexEnd.
-            Token::HeredocLit(_kind, _tag, body) => Ok(Expr { kind: ExprKind::StringLit(body), span }),
+            Token::HeredocLit(_kind, _tag, body) => Ok(Expr::new(ExprKind::StringLit(body), span)),
 
             // sort/map/grep with optional block
             Token::Keyword(kw) if keyword::is_block_list_op(kw) => self.parse_block_list_op(kw, span),
@@ -2384,7 +2395,7 @@ impl Parser {
             Token::Filetest(test_byte) => self.parse_filetest(test_byte, span),
 
             // Yada yada yada (...)
-            Token::DotDotDot => Ok(Expr { kind: ExprKind::YadaYada, span }),
+            Token::DotDotDot => Ok(Expr::new(ExprKind::YadaYada, span)),
 
             // Readline / diamond: <STDIN>, <>, <$fh>, <*.txt>
             Token::Readline(content, safe) => Self::readline_expr(content, safe, span),
@@ -2405,11 +2416,11 @@ impl Parser {
             Token::Dot => match self.lexer.lex_leading_dot_float()? {
                 Some(Token::FloatLit(n)) => {
                     let end = self.peek_span().start;
-                    Ok(Expr { kind: ExprKind::FloatLit(n), span: Span::new(span.start, end) })
+                    Ok(Expr::new(ExprKind::FloatLit(n), Span::new(span.start, end)))
                 }
                 Some(Token::VersionLit(v)) => {
                     let end = self.peek_span().start;
-                    Ok(Expr { kind: ExprKind::VersionLit(v), span: Span::new(span.start, end) })
+                    Ok(Expr::new(ExprKind::VersionLit(v), Span::new(span.start, end)))
                 }
                 _ => Err(ParseError::new("expected expression, got Dot", span)),
             },
@@ -2428,7 +2439,7 @@ impl Parser {
         // No delimiter byte (EOF) — treat as bareword.
         if raw.is_none() {
             let name: &str = kw.into();
-            return Ok(Expr { kind: ExprKind::Bareword(name.to_string()), span });
+            return Ok(Expr::new(ExprKind::Bareword(name.to_string()), span));
         }
 
         // Start sublexing — the lexer reads the delimiter and begins scanning the body.
@@ -2440,8 +2451,8 @@ impl Parser {
     fn dispatch_quote_result(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
         let token = self.lexer.begin_quote_sublex(kw)?;
         match token {
-            Token::StrLit(s) => Ok(Expr { kind: ExprKind::StringLit(s), span }),
-            Token::QwList(words) => Ok(Expr { kind: ExprKind::QwList(words), span }),
+            Token::StrLit(s) => Ok(Expr::new(ExprKind::StringLit(s), span)),
+            Token::QwList(words) => Ok(Expr::new(ExprKind::QwList(words), span)),
             Token::QuoteSublexBegin(_, _) => self.parse_interpolated_string(span),
             Token::RegexSublexBegin(kind, _delim) => {
                 let pattern = self.parse_interpolated()?;
@@ -2449,7 +2460,7 @@ impl Parser {
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Regex(kind, pattern, flags), span })
+                Ok(Expr::new(ExprKind::Regex(kind, pattern, flags), span))
             }
             Token::SubstSublexBegin(delim) => {
                 let pattern = self.parse_interpolated()?;
@@ -2472,20 +2483,20 @@ impl Parser {
                     let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
                     let expr = match prog.statements.into_iter().next() {
                         Some(Statement { kind: StmtKind::Expr(expr), .. }) => expr,
-                        _ => Expr { kind: ExprKind::StringLit(raw), span },
+                        _ => Expr::new(ExprKind::StringLit(raw), span),
                     };
                     Interpolated(vec![InterpPart::ExprInterp(Box::new(expr))])
                 } else {
                     self.parse_interpolated()?
                 };
                 let end = self.peek_span();
-                Ok(Expr { kind: ExprKind::Subst(pattern, replacement, flags), span: span.merge(end) })
+                Ok(Expr::new(ExprKind::Subst(pattern, replacement, flags), span.merge(end)))
             }
             Token::TranslitLit(from, to, flags) => {
                 if let Some(ref f) = flags {
                     Self::validate_tr_flags(f, span)?;
                 }
-                Ok(Expr { kind: ExprKind::Translit(from, to, flags), span })
+                Ok(Expr::new(ExprKind::Translit(from, to, flags), span))
             }
             other => Err(ParseError::new(format!("unexpected token from quote sublexer: {other:?}"), span)),
         }
@@ -2511,7 +2522,7 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            return Ok(Expr { kind: ExprKind::FuncCall(self.qualify_sub_name(&name), args), span: span.merge(end) });
+            return Ok(Expr::new(ExprKind::FuncCall(self.qualify_sub_name(&name), args), span.merge(end)));
         }
 
         // No parens — if we know this sub has a prototype, use it to drive argument parsing.
@@ -2535,7 +2546,7 @@ impl Parser {
                     let class_name = class_name.clone();
                     let class_span = self.peek_span();
                     self.next_token()?; // eat class name
-                    let class_expr = Expr { kind: ExprKind::Bareword(class_name), span: class_span };
+                    let class_expr = Expr::new(ExprKind::Bareword(class_name), class_span);
 
                     // Optional args
                     let mut args = Vec::new();
@@ -2549,10 +2560,10 @@ impl Parser {
                         }
                         let end = self.peek_span();
                         self.expect_token(&Token::RightParen)?;
-                        return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(end) });
+                        return Ok(Expr::new(ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span.merge(end)));
                     }
 
-                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span: span.merge(class_span) });
+                    return Ok(Expr::new(ExprKind::IndirectMethodCall(Box::new(class_expr), name, args), span.merge(class_span)));
                 }
                 Token::ScalarVar(_) => {
                     let var_span = self.peek_span();
@@ -2560,7 +2571,7 @@ impl Parser {
                         Token::ScalarVar(n) => n,
                         _ => unreachable!(),
                     };
-                    let invocant = Expr { kind: ExprKind::ScalarVar(var), span: var_span };
+                    let invocant = Expr::new(ExprKind::ScalarVar(var), var_span);
 
                     let mut args = Vec::new();
                     if self.at(&Token::LeftParen)? {
@@ -2573,17 +2584,17 @@ impl Parser {
                         }
                         let end = self.peek_span();
                         self.expect_token(&Token::RightParen)?;
-                        return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(end) });
+                        return Ok(Expr::new(ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span.merge(end)));
                     }
 
-                    return Ok(Expr { kind: ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span: span.merge(var_span) });
+                    return Ok(Expr::new(ExprKind::IndirectMethodCall(Box::new(invocant), name, args), span.merge(var_span)));
                 }
                 _ => {}
             }
         } // INDIRECT feature gate
 
         // Bare identifier — not followed by ( or indirect object context.
-        Ok(Expr { kind: ExprKind::Bareword(name), span })
+        Ok(Expr::new(ExprKind::Bareword(name), span))
     }
 
     /// True if the current token marks the end of a list-op / prototyped argument list: statement terminator, closing
@@ -2617,7 +2628,7 @@ impl Parser {
             }
         }
         let end_span = args.last().map(|a| a.span).unwrap_or(start);
-        Ok(Expr { kind: ExprKind::FuncCall(name, args), span: start.merge(end_span) })
+        Ok(Expr::new(ExprKind::FuncCall(name, args), start.merge(end_span)))
     }
 
     /// Parse a call whose target sub has a known prototype.  Arguments are consumed according to the prototype slots;
@@ -2641,7 +2652,7 @@ impl Parser {
                 // ($_), regardless of required/optional status.  All other slots simply stop; a later semantic pass can
                 // validate required-arg counts.
                 if matches!(slot, ProtoSlot::DefaultedScalar) {
-                    args.push(Expr { kind: ExprKind::DefaultVar, span: self.peek_span() });
+                    args.push(Expr::new(ExprKind::DefaultVar, self.peek_span()));
                 }
                 let _ = is_optional;
                 break;
@@ -2658,7 +2669,7 @@ impl Parser {
                     let arg = if i == 0 && self.at(&Token::LeftBrace)? {
                         let block = self.parse_block()?;
                         let span = block.span;
-                        Expr { kind: ExprKind::AnonSub(None, vec![], None, block), span }
+                        Expr::anon_sub(None, vec![], None, block, span)
                     } else {
                         self.parse_expr(PREC_NAMED_UNARY)?
                     };
@@ -2689,7 +2700,7 @@ impl Parser {
                             Token::Ident(n) => n,
                             _ => unreachable!(),
                         };
-                        Expr { kind: ExprKind::GlobVar(name), span: glob_span }
+                        Expr::new(ExprKind::GlobVar(name), glob_span)
                     } else {
                         self.parse_expr(PREC_NAMED_UNARY)?
                     };
@@ -2706,7 +2717,7 @@ impl Parser {
                     // one.
                     let arg = self.parse_expr(PREC_NAMED_UNARY)?;
                     let span = arg.span;
-                    args.push(Expr { kind: ExprKind::Ref(Box::new(arg)), span });
+                    args.push(Expr::reference(arg, span));
                     if i + 1 < proto.slots.len() {
                         self.eat(&Token::Comma)?;
                     }
@@ -2725,7 +2736,7 @@ impl Parser {
         }
 
         let end_span = args.last().map(|a| a.span).unwrap_or(start);
-        Ok(Expr { kind: ExprKind::FuncCall(name, args), span: start.merge(end_span) })
+        Ok(Expr::new(ExprKind::FuncCall(name, args), start.merge(end_span)))
     }
 
     /// Convert a keyword to its `CORE::name` form for the AST.  Keyword-dispatched function calls use this so the
@@ -2750,11 +2761,11 @@ impl Parser {
             self.next_token()?; // consume (
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span: span.merge(end) });
+            return Ok(Expr::new(ExprKind::FuncCall(name, vec![]), span.merge(end)));
         }
 
         // No parens — emit as a zero-arg call; the next token is an operator, not an argument.
-        Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span })
+        Ok(Expr::new(ExprKind::FuncCall(name, vec![]), span))
     }
 
     fn parse_named_unary(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
@@ -2783,13 +2794,13 @@ impl Parser {
             )
         {
             // No argument
-            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
+            return Ok(Expr::new(ExprKind::FuncCall(name, vec![]), span));
         }
 
         // Operators that prefer defined-or: // after shift/pop/undef/etc.  is defined-or, not an empty regex argument.
         // Matches toke.c's XTERMORDORDOR.
         if keyword::prefers_defined_or(kw) && matches!(self.peek_token(), Token::DefinedOr) {
-            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![]), span });
+            return Ok(Expr::new(ExprKind::FuncCall(name, vec![]), span));
         }
 
         if self.at(&Token::LeftParen)? {
@@ -2797,7 +2808,7 @@ impl Parser {
             let arg = self.parse_expr(PREC_LOW)?;
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            return Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: span.merge(end) });
+            return Ok(Expr::new(ExprKind::FuncCall(name, vec![arg]), span.merge(end)));
         }
 
         // Parse one term as the argument at named-unary precedence.  Named unary binds tighter than ternary,
@@ -2805,7 +2816,7 @@ impl Parser {
         // `defined($x) || $y`.  But it binds looser than arithmetic: `lc $x . $y` is `lc($x . $y)`.
         let arg = self.parse_expr(PREC_NAMED_UNARY)?;
         let end = span.merge(arg.span);
-        Ok(Expr { kind: ExprKind::FuncCall(name, vec![arg]), span: end })
+        Ok(Expr::new(ExprKind::FuncCall(name, vec![arg]), end))
     }
 
     /// Parse the target of a stat-family operation (filetest, stat, lstat).
@@ -2823,18 +2834,18 @@ impl Parser {
         if content.is_empty() {
             // `<>` (safe=false) or `<<>>` (safe=true).
             let name = if safe { "CORE::readline_safe" } else { "CORE::readline" };
-            Ok(Expr { kind: ExprKind::FuncCall(name.into(), vec![]), span })
+            Ok(Expr::new(ExprKind::FuncCall(name.into(), vec![]), span))
         } else if content.contains('*') || content.contains('?') {
-            Ok(Expr { kind: ExprKind::FuncCall("CORE::glob".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+            Ok(Expr::new(ExprKind::FuncCall("CORE::glob".into(), vec![Expr::new(ExprKind::StringLit(content), span)]), span))
         } else {
-            Ok(Expr { kind: ExprKind::FuncCall("CORE::readline".into(), vec![Expr { kind: ExprKind::StringLit(content), span }]), span })
+            Ok(Expr::new(ExprKind::FuncCall("CORE::readline".into(), vec![Expr::new(ExprKind::StringLit(content), span)]), span))
         }
     }
 
     fn parse_filetest(&mut self, test_byte: u8, span: Span) -> Result<Expr, ParseError> {
         let test_char = test_byte as char;
         let (target, end) = self.parse_stat_target(span)?;
-        Ok(Expr { span: span.merge(end), kind: ExprKind::Filetest(test_char, target) })
+        Ok(Expr::new(ExprKind::Filetest(test_char, target), span.merge(end)))
     }
 
     fn parse_stat_target(&mut self, start: Span) -> Result<(StatTarget, Span), ParseError> {
@@ -2876,7 +2887,7 @@ impl Parser {
     fn parse_stat_op(&mut self, is_lstat: bool, span: Span) -> Result<Expr, ParseError> {
         let (target, end) = self.parse_stat_target(span)?;
         let kind = if is_lstat { ExprKind::Lstat(target) } else { ExprKind::Stat(target) };
-        Ok(Expr { span: span.merge(end), kind })
+        Ok(Expr::new(kind, span.merge(end)))
     }
 
     fn parse_list_op(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
@@ -2894,7 +2905,7 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            return Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end) });
+            return Ok(Expr::new(ExprKind::ListOp(name, args), span.merge(end)));
         }
 
         // No parens — parse everything up to end of statement as args
@@ -2919,7 +2930,7 @@ impl Parser {
         }
 
         let end_span = args.last().map(|a| a.span).unwrap_or(span);
-        Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end_span) })
+        Ok(Expr::new(ExprKind::ListOp(name, args), span.merge(end_span)))
     }
 
     /// Parse sort/map/grep with optional block as first argument.  `sort { $a <=> $b } @list`, `map { ... } @list`,
@@ -2935,7 +2946,8 @@ impl Parser {
             // Check for block as first arg inside parens
             if self.at(&Token::LeftBrace)? {
                 let block = self.parse_block()?;
-                args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, vec![], None, block) });
+                let span = block.span;
+                args.push(Expr::anon_sub(None, vec![], None, block, span));
                 self.eat(&Token::Comma)?;
             }
             while !self.at(&Token::RightParen)? && !self.at_eof()? {
@@ -2946,7 +2958,7 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            return Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end) });
+            return Ok(Expr::new(ExprKind::ListOp(name, args), span.merge(end)));
         }
 
         let mut args = Vec::new();
@@ -2954,7 +2966,8 @@ impl Parser {
         // Check for block or sub name as first arg
         if self.at(&Token::LeftBrace)? {
             let block = self.parse_block()?;
-            args.push(Expr { span: block.span, kind: ExprKind::AnonSub(None, vec![], None, block) });
+            let span = block.span;
+            args.push(Expr::anon_sub(None, vec![], None, block, span));
         } else if kw == Keyword::Sort {
             // sort can also take a sub name: sort subname @list
             if let Token::Ident(_) = self.peek_token() {
@@ -2963,7 +2976,7 @@ impl Parser {
                     Token::Ident(s) => s,
                     _ => unreachable!(),
                 };
-                args.push(Expr { kind: ExprKind::Bareword(ident), span: ident_span });
+                args.push(Expr::new(ExprKind::Bareword(ident), ident_span));
             }
         }
 
@@ -2987,7 +3000,7 @@ impl Parser {
         }
 
         let end_span = args.last().map(|a| a.span).unwrap_or(span);
-        Ok(Expr { kind: ExprKind::ListOp(name, args), span: span.merge(end_span) })
+        Ok(Expr::new(ExprKind::ListOp(name, args), span.merge(end_span)))
     }
 
     /// Parse print/say with optional filehandle as first argument.  `print STDERR "error"`, `print "hello"`, `say $fh
@@ -3019,7 +3032,7 @@ impl Parser {
                 first_arg = Some(expr);
             } else {
                 // Bareword not followed by comma → filehandle.  `print STDERR "hello"`.
-                filehandle = Some(Box::new(Expr { kind: ExprKind::Bareword(fh_name), span: fh_span }));
+                filehandle = Some(Box::new(Expr::new(ExprKind::Bareword(fh_name), fh_span)));
             }
         } else if is_scalar {
             let var_span = self.peek_span();
@@ -3050,10 +3063,10 @@ impl Parser {
             );
             if next_is_term {
                 // `print $fh "hello"` → filehandle.
-                filehandle = Some(Box::new(Expr { kind: ExprKind::ScalarVar(var_name), span: var_span }));
+                filehandle = Some(Box::new(Expr::new(ExprKind::ScalarVar(var_name), var_span)));
             } else {
                 // `print $x + 1` → not filehandle, first argument.
-                let var_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
+                let var_expr = Expr::new(ExprKind::ScalarVar(var_name), var_span);
                 let initial = self.maybe_postfix_subscript(var_expr)?;
                 let expr = self.parse_expr_continuation(initial, PREC_COMMA + 1)?;
                 first_arg = Some(expr);
@@ -3072,7 +3085,7 @@ impl Parser {
                     self.expect_token(&Token::RightParen)?;
                 }
                 let end_span = args.last().map(|a| a.span).unwrap_or(span);
-                return Ok(Expr { kind: ExprKind::PrintOp(name, filehandle, args), span: span.merge(end_span) });
+                return Ok(Expr::new(ExprKind::PrintOp(name, filehandle, args), span.merge(end_span)));
             }
         }
         while !self.at_print_end(in_parens)? {
@@ -3087,7 +3100,7 @@ impl Parser {
         }
 
         let end_span = args.last().map(|a| a.span).unwrap_or(span);
-        Ok(Expr { kind: ExprKind::PrintOp(name, filehandle, args), span: span.merge(end_span) })
+        Ok(Expr::new(ExprKind::PrintOp(name, filehandle, args), span.merge(end_span)))
     }
 
     /// Check whether we're at the end of a print argument list.
@@ -3115,17 +3128,18 @@ impl Parser {
         let spanned = self.next_token()?;
         let span = spanned.span;
         match spanned.token {
-            Token::ScalarVar(name) => Ok(Expr { kind: ExprKind::ScalarVar(name), span }),
-            Token::ArrayVar(name) => Ok(Expr { kind: ExprKind::ArrayVar(name), span }),
-            Token::HashVar(name) => Ok(Expr { kind: ExprKind::HashVar(name), span }),
-            Token::SpecialVar(name) => Ok(Expr { kind: ExprKind::SpecialVar(name), span }),
-            Token::SpecialArrayVar(name) => Ok(Expr { kind: ExprKind::SpecialArrayVar(name), span }),
-            Token::SpecialHashVar(name) => Ok(Expr { kind: ExprKind::SpecialHashVar(name), span }),
+            Token::ScalarVar(name) => Ok(Expr::new(ExprKind::ScalarVar(name), span)),
+            Token::ArrayVar(name) => Ok(Expr::new(ExprKind::ArrayVar(name), span)),
+            Token::HashVar(name) => Ok(Expr::new(ExprKind::HashVar(name), span)),
+            Token::SpecialVar(name) => Ok(Expr::new(ExprKind::SpecialVar(name), span)),
+            Token::SpecialArrayVar(name) => Ok(Expr::new(ExprKind::SpecialArrayVar(name), span)),
+            Token::SpecialHashVar(name) => Ok(Expr::new(ExprKind::SpecialHashVar(name), span)),
 
             // Recursive: $$$ref
             Token::Dollar => {
                 let inner = self.parse_deref_operand()?;
-                Ok(Expr { span: span.merge(inner.span), kind: ExprKind::Deref(Sigil::Scalar, Box::new(inner)) })
+                let span = span.merge(inner.span);
+                Ok(Expr::deref(Sigil::Scalar, inner, span))
             }
             other => Err(ParseError::new(format!("expected variable after dereference sigil, got {other:?}"), span)),
         }
@@ -3144,7 +3158,8 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            Ok(Expr { span: callee.span.merge(end), kind: ExprKind::MethodCall(Box::new(callee), String::new(), args) })
+            let span = callee.span.merge(end);
+            Ok(Expr::method_call(callee, String::new(), args, span))
         } else {
             Ok(callee)
         }
@@ -3163,7 +3178,7 @@ impl Parser {
         // The one-token cache must be empty so the byte-level scanner sees the raw source bytes immediately after `{`.
         debug_assert!(self.current.is_none(), "parse_hash_subscript_key: one-token cache must be empty");
         if let Some((name, span)) = self.lexer.try_autoquoted_subscript_key() {
-            return Ok(Expr { kind: ExprKind::StringLit(name), span });
+            return Ok(Expr::new(ExprKind::StringLit(name), span));
         }
         let key = self.parse_expr(PREC_LOW)?;
 
@@ -3173,9 +3188,9 @@ impl Parser {
             && self.pragmas.features.contains(Features::MULTIDIMENSIONAL)
         {
             let span = key.span;
-            let mut args = vec![Expr { kind: ExprKind::SpecialVar(";".to_string()), span }];
+            let mut args = vec![Expr::new(ExprKind::SpecialVar(";".to_string()), span)];
             args.extend(items.iter().cloned());
-            return Ok(Expr { kind: ExprKind::FuncCall("CORE::join".to_string(), args), span });
+            return Ok(Expr::new(ExprKind::FuncCall("CORE::join".to_string(), args), span));
         }
         Ok(key)
     }
@@ -3194,7 +3209,7 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightBracket)?;
-            Ok(Expr { span: span.merge(end), kind: ExprKind::KvArraySlice(Box::new(recv), indices) })
+            Ok(Expr::new(ExprKind::KvArraySlice(Box::new(recv), indices), span.merge(end)))
         } else if self.at(&Token::LeftBrace)? {
             self.next_token()?;
             let mut keys = Vec::new();
@@ -3206,7 +3221,7 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightBrace)?;
-            Ok(Expr { span: span.merge(end), kind: ExprKind::KvHashSlice(Box::new(recv), keys) })
+            Ok(Expr::new(ExprKind::KvHashSlice(Box::new(recv), keys), span.merge(end)))
         } else {
             Ok(recv)
         }
@@ -3221,13 +3236,15 @@ impl Parser {
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBracket)?;
-                expr = Expr { span: expr.span.merge(end), kind: ExprKind::ArrayElem(Box::new(expr), Box::new(idx)) };
+                let span = expr.span.merge(end);
+                expr = Expr::array_elem(expr, idx, span);
             } else if self.at(&Token::LeftBrace)? {
                 self.next_token()?;
                 let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBrace)?;
-                expr = Expr { span: expr.span.merge(end), kind: ExprKind::HashElem(Box::new(expr), Box::new(key)) };
+                let span = expr.span.merge(end);
+                expr = Expr::hash_elem(expr, key, span);
             } else {
                 break;
             }
@@ -3260,21 +3277,21 @@ impl Parser {
                     let span = self.peek_span();
                     self.next_token()?;
                     let cm = self.lexer.take_interp_case_mod();
-                    let expr = apply_case_mod_wrap(Expr { kind: ExprKind::ScalarVar(name), span }, cm);
+                    let expr = apply_case_mod_wrap(Expr::new(ExprKind::ScalarVar(name), span), cm);
                     parts.push(InterpPart::ScalarInterp(Box::new(expr)));
                 }
                 Token::InterpArray(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
                     let cm = self.lexer.take_interp_case_mod();
-                    let expr = apply_case_mod_wrap(Expr { kind: ExprKind::ArrayVar(name), span }, cm);
+                    let expr = apply_case_mod_wrap(Expr::new(ExprKind::ArrayVar(name), span), cm);
                     parts.push(InterpPart::ArrayInterp(Box::new(expr)));
                 }
                 Token::InterpScalarChainStart(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
                     let cm = self.lexer.take_interp_case_mod();
-                    let initial = Expr { kind: ExprKind::ScalarVar(name), span };
+                    let initial = Expr::new(ExprKind::ScalarVar(name), span);
                     let after_subscripts = self.maybe_postfix_subscript(initial)?;
                     let expr = self.parse_expr_continuation(after_subscripts, PREC_LOW)?;
                     self.expect_token(&Token::InterpChainEnd)?;
@@ -3285,7 +3302,7 @@ impl Parser {
                     let span = self.peek_span();
                     self.next_token()?;
                     let cm = self.lexer.take_interp_case_mod();
-                    let recv = Expr { kind: ExprKind::ArrayVar(name), span };
+                    let recv = Expr::new(ExprKind::ArrayVar(name), span);
                     let expr = if self.eat(&Token::LeftBracket)? {
                         let mut indices = Vec::new();
                         while !self.at(&Token::RightBracket)? && !self.at_eof()? {
@@ -3296,7 +3313,7 @@ impl Parser {
                         }
                         let end = self.peek_span();
                         self.expect_token(&Token::RightBracket)?;
-                        Expr { span: span.merge(end), kind: ExprKind::ArraySlice(Box::new(recv), indices) }
+                        Expr::new(ExprKind::ArraySlice(Box::new(recv), indices), span.merge(end))
                     } else if self.eat(&Token::LeftBrace)? {
                         let mut keys = Vec::new();
                         while !self.at(&Token::RightBrace)? && !self.at_eof()? {
@@ -3307,7 +3324,7 @@ impl Parser {
                         }
                         let end = self.peek_span();
                         self.expect_token(&Token::RightBrace)?;
-                        Expr { span: span.merge(end), kind: ExprKind::HashSlice(Box::new(recv), keys) }
+                        Expr::new(ExprKind::HashSlice(Box::new(recv), keys), span.merge(end))
                     } else {
                         return Err(ParseError::new("expected [ or { after @name in string", self.peek_span()));
                     };
@@ -3459,13 +3476,15 @@ impl Parser {
                 if !Self::is_valid_lvalue(&left) {
                     return Err(ParseError::new("invalid operand for postfix ++", left.span));
                 }
-                Ok(Expr { span: left.span.merge(op_spanned.span), kind: ExprKind::PostfixOp(PostfixOp::Inc, Box::new(left)) })
+                let span = left.span.merge(op_spanned.span);
+                Ok(Expr::postfix(PostfixOp::Inc, left, span))
             }
             Token::MinusMinus => {
                 if !Self::is_valid_lvalue(&left) {
                     return Err(ParseError::new("invalid operand for postfix --", left.span));
                 }
-                Ok(Expr { span: left.span.merge(op_spanned.span), kind: ExprKind::PostfixOp(PostfixOp::Dec, Box::new(left)) })
+                let span = left.span.merge(op_spanned.span);
+                Ok(Expr::postfix(PostfixOp::Dec, left, span))
             }
 
             // Ternary
@@ -3473,7 +3492,8 @@ impl Parser {
                 let then_expr = self.parse_expr(PREC_LOW)?;
                 self.expect_token(&Token::Colon)?;
                 let else_expr = self.parse_expr(right_prec)?;
-                Ok(Expr { span: left.span.merge(else_expr.span), kind: ExprKind::Ternary(Box::new(left), Box::new(then_expr), Box::new(else_expr)) })
+                let span = left.span.merge(else_expr.span);
+                Ok(Expr::ternary(left, then_expr, else_expr, span))
             }
 
             // Arrow
@@ -3489,7 +3509,8 @@ impl Parser {
                     return Err(ParseError::new("invalid assignment target", left.span));
                 }
                 let right = self.parse_expr(right_prec)?;
-                Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::Assign(op, Box::new(left), Box::new(right)) })
+                let span = left.span.merge(right.span);
+                Ok(Expr::assign(op, left, right, span))
             }
 
             // Comma / fat comma — build a list
@@ -3513,19 +3534,21 @@ impl Parser {
                     (Some(f), Some(l)) => f.span.merge(l.span),
                     _ => Span::new(0, 0),
                 };
-                Ok(Expr { kind: ExprKind::List(items), span })
+                Ok(Expr::new(ExprKind::List(items), span))
             }
 
             // Range — non-associative, reject chaining.
             Token::DotDot => {
                 let right = self.parse_expr(right_prec)?;
                 self.reject_non_assoc_chaining(info, &right)?;
-                Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::Range(Box::new(left), Box::new(right)) })
+                let span = left.span.merge(right.span);
+                Ok(Expr::range(left, right, span))
             }
             Token::DotDotDot => {
                 let right = self.parse_expr(right_prec)?;
                 self.reject_non_assoc_chaining(info, &right)?;
-                Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::FlipFlop(Box::new(left), Box::new(right)) })
+                let span = left.span.merge(right.span);
+                Ok(Expr::flipflop(left, right, span))
             }
 
             // Binary operators
@@ -3561,19 +3584,24 @@ impl Parser {
                                     return Err(ParseError::new("non-associative operator cannot be chained", operands.last().map_or(start_span, |e| e.span)));
                                 }
                                 let end_span = operands.last().map_or(start_span, |e| e.span);
-                                return Ok(Expr { span: start_span.merge(end_span), kind: ExprKind::ChainedCmp(ops, operands) });
+                                return Ok(Expr::new(ExprKind::ChainedCmp(ops, operands), start_span.merge(end_span)));
                             } else {
                                 // Non-chainable operator at same precedence (e.g. `$a == $b <=> $c`).
                                 return Err(ParseError::new("non-associative operator cannot be chained", right.span));
                             }
                         }
-                        Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
+                        let span = left.span.merge(right.span);
+                        Ok(Expr::binop(binop, left, right, span))
                     }
                     Assoc::Non => {
                         self.reject_non_assoc_chaining(info, &right)?;
-                        Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) })
+                        let span = left.span.merge(right.span);
+                        Ok(Expr::binop(binop, left, right, span))
                     }
-                    _ => Ok(Expr { span: left.span.merge(right.span), kind: ExprKind::BinOp(binop, Box::new(left), Box::new(right)) }),
+                    _ => {
+                        let span = left.span.merge(right.span);
+                        Ok(Expr::binop(binop, left, right, span))
+                    }
                 }
             }
         }
@@ -3613,10 +3641,12 @@ impl Parser {
                 }
                 let end = self.peek_span();
                 self.expect_token(&Token::RightParen)?;
-                return Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), name, args) });
+                let span = left.span.merge(end);
+                return Ok(Expr::method_call(left, name, args, span));
             } else {
                 // Bare method call with no parens
-                return Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::MethodCall(Box::new(left), name, vec![]) });
+                let span = left.span.merge(self.peek_span());
+                return Ok(Expr::method_call(left, name, vec![], span));
             }
         }
         match self.peek_token().clone() {
@@ -3625,7 +3655,8 @@ impl Parser {
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBracket)?;
-                let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArrayElem(Box::new(idx))) };
+                let span = left.span.merge(end);
+                let expr = Expr::arrow_deref(left, ArrowTarget::array_elem(idx), span);
 
                 // Handle chained subscripts: $ref->[0][1], $ref->[0]{key}
                 self.maybe_postfix_subscript(expr)
@@ -3635,7 +3666,8 @@ impl Parser {
                 let key = self.parse_hash_subscript_key()?;
                 let end = self.peek_span();
                 self.expect_token(&Token::RightBrace)?;
-                let expr = Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::HashElem(Box::new(key))) };
+                let span = left.span.merge(end);
+                let expr = Expr::arrow_deref(left, ArrowTarget::hash_elem(key), span);
 
                 // Handle chained subscripts: $ref->{a}{b}, $ref->{a}[0]
                 self.maybe_postfix_subscript(expr)
@@ -3652,14 +3684,15 @@ impl Parser {
                 }
                 let end = self.peek_span();
                 self.expect_token(&Token::RightParen)?;
-                Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), String::new(), args) })
+                let span = left.span.merge(end);
+                Ok(Expr::method_call(left, String::new(), args, span))
             }
 
             // Dynamic method dispatch: ->$method or ->$method(args)
             Token::ScalarVar(var_name) => {
                 let var_span = self.peek_span();
                 self.next_token()?;
-                let method_expr = Expr { kind: ExprKind::ScalarVar(var_name), span: var_span };
+                let method_expr = Expr::new(ExprKind::ScalarVar(var_name), var_span);
                 if self.at(&Token::LeftParen)? {
                     self.next_token()?;
                     let mut args = Vec::new();
@@ -3671,12 +3704,11 @@ impl Parser {
                     }
                     let end = self.peek_span();
                     self.expect_token(&Token::RightParen)?;
-                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DynMethod(Box::new(method_expr), args)) })
+                    let span = left.span.merge(end);
+                    Ok(Expr::arrow_deref(left, ArrowTarget::dyn_method(method_expr, args), span))
                 } else {
-                    Ok(Expr {
-                        span: left.span.merge(var_span),
-                        kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DynMethod(Box::new(method_expr), vec![])),
-                    })
+                    let span = left.span.merge(var_span);
+                    Ok(Expr::arrow_deref(left, ArrowTarget::dyn_method(method_expr, vec![]), span))
                 }
             }
 
@@ -3688,19 +3720,22 @@ impl Parser {
             Token::At => {
                 self.next_token()?;
                 if self.eat(&Token::Star)? {
-                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefArray) })
+                    let span = left.span.merge(self.peek_span());
+                    Ok(Expr::arrow_deref(left, ArrowTarget::DerefArray, span))
                 } else if self.at(&Token::LeftBracket)? {
                     self.next_token()?;
                     let idx = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBracket)?;
-                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArraySliceIndices(Box::new(idx))) })
+                    let span = left.span.merge(end);
+                    Ok(Expr::arrow_deref(left, ArrowTarget::array_slice_indices(idx), span))
                 } else if self.at(&Token::LeftBrace)? {
                     self.next_token()?;
                     let key = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
-                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::ArraySliceKeys(Box::new(key))) })
+                    let span = left.span.merge(end);
+                    Ok(Expr::arrow_deref(left, ArrowTarget::array_slice_keys(key), span))
                 } else {
                     Err(ParseError::new("expected *, [indices], or {keys} after ->@", self.peek_span()))
                 }
@@ -3711,9 +3746,11 @@ impl Parser {
                 // `->$#*` — postderef last-index.  The lexer would otherwise tokenize the `#` as a comment start, so we
                 // peek+consume the two raw bytes here before the next token is lexed.
                 if self.lexer.try_consume_hash_star() {
-                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::LastIndex) })
+                    let span = left.span.merge(self.peek_span());
+                    Ok(Expr::arrow_deref(left, ArrowTarget::LastIndex, span))
                 } else if self.eat(&Token::Star)? {
-                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefScalar) })
+                    let span = left.span.merge(self.peek_span());
+                    Ok(Expr::arrow_deref(left, ArrowTarget::DerefScalar, span))
                 } else {
                     Err(ParseError::new("expected * or #* after ->$", self.peek_span()))
                 }
@@ -3721,19 +3758,22 @@ impl Parser {
             Token::Percent => {
                 self.next_token()?;
                 if self.eat(&Token::Star)? {
-                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefHash) })
+                    let span = left.span.merge(self.peek_span());
+                    Ok(Expr::arrow_deref(left, ArrowTarget::DerefHash, span))
                 } else if self.at(&Token::LeftBracket)? {
                     self.next_token()?;
                     let idx = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBracket)?;
-                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::KvSliceIndices(Box::new(idx))) })
+                    let span = left.span.merge(end);
+                    Ok(Expr::arrow_deref(left, ArrowTarget::kv_slice_indices(idx), span))
                 } else if self.at(&Token::LeftBrace)? {
                     self.next_token()?;
                     let key = self.parse_expr(PREC_LOW)?;
                     let end = self.peek_span();
                     self.expect_token(&Token::RightBrace)?;
-                    Ok(Expr { span: left.span.merge(end), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::KvSliceKeys(Box::new(key))) })
+                    let span = left.span.merge(end);
+                    Ok(Expr::arrow_deref(left, ArrowTarget::kv_slice_keys(key), span))
                 } else {
                     Err(ParseError::new("expected *, [indices], or {keys} after ->%", self.peek_span()))
                 }
@@ -3745,7 +3785,8 @@ impl Parser {
             Token::BitAnd => {
                 self.next_token()?;
                 if self.eat(&Token::Star)? {
-                    Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefCode) })
+                    let span = left.span.merge(self.peek_span());
+                    Ok(Expr::arrow_deref(left, ArrowTarget::DerefCode, span))
                 } else {
                     // Lexical method: ->&name or ->&name(args)
                     let method_name = match self.peek_token().clone() {
@@ -3766,9 +3807,11 @@ impl Parser {
                         }
                         let end = self.peek_span();
                         self.expect_token(&Token::RightParen)?;
-                        Ok(Expr { span: left.span.merge(end), kind: ExprKind::MethodCall(Box::new(left), name, args) })
+                        let span = left.span.merge(end);
+                        Ok(Expr::method_call(left, name, args, span))
                     } else {
-                        Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::MethodCall(Box::new(left), name, vec![]) })
+                        let span = left.span.merge(self.peek_span());
+                        Ok(Expr::method_call(left, name, vec![], span))
                     }
                 }
             }
@@ -3776,7 +3819,8 @@ impl Parser {
             // `->**` — glob deref.  Two consecutive `*`s; the lexer emits `Power` (`**`) for that pair.
             Token::Power => {
                 self.next_token()?;
-                Ok(Expr { span: left.span.merge(self.peek_span()), kind: ExprKind::ArrowDeref(Box::new(left), ArrowTarget::DerefGlob) })
+                let span = left.span.merge(self.peek_span());
+                Ok(Expr::arrow_deref(left, ArrowTarget::DerefGlob, span))
             }
             other => Err(ParseError::new(format!("expected method name or subscript after ->, got {other:?}"), self.peek_span())),
         }
@@ -3946,18 +3990,18 @@ fn apply_case_mod_wrap(mut expr: Expr, flags: CaseMod) -> Expr {
 
     // One-shot overrides persistent case mode.
     if flags.contains(CaseMod::LCFIRST) {
-        expr = Expr { kind: ExprKind::FuncCall("CORE::lcfirst".into(), vec![expr]), span };
+        expr = Expr::new(ExprKind::FuncCall("CORE::lcfirst".into(), vec![expr]), span);
     } else if flags.contains(CaseMod::UCFIRST) {
-        expr = Expr { kind: ExprKind::FuncCall("CORE::ucfirst".into(), vec![expr]), span };
+        expr = Expr::new(ExprKind::FuncCall("CORE::ucfirst".into(), vec![expr]), span);
     } else if flags.contains(CaseMod::UPPER) {
-        expr = Expr { kind: ExprKind::FuncCall("CORE::uc".into(), vec![expr]), span };
+        expr = Expr::new(ExprKind::FuncCall("CORE::uc".into(), vec![expr]), span);
     } else if flags.contains(CaseMod::LOWER) || flags.contains(CaseMod::FOLD) {
-        expr = Expr { kind: ExprKind::FuncCall("CORE::lc".into(), vec![expr]), span };
+        expr = Expr::new(ExprKind::FuncCall("CORE::lc".into(), vec![expr]), span);
     }
 
     // Quotemeta wraps outermost (applied last, after case).
     if flags.contains(CaseMod::QUOTEMETA) {
-        expr = Expr { kind: ExprKind::FuncCall("CORE::quotemeta".into(), vec![expr]), span };
+        expr = Expr::new(ExprKind::FuncCall("CORE::quotemeta".into(), vec![expr]), span);
     }
 
     expr
@@ -3985,5 +4029,5 @@ fn merge_interp_parts(parts: Vec<InterpPart>) -> Vec<InterpPart> {
 
 /// Convert an `Interpolated` into an `Expr`.  Returns `StringLit` for plain strings, `InterpolatedString` otherwise.
 fn interp_to_expr(interp: Interpolated, span: Span) -> Expr {
-    if let Some(s) = interp.as_plain_string() { Expr { kind: ExprKind::StringLit(s), span } } else { Expr { kind: ExprKind::InterpolatedString(interp), span } }
+    if let Some(s) = interp.as_plain_string() { Expr::new(ExprKind::StringLit(s), span) } else { Expr::new(ExprKind::InterpolatedString(interp), span) }
 }

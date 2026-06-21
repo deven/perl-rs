@@ -103,11 +103,152 @@ pub enum StmtKind {
     MethodDecl(SubDecl),
 }
 
+/// Evaluation context — scalar, list, or void (§6.1.5).
+///
+/// This is the *evaluation* context an expression is in, distinct from its grammatical category.  It is stamped onto
+/// AST nodes after parsing via [`Expr::save_context`]; see the module docs and design §6.1.5 for the full model.
+///
+/// - `Scalar` — the expression produces a single value (the ambient default for most positions).
+/// - `List`   — the expression is flattened into a list (a genuine stack operation; marked by an interposed list build).
+/// - `Void`   — the expression's value is discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Context {
+    Scalar,
+    List,
+    Void,
+}
+
 /// An expression.
 #[derive(Clone, Debug)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
+
+    /// Evaluation context this expression is in, or `None` until stamped.
+    ///
+    /// Born `None`.  Resolved by [`save_context`](Expr::save_context), called by whoever first knows the context: a
+    /// node's own constructor (for context-independent children), a positional parsing routine (for grammar positions
+    /// that fix the context — statement/clause parsers), or the parent node's own `save_context` (for deferred,
+    /// context-dependent children).  Context is never threaded through the parser as a parameter.
+    pub ctx: Option<Context>,
+}
+
+impl Expr {
+    /// Construct an expression with no context yet stamped (`ctx: None`).
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Expr { kind, span, ctx: None }
+    }
+
+    /// Construct an expression with its context already known (context-independent nodes set this at construction).
+    pub fn with_context(kind: ExprKind, span: Span, ctx: Context) -> Self {
+        Expr { kind, span, ctx: Some(ctx) }
+    }
+
+    // ── Operand-bearing constructors ──────────────────────────────────────────────────────────────────────────────
+    //
+    // These box their `Expr` operands internally so call sites never write `Box::new`.  The node's `span` is computed
+    // by the caller and passed last (uniformly across all constructors — no constructor computes a span merge itself).
+    // Passing operands by value also makes these the seam where the context-stamping ownership contract (§6.1.5) is
+    // applied to context-independent children.
+
+    /// `left OP right` — binary operator.
+    pub fn binop(op: BinOp, left: Expr, right: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::BinOp(op, Box::new(left), Box::new(right)), span)
+    }
+
+    /// `left = right`, `left += right`, etc. — assignment.
+    pub fn assign(op: AssignOp, left: Expr, right: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::Assign(op, Box::new(left), Box::new(right)), span)
+    }
+
+    /// `cond ? then_expr : else_expr` — ternary conditional.
+    pub fn ternary(cond: Expr, then_expr: Expr, else_expr: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::Ternary(Box::new(cond), Box::new(then_expr), Box::new(else_expr)), span)
+    }
+
+    /// `left .. right` — range.
+    pub fn range(left: Expr, right: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::Range(Box::new(left), Box::new(right)), span)
+    }
+
+    /// `left ... right` — flip-flop.
+    pub fn flipflop(left: Expr, right: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::FlipFlop(Box::new(left), Box::new(right)), span)
+    }
+
+    /// `$base[index]` — array element.
+    pub fn array_elem(base: Expr, index: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::ArrayElem(Box::new(base), Box::new(index)), span)
+    }
+
+    /// `$base{key}` — hash element.
+    pub fn hash_elem(base: Expr, key: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::HashElem(Box::new(base), Box::new(key)), span)
+    }
+
+    /// `OP operand` — prefix unary operator.
+    pub fn unary(op: UnaryOp, operand: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::UnaryOp(op, Box::new(operand)), span)
+    }
+
+    /// `operand++`, `operand--` — postfix operator.
+    pub fn postfix(op: PostfixOp, operand: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::PostfixOp(op, Box::new(operand)), span)
+    }
+
+    /// `$$ref`, `@$ref`, `%$ref`, etc. — dereference.
+    pub fn deref(sigil: Sigil, operand: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::Deref(sigil, Box::new(operand)), span)
+    }
+
+    /// `\operand` — reference.
+    pub fn reference(operand: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::Ref(Box::new(operand)), span)
+    }
+
+    /// `local operand` — localize an lvalue.
+    pub fn local(operand: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::Local(Box::new(operand)), span)
+    }
+
+    /// `$invocant->name(args)` — method call.
+    pub fn method_call(invocant: Expr, name: String, args: Vec<Expr>, span: Span) -> Expr {
+        Expr::new(ExprKind::MethodCall(Box::new(invocant), name, args), span)
+    }
+
+    /// `$base->TARGET` — arrow dereference/postfix.
+    pub fn arrow_deref(base: Expr, target: ArrowTarget, span: Span) -> Expr {
+        Expr::new(ExprKind::ArrowDeref(Box::new(base), target), span)
+    }
+
+    /// Postfix `EXPR if/unless/while/until/for COND` — statement modifier in expression form.
+    pub fn postfix_control(kind: PostfixKind, expr: Expr, cond: Expr, span: Span) -> Expr {
+        Expr::new(ExprKind::PostfixControl(kind, Box::new(expr), Box::new(cond)), span)
+    }
+
+    // ── Block-bearing constructors ────────────────────────────────────────────────────────────────────────────────
+    //
+    // Take a `Block`; the caller computes and passes the `span` last, as with the operand-bearing constructors.
+
+    /// `do { ... }`.
+    pub fn do_block(block: Block, span: Span) -> Expr {
+        Expr::new(ExprKind::DoBlock(block), span)
+    }
+
+    /// `eval { ... }`.
+    pub fn eval_block(block: Block, span: Span) -> Expr {
+        Expr::new(ExprKind::EvalBlock(block), span)
+    }
+
+    /// `sub { ... }` — anonymous sub.
+    pub fn anon_sub(proto: Option<String>, attrs: Vec<Attribute>, sig: Option<Signature>, block: Block, span: Span) -> Expr {
+        Expr::new(ExprKind::AnonSub(proto, attrs, sig, block), span)
+    }
+
+    /// `method { ... }` — anonymous method (5.38+).
+    pub fn anon_method(attrs: Vec<Attribute>, sig: Option<Signature>, block: Block, span: Span) -> Expr {
+        Expr::new(ExprKind::AnonMethod(attrs, sig, block), span)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -531,7 +672,47 @@ pub enum ArrowTarget {
     LastIndex,
 }
 
-/// Sigil for dereference operations.  Scope of a variable declaration in expression context.
+impl ArrowTarget {
+    // Constructors for the boxed-payload variants: each boxes its `Expr` payload internally so call sites never write
+    // `Box::new`.  Nullary variants (`DerefArray`, `DerefHash`, etc.) carry no payload and are used directly.
+
+    /// `$base->[index]` — arrow array element.
+    pub fn array_elem(index: Expr) -> ArrowTarget {
+        ArrowTarget::ArrayElem(Box::new(index))
+    }
+
+    /// `$base->{key}` — arrow hash element.
+    pub fn hash_elem(key: Expr) -> ArrowTarget {
+        ArrowTarget::HashElem(Box::new(key))
+    }
+
+    /// `$base->@[indices]` — arrow array slice by positions.
+    pub fn array_slice_indices(indices: Expr) -> ArrowTarget {
+        ArrowTarget::ArraySliceIndices(Box::new(indices))
+    }
+
+    /// `$base->@{keys}` — arrow slice of a hash returning values as an array.
+    pub fn array_slice_keys(keys: Expr) -> ArrowTarget {
+        ArrowTarget::ArraySliceKeys(Box::new(keys))
+    }
+
+    /// `$base->%[indices]` — arrow key/value pairs from an array.
+    pub fn kv_slice_indices(indices: Expr) -> ArrowTarget {
+        ArrowTarget::KvSliceIndices(Box::new(indices))
+    }
+
+    /// `$base->%{keys}` — arrow key/value pairs from a hash.
+    pub fn kv_slice_keys(keys: Expr) -> ArrowTarget {
+        ArrowTarget::KvSliceKeys(Box::new(keys))
+    }
+
+    /// `$obj->$method(args)` — dynamic method dispatch.
+    pub fn dyn_method(method: Expr, args: Vec<Expr>) -> ArrowTarget {
+        ArrowTarget::DynMethod(Box::new(method), args)
+    }
+}
+
+/// Scope of a variable declaration in expression context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclScope {
     My,
