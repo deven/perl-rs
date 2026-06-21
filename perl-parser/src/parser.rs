@@ -1952,7 +1952,7 @@ impl Parser {
             Token::Keyword(Keyword::Return) => {
                 self.next_token()?;
                 if self.at(&Token::Semi)? || self.at(&Token::RightBrace)? || self.at_eof()? {
-                    Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::FuncCall("CORE::return".into(), vec![]), span))))
+                    Ok(Some(PrefixResult::Leaf(Expr::new(ExprKind::Return(None), span))))
                 } else {
                     Ok(Some(PrefixResult::Frame(ExprFrame::ReturnExpr { span, min_prec: outer_prec }, PREC_COMMA)))
                 }
@@ -2079,7 +2079,7 @@ impl Parser {
             }
             ExprFrame::ReturnExpr { span, min_prec } => {
                 let end = span.merge(operand.span);
-                Ok(FrameResult::Done(Expr::new(ExprKind::FuncCall("CORE::return".into(), vec![operand]), end), min_prec))
+                Ok(FrameResult::Done(Expr::new(ExprKind::Return(Some(Box::new(operand))), end), min_prec))
             }
             ExprFrame::GotoExpr { span, min_prec } => {
                 let end = span.merge(operand.span);

@@ -552,6 +552,15 @@ impl Expr {
             // ── do/eval EXPR: the operand is a scalar (a filename for `do`, a string for `eval`). ──
             ExprKind::DoExpr(operand) | ExprKind::EvalExpr(operand) => queue.push((operand, Context::Scalar)),
 
+            // ── return: the operand forwards to the *caller* and is therefore in the caller's runtime context —
+            // intrinsically `Runtime`, independent of this node's own (vestigial) context, even when nested in an
+            // operator (`5 + return $x` evaluates `$x` in the caller's context, not `+`'s scalar context). ──
+            ExprKind::Return(operand) => {
+                if let Some(e) = operand {
+                    queue.push((e, Context::Runtime));
+                }
+            }
+
             // ── Comma: the C-comma vs list-construction distinction.  In list context every operand is list; in
             // scalar/void/boolean context all but the last operand are void and the last inherits our context. ──
             ExprKind::Comma(items) => {
@@ -948,6 +957,13 @@ pub enum ExprKind {
 
     /// `eval EXPR`.
     EvalExpr(Box<Expr>),
+
+    /// `return` / `return EXPR` — a diverging expression: it parses in expression position (with precedence, so
+    /// `5 + return 6` is valid and returns 6) but never yields a value to its syntactic context — it unwinds to the
+    /// caller.  The operand (if present) is evaluated in the *caller's* context (`Context::Runtime`), independent of
+    /// where the `return` sits, since it forwards to the call boundary.  The node's own context is therefore vestigial
+    /// (nothing consumes it).
+    Return(Option<Box<Expr>>),
 
     // ── Comma sequence ────────────────────────────────────────
     /// Expressions joined by comma (or fat-comma) operators.  This is the

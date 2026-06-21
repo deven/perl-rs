@@ -1763,11 +1763,10 @@ fn parse_eval_expr() {
 fn parse_return_value() {
     let e = parse_expr_str("return 42;");
     match &e.kind {
-        ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "CORE::return");
-            assert_eq!(args.len(), 1);
+        ExprKind::Return(Some(operand)) => {
+            assert!(matches!(operand.kind, ExprKind::IntLit(42)), "expected return 42, got {:?}", operand.kind);
         }
-        other => panic!("expected return call, got {other:?}"),
+        other => panic!("expected return with value, got {other:?}"),
     }
 }
 
@@ -1775,10 +1774,7 @@ fn parse_return_value() {
 fn parse_return_bare() {
     let e = parse_expr_str("return;");
     match &e.kind {
-        ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "CORE::return");
-            assert_eq!(args.len(), 0);
-        }
+        ExprKind::Return(None) => {}
         other => panic!("expected bare return, got {other:?}"),
     }
 }
@@ -9720,11 +9716,10 @@ fn iter_do_expr_vs_block() {
 fn iter_return_with_value() {
     let e = parse_expr_str("return 42;");
     match &e.kind {
-        ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "CORE::return");
-            assert_eq!(args.len(), 1);
+        ExprKind::Return(Some(operand)) => {
+            assert!(matches!(operand.kind, ExprKind::IntLit(42)), "expected return 42, got {:?}", operand.kind);
         }
-        other => panic!("expected FuncCall(return), got {other:?}"),
+        other => panic!("expected Return(Some), got {other:?}"),
     }
 }
 
@@ -9732,11 +9727,8 @@ fn iter_return_with_value() {
 fn iter_return_bare() {
     let e = parse_expr_str("return;");
     match &e.kind {
-        ExprKind::FuncCall(name, args) => {
-            assert_eq!(name, "CORE::return");
-            assert!(args.is_empty());
-        }
-        other => panic!("expected FuncCall(return), got {other:?}"),
+        ExprKind::Return(None) => {}
+        other => panic!("expected Return(None), got {other:?}"),
     }
 }
 
@@ -16484,5 +16476,60 @@ fn ctx_do_block_tail_inherits_context() {
             other => panic!("expected DoBlock, got {other:?}"),
         },
         other => panic!("expected ForEach, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_return_operand_is_runtime() {
+    // `return EXPR` evaluates its operand in the caller's context (Runtime), independent of the node's own position.
+    let stmts = parse_stmts("sub f { return $x }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::Return(Some(operand)) => {
+                    assert_eq!(operand.ctx, Some(Context::Runtime), "return operand is in the caller's runtime context");
+                }
+                other => panic!("expected Return(Some), got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_return_operand_runtime_even_when_nested() {
+    // `5 + return $x`: `return` is a diverging expression nested as `+`'s right operand, but its operand still inherits
+    // the caller's runtime context — the enclosing `+`'s scalar context never reaches it (the `+` never evaluates,
+    // since `return` unwinds first).
+    let stmts = parse_stmts("sub f { 5 + return $x }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                // The tail expression is `5 + (return $x)` — a BinOp(Add) whose right operand is the Return.
+                ExprKind::BinOp(BinOp::Add, _, rhs) => match &rhs.kind {
+                    ExprKind::Return(Some(operand)) => {
+                        assert_eq!(operand.ctx, Some(Context::Runtime), "nested return operand is still runtime");
+                    }
+                    other => panic!("expected Return as + right operand, got {other:?}"),
+                },
+                other => panic!("expected BinOp(Add), got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctx_return_bare_has_no_operand() {
+    // Bare `return` has no operand to stamp.
+    let stmts = parse_stmts("sub f { return }");
+    match &stmts[0].kind {
+        StmtKind::SubDecl(s) => match &s.body.statements[0].kind {
+            StmtKind::Expr(e) => assert!(matches!(e.kind, ExprKind::Return(None)), "expected Return(None), got {:?}", e.kind),
+            other => panic!("expected Expr, got {other:?}"),
+        },
+        other => panic!("expected SubDecl, got {other:?}"),
     }
 }
