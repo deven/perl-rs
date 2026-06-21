@@ -425,6 +425,19 @@ pub enum ExprKind {
     /// node's identity.
     Comma(Vec<Expr>),
 
+    // ── Empty list ────────────────────────────────────────────
+    /// The empty list `()`.  A dedicated node, not `Comma([])` (there is no
+    /// comma present) — mirroring Perl's `newNULLLIST`.  In scalar context
+    /// it is `undef`; in list context it is the zero-element list.  It is a
+    /// valid assignment lvalue (`() = LIST` discards the list; `my $n = ()
+    /// = LIST` is the count-of idiom), and will be reused as the operand of
+    /// an empty-list slice `()[...]` once list slices are modelled.  As a
+    /// comma operand it is *kept*, not dropped — `scalar(1, 2, ())` is
+    /// `undef` because the last C-comma operand is `()` — so the empty-list-
+    /// flattens behaviour of list context is a lowering concern, not a
+    /// parse-time drop.
+    EmptyList,
+
     // ── Parenthesized ─────────────────────────────────────────
     Paren(Box<Expr>),
 

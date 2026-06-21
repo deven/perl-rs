@@ -1725,7 +1725,7 @@ impl Parser {
                 self.next_token()?;
                 if self.at(&Token::RightParen)? {
                     self.next_token()?;
-                    let expr = Expr::new(ExprKind::Comma(vec![]), span);
+                    let expr = Expr::new(ExprKind::EmptyList, span);
                     return Ok(Some(PrefixResult::Leaf(self.maybe_postfix_subscript(expr)?)));
                 }
                 Ok(Some(PrefixResult::Frame(ExprFrame::Paren { span, min_prec: outer_prec }, PREC_LOW)))
@@ -3438,7 +3438,8 @@ impl Parser {
             ExprKind::Decl(_, _) => true,
             ExprKind::Paren(inner) => Self::is_valid_lvalue(inner),
             ExprKind::Comma(items) => items.iter().all(Self::is_valid_lvalue),
-            ExprKind::Undef => true, // (undef, $x) = (1, 2)
+            ExprKind::Undef => true,     // (undef, $x) = (1, 2)
+            ExprKind::EmptyList => true, // () = (1, 2, 3); my $n = () = LIST
             _ => false,
         }
     }

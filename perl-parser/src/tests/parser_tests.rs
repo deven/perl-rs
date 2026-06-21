@@ -6809,6 +6809,83 @@ fn pratt_deref_block_with_infix_inside() {
 }
 
 #[test]
+fn parse_empty_list_bare() {
+    // Bare `()` is the dedicated EmptyList node, not Comma([]).
+    let e = parse_expr_str("();");
+    assert!(matches!(e.kind, ExprKind::EmptyList), "expected EmptyList, got {:?}", e.kind);
+}
+
+#[test]
+fn parse_empty_list_in_parens_is_not_comma() {
+    // `()` must not be represented as an empty comma sequence.
+    let e = parse_expr_str("();");
+    assert!(!matches!(e.kind, ExprKind::Comma(_)), "() must be EmptyList, never Comma([]), got {:?}", e.kind);
+}
+
+#[test]
+fn parse_empty_list_as_assignment_lhs() {
+    // `() = (1, 2, 3)` is a legal list assignment (the RHS is discarded); the
+    // LHS is a valid lvalue.  Verified against perl: parses and runs.
+    let e = parse_expr_str("() = (1, 2, 3);");
+    match &e.kind {
+        ExprKind::Assign(_, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::EmptyList), "expected EmptyList LHS, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Assign with EmptyList LHS, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_empty_list_count_of_idiom() {
+    // `my $n = () = (1, 2, 3, 4)` — the count-of idiom.  The inner `() = LIST`
+    // is a list assignment whose scalar value is the RHS element count (4).
+    // Here we only assert it parses: a scalar assignment of an (EmptyList) list
+    // assignment.  Verified against perl: $n == 4.
+    let e = parse_expr_str("my $n = () = (1, 2, 3, 4);");
+    match &e.kind {
+        // Outer: scalar assignment `my $n = (...)`.
+        ExprKind::Assign(_, _, rhs) => match &rhs.kind {
+            // Inner: list assignment `() = (...)`.
+            ExprKind::Assign(_, inner_lhs, _) => {
+                assert!(matches!(inner_lhs.kind, ExprKind::EmptyList), "expected EmptyList LHS of inner assignment, got {:?}", inner_lhs.kind);
+            }
+            other => panic!("expected inner Assign (the () = LIST), got {other:?}"),
+        },
+        other => panic!("expected outer Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_empty_list_kept_as_comma_operand() {
+    // `()` is NOT dropped as a comma operand: `(1, 2, ())` keeps the trailing
+    // EmptyList, because scalar(1, 2, ()) is undef (the last C-comma operand is
+    // `()`).  The empty-list-flattens behaviour of list context is a lowering
+    // concern, not a parse-time structural drop.  Verified against perl.
+    let e = parse_expr_str("(1, 2, ());");
+    match &e.kind {
+        ExprKind::Comma(items) => {
+            assert_eq!(items.len(), 3, "expected 3 operands incl. trailing EmptyList, got {:?}", items);
+            assert!(matches!(items[2].kind, ExprKind::EmptyList), "expected EmptyList as last operand, got {:?}", items[2].kind);
+        }
+        other => panic!("expected Comma, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_empty_list_as_function_arg() {
+    // `foo(())` — an empty list passed as the (sole) argument expression.  The
+    // inner `()` is EmptyList.
+    let e = parse_expr_str("foo(());");
+    match &e.kind {
+        ExprKind::FuncCall(_, args) => {
+            assert_eq!(args.len(), 1, "expected one arg expression, got {:?}", args);
+            assert!(matches!(args[0].kind, ExprKind::EmptyList), "expected EmptyList arg, got {:?}", args[0].kind);
+        }
+        other => panic!("expected FuncCall, got {other:?}"),
+    }
+}
+
+#[test]
 #[ignore = "comma handler doesn't absorb consecutive commas — needs parse_term → Option<Expr> refactor"]
 fn pratt_consecutive_commas_in_list() {
     // Perl silently drops consecutive commas: `(1, 3, , , 5)` → `(1, 3, 5)`.
