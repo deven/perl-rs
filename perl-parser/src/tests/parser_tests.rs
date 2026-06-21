@@ -881,7 +881,7 @@ fn interp_array_slice_range() {
         ExprKind::ArraySlice(recv, indices) => {
             assert!(matches!(recv.kind, ExprKind::ArrayVar(ref n) if n == "a"));
             assert_eq!(indices.len(), 1);
-            assert!(matches!(indices[0].kind, ExprKind::Range(_, _)));
+            assert!(matches!(indices[0].kind, ExprKind::Range(_, _, _)));
         }
         other => panic!("expected ArraySlice, got {other:?}"),
     }
@@ -1079,7 +1079,7 @@ fn interp_array_chain_in_mid_string() {
         ExprKind::ArraySlice(recv, indices) => {
             assert!(matches!(recv.kind, ExprKind::ArrayVar(ref n) if n == "a"));
             assert_eq!(indices.len(), 1);
-            assert!(matches!(indices[0].kind, ExprKind::Range(_, _)));
+            assert!(matches!(indices[0].kind, ExprKind::Range(_, _, _)));
         }
         other => panic!("expected ArraySlice, got {other:?}"),
     }
@@ -5997,7 +5997,7 @@ fn prec_ternary_vs_range() {
     let e = parse_expr_str("1 .. 2 ? 3 : 4;");
     match &e.kind {
         ExprKind::Ternary(cond, _, _) => {
-            assert!(matches!(cond.kind, ExprKind::Range(_, _)), "expected Range as condition, got {:?}", cond.kind);
+            assert!(matches!(cond.kind, ExprKind::Range(_, _, _)), "expected Range as condition, got {:?}", cond.kind);
         }
         other => panic!("expected Ternary, got {other:?}"),
     }
@@ -6010,7 +6010,7 @@ fn prec_range_vs_or() {
     // `$a || $b .. $c` → Range(Or($a, $b), $c) — || binds tighter than range.
     let e = parse_expr_str("$a || $b .. $c;");
     match &e.kind {
-        ExprKind::Range(lhs, _) => {
+        ExprKind::Range(lhs, _, _) => {
             assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Or, _, _)), "expected Or on LHS of Range, got {:?}", lhs.kind);
         }
         other => panic!("expected Range, got {other:?}"),
@@ -7271,7 +7271,48 @@ fn parse_underscore_after_dot_x_bareword_is_error() {
 #[test]
 fn parse_range() {
     let e = parse_expr_str("1..10;");
-    assert!(matches!(e.kind, ExprKind::Range(_, _)));
+    assert!(matches!(e.kind, ExprKind::Range(_, _, _)));
+}
+
+#[test]
+fn parse_range_two_dots_kind() {
+    // `..` records RangeKind::TwoDots.
+    let e = parse_expr_str("1..10;");
+    match &e.kind {
+        ExprKind::Range(_, _, kind) => assert_eq!(*kind, RangeKind::TwoDots),
+        other => panic!("expected Range, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_range_three_dots_kind() {
+    // `...` is the same operator as `..`; it builds a Range node carrying
+    // RangeKind::ThreeDots.  Range-vs-flip-flop is context-determined at
+    // lowering — the node is Range either way.
+    let e = parse_expr_str("1...10;");
+    match &e.kind {
+        ExprKind::Range(_, _, kind) => assert_eq!(*kind, RangeKind::ThreeDots),
+        other => panic!("expected Range for `...`, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_range_kinds_differ_by_spelling_only() {
+    // `..` and `...` produce the same node kind (Range), differing only in the
+    // recorded RangeKind.
+    let two = parse_expr_str("$a..$b;");
+    let three = parse_expr_str("$a...$b;");
+    let k2 = match &two.kind {
+        ExprKind::Range(_, _, k) => *k,
+        other => panic!("expected Range, got {other:?}"),
+    };
+    let k3 = match &three.kind {
+        ExprKind::Range(_, _, k) => *k,
+        other => panic!("expected Range, got {other:?}"),
+    };
+    assert_eq!(k2, RangeKind::TwoDots);
+    assert_eq!(k3, RangeKind::ThreeDots);
+    assert_ne!(k2, k3);
 }
 
 #[test]
@@ -13013,9 +13054,7 @@ fn hard_block_vs_hash_in_map() {
         match &expr.kind {
             ExprKind::AnonHash(_) => true,
             ExprKind::AnonSub(_, _, _, body) => block_contains_anon_hash(body),
-            ExprKind::BinOp(_, l, r) | ExprKind::Assign(_, l, r) | ExprKind::Range(l, r) | ExprKind::FlipFlop(l, r) => {
-                expr_contains_anon_hash(l) || expr_contains_anon_hash(r)
-            }
+            ExprKind::BinOp(_, l, r) | ExprKind::Assign(_, l, r) | ExprKind::Range(l, r, _) => expr_contains_anon_hash(l) || expr_contains_anon_hash(r),
             ExprKind::UnaryOp(_, inner)
             | ExprKind::PostfixOp(_, inner)
             | ExprKind::Ref(inner)

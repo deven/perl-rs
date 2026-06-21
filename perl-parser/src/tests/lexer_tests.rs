@@ -1017,13 +1017,13 @@ fn lex_not_binding() {
 #[test]
 fn lex_dotdot() {
     let tokens = lex_all("1..10");
-    assert!(tokens.contains(&Token::DotDot));
+    assert!(tokens.contains(&Token::TwoDots));
 }
 
 #[test]
 fn lex_dotdotdot_as_yada() {
     let tokens = lex_all("...");
-    assert_eq!(tokens, vec![Token::DotDotDot]);
+    assert_eq!(tokens, vec![Token::ThreeDots]);
 }
 
 // ── Variable edge cases ───────────────────────────────────

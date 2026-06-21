@@ -146,8 +146,8 @@ pub enum Token {
     NotBinding, // !~
 
     // ── Operators — range ─────────────────────────────────────
-    DotDot,    // ..
-    DotDotDot, // ...
+    TwoDots,   // ..
+    ThreeDots, // ...
 
     // ── Operators — increment/decrement ───────────────────────
     PlusPlus,   // ++
@@ -494,8 +494,8 @@ impl std::fmt::Display for Token {
 
             // String
             Token::Dot => write!(f, "."),
-            Token::DotDot => write!(f, ".."),
-            Token::DotDotDot => write!(f, "..."),
+            Token::TwoDots => write!(f, ".."),
+            Token::ThreeDots => write!(f, "..."),
 
             // Comparison
             Token::NumEq => write!(f, "=="),

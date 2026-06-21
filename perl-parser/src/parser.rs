@@ -2395,7 +2395,7 @@ impl Parser {
             Token::Filetest(test_byte) => self.parse_filetest(test_byte, span),
 
             // Yada yada yada (...)
-            Token::DotDotDot => Ok(Expr::new(ExprKind::YadaYada, span)),
+            Token::ThreeDots => Ok(Expr::new(ExprKind::YadaYada, span)),
 
             // Readline / diamond: <STDIN>, <>, <$fh>, <*.txt>
             Token::Readline(content, safe) => Self::readline_expr(content, safe, span),
@@ -3402,7 +3402,7 @@ impl Parser {
             Token::Binding | Token::NotBinding => Some(OpInfo { prec: PREC_BINDING, assoc: Assoc::Left }),
             Token::Power => Some(OpInfo { prec: PREC_POW, assoc: Assoc::Right }),
             Token::Arrow => Some(OpInfo { prec: PREC_ARROW, assoc: Assoc::Left }),
-            Token::DotDot | Token::DotDotDot => Some(OpInfo { prec: PREC_RANGE, assoc: Assoc::Non }),
+            Token::TwoDots | Token::ThreeDots => Some(OpInfo { prec: PREC_RANGE, assoc: Assoc::Non }),
             Token::Question => Some(OpInfo { prec: PREC_TERNARY, assoc: Assoc::Right }),
             Token::Assign(_) => Some(OpInfo { prec: PREC_ASSIGN, assoc: Assoc::Right }),
             Token::Comma | Token::FatComma => Some(OpInfo { prec: PREC_COMMA, assoc: Assoc::Left }),
@@ -3538,18 +3538,20 @@ impl Parser {
                 Ok(Expr::new(ExprKind::Comma(items), span))
             }
 
-            // Range — non-associative, reject chaining.
-            Token::DotDot => {
+            // Range / flip-flop — non-associative, reject chaining.  `..` and
+            // `...` are the same operator; range-vs-flip-flop is determined by
+            // context at lowering.  We record only the spelling here.
+            Token::TwoDots => {
                 let right = self.parse_expr(right_prec)?;
                 self.reject_non_assoc_chaining(info, &right)?;
                 let span = left.span.merge(right.span);
-                Ok(Expr::range(left, right, span))
+                Ok(Expr::range(left, right, RangeKind::TwoDots, span))
             }
-            Token::DotDotDot => {
+            Token::ThreeDots => {
                 let right = self.parse_expr(right_prec)?;
                 self.reject_non_assoc_chaining(info, &right)?;
                 let span = left.span.merge(right.span);
-                Ok(Expr::flipflop(left, right, span))
+                Ok(Expr::range(left, right, RangeKind::ThreeDots, span))
             }
 
             // Binary operators

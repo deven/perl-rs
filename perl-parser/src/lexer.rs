@@ -3271,9 +3271,9 @@ impl Lexer {
                 self.skip(1);
                 if self.peek_byte(false) == Some(b'.') {
                     self.skip(1);
-                    Token::DotDotDot
+                    Token::ThreeDots
                 } else {
-                    Token::DotDot
+                    Token::TwoDots
                 }
             }
             Some(b'=') => {

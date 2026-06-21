@@ -118,6 +118,27 @@ pub enum Context {
     Void,
 }
 
+/// Which spelling of the range/flip-flop operator was written: `..` or `...`.
+///
+/// `..` and `...` are the *same* operator; whether a given occurrence behaves
+/// as a range or a flip-flop is determined by evaluation context (list context
+/// → range; scalar/boolean context → flip-flop), carried by the `ctx` tag and
+/// resolved at lowering — not by this field.
+///
+/// This field records only the syntactic spelling, which is **inert in range
+/// (list) context** (`3..6` and `3...6` produce the same list) and matters only
+/// in flip-flop (scalar/boolean) context, where it controls turn-off timing:
+/// `..` (`TwoDots`) may test the right operand and turn off on the *same*
+/// evaluation it turned on (awk-like); `...` (`ThreeDots`) defers testing the
+/// right operand until the *next* evaluation (sed-like).  See perlop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeKind {
+    /// `..`
+    TwoDots,
+    /// `...`
+    ThreeDots,
+}
+
 /// An expression.
 #[derive(Clone, Debug)]
 pub struct Expr {
@@ -166,14 +187,10 @@ impl Expr {
         Expr::new(ExprKind::Ternary(Box::new(cond), Box::new(then_expr), Box::new(else_expr)), span)
     }
 
-    /// `left .. right` — range.
-    pub fn range(left: Expr, right: Expr, span: Span) -> Expr {
-        Expr::new(ExprKind::Range(Box::new(left), Box::new(right)), span)
-    }
-
-    /// `left ... right` — flip-flop.
-    pub fn flipflop(left: Expr, right: Expr, span: Span) -> Expr {
-        Expr::new(ExprKind::FlipFlop(Box::new(left), Box::new(right)), span)
+    /// `left .. right` or `left ... right` — range/flip-flop (`kind` records
+    /// the spelling; range-vs-flip-flop is context-determined at lowering).
+    pub fn range(left: Expr, right: Expr, kind: RangeKind, span: Span) -> Expr {
+        Expr::new(ExprKind::Range(Box::new(left), Box::new(right), kind), span)
     }
 
     /// `$base[index]` — array element.
@@ -318,9 +335,12 @@ pub enum ExprKind {
     // ── Ternary ───────────────────────────────────────────────
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
 
-    // ── Range ─────────────────────────────────────────────────
-    Range(Box<Expr>, Box<Expr>),
-    FlipFlop(Box<Expr>, Box<Expr>),
+    // ── Range / flip-flop ─────────────────────────────────────
+    /// `left .. right` or `left ... right`.  One operator; range vs flip-flop
+    /// is determined by evaluation context (list → range, scalar/boolean →
+    /// flip-flop) via the `ctx` tag at lowering.  The `RangeKind` records the
+    /// `..`/`...` spelling, which only affects flip-flop turn-off timing.
+    Range(Box<Expr>, Box<Expr>, RangeKind),
 
     // ── Subscripting ──────────────────────────────────────────
     /// `$array[$idx]` — array element.
