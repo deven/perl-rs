@@ -2017,11 +2017,16 @@ impl Parser {
                 let end = self.peek_span();
                 self.expect_token(&Token::RightParen)?;
 
-                // Don't wrap in ExprKind::Paren — parentheses are purely syntactic grouping, and the tree structure
-                // already captures precedence.  Avoiding the wrapper prevents recursive-Drop overflow on deeply nested
-                // parens.  Update the span to include the parens.
-                let expr = Expr { span: span.merge(end), ..operand };
-                let expr = self.maybe_postfix_subscript(expr)?;
+                // Wrap the operand in a *transient* `Paren` carrying the parens-fact (which `=`, refgen, and the list
+                // slice need: `($x) =` is list assignment, `\(@a)` flattens, `(LIST)[i]` is a list slice).  The wrap is
+                // idempotent — a `Paren` operand is not re-wrapped — so nesting is capped at depth one, avoiding the
+                // recursive-`Drop` overflow that motivated dropping parens entirely.  `Paren` never persists in a
+                // finished tree: `maybe_postfix_subscript` consumes it (into a `ListSlice`, or unwraps it for plain
+                // grouping), and the `=`/refgen consumers read-then-unwrap it.
+                let span = span.merge(end);
+                let paren =
+                    if matches!(operand.kind, ExprKind::Paren(_)) { Expr { span, ..operand } } else { Expr::new(ExprKind::Paren(Box::new(operand)), span) };
+                let expr = self.maybe_postfix_subscript(paren)?;
                 Ok(FrameResult::Done(expr, min_prec))
             }
             ExprFrame::ArrayRef { mut elems, span, min_prec } => {
@@ -3235,10 +3240,30 @@ impl Parser {
     }
 
     fn maybe_postfix_subscript(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
-        // Handle chained subscripts: $x[0][1], $x{a}{b}, $x[0]{key}
+        // Subscript chains: `$x[0][1]`, `$x{a}{b}`, `$x[0]{key}`, and list slices `(LIST)[i]` / `(LIST)[i][j]`.
+        //
+        // A *list-literal* operand — `(LIST)` (a transient `Paren`), `qw[...]`, or `()` — followed by `[...]` is a list
+        // slice, not array-element access on a container.  A list slice's result is itself a list literal, so a chained
+        // `[...]` slices again.  Everything else (`$x`, a deref, an element) subscripts as an array/hash element.
         loop {
-            // After a term, we're in operator position.
-            if self.at(&Token::LeftBracket)? {
+            if self.at(&Token::LeftBracket)? && Self::is_list_literal_operand(&expr) {
+                // Unwrap a transient `Paren` to its inner list expression; `qw`/`()`/a prior `ListSlice` are used as-is.
+                let operand = match expr.kind {
+                    ExprKind::Paren(inner) => *inner,
+                    _ => expr,
+                };
+                self.next_token()?;
+                let idx = self.parse_expr(PREC_LOW)?;
+                let end = self.peek_span();
+                self.expect_token(&Token::RightBracket)?;
+                let span = operand.span.merge(end);
+                // The subscript is a list (`(1,2,3)[0,2]`): flatten a `Comma` into the index vector.
+                let indices = match idx.kind {
+                    ExprKind::Comma(items) => items,
+                    _ => vec![idx],
+                };
+                expr = Expr::list_slice(operand, indices, span);
+            } else if self.at(&Token::LeftBracket)? {
                 self.next_token()?;
                 let idx = self.parse_expr(PREC_LOW)?;
                 let end = self.peek_span();
@@ -3256,7 +3281,20 @@ impl Parser {
                 break;
             }
         }
+
+        // A parenthesized group not consumed as a list slice above is pure grouping — unwrap the transient `Paren` so it
+        // does not persist in the finished tree.  (Other `Paren` consumers — `=`, refgen — read it before this point.)
+        if let ExprKind::Paren(inner) = expr.kind {
+            expr = *inner;
+        }
         Ok(expr)
+    }
+
+    /// Whether `expr` is a *list literal* that a following `[...]` slices (rather than indexes as a container element).
+    /// The forms are a parenthesized expression (transient `Paren`), a `qw[...]`, an empty list `()`, and a list slice
+    /// (whose result is itself a list literal, so it can be sliced again).
+    fn is_list_literal_operand(expr: &Expr) -> bool {
+        matches!(expr.kind, ExprKind::Paren(_) | ExprKind::QwList(_) | ExprKind::EmptyList | ExprKind::ListSlice(_, _))
     }
 
     // ── Interpolated string assembly ──────────────────────────

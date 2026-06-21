@@ -264,6 +264,12 @@ impl Expr {
         Expr::new(ExprKind::HashElem(Box::new(base), Box::new(key)), span)
     }
 
+    /// `(LIST)[indices]` — list slice.  The operand is a list literal (a `Comma`, `QwList`, `EmptyList`, or single
+    /// parenthesized expression); the parser passes it already unwrapped of any transient `Paren`.
+    pub fn list_slice(operand: Expr, indices: Vec<Expr>, span: Span) -> Expr {
+        Expr::new(ExprKind::ListSlice(Box::new(operand), indices), span)
+    }
+
     /// `OP operand` — prefix unary operator.
     pub fn unary(op: UnaryOp, operand: Expr, span: Span) -> Expr {
         Expr::new(ExprKind::UnaryOp(op, Box::new(operand)), span)
@@ -485,6 +491,15 @@ impl Expr {
             | ExprKind::KvArraySlice(base, indices)
             | ExprKind::KvHashSlice(base, indices) => {
                 queue.push((base, Context::Scalar));
+                for idx in indices {
+                    queue.push((idx, Context::List));
+                }
+            }
+
+            // ── List slice `(LIST)[indices]`: the operand is a list literal evaluated in list context (unlike an
+            // array/hash slice's scalar-ish base, which is a container); the subscript list is also list context. ──
+            ExprKind::ListSlice(operand, indices) => {
+                queue.push((operand, Context::List));
                 for idx in indices {
                     queue.push((idx, Context::List));
                 }
@@ -879,6 +894,13 @@ pub enum ExprKind {
 
     /// `%hash{$k1, $k2}` — key/value hash slice (5.20+).
     KvHashSlice(Box<Expr>, Vec<Expr>),
+
+    /// `(LIST)[$i, $j]` — a *list slice*: positional selection from a list literal.  Distinct from `ArrayElem` (which
+    /// indexes a named array `@a` via `$a[i]`): the operand here is a list literal, not a container.  The operand is
+    /// one of the list-literal forms — a `Comma` (`(a, b, c)[i]`), a `QwList` (`qw[a b c][i]`), an `EmptyList`
+    /// (`()[i]`), or a single parenthesized list expression (`(expr)[i]`); it and the indices are in list context.
+    /// Mirrors Perl's `newSLICEOP` productions, which are separate from `aelem`.
+    ListSlice(Box<Expr>, Vec<Expr>),
 
     // ── Dereference ───────────────────────────────────────────
     /// `$$ref`, `@$ref`, `%$ref`.

@@ -9416,11 +9416,17 @@ fn depth_prefix_ops_are_iterative() {
 // ── Iterative parser adversarial tests ────────────────────
 
 #[test]
-fn iter_paren_subscript_still_works() {
-    // `(1, 2, 3)[1]` — postfix subscript after parens.  Paren no longer wraps in AST; maybe_postfix_subscript must
-    // still attach the subscript.
+fn iter_paren_subscript_is_list_slice() {
+    // `(1, 2, 3)[1]` — a list slice on a parenthesized list literal, NOT array-element access on a container.
     let e = parse_expr_str("(1, 2, 3)[1];");
-    assert!(matches!(e.kind, ExprKind::ArrayElem(_, _)), "expected ArrayElem, got {:?}", e.kind);
+    match &e.kind {
+        ExprKind::ListSlice(operand, indices) => {
+            assert!(matches!(operand.kind, ExprKind::Comma(_)), "operand is the list, got {:?}", operand.kind);
+            assert_eq!(indices.len(), 1);
+            assert!(matches!(indices[0].kind, ExprKind::IntLit(1)));
+        }
+        other => panic!("expected ListSlice, got {other:?}"),
+    }
 }
 
 #[test]
@@ -16532,4 +16538,113 @@ fn ctx_return_bare_has_no_operand() {
         },
         other => panic!("expected SubDecl, got {other:?}"),
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// List slices and transient Paren (§6.2.3–6.2.4)
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+fn list_slice_multiple_indices() {
+    // `(10, 20, 30)[0, 2]` — a list slice with a multi-index subscript; the indices flatten into the Vec.
+    let e = parse_expr_str("(10, 20, 30)[0, 2];");
+    match &e.kind {
+        ExprKind::ListSlice(operand, indices) => {
+            assert!(matches!(operand.kind, ExprKind::Comma(_)));
+            assert_eq!(indices.len(), 2, "two indices");
+            assert!(matches!(indices[0].kind, ExprKind::IntLit(0)));
+            assert!(matches!(indices[1].kind, ExprKind::IntLit(2)));
+        }
+        other => panic!("expected ListSlice, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_slice_single_paren_expr_operand() {
+    // `($x)[0]` — a single parenthesized expression sliced: the operand is the inner expr (Paren unwrapped), not a Comma.
+    let e = parse_expr_str("($x)[0];");
+    match &e.kind {
+        ExprKind::ListSlice(operand, indices) => {
+            assert!(matches!(operand.kind, ExprKind::ScalarVar(_)), "operand is the inner expr, got {:?}", operand.kind);
+            assert_eq!(indices.len(), 1);
+        }
+        other => panic!("expected ListSlice, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_slice_empty_list_operand() {
+    // `()[0]` — slicing the empty list.  Operand is EmptyList.
+    let e = parse_expr_str("()[0];");
+    match &e.kind {
+        ExprKind::ListSlice(operand, indices) => {
+            assert!(matches!(operand.kind, ExprKind::EmptyList), "operand is EmptyList, got {:?}", operand.kind);
+            assert_eq!(indices.len(), 1);
+        }
+        other => panic!("expected ListSlice, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_slice_chained() {
+    // `(10, 20, 30, 40)[1, 2, 3][0, 2]` — a list slice's result is itself a list literal, so it slices again.
+    let e = parse_expr_str("(10, 20, 30, 40)[1, 2, 3][0, 2];");
+    match &e.kind {
+        ExprKind::ListSlice(inner, outer_indices) => {
+            assert_eq!(outer_indices.len(), 2, "outer slice has two indices");
+            assert!(matches!(inner.kind, ExprKind::ListSlice(_, _)), "inner is itself a ListSlice, got {:?}", inner.kind);
+        }
+        other => panic!("expected chained ListSlice, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_slice_context_operand_and_indices_are_list() {
+    // save_context: a list slice's operand and indices are all in list context.
+    let e = parse_nonfinal_expr("(10, 20, 30)[0, 2]");
+    match &e.kind {
+        ExprKind::ListSlice(operand, indices) => {
+            assert_eq!(operand.ctx, Some(Context::List), "operand is list context");
+            for idx in indices {
+                assert_eq!(idx.ctx, Some(Context::List), "indices are list context");
+            }
+        }
+        other => panic!("expected ListSlice, got {other:?}"),
+    }
+}
+
+#[test]
+fn paren_grouping_does_not_persist() {
+    // The transient Paren must never persist in a finished tree: a parenthesized group used purely for grouping is
+    // unwrapped.  `(a + b) * c` is `(a+b) * c` with NO Paren node anywhere.
+    let e = parse_expr_str("($a + $b) * $c;");
+    fn assert_no_paren(e: &Expr) {
+        assert!(!matches!(e.kind, ExprKind::Paren(_)), "found a persisting Paren node");
+        if let ExprKind::BinOp(_, l, r) = &e.kind {
+            assert_no_paren(l);
+            assert_no_paren(r);
+        }
+    }
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Mul, l, r) => {
+            assert!(matches!(l.kind, ExprKind::BinOp(BinOp::Add, _, _)), "left is the unwrapped (a+b), got {:?}", l.kind);
+            assert!(matches!(r.kind, ExprKind::ScalarVar(_)));
+            assert_no_paren(&e);
+        }
+        other => panic!("expected Mul at top, got {other:?}"),
+    }
+}
+
+#[test]
+fn paren_nested_grouping_does_not_persist() {
+    // Deeply nested grouping parens collapse: `(((1 + 2)))` is just `1 + 2`, no Paren, no nesting.
+    let e = parse_expr_str("(((1 + 2)));");
+    assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Add, _, _)), "expected bare Add, got {:?}", e.kind);
+}
+
+#[test]
+fn paren_single_scalar_grouping_unwraps() {
+    // `($x)` alone (no slice, no assignment) is pure grouping → unwrapped to the bare scalar.
+    let e = parse_expr_str("($x);");
+    assert!(matches!(e.kind, ExprKind::ScalarVar(_)), "expected bare ScalarVar, got {:?}", e.kind);
 }
