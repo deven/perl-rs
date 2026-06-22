@@ -846,7 +846,9 @@ pub enum ExprKind {
     DefaultVar,
 
     /// `my $x`, `our ($a, $b)`, `state $x` in expression context.  The Pratt parser handles `= expr` as normal
-    /// assignment wrapping this.
+    /// assignment wrapping this.  The parenthesized list form (`my (...)`) is produced as a transient `Paren(Decl)` so
+    /// that the parens-fact rides the same grouping-`Paren` machinery as every other parenthesized lvalue (`($x)`,
+    /// `(@a)`); it is unwrapped to a bare `Decl` once read.
     Decl(DeclScope, Vec<VarDecl>),
 
     /// `local LVALUE` — localize any lvalue (hash elem, glob, etc.).

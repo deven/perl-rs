@@ -7017,33 +7017,33 @@ fn pratt_undef_placeholder_in_list_assign() {
 // ── Scalar vs list context from LHS declaration ──────────
 
 #[test]
-#[ignore = "parser doesn't distinguish my $x (scalar) from my ($x) (list) — both produce identical Decl nodes"]
 fn context_scalar_decl_vs_list_decl() {
     // `my $x = (2, 4, 6)` → scalar context.  $x = 6 (C comma, last value).
     // `my ($x) = (2, 4, 6)` → list context.  $x = 2 (first element of list).
-    // The parser must distinguish these: the LHS form determines the context of the RHS.
-    //
-    // The Decl node (or assignment node) should carry context information so the compiler knows whether to apply scalar
-    // or list semantics to the RHS.
+    // The list form is a transient `Paren(Decl)`, so both assignments store an identical bare `Decl` LHS once the
+    // Paren is unwrapped — the distinction survives only as the context the `=` handler stamps onto both sides.
     let prog1 = parse("my $x = (2, 4, 6);");
     let prog2 = parse("my ($x) = (2, 4, 6);");
 
-    let lhs1 = match &prog1.statements[0].kind {
-        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => lhs,
+    let (lhs1, rhs1) = match &prog1.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, rhs), .. }) => (lhs, rhs),
         other => panic!("stmt 1: expected Assign, got {other:?}"),
     };
-    let lhs2 = match &prog2.statements[0].kind {
-        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, _), .. }) => lhs,
+    let (lhs2, rhs2) = match &prog2.statements[0].kind {
+        StmtKind::Expr(Expr { kind: ExprKind::Assign(_, lhs, rhs), .. }) => (lhs, rhs),
         other => panic!("stmt 2: expected Assign, got {other:?}"),
     };
 
-    // The LHS nodes should differ structurally (ignoring spans).  `my $x` is a scalar declaration; `my ($x)` is a list-
-    // context declaration.  Currently both produce `Decl(My, [VarDecl])`.
-    assert!(
-        std::mem::discriminant(&lhs1.kind) != std::mem::discriminant(&lhs2.kind)
-            || format!("{:?}", lhs1.kind).contains("List") != format!("{:?}", lhs2.kind).contains("List"),
-        "my $x and my ($x) should produce structurally different LHS nodes"
-    );
+    // Both LHSs are a bare `Decl` — the grouping `Paren` around `my ($x)` was unwrapped before storage.
+    assert!(matches!(lhs1.kind, ExprKind::Decl(DeclScope::My, _)), "scalar-decl LHS is a bare Decl, got {:?}", lhs1.kind);
+    assert!(matches!(lhs2.kind, ExprKind::Decl(DeclScope::My, _)), "list-decl LHS is a bare Decl, got {:?}", lhs2.kind);
+
+    // The difference is the stamped context: a scalar declaration evaluates its RHS in scalar context, a list
+    // declaration in list context.  Both sides are stamped at assignment-construction time.
+    assert_eq!(lhs1.ctx, Some(Context::Scalar), "scalar-decl LHS is scalar");
+    assert_eq!(rhs1.ctx, Some(Context::Scalar), "scalar-decl RHS is scalar");
+    assert_eq!(lhs2.ctx, Some(Context::List), "list-decl LHS is list");
+    assert_eq!(rhs2.ctx, Some(Context::List), "list-decl RHS is list");
 }
 
 // ── Prototype-dependent comma parsing ────────────────────
@@ -16647,4 +16647,94 @@ fn paren_single_scalar_grouping_unwraps() {
     // `($x)` alone (no slice, no assignment) is pure grouping → unwrapped to the bare scalar.
     let e = parse_expr_str("($x);");
     assert!(matches!(e.kind, ExprKind::ScalarVar(_)), "expected bare ScalarVar, got {:?}", e.kind);
+}
+
+#[test]
+fn assign_list_vs_scalar_classification() {
+    // The list-vs-scalar rule is uniform across declaration and non-declaration LHS forms: list iff the LHS is
+    // parenthesized OR an inherent aggregate (array/hash/slice/deref).  Both sides are stamped with the resulting
+    // context at assignment-construction time.  This is the full cross-product of the forms that decide the question.
+    use Context::{List, Scalar};
+    let cases: &[(&str, Context)] = &[
+        // ── non-declaration ──
+        ("$x = 1", Scalar),
+        ("($x) = 1", List),
+        ("@a = (1, 2)", List),
+        ("(@a) = (1, 2)", List),
+        ("%h = (1, 2)", List),
+        ("(%h) = (1, 2)", List),
+        // ── declaration ──
+        ("my $x = 1", Scalar),
+        ("my ($x) = 1", List),
+        ("my @a = (1, 2)", List),
+        ("my (@a) = (1, 2)", List),
+        ("my %h = (1, 2)", List),
+        ("my (%h) = (1, 2)", List),
+        ("my ($x, $y) = (1, 2)", List),
+        ("my ($x, @rest) = (1, 2)", List),
+        // ── comma-list RHS in scalar vs list context (perl: `our $x = (2,4,6)` → 6; `our ($x) = (2,4,6)` → 2) ──
+        ("$x = (2, 4, 6)", Scalar),
+        ("our $x = (2, 4, 6)", Scalar),
+        ("our ($x) = (2, 4, 6)", List),
+    ];
+    for &(src, expected) in cases {
+        let e = parse_nonfinal_expr(src);
+        match &e.kind {
+            ExprKind::Assign(_, lhs, rhs) => {
+                assert_eq!(lhs.ctx, Some(expected), "{src}: LHS context");
+                assert_eq!(rhs.ctx, Some(expected), "{src}: RHS context");
+            }
+            other => panic!("{src}: expected Assign, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn decl_paren_form_does_not_persist() {
+    // The list form `my (...)` is a transient `Paren(Decl)`.  A standalone `my ($a, $b);` (no assignment to consume
+    // and unwrap the Paren) must still resolve to a bare `Decl` — the grouping `Paren` never persists.
+    let e = parse_expr_str("my ($a, $b);");
+    match &e.kind {
+        ExprKind::Decl(DeclScope::My, vars) => assert_eq!(vars.len(), 2),
+        other => panic!("expected bare Decl, got {other:?}"),
+    }
+}
+
+#[test]
+fn decl_paren_form_in_assignment_lhs_is_bare_decl() {
+    // `my ($x) = 1` — the LHS `Paren(Decl)` is unwrapped before being stored; the Assign LHS is a bare `Decl`.  (The
+    // parens-fact survives as list context — asserted in assign_list_vs_scalar_classification.)
+    let e = parse_nonfinal_expr("my ($x) = 1");
+    match &e.kind {
+        ExprKind::Assign(_, lhs, _) => {
+            assert!(matches!(lhs.kind, ExprKind::Decl(DeclScope::My, _)), "expected bare Decl LHS, got {:?}", lhs.kind);
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn assign_rhs_call_context_follows_assignment() {
+    // Ground truth (perl, `sub foo { @_ }`):
+    //   $x   = foo(2, 4, 6)  → foo called in SCALAR context → its `@_` yields the element count → $x == 3
+    //   ($x) = foo(2, 4, 6)  → foo called in LIST context   → `@_` flattens → $x == 2 (first element)
+    // The parser stamps the call node with the assignment's context (the runtime reads it to choose the calling
+    // context); call arguments are always list context, independent of that — which is why `@_` is (2, 4, 6) in both.
+    for (src, call_ctx) in [("$x = foo(2, 4, 6)", Context::Scalar), ("($x) = foo(2, 4, 6)", Context::List)] {
+        let e = parse_nonfinal_expr(src);
+        let rhs = match &e.kind {
+            ExprKind::Assign(_, _, rhs) => rhs,
+            other => panic!("{src}: expected Assign, got {other:?}"),
+        };
+        match &rhs.kind {
+            ExprKind::FuncCall(name, args) => {
+                assert!(name == "main::foo", "{src}: RHS calls foo, got {name}");
+                assert_eq!(rhs.ctx, Some(call_ctx), "{src}: call inherits the assignment context");
+                for a in args {
+                    assert_eq!(a.ctx, Some(Context::List), "{src}: call arguments are always list context");
+                }
+            }
+            other => panic!("{src}: RHS expected FuncCall, got {other:?}"),
+        }
+    }
 }

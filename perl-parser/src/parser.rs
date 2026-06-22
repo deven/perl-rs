@@ -416,7 +416,10 @@ impl Parser {
                             (kind, false)
                         } else {
                             let initial = self.parse_decl_expr(scope, kw_span)?;
-                            let expr = self.parse_expr_continuation(initial, PREC_LOW)?;
+                            // `my (...)` yields a transient `Paren(Decl)`; after the continuation has had its chance to
+                            // consume it (e.g. `my ($x) = ...`, where `=` reads-then-unwraps), unwrap any grouping
+                            // `Paren` that survived a bare `my ($a, $b);` so it does not persist in the statement.
+                            let expr = Self::unwrap_paren(self.parse_expr_continuation(initial, PREC_LOW)?);
                             let kind = self.maybe_postfix_control(expr)?;
                             let terminated = self.eat(&Token::Semi)?;
                             (kind, terminated)
@@ -937,7 +940,12 @@ impl Parser {
             }
             let end = self.peek_span();
             self.expect_token(&Token::RightParen)?;
-            Ok(Expr::new(ExprKind::Decl(scope, vars), span.merge(end)))
+            // Wrap the list form in a transient grouping `Paren` so the parens-fact rides the same machinery as any
+            // other parenthesized lvalue: the `=` arm reads it (`my ($x) = ...` is a list assignment) and unwraps, and
+            // a standalone `my ($a, $b);` is unwrapped to a bare `Decl` by the caller.  `Paren` never persists.
+            let full = span.merge(end);
+            let decl = Expr::new(ExprKind::Decl(scope, vars), full);
+            Ok(Expr::new(ExprKind::Paren(Box::new(decl)), full))
         } else {
             // Single variable: my $x, my @arr, my %hash
             // Optional attributes: my $x : Foo
@@ -1692,7 +1700,9 @@ impl Parser {
         loop {
             left = self.parse_expr_continuation(left, current_prec)?;
             match stack.pop() {
-                None => return Ok(left),
+                // Stack empty: this is the finished top-level expression.  A standalone `($x)` still carries a transient
+                // `Paren` here (no operator consumed it), so unwrap it — grouping parens never persist.
+                None => return Ok(Self::unwrap_paren(left)),
                 Some(frame) => match self.apply_expr_frame(frame, left)? {
                     FrameResult::Done(expr, prec) => {
                         left = expr;
@@ -1976,6 +1986,11 @@ impl Parser {
 
     /// Apply a saved continuation frame to the completed sub-expression.
     fn apply_expr_frame(&mut self, frame: ExprFrame, operand: Expr) -> Result<FrameResult, ParseError> {
+        // Grouping parens are transparent to a combined operand, so unwrap a transient `Paren` before applying the
+        // frame: this collapses `(($x))` to depth one and keeps grouping out of the finished tree (`-(x)` → `-x`,
+        // `[($x)]` → `[$x]`).  `Ref` is the exception — refgen reads the parens-fact off its operand, so it must see
+        // the `Paren` (the read-then-unwrap lives in the `Ref` arm).
+        let operand = if matches!(frame, ExprFrame::Ref { .. }) { operand } else { Self::unwrap_paren(operand) };
         match frame {
             ExprFrame::Unary { op, span, min_prec } => {
                 let span = span.merge(operand.span);
@@ -1998,6 +2013,10 @@ impl Parser {
                 }
             }
             ExprFrame::Ref { span, min_prec } => {
+                // `Ref` is carved out of the top-level operand unwrap so that refgen can observe whether its operand
+                // was parenthesized (`\@a` vs `\(@a)`).  Commit 2 does not yet read that fact, so unwrap here to keep
+                // grouping out of the tree; commit 3 replaces this with read-the-parens-fact-then-unwrap.
+                let operand = Self::unwrap_paren(operand);
                 let span = span.merge(operand.span);
                 Ok(FrameResult::Done(Expr::reference(operand, span), min_prec))
             }
@@ -2017,15 +2036,15 @@ impl Parser {
                 let end = self.peek_span();
                 self.expect_token(&Token::RightParen)?;
 
-                // Wrap the operand in a *transient* `Paren` carrying the parens-fact (which `=`, refgen, and the list
-                // slice need: `($x) =` is list assignment, `\(@a)` flattens, `(LIST)[i]` is a list slice).  The wrap is
-                // idempotent — a `Paren` operand is not re-wrapped — so nesting is capped at depth one, avoiding the
-                // recursive-`Drop` overflow that motivated dropping parens entirely.  `Paren` never persists in a
-                // finished tree: `maybe_postfix_subscript` consumes it (into a `ListSlice`, or unwraps it for plain
-                // grouping), and the `=`/refgen consumers read-then-unwrap it.
+                // Wrap the operand in a *transient* `Paren` carrying the parens-fact that `=`, refgen, and the list
+                // slice need (`($x) =` is list assignment, `\(@a)` flattens, `(LIST)[i]` is a list slice).  The operand
+                // arrives already unwrapped (the top of `apply_expr_frame` strips any inner `Paren`), so a fresh wrap
+                // here keeps nesting capped at depth one — `(($x))` is a single `Paren` — avoiding the recursive-`Drop`
+                // overflow that motivated dropping parens entirely.  `Paren` never persists in a finished tree: the
+                // list slice consumes it here, and every other consumer (`=`, refgen, prefix operands, the top-level
+                // return) unwraps it at the point of combination.
                 let span = span.merge(end);
-                let paren =
-                    if matches!(operand.kind, ExprKind::Paren(_)) { Expr { span, ..operand } } else { Expr::new(ExprKind::Paren(Box::new(operand)), span) };
+                let paren = Expr::new(ExprKind::Paren(Box::new(operand)), span);
                 let expr = self.maybe_postfix_subscript(paren)?;
                 Ok(FrameResult::Done(expr, min_prec))
             }
@@ -3282,11 +3301,10 @@ impl Parser {
             }
         }
 
-        // A parenthesized group not consumed as a list slice above is pure grouping — unwrap the transient `Paren` so it
-        // does not persist in the finished tree.  (Other `Paren` consumers — `=`, refgen — read it before this point.)
-        if let ExprKind::Paren(inner) = expr.kind {
-            expr = *inner;
-        }
+        // A `Paren` not consumed as a list slice above is left intact: it carries the parens-fact that the enclosing
+        // consumer needs (`=` classifies list-vs-scalar, refgen reads flatten-ness) and is unwrapped there, or at the
+        // top-level return for a standalone `($x)`.  Unwrapping it here — at paren-close, upstream of every consumer —
+        // would erase that fact before anyone could read it.
         Ok(expr)
     }
 
@@ -3489,6 +3507,39 @@ impl Parser {
         }
     }
 
+    /// Strip a single transient grouping `Paren`, returning the inner expression; any non-`Paren` is returned
+    /// unchanged.  Grouping parens are transparent at every point of combination (infix operators, prefix-frame
+    /// operands, the top-level return), and each such site calls this so the `Paren` never reaches the finished tree.
+    /// Nesting is already capped at depth one by the wrap site, so a single strip suffices.
+    fn unwrap_paren(expr: Expr) -> Expr {
+        match expr.kind {
+            ExprKind::Paren(inner) => *inner,
+            other => Expr { kind: other, ..expr },
+        }
+    }
+
+    /// Does this assignment LHS denote an aggregate (list-context) target?  Used by the `=` arm: an aggregate LHS — or
+    /// a parenthesized LHS, which the caller tests separately via the parens-fact — makes the whole assignment a list
+    /// assignment.  Arrays, hashes, their slices and derefs, a comma list, and the empty list are aggregates; `local`
+    /// inherits from its inner lvalue; a `Decl` is aggregate when it declares any array/hash (the parenthesized list
+    /// form is a grouping `Paren`, caught by the parens-fact, so it is not the concern here).  Everything else —
+    /// scalars, elements, scalar derefs — is scalar.
+    fn is_aggregate_lvalue(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::ArrayVar(_)
+            | ExprKind::HashVar(_)
+            | ExprKind::ArraySlice(_, _)
+            | ExprKind::HashSlice(_, _)
+            | ExprKind::Deref(Sigil::Array, _)
+            | ExprKind::Deref(Sigil::Hash, _)
+            | ExprKind::Comma(_)
+            | ExprKind::EmptyList => true,
+            ExprKind::Local(inner) => Self::is_aggregate_lvalue(inner),
+            ExprKind::Decl(_, vars) => vars.iter().any(|v| matches!(v.sigil, Sigil::Array | Sigil::Hash)),
+            _ => false,
+        }
+    }
+
     /// Is `expr` a valid left-hand side of an aliasing assignment, per the `refaliasing` feature?
     ///
     /// Accepts `\$x`, `\@a`, `\%h`, `\&f`, `\*g`, parenthesized forms, and lists of those (including `my`-declarations
@@ -3515,6 +3566,12 @@ impl Parser {
     fn parse_operator(&mut self, left: Expr, info: OpInfo) -> Result<Expr, ParseError> {
         let op_spanned = self.next_token()?;
         let right_prec = info.right_prec();
+
+        // Grouping parens are transparent to every infix operator.  Record whether the left operand was parenthesized
+        // before unwrapping it — the `=` arm needs that fact to classify a single-scalar LHS as a list assignment
+        // (`($x) = ...`) — then unwrap so the operator combines with the bare operand.
+        let left_parenthesized = matches!(left.kind, ExprKind::Paren(_));
+        let mut left = Self::unwrap_paren(left);
 
         match op_spanned.token {
             // Postfix increment/decrement
@@ -3554,7 +3611,15 @@ impl Parser {
                 if !Self::is_valid_lvalue(&left) && !refalias_ok {
                     return Err(ParseError::new("invalid assignment target", left.span));
                 }
-                let right = self.parse_expr(right_prec)?;
+                let mut right = self.parse_expr(right_prec)?;
+
+                // List assignment iff the LHS is a parenthesized list or an inherent aggregate target; both sides are
+                // then evaluated in list context.  A bare scalar LHS is a scalar assignment.  Stamp at construction so
+                // the context survives the descent's first-writer-wins guard (the descent leaves `Assign` deferred).
+                let ctx = if left_parenthesized || Self::is_aggregate_lvalue(&left) { Context::List } else { Context::Scalar };
+                left.save_context(ctx);
+                right.save_context(ctx);
+
                 let span = left.span.merge(right.span);
                 Ok(Expr::assign(op, left, right, span))
             }
