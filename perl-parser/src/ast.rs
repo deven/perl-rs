@@ -512,8 +512,9 @@ impl Expr {
                 target.save_context(queue);
             }
 
-            // ── Reference (refgen `\`): DEFERRED.  Operand context is set at construction from the parens-fact (the
-            // transient-Paren tagging), which lands with the Paren commit. ──
+            // ── Reference (refgen `\`): DEFERRED.  The operand's context is the parens-fact, stamped at construction
+            // by the `Ref` frame (`\@a` → Scalar, `\(@a)` → List); the descent must not re-stamp it, so this arm does
+            // not enqueue the operand. ──
             ExprKind::Ref(_) => {}
 
             // ── Anonymous aggregate constructors: elements are in list context. ──

@@ -16738,3 +16738,48 @@ fn assign_rhs_call_context_follows_assignment() {
         }
     }
 }
+
+#[test]
+fn refgen_operand_context_from_parens_fact() {
+    // Refgen records the `\@a` (reference the container whole) vs `\(@a)` (flatten, reference each element)
+    // distinction as the operand's context, stamped from the parens-fact at construction: no parens → Scalar, parens
+    // → List.  The rule is parens-only — `\@a` is Scalar despite @a being an aggregate.  (Lowering combines this tag
+    // with the operand's container-ness; the parser only records the fact — §6.2.5.)
+    use Context::{List, Scalar};
+    let cases: &[(&str, Context)] = &[("\\$x;", Scalar), ("\\($x);", List), ("\\@a;", Scalar), ("\\(@a);", List), ("\\%h;", Scalar), ("\\(%h);", List)];
+    for &(src, expected) in cases {
+        let e = parse_expr_str(src);
+        match &e.kind {
+            ExprKind::Ref(operand) => assert_eq!(operand.ctx, Some(expected), "{src}: operand context"),
+            other => panic!("{src}: expected Ref, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn refgen_paren_list_operand_is_list_context() {
+    // `\($a, @b)` — a parenthesized list operand carries the List parens-fact on the Comma as a whole; lowering then
+    // references each top-level item by its own kind (§6.2.5).
+    let e = parse_expr_str("\\($a, @b);");
+    match &e.kind {
+        ExprKind::Ref(operand) => {
+            assert!(matches!(operand.kind, ExprKind::Comma(_)), "expected Comma operand, got {:?}", operand.kind);
+            assert_eq!(operand.ctx, Some(Context::List), "comma operand is list");
+        }
+        other => panic!("expected Ref, got {other:?}"),
+    }
+}
+
+#[test]
+fn refgen_double_paren_collapses_to_list() {
+    // `\(($x))` — the wrap site caps nesting at depth one, so the Ref frame sees a single `Paren`; the operand is the
+    // bare `$x` stamped List, identical to `\($x)`.
+    let e = parse_expr_str("\\(($x));");
+    match &e.kind {
+        ExprKind::Ref(operand) => {
+            assert!(matches!(operand.kind, ExprKind::ScalarVar(_)), "expected bare ScalarVar operand, got {:?}", operand.kind);
+            assert_eq!(operand.ctx, Some(Context::List), "double-paren operand is still list");
+        }
+        other => panic!("expected Ref, got {other:?}"),
+    }
+}

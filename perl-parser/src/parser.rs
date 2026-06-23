@@ -2013,10 +2013,17 @@ impl Parser {
                 }
             }
             ExprFrame::Ref { span, min_prec } => {
-                // `Ref` is carved out of the top-level operand unwrap so that refgen can observe whether its operand
-                // was parenthesized (`\@a` vs `\(@a)`).  Commit 2 does not yet read that fact, so unwrap here to keep
-                // grouping out of the tree; commit 3 replaces this with read-the-parens-fact-then-unwrap.
-                let operand = Self::unwrap_paren(operand);
+                // Refgen distinguishes `\@a` (reference the container whole) from `\(@a)` (flatten and reference each
+                // element) by the parens-fact alone — the operand node is identical otherwise.  This frame is carved
+                // out of the top-level operand unwrap, so the transient `Paren` is still here to read: stamp the
+                // operand's context from it, then unwrap.  No parens → `Scalar`; parens → `List`.  The rule is parens-
+                // only (unlike the `=` arm's parens-or-aggregate), since `\@a` is a whole-array reference despite @a
+                // being an aggregate.  `save_context` leaves the `Ref` arm deferred, so this construction-time stamp is
+                // the sole writer of the operand's context and survives the descent; lowering later combines this tag
+                // with the operand's container-ness (§6.2.5).
+                let parenthesized = matches!(operand.kind, ExprKind::Paren(_));
+                let mut operand = Self::unwrap_paren(operand);
+                operand.save_context(if parenthesized { Context::List } else { Context::Scalar });
                 let span = span.merge(operand.span);
                 Ok(FrameResult::Done(Expr::reference(operand, span), min_prec))
             }
