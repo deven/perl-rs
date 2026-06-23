@@ -1249,87 +1249,103 @@ forward across line boundaries and then either rewind to the starting
 position or commit to where the scan ended, without disturbing the
 heredoc interleaving machinery.
 
-The mechanism is built entirely on the existing line-delivery
-queue.  The source layer gains three fields:
+The mechanism is built on the existing line-delivery queue.  The
+source layer gains four fields:
 
 ```rust
-/// Lines pulled during an active lookahead, captured for replay.
+/// Displaced lines captured during an active lookahead scan, in displacement order (original current line first).
+/// Drained on guard drop: the original line is restored and the rest pushed onto `queued_lines` for replay.
 lookahead: VecDeque<LexerLine>,
-/// Position where the most recent lookahead ended, if a
-/// `consume_lookahead` is still valid.  `Some` between guard drop
-/// and the window closing; taken (set `None`) by consume, and
-/// cleared when `next_line` falls back past the lookahead region.
+/// Source offset of the line a lookahead scan ended on, identifying it uniquely for `consume_lookahead`.  `Some`
+/// from guard drop until normal delivery reaches that line; `None` if the scan never left its starting line.
+lookahead_offset: Option<usize>,
+/// Cursor position the lookahead scan ended at, within the end line.  Taken by `consume_lookahead`, and cleared
+/// once normal delivery moves past the end line.
 lookahead_pos: Option<usize>,
-/// True while a lookahead guard is alive.  Suppresses `# line`
-/// directive side effects (see below) and enables line capture.
+/// True while a lookahead guard is alive: `next_line` captures displaced lines and `# line` directive setters are
+/// suppressed.
 lookahead_mode: bool,
 ```
 
-`next_line` becomes three-tier: it serves the `lookahead` queue
-first, then the regular queued lines (heredoc/subst bodies,
-push-back), then the interleaving algorithm.  Lines re-delivered from
-the `lookahead` queue have their `pos` reset to 0.  While
+**Delivery and capture.**  Line numbers are stamped at *delivery*:
+`next_line` assigns each line it delivers — freshly read or pulled
+from the regular queue — its `number` from the counter and advances
+it.  `install_line` stays a pure "set this line, as-is" primitive
+that does not renumber, so a saved line restored directly through it
+(a heredoc/subst remainder) keeps its baked number.  While
 `lookahead_mode` is set, each line `next_line` displaces from the
-current slot is captured into the `lookahead` queue (in order), so
-the consumer never tracks intervening lines itself.
+current slot is captured into the `lookahead` queue, so the consumer
+never tracks intervening lines itself.  Replay needs no special
+delivery tier: the previewed lines are re-queued onto the regular
+queue and ride the normal path back out.
 
-**The guard.**  `lookahead()` returns an RAII guard.  On creation it
-closes out any still-open prior lookahead: it sets
-`lookahead_pos = None` and moves any leftover `lookahead` lines to
-the front of the regular queue, so the `lookahead` queue is always
-empty when a fresh guard is returned.  The guard records the entry
-position (`self.line`'s `pos`) and sets `lookahead_mode = true`.
+**The guard.**  `lookahead()` returns an RAII guard that derefs to
+the `Lexer`, so the consumer scans with the ordinary line API.  On
+creation it supersedes any still-open prior window (clearing
+`lookahead_offset` and `lookahead_pos`), records the entry position
+(`self.line`'s `pos`), and sets `lookahead_mode = true`.
 
 On drop, the guard:
 
-- saves the final position into `lookahead_pos`;
-- if the `lookahead` queue is non-empty, pushes the current line onto
-  its back and pops its front into `self.line` — restoring the
-  original current line (the first line displaced, hence the front);
-- restores `self.line`'s `pos` to the recorded entry position;
-- rewinds the line-number counter to `self.line.number + 1` (the
-  restored current line is not re-baked, so the counter points one
-  past it);
+- records where the scan ended — the current line's `offset` (a
+  unique key) and `pos`;
+- if any line was displaced, restores the original current line (the
+  front of the capture queue) and re-queues the previewed run — the
+  scan-end line included — onto the front of the regular queue,
+  each line's `pos` reset to 0 so it re-scans from the start, and
+  records the end `offset`;
+- if nothing was displaced, the current line is itself the scan-end
+  line, so the end `offset` is left `None` (delivery is already
+  there);
+- restores the original current line's `pos` to the entry position
+  and refreshes its derived UTF-8 flag (the scan left the flag set
+  for the last previewed line);
+- rewinds the line-number counter to that line's `number + 1` — its
+  own number is already stamped, so the next line delivered continues
+  exactly where delivery left off, and no separate saved value is
+  needed;
 - clears `lookahead_mode`.
 
-The remaining captured lines stay in the `lookahead` queue, pending
-re-delivery by future `next_line` calls — transparently, in order.
+The previewed lines now sit on the regular queue, re-delivered by
+future `next_line` calls transparently and in order.
 
 **Consuming a lookahead.**  `consume_lookahead()` runs *after* the
-guard has dropped, when the consumer has decided to commit to where
-the scan ended rather than rewind.  It takes `lookahead_pos` (leaving
-`None`, so it is single-shot).  If the `lookahead` queue is non-empty
-it pops the *last* line, discards the rest (they are consumed), and
-installs the popped line as the current line at the saved position.
-If the queue is empty, the current line already *is* the line the
-lookahead ended on, and its position advances to the saved position
-(a no-op when already exactly there).
+guard has dropped, when the consumer commits to where the scan ended
+rather than rewinding.  It drives `next_line` forward until the line
+with the recorded end `offset` is current — re-delivering and
+re-stamping the intervening lines as it goes — then advances the
+cursor to the recorded end `pos`.  Offset is the right key because
+`number` is re-stamped on replay, but `offset` is the line's fixed
+position in the source, unique per line, so the match cannot drift.
 
-`consume_lookahead` returns an error ("consume_lookahead called with
-no active lookahead window") when the lookahead window has expired,
-which covers two cases that mean the same thing: there is no
-active lookahead (`lookahead_pos` is `None` — never opened, already
-consumed, or drained), or the current line has already advanced
-*past* the saved position (`pos > saved`), so consuming would rewind
-over bytes already processed.  Only forward motion to the lookahead
-limit (or staying exactly at it) is allowed.  `next_line` sets
-`lookahead_pos = None` whenever it falls back past the `lookahead`
-queue (the queue drains empty), closing the consume window once
-normal lexing has moved on.
+It is a no-op once the window has expired — never opened, already
+consumed, or passed by normal lexing — so it is always safe to
+call.  As delivery reaches the end line, `install_line` clears
+`lookahead_offset`; as delivery moves past it, `install_line`
+clears `lookahead_pos`.  Once both are clear there is nothing to
+consume.
+The single-line case falls out: nothing was displaced, the end
+`offset` is already `None`, and consume simply advances the cursor to
+the saved position on the line still current.
 
-**Line numbering and `# line` directives.**  Line numbers are
-assigned at delivery — `next_line` stamps each delivered line's
-`number` from the counter and advances it, for queued and freshly
-read lines alike.  Because the guard rewinds the counter on drop,
-lines replayed from the `lookahead` queue are re-stamped from the
-restored counter, so a `# line` directive that was passed over during
-the speculative scan takes effect correctly on the real pass.  With
-no directives present, re-stamping reproduces the original numbers
-exactly — a no-op.  To keep the speculative scan from applying
-directives early (a line that looks like `# line` might turn out to
-be heredoc body text, and must not renumber anything until really
-reached), `set_line_number` and `set_filename` are no-ops while
-`lookahead_mode` is set.
+**Line numbering and `# line` directives.**  Because numbering
+happens at delivery and the guard rewinds the counter on drop, the
+previewed lines are re-stamped when they replay, so a `# line`
+directive passed over during the speculative scan takes effect
+correctly on the real pass; with no directives present, re-stamping
+reproduces the original numbers exactly.  To keep the scan from
+applying directives early — a line that looks like `# line` might
+turn out to be heredoc body text, and must not renumber anything
+until really reached — `set_line_number` and `set_filename` are
+no-ops while `lookahead_mode` is set; the parser re-applies the
+directive when the line is delivered for real.
+
+Re-stamping every line drawn from the regular queue means heredoc and
+substitution *remainder* lines — currently delivered through that
+queue — are renumbered too, which is wrong for them.  That is
+tolerated for now: both are slated to restore their remainder
+directly through `install_line` (which preserves the baked number),
+at which point the friendly fire ends.
 
 ### 5.5 Sublexing and the Context Stack
 

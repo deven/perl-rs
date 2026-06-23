@@ -668,8 +668,179 @@ fn push_back_precedes_underlying_source() {
 
     let first = lexer.temp_next_line(false).unwrap().unwrap();
     assert_eq!(&first.line[..], b"queued", "push_back lines should come before underlying source");
-    assert_eq!(first.number, 999, "pushed line number should be preserved");
+    assert_eq!(first.number, 1, "delivered lines are renumbered from the counter, not from the pushed value");
 
     let second = lexer.temp_next_line(false).unwrap().unwrap();
     assert_eq!(&second.line[..], b"real", "underlying source should follow pushed lines");
+    assert_eq!(second.number, 2, "the following source line continues the delivery numbering");
+}
+
+// ── Lookahead ─────────────────────────────────────────────────
+
+#[test]
+fn lookahead_rewinds_to_entry_line_and_pos() {
+    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\nddd\n");
+    let _ = lexer.temp_next_line(false); // deliver line 1 "aaa"
+    if let Some(l) = lexer.line.as_mut() {
+        l.pos = 2; // advance the cursor within line 1
+    }
+
+    {
+        let mut g = lexer.lookahead();
+        let l2 = g.next_line(false).unwrap().clone().unwrap();
+        assert_eq!(&l2.line[..], b"bbb");
+        let l3 = g.next_line(false).unwrap().clone().unwrap();
+        assert_eq!(&l3.line[..], b"ccc");
+    } // guard drops -> snap back to line 1 at pos 2
+
+    let cur = lexer.line.clone().unwrap();
+    assert_eq!(&cur.line[..], b"aaa");
+    assert_eq!(cur.pos, 2);
+    assert_eq!(cur.number, 1);
+}
+
+#[test]
+fn lookahead_previewed_lines_replay_in_order_with_numbers() {
+    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\nddd\n");
+    let _ = lexer.temp_next_line(false); // line 1
+    {
+        let mut g = lexer.lookahead();
+        let _ = g.next_line(false); // bbb
+        let _ = g.next_line(false); // ccc
+    }
+
+    // Previewed lines replay before fresh reads, renumbered from the rewound counter (aaa=1, so bbb=2, ccc=3, ddd=4).
+    let b = lexer.temp_next_line(false).unwrap().unwrap();
+    assert_eq!(&b.line[..], b"bbb");
+    assert_eq!(b.number, 2);
+    let c = lexer.temp_next_line(false).unwrap().unwrap();
+    assert_eq!(&c.line[..], b"ccc");
+    assert_eq!(c.number, 3);
+    let d = lexer.temp_next_line(false).unwrap().unwrap();
+    assert_eq!(&d.line[..], b"ddd");
+    assert_eq!(d.number, 4);
+    assert!(matches!(lexer.temp_next_line(false), Ok(None)));
+}
+
+#[test]
+fn lookahead_suppresses_line_directive_setters() {
+    let mut lexer = Lexer::new(b"aaa\nbbb\n");
+    let _ = lexer.temp_next_line(false);
+    let saved_number = lexer.line_number;
+    let saved_name = lexer.filename().to_string();
+
+    {
+        let mut g = lexer.lookahead();
+        g.set_line_number(999);
+        g.set_filename("other".to_string());
+        assert_eq!(g.line_number, saved_number, "set_line_number is suppressed during a scan");
+        assert_eq!(g.filename(), saved_name, "set_filename is suppressed during a scan");
+    }
+
+    // After the scan the setters work again.
+    lexer.set_line_number(50);
+    assert_eq!(lexer.line_number, 50);
+}
+
+#[test]
+fn lookahead_directive_applies_to_replayed_lines() {
+    // A `# line` directive the lexer processes on the real pass renumbers what follows.  Driven here at the source
+    // layer: scan ahead, rewind, then on replay set the counter between deliveries the way the parser would.
+    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\n");
+    let _ = lexer.temp_next_line(false); // line 1
+    {
+        let mut g = lexer.lookahead();
+        let _ = g.next_line(false); // bbb
+        let _ = g.next_line(false); // ccc
+    }
+
+    let b = lexer.temp_next_line(false).unwrap().unwrap();
+    assert_eq!(b.number, 2, "bbb re-stamped from the rewound counter");
+    lexer.set_line_number(100); // directive encountered on the real pass
+    let c = lexer.temp_next_line(false).unwrap().unwrap();
+    assert_eq!(c.number, 100, "ccc picks up the directive on replay");
+}
+
+#[test]
+fn consume_lookahead_commits_to_scan_end() {
+    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\nddd\n");
+    let _ = lexer.temp_next_line(false); // line 1 "aaa"
+    {
+        let mut g = lexer.lookahead();
+        let _ = g.next_line(false); // bbb
+        let _ = g.next_line(false); // ccc (scan ends here)
+    }
+
+    lexer.consume_lookahead().unwrap();
+    let cur = lexer.line.clone().unwrap();
+    assert_eq!(&cur.line[..], b"ccc", "consume lands on the line the scan ended on");
+    assert_eq!(cur.number, 3);
+
+    let d = lexer.temp_next_line(false).unwrap().unwrap();
+    assert_eq!(&d.line[..], b"ddd");
+    assert_eq!(d.number, 4, "numbering continues correctly past the consumed region");
+}
+
+#[test]
+fn consume_lookahead_single_line_advances_pos() {
+    // A scan that never crosses a line boundary: consume advances the cursor to the scan-end position.
+    let mut lexer = Lexer::new(b"abcdef\n");
+    let _ = lexer.temp_next_line(false); // "abcdef" at pos 0
+    {
+        let mut g = lexer.lookahead();
+        if let Some(l) = g.line.as_mut() {
+            l.pos = 4; // scan forward within the line
+        }
+    } // drop -> pos restored to 0, scan-end pos (4) recorded
+
+    assert_eq!(lexer.line.as_ref().unwrap().pos, 0);
+    lexer.consume_lookahead().unwrap();
+    assert_eq!(lexer.line.as_ref().unwrap().pos, 4);
+}
+
+#[test]
+fn consume_lookahead_without_window_is_noop() {
+    let mut lexer = Lexer::new(b"aaa\nbbb\n");
+    let _ = lexer.temp_next_line(false);
+    let before = lexer.line.as_ref().unwrap().pos;
+    lexer.consume_lookahead().unwrap(); // no lookahead opened -> no-op
+    assert_eq!(lexer.line.as_ref().unwrap().pos, before);
+}
+
+#[test]
+fn consume_lookahead_after_replay_is_noop() {
+    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\n");
+    let _ = lexer.temp_next_line(false); // line 1
+    {
+        let mut g = lexer.lookahead();
+        let _ = g.next_line(false); // preview bbb
+    }
+    // Normal lexing replays bbb, then reads ccc fresh -- moving past the scan-end line closes the consume window.
+    let _ = lexer.temp_next_line(false); // bbb (replay)
+    let _ = lexer.temp_next_line(false); // ccc (fresh)
+
+    let pos_before = lexer.line.as_ref().unwrap().pos;
+    lexer.consume_lookahead().unwrap(); // window closed -> no-op
+    let cur = lexer.line.clone().unwrap();
+    assert_eq!(&cur.line[..], b"ccc");
+    assert_eq!(cur.pos, pos_before);
+}
+
+#[test]
+fn lookahead_replayed_lines_restart_at_pos_zero() {
+    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\n");
+    let _ = lexer.temp_next_line(false); // line 1
+    {
+        let mut g = lexer.lookahead();
+        let _ = g.next_line(false); // bbb becomes current
+        if let Some(l) = g.line.as_mut() {
+            l.pos = 2; // scan partway into bbb
+        }
+        let _ = g.next_line(false); // ccc
+    }
+
+    // On replay, bbb restarts at the beginning despite the mid-line scan position.
+    let b = lexer.temp_next_line(false).unwrap().unwrap();
+    assert_eq!(&b.line[..], b"bbb");
+    assert_eq!(b.pos, 0);
 }

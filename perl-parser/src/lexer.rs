@@ -155,6 +155,22 @@ pub(crate) struct Lexer {
     /// flags.
     pub(crate) subst_saved_line: Option<LexerLine>,
 
+    /// Displaced lines captured during an active lookahead scan, in displacement order (original current line first).
+    /// Drained on guard drop: the original line is restored and the rest pushed onto `queued_lines` for replay.
+    pub(crate) lookahead: VecDeque<LexerLine>,
+
+    /// Source offset of the line a lookahead scan ended on, identifying it uniquely for `consume_lookahead`.  `Some`
+    /// from guard drop until normal delivery reaches that line; `None` if the scan never left its starting line.
+    pub(crate) lookahead_offset: Option<usize>,
+
+    /// Cursor position the lookahead scan ended at, within the end line.  Taken by `consume_lookahead`, and cleared
+    /// once normal delivery moves past the end line.
+    pub(crate) lookahead_pos: Option<usize>,
+
+    /// True while a lookahead guard is alive: `next_line` captures displaced lines and `# line` directive setters are
+    /// suppressed.
+    pub(crate) lookahead_mode: bool,
+
     // ── Tokenization ──
     context_stack: Vec<LexContext>,
 
@@ -226,6 +242,10 @@ impl Lexer {
             terminator_pending: false,
             subst_eof_pending: false,
             subst_saved_line: None,
+            lookahead: VecDeque::new(),
+            lookahead_offset: None,
+            lookahead_pos: None,
+            lookahead_mode: false,
 
             // Tokenization.
             context_stack: Vec::new(),

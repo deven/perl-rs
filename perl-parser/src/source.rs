@@ -11,6 +11,8 @@ use crate::lexer::{Lexer, matching_delimiter};
 use crate::span::Span;
 use bytes::Bytes;
 use std::collections::VecDeque;
+use std::mem;
+use std::ops::{Deref, DerefMut};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -223,11 +225,19 @@ impl Lexer {
 
     /// Override the line number for `# line N` directives.
     pub fn set_line_number(&mut self, n: usize) {
+        // A directive crossed during a speculative scan must not renumber anything: the line it sits on might turn out
+        // to be heredoc body text.  The directive takes effect on the real pass, when the line is delivered for real.
+        if self.lookahead_mode {
+            return;
+        }
         self.line_number = n;
     }
 
     /// Override the filename for `# line N "file"` directives.
     pub fn set_filename(&mut self, name: String) {
+        if self.lookahead_mode {
+            return;
+        }
         self.filename = name;
     }
 
@@ -269,8 +279,10 @@ impl Lexer {
         }
 
         // 1. Return queued line if present (from heredoc remainder, push_back, or subst body — not subject to
-        //    terminator check).
-        if let Some(line) = self.queued_lines.pop_front() {
+        //    terminator check).  Stamped at delivery, so replayed lookahead lines pick up the current counter.
+        if let Some(mut line) = self.queued_lines.pop_front() {
+            line.number = self.line_number;
+            self.line_number += 1;
             return Ok(self.install_line(line));
         }
 
@@ -300,7 +312,7 @@ impl Lexer {
         };
 
         // 3. Strip required indent (if any).
-        let stripped = self.strip_indent(raw)?;
+        let mut stripped = self.strip_indent(raw)?;
 
         // 4. If inside a heredoc, check for terminator.
         let is_terminator = self.heredoc_stack.last().is_some_and(|ctx| stripped.line.as_ref() == ctx.tag.as_ref());
@@ -318,14 +330,36 @@ impl Lexer {
             return Ok(&None);
         }
 
+        // 5. Deliver the freshly read line, stamping its number from the counter.
+        stripped.number = self.line_number;
+        self.line_number += 1;
         Ok(self.install_line(stripped))
     }
 
     /// Install `line` as the current line, recompute `effective_utf8`, and return a borrow of `self.line` (always the
-    /// freshly-installed `Some`).  Centralizes the bookkeeping that line-producing paths in `next_line` share.
+    /// freshly-installed `Some`).  A "set this line, as-is" primitive: it does not renumber, so callers that restore a
+    /// saved line (heredoc/subst remainders) keep its original number.  Line numbering happens in `next_line` at
+    /// delivery; capture and `consume_lookahead` window tracking are install-event concerns and live here.
     fn install_line(&mut self, line: LexerLine) -> &Option<LexerLine> {
+        // During an active lookahead, capture the line being displaced (in displacement order) so the guard can restore
+        // the original current line and queue the rest for replay.
+        if self.lookahead_mode && let Some(displaced) = self.line.take() {
+            self.lookahead.push_back(displaced);
+        }
+
         self.effective_utf8 = self.utf8_mode && !line.ascii_only;
         self.line = Some(line);
+
+        // Outside a scan, narrow then close the `consume_lookahead` window as normal delivery reaches and then passes
+        // the line the scan ended on (identified by its unique source offset).
+        if !self.lookahead_mode {
+            match self.lookahead_offset {
+                Some(off) if self.line.as_ref().is_some_and(|l| l.offset == off) => self.lookahead_offset = None,
+                None if self.lookahead_pos.is_some() => self.lookahead_pos = None,
+                _ => {}
+            }
+        }
+
         &self.line
     }
 
@@ -334,6 +368,42 @@ impl Lexer {
     #[cfg(test)]
     pub(crate) fn temp_next_line(&mut self, peek_heredoc: bool) -> Result<Option<LexerLine>, ParseError> {
         self.next_line(peek_heredoc).cloned()
+    }
+
+    /// Begin a speculative lookahead.  Returns an RAII guard; while it is alive the consumer scans forward with the
+    /// normal line API (`next_line`, `peek_byte`, …) and `# line` directive setters are suppressed.  On drop the lexer
+    /// snaps back to the line and cursor where the scan began, and the previewed lines are re-queued for normal
+    /// re-delivery — unless the consumer then calls [`Self::consume_lookahead`] to commit to where the scan ended.
+    #[allow(dead_code)] // No consumers yet — the primitive lands ahead of its first user (e.g. fat-comma autoquoting).
+    pub(crate) fn lookahead(&mut self) -> Lookahead<'_> {
+        // A new lookahead supersedes any still-open consume window from a previous one.
+        self.lookahead_offset = None;
+        self.lookahead_pos = None;
+        let entry_pos = self.line.as_ref().map_or(0, |l| l.pos);
+        self.lookahead_mode = true;
+        Lookahead { lexer: self, entry_pos }
+    }
+
+    /// Commit to where the most recent lookahead ended instead of rewinding.  Drives normal delivery forward to the
+    /// line the scan ended on (re-stamping and re-delivering the intervening lines as it goes) and advances the cursor
+    /// to the scan-end position.  A no-op if the window has already expired — never opened, already consumed, or passed
+    /// by normal lexing — so it is always safe to call.
+    #[allow(dead_code)] // No consumers yet — paired with `lookahead`.
+    pub(crate) fn consume_lookahead(&mut self) -> Result<(), ParseError> {
+        // Deliver lines until the scan-end line is current; `install_line` clears `lookahead_offset` on arrival.
+        while self.lookahead_offset.is_some() {
+            if self.next_line(false)?.is_none() {
+                return Err(ParseError::new("consume_lookahead: lookahead end line is unreachable", Span::DUMMY));
+            }
+        }
+        // On (or already past) the end line: advance the cursor to the scan-end position unless we're there or beyond.
+        if let Some(end_pos) = self.lookahead_pos.take()
+            && let Some(line) = self.line.as_mut()
+            && end_pos > line.pos
+        {
+            line.pos = end_pos;
+        }
+        Ok(())
     }
 
     /// Begin processing an indented heredoc body (`<<~TAG`).
@@ -479,8 +549,9 @@ impl Lexer {
         }
 
         let start = self.cursor;
-        let number = self.line_number;
-        self.line_number += 1;
+        // The line number is stamped at delivery in `next_line` (which also advances the counter), so lines
+        // redelivered from `queued_lines` are renumbered; the read leaves a placeholder.
+        let number = 0;
 
         // Find end of line (\n or EOF), accumulating high-bit check.
         let mut end = start;
@@ -583,5 +654,70 @@ impl Lexer {
         }
 
         Err(ParseError::new(format!("can't find heredoc terminator '{}'", String::from_utf8_lossy(tag)), Span::new(scan_start as u32, self.cursor as u32)))
+    }
+}
+
+/// RAII guard for a speculative lookahead, returned by [`Lexer::lookahead`].  Derefs to the `Lexer` so the consumer
+/// scans with the normal line API.  On drop it snaps the lexer back to the line and cursor where the scan began,
+/// leaving the previewed lines queued for re-delivery and recording where the scan ended for `consume_lookahead`.
+#[allow(dead_code)] // Constructed only by `lookahead`, which has no consumers yet.
+pub(crate) struct Lookahead<'a> {
+    lexer: &'a mut Lexer,
+    /// Cursor position on the current line at the moment the scan began.
+    entry_pos: usize,
+}
+
+impl Drop for Lookahead<'_> {
+    fn drop(&mut self) {
+        let entry_pos = self.entry_pos;
+        let lx = &mut *self.lexer;
+
+        // Record where the scan ended — the current line's unique offset (the `consume_lookahead` key) and cursor —
+        // before any lines move, plus whether the scan ever left its starting line.
+        let end_offset = lx.line.as_ref().map(|l| l.offset);
+        let end_pos = lx.line.as_ref().map_or(0, |l| l.pos);
+        let displaced = !lx.lookahead.is_empty();
+
+        // Reclaim the original current line: the front of the capture queue if the scan crossed a boundary, else the
+        // still-current line.  Re-install it through `install_line` — while `lookahead_mode` is still set it captures
+        // the line it displaces, so installing the entry line sweeps the scan-end line onto the back of the capture
+        // queue and refreshes the restored line's derived state, with its cursor already back at the entry position.
+        let entry = if displaced { lx.lookahead.pop_front() } else { lx.line.take() };
+        if let Some(mut entry) = entry {
+            entry.pos = entry_pos;
+            lx.install_line(entry);
+        }
+
+        // The capture queue now holds exactly the previewed run; re-queue it for replay, each line from its start.
+        let mut replay = mem::take(&mut lx.lookahead);
+        for line in replay.iter_mut() {
+            line.pos = 0;
+        }
+        lx.push_back(replay);
+
+        // The scan-end line is reachable for `consume_lookahead` only when the scan actually left the original line.
+        lx.lookahead_offset = if displaced { end_offset } else { None };
+        lx.lookahead_pos = Some(end_pos);
+
+        // Rewind the counter to just past the restored line; its number is unchanged, so delivery resumes exactly
+        // where it left off, and no separate saved value is needed.
+        if let Some(number) = lx.line.as_ref().map(|l| l.number) {
+            lx.line_number = number + 1;
+        }
+        lx.lookahead_mode = false;
+    }
+}
+
+impl Deref for Lookahead<'_> {
+    type Target = Lexer;
+
+    fn deref(&self) -> &Lexer {
+        self.lexer
+    }
+}
+
+impl DerefMut for Lookahead<'_> {
+    fn deref_mut(&mut self) -> &mut Lexer {
+        self.lexer
     }
 }
