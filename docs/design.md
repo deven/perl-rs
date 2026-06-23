@@ -2898,8 +2898,8 @@ is *load-bearing*, not defensive: because the step unconditionally re-pushes
 every child, a child that a constructor stamped at construction is still
 pushed by its parent and must be skipped when popped — the guard is what
 makes first-writer-wins work.  It also makes the pass idempotent and lets
-deferred arms (see below) be filled in by a later mechanism without the pass
-fighting them.
+deferred arms (see below) be filled in by construction-time stamping
+without the pass fighting them.
 
 Statement nesting — which is shallow and not adversarial — is still handled
 by ordinary recursion in a set of statement/block routers (`save_context_body`,
@@ -2973,16 +2973,11 @@ context from the parens-fact it has in hand (via the transient `Paren`):
 `\@a` stamps the operand `Context::Scalar`, `\(@a)` stamps it
 `Context::List`.
 
-> Implementation status.  This refgen stamping, and the assignment
-> LHS-kind rule below, are the *design target*; they depend on the
-> transient `Paren` (§6.2.3), which the parser does not yet construct.  In
-> the current code the `save_context` step leaves the `Assign` and `Ref`
-> arms **deferred** (their children unstamped), so no construction-time
-> stamping happens yet — every node is stamped by the descent.  When these
-> arms land, the parent constructor will stamp the intrinsic-context child
-> subtree directly (e.g. the refgen operand from the parens-fact); the
-> first-writer-wins guard (above) is what lets that construction-time stamp
-> survive the descent.
+The `save_context` descent leaves the `Assign` and `Ref` arms deferred:
+it does not re-stamp their children.  Each such child — the refgen
+operand (from the parens-fact) and the two assignment sides (from the
+LHS-kind rule above) — is therefore stamped only at construction, and
+that stamp survives the descent under first-writer-wins.
 
 Behavior is then a function of *the operand's tag* (the parens-fact) **and
 the operand's node kind** (its container-ness), combined at lowering:
