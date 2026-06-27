@@ -141,7 +141,7 @@ fn lexer_line_slice_since() {
     let mut lexer = Lexer::new(b"abcdef\n");
     let mut line = lexer.temp_next_line(false).unwrap().unwrap();
     line.pos = 4;
-    let s = line.line.slice(2..line.pos);
+    let s = line.line.slice(2..line.pos as usize);
     assert_eq!(&s[..], b"cd");
 }
 
@@ -182,7 +182,7 @@ fn heredoc_basic() {
     // Next line: saved remainder (the declaration tail).
     let remainder = lexer.temp_next_line(false).unwrap().unwrap();
     assert_eq!(remainder.pos, 13); // cursor preserved
-    assert_eq!(&remainder.line[remainder.pos..], b" . \"suffix\";");
+    assert_eq!(&remainder.line[remainder.pos as usize..], b" . \"suffix\";");
 
     // Next line: code after the heredoc.
     let after = lexer.temp_next_line(false).unwrap().unwrap();
@@ -395,7 +395,7 @@ fn heredoc_non_indented_inside_indented() {
     // Remainder of OUTER body line restored.
     let remainder = lexer.temp_next_line(false).unwrap().unwrap();
     assert_eq!(remainder.pos, 14);
-    assert_eq!(&remainder.line[remainder.pos..], b" suffix");
+    assert_eq!(&remainder.line[remainder.pos as usize..], b" suffix");
 
     // OUTER body continues.
     let l2 = lexer.temp_next_line(false).unwrap().unwrap();
@@ -579,14 +579,14 @@ fn subst_body_virtual_eof_restores_remainder() {
     assert_eq!(flags.as_deref(), Some("e"));
 
     let body = lexer.temp_next_line(false).unwrap().unwrap();
-    assert_eq!(&body.line[body.pos..], b"bar");
+    assert_eq!(&body.line[body.pos as usize..], b"bar");
 
     // Virtual EOF after all body lines are delivered.
     assert!(matches!(lexer.temp_next_line(false), Ok(None)));
 
     // Then the saved remainder appears.
     let rest = lexer.temp_next_line(false).unwrap().unwrap();
-    assert_eq!(&rest.line[rest.pos..], b" + 1");
+    assert_eq!(&rest.line[rest.pos as usize..], b" + 1");
 }
 
 #[test]
@@ -599,12 +599,12 @@ fn subst_body_captures_multiple_flags_and_restores_remainder() {
     assert_eq!(flags.as_deref(), Some("msix"));
 
     let body = lexer.temp_next_line(false).unwrap().unwrap();
-    assert_eq!(&body.line[body.pos..], b"bar");
+    assert_eq!(&body.line[body.pos as usize..], b"bar");
 
     assert!(matches!(lexer.temp_next_line(false), Ok(None)));
 
     let rest = lexer.temp_next_line(false).unwrap().unwrap();
-    assert_eq!(&rest.line[rest.pos..], b" + 1");
+    assert_eq!(&rest.line[rest.pos as usize..], b" + 1");
 }
 
 #[test]
@@ -617,7 +617,7 @@ fn subst_body_with_paired_delimiter_nesting() {
     assert_eq!(flags.as_deref(), Some("r"));
 
     let body = lexer.temp_next_line(false).unwrap().unwrap();
-    assert_eq!(&body.line[body.pos..], b"a{b}c");
+    assert_eq!(&body.line[body.pos as usize..], b"a{b}c");
 
     assert!(matches!(lexer.temp_next_line(false), Ok(None)));
 }

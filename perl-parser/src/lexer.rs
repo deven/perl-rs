@@ -130,7 +130,7 @@ pub(crate) struct Lexer {
     pub(crate) line: Option<LexerLine>,
 
     /// Next line number to assign (1-based).
-    pub(crate) line_number: usize,
+    pub(crate) line_number: u32,
 
     /// Stack of active heredoc contexts.
     pub(crate) heredoc_stack: Vec<HeredocContext>,
@@ -161,11 +161,11 @@ pub(crate) struct Lexer {
 
     /// Source offset of the line a lookahead scan ended on, identifying it uniquely for `consume_lookahead`.  `Some`
     /// from guard drop until normal delivery reaches that line; `None` if the scan never left its starting line.
-    pub(crate) lookahead_offset: Option<usize>,
+    pub(crate) lookahead_offset: Option<u32>,
 
     /// Cursor position the lookahead scan ended at, within the end line.  Taken by `consume_lookahead`, and cleared
     /// once normal delivery moves past the end line.
-    pub(crate) lookahead_pos: Option<usize>,
+    pub(crate) lookahead_pos: Option<u32>,
 
     /// True while a lookahead guard is alive: `next_line` captures displaced lines and `# line` directive setters are
     /// suppressed.
@@ -265,7 +265,7 @@ impl Lexer {
     /// Global byte position in the original source.
     pub fn pos(&self) -> usize {
         match &self.line {
-            Some(line) => line.offset + line.pos,
+            Some(line) => (line.offset + line.pos) as usize,
             None => self.cursor(),
         }
     }
@@ -456,7 +456,7 @@ impl Lexer {
     // ── Position and span helpers ─────────────────────────────
     /// Current position within the current line (line-local).
     fn line_pos(&self) -> usize {
-        self.line.as_ref().map_or(0, |l| l.pos)
+        self.line.as_ref().map_or(0, |l| l.pos as usize)
     }
 
     /// Global position as u32 for span construction.
@@ -471,7 +471,7 @@ impl Lexer {
     /// current line.
     fn span_from(&self, local_start: usize) -> Span {
         match &self.line {
-            Some(line) => Span::new((line.offset + local_start) as u32, line.global_pos()),
+            Some(line) => Span::new(line.offset + local_start as u32, line.global_pos()),
             None => {
                 let pos = self.cursor() as u32;
                 Span::new(pos, pos)
@@ -482,7 +482,7 @@ impl Lexer {
     /// Advance the cursor by `n` bytes within the current line.
     fn skip(&mut self, n: usize) {
         if let Some(line) = self.line.as_mut() {
-            line.pos += n;
+            line.pos += n as u32;
         }
     }
 
@@ -490,7 +490,7 @@ impl Lexer {
     /// position.
     pub fn rewind(&mut self, n: usize) {
         if let Some(line) = self.line.as_mut() {
-            line.pos -= n;
+            line.pos -= n as u32;
         }
     }
 
@@ -525,7 +525,7 @@ impl Lexer {
         if digit_end == 0 {
             return;
         }
-        let line_num: usize = match std::str::from_utf8(&rest[..digit_end]) {
+        let line_num: u32 = match std::str::from_utf8(&rest[..digit_end]) {
             Ok(s) => match s.parse() {
                 Ok(n) => n,
                 Err(_) => return,
@@ -556,7 +556,7 @@ impl Lexer {
     /// Byte slice from line-local `start` to current cursor position.
     fn line_slice(&self, start: usize) -> &[u8] {
         match &self.line {
-            Some(line) => &line.line[start..line.pos],
+            Some(line) => &line.line[start..line.pos as usize],
             None => &[],
         }
     }
@@ -667,13 +667,13 @@ impl Lexer {
         // end of the identifier.  Leave `}` unconsumed for the parser to match.
         let offset = line.offset;
         let pos = line.pos;
-        let span_start = if has_dash { pos } else { pos + ident_start };
-        let start_global = (offset + span_start) as u32;
-        let end_global = (offset + pos + ident_end) as u32;
+        let span_start = if has_dash { pos } else { pos + ident_start as u32 };
+        let start_global = offset + span_start;
+        let end_global = offset + pos + ident_end as u32;
 
         // Advance the lexer past the identifier and trailing whitespace (up to but not including `}`).
         let mline = self.line.as_mut()?;
-        mline.pos += i;
+        mline.pos += i as u32;
 
         Some((name, Span::new(start_global, end_global)))
     }
@@ -766,8 +766,8 @@ impl Lexer {
         // Drop the consumed line from source-tracking state.
         self.line = None;
 
-        let offset_u32 = offset as u32;
-        let line_end_u32 = (offset + bytes.len()) as u32;
+        let offset_u32 = offset;
+        let line_end_u32 = offset + bytes.len() as u32;
 
         // Classify: terminator, comment, blank, or picture.
         if is_format_terminator(&bytes) {
@@ -794,7 +794,7 @@ impl Lexer {
         }
 
         // Tokenize as a picture/literal line.
-        self.format_tokenize_picture_line(offset, &bytes, stripped)
+        self.format_tokenize_picture_line(offset as usize, &bytes, stripped)
     }
 
     /// Tokenize one non-comment non-blank non-terminator line.  `offset` is the byte offset of the start of the line in
@@ -1322,7 +1322,7 @@ impl Lexer {
 
             // Not a v-string — rewind and parse as float.
             if let Some(line) = self.line.as_mut() {
-                line.pos = saved_pos;
+                line.pos = saved_pos as u32;
             }
 
             // Float
@@ -2056,7 +2056,7 @@ impl Lexer {
                 // like operators use ' as a delimiter; unconditional keywords (print, grep, die, etc.) always stop;
                 // feature-gated keywords (given, any, try, etc.) stop only when their feature is active.
                 if let Some(line) = &self.line {
-                    let so_far = &line.line[start..line.pos];
+                    let so_far = &line.line[start..line.pos as usize];
                     if self.is_active_keyword(so_far) {
                         break;
                     }
@@ -2111,7 +2111,7 @@ impl Lexer {
                 }
                 self.line = None;
                 let offset = match self.next_line(false) {
-                    Ok(Some(line)) => line.offset as u32,
+                    Ok(Some(line)) => line.offset,
                     _ => self.cursor() as u32,
                 };
                 self.data_end_info = Some((kw, offset));
@@ -2126,7 +2126,7 @@ impl Lexer {
                 return Ok(Token::SourceFile(saved_filename));
             }
             "__LINE__" => {
-                let saved_line_no = self.line.as_ref().map(|l| l.number).unwrap_or(0) as u32;
+                let saved_line_no = self.line.as_ref().map(|l| l.number).unwrap_or(0);
                 if self.at_fat_comma() {
                     return Ok(Token::StrLit(name));
                 }
@@ -2860,7 +2860,7 @@ impl Lexer {
 
                 // Not a simple ${name} — backtrack and scan as expression
                 if let Some(line) = self.line.as_mut() {
-                    line.pos = saved_pos;
+                    line.pos = saved_pos as u32;
                 }
             }
 
@@ -3355,7 +3355,7 @@ impl Lexer {
         } else {
             // Not a readline — rewind.
             if let Some(line) = self.line.as_mut() {
-                line.pos = start_pos;
+                line.pos = start_pos as u32;
             }
             None
         }
@@ -3379,7 +3379,7 @@ impl Lexer {
 
             // Single `>` after `<<` — not a valid heredoc or diamond.  Rewind.
             if let Some(line) = self.line.as_mut() {
-                line.pos = saved;
+                line.pos = saved as u32;
             }
             return Ok(None);
         }
@@ -3410,7 +3410,7 @@ impl Lexer {
             _ => {
                 // No valid tag — rewind to just after << so the parser can proceed with a normal shift-left.
                 if let Some(line) = self.line.as_mut() {
-                    line.pos = saved;
+                    line.pos = saved as u32;
                 }
                 Ok(None)
             }

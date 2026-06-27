@@ -27,10 +27,10 @@ mod tests;
 #[derive(Clone, Debug)]
 pub(crate) struct LexerLine {
     /// 1-based line number in the original source.
-    pub number: usize,
+    pub number: u32,
 
     /// Byte offset of the start of this line in the original source.
-    pub offset: usize,
+    pub offset: u32,
 
     /// Line content without line ending.  When inside an indented heredoc, the required indentation prefix has been
     /// stripped.
@@ -40,7 +40,7 @@ pub(crate) struct LexerLine {
     pub terminated: bool,
 
     /// Current scanning position within `line`.
-    pub pos: usize,
+    pub pos: u32,
 
     /// Whether the line contains only ASCII bytes (all < 0x80).  Computed for free during newline scanning and used to
     /// skip UTF-8 decoding and NFC normalization for all-ASCII lines.
@@ -52,9 +52,10 @@ impl LexerLine {
     /// only when truly exhausted (past \n or unterminated line fully consumed).
     #[inline]
     pub fn peek_byte(&self) -> Option<u8> {
-        if self.pos < self.line.len() {
-            Some(self.line[self.pos])
-        } else if self.pos == self.line.len() && self.terminated {
+        let pos = self.pos as usize;
+        if pos < self.line.len() {
+            Some(self.line[pos])
+        } else if pos == self.line.len() && self.terminated {
             Some(b'\n')
         } else {
             None
@@ -64,7 +65,7 @@ impl LexerLine {
     /// Peek at a byte at an offset from the current position.
     #[inline]
     pub fn peek_byte_at(&self, offset: usize) -> Option<u8> {
-        let idx = self.pos + offset;
+        let idx = self.pos as usize + offset;
         if idx < self.line.len() {
             Some(self.line[idx])
         } else if idx == self.line.len() && self.terminated {
@@ -79,11 +80,12 @@ impl LexerLine {
     #[cfg(test)]
     #[inline]
     pub fn advance_byte(&mut self) -> Option<u8> {
-        if self.pos < self.line.len() {
-            let b = self.line[self.pos];
+        let pos = self.pos as usize;
+        if pos < self.line.len() {
+            let b = self.line[pos];
             self.pos += 1;
             Some(b)
-        } else if self.pos == self.line.len() && self.terminated {
+        } else if pos == self.line.len() && self.terminated {
             self.pos += 1;
             Some(b'\n')
         } else {
@@ -94,13 +96,14 @@ impl LexerLine {
     /// The remaining unscanned content bytes (not including the virtual `\n` line terminator).
     #[inline]
     pub fn remaining(&self) -> &[u8] {
-        if self.pos < self.line.len() { &self.line[self.pos..] } else { &[] }
+        let pos = self.pos as usize;
+        if pos < self.line.len() { &self.line[pos..] } else { &[] }
     }
 
     /// Byte offset in the original source at the current cursor position.  Used for span construction.
     #[inline]
     pub fn global_pos(&self) -> u32 {
-        (self.offset + self.pos) as u32
+        self.offset + self.pos
     }
 }
 
@@ -114,8 +117,8 @@ pub(crate) struct HeredocContext {
 
 /// A raw line read from the source buffer before indent processing.
 struct RawLine {
-    number: usize,
-    offset: usize,
+    number: u32,
+    offset: u32,
     content: Bytes,
     terminated: bool,
     ascii_only: bool,
@@ -213,7 +216,7 @@ impl Lexer {
 
     /// Current line number (1-based).
     #[allow(dead_code)]
-    pub fn line_number(&self) -> usize {
+    pub fn line_number(&self) -> u32 {
         self.line_number
     }
 
@@ -224,7 +227,7 @@ impl Lexer {
     }
 
     /// Override the line number for `# line N` directives.
-    pub fn set_line_number(&mut self, n: usize) {
+    pub fn set_line_number(&mut self, n: u32) {
         // A directive crossed during a speculative scan must not renumber anything: the line it sits on might turn out
         // to be heredoc body text.  The directive takes effect on the real pass, when the line is delivered for real.
         if self.lookahead_mode {
@@ -343,7 +346,9 @@ impl Lexer {
     fn install_line(&mut self, line: LexerLine) -> &Option<LexerLine> {
         // During an active lookahead, capture the line being displaced (in displacement order) so the guard can restore
         // the original current line and queue the rest for replay.
-        if self.lookahead_mode && let Some(displaced) = self.line.take() {
+        if self.lookahead_mode
+            && let Some(displaced) = self.line.take()
+        {
             self.lookahead.push_back(displaced);
         }
 
@@ -457,7 +462,7 @@ impl Lexer {
             (buf, len)
         });
         let mut body_lines: VecDeque<LexerLine> = VecDeque::new();
-        let mut pos = line.pos;
+        let mut pos = line.pos as usize;
         let mut depth = 0u32;
 
         loop {
@@ -512,7 +517,7 @@ impl Lexer {
                 let saved = LexerLine {
                     line: line.line.clone(),
                     offset: line.offset,
-                    pos: flag_end,
+                    pos: flag_end as u32,
                     terminated: line.terminated,
                     number: line.number,
                     ascii_only: line.ascii_only,
@@ -573,7 +578,7 @@ impl Lexer {
         // Advance cursor past the \n (if present).
         self.cursor = if terminated { end + 1 } else { end };
 
-        Some(RawLine { number, offset: start, content: self.src.slice(start..content_end), terminated, ascii_only })
+        Some(RawLine { number, offset: start as u32, content: self.src.slice(start..content_end), terminated, ascii_only })
     }
 
     /// Strip the required indent from a raw line.
@@ -588,16 +593,20 @@ impl Lexer {
                 // Empty line — allowed without indent.
                 (raw.content, 0)
             } else {
-                return Err(ParseError::new(
-                    "indentation of here-doc doesn't match delimiter",
-                    Span::new(raw.offset as u32, (raw.offset + raw.content.len()) as u32),
-                ));
+                return Err(ParseError::new("indentation of here-doc doesn't match delimiter", Span::new(raw.offset, raw.offset + raw.content.len() as u32)));
             }
         } else {
             (raw.content, 0)
         };
 
-        Ok(LexerLine { number: raw.number, offset: raw.offset + indent_len, line: content, terminated: raw.terminated, pos: 0, ascii_only: raw.ascii_only })
+        Ok(LexerLine {
+            number: raw.number,
+            offset: raw.offset + indent_len as u32,
+            line: content,
+            terminated: raw.terminated,
+            pos: 0,
+            ascii_only: raw.ascii_only,
+        })
     }
 
     /// Scan ahead from the current cursor to find an indented heredoc terminator.  Returns the full raw whitespace
@@ -664,7 +673,7 @@ impl Lexer {
 pub(crate) struct Lookahead<'a> {
     lexer: &'a mut Lexer,
     /// Cursor position on the current line at the moment the scan began.
-    entry_pos: usize,
+    entry_pos: u32,
 }
 
 impl Drop for Lookahead<'_> {
