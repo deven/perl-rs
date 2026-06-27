@@ -993,49 +993,50 @@ then consults the symbol table to decide how to parse the arguments).
 
 The lexer does not read source bytes directly.  A dedicated *source
 layer* manages line-oriented source delivery, CRLF normalization,
-heredoc body sequencing, substitution body partitioning, and
-indentation stripping.  The rest of the lexer receives one line at a
-time and scans bytes within it, never dealing with line boundaries,
-newline encoding, or heredoc line reordering.
+heredoc body delivery, delimited-body framing, and `<<~` indent
+stamping.  The rest of the lexer receives one line at a time and scans
+bytes within it, never dealing with line boundaries, newline encoding,
+or heredoc interleaving.
 
 The source layer is not a separate type.  Its fields live directly on
 `Lexer` and its methods are `impl Lexer` methods, organized into their
-own module (`source.rs`) for conceptual clarity.  Earlier the layer
-was a distinct `LexerSource` struct held as a field, but the lexer and
-its source are in strict one-to-one correspondence and share mutable
-state intimately — every token scan coordinates current-line position,
-the context stack, and the line-delivery queues together.  A separate
-type is the textbook arrangement, but here it imposed a real cost: a
-borrow boundary that forced constant ownership negotiations (which
-struct owns the current line, the context stack, the saved
-remainders), `self.source.` indirection on hot paths, and methods that
-genuinely needed both sides at once.  None of the usual justifications
-for the split applied — there is no many-to-one relationship, no reuse
-of the source without the lexer, no trait-based substitution, and no
-invariant that needs protecting from the lexer itself.  Internal
-encapsulation is protection from oneself; the encapsulation that
-matters is at the crate boundary, which `pub(crate)`/`pub` markers on
-the lexer's API provide regardless of internal structure.  Keeping the
-module (`source.rs`) preserves the organizational clarity of the
-source layer without paying for a type boundary that returned less
-than it cost.
+own module (`source.rs`) for conceptual clarity.  Earlier the layer was
+a distinct `LexerSource` struct held as a field, but the lexer and its
+source are in strict one-to-one correspondence and share mutable state
+intimately — every token scan coordinates current-line position and the
+context stack together, the stack now carrying source frame and lex mode
+in one entry.  A separate type is the textbook arrangement, but here it
+imposed a real cost: a borrow boundary that forced constant ownership
+negotiations (which struct owns the current line, the context stack, the
+suspended frame lines), `self.source.` indirection on hot paths, and
+methods that genuinely needed both sides at once.  None of the usual
+justifications for the split applied — there is no many-to-one
+relationship, no reuse of the source without the lexer, no trait-based
+substitution, and no invariant that needs protecting from the lexer
+itself.  Internal encapsulation is protection from oneself; the
+encapsulation that matters is at the crate boundary, which
+`pub(crate)`/`pub` markers on the lexer's API provide regardless of
+internal structure.  Keeping the module (`source.rs`) preserves the
+organizational clarity of the source layer without paying for a type
+boundary that returned less than it cost.
 
 #### 5.4.1 Why a source layer:
 
 Without this abstraction, the lexer must juggle byte-level position
-pointers, CRLF normalization (either preprocessing via `Cow` or
-per-byte checks in every accessor), heredoc redirect tables, saved
-line positions for heredoc remainder restoration, indent
-save/restore stacks, and terminator detection interleaved with
-content scanning.  These are all line-level concerns forced into a
-byte-level API, resulting in significant accidental complexity.
+pointers, CRLF normalization (either preprocessing via `Cow` or per-byte
+checks in every accessor), the source-frame stack and its bounds, the
+suspended lines of frames below the delivery top, `<<~` indentation
+recorded per line, and up-front terminator scanning.  These are all
+line-level concerns forced into a byte-level API, resulting in
+significant accidental complexity.
 
 #### 5.4.2 Dependencies:
 
 `perl-parser` depends on the `bytes` crate.  The source layer uses
 `Bytes` for zero-copy reference-counted slices of the source buffer.
-Line slicing, heredoc remainder saving, and indentation prefixes are
-all `Bytes` handles into the same underlying allocation — no copying.
+Line slicing — including partial lines at frame bounds — and the
+suspended lines of frames below the top are all `Bytes` handles into the
+same underlying allocation — no copying.
 `perl-regex` remains dependency-free, operating on `&[u8]` and
 `&str` slices; the conversion from `Bytes` to `&[u8]` is free
 (`Bytes` derefs to `&[u8]`).
@@ -1050,16 +1051,29 @@ and `offset` for span computation:
 ```rust
 struct LexerLine {
     /// 1-based line number in the original source.
-    number: usize,
+    number: u32,
     /// Byte offset of the start of this line in the original source.
-    offset: usize,
-    /// Line content without line ending.  When inside an indented
-    /// heredoc, the required indentation prefix has been stripped.
+    /// Always physical — never adjusted for `<<~` indentation — so it
+    /// serves as a stable identity key, e.g. matching a lookahead
+    /// endpoint against a re-delivered line (§5.4.11).
+    offset: u32,
+    /// Line content without line ending, exactly as it appears in the
+    /// source.  For `<<~` bodies the indentation is recorded in
+    /// `indent`, not sliced out of `line`.
     line: Bytes,
     /// Whether this line was terminated by a newline in the source.
     terminated: bool,
-    /// Current scanning position within `line`.
-    pos: usize,
+    /// Leading bytes of `line` that are `<<~` indentation to skip;
+    /// 0 for every fresh read.  A `<<~` body line is stamped with its
+    /// required indent once, during the terminator scan (§5.4.5) —
+    /// recorded rather than removed, so `line` and `offset` stay
+    /// physical and the cursor (`pos`) begins here.
+    indent: u32,
+    /// Current scanning position within `line`.  A fresh read starts
+    /// at 0, and so does `indent`; only the `<<~` scan raises `indent`
+    /// and sets `pos = indent`.  Any later cursor-to-line-start reset —
+    /// a lookahead replay among them — resets `pos = indent`, not 0.
+    pos: u32,
     /// Whether the line contains only ASCII bytes (all < 0x80).
     /// Computed for free during newline scanning and used to skip
     /// UTF-8 decoding and NFC normalization on all-ASCII lines.
@@ -1071,6 +1085,21 @@ impl LexerLine {
     fn peek_byte(&self) -> Option<u8>;
     fn peek_byte_at(&self, offset: usize) -> Option<u8>;
     fn remaining(&self) -> &[u8];       // borrowed view for comparisons
+    /// This line's current cursor as a `LexerLinePosition`.
+    fn position(&self) -> LexerLinePosition {
+        LexerLinePosition { offset: self.offset, pos: self.pos }
+    }
+}
+
+/// A point in the source as line-relative coordinates: `offset`
+/// selects the line by its physical start offset, `pos` the cursor
+/// within it.  `u32` to match `Span` — but distinct from it, since
+/// `Span` is absolute and this is a lexer-internal coordinate tied
+/// to `LexerLine`.  Used for frame bounds (§5.4.4) and lookahead
+/// endpoints (§5.4.11).
+struct LexerLinePosition {
+    offset: u32,
+    pos: u32,
 }
 ```
 
@@ -1093,45 +1122,109 @@ restoring a line (e.g. for heredoc remainder) automatically preserves
 the cursor position within that line.  The lexer transparently
 resumes mid-line without any special-case logic.
 
-#### 5.4.4 Source layer internal architecture:
+For `<<~` bodies the indentation is not sliced out and is not handled
+by a separate strip pass on fresh reads — a fresh read always has
+`indent = 0`.  The required indent is stamped onto each body line once,
+during the terminator scan that must already walk those lines to find
+the close (§5.4.5).  Stamping records the indent in `indent` and leaves
+`line` and `offset` physical, which matters on two counts.  First,
+`offset` is the identity key the lookahead layer (§5.4.11) matches a
+recorded endpoint against when the same line is re-delivered, and that
+key must be indent-invariant: a terminator scan records the endpoint
+before the heredoc's indent is known, and the line is re-seen during
+body delivery once it is, so an `offset` shifted by stripping would
+fail to match and endpoint detection would run past the end.  Second,
+because the cursor begins at `pos = indent` rather than at a sliced
+buffer, a line captured during one scan can be re-examined by a nested
+scan — which reads the indent already in effect and adds its own on top
+(§5.4.5) — without any line ever being stripped twice.
 
-The source layer maintains a line queue (`VecDeque<LexerLine>`) and a
-push-back mechanism for line reordering.  When heredoc bodies or
-substitution bodies need to be served before the continuation of the
-current line, the relevant lines are queued and the saved remainder
-is pushed back for delivery after the body is consumed.
+#### 5.4.4 The source-frame stack:
+
+The source layer does not hold a single source.  The lexer maintains one
+stack of *frames*, and each frame is a bounded sub-source: a view over
+the line stream that yields lines and bytes up to a recorded endpoint
+and then reports virtual EOF — an end of input indistinguishable, to
+anything scanning within it, from the real end of the program.  The
+bottom frame is the whole program, bounded only by real EOF.  Heredoc
+bodies and delimited bodies — `s///`, `q//`, regex, `qw//`,
+interpolating strings — each push a frame.
+
+This is the same stack as the lexer's context stack (§5.5): one entry
+per active construct, carrying both the construct's source-delivery
+frame and its lex mode.  This subsection covers the delivery side; §5.5
+covers the mode side and why the two are one stack.
+
+A frame is a view over the *line stream*, not over a contiguous slice of
+the byte buffer.  Heredoc interleaving forces this: a heredoc body is
+delivered from the physical lines following the line that introduces it,
+so a region that introduces a heredoc has logical content spliced in
+from lines outside its own delimiters in the raw buffer.  A contiguous
+slice cannot represent that splice; only the line stream that performs
+it can.
+
+A frame's bound is a recorded endpoint — a `LexerLinePosition` (§5.4.3):
+the physical offset of the line the region ends on (stable and unique
+where the line number is not) and the cursor position within it.
+Delivery compares each line's `offset` against the bound's; lines before
+it are yielded whole, and the line whose `offset` matches is the
+endpoint line.  When the endpoint falls mid-line that line is delivered
+as a *partial line* — a `LexerLine` narrowed to a slice ending at the
+endpoint — after which the frame reports virtual EOF.  A heredoc body
+ends at the start of its terminator line, so its last line is whole; a
+delimited body whose close sits mid-line ends on a partial line.
+Front-narrowing for `<<~` indent and end-narrowing for a partial
+endpoint therefore never fall on the same line: heredoc bodies end
+whole, and delimited bodies are never indent-stamped.
+
+Delivery normally reads from the real top of the stack and reports
+virtual EOF when that frame's bound is reached.  `context_top` is a
+single field, normally `0`, that redirects *only* the virtual-EOF
+test: when it is non-zero, `next_line` checks the bound of
+`frames[context_top]` instead of the top frame's, so delivery runs to
+a lower frame's EOF while still reading lines forward from the shared
+position.  It changes nothing else — not which bytes `peek_byte`
+returns, not the current line.  Only the heredoc terminator scan raises
+it, to bound the scan by the *host* frame's EOF rather than the
+mid-line frame on top (§5.4.5), and only for the window between starting
+that scan and pushing the body frame; pushing the body frame resets it
+to `0`, and so does dismissing the scan.  `context_top` is never nested
+and carries no saved value.  The lookahead primitive (§5.4.11) is
+oblivious to it: the scan simply calls `next_line` and inherits the
+host's bound for free, naming no frame.  A scanner cannot read past the
+end of its sub-source because the bytes are simply not delivered — the
+boundary is a wall, not a convention, and no scanner is aware of the
+frame that contains it.
 
 ```rust
 impl Lexer {
-    /// Get the next line.  Serves queued lines (heredoc bodies,
-    /// substitution bodies) first, then reads from the source.
-    /// Returns `Ok(None)` for virtual EOF (heredoc/subst body
-    /// finished — the saved remainder follows on the next call).
-    /// `peek_heredoc` controls whether a found terminator is
-    /// consumed or merely peeked (used by `lex_body` to detect
-    /// end-of-body without consuming the signal).
-    fn next_line(&mut self, peek_heredoc: bool)
+    /// Deliver the next line, reporting `Ok(None)` at virtual EOF.
+    /// The EOF test is taken against the `context_top` frame's bound
+    /// (normally the top frame's).  Because a body's end is found up
+    /// front by the terminator scan (§5.4.5) and recorded as the
+    /// frame's bound, delivery needs no per-line terminator check.
+    fn next_line(&mut self)
         -> Result<Option<LexerLine>, ParseError>;
 
-    /// Begin processing a non-indented heredoc body.  Takes the
-    /// current line (saving its remainder for later), queues body
-    /// lines until the terminator is found.
+    /// Enter a non-indented heredoc body (§5.4.5).  Walks down to the
+    /// host frame, runs `lookahead()` to locate the terminator, and
+    /// pushes the body frame.
     fn start_heredoc(&mut self, tag: Bytes)
         -> Result<(), ParseError>;
 
-    /// Begin processing an indented heredoc body (`<<~`).  Scans
-    /// ahead to find the terminator, extracts its whitespace prefix
-    /// as the required indentation, and strips that prefix from all
-    /// body lines.
+    /// Enter an indented heredoc body, `<<~` (§5.4.5).  As
+    /// `start_heredoc`, and additionally stamps the terminator's
+    /// whitespace prefix as `indent` on each body line — recorded,
+    /// not stripped (§5.4.3).
     fn start_indented_heredoc(&mut self, tag: Bytes)
         -> Result<(), ParseError>;
 
-    /// Partition a substitution replacement body.  Scans forward
-    /// from the current position in the current line to find the
-    /// closing delimiter (tracking nesting depth for paired
-    /// delimiters), queues the body content as lines with a
-    /// virtual EOF, extracts flags, and saves the remainder.
-    fn start_subst_body(&mut self, delim: char, extra_paired: bool)
+    /// Enter a delimited body — `s///` replacement, `q//`, regex,
+    /// `qw//`, interpolating string (§5.4.6).  Scans for the closing
+    /// delimiter (tracking nesting for paired delimiters) and
+    /// promotes the lookahead span into a frame, returning any
+    /// trailing flags.
+    fn start_delimited_body(&mut self, delim: char, extra_paired: bool)
         -> Result<Option<String>, ParseError>;
 
     /// Override line numbering for `# line` directives.
@@ -1140,44 +1233,144 @@ impl Lexer {
 }
 ```
 
-#### 5.4.5 Heredoc line sequencing:
+#### 5.4.5 Heredoc bodies:
 
-When `start_heredoc` or `start_indented_heredoc` is called:
+A heredoc's body is not the span at `<<TAG`; it is the run of physical
+lines after the introducer line completes, up to the terminator line.
+The body must be delivered immediately — before the rest of the
+introducer line — yet it is drawn from lines that may lie below the
+current frame.  The introducer line's `terminated` flag decides from
+where.
 
-1. The current `LexerLine` (with its cursor position) is taken from
-   the lexer's `Option<LexerLine>` and saved internally.
-2. Subsequent source lines are read and queued as body lines until
-   the terminator is found.
-3. The terminator line itself is consumed (not delivered to the lexer).
-4. `next_line()` serves the queued body lines, then returns
-   `Ok(None)` to signal "body finished."
-5. On the following call, `next_line()` returns the saved remainder
-   line — the continuation of the original line after `<<TAG`.
+The source layer walks down from the real top to the nearest frame whose
+current line is `terminated: true` — the *host*.  A `<<TAG` on a line
+that ends in a real newline is its own host, and the walk stops at the
+top with `context_top` left at `0`.  A `<<TAG` whose introducer line is
+a mid-line partial line — `terminated: false`, as when it sits inside an
+`/e` replacement frame that ends at its closing delimiter — cannot host
+the body, so the walk skips it and any other mid-line frames down to the
+nearest frame whose current line ends in a physical newline.
 
-For multiple heredocs on one line (`<<A, <<B`), this nests naturally:
-A's body is consumed, the saved remainder (`, <<B);\n`) is returned,
-the lexer encounters `<<B` and calls `start_heredoc` again, which
-saves the new remainder (`);\n`) and queues B's body.  No special
-stacking logic in the lexer.
+`context_top` is then set to the host, and `lookahead()` (§5.4.11) runs
+on it — bound by the host's own virtual EOF, so the terminator search
+cannot escape the host's region, with no frame-targeting threaded into
+the scan.  The scan reads forward and tests each line for the tag at
+`pos = indent`.  The test is keyed on the heredoc form: a plain `<<TAG`
+requires the line from `pos = indent` to equal the tag exactly, with no
+whitespace skipped (only an enclosing `<<~`'s already-folded indent
+precedes `pos`); a `<<~TAG` skips leading whitespace from `pos = indent`
+and matches the tag at that point, and the skipped span *is* the
+heredoc's new required indent.  Reaching virtual or real EOF before the
+terminator is a fatal error.  The scan records the body span — the lines
+after the introducer up to, but not including, the terminator — and the
+terminator's offset and position.
 
-#### 5.4.6 Substitution body partitioning:
+For a `<<~`, the indentation is resolved here, while the captured lines
+are still fresh in the lookahead queue — before lookahead mode ends, so
+"replayed lines never change indent" holds.  Taking the new indent as
+the slice from `pos = indent` to the tag on the terminator line, the
+scan walks the captured body lines (every line except the first, the
+introducer, which is left alone) and validates each from `pos = indent`:
+the line either ends exactly there — `length == pos`, a logical blank
+line, accepted and delivering nothing — or it must carry the full new
+indent, after which `pos` advances and `indent` is set to it.  Anything
+between — whitespace present but short of the new indent, or non-
+whitespace before the indent completes — is a fatal "indentation doesn't
+match delimiter" error.  This staging is load-bearing for nesting: an
+inner `<<~` scan runs on lines an outer `<<~` already advanced to its
+own `pos = indent`, so it validates and adds *its* indent on top, and
+`indent` only ever grows across nested scans (restored on pop because
+the lines carry it).  The blank-line rule composes the same way — a line
+that is full-outer-then-empty is blank at the inner stage — which is why
+a 2-space line is a valid blank inside nested 2-and-2 indents while a
+1- or 3-space line is the fatal mismatch, matching perl.  The terminator
+line's own indent is logically raised to the body's level too, on the
+principle that it shares the level by definition; this is moot in
+practice since the terminator line is discarded.
 
-`s/pattern/replacement/flags` requires scanning ahead to find the
-replacement body's closing delimiter and extract flags before the
-lexer processes the replacement content.  `start_subst_body` handles
-this:
+The body frame is pushed at the real top, above the untouched mid-line
+frames, and `context_top` resets to `0` in the same step, making the
+body frame the delivery frame.  Its bound is logical byte 0 of the
+terminator line — the terminator's offset paired with its own
+`pos = indent` — and the body lines were already stamped with their
+required indent during the scan (§5.4.3), so delivery replays them
+as-is.  Once the bound is recorded, the scan drops the terminator line
+by setting the current line to `None` — its `(offset, pos)` is captured
+and nothing downstream needs it — so the terminator is neither delivered
+nor replayed, and when the body reaches virtual EOF the host is already
+positioned past it.  Popping the frame then restores the suspended
+introducer line and resumes lexing from its cursor — the rest of the
+introducer line, just past the `<<TAG` — with no terminator-discard step
+and no branch on body kind.  This is the same uniform pop a delimited
+body uses (§5.4.6).
 
-1. Scans the current line (and subsequent lines if needed) for the
-   closing delimiter, tracking nesting depth for paired delimiters
-   like `s{pattern}{replacement}`.
-2. Partitions the line: body content is queued with a virtual EOF,
-   flags are captured, and the remainder after the flags is saved.
-3. The lexer processes the body lines normally, hitting the virtual
-   EOF when the body is exhausted.  The saved remainder is delivered
-   on the next `next_line()` call.
+Because parsing is left to right and a heredoc is fully processed where
+its `<<` is parsed, no more than one heredoc is ever pending.  In `<<A
+<<B` on one line, A is processed completely — its body delivered through
+its terminator — before `<<B` is parsed; `<<B` then runs the identical
+walk from wherever the stack now is, finds the same host with its read
+position already past A's terminator, and scans B's body from there.
+Each `<<` re-walks independently; the state lives in the stack and the
+host's read position, not a saved pending set.  A heredoc reached while
+a heredoc body is current is not this case: a body line is a complete
+physical line, hence `terminated: true`, so the body frame is itself a
+valid host and the walk skips nothing.
 
-This is the same queue-and-save mechanism used for heredocs, extended
-to handle the delimited replacement body.
+#### 5.4.6 Delimited bodies:
+
+A delimited body — an `s///` pattern or replacement, `q//` and its kin,
+a regex, a `qw//` list, an interpolating string — is the text from the
+cursor, just inside the opening delimiter, to the matching close,
+possibly spanning lines.  `lookahead()` (§5.4.11) scans forward for that
+close, tracking balanced nesting for paired delimiters and honoring
+backslash escapes and multi-byte delimiters.  The scan is flat and
+textual: it finds *this* region's end without interpreting its contents
+or recursing into nested constructs, which are scanned and pushed only
+when tokenization later reaches them.  When the close sits on the same
+line as the opener — the common case — the body never spans a newline
+and the frame is unterminated in the line sense; a heredoc introduced
+inside it therefore hosts on the current line (§5.4.5), since the
+delimited frame's own line is mid-line and cannot host.
+
+The endpoint is recorded as a `LexerLinePosition` (§5.4.3), the same
+type any frame bound uses, with `pos` pointing at the closing delimiter
+— but it is stamped directly by `start_delimited_body`, not taken
+through `consume_lookahead`.  That endpoint becomes the frame's virtual
+EOF, and the previewed span is *promoted* into a frame — a third
+disposition of a lookahead, alongside rewinding it (the guard's drop)
+and committing to it (`consume_lookahead`, §5.4.11).  Because the close
+rarely begins a line, the endpoint is usually mid-line, and the frame
+delivers a partial line there.  Delivery compares each line's `offset`
+against the bound's, and the line whose `offset` matches — whether it is
+the line current when the frame is pushed or one reached later — is
+narrowed to a `LexerLine` ending at the close, after which the frame
+reports virtual EOF.  The one comparison covers both cases: the current
+line is found by `self.line.offset == bound.offset` just as a later line
+is, so there is no separate current-versus-future state to track or
+clear.  The content is then lexed against the frame and terminates
+naturally at virtual EOF — it physically cannot pass the region's end —
+after which the consumer pops and resumes the parent at the character
+after the close, where the suspended parent line's cursor was advanced
+before the frame was pushed, so the pop carries no resume logic of its
+own (§5.5).
+
+A substitution is two sequential promote/parse/pop cycles, with one seam
+between them: how the replacement's opening delimiter is established.
+The pattern region is scanned, promoted, parsed as a regex, and popped —
+and that pop resumes the outer line at the character immediately after
+the pattern's closing delimiter.  For an *unpaired* delimiter (`s/././`)
+that character is the shared middle delimiter, which does double duty as
+the pattern's close and the replacement's open, so the replacement body
+begins right there and reuses the same delimiter as its close.  For a
+*paired* delimiter (`s{}{}`, `s[]<>`) the pattern's close (`}`) does not
+open anything; the replacement needs a fresh opening delimiter, so the
+resumed scan skips optional whitespace and consumes the next character
+as the replacement's open, which may be any delimiter and pairs
+independently.  Whether the delimiter was paired is the single fact
+carried from the first cycle to the second.  The flags are then read
+from the resumed parent line, in source order, and the presence of `e`
+selects whether the replacement frame is tokenized as code or as an
+interpolating string.  No flag is threaded through the source layer.
 
 #### 5.4.7 CRLF normalization and line termination:
 
@@ -1213,7 +1406,7 @@ directive.
 #### 5.4.9 How this simplifies the lexer:
 
 The lexer's token-production loop never manages heredoc line ordering,
-CRLF normalization, indent stripping, substitution body partitioning,
+CRLF normalization, `<<~` indent stamping, delimited-body framing,
 or position save/restore.  These are fully encapsulated in the source
 layer.  The rest of the lexer simply calls `next_line()` as necessary
 to get each line, without needing to worry about complexities such as
@@ -1249,8 +1442,8 @@ forward across line boundaries and then either rewind to the starting
 position or commit to where the scan ended, without disturbing the
 heredoc interleaving machinery.
 
-The mechanism is built on the existing line-delivery queue.  The
-source layer gains four fields:
+The mechanism is built on the line delivery beneath the frames (§5.4.4).
+The source layer gains four fields:
 
 ```rust
 /// Displaced lines captured during an active lookahead scan, in displacement order (original current line first).
@@ -1258,10 +1451,10 @@ source layer gains four fields:
 lookahead: VecDeque<LexerLine>,
 /// Source offset of the line a lookahead scan ended on, identifying it uniquely for `consume_lookahead`.  `Some`
 /// from guard drop until normal delivery reaches that line; `None` if the scan never left its starting line.
-lookahead_offset: Option<usize>,
+lookahead_offset: Option<u32>,
 /// Cursor position the lookahead scan ended at, within the end line.  Taken by `consume_lookahead`, and cleared
 /// once normal delivery moves past the end line.
-lookahead_pos: Option<usize>,
+lookahead_pos: Option<u32>,
 /// True while a lookahead guard is alive: `next_line` captures displaced lines and `# line` directive setters are
 /// suppressed.
 lookahead_mode: bool,
@@ -1269,7 +1462,7 @@ lookahead_mode: bool,
 
 **Delivery and capture.**  Line numbers are stamped at *delivery*:
 `next_line` assigns each line it delivers — freshly read or pulled
-from the regular queue — its `number` from the counter and advances
+from `queued_lines` — its `number` from the counter and advances
 it.  `install_line` stays a pure "set this line, as-is" primitive
 that does not renumber, so a saved line restored directly through it
 (a heredoc/subst remainder) keeps its baked number.  While
@@ -1291,7 +1484,7 @@ On drop, the guard:
   unique key) and `pos`;
 - if any line was displaced, restores the original current line (the
   front of the capture queue) and re-queues the previewed run — the
-  scan-end line included — onto the front of the regular queue,
+  scan-end line included — onto the front of `queued_lines`,
   each line's `pos` reset to 0 so it re-scans from the start, and
   records the end `offset`;
 - if nothing was displaced, the current line is itself the scan-end
@@ -1306,7 +1499,7 @@ On drop, the guard:
   needed;
 - clears `lookahead_mode`.
 
-The previewed lines now sit on the regular queue, re-delivered by
+The previewed lines now sit on `queued_lines`, re-delivered by
 future `next_line` calls transparently and in order.
 
 **Consuming a lookahead.**  `consume_lookahead()` runs *after* the
@@ -1328,6 +1521,14 @@ The single-line case falls out: nothing was displaced, the end
 `offset` is already `None`, and consume simply advances the cursor to
 the saved position on the line still current.
 
+In the unified frame model, though, neither scan reaches for this
+disposition: the heredoc and delimited scans both rewind their
+lookahead, and the delimited endpoint is recorded directly into the
+frame bound (§5.4.6) rather than committed through `consume_lookahead`.
+It is kept here as the third disposition for now but currently has no
+consumer; if implementation confirms nothing needs "advance past a
+previewed span without framing it," it can be removed.
+
 **Line numbering and `# line` directives.**  Because numbering
 happens at delivery and the guard rewinds the counter on drop, the
 previewed lines are re-stamped when they replay, so a `# line`
@@ -1340,20 +1541,36 @@ until really reached — `set_line_number` and `set_filename` are
 no-ops while `lookahead_mode` is set; the parser re-applies the
 directive when the line is delivered for real.
 
-Re-stamping every line drawn from the regular queue means heredoc and
-substitution *remainder* lines — currently delivered through that
-queue — are renumbered too, which is wrong for them.  That is
-tolerated for now: both are slated to restore their remainder
-directly through `install_line` (which preserves the baked number),
-at which point the friendly fire ends.
+Re-stamping reaches only lines that replay through `queued_lines`.  A
+frame's suspended line — a heredoc or substitution *remainder* — is
+restored directly when the frame is popped, swapped back from its
+context entry (§5.5), which preserves its baked number.  Remainders are
+therefore not drawn back through `queued_lines`, and not subject to this
+re-stamping.
 
 ### 5.5 Sublexing and the Context Stack
 
 Sublexing is the core architectural requirement.  The implementation
-uses an explicit context stack (`Vec<LexContext>`) on the `Lexer`
-struct.  This stack tracks the lexer's current mode within the line
-it is scanning — it does not manage source positioning or line
-sequencing (those are source-layer concerns; see §5.4).
+uses a single explicit context stack (`Vec<LexContext>`) on the `Lexer`
+struct — the same stack the source layer delivers from (§5.4.4).  Each
+entry is one active bounded construct and carries that construct's full
+state: its source-delivery frame (the suspended line and cursor and the
+bounding endpoint — what lines the construct sees) together with its lex
+mode (the flags that govern how those bytes tokenize).  Source framing
+and lex mode are one scope, pushed and popped together at construct
+entry and exit.
+
+There is one stack rather than two because the two kinds of scope nest
+in lockstep.  Every quote-like construct pushes a frame and a mode at
+the same event and pops both at virtual EOF; the only intra-construct
+churn — `expr_depth` for `${...}`, the subscript-chain counters — is
+counters within an entry, not stack pushes.  So source-frame scopes and
+mode scopes never cross, and a single stack carries them with one spine
+instead of two that must be kept synchronized.  The source-delivery
+fields stay grouped as a cohesive cluster on the entry, so the layering
+survives in shape even though storage is shared: pure source maneuvers —
+the heredoc host-walk, `context_top` (§5.4.4) — read only that cluster,
+and the base entry's mode is the trivial top-level code mode.
 
 Unlike the enum-based `LexMode` design considered early on,
 `LexContext` is a single struct with boolean flags that control
@@ -1362,8 +1579,23 @@ covers all scanning modes:
 
 ```rust
 struct LexContext {
-    /// Opening delimiter character.  `None` for heredocs (end
-    /// signaled by the source layer returning `None` from `next_line`).
+    // --- source-delivery frame (§5.4.4) ---
+    /// The parent line suspended when this frame was pushed.  The
+    /// delivering frame's line is held live in the lexer's
+    /// `Option<LexerLine>`; pushing a frame moves the parent's line
+    /// down here, and popping restores it as the live line.  Its
+    /// `terminated` flag is what the heredoc host-walk reads when it
+    /// looks for the frame whose current line is terminated.
+    line: Option<LexerLine>,
+    /// The frame's bound: the endpoint past which it reports virtual
+    /// EOF, as a `LexerLinePosition` (§5.4.3) — `offset` the end line,
+    /// `pos` the cursor within it.  `None` only for the base frame,
+    /// which ends at real EOF.
+    bound: Option<LexerLinePosition>,
+    // --- lex mode ---
+    /// Opening delimiter character.  `None` for heredocs and `s///`
+    /// replacement bodies, where end-of-content is the frame's
+    /// virtual EOF rather than a delimiter byte in the stream.
     delim: Option<char>,
     /// Delimiter nesting depth (for paired delimiters like `{}`).
     depth: u32,
@@ -1404,9 +1636,41 @@ regex)`:
 
 Delimiter types are `char`, not `u8`, to support the Unicode paired
 delimiter table (§5.8).  `delim` is `None` for heredocs and
-substitution replacement bodies, where end-of-content is signaled by
-the source layer returning `Ok(None)` from `next_line()` rather than by
-a delimiter byte in the content stream.
+substitution replacement bodies, where end-of-content is the frame's
+virtual EOF — `next_line()` returning `Ok(None)` at the bound — rather
+than a delimiter byte in the content stream.
+
+Heredoc and delimited bodies share one sublexing path.  Setup fans in:
+`start_heredoc` and `start_delimited_body` (§5.4.5, §5.4.6) each locate
+the body's end up front and leave the same post-setup state — a body
+frame on the stack with its bound recorded, and a sublex context atop
+it — so once setup returns, the parser drops into one flow with no
+memory of which kind of body it is in.  Because the bound already
+encodes where the body ends, the shared per-token code (`lex_body`,
+§5.5.1) carries no closing-delimiter watch: it simply lexes to virtual
+EOF.  A literal (non-interpolating) heredoc is not a separate path that
+slurps the body whole; it is just a body frame lexed with
+`interpolating: false`, emitting `ConstSegment` runs through the same
+loop to `SublexEnd`, with no bespoke collector and no distinct token.
+
+Teardown is uniform across both body kinds, because the resume point is
+fixed at push time, not chosen at the pop.  Before suspending the parent
+line into the entry, setup advances its cursor to where parsing resumes:
+`start_delimited_body` moves it past the closing delimiter, and
+`start_heredoc` leaves it just past the introducer's `<<TAG`, where the
+tag scan already left it.  The heredoc terminator is consumed by the
+scan, not delivered, so reaching virtual EOF leaves the host past it.
+The pop is then one operation for either kind — restore the suspended
+line and resume from its cursor — so `LexContext` carries no body-kind
+discriminant.  Setup fans in, sublexing is shared, and so is teardown;
+the only per-kind step is the cursor nudge inside each setup.
+
+The first body line is fetched implicitly, not by setup.
+`start_heredoc` leaves the live line `None`; the parser's next token
+request re-enters `lex_body`, whose first `peek_byte` auto-loads the
+first body line, consuming the pending virtual-EOF signal — the same
+convention the interpolating sublex path already follows.  Setup only
+needs the frame in place before that first `peek_byte`, which it is.
 
 #### 5.5.1 Incremental sublexing:
 
@@ -1471,18 +1735,17 @@ UTF-8 sequence.
 
 #### 5.5.5 Format lexing:
 
-A `format NAME = ... .` declaration opens a line-oriented sublex
-region.  Despite being line-oriented rather than delimiter-oriented,
-it is *not* a parallel mechanism: it is a `LexContext` on the same
-context stack as string, regex, and heredoc sublexing, reached
-through the ordinary `lex_token` dispatch and torn down with the same
-`SublexEnd` plus `finish_body()` model (§5.6.8).  Heredocs already
-demonstrate that a line-oriented, source-signaled sublex mode belongs
-on the context stack (`delim: None`); formats are no different.  The
-format context carries the small amount of format-specific state the
-mode needs: which phase it is in (accumulating a picture run, or
-lexing an argument list) and, in the argument phase, a bracket-depth
-counter.
+A `format NAME = ... .` declaration opens a line-oriented sublex region.
+Despite being line-oriented rather than delimiter-oriented, it is *not*
+a parallel mechanism: it is a `LexContext` on the same context stack as
+string, regex, and heredoc sublexing, reached through the ordinary
+`lex_token` dispatch and torn down with the same `SublexEnd` plus
+frame-pop teardown (§5.6.8).  Heredocs already demonstrate that a
+line-oriented, source-signaled sublex mode belongs on the context stack
+(`delim: None`); formats are no different.  The format context carries
+the small amount of format-specific state the mode needs: which phase it
+is in (accumulating a picture run, or lexing an argument list) and, in
+the argument phase, a bracket-depth counter.
 
 A format body alternates between *picture runs* and *argument lists*,
 ending at a `.` terminator line:
@@ -1564,11 +1827,11 @@ manpage rather than the interpreter is how subtle bugs creep in:
 
 ### 5.6 Heredoc Handling
 
-Heredocs are handled by the source layer (§5.4) and the rest of
-the lexer's token-production loop.  The source layer manages all line
-ordering, indentation, and save/restore.  The lexer's only heredoc
-awareness is recognizing `<<TAG` and framing the body as
-`QuoteSublexBegin` / content tokens / `SublexEnd`.
+Heredocs are handled by the source layer (§5.4) and the rest of the
+lexer's token-production loop.  The source layer manages the body frame,
+its bound, and `<<~` indentation; the lexer's only heredoc awareness is
+recognizing `<<TAG` and framing the body as `QuoteSublexBegin` / content
+tokens / `SublexEnd`.
 
 #### 5.6.1 Basic flow:
 
@@ -1581,26 +1844,25 @@ END
 1. The lexer encounters `<<END` while scanning a line.  It emits
    `QuoteSublexBegin(QuoteKind::Heredoc, '\0')` (the `'\0'`
    delimiter signals "heredoc, no delimiter byte"), pushes a
-   `LexContext` (with `delim: None`, `interpolating: true`) onto the
-   context stack, and calls
-   `source.start_heredoc(tag, &mut self.current_line)`.  The method
-   takes the `LexerLine` (with cursor pointing at ` . "suffix";`)
-   and sets the lexer's current line to `None` in one step.
+   `LexContext` (`delim: None`, `interpolating: true`), and calls
+   `source.start_heredoc(tag)`, which walks to the host, scans for the
+   terminator, and pushes the body frame (§5.4.5).  The introducer
+   line — cursor at ` . "suffix";` — becomes the suspended line on the
+   entry beneath.
 
-2. The lexer's main loop calls `source.next_line()`, which returns
-   the first body line.  With `interpolating: true`, the lexer
-   scans it for interpolation and produces `ConstSegment`,
-   `InterpScalar`, etc. — the same token stream as `"..."` and
-   `qq{}`.
+2. The lexer's main loop calls `source.next_line()`, delivering body
+   lines from the body frame.  With `interpolating: true`, the lexer
+   scans each for interpolation and produces `ConstSegment`,
+   `InterpScalar`, etc. — the same token stream as `"..."` and `qq{}`.
 
-3. When `source.next_line()` returns `Ok(None)`, the terminator has
-   been found.  The lexer pops `LexContext` from the context stack
-   and emits `SublexEnd`.
+3. At the body frame's virtual EOF, `source.next_line()` returns
+   `Ok(None)`.  The lexer pops the `LexContext` and emits `SublexEnd`;
+   popping the body frame discards the terminator line and leaves the
+   read position past it (§5.4.5).
 
-4. On the next `next_line()` call, the source layer returns the
-   saved `LexerLine` — the remainder ` . "suffix";`.  Because
-   `LexerLine` carries the cursor position, the lexer transparently
-   resumes scanning mid-line.
+4. Delivery resumes on the suspended introducer line — the remainder
+   ` . "suffix";`.  Because `LexerLine` carries its cursor, the lexer
+   transparently resumes scanning mid-line.
 
 #### 5.6.2 Multiple heredocs on one line:
 
@@ -1612,19 +1874,18 @@ body B
 B
 ```
 
-This falls out naturally from the save/restore mechanism:
+Parsing is left to right, and each heredoc is fully processed where
+its `<<` is parsed (§5.4.5), so this needs no special stacking:
 
-1. `<<A` saves the remainder `, <<B);` and starts A's body.
-2. A's terminator found → `source.next_line()` returns `None`.
-   Lexer emits `SublexEnd`.
-3. Next `source.next_line()` returns the saved `, <<B);`.
-4. Lexer scans `, `, encounters `<<B`, saves `);\n`, starts B's body.
-5. B's terminator found → `source.next_line()` returns `None`.
-   Lexer emits `SublexEnd`.
-6. Next `source.next_line()` returns `);`.
+1. `<<A` pushes A's body frame; A's body is delivered to virtual EOF.
+2. The lexer emits `SublexEnd` and pops, resuming the introducer at
+   `, <<B);`.
+3. Scanning `, ` reaches `<<B`, which pushes B's body frame; B's body
+   is delivered to virtual EOF.
+4. `SublexEnd`, pop, and the introducer resumes at `);`.
 
-No special stacking logic needed.  The source layer's line queue
-and push-back mechanism handle all the line sequencing.
+Each `<<` re-walks to its host independently (§5.4.5); the state lives
+in the stack and the shared read position, not a saved set.
 
 #### 5.6.3 Indented heredocs (`<<~`):
 
@@ -1634,12 +1895,13 @@ my $x = <<~END;
     END
 ```
 
-The lexer calls `source.start_indented_heredoc(tag, current_line)`.
-The source layer scans ahead to find the terminator line, extracts its
-full whitespace prefix (`"    "` in this example), and sets that as
-the required indentation.  Subsequent body lines are delivered with
-the prefix stripped.  When the terminator is found, the previous
-required indentation (if any) is restored.
+The lexer calls `source.start_indented_heredoc(tag)`.  The terminator
+scan takes the terminator line's whitespace prefix (`"    "` in this
+example) as the new required indent and stamps each body line with it
+(§5.4.5) — recorded, not sliced — so the cursor begins past it.  The
+indent rides on each line rather than in a separate stack, so popping
+the body frame needs no indent restore: the enclosing frame's lines
+already carry whatever indent they were stamped with.
 
 #### 5.6.4 Heredoc tag forms:
 
@@ -1675,17 +1937,24 @@ my $x = <<~OUTER;
     OUTER
 ```
 
-- `<<~OUTER` sets required indent to `"    "` (from terminator).
-- Body lines are served with 4-space indent stripped.
-- Inside `${\(...)}`, the lexer encounters `<<A`.  The source layer
-  saves the remainder and starts A's body.  A is non-indented, but
-  the required indent (`"    "`) is still active — A's body lines
-  `"    1\n"` have the prefix stripped, yielding `"1\n"`.  The
-  terminator `"    A\n"` is also stripped to `"A"`, matching the tag.
-- After A, the remainder is restored.  The lexer encounters `<<B`,
-  same process.  B's body `"    2\n"` yields `"2\n"`.
-- After B, the expression completes.  The lexer is back in OUTER's
-  body, continuing with the next body line.
+- `<<~OUTER`'s scan finds its terminator `"    OUTER"`, takes `"    "`
+  as the required indent, and stamps *every* line of its body with it
+  (§5.4.5) — including the lines `"    1"`, `"    A"`, `"    2"`,
+  `"    B"` that will later serve as A's and B's bodies and terminators.
+- Inside `${\(...)}`, the lexer reaches `<<A`.  A is plain, so it adds
+  no indent of its own; its scan reads the already-stamped lines,
+  matches the terminator `"    A"` from `pos = indent` (the `"    "`
+  already folded in), and delivers A's body line from `pos = indent`,
+  yielding `"1\n"`.
+- `<<B` is the same, yielding `"2\n"`.
+- The expression completes, and OUTER's body resumes with its next line.
+
+There is no separate required-indent value consulted at delivery: the
+indent is stamped per line during whichever scan walks the line, and a
+nested plain heredoc inherits the enclosing `<<~`'s stamp simply because
+its lines already carry it.  A nested `<<~` instead validates and adds
+its own indent on top (§5.4.5), so `indent` grows across nested scans
+and is restored on pop because the lines carry it.
 
 This architecture correctly handles arbitrarily deep heredoc nesting,
 including the torture test case with 9+ heredocs at 4 levels of
@@ -1697,58 +1966,52 @@ initiating line, matching Perl's compile-time execution order.
 
 #### 5.6.6 Literal heredocs:
 
-Literal heredocs (`<<'TAG'`, `<<\TAG`, `<<~'TAG'`) do not
-interpolate.  The lexer collects the body into a single
-`ConstSegment` token rather than producing a sub-token stream with
-interpolation breaks.  The source layer manages the line sequencing
-identically.
+Literal heredocs (`<<'TAG'`, `<<\TAG`, `<<~'TAG'`) do not interpolate.
+The lexer lexes the body through the same shared sublex path with
+`interpolating: false` (§5.5), emitting a run of `ConstSegment` tokens
+with no interpolation breaks and ending at `SublexEnd` — there is no
+separate collector and no distinct literal token.  The source layer
+frames the body identically to an interpolating heredoc.
 
 #### 5.6.7 Heredoc terminator matching:
 
-A line matches the heredoc tag only if the entire line content
-(after any required indentation stripping) is an exact byte-for-byte
-match with the tag.  Trailing spaces, tabs, or any other content
-cause the line to be treated as body content, not a terminator.
+Terminator matching is keyed on the heredoc form (§5.4.5).  For a plain
+`<<TAG`, the line content from `pos = indent` — `indent` being only
+whatever an enclosing `<<~` already folded in — must equal the tag
+exactly, with no leading whitespace skipped.  For a `<<~TAG`, leading
+whitespace from `pos = indent` is skipped, the tag must match at that
+point, and the skipped span defines the heredoc's own required indent.
+In both forms the match is byte-for-byte and the rest of the line must
+be empty: trailing spaces, tabs, or any other content make the line body
+content, not a terminator.
 
 #### 5.6.8 Virtual EOF and body teardown:
 
-Heredoc and substitution bodies end not at a delimiter byte but when
-the line stream runs out of body content — the heredoc terminator
-line is read, or the queued substitution body lines are exhausted.
-This boundary is a *virtual EOF*: `next_line()` returns no line
-(`self.line` becomes `None`), but it is not the real end of the
-source.  Normal lexing within the body sees the virtual EOF the same
-way it would see end of input.
+A body ends not at a delimiter byte but at its frame's bound — the
+recorded endpoint past which the frame reports virtual EOF (§5.4.4).
+`next_line()` returns no line (`self.line` becomes `None`), but this is
+not the real end of the source: normal lexing within the body sees the
+virtual EOF exactly as it would see end of input.
 
-The virtual EOF is *idempotent*.  Once the body is exhausted,
-`next_line()` keeps reporting no current line — it does not read
-ahead into whatever follows the body — until the consumer explicitly
-asks to move past it.  The current line stays `None`, and only
-`next_line_after_eof()` advances out of that state (delivering the
-saved remainder of the line that introduced the body, or the next
-real line).  This separates *detecting* the end of a body (a
-repeatable observation) from *committing* to it (a single explicit
-step), without a deferral flag bridging the two across calls.
+The virtual EOF is *idempotent*.  Once the frame's content is exhausted,
+`next_line()` keeps reporting no current line — it does not read past
+the bound into whatever follows — until the consumer explicitly pops the
+frame.  This separates *detecting* the end of a body (a repeatable
+observation) from *committing* to it (a single explicit step, the pop),
+without a deferral flag bridging the two across calls.
 
-The teardown that a body's end requires — popping the heredoc
-context and restoring the previous indentation, or queueing a
-substitution's saved remainder — is performed by `finish_body()`, a
-source-layer method called at the point the body's `SublexEnd` token
-is emitted.  The lexer already tears down its own per-body state
-(the context stack, case-modification state) at that point; calling
-`finish_body()` alongside it co-locates the full commit at the one
-site that knows the body has definitively ended.  `finish_body()`
-manipulates only source-layer-internal state (the heredoc stack,
-the queued lines, the saved remainders); the lexer never reaches
-into those directly.
-
-This is a deliberate change from an earlier design in which the
-teardown was a side effect of the line read that detected the
-terminator, remembered across calls by a `terminator_pending` flag
-and a peek-versus-consume parameter on `next_line()`.  Folding the
-teardown into the `SublexEnd` emission removes both: detection is a
-plain idempotent `None`, and the commit is an explicit call where the
-body is known to be over.
+Popping the frame is the teardown, and it is one operation regardless of
+body kind.  The resume point was fixed when the frame was pushed: setup
+advanced the suspended line's cursor to where parsing resumes — past the
+closing delimiter for a delimited body (§5.4.6), just past the `<<TAG`
+for a heredoc (§5.4.5) — and the heredoc terminator was consumed by the
+scan rather than delivered, so reaching virtual EOF already leaves the
+host past it.  The pop restores the suspended line and resumes from its
+cursor, with no per-kind branch.  Because a frame and its lex mode are
+one entry (§5.5), the single pop tears down both the source-delivery
+state and the per-body lex state — case-modification state, the mode
+flags — at the one site that knows the body has definitively ended;
+nothing reaches across a layer boundary to do it.
 
 ### 5.7 Token Categories
 
