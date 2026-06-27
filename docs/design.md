@@ -1177,21 +1177,17 @@ Front-narrowing for `<<~` indent and end-narrowing for a partial
 endpoint therefore never fall on the same line: heredoc bodies end
 whole, and delimited bodies are never indent-stamped.
 
-Delivery normally reads from the real top of the stack and reports
-virtual EOF when that frame's bound is reached.  `context_top` is a
-single field, normally `0`, that redirects *only* the virtual-EOF
-test: when it is non-zero, `next_line` checks the bound of
-`frames[context_top]` instead of the top frame's, so delivery runs to
-a lower frame's EOF while still reading lines forward from the shared
-position.  It changes nothing else — not which bytes `peek_byte`
-returns, not the current line.  Only the heredoc terminator scan raises
-it, to bound the scan by the *host* frame's EOF rather than the
-mid-line frame on top (§5.4.5), and only for the window between starting
-that scan and pushing the body frame; pushing the body frame resets it
-to `0`, and so does dismissing the scan.  `context_top` is never nested
-and carries no saved value.  The lookahead primitive (§5.4.11) is
-oblivious to it: the scan simply calls `next_line` and inherits the
-host's bound for free, naming no frame.  A scanner cannot read past the
+Delivery always reads from the real top of the stack and reports virtual
+EOF when that frame's bound is reached — one test, no branch, no frame
+index.  The heredoc terminator scan still needs to run to the *host*
+frame's EOF rather than the mid-line frame on top (§5.4.5), but instead
+of redirecting delivery to a lower frame, the scan temporarily lends the
+top frame the host's bound for the scan's duration.  That borrow lives
+in the lookahead guard: `lookahead_to(ceiling)` (§5.4.11) saves the top
+frame's current bound, sets it to `ceiling`, and restores it on drop —
+so the change is invisible to `next_line`, which still just bounds by
+the top, and it is unwound on every exit, the error path included.  No
+persistent field redirects delivery, and a scanner cannot read past the
 end of its sub-source because the bytes are simply not delivered — the
 boundary is a wall, not a convention, and no scanner is aware of the
 frame that contains it.
@@ -1199,16 +1195,16 @@ frame that contains it.
 ```rust
 impl Lexer {
     /// Deliver the next line, reporting `Ok(None)` at virtual EOF.
-    /// The EOF test is taken against the `context_top` frame's bound
-    /// (normally the top frame's).  Because a body's end is found up
-    /// front by the terminator scan (§5.4.5) and recorded as the
-    /// frame's bound, delivery needs no per-line terminator check.
+    /// The EOF test is taken against the top frame's bound.  Because a
+    /// body's end is found up front by the terminator scan (§5.4.5) and
+    /// recorded as the frame's bound, delivery needs no per-line
+    /// terminator check.
     fn next_line(&mut self)
         -> Result<Option<LexerLine>, ParseError>;
 
     /// Enter a non-indented heredoc body (§5.4.5).  Walks down to the
-    /// host frame, runs `lookahead()` to locate the terminator, and
-    /// pushes the body frame.
+    /// host frame, scans for the terminator via `lookahead_to` (bounded
+    /// by the host's EOF), and pushes the body frame.
     fn start_heredoc(&mut self, tag: Bytes)
         -> Result<(), ParseError>;
 
@@ -1245,25 +1241,29 @@ where.
 The source layer walks down from the real top to the nearest frame whose
 current line is `terminated: true` — the *host*.  A `<<TAG` on a line
 that ends in a real newline is its own host, and the walk stops at the
-top with `context_top` left at `0`.  A `<<TAG` whose introducer line is
-a mid-line partial line — `terminated: false`, as when it sits inside an
-`/e` replacement frame that ends at its closing delimiter — cannot host
-the body, so the walk skips it and any other mid-line frames down to the
-nearest frame whose current line ends in a physical newline.
+top.  A `<<TAG` whose introducer line is a mid-line partial line —
+`terminated: false`, as when it sits inside an `/e` replacement frame
+that ends at its closing delimiter — cannot host the body, so the walk
+skips it and any other mid-line frames down to the nearest frame whose
+current line ends in a physical newline.  When the host is the base
+source, its bound is `None` (real EOF), which serves as the ceiling
+unchanged.
 
-`context_top` is then set to the host, and `lookahead()` (§5.4.11) runs
-on it — bound by the host's own virtual EOF, so the terminator search
-cannot escape the host's region, with no frame-targeting threaded into
-the scan.  The scan reads forward and tests each line for the tag at
-`pos = indent`.  The test is keyed on the heredoc form: a plain `<<TAG`
-requires the line from `pos = indent` to equal the tag exactly, with no
-whitespace skipped (only an enclosing `<<~`'s already-folded indent
-precedes `pos`); a `<<~TAG` skips leading whitespace from `pos = indent`
-and matches the tag at that point, and the skipped span *is* the
-heredoc's new required indent.  Reaching virtual or real EOF before the
-terminator is a fatal error.  The scan records the body span — the lines
-after the introducer up to, but not including, the terminator — and the
-terminator's offset and position.
+The host's bound becomes the *ceiling* handed to `lookahead_to(ceiling)`
+(§5.4.11): for the scan's duration the guard lends the top frame that
+ceiling in place of its own bound, so the terminator search runs to the
+host's EOF and cannot escape the host's region, with no frame-targeting
+threaded into the scan and the borrow unwound on drop.  The scan reads
+forward and tests each line for the tag at `pos = indent`.  The test is
+keyed on the heredoc form: a plain `<<TAG` requires the line from
+`pos = indent` to equal the tag exactly, with no whitespace skipped
+(only an enclosing `<<~`'s already-folded indent precedes `pos`); a
+`<<~TAG` skips leading whitespace from `pos = indent` and matches the
+tag at that point, and the skipped span *is* the heredoc's new required
+indent.  Reaching virtual or real EOF before the terminator is a fatal
+error.  The scan records the body span — the lines after the introducer
+up to, but not including, the terminator — and the terminator's offset
+and position.
 
 For a `<<~`, the indentation is resolved here, while the captured lines
 are still fresh in the lookahead queue — before lookahead mode ends, so
@@ -1289,20 +1289,20 @@ principle that it shares the level by definition; this is moot in
 practice since the terminator line is discarded.
 
 The body frame is pushed at the real top, above the untouched mid-line
-frames, and `context_top` resets to `0` in the same step, making the
-body frame the delivery frame.  Its bound is logical byte 0 of the
-terminator line — the terminator's offset paired with its own
-`pos = indent` — and the body lines were already stamped with their
-required indent during the scan (§5.4.3), so delivery replays them
-as-is.  Once the bound is recorded, the scan drops the terminator line
-by setting the current line to `None` — its `(offset, pos)` is captured
-and nothing downstream needs it — so the terminator is neither delivered
-nor replayed, and when the body reaches virtual EOF the host is already
-positioned past it.  Popping the frame then restores the suspended
-introducer line and resumes lexing from its cursor — the rest of the
-introducer line, just past the `<<TAG` — with no terminator-discard step
-and no branch on body kind.  This is the same uniform pop a delimited
-body uses (§5.4.6).
+frames, becoming the delivery frame; the borrowed ceiling was already
+released when the lookahead guard dropped at the end of the scan.  Its
+bound is logical byte 0 of the terminator line — the terminator's offset
+paired with its own `pos = indent` — and the body lines were already
+stamped with their required indent during the scan (§5.4.3), so delivery
+replays them as-is.  Once the bound is recorded, the scan drops the
+terminator line by setting the current line to `None` — its
+`(offset, pos)` is captured and nothing downstream needs it — so the
+terminator is neither delivered nor replayed, and when the body reaches
+virtual EOF the host is already positioned past it.  Popping the frame
+then restores the suspended introducer line and resumes lexing from its
+cursor — the rest of the introducer line, just past the `<<TAG` — with
+no terminator-discard step and no branch on body kind.  This is the
+same uniform pop a delimited body uses (§5.4.6).
 
 Because parsing is left to right and a heredoc is fully processed where
 its `<<` is parsed, no more than one heredoc is ever pending.  In `<<A
@@ -1502,6 +1502,20 @@ On drop, the guard:
 The previewed lines now sit on `queued_lines`, re-delivered by
 future `next_line` calls transparently and in order.
 
+**Borrowing a ceiling.**  `lookahead_to(ceiling: LexerLinePosition)` is
+an alternate constructor used by the heredoc terminator scan (§5.4.5).
+It does everything `lookahead()` does and additionally borrows a virtual
+EOF for the scan: it saves the top frame's current bound, sets that
+bound to `ceiling`, and on drop restores the saved bound.  Because the
+ceiling must be in place before the scan's first `next_line`, it is
+taken at construction — there is no way to set it on an already-running
+guard, and so no wrong-order hazard.  The restore rides the guard's
+`Drop`, so it is unwound whether the scan succeeds or returns `Err` on
+hitting EOF before the terminator; nothing at the call site has to
+remember to put the bound back.  `next_line` itself never learns the
+ceiling was moved — it always bounds by the top frame's bound, which is
+simply the borrowed value for the guard's lifetime.
+
 **Consuming a lookahead.**  `consume_lookahead()` runs *after* the
 guard has dropped, when the consumer commits to where the scan ended
 rather than rewinding.  It drives `next_line` forward until the line
@@ -1569,8 +1583,9 @@ mode scopes never cross, and a single stack carries them with one spine
 instead of two that must be kept synchronized.  The source-delivery
 fields stay grouped as a cohesive cluster on the entry, so the layering
 survives in shape even though storage is shared: pure source maneuvers —
-the heredoc host-walk, `context_top` (§5.4.4) — read only that cluster,
-and the base entry's mode is the trivial top-level code mode.
+the heredoc host-walk, the `lookahead_to` ceiling borrow (§5.4.11) —
+read only that cluster, while the top-level code mode needs no entry of
+its own, being simply the empty-stack default.
 
 Unlike the enum-based `LexMode` design considered early on,
 `LexContext` is a single struct with boolean flags that control
@@ -1589,8 +1604,9 @@ struct LexContext {
     line: Option<LexerLine>,
     /// The frame's bound: the endpoint past which it reports virtual
     /// EOF, as a `LexerLinePosition` (§5.4.3) — `offset` the end line,
-    /// `pos` the cursor within it.  `None` only for the base frame,
-    /// which ends at real EOF.
+    /// `pos` the cursor within it.  `None` means no bound — real EOF —
+    /// the base source's ceiling, and what `lookahead_to` installs when
+    /// a heredoc scan's host is the base (§5.4.11).
     bound: Option<LexerLinePosition>,
     // --- lex mode ---
     /// Opening delimiter character.  `None` for heredocs and `s///`
