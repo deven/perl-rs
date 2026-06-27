@@ -1044,24 +1044,35 @@ same underlying allocation — no copying.
 #### 5.4.3 `LexerLine` — the lexer's working unit:
 
 The lexer operates on a `LexerLine` that combines line metadata with
-a byte-scanning cursor.  All fields are `pub(crate)` — the lexer
-freely reads and writes `pos` for cursor control, and reads `number`
-and `offset` for span computation:
+a byte-scanning cursor.  The visible `line`/`terminated` are an
+*effective view*: the physical line, possibly narrowed to the current
+frame's EOF bound.  The hidden `full`/`full_terminated` hold the
+physical truth, and the view is always rebuilt from them, so a bound can
+narrow or widen the line at any time.  The lexer freely reads and writes
+`pos` for cursor control and reads `number`/`offset` for span
+computation; the physical fields are private and a line is only ever
+built through `LexerLine::new`, keeping them authoritative:
 
 ```rust
 struct LexerLine {
     /// 1-based line number in the original source.
     number: u32,
     /// Byte offset of the start of this line in the original source.
-    /// Always physical — never adjusted for `<<~` indentation — so it
-    /// serves as a stable identity key, e.g. matching a lookahead
-    /// endpoint against a re-delivered line (§5.4.11).
+    /// Always physical — never adjusted for `<<~` indentation or EOF
+    /// narrowing — so it serves as a stable identity key, e.g. matching
+    /// a frame bound or a lookahead endpoint against a re-delivered
+    /// line (§5.4.4, §5.4.11).
     offset: u32,
-    /// Line content without line ending, exactly as it appears in the
-    /// source.  For `<<~` bodies the indentation is recorded in
-    /// `indent`, not sliced out of `line`.
+    /// The *effective view*: line content without line ending, narrowed
+    /// to the current frame's EOF bound by `set_eof`.  Equal to `full`
+    /// when the bound lies at or past this line.  Rebuilt from `full`,
+    /// never edited in place.  For `<<~` bodies the indentation is
+    /// recorded in `indent`, not sliced out.
     line: Bytes,
-    /// Whether this line was terminated by a newline in the source.
+    /// Effective termination: whether the *view* ends at a real
+    /// newline.  `false` whenever `line` is narrowed below the
+    /// physical extent, since the narrow strips the virtual newline
+    /// first.
     terminated: bool,
     /// Leading bytes of `line` that are `<<~` indentation to skip;
     /// 0 for every fresh read.  A `<<~` body line is stamped with its
@@ -1079,29 +1090,49 @@ struct LexerLine {
     /// UTF-8 decoding and NFC normalization on all-ASCII lines.
     /// See §5.8 for the `effective_utf8` optimization.
     ascii_only: bool,
+    /// Physical line content, full width — what `set_eof` narrows or
+    /// widens the view from.  `Bytes` is refcounted, so this is a
+    /// second handle on the same buffer, not a copy.  Private:
+    /// callers see only the view.
+    full: Bytes,
+    /// Physical termination, restored when `set_eof` widens to the full
+    /// line.  Private.
+    full_terminated: bool,
 }
 
 impl LexerLine {
+    /// Build a freshly read line: the view starts equal to the physical
+    /// line, and `number`/`indent`/`pos` default to 0.  The only
+    /// constructor, so `full`/`full_terminated` cannot drift from the
+    /// view.
+    fn new(offset: u32, content: Bytes, terminated: bool,
+           ascii_only: bool) -> Self;
     fn peek_byte(&self) -> Option<u8>;
     fn peek_byte_at(&self, offset: usize) -> Option<u8>;
     fn remaining(&self) -> &[u8];       // borrowed view for comparisons
-    /// This line's current cursor as a `LexerLinePosition`.
-    fn position(&self) -> LexerLinePosition {
-        LexerLinePosition { offset: self.offset, pos: self.pos }
-    }
-}
-
-/// A point in the source as line-relative coordinates: `offset`
-/// selects the line by its physical start offset, `pos` the cursor
-/// within it.  `u32` to match `Span` — but distinct from it, since
-/// `Span` is absolute and this is a lexer-internal coordinate tied
-/// to `LexerLine`.  Used for frame bounds (§5.4.4) and lookahead
-/// endpoints (§5.4.11).
-struct LexerLinePosition {
-    offset: u32,
-    pos: u32,
+    fn global_pos(&self) -> u32;        // offset + pos, global
+    /// Apply a frame's EOF bound — a global byte offset, or `None` for
+    /// real EOF — rebuilding the view from `full`.  Narrows when the
+    /// bound falls within this line, widens to the full line when it
+    /// lies at or past the end, empties the line when it lies before
+    /// the start.  Total and idempotent (§5.4.4).
+    fn set_eof(&mut self, bound: Option<u32>);
 }
 ```
+
+A frame's EOF bound (§5.4.4) is a global byte offset, and `set_eof`
+turns it into a view by rebuilding `line` from `full`: this line spans
+the global range `[offset, offset + extent)`, where `extent` counts the
+virtual newline, so a bound within that range narrows the view (and
+clears `terminated`, since any cut strips the newline first), a bound at
+or past the end yields the full line, and a bound before the start
+yields an empty view.  Because the view is a pure function of
+`(full, bound)` — always rebuilt, never edited — `set_eof` is idempotent
+and narrows or widens with equal ease.  That is what lets a borrowed
+lookahead ceiling (§5.4.11) widen a line during a scan while the real
+bound re-narrows it afterward, and what lets a body frame narrow the
+line bearing its endpoint whether that line is the one current at push
+or one reached later, with no stale narrowing to track (§5.4.6).
 
 The typical lexer scanning pattern uses `peek_byte` for inspection
 and `skip(n)` on the `Lexer` to advance, rather than a combined
@@ -1163,19 +1194,20 @@ from lines outside its own delimiters in the raw buffer.  A contiguous
 slice cannot represent that splice; only the line stream that performs
 it can.
 
-A frame's bound is a recorded endpoint — a `LexerLinePosition` (§5.4.3):
-the physical offset of the line the region ends on (stable and unique
-where the line number is not) and the cursor position within it.
-Delivery compares each line's `offset` against the bound's; lines before
-it are yielded whole, and the line whose `offset` matches is the
-endpoint line.  When the endpoint falls mid-line that line is delivered
-as a *partial line* — a `LexerLine` narrowed to a slice ending at the
-endpoint — after which the frame reports virtual EOF.  A heredoc body
-ends at the start of its terminator line, so its last line is whole; a
-delimited body whose close sits mid-line ends on a partial line.
-Front-narrowing for `<<~` indent and end-narrowing for a partial
-endpoint therefore never fall on the same line: heredoc bodies end
-whole, and delimited bodies are never indent-stamped.
+A frame's bound is a global byte offset — the source position the region
+ends at — or `None` for real EOF (§5.4.3).  Before reading a line,
+delivery peeks where the next line starts (the replay queue's front, or
+the read frontier); a line starting past the bound is never read, so the
+frame reports virtual EOF without over-reading (§5.4.11).  The line that
+*contains* the bound is narrowed to a *partial line* ending there, by
+`set_eof` at the `install_line` choke point, after which the frame is at
+virtual EOF.  A heredoc body ends at the start of its terminator line,
+whose offset is the bound; the scan drops the terminator, so the body's
+last delivered line is whole and nothing is narrowed.  A delimited body
+whose close sits mid-line ends on a partial line.  Front-narrowing for
+`<<~` indent and end-narrowing for a partial endpoint therefore never
+fall on the same line: heredoc bodies end whole, and delimited bodies
+are never indent-stamped.
 
 Delivery always reads from the real top of the stack and reports virtual
 EOF when that frame's bound is reached — one test, no branch, no frame
@@ -1321,38 +1353,66 @@ valid host and the walk skips nothing.
 A delimited body — an `s///` pattern or replacement, `q//` and its kin,
 a regex, a `qw//` list, an interpolating string — is the text from the
 cursor, just inside the opening delimiter, to the matching close,
-possibly spanning lines.  `lookahead()` (§5.4.11) scans forward for that
-close, tracking balanced nesting for paired delimiters and honoring
-backslash escapes and multi-byte delimiters.  The scan is flat and
-textual: it finds *this* region's end without interpreting its contents
-or recursing into nested constructs, which are scanned and pushed only
-when tokenization later reaches them.  When the close sits on the same
-line as the opener — the common case — the body never spans a newline
-and the frame is unterminated in the line sense; a heredoc introduced
-inside it therefore hosts on the current line (§5.4.5), since the
-delimited frame's own line is mid-line and cannot host.
+possibly spanning lines.  The close is found by a byte walk over the
+`lookahead()` (§5.4.11) stream, the direct analogue of perl's `scan_str`
+over its flat buffer: the lookahead delivers bytes across line
+boundaries transparently, so the scan is oblivious to where lines fall
+and never handles a line itself.  It is flat and textual — it finds
+*this* region's end without interpreting its contents or recursing into
+nested constructs, which are scanned and pushed only when tokenization
+later reaches them.
 
-The endpoint is recorded as a `LexerLinePosition` (§5.4.3), the same
-type any frame bound uses, with `pos` pointing at the closing delimiter
-— but it is stamped directly by `start_delimited_body`, not taken
-through `consume_lookahead`.  That endpoint becomes the frame's virtual
-EOF, and the previewed span is *promoted* into a frame — a third
-disposition of a lookahead, alongside rewinding it (the guard's drop)
-and committing to it (`consume_lookahead`, §5.4.11).  Because the close
-rarely begins a line, the endpoint is usually mid-line, and the frame
-delivers a partial line there.  Delivery compares each line's `offset`
-against the bound's, and the line whose `offset` matches — whether it is
-the line current when the frame is pushed or one reached later — is
-narrowed to a `LexerLine` ending at the close, after which the frame
-reports virtual EOF.  The one comparison covers both cases: the current
-line is found by `self.line.offset == bound.offset` just as a later line
-is, so there is no separate current-versus-future state to track or
-clear.  The content is then lexed against the frame and terminates
-naturally at virtual EOF — it physically cannot pass the region's end —
-after which the consumer pops and resumes the parent at the character
-after the close, where the suspended parent line's cursor was advanced
-before the frame was pushed, so the pop carries no resume logic of its
-own (§5.5).
+The walk replicates `scan_str`'s close-finding exactly.  A backslash
+protects the following character so it cannot act as a delimiter —
+neither closing the body nor, for a paired delimiter, nesting it —
+unless the delimiter itself is a backslash, in which case no escaping
+applies and the first backslash ends the body (perl's
+`close_delim_code != '\\'` guard).  Paired delimiters (`open != close`,
+per `matching_delimiter`) track a nesting depth: an open raises it, a
+close lowers it, and the close that returns depth to zero is the end; an
+unpaired delimiter has no opener and ends at the first unescaped close.
+Scanning byte by byte suffices even for multi-byte content and
+delimiters — UTF-8 is self-synchronizing, so a backslash or delimiter
+byte can only match at a real character boundary and a continuation byte
+matches nothing.  The scan finds only the close *offset*: it builds no
+content and strips no escapes, which the body tokenization does later.
+
+When the close sits on the same line as the opener — the common case —
+the body never spans a newline and the frame is unterminated in the line
+sense; a heredoc introduced inside it therefore hosts on the current
+line (§5.4.5), since the delimited frame's own line is mid-line and
+cannot host.
+
+The close's global offset becomes the frame's bound.  Promotion reuses
+the lookahead's ordinary teardown rather than adding a disposition: the
+guard drops and rewinds — restoring the body's first line as the current
+line and re-queuing the previewed body lines — then
+`start_delimited_body` records the bound, suspends the parent as the
+close line with its cursor advanced just past the close, pushes the
+frame, and applies the bound to the current line with `set_eof`.  The
+re-queued body lines then deliver bounded by the new frame: `set_eof` at
+the `install_line` choke point (§5.4.4) narrows the line bearing the
+close to end there, whether it is the first line or one reached later —
+the global bound identifies that line the same way in both cases, so
+there is no current-versus-future state to track.  The content is lexed
+against the frame and terminates naturally at virtual EOF — it
+physically cannot pass the region's end — after which the consumer pops
+and resumes the parent at the character after the close, where the
+suspended line's cursor already sits, so the pop carries no resume logic
+of its own (§5.5).
+
+Several `scan_str` behaviors beyond close-finding live elsewhere, so the
+scan stays narrow and none is silently dropped.  Whether the escaping
+backslash is kept in or stripped from the body — `scan_str`'s
+`keep_bracketed_quoted` — is a mode property resolved by `lex_body` when
+it tokenizes the delivered bytes: regex-like bodies keep `\<delim>` for
+the engine to interpret, plain quotes strip the backslash.  The run-time
+`/(?{})/` reparse collapse of `\\` to `\` (`re_reparse`) likewise lives
+in `lex_body`, on the regex-reparse path.  The non-grapheme-delimiter
+error and the deprecation/experimental warnings for extra-paired
+delimiters are properties of the delimiter character, raised where the
+opener is recognized (alongside `matching_delimiter`), before the body
+scan.
 
 A substitution is two sequential promote/parse/pop cycles, with one seam
 between them: how the replacement's opening delimiter is established.
@@ -1502,12 +1562,13 @@ On drop, the guard:
 The previewed lines now sit on `queued_lines`, re-delivered by
 future `next_line` calls transparently and in order.
 
-**Borrowing a ceiling.**  `lookahead_to(ceiling: LexerLinePosition)` is
+**Borrowing a ceiling.**  `lookahead_to(ceiling: Option<u32>)` is
 an alternate constructor used by the heredoc terminator scan (§5.4.5).
 It does everything `lookahead()` does and additionally borrows a virtual
 EOF for the scan: it saves the top frame's current bound, sets that
-bound to `ceiling`, and on drop restores the saved bound.  Because the
-ceiling must be in place before the scan's first `next_line`, it is
+bound to `ceiling` (a global offset, or `None` for real EOF when the
+host is the base source), and on drop restores the saved bound.  Because
+the ceiling must be in place before the scan's first `next_line`, it is
 taken at construction — there is no way to set it on an already-running
 guard, and so no wrong-order hazard.  The restore rides the guard's
 `Drop`, so it is unwound whether the scan succeeds or returns `Err` on
@@ -1602,12 +1663,11 @@ struct LexContext {
     /// `terminated` flag is what the heredoc host-walk reads when it
     /// looks for the frame whose current line is terminated.
     line: Option<LexerLine>,
-    /// The frame's bound: the endpoint past which it reports virtual
-    /// EOF, as a `LexerLinePosition` (§5.4.3) — `offset` the end line,
-    /// `pos` the cursor within it.  `None` means no bound — real EOF —
+    /// The frame's bound: the global byte offset past which it reports
+    /// virtual EOF (§5.4.3, §5.4.4).  `None` means no bound — real EOF —
     /// the base source's ceiling, and what `lookahead_to` installs when
     /// a heredoc scan's host is the base (§5.4.11).
-    bound: Option<LexerLinePosition>,
+    bound: Option<u32>,
     // --- lex mode ---
     /// Opening delimiter character.  `None` for heredocs and `s///`
     /// replacement bodies, where end-of-content is the frame's
