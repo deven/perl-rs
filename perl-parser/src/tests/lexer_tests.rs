@@ -77,7 +77,6 @@ fn lex_all(src: &str) -> Vec<Token> {
             | Token::ArrayLen(_)
             | Token::SublexEnd
             | Token::TranslitLit(_, _, _)
-            | Token::HeredocLit(_, _, _)
             | Token::Readline(_, _)
             | Token::GlobVar(_)
             | Token::QwList(_)
@@ -142,15 +141,10 @@ fn lex_cr_only_not_treated_as_newline() {
     // Consume ShiftLeft, then call the heredoc hook.
     let tok = lexer.lex_token().unwrap();
     assert_eq!(tok.token, Token::ShiftLeft);
-    let heredoc_tok = lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
-    assert_eq!(heredoc_tok, Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'));
 
-    // Body line "hello\rEND\n" is not a terminator — returned as content.
-    let tok = lexer.lex_token().unwrap();
-    assert!(matches!(tok.token, Token::ConstSegment(_)));
-
-    // Next call surfaces the deferred unterminated heredoc error.
-    let result = lexer.lex_token();
+    // `\r` alone is not a line ending, so "hello\rEND" is a single body line with no terminator after it.  The
+    // up-front body scan finds no terminator and reports the unterminated error here, at setup.
+    let result = lexer.lex_heredoc_after_shift_left();
     assert!(result.is_err(), "expected unterminated heredoc error");
 }
 
@@ -164,22 +158,10 @@ fn lex_indented_heredoc_mismatch_croaks() {
 
     // Consume ShiftLeft, then call the heredoc hook.
     lexer.lex_token().unwrap();
-    lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
 
-    // Consume tokens until we hit the error.
-    let mut got_error = false;
-    for _ in 0..20 {
-        match lexer.lex_token() {
-            Err(e) => {
-                assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
-                got_error = true;
-                break;
-            }
-            Ok(tok) if matches!(tok.token, Token::Eof) => break,
-            Ok(_) => continue,
-        }
-    }
-    assert!(got_error, "expected indentation mismatch error");
+    // The up-front indent stamping rejects the mismatched body line when the heredoc is set up.
+    let err = lexer.lex_heredoc_after_shift_left().unwrap_err();
+    assert!(err.message.contains("indent"), "expected indentation error, got: {}", err.message);
 }
 
 #[test]
@@ -188,20 +170,10 @@ fn lex_indented_heredoc_tabs_vs_spaces_croaks() {
     let src = "<<~END;\n\t  hello\n    wrong\n\t  END\n";
     let mut lexer = Lexer::new(src.as_bytes());
     lexer.lex_token().unwrap();
-    lexer.lex_heredoc_after_shift_left().unwrap().expect("expected heredoc");
-    let mut got_error = false;
-    for _ in 0..20 {
-        match lexer.lex_token() {
-            Err(e) => {
-                assert!(e.message.contains("indent"), "expected indentation error, got: {}", e.message);
-                got_error = true;
-                break;
-            }
-            Ok(tok) if matches!(tok.token, Token::Eof) => break,
-            Ok(_) => continue,
-        }
-    }
-    assert!(got_error, "expected indentation mismatch error");
+
+    // The up-front indent stamping rejects the mismatched body line when the heredoc is set up.
+    let err = lexer.lex_heredoc_after_shift_left().unwrap_err();
+    assert!(err.message.contains("indent"), "expected indentation error, got: {}", err.message);
 }
 
 #[test]
@@ -578,7 +550,10 @@ fn lex_heredoc_double_quoted() {
 fn lex_heredoc_single_quoted() {
     let src = "<<'END';\nNo $interpolation here.\nEND\n";
     let tokens = lex_all(src);
-    assert_eq!(tokens, vec![Token::HeredocLit(HeredocKind::Literal, "END".into(), "No $interpolation here.\n".into()), Token::Semi,]);
+    assert_eq!(
+        tokens,
+        vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::ConstSegment("No $interpolation here.\n".into()), Token::SublexEnd, Token::Semi,]
+    );
 }
 
 #[test]
@@ -871,13 +846,7 @@ fn lex_heredoc_empty_body() {
 fn lex_heredoc_indented_literal() {
     let src = "<<~'END';\n    hello\n    END\n";
     let tokens = lex_all(src);
-    match &tokens[0] {
-        Token::HeredocLit(HeredocKind::IndentedLiteral, tag, body) => {
-            assert_eq!(tag, "END");
-            assert_eq!(body, "hello\n");
-        }
-        other => panic!("expected IndentedLiteral HeredocLit, got {other:?}"),
-    }
+    assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::ConstSegment("hello\n".into()), Token::SublexEnd, Token::Semi,]);
 }
 
 // ── Multiline string handling ────────────────────────────────
@@ -922,8 +891,8 @@ fn lex_double_quoted_multiline_breaks_at_interp() {
 
 #[test]
 fn lex_heredoc_multiline_single_segment() {
-    // Heredocs return all body lines in one ConstSegment, same as regular strings.  The peek_heredoc mechanism in
-    // next_line prevents the one-shot signal from being consumed prematurely.
+    // Heredocs return all body lines in one ConstSegment, same as regular strings: the body frame lexes every line to
+    // virtual EOF and the segments concatenate, newlines between body lines included.
     let src = "<<END;\nline 1\nline 2\nEND\n";
     let tokens = lex_all(src);
     assert_eq!(tokens, vec![Token::QuoteSublexBegin(QuoteKind::Heredoc, '\0'), Token::ConstSegment("line 1\nline 2\n".into()), Token::SublexEnd, Token::Semi,]);

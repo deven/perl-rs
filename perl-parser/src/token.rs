@@ -255,9 +255,6 @@ pub enum Token {
     /// Body of a heredoc (sub-tokens if interpolating).
     HeredocEnd,
 
-    /// Complete heredoc with body already collected (bootstrap).  Fields: kind, tag, body.
-    HeredocLit(HeredocKind, String, String),
-
     // ── Special compile-time tokens ───────────────────────────
     /// `__FILE__` — current source filename.  Captured at lex time from `Lexer::filename()`.
     SourceFile(String),
@@ -448,7 +445,6 @@ impl Token {
                 | Token::HeredocBegin(_, _)
                 | Token::SubstSublexBegin(_)
                 | Token::TranslitLit(_, _, _)
-                | Token::HeredocLit(_, _, _)
                 | Token::Readline(_, _)
                 | Token::QwList(_)
                 | Token::Dollar

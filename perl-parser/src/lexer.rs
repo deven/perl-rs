@@ -10,11 +10,11 @@
 use crate::error::ParseError;
 use crate::keyword::{self, Keyword};
 use crate::pragma::Features;
-use crate::source::{HeredocContext, LexerLine};
+use crate::source::LexerLine;
 use crate::span::Span;
 use crate::token::*;
 use bytes::Bytes;
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{memchr, memchr3};
 use std::collections::VecDeque;
 use unicode_normalization::UnicodeNormalization;
 use unicode_xid::UnicodeXID;
@@ -35,40 +35,49 @@ mod tests;
 /// `chain_end_pending` is set between tokens when the probe has detected end-of-chain — the next `lex_token` call emits
 /// `InterpChainEnd` and clears the chain state.
 #[derive(Clone, Debug, Default)]
-struct LexContext {
-    /// Opening delimiter character.  `None` for heredocs (end signaled by the source layer).
-    delim: Option<char>,
+pub(crate) struct LexContext {
+    // --- source-delivery frame ---
+    /// The suspended current line of the frame one level *below* this entry — the parent's line, parked when this
+    /// construct was pushed and restored to `self.line` when it pops.  The top frame's *own* current line is never
+    /// here; it is the live `self.line`.  Read during the heredoc host-walk.
+    pub(crate) line: Option<LexerLine>,
 
-    /// Delimiter nesting depth (for paired delimiters like `{}`).
-    depth: u32,
+    /// The frame's EOF bound: the global byte offset past which delivery reports virtual EOF.  `None` means no bound —
+    /// real EOF — which is the base source's ceiling and what a `lookahead_to` borrow installs when a heredoc scan's
+    /// host is the base.
+    pub(crate) bound: Option<u32>,
+
+    // --- lex mode ---
+    /// Opening delimiter character.  `None` for heredocs (end signaled by the source layer).
+    pub(crate) delim: Option<char>,
 
     /// Brace depth inside `${expr}` or `@{expr}`.  When > 0, the lexer produces normal code tokens.  When 0, it
     /// produces string body tokens via `lex_body`.
-    expr_depth: u32,
+    pub(crate) expr_depth: u32,
 
     /// Whether `$`/`@` trigger interpolation.
-    interpolating: bool,
+    pub(crate) interpolating: bool,
 
-    /// Whether escapes pass through raw (for regex, tr, prototypes).
-    raw: bool,
+    /// Whether escapes pass through raw (for regex, tr, prototypes, and literal heredocs — every backslash literal).
+    pub(crate) raw: bool,
 
     /// Whether to detect `(?{...})` code blocks (regex mode).
-    regex: bool,
+    pub(crate) regex: bool,
 
     /// Inside a subscript chain (see type-level doc).
-    chain_active: bool,
+    pub(crate) chain_active: bool,
 
     /// Bracket/brace nesting inside the chain.
-    chain_depth: u32,
+    pub(crate) chain_depth: u32,
 
     /// Chain end detected; emit `InterpChainEnd` on the next call.
-    chain_end_pending: bool,
+    pub(crate) chain_end_pending: bool,
 }
 
 impl LexContext {
     /// Convenience for the common string/regex push pattern: opening delimiter plus the three behavior flags.  Chain
-    /// fields default to false/0.
-    fn new(delim: Option<char>, interpolating: bool, raw: bool, regex: bool) -> Self {
+    /// fields and the source-delivery cluster default to empty; the source layer sets `line`/`bound` after.
+    pub(crate) fn new(delim: Option<char>, interpolating: bool, raw: bool, regex: bool) -> Self {
         LexContext { delim, interpolating, raw, regex, ..Default::default() }
     }
 }
@@ -132,28 +141,9 @@ pub(crate) struct Lexer {
     /// Next line number to assign (1-based).
     pub(crate) line_number: u32,
 
-    /// Stack of active heredoc contexts.
-    pub(crate) heredoc_stack: Vec<HeredocContext>,
-
     /// Lines queued for delivery by future `next_line()` calls.  Used for heredoc remainder delivery, push_back, and
     /// subst bodies.
     pub(crate) queued_lines: VecDeque<LexerLine>,
-
-    /// Indentation prefix to strip from every non-empty line.  Set by `start_indented_heredoc`, restored when the
-    /// heredoc finishes.
-    pub(crate) required_indent: Option<Bytes>,
-
-    /// Set when a heredoc terminator was found during a peek call.  The next consuming call will pop the heredoc
-    /// context.
-    pub(crate) terminator_pending: bool,
-
-    /// Set when the queued body lines of a substitution have been delivered.  The next `next_line` returns `None`
-    /// (virtual EOF), then delivers the saved remainder.
-    pub(crate) subst_eof_pending: bool,
-
-    /// Line to deliver after the virtual EOF of a subst body.  Contains the remainder of the source line after the
-    /// flags.
-    pub(crate) subst_saved_line: Option<LexerLine>,
 
     /// Displaced lines captured during an active lookahead scan, in displacement order (original current line first).
     /// Drained on guard drop: the original line is restored and the rest pushed onto `queued_lines` for replay.
@@ -172,7 +162,7 @@ pub(crate) struct Lexer {
     pub(crate) lookahead_mode: bool,
 
     // ── Tokenization ──
-    context_stack: Vec<LexContext>,
+    pub(crate) context_stack: Vec<LexContext>,
 
     /// Deferred error from auto-loading in `peek_byte`.  Surfaced on the next call to `lex_token`.
     pending_error: Option<ParseError>,
@@ -236,12 +226,7 @@ impl Lexer {
             cursor: 0,
             line: None,
             line_number: 1,
-            heredoc_stack: Vec::new(),
             queued_lines: VecDeque::new(),
-            required_indent: None,
-            terminator_pending: false,
-            subst_eof_pending: false,
-            subst_saved_line: None,
             lookahead: VecDeque::new(),
             lookahead_offset: None,
             lookahead_pos: None,
@@ -412,7 +397,7 @@ impl Lexer {
     ///
     /// `peek_heredoc`: when true, a heredoc end-of-body signal from `next_line` is preserved (not consumed).  Use
     /// `true` inside body scanning loops, `false` at entry points.
-    fn peek_byte(&mut self, peek_heredoc: bool) -> Option<u8> {
+    fn peek_byte(&mut self) -> Option<u8> {
         // Check current line for available bytes.
         if let Some(line) = &self.line
             && let Some(b) = line.peek_byte()
@@ -423,7 +408,7 @@ impl Lexer {
         // No line or line exhausted.  Try to load a new one.  `next_line` installs the new line (and recomputes
         // `effective_utf8`) on success; on EOF it returns `&None` and leaves the old line in place so callers can
         // still use line_slice etc.
-        match self.next_line(peek_heredoc) {
+        match self.next_line() {
             Ok(Some(line)) => line.peek_byte(),
             Ok(None) => None,
             Err(e) => {
@@ -748,7 +733,7 @@ impl Lexer {
         // Ensure any in-progress line is dropped; we read raw lines.
         self.line = None;
         // Advance to the next line.  An error or end of input both finish the format.
-        let got_line = self.next_line(false).map(|l| l.is_some()).unwrap_or(false);
+        let got_line = self.next_line().map(|l| l.is_some()).unwrap_or(false);
         let line = if got_line { self.line.take() } else { None };
         let Some(line) = line else {
             // EOF (or read error) inside a format — emit SublexEnd and finish.
@@ -873,11 +858,11 @@ impl Lexer {
         self.format_skip_inline_ws();
 
         // If at end of current source line, or at EOF, end args.
-        if self.peek_byte(false).is_none_or(|b| b == b'\n') {
+        if self.peek_byte().is_none_or(|b| b == b'\n') {
             let pos_start = self.span_pos();
 
             // Consume the newline (if any) so we're positioned on the next line for further format scanning.
-            if self.peek_byte(false) == Some(b'\n') {
+            if self.peek_byte() == Some(b'\n') {
                 self.skip(1);
             }
             if let Some(state) = &mut self.format_state {
@@ -923,7 +908,7 @@ impl Lexer {
 
     /// Skip space/tab characters but not newlines.
     fn format_skip_inline_ws(&mut self) {
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if b == b' ' || b == b'\t' {
                 self.skip(1);
             } else {
@@ -936,7 +921,7 @@ impl Lexer {
     fn skip_ws_and_comments(&mut self) -> Result<(), ParseError> {
         loop {
             // peek_byte auto-loads lines. \n is a byte, skipped as whitespace.
-            match self.peek_byte(false) {
+            match self.peek_byte() {
                 Some(b' ') | Some(b'\t') | Some(b'\n') => self.skip(1),
                 Some(b'#') => {
                     // Check for `# line N "file"` directive at column 0.
@@ -974,7 +959,7 @@ impl Lexer {
     /// candidate delimiter byte.
     fn skip_ws_and_comments_no_pod(&mut self) -> Result<(), ParseError> {
         loop {
-            match self.peek_byte(false) {
+            match self.peek_byte() {
                 Some(b' ') | Some(b'\t') | Some(b'\n') => self.skip(1),
                 Some(b'#') => {
                     // Check for `# line N "file"` directive at column 0, same as skip_ws_and_comments.
@@ -998,7 +983,7 @@ impl Lexer {
         // Read lines until =cut at start of line.
         loop {
             // peek_byte auto-loads the next line.
-            if self.peek_byte(false).is_none() {
+            if self.peek_byte().is_none() {
                 break; // EOF inside pod — not an error per Perl
             }
             let is_cut = self.line.as_ref().is_some_and(|line| line.line.starts_with(b"=cut") && !line.line.get(4).is_some_and(|b| b.is_ascii_alphabetic()));
@@ -1094,9 +1079,9 @@ impl Lexer {
                 }
                 return Ok(result);
             }
-            Some(ctx) => {
-                let (delim, depth, interpolating, raw, regex) = (ctx.delim, ctx.depth, ctx.interpolating, ctx.raw, ctx.regex);
-                return self.lex_body(delim, depth, interpolating, regex, raw);
+            Some(_) => {
+                // A body frame is on top: lex one body token.  `lex_body` reads its mode from the frame.
+                return self.lex_body();
             }
             None => {}
         }
@@ -1115,7 +1100,7 @@ impl Lexer {
 
         let start = self.span_pos();
 
-        let b = match self.peek_byte(false) {
+        let b = match self.peek_byte() {
             Some(b) => b,
             None => {
                 return Ok(Spanned { token: Token::Eof, span: Span::new(start, start) });
@@ -1138,12 +1123,12 @@ impl Lexer {
             b'\'' => self.lex_single_quoted_string()?,
             b'"' => {
                 self.skip(1); // skip opening "
-                self.context_stack.push(LexContext::new(Some('"'), true, false, false));
+                self.start_delimited_body(LexContext::new(Some('"'), true, false, false), false)?;
                 Token::QuoteSublexBegin(QuoteKind::Double, '"')
             }
             b'`' => {
                 self.skip(1); // skip opening `
-                self.context_stack.push(LexContext::new(Some('`'), true, false, false));
+                self.start_delimited_body(LexContext::new(Some('`'), true, false, false), false)?;
                 Token::QuoteSublexBegin(QuoteKind::Backtick, '`')
             }
 
@@ -1161,23 +1146,23 @@ impl Lexer {
             b'|' => self.lex_pipe(),
             b'^' => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'^') {
+                if self.peek_byte() == Some(b'^') {
                     self.skip(1);
-                    if self.peek_byte(false) == Some(b'=') {
+                    if self.peek_byte() == Some(b'=') {
                         self.skip(1);
                         Token::Assign(AssignOp::LogicalXorEq)
                     } else {
                         Token::LogicalXor
                     }
-                } else if self.peek_byte(false) == Some(b'.') && self.features.contains(Features::BITWISE) {
+                } else if self.peek_byte() == Some(b'.') && self.features.contains(Features::BITWISE) {
                     self.skip(1);
-                    if self.peek_byte(false) == Some(b'=') {
+                    if self.peek_byte() == Some(b'=') {
                         self.skip(1);
                         Token::Assign(AssignOp::StringBitXorEq)
                     } else {
                         Token::StringBitXor
                     }
-                } else if self.peek_byte(false) == Some(b'=') {
+                } else if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::BitXorEq)
                 } else {
@@ -1186,10 +1171,10 @@ impl Lexer {
             }
             b'~' => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'~') {
+                if self.peek_byte() == Some(b'~') {
                     self.skip(1);
                     Token::SmartMatch
-                } else if self.peek_byte(false) == Some(b'.') && self.features.contains(Features::BITWISE) {
+                } else if self.peek_byte() == Some(b'.') && self.features.contains(Features::BITWISE) {
                     self.skip(1);
                     Token::StringBitNot
                 } else {
@@ -1287,7 +1272,7 @@ impl Lexer {
         let start = self.line_pos();
 
         // Check for 0x, 0b, 0o prefixes
-        if self.peek_byte(false) == Some(b'0') {
+        if self.peek_byte() == Some(b'0') {
             match self.peek_byte_at(1) {
                 Some(b'x') | Some(b'X') => return self.lex_hex(),
                 Some(b'b') | Some(b'B') => return self.lex_binary(),
@@ -1299,20 +1284,20 @@ impl Lexer {
         // Decimal integer or float
         self.scan_digits();
 
-        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit() || b == b'_') {
+        if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit() || b == b'_') {
             // Before committing to float: check if this is a v-string without the `v` prefix.  If there are 2+ dots
             // (e.g. 102.111.111), it's a v-string per perldata.
             let saved_pos = self.line_pos();
             self.skip(1); // skip first '.'
             self.scan_digits();
-            if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+            if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
                 // Two dots — v-string without v prefix.  Collect the rest: .digits(.digits)*
                 let mut vstr = self.line_slice_str(start)?.to_string();
-                while self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+                while self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
                     vstr.push('.');
                     self.skip(1);
                     let seg_start = self.line_pos();
-                    while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+                    while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
                         self.skip(1);
                     }
                     vstr.push_str(self.line_slice_str(seg_start)?);
@@ -1331,7 +1316,7 @@ impl Lexer {
             self.scan_digits();
 
             // Legacy octal float: 07.65p2 — starts with 0, has p exponent.
-            if (self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P')) && self.line_slice_str(start)?.starts_with('0') {
+            if (self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P')) && self.line_slice_str(start)?.starts_with('0') {
                 let int_s = self.line_slice_str(start)?.split('.').next().unwrap_or("0").replace('_', "");
                 let frac_s = self.line_slice_str(frac_start)?.replace('_', "");
                 let exp = self.scan_p_exponent();
@@ -1345,7 +1330,7 @@ impl Lexer {
             let s = s.replace('_', "");
             let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
             Ok(Token::FloatLit(n))
-        } else if self.peek_byte(false) == Some(b'e') || self.peek_byte(false) == Some(b'E') {
+        } else if self.peek_byte() == Some(b'e') || self.peek_byte() == Some(b'E') {
             // Float with exponent
             self.scan_exponent();
             let s = self.line_slice_str(start)?;
@@ -1373,7 +1358,7 @@ impl Lexer {
     }
 
     fn scan_digits(&mut self) {
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if b.is_ascii_digit() || b == b'_' {
                 self.skip(1);
             } else {
@@ -1383,9 +1368,9 @@ impl Lexer {
     }
 
     fn scan_exponent(&mut self) {
-        if self.peek_byte(false) == Some(b'e') || self.peek_byte(false) == Some(b'E') {
+        if self.peek_byte() == Some(b'e') || self.peek_byte() == Some(b'E') {
             self.skip(1);
-            if self.peek_byte(false) == Some(b'+') || self.peek_byte(false) == Some(b'-') {
+            if self.peek_byte() == Some(b'+') || self.peek_byte() == Some(b'-') {
                 self.skip(1);
             }
             self.scan_digits();
@@ -1396,17 +1381,17 @@ impl Lexer {
     /// the signed exponent.
     fn scan_p_exponent(&mut self) -> i32 {
         self.skip(1); // skip p/P
-        let neg = if self.peek_byte(false) == Some(b'-') {
+        let neg = if self.peek_byte() == Some(b'-') {
             self.skip(1);
             true
         } else {
-            if self.peek_byte(false) == Some(b'+') {
+            if self.peek_byte() == Some(b'+') {
                 self.skip(1);
             }
             false
         };
         let exp_start = self.line_pos();
-        while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+        while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
             self.skip(1);
         }
         let exp_s = std::str::from_utf8(self.line_slice(exp_start)).unwrap_or("0");
@@ -1418,7 +1403,7 @@ impl Lexer {
         let start = self.line_pos();
         self.skip(2); // skip 0x
         let hex_start = self.line_pos();
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if b.is_ascii_hexdigit() || b == b'_' {
                 self.skip(1);
             } else {
@@ -1428,10 +1413,10 @@ impl Lexer {
         let int_str = self.line_slice_str(hex_start)?.replace('_', "");
 
         // Check for hex float: 0xHH.HHpEE
-        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_hexdigit()) {
+        if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_hexdigit()) {
             self.skip(1); // skip '.'
             let frac_start = self.line_pos();
-            while let Some(b) = self.peek_byte(false) {
+            while let Some(b) = self.peek_byte() {
                 if b.is_ascii_hexdigit() || b == b'_' {
                     self.skip(1);
                 } else {
@@ -1441,7 +1426,7 @@ impl Lexer {
             let frac_str = self.line_slice_str(frac_start)?.replace('_', "");
 
             // 'p' or 'P' exponent is required for hex float
-            if self.peek_byte(false) != Some(b'p') && self.peek_byte(false) != Some(b'P') {
+            if self.peek_byte() != Some(b'p') && self.peek_byte() != Some(b'P') {
                 return Err(ParseError::new("hex float requires 'p' exponent", self.span_from(start)));
             }
             let exp = self.scan_p_exponent();
@@ -1453,7 +1438,7 @@ impl Lexer {
         }
 
         // Check for hex float without fraction: 0xHHpEE
-        if self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P') {
+        if self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P') {
             let exp = self.scan_p_exponent();
             let int_val = u64::from_str_radix(&int_str, 16).unwrap_or(0) as f64;
             let val = int_val * 2f64.powi(exp);
@@ -1468,7 +1453,7 @@ impl Lexer {
         let start = self.line_pos();
         self.skip(2); // skip 0b
         let bin_start = self.line_pos();
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if b == b'0' || b == b'1' || b == b'_' {
                 self.skip(1);
             } else {
@@ -1477,7 +1462,7 @@ impl Lexer {
         }
 
         // Check for illegal binary digits (2-9)
-        if let Some(b) = self.peek_byte(false)
+        if let Some(b) = self.peek_byte()
             && b.is_ascii_digit()
         {
             return Err(ParseError::new(format!("Illegal binary digit '{}'", b as char), self.span_from(start)));
@@ -1485,14 +1470,14 @@ impl Lexer {
         let bin_str = self.line_slice_str(bin_start)?.replace('_', "");
 
         // Check for binary float: 0b101.01p-1
-        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b == b'0' || b == b'1') {
+        if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b == b'0' || b == b'1') {
             self.skip(1);
             let frac_start = self.line_pos();
-            while self.peek_byte(false).is_some_and(|b| b == b'0' || b == b'1' || b == b'_') {
+            while self.peek_byte().is_some_and(|b| b == b'0' || b == b'1' || b == b'_') {
                 self.skip(1);
             }
             let frac_str = self.line_slice_str(frac_start)?.replace('_', "");
-            if self.peek_byte(false) != Some(b'p') && self.peek_byte(false) != Some(b'P') {
+            if self.peek_byte() != Some(b'p') && self.peek_byte() != Some(b'P') {
                 return Err(ParseError::new("binary float requires 'p' exponent", self.span_from(start)));
             }
             let exp = self.scan_p_exponent();
@@ -1500,7 +1485,7 @@ impl Lexer {
             let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 2).unwrap_or(0) as f64 / 2f64.powi(frac_str.len() as i32) };
             return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
         }
-        if self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P') {
+        if self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P') {
             let exp = self.scan_p_exponent();
             let int_val = u64::from_str_radix(&bin_str, 2).unwrap_or(0) as f64;
             return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
@@ -1514,7 +1499,7 @@ impl Lexer {
         let start = self.line_pos();
         self.skip(2); // skip 0o
         let oct_start = self.line_pos();
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if (b'0'..=b'7').contains(&b) || b == b'_' {
                 self.skip(1);
             } else {
@@ -1523,7 +1508,7 @@ impl Lexer {
         }
 
         // Check for illegal octal digits (8, 9)
-        if let Some(b) = self.peek_byte(false)
+        if let Some(b) = self.peek_byte()
             && (b == b'8' || b == b'9')
         {
             return Err(ParseError::new(format!("Illegal octal digit '{}'", b as char), self.span_from(start)));
@@ -1531,14 +1516,14 @@ impl Lexer {
         let oct_str = self.line_slice_str(oct_start)?.replace('_', "");
 
         // Check for octal float: 0o7.65p2
-        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| (b'0'..=b'7').contains(&b)) {
+        if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| (b'0'..=b'7').contains(&b)) {
             self.skip(1);
             let frac_start = self.line_pos();
-            while self.peek_byte(false).is_some_and(|b| (b'0'..=b'7').contains(&b) || b == b'_') {
+            while self.peek_byte().is_some_and(|b| (b'0'..=b'7').contains(&b) || b == b'_') {
                 self.skip(1);
             }
             let frac_str = self.line_slice_str(frac_start)?.replace('_', "");
-            if self.peek_byte(false) != Some(b'p') && self.peek_byte(false) != Some(b'P') {
+            if self.peek_byte() != Some(b'p') && self.peek_byte() != Some(b'P') {
                 return Err(ParseError::new("octal float requires 'p' exponent", self.span_from(start)));
             }
             let exp = self.scan_p_exponent();
@@ -1546,7 +1531,7 @@ impl Lexer {
             let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 8).unwrap_or(0) as f64 / 8f64.powi(frac_str.len() as i32) };
             return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
         }
-        if self.peek_byte(false) == Some(b'p') || self.peek_byte(false) == Some(b'P') {
+        if self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P') {
             let exp = self.scan_p_exponent();
             let int_val = u64::from_str_radix(&oct_str, 8).unwrap_or(0) as f64;
             return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
@@ -1563,9 +1548,9 @@ impl Lexer {
         // Per perldata: "It is legal, but not recommended, to separate a variable's sigil from its name by space and/or
         // tab characters."  Only whitespace triggers this — `$#` is ArrayLen, not a comment.  Once inside the skip,
         // skip_ws_and_comments_no_pod handles any comments encountered along the way (e.g. `$  # comment\n x`).
-        if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
+        if matches!(self.peek_byte(), Some(b' ' | b'\t' | b'\n')) {
             self.skip_ws_and_comments_no_pod()?;
-            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
+            if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
                     return Ok(Token::ScalarVar(name));
@@ -1576,7 +1561,7 @@ impl Lexer {
 
         // $# — array length
         let after_hash = self.peek_byte_at(1);
-        if self.peek_byte(false) == Some(b'#') && after_hash.is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
+        if self.peek_byte() == Some(b'#') && after_hash.is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
             self.skip(1); // skip #
             let name = self.scan_ident();
             if !name.is_empty() {
@@ -1588,7 +1573,7 @@ impl Lexer {
         }
 
         // Special variables: $$, $!, $@, $_, $0-$9, $/, $\, etc.
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'_') => {
                 // Could be $_ or $_[...] or $_ident or $_ünïcödé
                 if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || (self.effective_utf8 && b >= 0x80)) {
@@ -1616,7 +1601,7 @@ impl Lexer {
                 if self.peek_byte_at(1) == Some(b'^') {
                     self.skip(2); // skip { and ^
                     let ident_start = self.line_pos();
-                    while let Some(b) = self.peek_byte(false) {
+                    while let Some(b) = self.peek_byte() {
                         if b.is_ascii_alphanumeric() || b == b'_' {
                             self.skip(1);
                         } else {
@@ -1625,7 +1610,7 @@ impl Lexer {
                     }
                     let ident = self.line_slice_str(ident_start)?;
                     let name = format!("^{ident}");
-                    if self.peek_byte(false) == Some(b'}') {
+                    if self.peek_byte() == Some(b'}') {
                         self.skip(1);
                     }
                     return Ok(Token::SpecialVar(name));
@@ -1636,7 +1621,7 @@ impl Lexer {
                 if self.peek_byte_at(1).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) {
                     self.skip(1); // skip {
                     let name = self.scan_ident();
-                    if self.peek_byte(false) == Some(b'}') {
+                    if self.peek_byte() == Some(b'}') {
                         self.skip(1);
                     }
                     return Ok(Token::ScalarVar(name));
@@ -1830,7 +1815,7 @@ impl Lexer {
             }
             Some(b) if b.is_ascii_digit() => {
                 let start = self.line_pos();
-                while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+                while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
                     self.skip(1);
                 }
                 let name = self.line_slice_str(start)?;
@@ -1846,9 +1831,9 @@ impl Lexer {
         self.skip(1); // skip @
 
         // Whitespace between sigil and name.
-        if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
+        if matches!(self.peek_byte(), Some(b' ' | b'\t' | b'\n')) {
             self.skip_ws_and_comments_no_pod()?;
-            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
+            if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
                     return Ok(Token::ArrayVar(name));
@@ -1857,12 +1842,12 @@ impl Lexer {
             return Ok(Token::At);
         }
 
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
                 // @{^CAPTURE} etc.
                 self.skip(2); // skip { and ^
                 let ident_start = self.line_pos();
-                while let Some(b) = self.peek_byte(false) {
+                while let Some(b) = self.peek_byte() {
                     if b.is_ascii_alphanumeric() || b == b'_' {
                         self.skip(1);
                     } else {
@@ -1871,7 +1856,7 @@ impl Lexer {
                 }
                 let ident = self.line_slice_str(ident_start)?;
                 let name = format!("^{ident}");
-                if self.peek_byte(false) == Some(b'}') {
+                if self.peek_byte() == Some(b'}') {
                     self.skip(1);
                 }
                 Ok(Token::SpecialArrayVar(name))
@@ -1910,7 +1895,7 @@ impl Lexer {
         // Always return Percent or ModEq.  The parser, in term position, calls lex_hash_var_after_percent to attempt
         // hash-variable detection.
         self.skip(1);
-        if self.peek_byte(false) == Some(b'=') {
+        if self.peek_byte() == Some(b'=') {
             self.skip(1);
             Ok(Token::Assign(AssignOp::ModEq))
         } else {
@@ -1923,9 +1908,9 @@ impl Lexer {
     /// an invalid standalone term).
     pub fn lex_hash_var_after_percent(&mut self) -> Result<Option<Token>, ParseError> {
         // Whitespace between sigil and name.
-        if matches!(self.peek_byte(false), Some(b' ' | b'\t' | b'\n')) {
+        if matches!(self.peek_byte(), Some(b' ' | b'\t' | b'\n')) {
             self.skip_ws_and_comments_no_pod()?;
-            if self.peek_byte(false).is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
+            if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
                     return Ok(Some(Token::HashVar(name)));
@@ -1934,12 +1919,12 @@ impl Lexer {
             return Ok(None);
         }
 
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'{') if self.peek_byte_at(1) == Some(b'^') => {
                 // %{^CAPTURE} etc.
                 self.skip(2); // skip { and ^
                 let ident_start = self.line_pos();
-                while let Some(b) = self.peek_byte(false) {
+                while let Some(b) = self.peek_byte() {
                     if b.is_ascii_alphanumeric() || b == b'_' {
                         self.skip(1);
                     } else {
@@ -1948,7 +1933,7 @@ impl Lexer {
                 }
                 let ident = self.line_slice_str(ident_start)?;
                 let name = format!("^{ident}");
-                if self.peek_byte(false) == Some(b'}') {
+                if self.peek_byte() == Some(b'}') {
                     self.skip(1);
                 }
                 Ok(Some(Token::SpecialHashVar(name)))
@@ -2033,7 +2018,7 @@ impl Lexer {
     fn scan_ident(&mut self) -> String {
         let start = self.line_pos();
         let mut first = true;
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if b == b'_' || b.is_ascii_alphabetic() || (!first && b.is_ascii_digit()) {
                 self.skip(1);
                 first = false;
@@ -2103,14 +2088,14 @@ impl Lexer {
         match name.as_str() {
             "__DATA__" | "__END__" => {
                 let kw = if name == "__DATA__" { Keyword::__DATA__ } else { Keyword::__END__ };
-                while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
+                while matches!(self.peek_byte(), Some(b' ' | b'\t')) {
                     self.skip(1);
                 }
-                if self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
+                if self.peek_byte() == Some(b'=') && self.peek_byte_at(1) == Some(b'>') {
                     return Ok(Token::StrLit(name));
                 }
                 self.line = None;
-                let offset = match self.next_line(false) {
+                let offset = match self.next_line() {
                     Ok(Some(line)) => line.offset,
                     _ => self.cursor() as u32,
                 };
@@ -2138,7 +2123,7 @@ impl Lexer {
         // `x=` compound assignment: when the identifier is exactly "x" and the immediately next byte (no whitespace —
         // scan_ident stopped at a non-ident char) is `=` not followed by `>` (which would be `x =>`, a fat comma), emit
         // RepeatEq.  Must be before at_fat_comma which consumes whitespace and would break the adjacency check.
-        if name == "x" && self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) != Some(b'>') {
+        if name == "x" && self.peek_byte() == Some(b'=') && self.peek_byte_at(1) != Some(b'>') {
             self.skip(1); // consume =
             return Ok(Token::Assign(AssignOp::RepeatEq));
         }
@@ -2154,13 +2139,13 @@ impl Lexer {
         // v-strings: v5, v5.26, v5.26.0 etc.
         if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|b| b.is_ascii_digit()) {
             let mut vstr = name.clone();
-            while self.peek_byte(false) == Some(b'.') {
+            while self.peek_byte() == Some(b'.') {
                 // Check that a digit follows the dot
                 if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
                     vstr.push('.');
                     self.skip(1); // skip '.'
                     let start = self.line_pos();
-                    while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+                    while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
                         self.skip(1);
                     }
                     vstr.push_str(self.line_slice_str(start)?);
@@ -2202,7 +2187,7 @@ impl Lexer {
     /// EOF.
     pub fn skip_ws_and_peek_byte(&mut self) -> Option<u8> {
         let _ = self.skip_ws_and_comments_no_pod();
-        self.peek_byte(false)
+        self.peek_byte()
     }
 
     /// Skip whitespace/newlines/comments (not POD) and check if `=>` (fat comma) follows.  Used by `lex_word` to
@@ -2210,7 +2195,7 @@ impl Lexer {
     /// `lex_normal_token` call would have skipped it anyway.
     fn at_fat_comma(&mut self) -> bool {
         let _ = self.skip_ws_and_comments_no_pod();
-        self.peek_byte(false) == Some(b'=') && self.peek_byte_at(1) == Some(b'>')
+        self.peek_byte() == Some(b'=') && self.peek_byte_at(1) == Some(b'>')
     }
 
     // ── Strings ───────────────────────────────────────────────
@@ -2224,18 +2209,30 @@ impl Lexer {
     /// Scan one token from a string/regex body.
     ///
     /// In interpolating mode (called repeatedly via context stack): returns one sub-token per call — `ConstSegment`,
-    /// `InterpScalar`, `InterpScalarExprStart`, etc.  Returns `SublexEnd` when the closing delimiter is reached.
+    /// `InterpScalar`, `InterpScalarExprStart`, etc.  Returns `SublexEnd` at the body frame's virtual EOF, popping
+    /// the frame (§5.5).
     ///
-    /// In non-interpolating mode (called once by q//, '...', etc.): scans the entire body and returns a single
-    /// `ConstSegment`.  The closing delimiter is consumed.
+    /// The body's end is the frame's bound (§5.4.6), not a delimiter in the stream, so this watches no close and
+    /// tracks no nesting depth: a nested or escaped delimiter is ordinary content.  `delim` is retained only to
+    /// unescape `\delim` (and `\open`/`\close` for paired delimiters); it is `None` for heredoc and `s///`
+    /// replacement bodies.
     ///
     /// Escape handling is controlled by the flags:
     /// - `!raw && !interpolating`: literal escapes (`\\`→`\`, `\delim`→delim).  For `q//`, `'...'`.
     /// - `!raw && interpolating`: double-quote escapes (`\n`, `\t`, etc.) via `process_escape`.  For `qq//`, `"..."`.
     /// - `raw`: passthrough (backslash prevents delimiter matching but both bytes are kept).  For `m//`, `tr//`.
     /// - `regex`: detect `(?{...})` code blocks (future).
-    fn lex_body(&mut self, delim: Option<char>, depth: u32, interpolating: bool, regex: bool, raw: bool) -> Result<Spanned, ParseError> {
-        // Compute open/close from the delimiter.  None means heredoc (no delimiter — end signaled by the source layer).
+    fn lex_body(&mut self) -> Result<Spanned, ParseError> {
+        // The body frame on top of the stack carries the mode, set when it was pushed (`LexContext::new` in the quote
+        // dispatch or `start_heredoc`).  Reading it here means callers thread nothing.  `delim` is kept only for
+        // escape processing (`\delim` → delim, `\open`/`\close` unescaping); the body ends at the frame's virtual
+        // EOF, never a delimiter in the stream.  `None` for heredoc / `s///` replacement.
+        let (delim, interpolating, regex, raw) = {
+            let Some(ctx) = self.context_stack.last() else {
+                return Err(ParseError::new("lex_body requires a body frame on the stack", Span::new(self.cursor as u32, self.cursor as u32)));
+            };
+            (ctx.delim, ctx.interpolating, ctx.regex, ctx.raw)
+        };
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
         let (open, close) = match delim {
             Some(d) => {
@@ -2245,43 +2242,24 @@ impl Lexer {
             None => (None, None),
         };
 
-        // peek_byte(false) auto-loads the next line, consuming the virtual EOF signal if pending (heredoc or subst
-        // body).
-        let b = match self.peek_byte(false) {
+        // The first `peek_byte` auto-loads the next body line, consuming a pending virtual-EOF signal.  At the bound
+        // it returns `None`: the body is done — pop the frame (restoring the suspended parent line, re-narrowed to the
+        // enclosing bound) and emit `SublexEnd`.  Unterminated bodies were already caught by the up-front scan.
+        let b = match self.peek_byte() {
             Some(b) => b,
             None => {
                 let pos = self.span_pos();
-                if close.is_none() {
-                    // Heredoc or subst body finished (virtual EOF).
-                    self.context_stack.pop();
-                    self.case_mod_stack.clear();
-                    self.case_mod_lcfirst = false;
-                    self.case_mod_ucfirst = false;
-                    return Ok(Spanned { token: Token::SublexEnd, span: Span::new(pos, pos) });
-                }
-                return Err(ParseError::new("unterminated string", Span::new(pos, pos)));
+                self.pop_context();
+                self.case_mod_stack.clear();
+                self.case_mod_lcfirst = false;
+                self.case_mod_ucfirst = false;
+                return Ok(Spanned { token: Token::SublexEnd, span: Span::new(pos, pos) });
             }
         };
 
         // Compute start AFTER peek_byte, so the position reflects the loaded line (not a stale source cursor).
         let start = self.span_pos();
 
-        // Fast dispatch for closing delimiter (incremental mode: context on the stack → pop and return SublexEnd).
-        if let Some(close_ch) = close
-            && depth == 0
-            && !self.context_stack.is_empty()
-        {
-            let mut cbuf = [0u8; 4];
-            let close_bytes = close_ch.encode_utf8(&mut cbuf).as_bytes();
-            if self.remaining().starts_with(close_bytes) {
-                self.skip(close_ch.len_utf8());
-                self.context_stack.pop();
-                self.case_mod_stack.clear();
-                self.case_mod_lcfirst = false;
-                self.case_mod_ucfirst = false;
-                return Ok(Spanned { token: Token::SublexEnd, span: Span::new(start, self.span_pos()) });
-            }
-        }
         if interpolating {
             if b == b'$' {
                 return self.lex_interp_scalar(start);
@@ -2302,7 +2280,7 @@ impl Lexer {
                 let escape_start = self.span_pos();
                 self.skip(3); // consume \N{
                 let mut name = String::new();
-                while let Some(b) = self.peek_byte(false) {
+                while let Some(b) = self.peek_byte() {
                     if b == b'}' {
                         self.skip(1);
                         break;
@@ -2347,65 +2325,31 @@ impl Lexer {
             }
         }
 
-        // Scan a ConstSegment: everything until we hit the closing delimiter (or $/@/end-of-line in interpolating
-        // mode).
+        // Scan a ConstSegment: bulk content up to the next interpolation/escape trigger or the body's virtual EOF.
+        // Delimiters are never triggers — a nested or escaped delimiter is content (§5.5.4).
         let mut s = String::new();
-        let mut current_depth = depth;
 
         loop {
             // ── memchr fast path ──────────────────────────────────
-            // When no case mods are active and we have remaining bytes in the current line, use SIMD-optimized search
-            // to skip past safe bytes in bulk.
+            // When no case mods are active and the line has bytes, SIMD-search for the next trigger and bulk-copy
+            // everything before it.  The line is narrowed to the frame's bound, so `remaining()` never runs past the
+            // body and the line end is the natural stop at virtual EOF.
             let no_case_mods = !self.case_mod_lcfirst && !self.case_mod_ucfirst && self.case_mod_stack.last().is_none_or(|f| f.is_empty());
-            if no_case_mods && current_depth == 0 {
+            if no_case_mods {
                 let r = self.remaining();
                 if !r.is_empty() {
-                    // First UTF-8 byte of each delimiter char, for memchr triggers.  For multi-byte delimiters this may
-                    // produce false positives (other chars sharing the same lead byte), which is safe — the byte-by-
-                    // byte fallback verifies the full sequence.
-                    let close_byte = close.map(|c| {
-                        let mut b = [0u8; 4];
-                        c.encode_utf8(&mut b);
-                        b[0]
-                    });
-                    let open_byte = open.map(|c| {
-                        let mut b = [0u8; 4];
-                        c.encode_utf8(&mut b);
-                        b[0]
-                    });
-
-                    // Find the next trigger byte using memchr.
+                    // Triggers: `$`/`@` when interpolating, `\` when not raw, `(` in regex.  No delimiter triggers.
                     let trigger_pos = if regex {
-                        // Regex: $, @, \, close, (
                         let sig = memchr3(b'$', b'@', b'\\', r);
-                        let delim = if let Some(c) = close_byte { memchr2(c, b'(', r) } else { memchr(b'(', r) };
-                        match (sig, delim) {
+                        match (sig, memchr(b'(', r)) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
                         }
                     } else if interpolating {
-                        // Interpolating: $, @, \, close
-                        let sig = memchr3(b'$', b'@', b'\\', r);
-                        let delim = close_byte.and_then(|c| memchr(c, r));
-                        match (sig, delim) {
-                            (Some(a), Some(b)) => Some(a.min(b)),
-                            (a, b) => a.or(b),
-                        }
+                        memchr3(b'$', b'@', b'\\', r)
                     } else {
-                        // Non-interpolating: \, close
-                        if let Some(c) = close_byte { memchr2(b'\\', c, r) } else { memchr(b'\\', r) }
-                    };
-
-                    // Also search for open delimiter (depth tracking).
-                    let trigger_pos = if let Some(ob) = open_byte
-                        && ob != close_byte.unwrap_or(0)
-                    {
-                        match (trigger_pos, memchr(ob, r)) {
-                            (Some(a), Some(b)) => Some(a.min(b)),
-                            (a, b) => a.or(b),
-                        }
-                    } else {
-                        trigger_pos
+                        // q//, '...', tr//, literal heredoc: only `\` (for `\\`, `\delim`, raw passthrough).
+                        memchr(b'\\', r)
                     };
 
                     let safe_len = trigger_pos.unwrap_or(r.len());
@@ -2431,50 +2375,12 @@ impl Lexer {
             }
 
             // ── Byte-by-byte fallback ─────────────────────────────
-            let Some(b) = self.peek_byte(true) else {
-                // EOF or virtual EOF (peeked).  For delimited strings (close is Some), this means the closing delimiter
-                // was not found — that's an error.
-                if close.is_some() {
-                    return Err(ParseError::new("unterminated string", Span::new(start, self.span_pos())));
-                }
+            let Some(b) = self.peek_byte() else {
+                // Virtual EOF at the bound: the body is done.  Flush the accumulated segment; the next call pops the
+                // frame and emits SublexEnd.  A nested or escaped delimiter never reaches here — it is plain content
+                // handled below; the bound, not a close byte, ends the body.
                 break;
             };
-
-            // Check close delimiter (handles both ASCII and multi-byte).
-            if let Some(close_ch) = close {
-                let close_len = close_ch.len_utf8();
-                let mut cbuf = [0u8; 4];
-                let close_bytes = close_ch.encode_utf8(&mut cbuf).as_bytes();
-                if self.remaining().starts_with(close_bytes) {
-                    if current_depth == 0 {
-                        if self.context_stack.is_empty() {
-                            // lex_body_str mode: consume the closing delimiter.
-                            self.skip(close_len);
-                        }
-
-                        // Incremental mode: leave the delimiter for the SublexEnd fast dispatch on the next call.
-                        break;
-                    } else {
-                        current_depth -= 1;
-                        self.skip(close_len);
-                        self.push_case_mod(&mut s, close_ch);
-                        continue;
-                    }
-                }
-            }
-
-            // Check open delimiter for nesting depth.
-            if let Some(open_ch) = open {
-                let open_len = open_ch.len_utf8();
-                let mut obuf = [0u8; 4];
-                let open_bytes = open_ch.encode_utf8(&mut obuf).as_bytes();
-                if self.remaining().starts_with(open_bytes) {
-                    current_depth += 1;
-                    self.skip(open_len);
-                    self.push_case_mod(&mut s, open_ch);
-                    continue;
-                }
-            }
 
             match b {
                 b'$' | b'@' if interpolating => break,
@@ -2527,7 +2433,7 @@ impl Lexer {
                     } else {
                         // Literal (single-quote) escapes: \\ → \, \close → close, \open → open.
                         let mut matched = false;
-                        if self.peek_byte(false) == Some(b'\\') {
+                        if self.peek_byte() == Some(b'\\') {
                             self.skip(1);
                             s.push('\\');
                             matched = true;
@@ -2570,48 +2476,35 @@ impl Lexer {
             }
         }
 
-        // Update depth in context stack (only relevant for interpolating mode with paired delimiters).
-        if interpolating && let Some(ctx) = self.context_stack.last_mut() {
-            ctx.depth = current_depth;
-        }
-
         Ok(Spanned { token: Token::ConstSegment(s), span: Span::new(start, self.span_pos()) })
     }
 
-    /// Non-interpolating convenience: scan the entire body and return the content as a String.  The closing delimiter
-    /// is consumed.
+    /// Scan a non-interpolating delimited body and return its content as a `String` — `q//`, `'...'`, `qw//`, and
+    /// each half of `tr///`.  Pushes a body frame via `start_delimited_body` (which finds the close and suspends the
+    /// parent past it), then drives `lex_body` to `SublexEnd`, concatenating the `ConstSegment` runs.  The frame pops
+    /// itself at the body's virtual EOF, so the cursor is left past the close — top-level or nested alike.
     ///
     /// `raw` selects escape handling:
     /// - `false`: single-quote escapes (`\\`→`\`, `\delim`→delim).
     /// - `true`: raw passthrough (`\delim`→delim, else pass through).
     pub fn lex_body_str(&mut self, delim: char, raw: bool) -> Result<String, ParseError> {
-        let spanned = self.lex_body(Some(delim), 0, false, false, raw)?;
-        let s = match spanned.token {
-            Token::ConstSegment(s) => s,
-            _ => unreachable!("lex_body in non-interpolating mode should return ConstSegment"),
-        };
-
-        // `lex_body` only auto-consumes the closing delimiter when the context stack is empty — its incremental-sublex
-        // protocol leaves the delim in place so the next `lex_token` call can emit `SublexEnd`.  When we're called from
-        // inside a sublex context (e.g. a single-quoted subscript key inside a `"..."` interpolation, or the second
-        // half of `tr{from}{to}`), that leaves the delim un-consumed.  Consume it here so `lex_body_str` always leaves
-        // the cursor past the closer.
-        //
-        // Use `matching_delimiter` to get the CLOSING char — for paired delimiters like `{`, the close is `}`, not `{`
-        // itself.
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
-        let (_, close) = matching_delimiter(delim, extra);
-        let mut cbuf = [0u8; 4];
-        let close_bytes = close.encode_utf8(&mut cbuf).as_bytes();
-        if self.remaining().starts_with(close_bytes) {
-            self.skip(close.len_utf8());
+        self.start_delimited_body(LexContext::new(Some(delim), false, raw, false), extra)?;
+
+        let mut s = String::new();
+        loop {
+            match self.lex_body()?.token {
+                Token::ConstSegment(seg) => s.push_str(&seg),
+                Token::SublexEnd => break,
+                other => unreachable!("non-interpolating lex_body yields only ConstSegment/SublexEnd, got {other:?}"),
+            }
         }
         Ok(s)
     }
 
     /// Process a backslash escape inside a double-quoted string.  The backslash has already been consumed.
     fn process_escape(&mut self, s: &mut String, close: Option<char>) -> Result<(), ParseError> {
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'n') => {
                 self.skip(1);
                 s.push('\n');
@@ -2669,11 +2562,11 @@ impl Lexer {
             Some(b'x') => {
                 self.skip(1);
                 let mut val = 0u8;
-                if self.peek_byte(false) == Some(b'{') {
+                if self.peek_byte() == Some(b'{') {
                     // \x{HH...} — Unicode escape
                     self.skip(1);
                     let mut n = 0u32;
-                    while let Some(b) = self.peek_byte(false) {
+                    while let Some(b) = self.peek_byte() {
                         if b == b'}' {
                             self.skip(1);
                             break;
@@ -2691,7 +2584,7 @@ impl Lexer {
                 } else {
                     // \xHH
                     for _ in 0..2 {
-                        if let Some(b) = self.peek_byte(false) {
+                        if let Some(b) = self.peek_byte() {
                             if b.is_ascii_hexdigit() {
                                 self.skip(1);
                                 val = val * 16 + hex_digit(b);
@@ -2707,11 +2600,11 @@ impl Lexer {
                 // \N{U+XXXX} — hex codepoint escape.  \N{CHARNAME} is handled inline in lex_body before process_escape
                 // is called, so only the U+ form and bare \N reach here.
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'{') {
+                if self.peek_byte() == Some(b'{') {
                     let escape_start = self.span_pos();
                     self.skip(1);
                     let mut name = String::new();
-                    while let Some(b) = self.peek_byte(false) {
+                    while let Some(b) = self.peek_byte() {
                         if b == b'}' {
                             self.skip(1);
                             break;
@@ -2737,10 +2630,10 @@ impl Lexer {
             Some(b'o') => {
                 // \o{NNN} — octal escape with braces.
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'{') {
+                if self.peek_byte() == Some(b'{') {
                     self.skip(1);
                     let mut n = 0u32;
-                    while let Some(b) = self.peek_byte(false) {
+                    while let Some(b) = self.peek_byte() {
                         if b == b'}' {
                             self.skip(1);
                             break;
@@ -2764,7 +2657,7 @@ impl Lexer {
             Some(b'c') => {
                 // \cX — control character.  The character following \c is XORed with 0x40 to produce the control char.
                 self.skip(1);
-                if let Some(next) = self.peek_byte(false) {
+                if let Some(next) = self.peek_byte() {
                     self.skip(1);
                     let ctrl = (next.to_ascii_uppercase()) ^ 0x40;
                     s.push(ctrl as char);
@@ -2777,7 +2670,7 @@ impl Lexer {
                 // \NNN — octal escape (1–3 digits, no braces).  Note: \0 is handled separately above.
                 let mut n = 0u32;
                 for _ in 0..3 {
-                    if let Some(b) = self.peek_byte(false) {
+                    if let Some(b) = self.peek_byte() {
                         if (b'0'..=b'7').contains(&b) {
                             self.skip(1);
                             n = n * 8 + (b - b'0') as u32;
@@ -2844,16 +2737,16 @@ impl Lexer {
         self.skip(1); // skip $
 
         // ${...} form
-        if self.peek_byte(false) == Some(b'{') {
+        if self.peek_byte() == Some(b'{') {
             self.skip(1); // skip {
 
             // Simple identifier: ${name}
-            let next_byte = self.peek_byte(false);
+            let next_byte = self.peek_byte();
             let is_ident = next_byte.is_some_and(|b| self.is_ident_start(b));
             if is_ident {
                 let saved_pos = self.line_pos();
                 let name = self.scan_ident();
-                if self.peek_byte(false) == Some(b'}') {
+                if self.peek_byte() == Some(b'}') {
                     self.skip(1);
                     return Ok(Spanned { token: Token::InterpScalar(name), span: Span::new(start, self.span_pos()) });
                 }
@@ -2872,7 +2765,7 @@ impl Lexer {
         }
 
         // $name form — must start with alpha, _ or (in UTF-8 mode) a Unicode letter.
-        let next_byte = self.peek_byte(false);
+        let next_byte = self.peek_byte();
         let is_name = next_byte.is_some_and(|b| self.is_ident_start(b));
         if is_name {
             let name = self.scan_ident();
@@ -2890,7 +2783,7 @@ impl Lexer {
 
         // $^X — caret variable (single uppercase letter after ^).  Perl interpolates these in strings: `"v$^V"` gives
         // the Perl version string.
-        if self.peek_byte(false) == Some(b'^')
+        if self.peek_byte() == Some(b'^')
             && let Some(next) = self.peek_byte_at(1)
             && (next.is_ascii_alphabetic() || next == b'[' || next == b']' || next == b'^' || next == b'_' || next == b'?' || next == b'\\')
         {
@@ -2901,7 +2794,7 @@ impl Lexer {
 
         // $'ident — apostrophe as package separator in string interpolation.  Must check that ' is not the close
         // delimiter (e.g. qq'$'x' — the ' closes the string).
-        if self.peek_byte(false) == Some(b'\'')
+        if self.peek_byte() == Some(b'\'')
             && self.features.contains(Features::APOSTROPHE_AS_PACKAGE_SEPARATOR)
             && self.context_stack.last().and_then(|ctx| ctx.delim).is_none_or(|d| d != '\'')
             && self.peek_byte_at(1).is_some_and(|next| next == b'_' || next.is_ascii_alphabetic() || (self.effective_utf8 && next >= 0x80))
@@ -2927,7 +2820,7 @@ impl Lexer {
         self.skip(1); // skip @
 
         // @{...} form — expression interpolation: @{[ expr ]}
-        if self.peek_byte(false) == Some(b'{') {
+        if self.peek_byte() == Some(b'{') {
             self.skip(1); // skip {
             if let Some(ctx) = self.context_stack.last_mut() {
                 ctx.expr_depth = 1;
@@ -2936,7 +2829,7 @@ impl Lexer {
         }
 
         // @name form
-        let next_byte = self.peek_byte(false);
+        let next_byte = self.peek_byte();
         let is_name = next_byte.is_some_and(|b| self.is_ident_start(b));
         if is_name {
             let name = self.scan_ident();
@@ -3017,13 +2910,15 @@ impl Lexer {
 
     fn lex_qq_string(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext::new(Some(delim), true, false, false));
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        self.start_delimited_body(LexContext::new(Some(delim), true, false, false), extra)?;
         Ok(Token::QuoteSublexBegin(QuoteKind::Double, delim))
     }
 
     fn lex_qx(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext::new(Some(delim), true, false, false));
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        self.start_delimited_body(LexContext::new(Some(delim), true, false, false), extra)?;
         Ok(Token::QuoteSublexBegin(QuoteKind::Backtick, delim))
     }
 
@@ -3040,14 +2935,16 @@ impl Lexer {
     /// `m/pattern/flags` or `m{pattern}flags`
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext::new(Some(delim), delim != '\'', true, true));
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        self.start_delimited_body(LexContext::new(Some(delim), delim != '\'', true, true), extra)?;
         Ok(Token::RegexSublexBegin(RegexKind::Match, delim))
     }
 
     /// `qr/pattern/flags` or `qr{pattern}flags`
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        self.context_stack.push(LexContext::new(Some(delim), delim != '\'', true, true));
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        self.start_delimited_body(LexContext::new(Some(delim), delim != '\'', true, true), extra)?;
         Ok(Token::RegexSublexBegin(RegexKind::Qr, delim))
     }
 
@@ -3055,10 +2952,10 @@ impl Lexer {
     fn lex_s(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
 
-        // Push context for the pattern body (raw, regex mode).  Single-quote delimiter disables interpolation.  The
-        // parser will collect body tokens until SublexEnd, then call start_subst_replacement to set up the replacement
-        // body.
-        self.context_stack.push(LexContext::new(Some(delim), delim != '\'', true, true));
+        // Push the pattern body frame (raw, regex mode; single-quote delimiter disables interpolation).  The parser
+        // collects the pattern's tokens to SublexEnd, then calls `start_subst_replacement` for the replacement body.
+        let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+        self.start_delimited_body(LexContext::new(Some(delim), delim != '\'', true, true), extra)?;
 
         Ok(Token::SubstSublexBegin(delim))
     }
@@ -3066,21 +2963,51 @@ impl Lexer {
     /// Set up the replacement body of a substitution after the pattern has been consumed.  Called by the parser after
     /// collecting the pattern's SublexEnd.
     ///
-    /// For paired delimiters, reads the replacement delimiter.  Scans ahead for flags via `start_subst_body`, then
-    /// pushes the appropriate LexContext for the replacement body.  Returns the captured flags.
+    /// For paired delimiters, reads the replacement delimiter, then pushes the replacement body via
+    /// `start_delimited_body` (which finds the close and suspends the parent just past it — exactly where the flags
+    /// sit).  The flags decide the body's mode (`/e` → raw code, else interpolating string), but they follow the
+    /// close, so they are read off the parent-resume line and the frame's mode is set afterward, before any sublexing.
+    /// Returns the captured flags.
     pub fn start_subst_replacement(&mut self, pattern_delim: char) -> Result<Option<String>, ParseError> {
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
         let repl_delim = if is_paired(pattern_delim, extra) { self.read_quote_delimiter()? } else { pattern_delim };
 
-        let flags = self.start_subst_body(repl_delim, extra)?;
+        // Push the replacement frame.  `delim` is `Some` so the scan can find the close; the body then sublexes to the
+        // bound and the delimiter is not watched for again.  The mode here is provisional — the scan ignores it — and
+        // is corrected below once `/e` is known.
+        self.start_delimited_body(LexContext::new(Some(repl_delim), true, false, false), extra)?;
+
+        // The flags sit immediately after the close, on the frame's parent-resume line.  Read them there and advance
+        // that line past them, so the parent resumes after the flags.
+        let flags = self.read_quote_flags();
         let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
 
-        // Push context for the replacement body.  delim is None — the body ends at the virtual EOF set up by
-        // start_subst_body, not at a delimiter byte.  With /e: raw scan (code, parser will reparse).  Without /e:
-        // interpolating string.
-        self.context_stack.push(LexContext::new(None, !has_eval, has_eval, false));
+        // `/e` is known now, before any sublexing: set the replacement body's mode in place — raw code for `/e`, an
+        // interpolating string otherwise.
+        if let Some(top) = self.context_stack.last_mut() {
+            top.interpolating = !has_eval;
+            top.raw = has_eval;
+        }
 
         Ok(flags)
+    }
+
+    /// Read the trailing flag run (`[A-Za-z0-9_]*`) that follows a quote-like close, off the top frame's suspended
+    /// parent-resume line, and advance that line past it so the parent resumes after the flags.  Returns the flags, or
+    /// `None` when there are none.
+    pub(crate) fn read_quote_flags(&mut self) -> Option<String> {
+        let line = self.context_stack.last_mut()?.line.as_mut()?;
+        let start = line.pos as usize;
+        let mut end = start;
+        while end < line.line.len() && (line.line[end].is_ascii_alphanumeric() || line.line[end] == b'_') {
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        let flags = String::from_utf8_lossy(&line.line[start..end]).into_owned();
+        line.pos = end as u32;
+        Some(flags)
     }
 
     /// `tr/from/to/flags` or `y/from/to/flags`
@@ -3108,7 +3035,7 @@ impl Lexer {
         //
         // Uses the no-pod skipper: inside a quote op's delimiter scan, `=pod` at column 0 is a candidate delimiter
         // byte, not a pod block.  See `skip_ws_and_comments_no_pod`.
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b) if b == b' ' || b == b'\t' => {
                 self.skip_ws_and_comments_no_pod()?;
             }
@@ -3118,7 +3045,7 @@ impl Lexer {
             }
             _ => {}
         }
-        let b = self.peek_byte(false).ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))?;
+        let b = self.peek_byte().ok_or_else(|| ParseError::new("expected delimiter", Span::new(self.span_pos(), self.span_pos())))?;
         if b < 0x80 {
             // ASCII delimiter — single byte.
             self.skip(1);
@@ -3136,7 +3063,7 @@ impl Lexer {
     // ── Operators ─────────────────────────────────────────────
     fn lex_plus(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'+') => {
                 self.skip(1);
                 Token::PlusPlus
@@ -3151,7 +3078,7 @@ impl Lexer {
 
     fn lex_minus(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'-') => {
                 self.skip(1);
                 Token::MinusMinus
@@ -3172,20 +3099,20 @@ impl Lexer {
     /// leading-dot float (`.5`, `.5e2`) or v-string (`.5.6` → `v0.5.6`).  Returns `Some(FloatLit(n))` or
     /// `Some(VersionLit(s))` if found, `None` otherwise (the dot is not the start of a numeric literal).
     pub fn lex_leading_dot_float(&mut self) -> Result<Option<Token>, ParseError> {
-        if !self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+        if !self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
             return Ok(None);
         }
         let start = self.line_pos();
         self.scan_digits();
 
         // Check for v-string: `.5.6` has a second dot+digit → VersionLit("0.5.6").
-        if self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+        if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
             let mut vstr = format!("0.{}", self.line_slice_str(start)?);
-            while self.peek_byte(false) == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
+            while self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit()) {
                 vstr.push('.');
                 self.skip(1);
                 let seg_start = self.line_pos();
-                while self.peek_byte(false).is_some_and(|b| b.is_ascii_digit()) {
+                while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
                     self.skip(1);
                 }
                 vstr.push_str(self.line_slice_str(seg_start)?);
@@ -3205,7 +3132,7 @@ impl Lexer {
     /// byte is a single letter not followed by a word-continuation char (e.g. `-f $file`, `-d "/tmp"`).  Returns `None`
     /// otherwise.
     pub fn lex_filetest_after_minus(&mut self) -> Option<Token> {
-        let b = self.peek_byte(false)?;
+        let b = self.peek_byte()?;
         if !b.is_ascii_alphabetic() {
             return None;
         }
@@ -3226,10 +3153,10 @@ impl Lexer {
 
     fn lex_star(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'*') => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::PowEq)
                 } else {
@@ -3247,7 +3174,7 @@ impl Lexer {
     fn lex_slash(&mut self) -> Token {
         if self.peek_byte_at(1) == Some(b'/') {
             self.skip(2);
-            if self.peek_byte(false) == Some(b'=') {
+            if self.peek_byte() == Some(b'=') {
                 self.skip(1);
                 Token::Assign(AssignOp::DefinedOrEq)
             } else {
@@ -3255,7 +3182,7 @@ impl Lexer {
             }
         } else {
             self.skip(1);
-            if self.peek_byte(false) == Some(b'=') {
+            if self.peek_byte() == Some(b'=') {
                 self.skip(1);
                 Token::Assign(AssignOp::DivEq)
             } else {
@@ -3270,7 +3197,7 @@ impl Lexer {
     /// reports errors for invalid ones.
     pub fn scan_adjacent_word_chars(&mut self) -> Option<String> {
         let start = self.line_pos();
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if b.is_ascii_alphanumeric() || b == b'_' {
                 self.skip(1);
             } else {
@@ -3286,10 +3213,10 @@ impl Lexer {
 
     fn lex_dot(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'.') => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'.') {
+                if self.peek_byte() == Some(b'.') {
                     self.skip(1);
                     Token::ThreeDots
                 } else {
@@ -3306,12 +3233,12 @@ impl Lexer {
 
     fn lex_less_than(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // consume first <
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'<') => {
                 // Always return ShiftLeft / ShiftLeftEq.  The parser handles heredoc detection in term position by
                 // calling lex_heredoc_after_shift_left.
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Ok(Token::Assign(AssignOp::ShiftLeftEq))
                 } else {
@@ -3320,7 +3247,7 @@ impl Lexer {
             }
             Some(b'=') => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'>') {
+                if self.peek_byte() == Some(b'>') {
                     self.skip(1);
                     Ok(Token::Spaceship)
                 } else {
@@ -3338,7 +3265,7 @@ impl Lexer {
         let start_pos = self.line_pos();
         let mut content = String::new();
         let mut found_close = false;
-        while let Some(b) = self.peek_byte(false) {
+        while let Some(b) = self.peek_byte() {
             if b == b'>' {
                 self.skip(1);
                 found_close = true;
@@ -3362,17 +3289,17 @@ impl Lexer {
     }
 
     /// Called by the parser after consuming a `ShiftLeft` token in term position.  Attempts to read a heredoc tag (with
-    /// optional `~` prefix) and start the heredoc body.  Returns the token produced (`QuoteSublexBegin` for
-    /// interpolating, `HeredocLit` for literal), or rewinds and returns `None` if no valid tag follows — the parser
-    /// should then treat the `ShiftLeft` as a shift.
+    /// optional `~` prefix) and start the heredoc body.  Returns the token produced (`QuoteSublexBegin` for every
+    /// heredoc form — literal heredocs differ only by the body frame's mode, not the token), or rewinds and returns
+    /// `None` if no valid tag follows — the parser should then treat the `ShiftLeft` as a shift.
     pub fn lex_heredoc_after_shift_left(&mut self) -> Result<Option<Token>, ParseError> {
         let saved = self.line_pos();
 
         // `<<>>` — double diamond (safe version of <>).  Must check before heredoc tag parsing since `>` is not a valid
         // tag character.
-        if self.peek_byte(false) == Some(b'>') {
+        if self.peek_byte() == Some(b'>') {
             self.skip(1);
-            if self.peek_byte(false) == Some(b'>') {
+            if self.peek_byte() == Some(b'>') {
                 self.skip(1);
                 return Ok(Some(Token::Readline(String::new(), true)));
             }
@@ -3385,21 +3312,21 @@ impl Lexer {
         }
 
         // <<~ for indented heredocs
-        let indented = self.peek_byte(false) == Some(b'~');
+        let indented = self.peek_byte() == Some(b'~');
         if indented {
             self.skip(1);
         }
 
         // Whitespace between <<(~) and the tag is allowed before quoted tags but NOT before bare tags.  Perl treats
         // `<< TAG` as `<<""` (empty tag) which is forbidden.
-        let had_whitespace = matches!(self.peek_byte(false), Some(b' ' | b'\t'));
+        let had_whitespace = matches!(self.peek_byte(), Some(b' ' | b'\t'));
         if had_whitespace {
-            while matches!(self.peek_byte(false), Some(b' ' | b'\t')) {
+            while matches!(self.peek_byte(), Some(b' ' | b'\t')) {
                 self.skip(1);
             }
         }
 
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             // Quoted tags: whitespace before them is fine.
             Some(b'"') | Some(b'\'') | Some(b'\\') | Some(b'`') => Ok(Some(self.lex_heredoc(indented)?)),
 
@@ -3421,7 +3348,7 @@ impl Lexer {
     /// the tag start.
     fn lex_heredoc(&mut self, indented: bool) -> Result<Token, ParseError> {
         // Determine quoting style and extract tag.  `command` tracks backtick quoting (interpolated + executed).
-        let (kind, tag, command) = match self.peek_byte(false) {
+        let (kind, tag, command) = match self.peek_byte() {
             Some(b'\'') => {
                 // <<'TAG' — literal
                 self.skip(1);
@@ -3448,7 +3375,7 @@ impl Lexer {
                 self.skip(1);
                 let tag_start = self.line_pos();
                 loop {
-                    match self.peek_byte(false) {
+                    match self.peek_byte() {
                         Some(b) if b == b'_' || b.is_ascii_alphanumeric() => self.skip(1),
                         Some(b) if self.effective_utf8 && b >= 0x80 => {
                             if let Some((ch, len)) = self.peek_utf8_char()
@@ -3470,7 +3397,7 @@ impl Lexer {
                 // Bare identifier — interpolating
                 let tag_start = self.line_pos();
                 loop {
-                    match self.peek_byte(false) {
+                    match self.peek_byte() {
                         Some(b) if b == b'_' || b.is_ascii_alphanumeric() => self.skip(1),
                         Some(b) if self.effective_utf8 && b >= 0x80 => {
                             if let Some((ch, len)) = self.peek_utf8_char()
@@ -3493,54 +3420,27 @@ impl Lexer {
         let tag_bytes = Bytes::from(tag.as_bytes().to_vec());
         let quote_kind = if command { QuoteKind::Backtick } else { QuoteKind::Heredoc };
 
-        match kind {
-            HeredocKind::Interpolating => {
-                self.start_heredoc(tag_bytes)?;
-                self.context_stack.push(LexContext::new(None, true, false, false));
-                Ok(Token::QuoteSublexBegin(quote_kind, '\0'))
-            }
-            HeredocKind::Indented => {
-                self.start_indented_heredoc(tag_bytes)?;
-                self.context_stack.push(LexContext::new(None, true, false, false));
-                Ok(Token::QuoteSublexBegin(quote_kind, '\0'))
-            }
-            HeredocKind::Literal => {
-                self.start_heredoc(tag_bytes)?;
-                self.collect_heredoc_literal(&tag, false)
-            }
-            HeredocKind::IndentedLiteral => {
-                self.start_indented_heredoc(tag_bytes)?;
-                self.collect_heredoc_literal(&tag, true)
-            }
-        }
-    }
-
-    /// Collect a literal heredoc body as a raw string.  The source layer handles terminator detection and indent
-    /// stripping.
-    fn collect_heredoc_literal(&mut self, tag: &str, indented: bool) -> Result<Token, ParseError> {
-        let mut body = String::new();
-        while self.next_line(false)?.is_some() {
-            if let Some(line) = &self.line {
-                body.push_str(&String::from_utf8_lossy(&line.line));
-                body.push('\n');
-            }
-        }
-        // `next_line` installs each body line into `self.line` and, on the terminator's virtual EOF, leaves the last
-        // one in place (the keep-old-line contract).  Clear it so the queued tag-line remainder — saved by
-        // `start_heredoc` and re-queued when the terminator was consumed — is delivered when lexing resumes.
-        self.line = None;
-        let kind = if indented { HeredocKind::IndentedLiteral } else { HeredocKind::Literal };
-        Ok(Token::HeredocLit(kind, tag.to_string(), body))
+        // All four heredoc forms share one path: `start_heredoc` pushes the body frame (interpolating or literal per
+        // the tag's quoting, indented per `<<~`), and the body sublexes through `lex_body` to `SublexEnd`.  A literal
+        // heredoc is just `interpolating: false` — no separate collector, no distinct token (§5.5).
+        let (indented, interpolating) = match kind {
+            HeredocKind::Interpolating => (false, true),
+            HeredocKind::Indented => (true, true),
+            HeredocKind::Literal => (false, false),
+            HeredocKind::IndentedLiteral => (true, false),
+        };
+        self.start_heredoc(tag_bytes, indented, interpolating)?;
+        Ok(Token::QuoteSublexBegin(quote_kind, '\0'))
     }
 
     /// Scan a quoted heredoc tag (between matching quotes).
     fn scan_heredoc_tag(&mut self, close: u8) -> Result<String, ParseError> {
         let start = self.line_pos();
-        while self.peek_byte(false).is_some_and(|b| b != close) {
+        while self.peek_byte().is_some_and(|b| b != close) {
             self.skip(1);
         }
         let tag = String::from_utf8_lossy(self.line_slice(start)).into_owned();
-        if self.peek_byte(false) == Some(close) {
+        if self.peek_byte() == Some(close) {
             self.skip(1); // skip closing quote
         }
         Ok(tag)
@@ -3548,10 +3448,10 @@ impl Lexer {
 
     fn lex_greater_than(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'>') => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::ShiftRightEq)
                 } else {
@@ -3568,7 +3468,7 @@ impl Lexer {
 
     fn lex_equals(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'=') => {
                 self.skip(1);
                 Token::NumEq
@@ -3587,7 +3487,7 @@ impl Lexer {
 
     fn lex_bang(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'=') => {
                 self.skip(1);
                 Token::NumNe
@@ -3602,10 +3502,10 @@ impl Lexer {
 
     fn lex_ampersand(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'&') => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::AndEq)
                 } else {
@@ -3614,7 +3514,7 @@ impl Lexer {
             }
             Some(b'.') if self.features.contains(Features::BITWISE) => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::StringBitAndEq)
                 } else {
@@ -3631,10 +3531,10 @@ impl Lexer {
 
     fn lex_pipe(&mut self) -> Token {
         self.skip(1);
-        match self.peek_byte(false) {
+        match self.peek_byte() {
             Some(b'|') => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::OrEq)
                 } else {
@@ -3643,7 +3543,7 @@ impl Lexer {
             }
             Some(b'.') if self.features.contains(Features::BITWISE) => {
                 self.skip(1);
-                if self.peek_byte(false) == Some(b'=') {
+                if self.peek_byte() == Some(b'=') {
                     self.skip(1);
                     Token::Assign(AssignOp::StringBitOrEq)
                 } else {

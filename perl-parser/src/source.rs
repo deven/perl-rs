@@ -7,7 +7,7 @@
 //! See design document §5.4 for the full design rationale.
 
 use crate::error::ParseError;
-use crate::lexer::{Lexer, matching_delimiter};
+use crate::lexer::{LexContext, Lexer, matching_delimiter};
 use crate::span::Span;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -22,22 +22,30 @@ mod tests;
 // ── LexerLine ─────────────────────────────────────────────────────
 /// A single line of source code with a byte-scanning cursor.
 ///
-/// The lexer's working unit.  All fields are `pub(crate)` — the lexer freely reads and writes `pos` for cursor control,
-/// and reads `number` and `offset` for span computation.
+/// The lexer's working unit.  The visible `line`/`terminated` are an *effective view*: the physical line, possibly
+/// narrowed to a frame's EOF bound (`set_eof`).  The physical truth lives in the hidden `full`/`full_terminated`, which
+/// the view is always rebuilt from, so a bound can narrow or widen at any time.  Because the hidden fields must stay
+/// the authoritative source of the view, a `LexerLine` can only be built through `LexerLine::new`.
 #[derive(Clone, Debug)]
 pub(crate) struct LexerLine {
     /// 1-based line number in the original source.
     pub number: u32,
 
-    /// Byte offset of the start of this line in the original source.
+    /// Byte offset of the start of this line in the original source.  Physically invariant — narrowing never shifts
+    /// it — so it serves as the equality key for endpoint detection.
     pub offset: u32,
 
-    /// Line content without line ending.  When inside an indented heredoc, the required indentation prefix has been
-    /// stripped.
+    /// Effective line content delivered to the lexer: the physical line, possibly narrowed by an EOF bound.  Never
+    /// includes the line ending.
     pub line: Bytes,
 
-    /// Whether this line was terminated by a newline in the source.
+    /// Effective termination: whether the *effective view* ends at a real newline.  `false` whenever `line` is narrowed
+    /// below the physical extent, since the narrow strips the virtual newline first.
     pub terminated: bool,
+
+    /// Required indent for this line, in bytes from `offset`.  Stamped during a `<<~` body scan; `0` for fresh reads
+    /// and every other construct.  Carried so replayed lines keep their indent.
+    pub indent: u32,
 
     /// Current scanning position within `line`.
     pub pos: u32,
@@ -45,9 +53,62 @@ pub(crate) struct LexerLine {
     /// Whether the line contains only ASCII bytes (all < 0x80).  Computed for free during newline scanning and used to
     /// skip UTF-8 decoding and NFC normalization for all-ASCII lines.
     pub ascii_only: bool,
+
+    /// Physical line content, full width — the source `set_eof` narrows or widens from.  `Bytes` is refcounted, so this
+    /// is a second handle on the same buffer, not a copy.
+    full: Bytes,
+
+    /// Physical termination, restored when `set_eof` widens back to the full line.
+    full_terminated: bool,
 }
 
 impl LexerLine {
+    /// Construct a freshly read line: the effective view starts equal to the physical line (un-narrowed), and `number`,
+    /// `indent`, and `pos` default to `0`.  `number` is stamped at delivery; callers set `pos`/`indent` after when a
+    /// body resumes mid-line or carries a required indent.
+    pub fn new(offset: u32, content: Bytes, terminated: bool, ascii_only: bool) -> Self {
+        LexerLine { number: 0, offset, full: content.clone(), line: content, full_terminated: terminated, terminated, indent: 0, pos: 0, ascii_only }
+    }
+
+    /// Test-only constructor mirroring the old field-literal shape, so source tests can build a line with an explicit
+    /// `number`/`pos` without naming the hidden physical fields.  The effective view starts un-narrowed (`full == line`,
+    /// `indent == 0`).
+    #[cfg(test)]
+    pub(crate) fn for_test(number: u32, offset: u32, line: Bytes, terminated: bool, pos: u32, ascii_only: bool) -> Self {
+        let mut l = LexerLine::new(offset, line, terminated, ascii_only);
+        l.number = number;
+        l.pos = pos;
+        l
+    }
+
+    /// Apply a frame's EOF bound — a global byte offset, or `None` for real EOF — rebuilding the effective view from
+    /// `full`.  A total, idempotent pure function of `(full, bound)`: this line covers the global range
+    /// `[offset, offset + extent)` where `extent` includes the virtual newline, so the bound either narrows within that
+    /// range, widens to the full line (bound at/after the end), or empties the line (bound before the start).
+    pub fn set_eof(&mut self, bound: Option<u32>) {
+        let start = self.offset;
+        // Global end of the line, one past the virtual newline when physically terminated.
+        let extent = start + self.full.len() as u32 + self.full_terminated as u32;
+        match bound {
+            // Endpoint on an earlier line: this line is wholly past EOF, so it delivers nothing.
+            Some(g) if g < start => {
+                self.line = self.full.slice(..0);
+                self.terminated = false;
+            }
+            // Endpoint within this line: narrow to it.  Any cut below the full extent strips at least the virtual
+            // newline, so the effective view is unterminated.
+            Some(g) if g < extent => {
+                self.line = self.full.slice(..(g - start) as usize);
+                self.terminated = false;
+            }
+            // No bound, or an endpoint at/after this line's end: the full physical line.
+            _ => {
+                self.line = self.full.clone();
+                self.terminated = self.full_terminated;
+            }
+        }
+    }
+
     /// Peek at the current byte without advancing.  Returns `b'\n'` at the end of a terminated line.  Returns `None`
     /// only when truly exhausted (past \n or unterminated line fully consumed).
     #[inline]
@@ -108,16 +169,8 @@ impl LexerLine {
 }
 
 // ── Source layer (impl Lexer) ──────────────────────────────────────────────────────────────────────────────────────
-/// Internal heredoc context saved when entering a heredoc body.
-pub(crate) struct HeredocContext {
-    tag: Bytes,
-    saved_line: LexerLine,
-    prev_indent: Option<Bytes>,
-}
-
 /// A raw line read from the source buffer before indent processing.
 struct RawLine {
-    number: u32,
     offset: u32,
     content: Bytes,
     terminated: bool,
@@ -256,94 +309,50 @@ impl Lexer {
         self.queued_lines = lines;
     }
 
-    /// Get the next line.
-    ///
-    /// On success, installs the line as the current line (`self.line`), recomputes `effective_utf8`, and returns
-    /// `Ok(&self.line)` (a borrow of the freshly-installed `Some`).  On end of input — real EOF, a finished heredoc
-    /// body, or a finished substitution body — returns `Ok(&None)` and leaves `self.line` untouched, so callers that
-    /// still need the previous line's position (e.g. `span_pos` at a virtual EOF) see it unchanged.  Returns `Err` for
-    /// real errors (unterminated heredoc, indentation mismatch).
-    ///
-    /// `peek_heredoc`: when true and a heredoc terminator is found, returns `Ok(&None)` without consuming the signal —
-    /// the heredoc context stays on the stack and `queued_lines` is not modified.  The next call with
-    /// `peek_heredoc=false` will consume it.
-    pub fn next_line(&mut self, peek_heredoc: bool) -> Result<&Option<LexerLine>, ParseError> {
-        // 0. If a terminator was found during a previous peek call, handle it without reading another line.
-        if self.terminator_pending {
-            if !peek_heredoc {
-                // Consume the pending terminator.
-                self.terminator_pending = false;
-                if let Some(ctx) = self.heredoc_stack.pop() {
-                    self.required_indent = ctx.prev_indent;
-                    self.queued_lines.push_back(ctx.saved_line);
-                }
-            }
-            return Ok(&None);
+    /// Deliver the next line as the current line (`self.line`), or `Ok(&None)` at virtual EOF — the top frame's bound
+    /// reached, or real EOF.  The bound was fixed up front by the body's setup scan (§5.4.5/§5.4.6), so there is no
+    /// per-line terminator check here; delivery just runs the line stream to the bound.  Lines come from the replay
+    /// queue first, then fresh reads.  On `Ok(&None)` the previous current line is left in place, so callers that still
+    /// need its position (e.g. `span_pos` at a virtual EOF) see it unchanged.
+    pub fn next_line(&mut self) -> Result<&Option<LexerLine>, ParseError> {
+        let bound = self.context_stack.last().and_then(|c| c.bound);
+
+        // The next line's start offset is known before reading it — the queue front's offset if queued, else the read
+        // frontier.  Peeking it lets the bound test fire without consuming a line that starts past the end.
+        let next_start = self.queued_lines.front().map_or(self.cursor as u32, |l| l.offset);
+        if let Some(b) = bound
+            && next_start > b
+        {
+            return Ok(&None); // Virtual EOF: the next line starts past the frame's bound.
         }
 
-        // 1. Return queued line if present (from heredoc remainder, push_back, or subst body — not subject to
-        //    terminator check).  Stamped at delivery, so replayed lookahead lines pick up the current counter.
-        if let Some(mut line) = self.queued_lines.pop_front() {
-            line.number = self.line_number;
-            self.line_number += 1;
-            return Ok(self.install_line(line));
-        }
-
-        // 1b. Subst body virtual EOF — all body lines delivered.
-        if self.subst_eof_pending {
-            if !peek_heredoc {
-                // Consume: queue the saved remainder for next call.
-                self.subst_eof_pending = false;
-                if let Some(saved) = self.subst_saved_line.take() {
-                    self.queued_lines.push_back(saved);
-                }
-            }
-            return Ok(&None);
-        }
-
-        // 2. Read next raw line from source.
-        let raw = match self.read_raw_line() {
-            Some(raw) => raw,
-            None => {
-                // EOF — error if inside a heredoc.
-                if let Some(ctx) = self.heredoc_stack.last() {
-                    let tag = String::from_utf8_lossy(&ctx.tag).into_owned();
-                    return Err(ParseError::new(format!("can't find heredoc terminator '{tag}'"), Span::new(0, self.src.len() as u32)));
-                }
-                return Ok(&None); // Normal EOF.
+        // Obtain the line: replayed, else freshly read.  `install_line` applies the bound (`set_eof`), so the endpoint
+        // line is narrowed there, at the single choke point — not here.
+        let mut line = if let Some(line) = self.queued_lines.pop_front() {
+            line
+        } else {
+            match self.read_raw_line() {
+                Some(raw) => LexerLine::new(raw.offset, raw.content, raw.terminated, raw.ascii_only),
+                None => return Ok(&None), // Real EOF.
             }
         };
 
-        // 3. Strip required indent (if any).
-        let mut stripped = self.strip_indent(raw)?;
-
-        // 4. If inside a heredoc, check for terminator.
-        let is_terminator = self.heredoc_stack.last().is_some_and(|ctx| stripped.line.as_ref() == ctx.tag.as_ref());
-        if is_terminator {
-            if peek_heredoc {
-                // Peek mode: signal end without consuming.
-                self.terminator_pending = true;
-            } else {
-                // Consume mode: pop the heredoc context.
-                if let Some(ctx) = self.heredoc_stack.pop() {
-                    self.required_indent = ctx.prev_indent;
-                    self.queued_lines.push_back(ctx.saved_line);
-                }
-            }
-            return Ok(&None);
-        }
-
-        // 5. Deliver the freshly read line, stamping its number from the counter.
-        stripped.number = self.line_number;
+        // Stamped at delivery, so replayed lookahead lines pick up the current counter.
+        line.number = self.line_number;
         self.line_number += 1;
-        Ok(self.install_line(stripped))
+        Ok(self.install_line(line))
     }
 
     /// Install `line` as the current line, recompute `effective_utf8`, and return a borrow of `self.line` (always the
-    /// freshly-installed `Some`).  A "set this line, as-is" primitive: it does not renumber, so callers that restore a
-    /// saved line (heredoc/subst remainders) keep its original number.  Line numbering happens in `next_line` at
-    /// delivery; capture and `consume_lookahead` window tracking are install-event concerns and live here.
-    fn install_line(&mut self, line: LexerLine) -> &Option<LexerLine> {
+    /// freshly-installed `Some`).  A "set this line" primitive: it does not renumber, so callers that restore a saved
+    /// line keep its original number.  Line numbering happens in `next_line` at delivery; capture, the bound narrow,
+    /// and `consume_lookahead` window tracking are install-event concerns and live here.
+    ///
+    /// The single choke point every delivered line passes through, so it is where the top frame's EOF bound is applied
+    /// (`set_eof`): no installed line ever exceeds the current frame's bound, no matter the delivery path.  During a
+    /// scan the borrowed ceiling sits past every line read, so `set_eof` widens to the full line automatically — no
+    /// mode gate needed; when the guard drops and restores the real bound, the re-installed entry line re-narrows.
+    fn install_line(&mut self, mut line: LexerLine) -> &Option<LexerLine> {
         // During an active lookahead, capture the line being displaced (in displacement order) so the guard can restore
         // the original current line and queue the rest for replay.
         if self.lookahead_mode
@@ -352,6 +361,7 @@ impl Lexer {
             self.lookahead.push_back(displaced);
         }
 
+        line.set_eof(self.context_stack.last().and_then(|c| c.bound));
         self.effective_utf8 = self.utf8_mode && !line.ascii_only;
         self.line = Some(line);
 
@@ -368,11 +378,24 @@ impl Lexer {
         &self.line
     }
 
+    /// Pop the top context frame, restoring its suspended parent line as the live line (§5.5).  The body's bound goes
+    /// with the frame, so the restored line is re-narrowed to the new top's bound — real EOF at the base.  The resume
+    /// cursor is already baked into the suspended line (past the close for a delimited body, past `<<TAG` for a
+    /// heredoc), so the pop carries no resume logic.  Returns the popped frame for any mode-specific teardown.
+    pub(crate) fn pop_context(&mut self) -> Option<LexContext> {
+        let mut ctx = self.context_stack.pop()?;
+        self.line = ctx.line.take();
+        if let Some(line) = self.line.as_mut() {
+            line.set_eof(self.context_stack.last().and_then(|c| c.bound));
+        }
+        Some(ctx)
+    }
+
     /// TEMPORARY: owned-clone wrapper around `next_line`, for the source tests which still consume lines by value.
     /// Remove once those tests are updated to the borrowing API.
     #[cfg(test)]
-    pub(crate) fn temp_next_line(&mut self, peek_heredoc: bool) -> Result<Option<LexerLine>, ParseError> {
-        self.next_line(peek_heredoc).cloned()
+    pub(crate) fn temp_next_line(&mut self) -> Result<Option<LexerLine>, ParseError> {
+        self.next_line().cloned()
     }
 
     /// Begin a speculative lookahead.  Returns an RAII guard; while it is alive the consumer scans forward with the
@@ -386,7 +409,28 @@ impl Lexer {
         self.lookahead_pos = None;
         let entry_pos = self.line.as_ref().map_or(0, |l| l.pos);
         self.lookahead_mode = true;
-        Lookahead { lexer: self, entry_pos }
+        Lookahead { lexer: self, entry_pos, saved_bound: None }
+    }
+
+    /// Begin a lookahead that borrows a virtual EOF for its duration.  Like [`Self::lookahead`], but the top frame's
+    /// bound is replaced by `ceiling` (a global offset, or `None` for real EOF) so the scan runs to that ceiling and
+    /// cannot escape it — used by the heredoc terminator scan to search down to the host's EOF without targeting a
+    /// frame (§5.4.5, §5.4.11).  The original bound is saved and restored when the guard drops, on every path.  The
+    /// ceiling must be in place before the first `next_line`, so it is taken at construction.
+    #[allow(dead_code)] // No consumers yet — paired with `start_heredoc`.
+    pub(crate) fn lookahead_to(&mut self, ceiling: Option<u32>) -> Lookahead<'_> {
+        self.lookahead_offset = None;
+        self.lookahead_pos = None;
+        let entry_pos = self.line.as_ref().map_or(0, |l| l.pos);
+        self.lookahead_mode = true;
+        // Borrow the ceiling on the top frame (the frame `next_line` bounds by).  An empty stack has no frame to
+        // borrow and already bounds by real EOF, which is the only ceiling the base host yields, so nothing to save.
+        let saved_bound = self.context_stack.last_mut().map(|c| {
+            let old = c.bound;
+            c.bound = ceiling;
+            old
+        });
+        Lookahead { lexer: self, entry_pos, saved_bound }
     }
 
     /// Commit to where the most recent lookahead ended instead of rewinding.  Drives normal delivery forward to the
@@ -397,7 +441,7 @@ impl Lexer {
     pub(crate) fn consume_lookahead(&mut self) -> Result<(), ParseError> {
         // Deliver lines until the scan-end line is current; `install_line` clears `lookahead_offset` on arrival.
         while self.lookahead_offset.is_some() {
-            if self.next_line(false)?.is_none() {
+            if self.next_line()?.is_none() {
                 return Err(ParseError::new("consume_lookahead: lookahead end line is unreachable", Span::DUMMY));
             }
         }
@@ -411,136 +455,254 @@ impl Lexer {
         Ok(())
     }
 
-    /// Begin processing an indented heredoc body (`<<~TAG`).
+    /// Begin a heredoc body — `<<TAG`, `<<~TAG`, interpolating or not.
     ///
-    /// Scans ahead to find the terminator, sets the required indentation from its whitespace prefix.  The current line
-    /// is taken from the Option (setting it to None) and saved internally for restoration when the terminator is found.
-    pub fn start_indented_heredoc(&mut self, tag: Bytes) -> Result<(), ParseError> {
-        let line = self.line.take().ok_or_else(|| ParseError::new("internal error: start_indented_heredoc called without a current line", Span::DUMMY))?;
-        let prev_indent = self.required_indent.clone();
-
-        // Scan ahead for the terminator to determine indentation.
-        let new_indent = self.scan_for_indented_terminator(&tag)?;
-
-        // Push heredoc context.
-        self.heredoc_stack.push(HeredocContext { tag, saved_line: line, prev_indent });
-        self.required_indent = Some(new_indent);
-
-        Ok(())
-    }
-
-    /// Begin processing a non-indented heredoc body (`<<TAG`).
-    ///
-    /// The current line is taken from the Option (setting it to None) and saved internally for restoration when the
-    /// terminator is found.  Does not change the required indentation.
-    pub fn start_heredoc(&mut self, tag: Bytes) -> Result<(), ParseError> {
-        let line = self.line.take().ok_or_else(|| ParseError::new("internal error: start_heredoc called without a current line", Span::DUMMY))?;
-        let prev_indent = self.required_indent.clone();
-
-        self.heredoc_stack.push(HeredocContext { tag, saved_line: line, prev_indent });
-        Ok(())
-    }
-
-    /// Begin processing a substitution replacement body.
-    ///
-    /// Takes the current line, scans ahead to find the closing delimiter and flags, then queues the body lines for
-    /// delivery with a virtual EOF at the end.  The remainder of the source line after the flags is saved for delivery
-    /// after the EOF.
-    ///
-    /// Returns the captured flags (or None if no flags).
-    pub fn start_subst_body(&mut self, delim: char, extra_paired: bool) -> Result<Option<String>, ParseError> {
-        let mut line = self.line.take().ok_or_else(|| ParseError::new("internal error: start_subst_body called without a current line", Span::DUMMY))?;
-
-        let (open, close) = matching_delimiter(delim, extra_paired);
-        let close_len = close.len_utf8();
-        let mut close_buf = [0u8; 4];
-        let close_bytes = close.encode_utf8(&mut close_buf);
-        let open_bytes = open.map(|o| {
-            let mut buf = [0u8; 4];
-            let len = o.len_utf8();
-            o.encode_utf8(&mut buf);
-            (buf, len)
-        });
-        let mut body_lines: VecDeque<LexerLine> = VecDeque::new();
-        let mut pos = line.pos as usize;
-        let mut depth = 0u32;
-
-        loop {
-            if pos >= line.line.len() {
-                // Line exhausted — queue it as a body line.
-                body_lines.push_back(line);
-                // Advance to the next line; take ownership of whatever next_line installed.
-                self.next_line(false)?;
-                match self.line.take() {
-                    Some(next) => {
-                        line = next;
-                        pos = 0;
-                        continue;
-                    }
-                    None => {
-                        // EOF inside replacement body.
-                        self.push_back(body_lines);
-                        return Err(ParseError::new("unterminated substitution", Span::new(0, self.src.len() as u32)));
-                    }
+    /// A heredoc's body is the run of lines after the introducer, up to the terminator, delivered immediately —
+    /// before the rest of the introducer line (§5.4.5).  Walks to the host (the nearest frame whose current line is
+    /// terminated), scans under the host's bound as a borrowed ceiling for the terminator, resolves and stamps the
+    /// `<<~` indent on the captured body lines while they are still in the lookahead queue, drops the terminator, and
+    /// pushes the body frame with the introducer suspended as its parent — so popping resumes just past `<<TAG`.
+    pub fn start_heredoc(&mut self, tag: Bytes, indented: bool, interpolating: bool) -> Result<(), ParseError> {
+        // Host-walk: down from the real top, the nearest frame whose current line ends in a real newline hosts the
+        // body, and its bound is the scan ceiling; mid-line frames (e.g. an `/e` replacement at its close) can't host
+        // and are skipped.  At stack level `idx` the current line is `self.line` (top) or `stack[idx].line`, paired
+        // with bound `stack[idx-1].bound`, or `None` at the base.
+        let intro_offset = self.line.as_ref().map_or(self.cursor as u32, |l| l.offset);
+        let ceiling = {
+            let mut idx = self.context_stack.len();
+            let mut cur = self.line.as_ref();
+            loop {
+                let bound = if idx > 0 { self.context_stack[idx - 1].bound } else { None };
+                if cur.is_some_and(|l| l.terminated) {
+                    break bound;
                 }
+                if idx == 0 {
+                    break None; // The base line is unterminated only at real EOF; the ceiling is real EOF anyway.
+                }
+                cur = self.context_stack[idx - 1].line.as_ref();
+                idx -= 1;
             }
+        };
 
-            let b = line.line[pos];
+        // Scan under the borrowed ceiling for the terminator, capturing the body lines.  The bound is the terminator's
+        // offset; for `<<~`, its leading whitespace is the new required indent, stamped on the captured body lines
+        // before the guard drops.
+        let bound;
+        {
+            let mut g = self.lookahead_to(ceiling);
+            bound = loop {
+                let found = match g.next_line()? {
+                    Some(line) => Self::terminator_matches(line, &tag, indented).map(|ws| {
+                        let new_indent = indented.then(|| line.line.slice(line.pos as usize..line.pos as usize + ws as usize));
+                        (line.offset, new_indent)
+                    }),
+                    None => {
+                        return Err(ParseError::new(
+                            format!("Can't find string terminator \"{}\" anywhere before EOF", String::from_utf8_lossy(&tag)),
+                            Span::new(intro_offset, intro_offset),
+                        ));
+                    }
+                };
+                if let Some((offset, new_indent)) = found {
+                    if let Some(indent) = new_indent {
+                        g.stamp_heredoc_indent(&indent)?;
+                    }
+                    // Drop the terminator: the read frontier is already past it, so the body reaches virtual EOF
+                    // without it being delivered or replayed.
+                    g.line = None;
+                    break offset;
+                }
+            };
+        } // Guard drops: the introducer is restored as `self.line` (past `<<TAG`), the body lines re-queued.
+
+        // Promote: suspend the introducer as the parent and push the body frame bounded at the terminator's offset.
+        // The live line is left `None` — the first `peek_byte` in `lex_body` auto-loads body line 1, consuming the
+        // pending virtual-EOF signal (§5.5).  Popping later restores the introducer and resumes after `<<TAG` — the
+        // uniform pop a delimited body uses.
+        // A heredoc is either interpolating (escapes processed like `"..."`, `raw = false`) or literal (`<<'TAG'`,
+        // no escape processing at all — verified against perl: `\\` stays `\\`), which `raw = true` with `delim =
+        // None` delivers.  The two are mutually determined, so `raw` is `!interpolating`.
+        let introducer = self.line.take();
+        let mut ctx = LexContext::new(None, interpolating, !interpolating, false);
+        ctx.line = introducer;
+        ctx.bound = Some(bound);
+        self.context_stack.push(ctx);
+        Ok(())
+    }
+
+    /// Test whether `line` is a heredoc terminator for `tag`, read from `pos = indent`.  A plain `<<TAG` requires the
+    /// line from `pos` to equal the tag exactly; a `<<~TAG` skips leading whitespace and matches the tag after it.
+    /// Returns the leading-whitespace byte count — the `<<~` new required indent, `0` for a plain match — on a match.
+    fn terminator_matches(line: &LexerLine, tag: &[u8], indented: bool) -> Option<u32> {
+        let rest = &line.line[line.pos as usize..];
+        if indented {
+            let ws = rest.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            (&rest[ws..] == tag).then_some(ws as u32)
+        } else {
+            (rest == tag).then_some(0)
+        }
+    }
+
+    /// Validate and stamp the `<<~` required indent on the captured body lines.  The introducer is `lookahead[0]`,
+    /// left alone; each body line is checked from its current `pos` (the enclosing indent already in effect): empty
+    /// from `pos` is a logical blank (left as-is), one carrying the full new indent advances `pos`/`indent` past it,
+    /// anything else is the fatal mismatch.  Runs while the lines are still captured, so nested scans compose and
+    /// replayed lines keep their indent (§5.4.5).
+    fn stamp_heredoc_indent(&mut self, new_indent: &[u8]) -> Result<(), ParseError> {
+        for line in self.lookahead.iter_mut().skip(1) {
+            let pos = line.pos as usize;
             let rest = &line.line[pos..];
-            if b == b'\\' {
-                // Skip escaped byte (or multi-byte delimiter after backslash).
-                if rest.len() > 1 && rest[1..].starts_with(close_bytes.as_bytes()) {
-                    pos += 1 + close_len;
-                } else {
-                    pos += 2;
-                }
-            } else if rest.starts_with(close_bytes.as_bytes()) && depth == 0 {
-                // Found closing delimiter at `pos`.  Body content on this line: everything before `pos`.
-                let truncated = LexerLine {
-                    line: line.line.slice(..pos),
-                    offset: line.offset,
-                    pos: if body_lines.is_empty() { line.pos } else { 0 },
-                    terminated: false, // virtual EOF, no newline
-                    number: line.number,
-                    ascii_only: line.ascii_only,
-                };
-                body_lines.push_back(truncated);
-
-                // Read flags starting after the delimiter.
-                let mut flag_end = pos + close_len;
-                while flag_end < line.line.len() && (line.line[flag_end].is_ascii_alphanumeric() || line.line[flag_end] == b'_') {
-                    flag_end += 1;
-                }
-                let flags = if flag_end > pos + close_len { Some(String::from_utf8_lossy(&line.line[pos + close_len..flag_end]).into_owned()) } else { None };
-
-                // Saved remainder: rest of the line after flags.
-                let saved = LexerLine {
-                    line: line.line.clone(),
-                    offset: line.offset,
-                    pos: flag_end as u32,
-                    terminated: line.terminated,
-                    number: line.number,
-                    ascii_only: line.ascii_only,
-                };
-
-                // Queue body lines and set up virtual EOF.
-                self.push_back(body_lines);
-                self.subst_eof_pending = true;
-                self.subst_saved_line = Some(saved);
-
-                return Ok(flags);
-            } else if let Some((ref obuf, olen)) = open_bytes
-                && rest.starts_with(&obuf[..olen])
-            {
-                depth += 1;
-                pos += olen;
-            } else if rest.starts_with(close_bytes.as_bytes()) {
-                depth -= 1;
-                pos += close_len;
+            if rest.is_empty() {
+                continue; // Logical blank line at this stage.
+            }
+            if rest.starts_with(new_indent) {
+                line.pos += new_indent.len() as u32;
+                line.indent = line.pos;
             } else {
-                pos += 1;
+                return Err(ParseError::new("indentation of here-doc doesn't match delimiter", Span::new(line.offset, line.offset)));
             }
         }
+        Ok(())
+    }
+
+    /// Advance the cursor `n` bytes within the current line and return the byte now under it: a content byte, the
+    /// virtual `\n` at line end, or `None` once past it.  Stays within the line — `None` is the caller's cue to cross
+    /// to the next line via `next_line`, the sole point a new physical line offset enters a scan.  A global position
+    /// is only ever `offset + pos` of one line and is never carried across a newline (§5.4.3), so this primitive
+    /// never synthesizes a position past the line end.
+    fn advance(&mut self, n: usize) -> Option<u8> {
+        let line = self.line.as_mut()?;
+        line.pos += n as u32;
+        line.peek_byte()
+    }
+
+    /// Begin a delimited body — the shared front end for every quote-like construct (`q//`, `qq{}`, `m//`, `s///`,
+    /// `tr///`, …).  The caller has already consumed the opening delimiter, so the cursor sits at the first body byte,
+    /// and has built `ctx` with the body's lex mode (`LexContext::new`); this scans ahead to the matching close,
+    /// records the body's bound, suspends the parent at the resume point past the close, and pushes `ctx` as the body
+    /// frame with its source-delivery cluster (`line`/`bound`) filled.
+    ///
+    /// The scan is `scan_str` parity (§5.4.6): a byte walk over the lookahead stream, oblivious to where lines fall,
+    /// in which a backslash protects the next character (unless the delimiter is itself a backslash), paired
+    /// delimiters nest by depth, and only the close offset is recorded.  Keeping or stripping the escaping backslash,
+    /// the `s///` flags, and the body's interpolation are all the sublexer's concern, downstream of the frame.
+    pub fn start_delimited_body(&mut self, mut ctx: LexContext, extra_paired: bool) -> Result<(), ParseError> {
+        let Some(delim) = ctx.delim else {
+            return Err(ParseError::new("start_delimited_body requires a delimiter", Span::new(self.cursor as u32, self.cursor as u32)));
+        };
+        let (open, close) = matching_delimiter(delim, extra_paired);
+        let close_is_backslash = close == '\\';
+
+        // Encode open/close to the bytes the source holds them as under the active mode: UTF-8 (1–4 bytes) under
+        // `use utf8`, a single Latin-1 byte under `no utf8` (where a delimiter is always <= U+00FF).  The body is
+        // single-mode, so this encoding is fixed for the whole scan.  `matching_delimiter` itself is mode-independent
+        // — only the byte width differs (`«` is `C2 AB` under utf8, `AB` under `no utf8`).
+        let mut close_buf = [0u8; 4];
+        let close_len = if self.utf8_mode {
+            close.encode_utf8(&mut close_buf).len()
+        } else {
+            close_buf[0] = close as u8;
+            1
+        };
+        let close_bytes = &close_buf[..close_len];
+        let mut open_buf = [0u8; 4];
+        let open_bytes: Option<&[u8]> = if let Some(o) = open {
+            let len = if self.utf8_mode {
+                o.encode_utf8(&mut open_buf).len()
+            } else {
+                open_buf[0] = o as u8;
+                1
+            };
+            Some(&open_buf[..len])
+        } else {
+            None
+        };
+
+        // Span anchor for an unterminated-body error, read before the scan borrows `self`.
+        let body_start = self.line.as_ref().map_or(self.cursor as u32, |l| l.global_pos());
+
+        // Scan for the close.  Two independent partial-match indices — `i` over the close needle, `j` over the open —
+        // advance in lockstep with the byte walk; a mismatch resets that needle to 0 with no re-anchor, exact because
+        // the input is valid UTF-8 by construction (§5.4.6): a byte that breaks a partial match is a continuation
+        // byte and so can never equal a needle's lead byte.  A paired open raises `depth`; a close at depth 0 ends
+        // the body.  The close-line clone and bound are produced by the loop's `break` value, captured before the
+        // guard drops and rewinds.
+        let (parent, bound) = {
+            let mut g = self.lookahead();
+            let mut i = 0usize;
+            let mut j = 0usize;
+            let mut depth = 0u32;
+            let mut b = g.peek_byte_at(0);
+            loop {
+                let Some(byte) = b else {
+                    // Line exhausted: cross to the next line, re-anchoring on its own physical offset.
+                    if g.next_line()?.is_none() {
+                        return Err(ParseError::new(
+                            format!("Can't find string terminator \"{close}\" anywhere before EOF"),
+                            Span::new(body_start, body_start),
+                        ));
+                    }
+                    b = g.peek_byte_at(0);
+                    continue;
+                };
+
+                if byte == b'\\' && !close_is_backslash {
+                    // Escape: skip the backslash and the next character's lead byte.  Its continuation bytes (if any)
+                    // then match no needle, so a multi-byte escaped delimiter is protected with no width logic.
+                    b = g.advance(2);
+                    i = 0;
+                    j = 0;
+                    continue;
+                }
+
+                i = if byte == close_bytes[i] { i + 1 } else { 0 };
+                if let Some(ob) = open_bytes {
+                    j = if byte == ob[j] { j + 1 } else { 0 };
+                }
+
+                if i == close_len {
+                    if depth == 0 {
+                        // Found the close.  The cursor sits on its last byte; the close begins `close_len - 1` bytes
+                        // back on this same line (a delimiter never spans a newline), and the parent resumes one byte
+                        // past it.  Every position is `offset + pos` of this one line — no cross-line arithmetic.  A
+                        // missing current line here is impossible (the matched byte came from it), but is reported as
+                        // an unterminated body rather than panicked on.
+                        let Some(line) = g.line.as_ref() else {
+                            return Err(ParseError::new(
+                                format!("Can't find string terminator \"{close}\" anywhere before EOF"),
+                                Span::new(body_start, body_start),
+                            ));
+                        };
+                        let bound = line.offset + line.pos - (close_len as u32 - 1);
+                        let mut parent = line.clone();
+                        parent.pos = line.pos + 1;
+                        break (parent, bound);
+                    }
+                    depth -= 1;
+                    i = 0;
+                    j = 0;
+                } else if let Some(ob) = open_bytes
+                    && j == ob.len()
+                {
+                    depth += 1;
+                    i = 0;
+                    j = 0;
+                }
+
+                b = g.advance(1);
+            }
+        }; // Guard drops: `self.line` is restored to the body's first line at the body start, previewed lines re-queued.
+
+        // Promote: suspend the parent at the resume point, push the body frame with its bound, and narrow the live
+        // body-first line to the bound.  A single-line body shares the physical line with the parent (two views, one
+        // buffer); a multi-line body keeps the first line whole and the re-queued close line narrows on delivery.
+        ctx.line = Some(parent);
+        ctx.bound = Some(bound);
+        self.context_stack.push(ctx);
+        if let Some(line) = self.line.as_mut() {
+            line.set_eof(Some(bound));
+        }
+        Ok(())
     }
 
     // ── Internal methods ──────────────────────────────────────────
@@ -555,8 +717,7 @@ impl Lexer {
 
         let start = self.cursor;
         // The line number is stamped at delivery in `next_line` (which also advances the counter), so lines
-        // redelivered from `queued_lines` are renumbered; the read leaves a placeholder.
-        let number = 0;
+        // redelivered from `queued_lines` are renumbered; the raw read carries no number.
 
         // Find end of line (\n or EOF), accumulating high-bit check.
         let mut end = start;
@@ -578,91 +739,7 @@ impl Lexer {
         // Advance cursor past the \n (if present).
         self.cursor = if terminated { end + 1 } else { end };
 
-        Some(RawLine { number, offset: start as u32, content: self.src.slice(start..content_end), terminated, ascii_only })
-    }
-
-    /// Strip the required indent from a raw line.
-    ///
-    /// Returns the `LexerLine` with indent stripped and cursor at 0.  Empty lines (zero content) are allowed without
-    /// the indent prefix.
-    fn strip_indent(&self, raw: RawLine) -> Result<LexerLine, ParseError> {
-        let (content, indent_len) = if let Some(indent) = &self.required_indent {
-            if raw.content.starts_with(indent.as_ref()) {
-                (raw.content.slice(indent.len()..), indent.len())
-            } else if raw.content.is_empty() {
-                // Empty line — allowed without indent.
-                (raw.content, 0)
-            } else {
-                return Err(ParseError::new("indentation of here-doc doesn't match delimiter", Span::new(raw.offset, raw.offset + raw.content.len() as u32)));
-            }
-        } else {
-            (raw.content, 0)
-        };
-
-        Ok(LexerLine {
-            number: raw.number,
-            offset: raw.offset + indent_len as u32,
-            line: content,
-            terminated: raw.terminated,
-            pos: 0,
-            ascii_only: raw.ascii_only,
-        })
-    }
-
-    /// Scan ahead from the current cursor to find an indented heredoc terminator.  Returns the full raw whitespace
-    /// prefix of the terminator line.  Does not advance the cursor.
-    fn scan_for_indented_terminator(&mut self, tag: &[u8]) -> Result<Bytes, ParseError> {
-        let saved_cursor = self.cursor;
-        let saved_line_number = self.line_number;
-
-        let result = self.scan_for_indented_terminator_inner(tag);
-
-        // Restore cursor regardless of result.
-        self.cursor = saved_cursor;
-        self.line_number = saved_line_number;
-
-        result
-    }
-
-    /// Inner scan — advances cursor, caller saves/restores.
-    fn scan_for_indented_terminator_inner(&mut self, tag: &[u8]) -> Result<Bytes, ParseError> {
-        let scan_start = self.cursor;
-
-        while self.cursor < self.src.len() {
-            let line_start = self.cursor;
-
-            // Find end of line.
-            let mut end = self.cursor;
-            while end < self.src.len() && self.src[end] != b'\n' {
-                end += 1;
-            }
-            self.cursor = if end < self.src.len() { end + 1 } else { end };
-
-            // CRLF strip for matching.
-            let content_end = if end > line_start && self.src[end - 1] == b'\r' { end - 1 } else { end };
-
-            // Find the whitespace prefix.
-            let mut indent_end = line_start;
-            while indent_end < content_end && (self.src[indent_end] == b' ' || self.src[indent_end] == b'\t') {
-                indent_end += 1;
-            }
-
-            // Check if the non-whitespace part matches the tag.
-            if &self.src[indent_end..content_end] == tag {
-                let raw_prefix = self.src.slice(line_start..indent_end);
-
-                // Validate that the terminator starts with the outer indent.
-                if let Some(outer) = &self.required_indent
-                    && !raw_prefix.starts_with(outer.as_ref())
-                {
-                    return Err(ParseError::new("indentation of here-doc doesn't match delimiter", Span::new(line_start as u32, content_end as u32)));
-                }
-
-                return Ok(raw_prefix);
-            }
-        }
-
-        Err(ParseError::new(format!("can't find heredoc terminator '{}'", String::from_utf8_lossy(tag)), Span::new(scan_start as u32, self.cursor as u32)))
+        Some(RawLine { offset: start as u32, content: self.src.slice(start..content_end), terminated, ascii_only })
     }
 }
 
@@ -674,12 +751,23 @@ pub(crate) struct Lookahead<'a> {
     lexer: &'a mut Lexer,
     /// Cursor position on the current line at the moment the scan began.
     entry_pos: u32,
+    /// For a `lookahead_to` ceiling borrow, the top frame's original bound, restored on drop.  `None` for a plain
+    /// `lookahead` (no ceiling was borrowed, so nothing to restore).
+    saved_bound: Option<Option<u32>>,
 }
 
 impl Drop for Lookahead<'_> {
     fn drop(&mut self) {
         let entry_pos = self.entry_pos;
         let lx = &mut *self.lexer;
+
+        // Restore a borrowed ceiling first, so the entry line is re-narrowed (via `install_line`) to the host frame's
+        // real bound, not the ceiling that was in force during the scan.
+        if let Some(old) = self.saved_bound
+            && let Some(top) = lx.context_stack.last_mut()
+        {
+            top.bound = old;
+        }
 
         // Record where the scan ended — the current line's unique offset (the `consume_lookahead` key) and cursor —
         // before any lines move, plus whether the scan ever left its starting line.
@@ -697,10 +785,11 @@ impl Drop for Lookahead<'_> {
             lx.install_line(entry);
         }
 
-        // The capture queue now holds exactly the previewed run; re-queue it for replay, each line from its start.
+        // The capture queue now holds exactly the previewed run; re-queue it for replay, each line from its start —
+        // which for a `<<~`-stamped line is its required indent, not 0, so replayed lines keep their indent (§5.4.3).
         let mut replay = mem::take(&mut lx.lookahead);
         for line in replay.iter_mut() {
-            line.pos = 0;
+            line.pos = line.indent;
         }
         lx.push_back(replay);
 

@@ -8873,13 +8873,16 @@ fn parse_fails(src: &str) -> String {
 #[test]
 fn lexer_error_unterminated_string() {
     let msg = parse_fails("my $x = \"hello;");
-    assert!(msg.contains("unterminated"), "expected unterminated error, got: {msg}");
+    assert!(msg.contains("Can't find string terminator"), "expected unterminated string error, got: {msg}");
 }
 
 #[test]
 fn lexer_error_unterminated_regex() {
+    // Perl reports "Search pattern not terminated" for an unterminated m//; the unified delimited-body scan currently
+    // emits the string-terminator wording instead.  Assert on the shared "terminat" stem so this holds either way,
+    // until construct-specific unterminated messages land.
     let msg = parse_fails("/foo bar");
-    assert!(msg.contains("unterminated"), "expected unterminated error, got: {msg}");
+    assert!(msg.contains("terminat"), "expected unterminated regex error, got: {msg}");
 }
 
 #[test]
@@ -8892,14 +8895,14 @@ fn lexer_error_unexpected_byte() {
 fn lexer_error_after_valid_code() {
     // Error occurs after some valid statements have been parsed.
     let msg = parse_fails("my $x = 1; my $y = \"unterminated;");
-    assert!(msg.contains("unterminated"), "expected unterminated error, got: {msg}");
+    assert!(msg.contains("Can't find string terminator"), "expected unterminated string error, got: {msg}");
 }
 
 #[test]
 fn lexer_error_immediate() {
     // Error on the very first token — no valid code at all.
     let msg = parse_fails("\"unterminated");
-    assert!(msg.contains("unterminated"), "expected unterminated error, got: {msg}");
+    assert!(msg.contains("Can't find string terminator"), "expected unterminated string error, got: {msg}");
 }
 
 // ── Hard parsing corpus ───────────────────────────────────

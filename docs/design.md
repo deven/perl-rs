@@ -1234,26 +1234,23 @@ impl Lexer {
     fn next_line(&mut self)
         -> Result<Option<LexerLine>, ParseError>;
 
-    /// Enter a non-indented heredoc body (§5.4.5).  Walks down to the
-    /// host frame, scans for the terminator via `lookahead_to` (bounded
-    /// by the host's EOF), and pushes the body frame.
-    fn start_heredoc(&mut self, tag: Bytes)
-        -> Result<(), ParseError>;
-
-    /// Enter an indented heredoc body, `<<~` (§5.4.5).  As
-    /// `start_heredoc`, and additionally stamps the terminator's
+    /// Enter a heredoc body — `<<TAG` or `<<~TAG`, interpolating or
+    /// not (§5.4.5).  Walks down to the host frame, scans for the
+    /// terminator via `lookahead_to` (bounded by the host's EOF),
+    /// and pushes the body frame.  For `<<~`, stamps the terminator's
     /// whitespace prefix as `indent` on each body line — recorded,
     /// not stripped (§5.4.3).
-    fn start_indented_heredoc(&mut self, tag: Bytes)
-        -> Result<(), ParseError>;
+    fn start_heredoc(&mut self, tag: Bytes, indented: bool,
+        interpolating: bool) -> Result<(), ParseError>;
 
     /// Enter a delimited body — `s///` replacement, `q//`, regex,
-    /// `qw//`, interpolating string (§5.4.6).  Scans for the closing
-    /// delimiter (tracking nesting for paired delimiters) and
-    /// promotes the lookahead span into a frame, returning any
-    /// trailing flags.
-    fn start_delimited_body(&mut self, delim: char, extra_paired: bool)
-        -> Result<Option<String>, ParseError>;
+    /// `qw//`, interpolating string (§5.4.6).  The caller has already
+    /// consumed the opening delimiter and built `ctx` with the body's
+    /// lex mode; this scans for the close (tracking nesting for
+    /// paired delimiters), records the bound, suspends the parent past
+    /// the close, and pushes `ctx` as the body frame.
+    fn start_delimited_body(&mut self, ctx: LexContext,
+        extra_paired: bool) -> Result<(), ParseError>;
 
     /// Override line numbering for `# line` directives.
     fn set_line_number(&mut self, n: usize);
@@ -1673,15 +1670,14 @@ struct LexContext {
     /// replacement bodies, where end-of-content is the frame's
     /// virtual EOF rather than a delimiter byte in the stream.
     delim: Option<char>,
-    /// Delimiter nesting depth (for paired delimiters like `{}`).
-    depth: u32,
     /// Brace depth inside `${expr}` or `@{expr}`.  When > 0,
     /// the lexer produces normal code tokens.  When 0, it
     /// produces string body tokens via `lex_body`.
     expr_depth: u32,
     /// Whether `$`/`@` trigger interpolation.
     interpolating: bool,
-    /// Whether escapes pass through raw (regex, tr, prototypes).
+    /// Whether escapes pass through raw (regex, tr, prototypes, and
+    /// literal heredocs, where every backslash stays literal).
     raw: bool,
     /// Whether to detect `(?{...})` code blocks (regex mode).
     regex: bool,
@@ -1708,7 +1704,7 @@ regex)`:
 | `s///` replacement (no `/e`) | true | false | false | `None` (virtual EOF) |
 | `s///` replacement (`/e`) | false | true | false | `None` (virtual EOF) |
 | Heredoc (interpolating) | true | false | false | `None` |
-| Heredoc (literal) | false | false | false | `None` |
+| Heredoc (literal) | false | true | false | `None` |
 
 Delimiter types are `char`, not `u8`, to support the Unicode paired
 delimiter table (§5.8).  `delim` is `None` for heredocs and
@@ -1797,17 +1793,17 @@ parser instance, with proper span tracking and error reporting.
 
 The body scanner (`lex_body`) uses a `memchr`-based fast path for
 bulk copying of string content.  When no case modifications are
-active and no nesting depth is in play, it searches for the next
-trigger byte (`$`, `@`, `\`, close delimiter, or open delimiter)
-using SIMD-optimized `memchr`, then bulk-copies everything before
-that trigger into the output string.  This avoids per-byte
-processing for the common case of long literal string segments.
+active, it searches for the next trigger byte — `$` or `@` when
+interpolating, `\` when not raw — using SIMD-optimized `memchr`,
+then bulk-copies everything before that trigger into the output
+string.  This avoids per-byte processing for the common case of
+long literal string segments.
 
-For Unicode paired delimiters, `memchr` searches for the first
-UTF-8 byte of the delimiter character.  This may produce false
-positives (other characters sharing the same lead byte), which are
-handled safely by the byte-by-byte fallback that verifies the full
-UTF-8 sequence.
+No delimiter is among the triggers: a body's end is its frame's
+virtual EOF (§5.5), not a byte in the stream, so the bulk copy
+stops at a trigger or at the line end, and a delimiter character
+inside the body — a nested `{` in `qq{ {x} }`, a `/` in a `tr`
+class — is ordinary content the scan copies straight through.
 
 #### 5.5.5 Format lexing:
 

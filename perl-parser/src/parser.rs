@@ -2183,7 +2183,6 @@ impl Parser {
                             e
                         })
                     }
-                    Some(Token::HeredocLit(_kind, _tag, body)) => Ok(Expr::new(ExprKind::StringLit(body), span)),
 
                     // <<>> double diamond — safe version of <>.
                     Some(Token::Readline(content, safe)) => Self::readline_expr(content, safe, span),
@@ -2418,10 +2417,6 @@ impl Parser {
                 }
                 Ok(Expr::new(ExprKind::Translit(from, to, flags), span))
             }
-
-            // Heredoc (body already collected by lexer).  Literal heredocs (body collected by lexer as raw string).
-            // Interpolating heredocs come through QuoteSublexBegin → tokens → SublexEnd.
-            Token::HeredocLit(_kind, _tag, body) => Ok(Expr::new(ExprKind::StringLit(body), span)),
 
             // sort/map/grep with optional block
             Token::Keyword(kw) if keyword::is_block_list_op(kw) => self.parse_block_list_op(kw, span),
@@ -3095,7 +3090,6 @@ impl Parser {
                     | Token::LeftBracket
                     | Token::RegexSublexBegin(_, _)
                     | Token::SubstSublexBegin(_)
-                    | Token::HeredocLit(_, _, _)
                     | Token::QwList(_)
                     | Token::Backslash
             );
