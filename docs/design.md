@@ -1818,11 +1818,13 @@ exhaustive `match` at the dispatch site; no predicate re-derives it, and
 adding a role cannot compile until that match accounts for it.
 
 `unterminated_kind()` projects the role onto the error condition for a
-body that runs to EOF without closing (§5.5.6).  The projection is
-many-to-one — the interpolated/literal pairs share a message, and the
-`String`/`LiteralString`/`QuoteWords` family shares one — so it lands on
-markedly fewer kinds than there are roles, which is what keeps it a real
-projection rather than a renamed copy of the enum.
+body that runs to EOF without closing (§5.5.6).  The projection is the
+identity over the body-shaped subset — `UnterminatedKind` mirrors
+`FrameRole` one to one — and what keeps it a real type rather than a
+renamed copy is the axis it answers: it is organized by the *condition*,
+"what was left open," and so grows frameless variants no role reaches.
+The interpolated/literal message coincidences live in the `error.rs`
+wording match, not in the kind.
 
 Delimiter types are `char`, not `u8`, to support the Unicode paired
 delimiter table (§5.8).  `delim` is `None` for heredocs and
@@ -2048,37 +2050,54 @@ not a `FrameRole` stands behind it.
 
 ```rust
 enum UnterminatedKind {
-    String,             // String | LiteralString | QuoteWords  — close char
-    Heredoc,            // Heredoc | LiteralHeredoc        — tag
-    Regex,              // Regex | LiteralRegex
-    SubstRegex,         // SubstRegex | LiteralSubstRegex
-    SubstReplacement,   // SubstReplacement | LiteralSubstReplacement | EvalSubstReplacement
+    Format,
+    Prototype,
+    Signature,
+    String,
+    LiteralString,
+    QuoteWords,
+    Heredoc,
+    LiteralHeredoc,
+    Regex,
+    LiteralRegex,
+    SubstRegex,
+    LiteralSubstRegex,
+    SubstReplacement,
+    LiteralSubstReplacement,
+    EvalSubstReplacement,
     TrSearchList,
     TrReplacementList,
-    Format,
 }
 ```
 
-The variant names match the role names, with one rule: where several
-roles share a message they collapse onto one kind named for the family.
-That collapse is why the kind count (eight) is well below the role count
-(seventeen) — the projection tracks *distinct messages*, and the
-interpolated/literal pairs do not differ in their wording:
+`UnterminatedKind` mirrors `FrameRole` one to one over the body-shaped
+subset — same variant names — so `unterminated_kind()` is a plain
+identity map.
 
-- `String` — "Can't find string terminator `<char>` anywhere before
-  EOF", for the `String`/`LiteralString`/`QuoteWords` family.
-- `Heredoc` — the same template with the tag in place of the close
-  character.  It is a distinct kind, not folded into `String`, because
-  the token it carries is a tag, not a delimiter character, and keeping
-  "a heredoc is its own construct" legible at the wording site is worth
-  one variant even though the template text coincides.
-- `Regex` — "Search pattern not terminated" (`Regex`/`LiteralRegex`).
-- `SubstRegex` — "Substitution pattern not terminated".
-- `SubstReplacement` — "Substitution replacement not terminated", for
-  all three replacement roles including `/e`.
+The mirror is deliberate, not redundancy.  Collapsing the variants that
+share a message — folding `Regex` and `LiteralRegex` into one, or the
+three string roles into a `String` family — would make `UnterminatedKind`
+a payload-stripped clone of `FrameRole` maintained in lockstep, and a
+clone has no reason to be its own type.  Keeping the variants distinct is
+what lets the enum grow *frameless* cases the role projection can't
+reach — its whole justification for existing separately, organized by the
+condition rather than the role.  Several kinds do render the same string;
+those coincidences are the groupings the `error.rs` wording match
+collapses:
+
+- the string family — `String`, `LiteralString`, `QuoteWords` — and the
+  heredoc family — `Heredoc`, `LiteralHeredoc` — render "Can't find
+  string terminator `<tok>` anywhere before EOF", with the close
+  character as the token for the former and the tag for the latter.
+- `Regex` / `LiteralRegex` — "Search pattern not terminated".
+- `SubstRegex` / `LiteralSubstRegex` — "Substitution pattern not
+  terminated".
+- the three replacement roles, `/e` included — "Substitution replacement
+  not terminated".
 - `TrSearchList` / `TrReplacementList` — "Transliteration pattern not
   terminated" / "Transliteration replacement not terminated".
-- `Format` — "Format not terminated".
+- `Format` — "Format not terminated"; `Prototype` — "Prototype not
+  terminated".  Both verified against perl.
 
 The kind is a plain enum; the token that fills the message's slot — a
 close character for `String`, a tag for `Heredoc`, nothing for the
@@ -2100,11 +2119,13 @@ that text match, not in the type: they are where several kinds format
 the same string, an implementation detail of rendering, not a structural
 claim about the roles.
 
-`Prototype` and `Signature` will project here too once their
-unterminated messages are confirmed against perl; their kinds are
-deferred with that verification rather than guessed, so
-`unterminated_kind()` covers the body roles above and gains those two
-arms when the prototype/signature frame migration lands.
+`Prototype`'s message is confirmed against perl ("Prototype not
+terminated") and live now, since a prototype body lexes through
+`lex_body_str` today.  `Signature` mirrors its role for completeness but
+is unreached: signatures are not yet framed, and perl answers an
+unterminated signature with a parameter-syntax error rather than a clean
+"not terminated", so its wording stays a deferred placeholder that the
+signature frame migration will settle against perl.
 
 ### 5.6 Heredoc Handling
 

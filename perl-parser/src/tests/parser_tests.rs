@@ -8878,11 +8878,40 @@ fn lexer_error_unterminated_string() {
 
 #[test]
 fn lexer_error_unterminated_regex() {
-    // Perl reports "Search pattern not terminated" for an unterminated m//; the unified delimited-body scan currently
-    // emits the string-terminator wording instead.  Assert on the shared "terminat" stem so this holds either way,
-    // until construct-specific unterminated messages land.
-    let msg = parse_fails("/foo bar");
-    assert!(msg.contains("terminat"), "expected unterminated regex error, got: {msg}");
+    // `m//` and `qr//` lex through the `Regex` role; perl reports "Search pattern not terminated" (verified, 5.38).
+    assert_eq!(parse_fails("my $x = m/foo bar"), "Search pattern not terminated");
+    assert_eq!(parse_fails("my $x = qr/foo bar"), "Search pattern not terminated");
+}
+
+#[test]
+fn lexer_error_unterminated_subst() {
+    // The `s///` pattern and replacement carry distinct messages, both verified against perl.
+    assert_eq!(parse_fails("$x =~ s/foo"), "Substitution pattern not terminated");
+    assert_eq!(parse_fails("$x =~ s/foo/bar"), "Substitution replacement not terminated");
+}
+
+#[test]
+fn lexer_error_unterminated_tr() {
+    assert_eq!(parse_fails("$x =~ tr/abc"), "Transliteration pattern not terminated");
+    assert_eq!(parse_fails("$x =~ tr/abc/xyz"), "Transliteration replacement not terminated");
+}
+
+#[test]
+fn lexer_error_unterminated_quote_words() {
+    // `qw//` shares the string-terminator family wording, with the close delimiter as the token.
+    assert_eq!(parse_fails("my @x = qw/a b c"), "Can't find string terminator \"/\" anywhere before EOF");
+}
+
+#[test]
+fn lexer_error_unterminated_prototype() {
+    assert_eq!(parse_fails("sub foo ("), "Prototype not terminated");
+}
+
+#[test]
+#[ignore = "bare /.../ uses the Prototype placeholder role until lex_term lands; reports Prototype not terminated, not Search pattern not terminated"]
+fn lexer_error_unterminated_bare_regex() {
+    // Target wording once bare slash routes through the `m//` regex frame (deferred lex_term work, §5.5).
+    assert_eq!(parse_fails("/foo bar"), "Search pattern not terminated");
 }
 
 #[test]

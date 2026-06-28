@@ -497,10 +497,9 @@ impl Lexer {
                         (line.offset, new_indent)
                     }),
                     None => {
-                        return Err(ParseError::new(
-                            format!("Can't find string terminator \"{}\" anywhere before EOF", String::from_utf8_lossy(&tag)),
-                            Span::new(intro_offset, intro_offset),
-                        ));
+                        let kind = (if interpolating { FrameRole::Heredoc } else { FrameRole::LiteralHeredoc }).unterminated_kind();
+                        let tag = String::from_utf8_lossy(&tag);
+                        return Err(ParseError::unterminated(kind, Some(tag.as_ref()), Span::new(intro_offset, intro_offset)));
                     }
                 };
                 if let Some((offset, new_indent)) = found {
@@ -637,10 +636,8 @@ impl Lexer {
                 let Some(byte) = b else {
                     // Line exhausted: cross to the next line, re-anchoring on its own physical offset.
                     if g.next_line()?.is_none() {
-                        return Err(ParseError::new(
-                            format!("Can't find string terminator \"{close}\" anywhere before EOF"),
-                            Span::new(body_start, body_start),
-                        ));
+                        let tok = close.to_string();
+                        return Err(ParseError::unterminated(ctx.role.unterminated_kind(), Some(tok.as_str()), Span::new(body_start, body_start)));
                     }
                     b = g.peek_byte_at(0);
                     continue;
@@ -668,10 +665,8 @@ impl Lexer {
                         // missing current line here is impossible (the matched byte came from it), but is reported as
                         // an unterminated body rather than panicked on.
                         let Some(line) = g.line.as_ref() else {
-                            return Err(ParseError::new(
-                                format!("Can't find string terminator \"{close}\" anywhere before EOF"),
-                                Span::new(body_start, body_start),
-                            ));
+                            let tok = close.to_string();
+                            return Err(ParseError::unterminated(ctx.role.unterminated_kind(), Some(tok.as_str()), Span::new(body_start, body_start)));
                         };
                         let bound = line.offset + line.pos - (close_len as u32 - 1);
                         let mut parent = line.clone();

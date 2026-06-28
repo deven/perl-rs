@@ -7,7 +7,7 @@
 //! This module implements the core tokenization loop.  Quote-like sublexing, heredocs, and regex scanning are handled
 //! by helper methods.
 
-use crate::error::ParseError;
+use crate::error::{ParseError, UnterminatedKind};
 use crate::keyword::{self, Keyword};
 use crate::pragma::Features;
 use crate::source::LexerLine;
@@ -95,6 +95,33 @@ impl FrameRole {
     pub(crate) fn regex(self) -> bool {
         use FrameRole::*;
         matches!(self, Regex | LiteralRegex | SubstRegex | LiteralSubstRegex)
+    }
+
+    /// Project this role onto the unterminated-error condition for a body that runs to EOF without closing (§5.5.6).
+    /// The identity map over the body-shaped subset: `UnterminatedKind` mirrors `FrameRole`, and the interpolated/
+    /// literal message coincidences are grouped in the `error.rs` wording match, not here.
+    pub(crate) fn unterminated_kind(self) -> UnterminatedKind {
+        use FrameRole as R;
+        use UnterminatedKind as U;
+        match self {
+            R::Format => U::Format,
+            R::Prototype => U::Prototype,
+            R::Signature => U::Signature,
+            R::String => U::String,
+            R::LiteralString => U::LiteralString,
+            R::QuoteWords => U::QuoteWords,
+            R::Heredoc => U::Heredoc,
+            R::LiteralHeredoc => U::LiteralHeredoc,
+            R::Regex => U::Regex,
+            R::LiteralRegex => U::LiteralRegex,
+            R::SubstRegex => U::SubstRegex,
+            R::LiteralSubstRegex => U::LiteralSubstRegex,
+            R::SubstReplacement => U::SubstReplacement,
+            R::LiteralSubstReplacement => U::LiteralSubstReplacement,
+            R::EvalSubstReplacement => U::EvalSubstReplacement,
+            R::TrSearchList => U::TrSearchList,
+            R::TrReplacementList => U::TrReplacementList,
+        }
     }
 }
 
