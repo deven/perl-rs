@@ -97,6 +97,14 @@ impl FrameRole {
         matches!(self, Regex | LiteralRegex | SubstRegex | LiteralSubstRegex)
     }
 
+    /// Lexed as normal code against the frame's virtual EOF, outside `lex_body` — the `/e` replacement and (once
+    /// framed) a signature.  For these the body predicates above are not the question, as they are not for top-level
+    /// code (§5.5).
+    pub(crate) fn bounded_code(self) -> bool {
+        use FrameRole::*;
+        matches!(self, EvalSubstReplacement | Signature)
+    }
+
     /// Project this role onto the unterminated-error condition for a body that runs to EOF without closing (§5.5.6).
     /// The identity map over the body-shaped subset: `UnterminatedKind` mirrors `FrameRole`, and the interpolated/
     /// literal message coincidences are grouped in the `error.rs` wording match, not here.
@@ -1175,6 +1183,12 @@ impl Lexer {
                 }
                 return Ok(result);
             }
+            Some(ctx) if ctx.role.bounded_code() => {
+                // A bounded-code frame (`/e` replacement, or a signature once framed): lex it as normal code against
+                // the frame's virtual EOF.  `lex_normal_token` emits `SublexEnd` and pops at the bound, the way
+                // `lex_body` does for string bodies.
+                return self.lex_normal_token();
+            }
             Some(_) => {
                 // A body frame is on top: lex one body token.  `lex_body` reads its mode from the frame.
                 return self.lex_body();
@@ -1199,6 +1213,13 @@ impl Lexer {
         let b = match self.peek_byte() {
             Some(b) => b,
             None => {
+                // A bounded-code frame ends at its virtual EOF: pop and emit `SublexEnd` so the parser's block-body
+                // loop stops, mirroring `lex_body`'s virtual-EOF exit.  Whitespace and comments were already skipped
+                // above, so a region with trailing space still ends here rather than leaking an `Eof`.
+                if self.context_stack.last().is_some_and(|ctx| ctx.role.bounded_code()) {
+                    self.pop_context();
+                    return Ok(Spanned { token: Token::SublexEnd, span: Span::new(start, start) });
+                }
                 return Ok(Spanned { token: Token::Eof, span: Span::new(start, start) });
             }
         };

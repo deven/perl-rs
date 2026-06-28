@@ -1221,7 +1221,7 @@ fn interp_chain_in_subst_pattern() {
 fn interp_chain_in_subst_replacement() {
     let e = parse_expr_str(r#"s/old/$h->{key}/;"#);
     match &e.kind {
-        ExprKind::Subst(_, repl, _) => {
+        ExprKind::Subst(_, SubstReplacement::Interp(repl), _) => {
             let has_chain = repl.0.iter().any(|p| {
                 matches!(
                     p,
@@ -1233,7 +1233,7 @@ fn interp_chain_in_subst_replacement() {
             });
             assert!(has_chain, "expected arrow-hash chain in subst replacement: {parts:?}", parts = repl.0);
         }
-        other => panic!("expected Subst, got {other:?}"),
+        other => panic!("expected Subst with interpolated replacement, got {other:?}"),
     }
 }
 
@@ -1592,7 +1592,7 @@ fn parse_shift_defined_or_bareword() {
 fn parse_substitution() {
     let e = parse_expr_str("s/foo/bar/g;");
     match &e.kind {
-        ExprKind::Subst(pat, repl, flags) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), flags) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(flags.as_deref(), Some("g"));
             assert_eq!(pat_str(repl), "bar");
@@ -1605,7 +1605,7 @@ fn parse_substitution() {
 fn parse_substitution_no_flags() {
     let e = parse_expr_str("s/old/new/;");
     match &e.kind {
-        ExprKind::Subst(pat, repl, flags) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), flags) => {
             assert_eq!(pat_str(pat), "old");
             assert!(flags.is_none());
             assert_eq!(pat_str(repl), "new");
@@ -1618,7 +1618,7 @@ fn parse_substitution_no_flags() {
 fn parse_substitution_paired_delimiters() {
     let e = parse_expr_str("s{foo}{bar}g;");
     match &e.kind {
-        ExprKind::Subst(pat, repl, flags) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), flags) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(flags.as_deref(), Some("g"));
             assert_eq!(pat_str(repl), "bar");
@@ -1647,6 +1647,66 @@ fn parse_subst_binding() {
             assert!(matches!(&right.kind, ExprKind::Subst(_, _, _)));
         }
         other => panic!("expected Binding with Subst, got {other:?}"),
+    }
+}
+
+// ── /e replacement: code block, last value, eval depth ────
+
+// The whole replacement is a statement block valued at its last statement — perl `s/Z/my $a=2; my $b=3; $a*$b/e`
+// yields 6.  The old reparse kept only the first statement; this is the regression guard.
+#[test]
+fn subst_e_multi_statement_block() {
+    let e = parse_expr_str("s/Z/my $a = 2; my $b = 3; $a * $b/e;");
+    match &e.kind {
+        ExprKind::Subst(_, SubstReplacement::Eval { block, evals }, flags) => {
+            assert_eq!(*evals, 1);
+            assert_eq!(block.statements.len(), 3, "all three statements are kept, not just the first");
+            assert!(flags.is_none());
+        }
+        other => panic!("expected Subst with /e eval replacement, got {other:?}"),
+    }
+}
+
+#[test]
+fn subst_ee_eval_depth_two() {
+    let e = parse_expr_str("s/x/$code/ee;");
+    match &e.kind {
+        ExprKind::Subst(_, SubstReplacement::Eval { evals, .. }, _) => assert_eq!(*evals, 2),
+        other => panic!("expected Subst with /ee eval replacement, got {other:?}"),
+    }
+}
+
+#[test]
+fn subst_eee_eval_depth_three() {
+    let e = parse_expr_str("s/x/$code/eee;");
+    match &e.kind {
+        ExprKind::Subst(_, SubstReplacement::Eval { evals, .. }, _) => assert_eq!(*evals, 3),
+        other => panic!("expected Subst with /eee eval replacement, got {other:?}"),
+    }
+}
+
+// The `e`s lift into `evals`; the remaining modifiers stay in the flag string.
+#[test]
+fn subst_e_strips_e_keeps_other_flags() {
+    let e = parse_expr_str("s/x/1/eg;");
+    match &e.kind {
+        ExprKind::Subst(_, SubstReplacement::Eval { evals, .. }, flags) => {
+            assert_eq!(*evals, 1);
+            assert_eq!(flags.as_deref(), Some("g"), "the `e` is gone, `g` remains");
+        }
+        other => panic!("expected Subst with /e eval replacement, got {other:?}"),
+    }
+}
+
+#[test]
+fn subst_e_empty_replacement() {
+    let e = parse_expr_str("s/x//e;");
+    match &e.kind {
+        ExprKind::Subst(_, SubstReplacement::Eval { block, evals }, _) => {
+            assert_eq!(*evals, 1);
+            assert!(block.statements.is_empty(), "an empty /e body is a statement-less block");
+        }
+        other => panic!("expected Subst with /e eval replacement, got {other:?}"),
     }
 }
 
@@ -5097,7 +5157,7 @@ fn heredoc_terminator_must_be_exact_trailing_tab() {
 fn subst_paren_delimiters() {
     let e = parse_expr_str("s(foo)(bar);");
     match &e.kind {
-        ExprKind::Subst(pat, repl, _) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), _) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(pat_str(repl), "bar");
         }
@@ -5109,7 +5169,7 @@ fn subst_paren_delimiters() {
 fn subst_bracket_delimiters() {
     let e = parse_expr_str("s[foo][bar];");
     match &e.kind {
-        ExprKind::Subst(pat, repl, _) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), _) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(pat_str(repl), "bar");
         }
@@ -5122,7 +5182,7 @@ fn subst_mixed_paired_delimiters() {
     // s{pattern}(replacement) — different paired delims.
     let e = parse_expr_str("s{foo}(bar);");
     match &e.kind {
-        ExprKind::Subst(pat, repl, _) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), _) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(pat_str(repl), "bar");
         }
@@ -5135,7 +5195,7 @@ fn subst_paired_pattern_unpaired_replacement() {
     // s{pattern}/replacement/ — paired then unpaired.
     let e = parse_expr_str("s{foo}/bar/;");
     match &e.kind {
-        ExprKind::Subst(pat, repl, _) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), _) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(pat_str(repl), "bar");
         }
@@ -5148,7 +5208,7 @@ fn subst_angle_delimiters() {
     // s<foo><bar> — angle brackets as paired delimiters.
     let e = parse_expr_str("s<foo><bar>;");
     match &e.kind {
-        ExprKind::Subst(pat, repl, _) => {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), _) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(pat_str(repl), "bar");
         }
@@ -8369,10 +8429,12 @@ fn sig_two_slurpies_is_error() {
 fn parse_subst_e_flag() {
     let e = parse_expr_str("s/foo/uc($&)/e;");
     match &e.kind {
-        ExprKind::Subst(_, repl, _) => {
-            assert!(repl.as_plain_string().is_none(), "expected non-literal replacement for /e, got {repl:?}");
+        ExprKind::Subst(_, SubstReplacement::Eval { block, evals }, flags) => {
+            assert_eq!(*evals, 1, "a single /e is one eval");
+            assert_eq!(block.statements.len(), 1, "the replacement is one statement");
+            assert!(flags.is_none(), "the lone `e` lifts into evals, leaving no flags: {flags:?}");
         }
-        other => panic!("expected Subst, got {other:?}"),
+        other => panic!("expected Subst with /e eval replacement, got {other:?}"),
     }
 }
 

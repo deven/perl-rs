@@ -407,7 +407,12 @@ impl Expr {
             ExprKind::Regex(_, parts, _) => parts.save_context(queue),
             ExprKind::Subst(pat, repl, _) => {
                 pat.save_context(queue);
-                repl.save_context(queue);
+                match repl {
+                    SubstReplacement::Interp(parts) => parts.save_context(queue),
+                    // The block's value is stringified into the match, so its last statement is scalar — the same
+                    // context the prior single-expression `/e` replacement carried.
+                    SubstReplacement::Eval { block, .. } => block.save_context(Context::Scalar, queue),
+                }
             }
             ExprKind::Translit(_, _, _) => {}
 
@@ -803,6 +808,17 @@ impl Signature {
     }
 }
 
+/// The replacement half of `s/.../.../`.  Two grammatically distinct productions: an interpolated template (re-run per
+/// match) for a plain replacement, or a code block valued at its last statement for `/e`.  The `e`-count lifts here as
+/// `evals` (≥ 1) so the eval depth has a single home; the remaining modifiers stay in the `Subst` flag string.
+#[derive(Clone, Debug)]
+pub enum SubstReplacement {
+    /// Non-`/e`: interpolated replacement string.
+    Interp(Interpolated),
+    /// `/e`, `/ee`, … : code block, evaluated `evals` times, the last value used as the replacement.
+    Eval { block: Block, evals: u32 },
+}
+
 #[derive(Clone, Debug)]
 pub enum ExprKind {
     // ── Literals ──────────────────────────────────────────────
@@ -957,7 +973,7 @@ pub enum ExprKind {
 
     // ── Regex operations ──────────────────────────────────────
     /// `s/pattern/replacement/flags`.
-    Subst(Interpolated, Interpolated, Option<String>),
+    Subst(Interpolated, SubstReplacement, Option<String>),
 
     /// `tr/from/to/flags` or `y/from/to/flags`.
     Translit(String, String, Option<String>),

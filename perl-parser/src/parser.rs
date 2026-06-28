@@ -1677,6 +1677,48 @@ impl Parser {
         result
     }
 
+    /// Parse the brace-less statement sequence a bounded-code frame delivers — the `/e` replacement body — up to the
+    /// `SublexEnd` that marks the frame's virtual EOF, into a `Block`.  Pragmas are lexically scoped as in `parse_block`
+    /// (a `use` inside the replacement does not leak out).  The block is valued at its last statement (`/e` semantics);
+    /// an empty body yields a statement-less block.
+    fn parse_eval_block(&mut self) -> Result<Block, ParseError> {
+        let saved_pragmas = self.pragmas;
+        let saved_package = self.current_package.clone();
+
+        let start = self.peek_span();
+        let result = (|this: &mut Parser| -> Result<Block, ParseError> {
+            let mut statements = Vec::new();
+            while !this.at(&Token::SublexEnd)? && !this.at_eof()? {
+                statements.push(this.parse_statement()?);
+            }
+            let end = this.peek_span();
+            this.expect_token(&Token::SublexEnd)?;
+            Ok(Block { statements, span: start.merge(end) })
+        })(self);
+
+        self.pragmas = saved_pragmas;
+        self.current_package = saved_package;
+        self.lexer.set_utf8_mode(self.pragmas.utf8);
+        self.lexer.features = self.pragmas.features;
+        result
+    }
+
+    /// Finish an `s///` once its pattern is collected: set up the replacement frame, then parse the replacement either
+    /// as an interpolated template or — for `/e` — as a code block valued at its last statement.  The `e`-count becomes
+    /// `SubstReplacement::Eval`'s `evals` and is stripped from the stored flags so the eval depth lives in one place.
+    fn finish_subst(&mut self, delim: char, pattern: Interpolated, span: Span) -> Result<Expr, ParseError> {
+        let flags = self.lexer.start_subst_replacement(delim)?;
+        if let Some(ref f) = flags {
+            Self::validate_subst_flags(f, span)?;
+        }
+        let evals = flags.as_ref().map_or(0, |f| f.bytes().filter(|&b| b == b'e').count() as u32);
+        let replacement =
+            if evals > 0 { SubstReplacement::Eval { block: self.parse_eval_block()?, evals } } else { SubstReplacement::Interp(self.parse_interpolated()?) };
+        let flags = flags.map(|f| f.chars().filter(|&c| c != 'e').collect::<String>()).filter(|f| !f.is_empty());
+        let end = self.peek_span();
+        Ok(Expr::new(ExprKind::Subst(pattern, replacement, flags), span.merge(end)))
+    }
+
     fn parse_paren_expr(&mut self) -> Result<Expr, ParseError> {
         self.expect_token(&Token::LeftParen)?;
         let expr = self.parse_expr(PREC_LOW)?;
@@ -2381,40 +2423,9 @@ impl Parser {
                 Ok(Expr::new(ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span))
             }
             Token::SubstSublexBegin(delim) => {
-                // Collect pattern body tokens until SublexEnd.
+                // Collect pattern body tokens until SublexEnd, then finish the replacement.
                 let pattern = self.parse_interpolated()?;
-
-                // Set up the replacement body (virtual EOF, flags).
-                let flags = self.lexer.start_subst_replacement(delim)?;
-                if let Some(ref f) = flags {
-                    Self::validate_subst_flags(f, span)?;
-                }
-                let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
-
-                let replacement = if has_eval {
-                    // With /e: body is raw bytes in a single ConstSegment.  Reparse as code.
-                    let raw = match self.peek_token().clone() {
-                        Token::ConstSegment(s) => {
-                            self.next_token()?;
-                            s
-                        }
-                        Token::SublexEnd => String::new(),
-                        other => return Err(ParseError::new(format!("unexpected token in s///e: {other:?}"), self.peek_span())),
-                    };
-                    self.expect_token(&Token::SublexEnd)?;
-                    let repl_src = format!("{};", raw);
-                    let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
-                    let expr = match prog.statements.into_iter().next() {
-                        Some(Statement { kind: StmtKind::Expr(expr), .. }) => expr,
-                        _ => Expr::new(ExprKind::StringLit(raw), span),
-                    };
-                    Interpolated(vec![InterpPart::ExprInterp(Box::new(expr))])
-                } else {
-                    // Without /e: body is an interpolated string.
-                    self.parse_interpolated()?
-                };
-                let end = self.peek_span();
-                Ok(Expr::new(ExprKind::Subst(pattern, replacement, flags), span.merge(end)))
+                self.finish_subst(delim, pattern, span)
             }
             Token::TranslitLit(from, to, flags) => {
                 if let Some(ref f) = flags {
@@ -2502,33 +2513,7 @@ impl Parser {
             }
             Token::SubstSublexBegin(delim) => {
                 let pattern = self.parse_interpolated()?;
-                let flags = self.lexer.start_subst_replacement(delim)?;
-                if let Some(ref f) = flags {
-                    Self::validate_subst_flags(f, span)?;
-                }
-                let has_eval = flags.as_ref().is_some_and(|f| f.contains('e'));
-                let replacement = if has_eval {
-                    let raw = match self.peek_token().clone() {
-                        Token::ConstSegment(s) => {
-                            self.next_token()?;
-                            s
-                        }
-                        Token::SublexEnd => String::new(),
-                        other => return Err(ParseError::new(format!("unexpected token in s///e: {other:?}"), self.peek_span())),
-                    };
-                    self.expect_token(&Token::SublexEnd)?;
-                    let repl_src = format!("{};", raw);
-                    let prog = crate::parse(repl_src.as_bytes()).map_err(|e| ParseError::new(format!("in s///e replacement: {}", e.message), span))?;
-                    let expr = match prog.statements.into_iter().next() {
-                        Some(Statement { kind: StmtKind::Expr(expr), .. }) => expr,
-                        _ => Expr::new(ExprKind::StringLit(raw), span),
-                    };
-                    Interpolated(vec![InterpPart::ExprInterp(Box::new(expr))])
-                } else {
-                    self.parse_interpolated()?
-                };
-                let end = self.peek_span();
-                Ok(Expr::new(ExprKind::Subst(pattern, replacement, flags), span.merge(end)))
+                self.finish_subst(delim, pattern, span)
             }
             Token::TranslitLit(from, to, flags) => {
                 if let Some(ref f) = flags {
