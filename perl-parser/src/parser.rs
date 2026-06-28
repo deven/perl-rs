@@ -6,7 +6,7 @@
 use crate::ast::*;
 use crate::error::ParseError;
 use crate::keyword::{self, Keyword};
-use crate::lexer::Lexer;
+use crate::lexer::{FrameRole, Lexer};
 use crate::pragma::{Features, Pragmas, resolve_feature_name};
 use crate::span::Span;
 use crate::symbol::{ProtoSlot, SubPrototype, SymbolTable};
@@ -699,7 +699,7 @@ impl Parser {
     fn parse_prototype(&mut self) -> Result<Option<String>, ParseError> {
         if self.at(&Token::LeftParen)? {
             self.next_token()?; // consume (
-            let proto = self.lexer.lex_body_str('(', true)?;
+            let proto = self.lexer.lex_body_str('(', FrameRole::Prototype)?;
             Ok(Some(proto))
         } else {
             Ok(None)
@@ -885,7 +885,7 @@ impl Parser {
                 let value = if self.at(&Token::LeftParen)? {
                     self.next_token()?; // consume (
                     if name == "prototype" {
-                        Some(self.lexer.lex_body_str('(', true)?)
+                        Some(self.lexer.lex_body_str('(', FrameRole::Prototype)?)
                     } else {
                         let mut args = String::new();
                         let mut depth = 1u32;
@@ -2357,7 +2357,10 @@ impl Parser {
 
             // / in term position is a regex, not division.
             Token::Slash => {
-                let pattern = self.lexer.lex_body_str('/', true)?;
+                // TODO(lex_term): bare `/.../` must lex through the `m//` regex frame like `m`/`qr`, not this raw
+                // `lex_body_str` capture (an extra pass that also drops interpolation).  `Prototype` is a placeholder
+                // role until that alignment lands; see the deferred-work list.
+                let pattern = self.lexer.lex_body_str('/', FrameRole::Prototype)?;
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
@@ -2368,7 +2371,9 @@ impl Parser {
             // /= in term position: = is the first character of the regex pattern, not a division-assignment operator.
             Token::Assign(AssignOp::DivEq) => {
                 self.lexer.rewind(1);
-                let pattern = self.lexer.lex_body_str('/', true)?;
+                // TODO(lex_term): see the `Token::Slash` arm — bare `/.../` should use the regex frame; `Prototype`
+                // is a placeholder role here too.
+                let pattern = self.lexer.lex_body_str('/', FrameRole::Prototype)?;
                 let flags = self.lexer.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;

@@ -7,7 +7,7 @@
 //! See design document §5.4 for the full design rationale.
 
 use crate::error::ParseError;
-use crate::lexer::{LexContext, Lexer, matching_delimiter};
+use crate::lexer::{FrameRole, LexContext, Lexer, matching_delimiter};
 use crate::span::Span;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -519,11 +519,11 @@ impl Lexer {
         // The live line is left `None` — the first `peek_byte` in `lex_body` auto-loads body line 1, consuming the
         // pending virtual-EOF signal (§5.5).  Popping later restores the introducer and resumes after `<<TAG` — the
         // uniform pop a delimited body uses.
-        // A heredoc is either interpolating (escapes processed like `"..."`, `raw = false`) or literal (`<<'TAG'`,
-        // no escape processing at all — verified against perl: `\\` stays `\\`), which `raw = true` with `delim =
-        // None` delivers.  The two are mutually determined, so `raw` is `!interpolating`.
+        // A heredoc is either interpolating (`<<TAG`, escapes processed like `"..."`) or literal (`<<'TAG'`, no escape
+        // processing at all — verified against perl: `\\` stays `\\`).  The `Heredoc`/`LiteralHeredoc` role carries
+        // which, and `lex_body` reads `role.raw()` (false for the former, true for the latter).
         let introducer = self.line.take();
-        let mut ctx = LexContext::new(None, interpolating, !interpolating, false);
+        let mut ctx = LexContext::new(None, if interpolating { FrameRole::Heredoc } else { FrameRole::LiteralHeredoc });
         ctx.line = introducer;
         ctx.bound = Some(bound);
         self.context_stack.push(ctx);

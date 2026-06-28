@@ -1374,6 +1374,17 @@ byte can only match at a real character boundary and a continuation byte
 matches nothing.  The scan finds only the close *offset*: it builds no
 content and strips no escapes, which the body tokenization does later.
 
+If the walk reaches real EOF without finding the close, the body is
+unterminated.  `start_delimited_body` is handed the frame's
+`FrameRole`, and on this exit projects it through `unterminated_kind()`
+(§5.5.6) to the error wording, passing the opening delimiter as the
+close-character token perl names in the message.  The diagnostic is thus
+selected by role, not by a string the scanner assembles: an unterminated
+`m//` and an unterminated `s///` pattern differ only in their role and
+so in their message, though the scan that fails is identical.  (A
+heredoc's unterminated case is raised the same way by `start_heredoc`,
+with the tag standing in as the token — §5.4.5.)
+
 When the close sits on the same line as the opener — the common case —
 the body never spans a newline and the frame is unterminated in the line
 sense; a heredoc introduced inside it therefore hosts on the current
@@ -1426,8 +1437,9 @@ as the replacement's open, which may be any delimiter and pairs
 independently.  Whether the delimiter was paired is the single fact
 carried from the first cycle to the second.  The flags are then read
 from the resumed parent line, in source order, and the presence of `e`
-selects whether the replacement frame is tokenized as code or as an
-interpolating string.  No flag is threaded through the source layer.
+selects the replacement's role — `SubstReplacement` for an interpolating
+string body, or `EvalSubstReplacement` for code (§5.5).  No flag is
+threaded through the source layer.
 
 #### 5.4.7 CRLF normalization and line termination:
 
@@ -1645,42 +1657,40 @@ the heredoc host-walk, the `lookahead_to` ceiling borrow (§5.4.11) —
 read only that cluster, while the top-level code mode needs no entry of
 its own, being simply the empty-stack default.
 
-Unlike the enum-based `LexMode` design considered early on,
-`LexContext` is a single struct with boolean flags that control
-behavior.  The combination of `interpolating`, `raw`, and `regex`
-covers all scanning modes:
+A frame's lex mode is a single `role: FrameRole`, not a set of
+independent boolean flags.  The early design carried three orthogonal
+flags — `interpolating`, `raw`, `regex` — but the modes a Perl body can
+take are not a free cross-product of those bits.  The combinations that
+actually occur are an enumerable, closed list, and some apparent
+combinations cannot occur at all (the `/e` replacement is code, so it is
+never also interpolating).  Naming each occurring combination as a
+variant makes the impossible ones unrepresentable and lets every
+consumer match a self-describing name instead of decoding a tuple.
 
 ```rust
 struct LexContext {
     // --- source-delivery frame (§5.4.4) ---
-    /// The parent line suspended when this frame was pushed.  The
-    /// delivering frame's line is held live in the lexer's
-    /// `Option<LexerLine>`; pushing a frame moves the parent's line
-    /// down here, and popping restores it as the live line.  Its
-    /// `terminated` flag is what the heredoc host-walk reads when it
-    /// looks for the frame whose current line is terminated.
+    /// The parent line suspended when this frame was pushed.  The delivering frame's line is held live in the
+    /// lexer's `Option<LexerLine>`; pushing a frame moves the parent's line down here, and popping restores it as
+    /// the live line.  Its `terminated` flag is what the heredoc host-walk reads when it looks for the frame whose
+    /// current line is terminated.
     line: Option<LexerLine>,
-    /// The frame's bound: the global byte offset past which it reports
-    /// virtual EOF (§5.4.3, §5.4.4).  `None` means no bound — real EOF —
-    /// the base source's ceiling, and what `lookahead_to` installs when
-    /// a heredoc scan's host is the base (§5.4.11).
+    /// The frame's bound: the global byte offset past which it reports virtual EOF (§5.4.3, §5.4.4).  `None` means
+    /// no bound — real EOF — the base source's ceiling, and what `lookahead_to` installs when a heredoc scan's host
+    /// is the base (§5.4.11).
     bound: Option<u32>,
     // --- lex mode ---
-    /// Opening delimiter character.  `None` for heredocs and `s///`
-    /// replacement bodies, where end-of-content is the frame's
-    /// virtual EOF rather than a delimiter byte in the stream.
+    /// The role this frame's body plays — which construct it belongs to and, for two-part constructs, which part.
+    /// Selects the body lexer and the scanning mode within it (below), and projects to the unterminated-error
+    /// wording (§5.5.6).
+    role: FrameRole,
+    /// Opening delimiter character.  `None` for heredocs and `s///` replacement bodies, where end-of-content is the
+    /// frame's virtual EOF rather than a delimiter byte in the stream.  Purely mechanical: it drives close-scanning
+    /// (§5.4.6) and `\<delim>` unescaping, and no `role` predicate reads it.
     delim: Option<char>,
-    /// Brace depth inside `${expr}` or `@{expr}`.  When > 0,
-    /// the lexer produces normal code tokens.  When 0, it
+    /// Brace depth inside `${expr}` or `@{expr}`.  When > 0, the lexer produces normal code tokens.  When 0, it
     /// produces string body tokens via `lex_body`.
     expr_depth: u32,
-    /// Whether `$`/`@` trigger interpolation.
-    interpolating: bool,
-    /// Whether escapes pass through raw (regex, tr, prototypes, and
-    /// literal heredocs, where every backslash stays literal).
-    raw: bool,
-    /// Whether to detect `(?{...})` code blocks (regex mode).
-    regex: bool,
     /// Inside a subscript chain (e.g. `"$h->{k}[0]"`).
     chain_active: bool,
     /// Bracket/brace nesting inside the chain.
@@ -1690,21 +1700,129 @@ struct LexContext {
 }
 ```
 
-The behavior for each quote-like construct is determined by the flag
-combination passed to `LexContext::new(delim, interpolating, raw,
-regex)`:
+`FrameRole` enumerates the bodies the lexer sublexes.  The common,
+interpolating case is the bare name; the `Literal` and `Eval` prefixes
+mark the exceptions — a single-quote-style body that does not
+interpolate, or the `/e` replacement that is code:
 
-| Construct | `interpolating` | `raw` | `regex` | `delim` |
-|-----------|-----------------|-------|---------|---------|
-| `"..."`, `qq//` | true | false | false | `Some('"')` or delimiter |
-| `'...'`, `q//` | false | false | false | `Some('\'')` or delimiter |
-| `` `...` ``, `qx//` | true | false | false | `` Some('`') `` or delimiter |
-| `m//`, `qr//` | `delim != '\''` | true | true | `Some(delim)` |
-| `s///` pattern | `delim != '\''` | true | true | `Some(delim)` |
-| `s///` replacement (no `/e`) | true | false | false | `None` (virtual EOF) |
-| `s///` replacement (`/e`) | false | true | false | `None` (virtual EOF) |
-| Heredoc (interpolating) | true | false | false | `None` |
-| Heredoc (literal) | false | true | false | `None` |
+```rust
+enum FrameRole {
+    /// `format NAME = ... .` body — line-oriented (§5.5.5).
+    Format,
+    /// `sub name (...)` prototype — a raw character capture (§5.9.3).
+    Prototype,
+    /// `sub name (...)` signature — bounded code.
+    Signature,
+
+    /// `"..."`, `qq//`, `` `...` ``, `qx//` — interpolating string body.
+    String,
+    /// `'...'`, `q//` — soft literal: processes `\\` and `\<delim>`, leaves other backslashes intact; no interp.
+    LiteralString,
+    /// `qw//` — soft literal like `LiteralString`, then split on whitespace into words (§5.5.4).
+    QuoteWords,
+
+    /// `<<TAG`, `<<"TAG"` — interpolating heredoc body.
+    Heredoc,
+    /// `<<'TAG'`, `<<\TAG` — hard-raw heredoc: every backslash literal.
+    LiteralHeredoc,
+
+    /// `m//`, `qr//` — regex body: interpolates, keeps backslashes for the engine, detects `(?{...})`.
+    Regex,
+    /// `m'...'`, `qr'...'` — non-interpolating regex; backslashes still kept for the engine.
+    LiteralRegex,
+    /// `s///` pattern (interpolating).
+    SubstRegex,
+    /// `s'...'...'` pattern (non-interpolating).
+    LiteralSubstRegex,
+
+    /// `s/.../.../` replacement — interpolating string body.
+    SubstReplacement,
+    /// `s'...'...'` replacement — non-interpolating; `\\` still paired.
+    LiteralSubstReplacement,
+    /// `s/.../.../e` replacement — bounded code, not a string body.
+    EvalSubstReplacement,
+
+    /// `tr/.../`, `y/.../` search list.
+    TrSearchList,
+    /// `tr/.../.../`, `y/.../.../` replacement list.
+    TrReplacementList,
+}
+```
+
+Three predicates carry the cross-cutting scanning axes.  They are the
+interface of `lex_body` (§5.5.1): the roles lexed outside it — `Format`,
+`Signature`, `EvalSubstReplacement` — never consult them, exactly as
+top-level code has no interpolation mode.  Each is a `matches!` over the
+roles for which the axis holds, so the axis lives in one place and reads
+as a roll-call of self-describing names:
+
+```rust
+impl FrameRole {
+    /// `$`/`@` trigger interpolation.
+    fn interpolating(self) -> bool {
+        use FrameRole::*;
+        matches!(self, String | Heredoc | Regex | SubstRegex | SubstReplacement)
+    }
+    /// Backslashes pass through the body untouched — kept for the regex engine, held literal in `<<'TAG'`, or
+    /// captured raw by `lex_body_str` (prototypes, `tr///`).
+    fn raw(self) -> bool {
+        use FrameRole::*;
+        matches!(
+            self,
+            LiteralHeredoc | Regex | LiteralRegex | SubstRegex | LiteralSubstRegex | Prototype | TrSearchList | TrReplacementList
+        )
+    }
+    /// Detect `(?{...})` code blocks.
+    fn regex(self) -> bool {
+        use FrameRole::*;
+        matches!(self, Regex | LiteralRegex | SubstRegex | LiteralSubstRegex)
+    }
+}
+```
+
+For the eleven string-body roles those predicates are a truth table:
+
+| Role | Construct(s) | `interp` | `raw` | `regex` |
+|------|-------------|:--------:|:-----:|:-------:|
+| `String` | `"…"` `qq//` `` `…` `` `qx//` | ✓ | | |
+| `LiteralString` | `'…'` `q//` | | | |
+| `QuoteWords` | `qw//` | | | |
+| `Heredoc` | `<<TAG` `<<"TAG"` | ✓ | | |
+| `LiteralHeredoc` | `<<'TAG'` `<<\TAG` | | ✓ | |
+| `Regex` | `m//` `qr//` | ✓ | ✓ | ✓ |
+| `LiteralRegex` | `m'…'` `qr'…'` | | ✓ | ✓ |
+| `SubstRegex` | `s/…/` pattern | ✓ | ✓ | ✓ |
+| `LiteralSubstRegex` | `s'…'` pattern | | ✓ | ✓ |
+| `SubstReplacement` | `s/…/…/` replacement | ✓ | | |
+| `LiteralSubstReplacement` | `s'…'…'` replacement | | | |
+
+A regex body is both interpolating and raw at once — interpolation
+handles `$`/`@`, the raw axis keeps every backslash for the engine — so
+`Regex` and `SubstRegex` sit in two columns without contradiction.
+
+The role also selects which lexer drives the body; `lex_body` no more
+owns every frame than `lex_token` owns all of normal code.  Most roles
+feed `lex_body` (§5.5.1), which reads the three predicates to pick its
+scanning mode.  The eleven string-body roles stream their sub-tokens to
+the parser; `Prototype`, `TrSearchList`, and `TrReplacementList` reach
+`lex_body` through `lex_body_str` (§5.9.3), a wrapper that drives a
+non-interpolating body to `SublexEnd` and concatenates its `ConstSegment`
+run into a string for the parser to sift.  Collection, not a different
+lexer, is what sets the captures apart — they consult `raw()` like any
+other body.  Only `Format` (the line-oriented format lexer, §5.5.5) and
+the bounded-code roles `Signature` and `EvalSubstReplacement` (lexed by
+the normal token path against the frame's virtual EOF) sit outside
+`lex_body`, where interpolation and rawness are not the question, the way
+they are not for top-level code.  Which lexer a role feeds is one
+exhaustive `match` at the dispatch site; no predicate re-derives it, and
+adding a role cannot compile until that match accounts for it.
+
+`unterminated_kind()` projects the role onto the error condition for a
+body that runs to EOF without closing (§5.5.6).  The projection is
+many-to-one — the interpolated/literal pairs share a message, and the
+`String`/`LiteralString`/`QuoteWords` family shares one — so it lands on
+markedly fewer kinds than there are roles, which is what keeps it a real
+projection rather than a renamed copy of the enum.
 
 Delimiter types are `char`, not `u8`, to support the Unicode paired
 delimiter table (§5.8).  `delim` is `None` for heredocs and
@@ -1721,21 +1839,23 @@ memory of which kind of body it is in.  Because the bound already
 encodes where the body ends, the shared per-token code (`lex_body`,
 §5.5.1) carries no closing-delimiter watch: it simply lexes to virtual
 EOF.  A literal (non-interpolating) heredoc is not a separate path that
-slurps the body whole; it is just a body frame lexed with
-`interpolating: false`, emitting `ConstSegment` runs through the same
-loop to `SublexEnd`, with no bespoke collector and no distinct token.
+slurps the body whole; it is just a body frame with the `LiteralHeredoc`
+role, emitting `ConstSegment` runs through the same loop to `SublexEnd`,
+with no bespoke collector and no distinct token.
 
 Teardown is uniform across both body kinds, because the resume point is
-fixed at push time, not chosen at the pop.  Before suspending the parent
+fixed at push time, not chosen at the end.  Before suspending the parent
 line into the entry, setup advances its cursor to where parsing resumes:
 `start_delimited_body` moves it past the closing delimiter, and
 `start_heredoc` leaves it just past the introducer's `<<TAG`, where the
 tag scan already left it.  The heredoc terminator is consumed by the
 scan, not delivered, so reaching virtual EOF leaves the host past it.
-The pop is then one operation for either kind — restore the suspended
-line and resume from its cursor — so `LexContext` carries no body-kind
-discriminant.  Setup fans in, sublexing is shared, and so is teardown;
-the only per-kind step is the cursor nudge inside each setup.
+When the body reaches virtual EOF the frame ends: `end_frame` restores
+the suspended parent line as the live line, re-narrowed to the enclosing
+bound, and resumes from its cursor — one operation for either kind, so
+`LexContext` carries no body-kind discriminant.  Setup fans in,
+sublexing is shared, and so is the end; the only per-kind step is the
+cursor nudge inside each setup.
 
 The first body line is fetched implicitly, not by setup.
 `start_heredoc` leaves the live line `None`; the parser's next token
@@ -1804,6 +1924,20 @@ virtual EOF (§5.5), not a byte in the stream, so the bulk copy
 stops at a trigger or at the line end, and a delimiter character
 inside the body — a nested `{` in `qq{ {x} }`, a `/` in a `tr`
 class — is ordinary content the scan copies straight through.
+
+A `QuoteWords` body (`qw//`) lexes with the same soft-literal mode as
+`LiteralString` — no interpolation, `\\` and `\<delim>` processed, other
+backslashes kept — but the scanner splits the body on whitespace and
+emits one `ConstSegment` per word rather than one per literal run.
+Whitespace is therefore an additional trigger in this mode: the fast
+path stops at it as a word boundary, strips it, and resumes at the next
+word.  The split follows `split ' '` semantics (leading whitespace
+discarded, runs of whitespace collapsed) and runs on the post-escape
+content, so `qw(a\ b)` yields the words `a\` and `b` — the backslash is
+plain content and does not bind the space.  Words never cross a line: a
+newline is a separator like any other whitespace, so the role needs no
+cross-line state.  The parser assembles the streamed words into the
+`qw` list node; the lexer never holds the list.
 
 #### 5.5.5 Format lexing:
 
@@ -1896,6 +2030,81 @@ manpage rather than the interpreter is how subtle bugs creep in:
   argument list is expected (at depth 0, before any argument content)
   is not skipped to find the arguments — the picture run receives no
   arguments and the line is processed on its own.
+
+#### 5.5.6 Unterminated bodies:
+
+A body that reaches end of input without its close is unterminated.  The
+condition is reified as `UnterminatedKind`, owned by `error.rs` together
+with its wording, and it is the organizing axis for *unterminatedness*
+across the lexer — not a per-construct error.  A frame projects onto it
+through `FrameRole::unterminated_kind()`.  The axis is the condition, not
+the context: a future unterminated case with no frame behind it — a
+`__DATA__` section left open, say — attaches as a new `UnterminatedKind`
+variant directly, where a per-context `SomethingError::Unterminated`
+would instead scatter the one concept across unrelated enums that merely
+reuse the word.  So `UnterminatedKind` stays coherent even as it grows
+heterogeneous: every variant answers "what was left open," whether or
+not a `FrameRole` stands behind it.
+
+```rust
+enum UnterminatedKind {
+    String,             // String | LiteralString | QuoteWords  — close char
+    Heredoc,            // Heredoc | LiteralHeredoc        — tag
+    Regex,              // Regex | LiteralRegex
+    SubstRegex,         // SubstRegex | LiteralSubstRegex
+    SubstReplacement,   // SubstReplacement | LiteralSubstReplacement | EvalSubstReplacement
+    TrSearchList,
+    TrReplacementList,
+    Format,
+}
+```
+
+The variant names match the role names, with one rule: where several
+roles share a message they collapse onto one kind named for the family.
+That collapse is why the kind count (eight) is well below the role count
+(seventeen) — the projection tracks *distinct messages*, and the
+interpolated/literal pairs do not differ in their wording:
+
+- `String` — "Can't find string terminator `<char>` anywhere before
+  EOF", for the `String`/`LiteralString`/`QuoteWords` family.
+- `Heredoc` — the same template with the tag in place of the close
+  character.  It is a distinct kind, not folded into `String`, because
+  the token it carries is a tag, not a delimiter character, and keeping
+  "a heredoc is its own construct" legible at the wording site is worth
+  one variant even though the template text coincides.
+- `Regex` — "Search pattern not terminated" (`Regex`/`LiteralRegex`).
+- `SubstRegex` — "Substitution pattern not terminated".
+- `SubstReplacement` — "Substitution replacement not terminated", for
+  all three replacement roles including `/e`.
+- `TrSearchList` / `TrReplacementList` — "Transliteration pattern not
+  terminated" / "Transliteration replacement not terminated".
+- `Format` — "Format not terminated".
+
+The kind is a plain enum; the token that fills the message's slot — a
+close character for `String`, a tag for `Heredoc`, nothing for the
+rest — is a separate channel, supplied by the site that raises the error
+(`start_delimited_body`, `start_heredoc`).  This keeps `UnterminatedKind`
+a clean projection target and keeps the heterogeneous token out of the
+type, the same way `delim` stays out of band on `LexContext` (§5.5).
+
+The names deliberately drop perl's diagnostic vocabulary, which says
+"pattern" where the role says `Regex`: anchoring the variant to the role
+makes `UnterminatedKind::Regex` read as "the unterminated case of
+`FrameRole::Regex`" and survives perl revising its wording, since the
+text lives in `error.rs` regardless.
+
+The wording match in `error.rs` is exhaustive over `UnterminatedKind`,
+so a new kind cannot be added without supplying its message.  The
+message coincidences — the interpolated/literal `|` groupings — live in
+that text match, not in the type: they are where several kinds format
+the same string, an implementation detail of rendering, not a structural
+claim about the roles.
+
+`Prototype` and `Signature` will project here too once their
+unterminated messages are confirmed against perl; their kinds are
+deferred with that verification rather than guessed, so
+`unterminated_kind()` covers the body roles above and gains those two
+arms when the prototype/signature frame migration lands.
 
 ### 5.6 Heredoc Handling
 

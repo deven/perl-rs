@@ -24,6 +24,80 @@ use unicode_xid::UnicodeXID;
 #[path = "tests/lexer_tests.rs"]
 mod tests;
 
+/// The role a sublex frame's body plays — which construct it belongs to and, for two-part constructs, which part.
+/// Selects the body lexer and, via the predicates below, the scanning mode within `lex_body` (§5.5).  The bare name is
+/// the common interpolating case; the `Literal`/`Eval` prefixes mark the non-interpolating or code exceptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameRole {
+    /// `format NAME = ... .` body — line-oriented (§5.5.5).
+    #[allow(dead_code)] // Not yet wired: format uses `FormatState`, not a `LexContext`.
+    Format,
+    /// `sub name (...)` prototype — a raw character capture via `lex_body_str` (§5.9.3).
+    Prototype,
+    /// `sub name (...)` signature — bounded code.
+    #[allow(dead_code)] // Not yet wired: signatures are not yet framed.
+    Signature,
+
+    /// `"..."`, `qq//`, `` `...` ``, `qx//` — interpolating string body.
+    String,
+    /// `'...'`, `q//` — soft literal: processes `\\` and `\<delim>`, leaves other backslashes intact; no interp.
+    LiteralString,
+    /// `qw//` — soft literal like `LiteralString`, then split on whitespace into words.
+    QuoteWords,
+
+    /// `<<TAG`, `<<"TAG"` — interpolating heredoc body.
+    Heredoc,
+    /// `<<'TAG'`, `<<\TAG` — hard-raw heredoc: every backslash literal.
+    LiteralHeredoc,
+
+    /// `m//`, `qr//` — regex body: interpolates, keeps backslashes for the engine, detects `(?{...})`.
+    Regex,
+    /// `m'...'`, `qr'...'` — non-interpolating regex; backslashes still kept for the engine.
+    LiteralRegex,
+    /// `s///` pattern (interpolating).
+    SubstRegex,
+    /// `s'...'...'` pattern (non-interpolating).
+    LiteralSubstRegex,
+
+    /// `s/.../.../` replacement — interpolating string body.
+    SubstReplacement,
+    /// `s'...'...'` replacement — non-interpolating; `\\` still paired.
+    #[allow(dead_code)] // Not yet wired: the replacement push is unconditionally interpolating today.
+    LiteralSubstReplacement,
+    /// `s/.../.../e` replacement — bounded code; still captured raw via `lex_body` until the reparse is removed.
+    EvalSubstReplacement,
+
+    /// `tr/.../`, `y/.../` search list.
+    TrSearchList,
+    /// `tr/.../.../`, `y/.../.../` replacement list.
+    TrReplacementList,
+}
+
+impl FrameRole {
+    /// `$`/`@` trigger interpolation.
+    pub(crate) fn interpolating(self) -> bool {
+        use FrameRole::*;
+        matches!(self, String | Heredoc | Regex | SubstRegex | SubstReplacement)
+    }
+
+    /// Backslashes pass through the body untouched — kept for the regex engine, held literal in `<<'TAG'`, or captured
+    /// raw by `lex_body_str`.  `EvalSubstReplacement` is here transitionally: `/e` still runs through `lex_body` raw
+    /// until the reparse path is removed, after which it becomes code and drops out.
+    pub(crate) fn raw(self) -> bool {
+        use FrameRole::*;
+        matches!(
+            self,
+            Prototype | LiteralHeredoc | Regex | LiteralRegex | SubstRegex | LiteralSubstRegex | EvalSubstReplacement | TrSearchList | TrReplacementList
+        )
+    }
+
+    /// Detect `(?{...})` code blocks.
+    pub(crate) fn regex(self) -> bool {
+        use FrameRole::*;
+        matches!(self, Regex | LiteralRegex | SubstRegex | LiteralSubstRegex)
+    }
+}
+
 /// Sublexing context — tracks what mode the lexer is in.
 ///
 /// When `expr_depth > 0`, the lexer is in expression-parsing mode inside `${expr}` or `@{expr}`.  When `expr_depth ==
@@ -34,7 +108,7 @@ mod tests;
 /// ends when a closing bracket returns depth to 0 and no continuation (`[`, `{`, `->[`, `->{`) follows.
 /// `chain_end_pending` is set between tokens when the probe has detected end-of-chain — the next `lex_token` call emits
 /// `InterpChainEnd` and clears the chain state.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct LexContext {
     // --- source-delivery frame ---
     /// The suspended current line of the frame one level *below* this entry — the parent's line, parked when this
@@ -48,21 +122,16 @@ pub(crate) struct LexContext {
     pub(crate) bound: Option<u32>,
 
     // --- lex mode ---
-    /// Opening delimiter character.  `None` for heredocs (end signaled by the source layer).
+    /// The role this frame's body plays (§5.5).  Selects the body lexer and, via its predicates, the scanning mode.
+    pub(crate) role: FrameRole,
+
+    /// Opening delimiter character.  `None` for heredocs and `s///` replacement bodies (end signaled by the source
+    /// layer).  Mechanical: drives close-scanning and `\<delim>` unescaping; no `role` predicate reads it.
     pub(crate) delim: Option<char>,
 
     /// Brace depth inside `${expr}` or `@{expr}`.  When > 0, the lexer produces normal code tokens.  When 0, it
     /// produces string body tokens via `lex_body`.
     pub(crate) expr_depth: u32,
-
-    /// Whether `$`/`@` trigger interpolation.
-    pub(crate) interpolating: bool,
-
-    /// Whether escapes pass through raw (for regex, tr, prototypes, and literal heredocs — every backslash literal).
-    pub(crate) raw: bool,
-
-    /// Whether to detect `(?{...})` code blocks (regex mode).
-    pub(crate) regex: bool,
 
     /// Inside a subscript chain (see type-level doc).
     pub(crate) chain_active: bool,
@@ -75,10 +144,10 @@ pub(crate) struct LexContext {
 }
 
 impl LexContext {
-    /// Convenience for the common string/regex push pattern: opening delimiter plus the three behavior flags.  Chain
-    /// fields and the source-delivery cluster default to empty; the source layer sets `line`/`bound` after.
-    pub(crate) fn new(delim: Option<char>, interpolating: bool, raw: bool, regex: bool) -> Self {
-        LexContext { delim, interpolating, raw, regex, ..Default::default() }
+    /// Convenience for the common string/regex push pattern: opening delimiter plus the frame's role.  Chain fields
+    /// and the source-delivery cluster start empty; the source layer sets `line`/`bound` after.
+    pub(crate) fn new(delim: Option<char>, role: FrameRole) -> Self {
+        LexContext { line: None, bound: None, role, delim, expr_depth: 0, chain_active: false, chain_depth: 0, chain_end_pending: false }
     }
 }
 
@@ -1123,12 +1192,12 @@ impl Lexer {
             b'\'' => self.lex_single_quoted_string()?,
             b'"' => {
                 self.skip(1); // skip opening "
-                self.start_delimited_body(LexContext::new(Some('"'), true, false, false), false)?;
+                self.start_delimited_body(LexContext::new(Some('"'), FrameRole::String), false)?;
                 Token::QuoteSublexBegin(QuoteKind::Double, '"')
             }
             b'`' => {
                 self.skip(1); // skip opening `
-                self.start_delimited_body(LexContext::new(Some('`'), true, false, false), false)?;
+                self.start_delimited_body(LexContext::new(Some('`'), FrameRole::String), false)?;
                 Token::QuoteSublexBegin(QuoteKind::Backtick, '`')
             }
 
@@ -2201,7 +2270,7 @@ impl Lexer {
     // ── Strings ───────────────────────────────────────────────
     fn lex_single_quoted_string(&mut self) -> Result<Token, ParseError> {
         self.skip(1); // skip opening '
-        let s = self.lex_body_str('\'', false)?;
+        let s = self.lex_body_str('\'', FrameRole::LiteralString)?;
         Ok(Token::StrLit(s))
     }
 
@@ -2231,7 +2300,7 @@ impl Lexer {
             let Some(ctx) = self.context_stack.last() else {
                 return Err(ParseError::new("lex_body requires a body frame on the stack", Span::new(self.cursor as u32, self.cursor as u32)));
             };
-            (ctx.delim, ctx.interpolating, ctx.regex, ctx.raw)
+            (ctx.delim, ctx.role.interpolating(), ctx.role.regex(), ctx.role.raw())
         };
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
         let (open, close) = match delim {
@@ -2484,12 +2553,12 @@ impl Lexer {
     /// parent past it), then drives `lex_body` to `SublexEnd`, concatenating the `ConstSegment` runs.  The frame pops
     /// itself at the body's virtual EOF, so the cursor is left past the close — top-level or nested alike.
     ///
-    /// `raw` selects escape handling:
-    /// - `false`: single-quote escapes (`\\`→`\`, `\delim`→delim).
-    /// - `true`: raw passthrough (`\delim`→delim, else pass through).
-    pub fn lex_body_str(&mut self, delim: char, raw: bool) -> Result<String, ParseError> {
+    /// `role` selects escape handling via `role.raw()` — soft (`\\`→`\`, `\delim`→delim) when false, raw passthrough
+    /// (`\delim`→delim, else pass through) when true.  The role must be non-interpolating and non-regex, or the loop
+    /// below `unreachable!`s: `LiteralString`, `QuoteWords`, `Prototype`, and the `Tr` lists.
+    pub fn lex_body_str(&mut self, delim: char, role: FrameRole) -> Result<String, ParseError> {
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
-        self.start_delimited_body(LexContext::new(Some(delim), false, raw, false), extra)?;
+        self.start_delimited_body(LexContext::new(Some(delim), role), extra)?;
 
         let mut s = String::new();
         loop {
@@ -2904,21 +2973,21 @@ impl Lexer {
     // ── q// qq// qw// ─────────────────────────────────────────
     fn lex_q_string(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        let s = self.lex_body_str(delim, false)?;
+        let s = self.lex_body_str(delim, FrameRole::LiteralString)?;
         Ok(Token::StrLit(s))
     }
 
     fn lex_qq_string(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
-        self.start_delimited_body(LexContext::new(Some(delim), true, false, false), extra)?;
+        self.start_delimited_body(LexContext::new(Some(delim), FrameRole::String), extra)?;
         Ok(Token::QuoteSublexBegin(QuoteKind::Double, delim))
     }
 
     fn lex_qx(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
-        self.start_delimited_body(LexContext::new(Some(delim), true, false, false), extra)?;
+        self.start_delimited_body(LexContext::new(Some(delim), FrameRole::String), extra)?;
         Ok(Token::QuoteSublexBegin(QuoteKind::Backtick, delim))
     }
 
@@ -2926,7 +2995,7 @@ impl Lexer {
         let delim = self.read_quote_delimiter()?;
 
         // qw is documented as equivalent to split(' ', q/.../).  Use literal (q//) escape mode: \\ → \, \delim → delim.
-        let body = self.lex_body_str(delim, false)?;
+        let body = self.lex_body_str(delim, FrameRole::QuoteWords)?;
         let words: Vec<String> = body.split_whitespace().map(String::from).collect();
         Ok(Token::QwList(words))
     }
@@ -2936,7 +3005,7 @@ impl Lexer {
     fn lex_m(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
-        self.start_delimited_body(LexContext::new(Some(delim), delim != '\'', true, true), extra)?;
+        self.start_delimited_body(LexContext::new(Some(delim), if delim == '\'' { FrameRole::LiteralRegex } else { FrameRole::Regex }), extra)?;
         Ok(Token::RegexSublexBegin(RegexKind::Match, delim))
     }
 
@@ -2944,7 +3013,7 @@ impl Lexer {
     fn lex_qr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
-        self.start_delimited_body(LexContext::new(Some(delim), delim != '\'', true, true), extra)?;
+        self.start_delimited_body(LexContext::new(Some(delim), if delim == '\'' { FrameRole::LiteralRegex } else { FrameRole::Regex }), extra)?;
         Ok(Token::RegexSublexBegin(RegexKind::Qr, delim))
     }
 
@@ -2955,7 +3024,7 @@ impl Lexer {
         // Push the pattern body frame (raw, regex mode; single-quote delimiter disables interpolation).  The parser
         // collects the pattern's tokens to SublexEnd, then calls `start_subst_replacement` for the replacement body.
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
-        self.start_delimited_body(LexContext::new(Some(delim), delim != '\'', true, true), extra)?;
+        self.start_delimited_body(LexContext::new(Some(delim), if delim == '\'' { FrameRole::LiteralSubstRegex } else { FrameRole::SubstRegex }), extra)?;
 
         Ok(Token::SubstSublexBegin(delim))
     }
@@ -2975,7 +3044,7 @@ impl Lexer {
         // Push the replacement frame.  `delim` is `Some` so the scan can find the close; the body then sublexes to the
         // bound and the delimiter is not watched for again.  The mode here is provisional — the scan ignores it — and
         // is corrected below once `/e` is known.
-        self.start_delimited_body(LexContext::new(Some(repl_delim), true, false, false), extra)?;
+        self.start_delimited_body(LexContext::new(Some(repl_delim), FrameRole::SubstReplacement), extra)?;
 
         // The flags sit immediately after the close, on the frame's parent-resume line.  Read them there and advance
         // that line past them, so the parent resumes after the flags.
@@ -2985,8 +3054,7 @@ impl Lexer {
         // `/e` is known now, before any sublexing: set the replacement body's mode in place — raw code for `/e`, an
         // interpolating string otherwise.
         if let Some(top) = self.context_stack.last_mut() {
-            top.interpolating = !has_eval;
-            top.raw = has_eval;
+            top.role = if has_eval { FrameRole::EvalSubstReplacement } else { FrameRole::SubstReplacement };
         }
 
         Ok(flags)
@@ -3013,13 +3081,13 @@ impl Lexer {
     /// `tr/from/to/flags` or `y/from/to/flags`
     fn lex_tr(&mut self) -> Result<Token, ParseError> {
         let delim = self.read_quote_delimiter()?;
-        let from = self.lex_body_str(delim, true)?;
+        let from = self.lex_body_str(delim, FrameRole::TrSearchList)?;
         let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
         let to = if is_paired(delim, extra) {
             let delim2 = self.read_quote_delimiter()?;
-            self.lex_body_str(delim2, true)?
+            self.lex_body_str(delim2, FrameRole::TrReplacementList)?
         } else {
-            self.lex_body_str(delim, true)?
+            self.lex_body_str(delim, FrameRole::TrReplacementList)?
         };
         let flags = self.scan_adjacent_word_chars();
         Ok(Token::TranslitLit(from, to, flags))

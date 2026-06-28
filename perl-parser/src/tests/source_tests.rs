@@ -529,7 +529,7 @@ fn subst_body_reads_flags_and_restores_remainder() {
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"bar/e + 1"), false, 0, true));
 
     // Scan the `/`-delimited body: it becomes the live (narrowed) line, and the parent is suspended past the close.
-    lexer.start_delimited_body(LexContext::new(Some('/'), true, false, false), false).unwrap();
+    lexer.start_delimited_body(LexContext::new(Some('/'), FrameRole::String), false).unwrap();
     let body = lexer.line.clone().unwrap();
     assert_eq!(&body.line[body.pos as usize..], b"bar");
 
@@ -548,7 +548,7 @@ fn subst_body_captures_multiple_flags_and_restores_remainder() {
     let mut lexer = Lexer::new(b"");
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"bar/msix + 1"), false, 0, true));
 
-    lexer.start_delimited_body(LexContext::new(Some('/'), true, false, false), false).unwrap();
+    lexer.start_delimited_body(LexContext::new(Some('/'), FrameRole::String), false).unwrap();
     let body = lexer.line.clone().unwrap();
     assert_eq!(&body.line[body.pos as usize..], b"bar");
 
@@ -566,7 +566,7 @@ fn subst_body_with_paired_delimiter_nesting() {
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"a{b}c}r"), false, 0, true));
 
     // `{`-delimited: the inner `{...}` nests, so the body ends at the second `}`.
-    lexer.start_delimited_body(LexContext::new(Some('{'), true, false, false), false).unwrap();
+    lexer.start_delimited_body(LexContext::new(Some('{'), FrameRole::String), false).unwrap();
     let body = lexer.line.clone().unwrap();
     assert_eq!(&body.line[body.pos as usize..], b"a{b}c");
 
@@ -579,7 +579,7 @@ fn subst_body_errors_on_eof() {
     let mut lexer = Lexer::new(b"");
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"unterminated"), false, 0, true));
 
-    let err = lexer.start_delimited_body(LexContext::new(Some('/'), true, false, false), false).unwrap_err();
+    let err = lexer.start_delimited_body(LexContext::new(Some('/'), FrameRole::String), false).unwrap_err();
     assert!(err.message.contains("Can't find string terminator"));
 }
 
