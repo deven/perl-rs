@@ -3,7 +3,7 @@
 use super::*;
 
 fn lex_all(src: &str) -> Vec<Token> {
-    let mut lexer = Lexer::new(src.as_bytes());
+    let mut lexer = Parser::new(src.as_bytes()).unwrap();
     lexer.features = Features::ALL;
     let mut term_context = true; // start of statement is term context
     let mut tokens = Vec::new();
@@ -136,7 +136,7 @@ fn lex_cr_only_not_treated_as_newline() {
     // Standalone \r is NOT a line ending.  This source has \r (not \r\n) before the terminator, so "END" is not at line
     // start and the heredoc is unterminated — matching Perl's behavior.
     let src = b"<<END;\nhello\rEND\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
 
     // Consume ShiftLeft, then call the heredoc hook.
     let tok = lexer.lex_token().unwrap();
@@ -154,7 +154,7 @@ fn lex_cr_only_not_treated_as_newline() {
 fn lex_indented_heredoc_mismatch_croaks() {
     // Body line with wrong indentation should error.
     let src = "<<~END;\n    hello\n  bad indent\n    END\n";
-    let mut lexer = Lexer::new(src.as_bytes());
+    let mut lexer = Parser::new(src.as_bytes()).unwrap();
 
     // Consume ShiftLeft, then call the heredoc hook.
     lexer.lex_token().unwrap();
@@ -168,7 +168,7 @@ fn lex_indented_heredoc_mismatch_croaks() {
 fn lex_indented_heredoc_tabs_vs_spaces_croaks() {
     // Terminator uses tab+spaces, body line uses only spaces — mismatch.
     let src = "<<~END;\n\t  hello\n    wrong\n\t  END\n";
-    let mut lexer = Lexer::new(src.as_bytes());
+    let mut lexer = Parser::new(src.as_bytes()).unwrap();
     lexer.lex_token().unwrap();
 
     // The up-front indent stamping rejects the mismatched body line when the heredoc is set up.

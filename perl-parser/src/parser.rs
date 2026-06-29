@@ -6,11 +6,14 @@
 use crate::ast::*;
 use crate::error::ParseError;
 use crate::keyword::{self, Keyword};
-use crate::lexer::{FrameRole, Lexer};
+use crate::lexer::{FormatState, FrameRole, LexContext};
 use crate::pragma::{Features, Pragmas, resolve_feature_name};
+use crate::source::LexerLine;
 use crate::span::Span;
 use crate::symbol::{ProtoSlot, SubPrototype, SymbolTable};
 use crate::token::*;
+use bytes::Bytes;
+use std::collections::VecDeque;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -152,7 +155,51 @@ impl OpInfo {
 
 /// The combined parser/lexer.
 pub struct Parser {
-    lexer: Lexer,
+    // ── Lexer source layer (line delivery, heredoc/subst interleaving, CRLF; methods in source.rs) ──
+    /// The complete source buffer.
+    pub(crate) src: Bytes,
+    /// Name of the source — used for `__FILE__` resolution and diagnostic messages.  Defaults to `"(script)"`.
+    pub(crate) filename: String,
+    /// Current byte position for reading the next line.
+    pub(crate) cursor: usize,
+    /// The line currently being scanned, if any.  `None` forces a fresh `next_line` read on the next `peek_byte`.
+    pub(crate) line: Option<LexerLine>,
+    /// Next line number to assign (1-based).
+    pub(crate) line_number: u32,
+    /// Lines queued for delivery by future `next_line()` calls (heredoc remainders, push_back, subst bodies).
+    pub(crate) queued_lines: VecDeque<LexerLine>,
+    /// Displaced lines captured during an active lookahead scan, in displacement order.
+    pub(crate) lookahead: VecDeque<LexerLine>,
+    /// Source offset of the line a lookahead scan ended on, identifying it for `consume_lookahead`.
+    pub(crate) lookahead_offset: Option<u32>,
+    /// Cursor position the lookahead scan ended at, within the end line.
+    pub(crate) lookahead_pos: Option<u32>,
+    /// True while a lookahead guard is alive.
+    pub(crate) lookahead_mode: bool,
+
+    // ── Lexer tokenization layer (methods in lexer.rs) ──
+    pub(crate) context_stack: Vec<LexContext>,
+    /// Deferred error from auto-loading in `peek_byte`.  Surfaced on the next call to `lex_token`.
+    pub(crate) pending_error: Option<ParseError>,
+    /// Active format sublex state, if we're inside a format body.
+    pub(crate) format_state: Option<FormatState>,
+    /// Whether `use utf8` is active.  Kept in step with `pragmas` at block boundaries; read by the lexer layer for
+    /// error diagnostics on high bytes outside strings.
+    pub(crate) utf8_mode: bool,
+    /// Fast-path composite: `utf8_mode && !line.ascii_only`.  When false, the current line is pure ASCII.
+    pub(crate) effective_utf8: bool,
+    /// Feature flags, kept in step with `pragmas.features`.  A cached copy the lexer layer reads on hot paths.
+    pub(crate) features: Features,
+    /// Stacked cumulative case-modification flags (`\L`/`\U`/`\F`/`\Q`/`\E`).
+    pub(crate) case_mod_stack: Vec<CaseMod>,
+    /// `\l` pending — lowercase the very next character only.
+    pub(crate) case_mod_lcfirst: bool,
+    /// `\u` pending — titlecase the very next character only.
+    pub(crate) case_mod_ucfirst: bool,
+    /// Set when `__DATA__`/`__END__` or `^D`/`^Z` triggers logical end-of-source.
+    pub(crate) logical_eof: bool,
+    /// Set when `__DATA__`/`__END__` triggers logical EOF: the keyword and the byte offset where trailing data begins.
+    pub(crate) data_end_info: Option<(Keyword, u32)>,
 
     /// Cached current token.  `None` means no token is cached — the next peek/next will lex one.
     current: Option<Spanned>,
@@ -176,19 +223,47 @@ pub struct Parser {
 impl Parser {
     // ── Construction ──────────────────────────────────────────
     pub fn new(src: &[u8]) -> Result<Self, ParseError> {
-        Self::from_lexer(Lexer::new(src))
+        Self::build(Bytes::copy_from_slice(src), "(script)".into())
     }
 
     /// Construct a parser that reports `filename` for `__FILE__` resolution and in diagnostic messages.  Prefer this
     /// over [`Self::new`] when the source comes from a named file.
     pub fn with_filename(src: &[u8], filename: impl Into<String>) -> Result<Self, ParseError> {
-        Self::from_lexer(Lexer::with_filename(src, filename))
+        Self::build(Bytes::copy_from_slice(src), filename.into())
     }
 
-    /// Shared core: all constructors funnel through here so field initialization stays in one place.
-    fn from_lexer(lexer: Lexer) -> Result<Self, ParseError> {
+    /// Shared core: detect/transcode any BOM or UTF-16 encoding, then initialize the lexer-layer and parser-layer
+    /// state together.  The source bytes are copied into a `Bytes` buffer once; all subsequent line slicing is
+    /// zero-copy.
+    fn build(src: Bytes, filename: String) -> Result<Self, ParseError> {
+        let (src, bom_utf8) = Self::detect_and_transcode(src);
         Ok(Parser {
-            lexer,
+            // Lexer source layer.
+            src,
+            filename,
+            cursor: 0,
+            line: None,
+            line_number: 1,
+            queued_lines: VecDeque::new(),
+            lookahead: VecDeque::new(),
+            lookahead_offset: None,
+            lookahead_pos: None,
+            lookahead_mode: false,
+
+            // Lexer tokenization layer.
+            context_stack: Vec::new(),
+            pending_error: None,
+            format_state: None,
+            utf8_mode: bom_utf8,
+            effective_utf8: false,
+            features: Features::DEFAULT,
+            case_mod_stack: Vec::new(),
+            case_mod_lcfirst: false,
+            case_mod_ucfirst: false,
+            logical_eof: false,
+            data_end_info: None,
+
+            // Parser layer.
             current: None,
             lexer_error: None,
             symbols: SymbolTable::new(),
@@ -212,18 +287,18 @@ impl Parser {
     /// for tests that need to parse under a specific feature bundle without a `use feature` declaration in the source.
     pub fn set_features(&mut self, features: Features) {
         self.pragmas.features = features;
-        self.lexer.features = features;
+        self.features = features;
     }
 
     // ── Token access ──────────────────────────────────────────
     /// Peek at the current token without consuming it.  Lexes on demand if no token is cached.
     fn peek_token(&mut self) -> &Token {
         if self.current.is_none() {
-            self.current = Some(match self.lexer.lex_token() {
+            self.current = Some(match self.lex_token() {
                 Ok(s) => s,
                 Err(e) => {
                     self.lexer_error = Some(e);
-                    Spanned { token: Token::Eof, span: Span::new(self.lexer.pos() as u32, self.lexer.pos() as u32) }
+                    Spanned { token: Token::Eof, span: Span::new(self.pos() as u32, self.pos() as u32) }
                 }
             });
         }
@@ -337,7 +412,7 @@ impl Parser {
 
         // If __DATA__/__END__ triggered logical EOF, the lexer stored the keyword and data offset.  Emit a DataEnd
         // node so the compiler knows where the DATA filehandle content begins.
-        if let Some((kw, offset)) = self.lexer.data_end_info.take() {
+        if let Some((kw, offset)) = self.data_end_info.take() {
             let end_span = self.peek_span();
             statements.push(Statement { kind: StmtKind::DataEnd(kw, offset), span: end_span, terminated: false });
         }
@@ -611,7 +686,7 @@ impl Parser {
             Token::HashVar(name) => Ok(VarDecl { sigil: Sigil::Hash, name, span, attributes: vec![], is_ref }),
             Token::Percent => {
                 // my %hash — lexer emitted Percent; read the hash name.
-                match self.lexer.lex_hash_var_after_percent()? {
+                match self.lex_hash_var_after_percent()? {
                     Some(Token::HashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, attributes: vec![], is_ref }),
                     Some(Token::SpecialHashVar(name)) => Ok(VarDecl { sigil: Sigil::Hash, name, span, attributes: vec![], is_ref }),
                     _ => Err(ParseError::new("expected hash variable name after %", span)),
@@ -699,7 +774,7 @@ impl Parser {
     fn parse_prototype(&mut self) -> Result<Option<String>, ParseError> {
         if self.at(&Token::LeftParen)? {
             self.next_token()?; // consume (
-            let proto = self.lexer.lex_body_str('(', FrameRole::Prototype)?;
+            let proto = self.lex_body_str('(', FrameRole::Prototype)?;
             Ok(Some(proto))
         } else {
             Ok(None)
@@ -835,7 +910,7 @@ impl Parser {
             Token::At => Ok(SigParam::AnonArray { span }),
             Token::Percent => {
                 // Either anon hash placeholder or named slurpy hash; ask the lexer to probe for a hash name.
-                match self.lexer.lex_hash_var_after_percent()? {
+                match self.lex_hash_var_after_percent()? {
                     Some(Token::HashVar(name)) => Ok(SigParam::SlurpyHash { name, span }),
                     Some(Token::SpecialHashVar(_)) | Some(_) => {
                         // `%^FOO` etc. — not valid in a signature.
@@ -885,7 +960,7 @@ impl Parser {
                 let value = if self.at(&Token::LeftParen)? {
                     self.next_token()?; // consume (
                     if name == "prototype" {
-                        Some(self.lexer.lex_body_str('(', FrameRole::Prototype)?)
+                        Some(self.lex_body_str('(', FrameRole::Prototype)?)
                     } else {
                         let mut args = String::new();
                         let mut depth = 1u32;
@@ -1259,8 +1334,8 @@ impl Parser {
         apply_pragma(&mut self.pragmas, &module, is_no, imports.as_ref());
 
         // Sync shared UTF-8 flag — the lexer reads this to decide whether to accept multi-byte identifiers.
-        self.lexer.set_utf8_mode(self.pragmas.utf8);
-        self.lexer.features = self.pragmas.features;
+        self.set_utf8_mode(self.pragmas.utf8);
+        self.features = self.pragmas.features;
 
         // `use subs qw(name ...)` — forward-declare names in the symbol table so the parser recognizes them as known
         // subs.  This causes weak keywords to be overridden in term position.
@@ -1355,9 +1430,9 @@ impl Parser {
         // Careful: do NOT call `peek_span` here — that would invoke the lexer and potentially tokenize into the first
         // body line, which `start_format` would then discard when it drops `current_line`.  Build the begin span from
         // `start` and the current (pre-body) lexer position instead.
-        let here = self.lexer.pos() as u32;
+        let here = self.pos() as u32;
         let begin_span = start.merge(Span::new(here, here));
-        self.lexer.start_format(name.clone(), begin_span);
+        self.start_format(name.clone(), begin_span);
 
         // Clear any cached current-token so the Parser re-fetches.
         self.current = None;
@@ -1426,7 +1501,7 @@ impl Parser {
         let braced = matches!(self.peek_token(), Token::LeftBrace);
         if braced {
             self.next_token()?; // consume `{`
-            self.lexer.format_args_enter_braced();
+            self.format_args_enter_braced();
 
             // Clear any cached token — the mode switch may affect how the next token is produced.
             self.current = None;
@@ -1672,8 +1747,8 @@ impl Parser {
         self.current_package = saved_package;
 
         // Sync shared state with the restored lexical scope.
-        self.lexer.set_utf8_mode(self.pragmas.utf8);
-        self.lexer.features = self.pragmas.features;
+        self.set_utf8_mode(self.pragmas.utf8);
+        self.features = self.pragmas.features;
         result
     }
 
@@ -1698,8 +1773,8 @@ impl Parser {
 
         self.pragmas = saved_pragmas;
         self.current_package = saved_package;
-        self.lexer.set_utf8_mode(self.pragmas.utf8);
-        self.lexer.features = self.pragmas.features;
+        self.set_utf8_mode(self.pragmas.utf8);
+        self.features = self.pragmas.features;
         result
     }
 
@@ -1707,7 +1782,7 @@ impl Parser {
     /// as an interpolated template or — for `/e` — as a code block valued at its last statement.  The `e`-count becomes
     /// `SubstReplacement::Eval`'s `evals` and is stripped from the stored flags so the eval depth lives in one place.
     fn finish_subst(&mut self, delim: char, pattern: Interpolated, span: Span) -> Result<Expr, ParseError> {
-        let flags = self.lexer.start_subst_replacement(delim)?;
+        let flags = self.start_subst_replacement(delim)?;
         if let Some(ref f) = flags {
             Self::validate_subst_flags(f, span)?;
         }
@@ -1793,7 +1868,7 @@ impl Parser {
                 self.next_token()?;
 
                 // Filetest: -f, -d, etc.  In fat-comma context, lex_filetest_after_minus returns StrLit.
-                match self.lexer.lex_filetest_after_minus() {
+                match self.lex_filetest_after_minus() {
                     Some(Token::Filetest(b)) => {
                         let end = self.peek_span();
                         return Ok(Some(PrefixResult::Leaf(self.parse_filetest(b, span.merge(end))?)));
@@ -1901,7 +1976,7 @@ impl Parser {
             }
             Token::Percent => {
                 self.next_token()?;
-                match self.lexer.lex_hash_var_after_percent()? {
+                match self.lex_hash_var_after_percent()? {
                     Some(Token::HashVar(name)) => {
                         let recv = Expr::new(ExprKind::HashVar(name), span);
                         Ok(Some(PrefixResult::Leaf(self.maybe_kv_slice(recv, span)?)))
@@ -2216,7 +2291,7 @@ impl Parser {
             // << in term position: try heredoc.  The lexer emitted ShiftLeft; we ask it to attempt heredoc detection.
             // If it can't find a valid tag, that's a parse error (shift-left is not a valid term).
             Token::ShiftLeft => {
-                match self.lexer.lex_heredoc_after_shift_left()? {
+                match self.lex_heredoc_after_shift_left()? {
                     Some(Token::QuoteSublexBegin(kind, delim)) => {
                         let body_span = self.peek_span();
                         self.parse_interpolated_string(body_span.merge(span)).map(|mut e| {
@@ -2381,7 +2456,7 @@ impl Parser {
             // Regex, substitution, transliteration
             Token::RegexSublexBegin(kind, _delim) => {
                 let pattern = self.parse_interpolated()?;
-                let flags = self.lexer.scan_adjacent_word_chars();
+                let flags = self.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
@@ -2390,7 +2465,7 @@ impl Parser {
 
             // // in term position is an empty regex, not defined-or.
             Token::DefinedOr => {
-                let flags = self.lexer.scan_adjacent_word_chars();
+                let flags = self.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
@@ -2402,8 +2477,8 @@ impl Parser {
                 // TODO(lex_term): bare `/.../` must lex through the `m//` regex frame like `m`/`qr`, not this raw
                 // `lex_body_str` capture (an extra pass that also drops interpolation).  `Prototype` is a placeholder
                 // role until that alignment lands; see the deferred-work list.
-                let pattern = self.lexer.lex_body_str('/', FrameRole::Prototype)?;
-                let flags = self.lexer.scan_adjacent_word_chars();
+                let pattern = self.lex_body_str('/', FrameRole::Prototype)?;
+                let flags = self.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
@@ -2412,11 +2487,11 @@ impl Parser {
 
             // /= in term position: = is the first character of the regex pattern, not a division-assignment operator.
             Token::Assign(AssignOp::DivEq) => {
-                self.lexer.rewind(1);
+                self.rewind(1);
                 // TODO(lex_term): see the `Token::Slash` arm — bare `/.../` should use the regex frame; `Prototype`
                 // is a placeholder role here too.
-                let pattern = self.lexer.lex_body_str('/', FrameRole::Prototype)?;
-                let flags = self.lexer.scan_adjacent_word_chars();
+                let pattern = self.lex_body_str('/', FrameRole::Prototype)?;
+                let flags = self.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
@@ -2452,7 +2527,7 @@ impl Parser {
             // < in term position: try readline.  The lexer emitted NumLt; we ask it to attempt readline scanning.  If
             // not a readline, that's a parse error (less-than is not a valid term).
             Token::NumLt => {
-                if let Some(Token::Readline(content, safe)) = self.lexer.lex_readline_after_lt() {
+                if let Some(Token::Readline(content, safe)) = self.lex_readline_after_lt() {
                     let end = self.peek_span();
                     Self::readline_expr(content, safe, span.merge(end))
                 } else {
@@ -2462,7 +2537,7 @@ impl Parser {
 
             // `.` in term position: try leading-dot float (`.5`, `.5e2`) or v-string (`.5.6`).  In operator position,
             // `.` is concat (handled by peek_op_info) — same disambiguation pattern as `/` (regex vs division).
-            Token::Dot => match self.lexer.lex_leading_dot_float()? {
+            Token::Dot => match self.lex_leading_dot_float()? {
                 Some(Token::FloatLit(n)) => {
                     let end = self.peek_span().start;
                     Ok(Expr::new(ExprKind::FloatLit(n), Span::new(span.start, end)))
@@ -2483,7 +2558,7 @@ impl Parser {
     /// (e.g. `q => 1`) is handled by the lexer, which returns StrLit instead of the keyword.  Must be called BEFORE any
     /// `peek_token()` — tokenizing the delimiter byte would be destructive.
     fn parse_quote_keyword(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let raw = self.lexer.skip_ws_and_peek_byte();
+        let raw = self.skip_ws_and_peek_byte();
 
         // No delimiter byte (EOF) — treat as bareword.
         if raw.is_none() {
@@ -2498,14 +2573,14 @@ impl Parser {
     /// Enter sublexing for a quote keyword and dispatch the resulting token.  The lexer must be positioned at (or
     /// before whitespace preceding) the delimiter byte.
     fn dispatch_quote_result(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let token = self.lexer.begin_quote_sublex(kw)?;
+        let token = self.begin_quote_sublex(kw)?;
         match token {
             Token::StrLit(s) => Ok(Expr::new(ExprKind::StringLit(s), span)),
             Token::QwList(words) => Ok(Expr::new(ExprKind::QwList(words), span)),
             Token::QuoteSublexBegin(_, _) => self.parse_interpolated_string(span),
             Token::RegexSublexBegin(kind, _delim) => {
                 let pattern = self.parse_interpolated()?;
-                let flags = self.lexer.scan_adjacent_word_chars();
+                let flags = self.scan_adjacent_word_chars();
                 if let Some(ref f) = flags {
                     Self::validate_regex_flags(f, span)?;
                 }
@@ -3199,7 +3274,7 @@ impl Parser {
     fn parse_hash_subscript_key(&mut self) -> Result<Expr, ParseError> {
         // The one-token cache must be empty so the byte-level scanner sees the raw source bytes immediately after `{`.
         debug_assert!(self.current.is_none(), "parse_hash_subscript_key: one-token cache must be empty");
-        if let Some((name, span)) = self.lexer.try_autoquoted_subscript_key() {
+        if let Some((name, span)) = self.try_autoquoted_subscript_key() {
             return Ok(Expr::new(ExprKind::StringLit(name), span));
         }
         let key = self.parse_expr(PREC_LOW)?;
@@ -3330,21 +3405,21 @@ impl Parser {
                 Token::InterpScalar(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
-                    let cm = self.lexer.take_interp_case_mod();
+                    let cm = self.take_interp_case_mod();
                     let expr = apply_case_mod_wrap(Expr::new(ExprKind::ScalarVar(name), span), cm);
                     parts.push(InterpPart::ScalarInterp(Box::new(expr)));
                 }
                 Token::InterpArray(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
-                    let cm = self.lexer.take_interp_case_mod();
+                    let cm = self.take_interp_case_mod();
                     let expr = apply_case_mod_wrap(Expr::new(ExprKind::ArrayVar(name), span), cm);
                     parts.push(InterpPart::ArrayInterp(Box::new(expr)));
                 }
                 Token::InterpScalarChainStart(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
-                    let cm = self.lexer.take_interp_case_mod();
+                    let cm = self.take_interp_case_mod();
                     let initial = Expr::new(ExprKind::ScalarVar(name), span);
                     let after_subscripts = self.maybe_postfix_subscript(initial)?;
                     let expr = self.parse_expr_continuation(after_subscripts, PREC_LOW)?;
@@ -3355,7 +3430,7 @@ impl Parser {
                 Token::InterpArrayChainStart(name) => {
                     let span = self.peek_span();
                     self.next_token()?;
-                    let cm = self.lexer.take_interp_case_mod();
+                    let cm = self.take_interp_case_mod();
                     let recv = Expr::new(ExprKind::ArrayVar(name), span);
                     let expr = if self.eat(&Token::LeftBracket)? {
                         let mut indices = Vec::new();
@@ -3388,7 +3463,7 @@ impl Parser {
                 }
                 Token::InterpScalarExprStart | Token::InterpArrayExprStart => {
                     self.next_token()?;
-                    let cm = self.lexer.take_interp_case_mod();
+                    let cm = self.take_interp_case_mod();
                     let expr = self.parse_expr(PREC_LOW)?;
                     self.expect_token(&Token::RightBrace)?;
                     let expr = apply_case_mod_wrap(expr, cm);
@@ -3400,7 +3475,7 @@ impl Parser {
                     self.next_token()?;
                     let expr = self.parse_expr(PREC_LOW)?;
                     let code_end = self.peek_span().start as usize;
-                    let raw = String::from_utf8_lossy(self.lexer.slice(code_start, code_end)).into_owned();
+                    let raw = String::from_utf8_lossy(self.slice(code_start, code_end)).into_owned();
                     self.expect_token(&Token::RightBrace)?;
                     if is_cond {
                         parts.push(InterpPart::RegexCondCode(raw, Box::new(expr)));
@@ -3849,7 +3924,7 @@ impl Parser {
 
                 // `->$#*` — postderef last-index.  The lexer would otherwise tokenize the `#` as a comment start, so we
                 // peek+consume the two raw bytes here before the next token is lexed.
-                if self.lexer.try_consume_hash_star() {
+                if self.try_consume_hash_star() {
                     let span = left.span.merge(self.peek_span());
                     Ok(Expr::arrow_deref(left, ArrowTarget::LastIndex, span))
                 } else if self.eat(&Token::Star)? {

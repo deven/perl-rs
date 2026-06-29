@@ -7,7 +7,8 @@
 //! See design document §5.4 for the full design rationale.
 
 use crate::error::ParseError;
-use crate::lexer::{FrameRole, LexContext, Lexer, matching_delimiter};
+use crate::lexer::{FrameRole, LexContext, matching_delimiter};
+use crate::parser::Parser;
 use crate::span::Span;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -66,7 +67,7 @@ impl LexerLine {
     /// Construct a freshly read line: the effective view starts equal to the physical line (un-narrowed), and `number`,
     /// `indent`, and `pos` default to `0`.  `number` is stamped at delivery; callers set `pos`/`indent` after when a
     /// body resumes mid-line or carries a required indent.
-    pub fn new(offset: u32, content: Bytes, terminated: bool, ascii_only: bool) -> Self {
+    pub(crate) fn new(offset: u32, content: Bytes, terminated: bool, ascii_only: bool) -> Self {
         LexerLine { number: 0, offset, full: content.clone(), line: content, full_terminated: terminated, terminated, indent: 0, pos: 0, ascii_only }
     }
 
@@ -85,7 +86,7 @@ impl LexerLine {
     /// `full`.  A total, idempotent pure function of `(full, bound)`: this line covers the global range
     /// `[offset, offset + extent)` where `extent` includes the virtual newline, so the bound either narrows within that
     /// range, widens to the full line (bound at/after the end), or empties the line (bound before the start).
-    pub fn set_eof(&mut self, bound: Option<u32>) {
+    pub(crate) fn set_eof(&mut self, bound: Option<u32>) {
         let start = self.offset;
         // Global end of the line, one past the virtual newline when physically terminated.
         let extent = start + self.full.len() as u32 + self.full_terminated as u32;
@@ -112,7 +113,7 @@ impl LexerLine {
     /// Peek at the current byte without advancing.  Returns `b'\n'` at the end of a terminated line.  Returns `None`
     /// only when truly exhausted (past \n or unterminated line fully consumed).
     #[inline]
-    pub fn peek_byte(&self) -> Option<u8> {
+    pub(crate) fn peek_byte(&self) -> Option<u8> {
         let pos = self.pos as usize;
         if pos < self.line.len() {
             Some(self.line[pos])
@@ -125,7 +126,7 @@ impl LexerLine {
 
     /// Peek at a byte at an offset from the current position.
     #[inline]
-    pub fn peek_byte_at(&self, offset: usize) -> Option<u8> {
+    pub(crate) fn peek_byte_at(&self, offset: usize) -> Option<u8> {
         let idx = self.pos as usize + offset;
         if idx < self.line.len() {
             Some(self.line[idx])
@@ -140,7 +141,7 @@ impl LexerLine {
     /// `None` only when truly exhausted.
     #[cfg(test)]
     #[inline]
-    pub fn advance_byte(&mut self) -> Option<u8> {
+    pub(crate) fn advance_byte(&mut self) -> Option<u8> {
         let pos = self.pos as usize;
         if pos < self.line.len() {
             let b = self.line[pos];
@@ -156,14 +157,14 @@ impl LexerLine {
 
     /// The remaining unscanned content bytes (not including the virtual `\n` line terminator).
     #[inline]
-    pub fn remaining(&self) -> &[u8] {
+    pub(crate) fn remaining(&self) -> &[u8] {
         let pos = self.pos as usize;
         if pos < self.line.len() { &self.line[pos..] } else { &[] }
     }
 
     /// Byte offset in the original source at the current cursor position.  Used for span construction.
     #[inline]
-    pub fn global_pos(&self) -> u32 {
+    pub(crate) fn global_pos(&self) -> u32 {
         self.offset + self.pos
     }
 }
@@ -177,7 +178,7 @@ struct RawLine {
     ascii_only: bool,
 }
 
-impl Lexer {
+impl Parser {
     /// Detect BOM or UTF-16 encoding at the start of a source buffer and transcode to UTF-8 if needed.  Returns the
     /// (possibly transcoded) source bytes and whether UTF-8 mode should be enabled.
     ///
@@ -263,24 +264,24 @@ impl Lexer {
     }
 
     /// Current byte position in the source buffer.  Used for global position when no current line is active.
-    pub fn cursor(&self) -> usize {
+    pub(crate) fn cursor(&self) -> usize {
         self.cursor
     }
 
     /// Current line number (1-based).
     #[allow(dead_code)]
-    pub fn line_number(&self) -> u32 {
+    pub(crate) fn line_number(&self) -> u32 {
         self.line_number
     }
 
     /// Name of the source file being lexed, for `__FILE__` resolution and diagnostics.  Defaults to `"(script)"` when
     /// the caller used [`Self::new`] without a filename.
-    pub fn filename(&self) -> &str {
+    pub(crate) fn filename(&self) -> &str {
         &self.filename
     }
 
     /// Override the line number for `# line N` directives.
-    pub fn set_line_number(&mut self, n: u32) {
+    pub(crate) fn set_line_number(&mut self, n: u32) {
         // A directive crossed during a speculative scan must not renumber anything: the line it sits on might turn out
         // to be heredoc body text.  The directive takes effect on the real pass, when the line is delivered for real.
         if self.lookahead_mode {
@@ -290,7 +291,7 @@ impl Lexer {
     }
 
     /// Override the filename for `# line N "file"` directives.
-    pub fn set_filename(&mut self, name: String) {
+    pub(crate) fn set_filename(&mut self, name: String) {
         if self.lookahead_mode {
             return;
         }
@@ -299,12 +300,12 @@ impl Lexer {
 
     /// Raw slice of the source buffer.  For rare operations that need access to the underlying bytes (e.g. format body
     /// extraction).
-    pub fn src_slice(&self, start: usize, end: usize) -> &[u8] {
+    pub(crate) fn src_slice(&self, start: usize, end: usize) -> &[u8] {
         &self.src[start..end]
     }
 
     /// Push lines to be returned by future `next_line()` calls, ahead of any lines read from the source.
-    pub fn push_back(&mut self, mut lines: VecDeque<LexerLine>) {
+    pub(crate) fn push_back(&mut self, mut lines: VecDeque<LexerLine>) {
         lines.append(&mut self.queued_lines);
         self.queued_lines = lines;
     }
@@ -314,7 +315,7 @@ impl Lexer {
     /// per-line terminator check here; delivery just runs the line stream to the bound.  Lines come from the replay
     /// queue first, then fresh reads.  On `Ok(&None)` the previous current line is left in place, so callers that still
     /// need its position (e.g. `span_pos` at a virtual EOF) see it unchanged.
-    pub fn next_line(&mut self) -> Result<&Option<LexerLine>, ParseError> {
+    pub(crate) fn next_line(&mut self) -> Result<&Option<LexerLine>, ParseError> {
         let bound = self.context_stack.last().and_then(|c| c.bound);
 
         // The next line's start offset is known before reading it — the queue front's offset if queued, else the read
@@ -462,7 +463,7 @@ impl Lexer {
     /// terminated), scans under the host's bound as a borrowed ceiling for the terminator, resolves and stamps the
     /// `<<~` indent on the captured body lines while they are still in the lookahead queue, drops the terminator, and
     /// pushes the body frame with the introducer suspended as its parent — so popping resumes just past `<<TAG`.
-    pub fn start_heredoc(&mut self, tag: Bytes, indented: bool, interpolating: bool) -> Result<(), ParseError> {
+    pub(crate) fn start_heredoc(&mut self, tag: Bytes, indented: bool, interpolating: bool) -> Result<(), ParseError> {
         // Host-walk: down from the real top, the nearest frame whose current line ends in a real newline hosts the
         // body, and its bound is the scan ceiling; mid-line frames (e.g. an `/e` replacement at its close) can't host
         // and are skipped.  At stack level `idx` the current line is `self.line` (top) or `stack[idx].line`, paired
@@ -585,7 +586,7 @@ impl Lexer {
     /// in which a backslash protects the next character (unless the delimiter is itself a backslash), paired
     /// delimiters nest by depth, and only the close offset is recorded.  Keeping or stripping the escaping backslash,
     /// the `s///` flags, and the body's interpolation are all the sublexer's concern, downstream of the frame.
-    pub fn start_delimited_body(&mut self, mut ctx: LexContext, extra_paired: bool) -> Result<(), ParseError> {
+    pub(crate) fn start_delimited_body(&mut self, mut ctx: LexContext, extra_paired: bool) -> Result<(), ParseError> {
         let Some(delim) = ctx.delim else {
             return Err(ParseError::new("start_delimited_body requires a delimiter", Span::new(self.cursor as u32, self.cursor as u32)));
         };
@@ -738,12 +739,12 @@ impl Lexer {
     }
 }
 
-/// RAII guard for a speculative lookahead, returned by [`Lexer::lookahead`].  Derefs to the `Lexer` so the consumer
+/// RAII guard for a speculative lookahead, returned by [`Parser::lookahead`].  Derefs to the `Lexer` so the consumer
 /// scans with the normal line API.  On drop it snaps the lexer back to the line and cursor where the scan began,
 /// leaving the previewed lines queued for re-delivery and recording where the scan ended for `consume_lookahead`.
 #[allow(dead_code)] // Constructed only by `lookahead`, which has no consumers yet.
 pub(crate) struct Lookahead<'a> {
-    lexer: &'a mut Lexer,
+    lexer: &'a mut Parser,
     /// Cursor position on the current line at the moment the scan began.
     entry_pos: u32,
     /// For a `lookahead_to` ceiling borrow, the top frame's original bound, restored on drop.  `None` for a plain
@@ -802,15 +803,15 @@ impl Drop for Lookahead<'_> {
 }
 
 impl Deref for Lookahead<'_> {
-    type Target = Lexer;
+    type Target = Parser;
 
-    fn deref(&self) -> &Lexer {
+    fn deref(&self) -> &Parser {
         self.lexer
     }
 }
 
 impl DerefMut for Lookahead<'_> {
-    fn deref_mut(&mut self) -> &mut Lexer {
+    fn deref_mut(&mut self) -> &mut Parser {
         self.lexer
     }
 }

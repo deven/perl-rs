@@ -21,7 +21,7 @@ fn parse_expr_str(src: &str) -> Expr {
 
 /// Collect all tokens from source, for tests that need to inspect token-level output (e.g. NFC on variable names).
 fn collect_tokens(src: &str) -> Vec<Token> {
-    let mut lexer = Lexer::new(src.as_bytes());
+    let mut lexer = Parser::new(src.as_bytes()).unwrap();
     let mut tokens = Vec::new();
     loop {
         let spanned = lexer.lex_token().unwrap();
@@ -36,7 +36,7 @@ fn collect_tokens(src: &str) -> Vec<Token> {
 /// Like `collect_tokens` but with UTF-8 mode pre-enabled, for tests that need to tokenize Unicode identifiers without
 /// going through the full parser pragma machinery.
 fn collect_tokens_utf8(src: &str) -> Vec<Token> {
-    let mut lexer = Lexer::new(src.as_bytes());
+    let mut lexer = Parser::new(src.as_bytes()).unwrap();
     lexer.set_utf8_mode(true);
     let mut tokens = Vec::new();
     loop {

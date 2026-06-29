@@ -4,7 +4,7 @@ use super::*;
 
 /// Helper: collect all lines from a source.
 fn collect_lines(src: &str) -> Vec<String> {
-    let mut lexer = Lexer::new(src.as_bytes());
+    let mut lexer = Parser::new(src.as_bytes()).unwrap();
     let mut lines = Vec::new();
     while let Ok(Some(line)) = lexer.temp_next_line() {
         lines.push(String::from_utf8_lossy(&line.line).into_owned());
@@ -16,13 +16,13 @@ fn collect_lines(src: &str) -> Vec<String> {
 
 #[test]
 fn empty_source() {
-    let mut lexer = Lexer::new(b"");
+    let mut lexer = Parser::new(b"").unwrap();
     assert!(matches!(lexer.temp_next_line(), Ok(None)));
 }
 
 #[test]
 fn single_line_no_newline() {
-    let mut lexer = Lexer::new(b"hello");
+    let mut lexer = Parser::new(b"hello").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert_eq!(&line.line[..], b"hello");
     assert!(!line.terminated);
@@ -32,7 +32,7 @@ fn single_line_no_newline() {
 
 #[test]
 fn single_line_with_newline() {
-    let mut lexer = Lexer::new(b"hello\n");
+    let mut lexer = Parser::new(b"hello\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert_eq!(&line.line[..], b"hello");
     assert!(line.terminated);
@@ -59,7 +59,7 @@ fn empty_lines() {
 
 #[test]
 fn line_numbers() {
-    let mut lexer = Lexer::new(b"a\nb\nc\n");
+    let mut lexer = Parser::new(b"a\nb\nc\n").unwrap();
     assert_eq!(lexer.temp_next_line().unwrap().unwrap().number, 1);
     assert_eq!(lexer.temp_next_line().unwrap().unwrap().number, 2);
     assert_eq!(lexer.temp_next_line().unwrap().unwrap().number, 3);
@@ -67,7 +67,7 @@ fn line_numbers() {
 
 #[test]
 fn byte_offsets() {
-    let mut lexer = Lexer::new(b"ab\ncde\nf\n");
+    let mut lexer = Parser::new(b"ab\ncde\nf\n").unwrap();
     let l1 = lexer.temp_next_line().unwrap().unwrap();
     assert_eq!(l1.offset, 0);
     let l2 = lexer.temp_next_line().unwrap().unwrap();
@@ -86,7 +86,7 @@ fn crlf_stripped() {
 
 #[test]
 fn standalone_cr_preserved() {
-    let mut lexer = Lexer::new(b"a\rb\n");
+    let mut lexer = Parser::new(b"a\rb\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert_eq!(&line.line[..], b"a\rb");
 }
@@ -101,7 +101,7 @@ fn mixed_crlf_and_lf() {
 
 #[test]
 fn lexer_line_peek_and_advance() {
-    let mut lexer = Lexer::new(b"abc\n");
+    let mut lexer = Parser::new(b"abc\n").unwrap();
     let mut line = lexer.temp_next_line().unwrap().unwrap();
     assert_eq!(line.peek_byte(), Some(b'a'));
     assert_eq!(line.advance_byte(), Some(b'a'));
@@ -120,7 +120,7 @@ fn lexer_line_peek_and_advance() {
 
 #[test]
 fn lexer_line_remaining() {
-    let mut lexer = Lexer::new(b"abcdef\n");
+    let mut lexer = Parser::new(b"abcdef\n").unwrap();
     let mut line = lexer.temp_next_line().unwrap().unwrap();
     line.pos = 3;
     assert_eq!(line.remaining(), b"def");
@@ -128,7 +128,7 @@ fn lexer_line_remaining() {
 
 #[test]
 fn lexer_line_slice() {
-    let mut lexer = Lexer::new(b"hello world\n");
+    let mut lexer = Parser::new(b"hello world\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     let s = line.line.slice(0..5);
     assert_eq!(&s[..], b"hello");
@@ -138,7 +138,7 @@ fn lexer_line_slice() {
 
 #[test]
 fn lexer_line_slice_since() {
-    let mut lexer = Lexer::new(b"abcdef\n");
+    let mut lexer = Parser::new(b"abcdef\n").unwrap();
     let mut line = lexer.temp_next_line().unwrap().unwrap();
     line.pos = 4;
     let s = line.line.slice(2..line.pos as usize);
@@ -153,7 +153,7 @@ fn heredoc_basic() {
     // hello
     // END
     let src = b"my $x = <<END . \"suffix\";\nhello\nEND\nmore code\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
 
     // Line 1: the declaration line.
     let decl = lexer.temp_next_line().unwrap().unwrap();
@@ -185,7 +185,7 @@ fn heredoc_basic() {
 #[test]
 fn heredoc_empty_body() {
     let src = b"<<END;\nEND\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
 
     lexer.line = Some(LexerLine::for_test(decl.number, decl.offset, decl.line, decl.terminated, 5, true));
@@ -198,7 +198,7 @@ fn heredoc_empty_body() {
 #[test]
 fn heredoc_unterminated() {
     let src = b"<<END;\nhello\nworld\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
 
     lexer.line = Some(LexerLine::for_test(decl.number, decl.offset, decl.line, decl.terminated, 5, true));
@@ -218,7 +218,7 @@ fn heredoc_stacked() {
     // B
     // after
     let src = b"(<<A, <<B);\nbody A\nA\nbody B\nB\nafter\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
 
     // Start <<A: introducer at pos 4 (after "<<A").
@@ -259,7 +259,7 @@ fn heredoc_stacked() {
 #[test]
 fn heredoc_indented() {
     let src = b"<<~END;\n    hello\n    world\n    END\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
 
     lexer.line = Some(LexerLine::for_test(decl.number, decl.offset, decl.line, decl.terminated, 6, true));
@@ -286,7 +286,7 @@ fn heredoc_indented() {
 fn heredoc_indented_empty_lines() {
     // Empty lines are allowed without indentation.
     let src = b"<<~END;\n    hello\n\n    world\n    END\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
 
     lexer.line = Some(LexerLine::for_test(decl.number, decl.offset, decl.line, decl.terminated, 6, true));
@@ -308,7 +308,7 @@ fn heredoc_indented_empty_lines() {
 fn heredoc_indented_mismatch() {
     // Body line with wrong indentation.
     let src = b"<<~END;\n    hello\n  bad\n    END\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
 
     lexer.line = Some(LexerLine::for_test(decl.number, decl.offset, decl.line, decl.terminated, 6, true));
@@ -330,7 +330,7 @@ fn heredoc_non_indented_inside_indented() {
     // against perl), so the nested body lines keep `pos = 4` even though INNER itself is non-indented — INNER's scan
     // adds no new indent, so OUTER's stamp persists.
     let src = b"<<~OUTER;\n    prefix <<INNER suffix\n    inner body\n    INNER\n    outer continues\n    OUTER\n";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
 
     // Start <<~OUTER: introducer at pos 9 (at ";").
@@ -371,42 +371,42 @@ fn heredoc_non_indented_inside_indented() {
 
 #[test]
 fn ascii_only_pure_ascii_line() {
-    let mut lexer = Lexer::new(b"hello world\n");
+    let mut lexer = Parser::new(b"hello world\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(line.ascii_only, "pure ASCII line should have ascii_only = true");
 }
 
 #[test]
 fn ascii_only_empty_line() {
-    let mut lexer = Lexer::new(b"\n");
+    let mut lexer = Parser::new(b"\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(line.ascii_only, "empty line should have ascii_only = true");
 }
 
 #[test]
 fn ascii_only_with_high_bytes() {
-    let mut lexer = Lexer::new("café\n".as_bytes());
+    let mut lexer = Parser::new("café\n".as_bytes()).unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(!line.ascii_only, "line with UTF-8 should have ascii_only = false");
 }
 
 #[test]
 fn ascii_only_high_byte_at_end() {
-    let mut lexer = Lexer::new(b"hello\xff\n");
+    let mut lexer = Parser::new(b"hello\xff\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(!line.ascii_only, "line with high byte should have ascii_only = false");
 }
 
 #[test]
 fn ascii_only_high_byte_at_start() {
-    let mut lexer = Lexer::new(b"\x80rest\n");
+    let mut lexer = Parser::new(b"\x80rest\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(!line.ascii_only, "line starting with high byte should have ascii_only = false");
 }
 
 #[test]
 fn ascii_only_multiline_mixed() {
-    let mut lexer = Lexer::new("ascii\ncafé\nmore ascii\n".as_bytes());
+    let mut lexer = Parser::new("ascii\ncafé\nmore ascii\n".as_bytes()).unwrap();
     let l1 = lexer.temp_next_line().unwrap().unwrap();
     assert!(l1.ascii_only, "first line is ASCII");
     let l2 = lexer.temp_next_line().unwrap().unwrap();
@@ -417,21 +417,21 @@ fn ascii_only_multiline_mixed() {
 
 #[test]
 fn ascii_only_unterminated_line() {
-    let mut lexer = Lexer::new(b"no newline");
+    let mut lexer = Parser::new(b"no newline").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(line.ascii_only, "unterminated ASCII line should have ascii_only = true");
 }
 
 #[test]
 fn ascii_only_unterminated_with_utf8() {
-    let mut lexer = Lexer::new("no newline café".as_bytes());
+    let mut lexer = Parser::new("no newline café".as_bytes()).unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(!line.ascii_only, "unterminated UTF-8 line should have ascii_only = false");
 }
 
 #[test]
 fn ascii_only_crlf_line() {
-    let mut lexer = Lexer::new(b"hello\r\n");
+    let mut lexer = Parser::new(b"hello\r\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(line.ascii_only, "CRLF line with ASCII content should have ascii_only = true");
 }
@@ -439,7 +439,7 @@ fn ascii_only_crlf_line() {
 #[test]
 fn ascii_only_only_control_chars() {
     // Control chars (0x01..0x1F) are all < 0x80.
-    let mut lexer = Lexer::new(b"\x01\x1f\t\n");
+    let mut lexer = Parser::new(b"\x01\x1f\t\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(line.ascii_only, "control chars are ASCII");
 }
@@ -447,7 +447,7 @@ fn ascii_only_only_control_chars() {
 #[test]
 fn ascii_only_boundary_byte_0x7f() {
     // 0x7F (DEL) is the highest ASCII byte.
-    let mut lexer = Lexer::new(b"\x7f\n");
+    let mut lexer = Parser::new(b"\x7f\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(line.ascii_only, "0x7F is still ASCII");
 }
@@ -455,7 +455,7 @@ fn ascii_only_boundary_byte_0x7f() {
 #[test]
 fn ascii_only_boundary_byte_0x80() {
     // 0x80 is the first non-ASCII byte.
-    let mut lexer = Lexer::new(b"\x80\n");
+    let mut lexer = Parser::new(b"\x80\n").unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     assert!(!line.ascii_only, "0x80 is not ASCII");
 }
@@ -463,7 +463,7 @@ fn ascii_only_boundary_byte_0x80() {
 #[test]
 fn ascii_only_heredoc_body_lines() {
     // Heredoc body lines should have correct ascii_only flags.
-    let mut lexer = Lexer::new("<<END\nascii line\ncaf\u{00E9} line\nEND\n".as_bytes());
+    let mut lexer = Parser::new("<<END\nascii line\ncaf\u{00E9} line\nEND\n".as_bytes()).unwrap();
     let decl = lexer.temp_next_line().unwrap().unwrap();
     assert!(decl.ascii_only, "declaration line is ASCII");
 
@@ -488,7 +488,7 @@ fn ascii_only_heredoc_body_lines() {
 #[test]
 fn heredoc_terminator_at_eof_without_newline() {
     let src = b"<<END\nbody\nEND";
-    let mut lexer = Lexer::new(src);
+    let mut lexer = Parser::new(src).unwrap();
     let line = lexer.temp_next_line().unwrap().unwrap();
     lexer.line = Some(line);
     lexer.start_heredoc(Bytes::from("END"), false, true).unwrap();
@@ -502,7 +502,7 @@ fn heredoc_terminator_at_eof_without_newline() {
 
 #[test]
 fn heredoc_virtual_eof_is_stable_then_pop_restores_introducer() {
-    let mut lexer = Lexer::new(b"body\nEND\nrest\n");
+    let mut lexer = Parser::new(b"body\nEND\nrest\n").unwrap();
 
     lexer.line = Some(LexerLine::for_test(999, 123, Bytes::from_static(b"saved"), false, 0, true));
     lexer.start_heredoc(Bytes::from_static(b"END"), false, true).unwrap();
@@ -525,7 +525,7 @@ fn heredoc_virtual_eof_is_stable_then_pop_restores_introducer() {
 
 #[test]
 fn subst_body_reads_flags_and_restores_remainder() {
-    let mut lexer = Lexer::new(b"");
+    let mut lexer = Parser::new(b"").unwrap();
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"bar/e + 1"), false, 0, true));
 
     // Scan the `/`-delimited body: it becomes the live (narrowed) line, and the parent is suspended past the close.
@@ -545,7 +545,7 @@ fn subst_body_reads_flags_and_restores_remainder() {
 
 #[test]
 fn subst_body_captures_multiple_flags_and_restores_remainder() {
-    let mut lexer = Lexer::new(b"");
+    let mut lexer = Parser::new(b"").unwrap();
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"bar/msix + 1"), false, 0, true));
 
     lexer.start_delimited_body(LexContext::new(Some('/'), FrameRole::String), false).unwrap();
@@ -562,7 +562,7 @@ fn subst_body_captures_multiple_flags_and_restores_remainder() {
 
 #[test]
 fn subst_body_with_paired_delimiter_nesting() {
-    let mut lexer = Lexer::new(b"");
+    let mut lexer = Parser::new(b"").unwrap();
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"a{b}c}r"), false, 0, true));
 
     // `{`-delimited: the inner `{...}` nests, so the body ends at the second `}`.
@@ -576,7 +576,7 @@ fn subst_body_with_paired_delimiter_nesting() {
 
 #[test]
 fn subst_body_errors_on_eof() {
-    let mut lexer = Lexer::new(b"");
+    let mut lexer = Parser::new(b"").unwrap();
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"unterminated"), false, 0, true));
 
     let err = lexer.start_delimited_body(LexContext::new(Some('/'), FrameRole::String), false).unwrap_err();
@@ -585,7 +585,7 @@ fn subst_body_errors_on_eof() {
 
 #[test]
 fn indented_heredoc_empty_required_indent_delivers_body_as_is() {
-    let mut lexer = Lexer::new(b"  body\nEND\n");
+    let mut lexer = Parser::new(b"  body\nEND\n").unwrap();
     // Terminator "END" has no indent, so the required indent is empty and body lines are delivered unchanged.
     lexer.line = Some(LexerLine::for_test(1, 0, Bytes::from_static(b"saved"), false, 0, true));
     lexer.start_heredoc(Bytes::from_static(b"END"), true, true).unwrap();
@@ -600,17 +600,17 @@ fn indented_heredoc_empty_required_indent_delivers_body_as_is() {
 
 #[test]
 fn filename_is_preserved() {
-    let lexer = Lexer::with_filename(b"1;\n", "foo.pl");
+    let lexer = Parser::with_filename(b"1;\n", "foo.pl").unwrap();
     assert_eq!(lexer.filename(), "foo.pl");
 
     // Default filename should be a sensible default.
-    let default = Lexer::new(b"1;\n");
+    let default = Parser::new(b"1;\n").unwrap();
     assert!(!default.filename().is_empty(), "default filename should not be empty");
 }
 
 #[test]
 fn push_back_precedes_underlying_source() {
-    let mut lexer = Lexer::new(b"real\n");
+    let mut lexer = Parser::new(b"real\n").unwrap();
     let mut q = VecDeque::new();
     q.push_back(LexerLine::for_test(999, 123, Bytes::from_static(b"queued"), false, 0, true));
     lexer.push_back(q);
@@ -628,7 +628,7 @@ fn push_back_precedes_underlying_source() {
 
 #[test]
 fn lookahead_rewinds_to_entry_line_and_pos() {
-    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\nddd\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\nccc\nddd\n").unwrap();
     let _ = lexer.temp_next_line(); // deliver line 1 "aaa"
     if let Some(l) = lexer.line.as_mut() {
         l.pos = 2; // advance the cursor within line 1
@@ -650,7 +650,7 @@ fn lookahead_rewinds_to_entry_line_and_pos() {
 
 #[test]
 fn lookahead_previewed_lines_replay_in_order_with_numbers() {
-    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\nddd\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\nccc\nddd\n").unwrap();
     let _ = lexer.temp_next_line(); // line 1
     {
         let mut g = lexer.lookahead();
@@ -673,7 +673,7 @@ fn lookahead_previewed_lines_replay_in_order_with_numbers() {
 
 #[test]
 fn lookahead_suppresses_line_directive_setters() {
-    let mut lexer = Lexer::new(b"aaa\nbbb\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\n").unwrap();
     let _ = lexer.temp_next_line();
     let saved_number = lexer.line_number;
     let saved_name = lexer.filename().to_string();
@@ -695,7 +695,7 @@ fn lookahead_suppresses_line_directive_setters() {
 fn lookahead_directive_applies_to_replayed_lines() {
     // A `# line` directive the lexer processes on the real pass renumbers what follows.  Driven here at the source
     // layer: scan ahead, rewind, then on replay set the counter between deliveries the way the parser would.
-    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\nccc\n").unwrap();
     let _ = lexer.temp_next_line(); // line 1
     {
         let mut g = lexer.lookahead();
@@ -712,7 +712,7 @@ fn lookahead_directive_applies_to_replayed_lines() {
 
 #[test]
 fn consume_lookahead_commits_to_scan_end() {
-    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\nddd\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\nccc\nddd\n").unwrap();
     let _ = lexer.temp_next_line(); // line 1 "aaa"
     {
         let mut g = lexer.lookahead();
@@ -733,7 +733,7 @@ fn consume_lookahead_commits_to_scan_end() {
 #[test]
 fn consume_lookahead_single_line_advances_pos() {
     // A scan that never crosses a line boundary: consume advances the cursor to the scan-end position.
-    let mut lexer = Lexer::new(b"abcdef\n");
+    let mut lexer = Parser::new(b"abcdef\n").unwrap();
     let _ = lexer.temp_next_line(); // "abcdef" at pos 0
     {
         let mut g = lexer.lookahead();
@@ -749,7 +749,7 @@ fn consume_lookahead_single_line_advances_pos() {
 
 #[test]
 fn consume_lookahead_without_window_is_noop() {
-    let mut lexer = Lexer::new(b"aaa\nbbb\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\n").unwrap();
     let _ = lexer.temp_next_line();
     let before = lexer.line.as_ref().unwrap().pos;
     lexer.consume_lookahead().unwrap(); // no lookahead opened -> no-op
@@ -758,7 +758,7 @@ fn consume_lookahead_without_window_is_noop() {
 
 #[test]
 fn consume_lookahead_after_replay_is_noop() {
-    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\nccc\n").unwrap();
     let _ = lexer.temp_next_line(); // line 1
     {
         let mut g = lexer.lookahead();
@@ -777,7 +777,7 @@ fn consume_lookahead_after_replay_is_noop() {
 
 #[test]
 fn lookahead_replayed_lines_restart_at_pos_zero() {
-    let mut lexer = Lexer::new(b"aaa\nbbb\nccc\n");
+    let mut lexer = Parser::new(b"aaa\nbbb\nccc\n").unwrap();
     let _ = lexer.temp_next_line(); // line 1
     {
         let mut g = lexer.lookahead();
