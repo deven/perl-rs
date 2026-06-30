@@ -2621,14 +2621,18 @@ the position-independent lex of `/` is already `Slash` (division),
 repeat operator written flush against its count.  `lex_token()`
 scans `x5` as the single identifier `x5`, so in operator position
 `lex_operator()` splits it back into the `x` operator and rewinds
-over the digits to re-lex them as the integer operand.  A bare `x`
-already arrives as `Keyword(X)` — `lookup_keyword` recognizes it —
-and flows through the table with no fix-up; only `x` adjacent to a
-digit needs the split, since every other keyword operator (`or`,
-`and`, `eq`, `lt`, etc.) is multi-letter and a following digit keeps
-it one identifier.  When the split would bind too loosely for the
-current level the `x5` identifier stays cached for an outer level,
-so `$a ** $b x5` parses as `($a ** $b) x 5`.
+everything after the `x` to re-lex as the operand.  Only the byte
+immediately after `x` needs to be a digit — longer runs like
+`x5x5` split on the first `x`, and the remaining `5x5` re-lexes
+as `5` then a second `x5` which splits again on the next iteration
+(`"ab" x5x5` → `("ab" x 5) x 5`).  A bare `x` already arrives as
+`Keyword(X)` — `lookup_keyword` recognizes it — and flows through
+the table with no fix-up; only `x` adjacent to a digit needs the
+split, since every other keyword operator (`or`, `and`, `eq`, `lt`,
+etc.) is multi-letter and a following digit keeps it one identifier.
+When the split would bind too loosely for the current level the
+identifier stays cached for an outer level, so `$a ** $b x5` parses
+as `($a ** $b) x 5`.
 
 #### 5.9.2 Token consumption methods:
 

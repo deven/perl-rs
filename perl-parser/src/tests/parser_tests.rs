@@ -6443,6 +6443,20 @@ fn repeat_flush_digit_precedence() {
     }
 }
 
+#[test]
+fn repeat_flush_digit_chained() {
+    // `"ab" x5x5` → Repeat(Repeat("ab", 5), 5) — `scan_ident` produces `Ident("x5x5")`, `lex_operator` splits off
+    // the first `x`, and the remaining `5x5` re-lexes as `IntLit(5)` then `Ident("x5")` which splits again.
+    let e = parse_expr_str(r#""ab" x5x5;"#);
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Repeat, lhs, rhs) => {
+            assert!(matches!(lhs.kind, ExprKind::BinOp(BinOp::Repeat, _, _)), "expected inner Repeat, got {:?}", lhs.kind);
+            assert!(matches!(rhs.kind, ExprKind::IntLit(5)), "expected outer count IntLit(5), got {:?}", rhs.kind);
+        }
+        other => panic!("expected Repeat, got {other:?}"),
+    }
+}
+
 // ── Mixed prefix/infix same token ────────────────────────
 
 #[test]
@@ -9017,9 +9031,8 @@ fn lexer_error_unterminated_prototype() {
 }
 
 #[test]
-#[ignore = "bare /.../ uses the Prototype placeholder role until lex_term lands; reports Prototype not terminated, not Search pattern not terminated"]
 fn lexer_error_unterminated_bare_regex() {
-    // Target wording once bare slash routes through the `m//` regex frame (deferred lex_term work, §5.5).
+    // Bare slash routes through the `m//` regex frame via lex_term, producing the correct error message.
     assert_eq!(parse_fails("/foo bar"), "Search pattern not terminated");
 }
 

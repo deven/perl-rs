@@ -2252,17 +2252,93 @@ impl Parser {
     }
 
     // ── Term parsing ──────────────────────────────────────────
-    fn parse_term(&mut self) -> Result<Expr, ParseError> {
-        let spanned = self.next_token()?;
-        let span = spanned.span;
-
-        // Quote keywords must be handled before any peek_token() call — tokenizing the delimiter byte would be
-        // destructive (e.g. `q/foo/` would lex `/` as Slash, losing the quote-op context).
-        if let Token::Keyword(kw) = &spanned.token
-            && keyword::is_quote_keyword(*kw)
-        {
-            return self.parse_quote_keyword(*kw, span);
+    /// Term-position tokenization.  Fills the one-token cache via position-independent `lex_token()`, then checks
+    /// whether the cached token needs reinterpretation for term context.  Five cases are handled:
+    ///
+    /// - Quote keywords (`q`, `qq`, `qw`, `qr`, `qx`, `m`, `s`, `tr`, `y`) → initiate sublexing via
+    ///   `begin_quote_sublex`, returning the begin token (or `StrLit`/`QwList`/`TranslitLit` for single-pass cases).
+    /// - `Slash` → start the regex sublex frame (delimiter `/`, `FrameRole::Regex`), returning `RegexSublexBegin`.
+    /// - `Assign(DivEq)` → rewind the `=`, start the regex sublex frame, returning `RegexSublexBegin`.
+    /// - `ShiftLeft` → attempt heredoc via `lex_heredoc_after_shift_left`, returning `QuoteSublexBegin` or `Readline`.
+    /// - `Dot` → attempt leading-dot float via `lex_leading_dot_float`, returning `FloatLit` or `VersionLit`.
+    ///
+    /// Everything else passes through unchanged.  `DefinedOr` (empty regex), `NumLt` (readline/glob), and `Minus`
+    /// (filetest) are not re-lexed here — the first is unambiguous as a token, and the other two require parser-grammar
+    /// knowledge that does not belong in the tokenization layer.
+    fn lex_term(&mut self) -> Result<Spanned, ParseError> {
+        self.peek_token();
+        if let Some(e) = self.lexer_error.take() {
+            return Err(e);
         }
+
+        match self.current.as_ref().map(|s| &s.token) {
+            // Quote keywords → begin sublexing.
+            Some(Token::Keyword(kw)) if keyword::is_quote_keyword(*kw) => {
+                let kw = *kw;
+                let span = self.current.as_ref().map(|s| s.span).unwrap_or(Span::new(0, 0));
+                self.current = None;
+                // EOF after keyword → bareword.
+                if self.skip_ws_and_peek_byte().is_none() {
+                    let name: &str = kw.into();
+                    return Ok(Spanned { token: Token::Ident(name.to_string()), span });
+                }
+                let token = self.begin_quote_sublex(kw)?;
+                Ok(Spanned { token, span })
+            }
+
+            // `/` in term position → regex, not division.  Start the regex sublex frame with delimiter `/` so the body
+            // scanner handles interpolation and produces "Search pattern not terminated" on error.
+            Some(Token::Slash) => {
+                let span = self.current.as_ref().map(|s| s.span).unwrap_or(Span::new(0, 0));
+                self.current = None;
+                let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+                self.start_delimited_body(LexContext::new(Some('/'), FrameRole::Regex), extra)?;
+                Ok(Spanned { token: Token::RegexSublexBegin(RegexKind::Match, '/'), span })
+            }
+
+            // `/=` in term position → regex starting with `=`, not division-assign.  Rewind the `=` so it becomes the
+            // first byte of the pattern body.
+            Some(Token::Assign(AssignOp::DivEq)) => {
+                let span = self.current.as_ref().map(|s| s.span).unwrap_or(Span::new(0, 0));
+                self.current = None;
+                self.rewind(1);
+                let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+                self.start_delimited_body(LexContext::new(Some('/'), FrameRole::Regex), extra)?;
+                Ok(Spanned { token: Token::RegexSublexBegin(RegexKind::Match, '/'), span })
+            }
+
+            // `<<` in term position → heredoc, not shift-left.
+            Some(Token::ShiftLeft) => {
+                let span = self.current.as_ref().map(|s| s.span).unwrap_or(Span::new(0, 0));
+                self.current = None;
+                match self.lex_heredoc_after_shift_left()? {
+                    Some(token) => Ok(Spanned { token, span }),
+                    None => Err(ParseError::new("expected heredoc tag after <<", span)),
+                }
+            }
+
+            // `.` in term position → leading-dot float or version, not concat.
+            Some(Token::Dot) => {
+                let span = self.current.as_ref().map(|s| s.span).unwrap_or(Span::new(0, 0));
+                self.current = None;
+                match self.lex_leading_dot_float()? {
+                    Some(token) => {
+                        let end = self.pos() as u32;
+                        Ok(Spanned { token, span: Span::new(span.start, end) })
+                    }
+                    // No digit after `.` — pass Dot through for parse_term to error on.
+                    None => Ok(Spanned { token: Token::Dot, span }),
+                }
+            }
+
+            // Not in the re-lex set — return the cached token as-is.
+            _ => self.next_token(),
+        }
+    }
+
+    fn parse_term(&mut self) -> Result<Expr, ParseError> {
+        let spanned = self.lex_term()?;
+        let span = spanned.span;
 
         // Weak keyword override: if this keyword has been declared as a sub (via `use subs`, `sub name;`, etc.), treat
         // it as an identifier in term position so the user sub takes precedence.  Infix position is unaffected — `"ab"
@@ -2284,26 +2360,6 @@ impl Parser {
 
             // Interpolating string: collect sub-tokens into AST.
             Token::QuoteSublexBegin(_, _) => self.parse_interpolated_string(span),
-
-            // << in term position: try heredoc.  The lexer emitted ShiftLeft; we ask it to attempt heredoc detection.
-            // If it can't find a valid tag, that's a parse error (shift-left is not a valid term).
-            Token::ShiftLeft => {
-                match self.lex_heredoc_after_shift_left()? {
-                    Some(Token::QuoteSublexBegin(kind, delim)) => {
-                        let body_span = self.peek_span();
-                        self.parse_interpolated_string(body_span.merge(span)).map(|mut e| {
-                            e.span = span.merge(e.span);
-                            let _ = (kind, delim);
-                            e
-                        })
-                    }
-
-                    // <<>> double diamond — safe version of <>.
-                    Some(Token::Readline(content, safe)) => Self::readline_expr(content, safe, span),
-                    Some(other) => unreachable!("unexpected heredoc token: {other:?}"),
-                    None => Err(ParseError::new("expected heredoc tag after <<", span)),
-                }
-            }
 
             Token::ScalarVar(name) => {
                 let expr = Expr::new(ExprKind::ScalarVar(name), span);
@@ -2469,31 +2525,6 @@ impl Parser {
                 Ok(Expr::new(ExprKind::Regex(RegexKind::Match, Interpolated(vec![]), flags), span))
             }
 
-            // / in term position is a regex, not division.
-            Token::Slash => {
-                // TODO(lex_term): bare `/.../` must lex through the `m//` regex frame like `m`/`qr`, not this raw
-                // `lex_body_str` capture (an extra pass that also drops interpolation).  `Prototype` is a placeholder
-                // role until that alignment lands; see the deferred-work list.
-                let pattern = self.lex_body_str('/', FrameRole::Prototype)?;
-                let flags = self.scan_adjacent_word_chars();
-                if let Some(ref f) = flags {
-                    Self::validate_regex_flags(f, span)?;
-                }
-                Ok(Expr::new(ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span))
-            }
-
-            // /= in term position: = is the first character of the regex pattern, not a division-assignment operator.
-            Token::Assign(AssignOp::DivEq) => {
-                self.rewind(1);
-                // TODO(lex_term): see the `Token::Slash` arm — bare `/.../` should use the regex frame; `Prototype`
-                // is a placeholder role here too.
-                let pattern = self.lex_body_str('/', FrameRole::Prototype)?;
-                let flags = self.scan_adjacent_word_chars();
-                if let Some(ref f) = flags {
-                    Self::validate_regex_flags(f, span)?;
-                }
-                Ok(Expr::new(ExprKind::Regex(RegexKind::Match, Interpolated(vec![InterpPart::Const(pattern)]), flags), span))
-            }
             Token::SubstSublexBegin(delim) => {
                 // Collect pattern body tokens until SublexEnd, then finish the replacement.
                 let pattern = self.parse_interpolated()?;
@@ -2532,68 +2563,7 @@ impl Parser {
                 }
             }
 
-            // `.` in term position: try leading-dot float (`.5`, `.5e2`) or v-string (`.5.6`).  In operator position,
-            // `.` is concat (handled by lex_operator) — same disambiguation pattern as `/` (regex vs division).
-            Token::Dot => match self.lex_leading_dot_float()? {
-                Some(Token::FloatLit(n)) => {
-                    let end = self.peek_span().start;
-                    Ok(Expr::new(ExprKind::FloatLit(n), Span::new(span.start, end)))
-                }
-                Some(Token::VersionLit(v)) => {
-                    let end = self.peek_span().start;
-                    Ok(Expr::new(ExprKind::VersionLit(v), Span::new(span.start, end)))
-                }
-                _ => Err(ParseError::new("expected expression, got Dot", span)),
-            },
-
             other => Err(ParseError::new(format!("expected expression, got {other:?}"), span)),
-        }
-    }
-
-    /// Handle a quote keyword (`q`, `qq`, `qw`, `qr`, `qx`, `m`, `s`, `tr`, `y`) received in `parse_term`.  Skips
-    /// whitespace and peeks at the raw delimiter byte to decide whether to start sublexing.  Fat-comma autoquoting
-    /// (e.g. `q => 1`) is handled by the lexer, which returns StrLit instead of the keyword.  Must be called BEFORE any
-    /// `peek_token()` — tokenizing the delimiter byte would be destructive.
-    fn parse_quote_keyword(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let raw = self.skip_ws_and_peek_byte();
-
-        // No delimiter byte (EOF) — treat as bareword.
-        if raw.is_none() {
-            let name: &str = kw.into();
-            return Ok(Expr::new(ExprKind::Bareword(name.to_string()), span));
-        }
-
-        // Start sublexing — the lexer reads the delimiter and begins scanning the body.
-        self.dispatch_quote_result(kw, span)
-    }
-
-    /// Enter sublexing for a quote keyword and dispatch the resulting token.  The lexer must be positioned at (or
-    /// before whitespace preceding) the delimiter byte.
-    fn dispatch_quote_result(&mut self, kw: Keyword, span: Span) -> Result<Expr, ParseError> {
-        let token = self.begin_quote_sublex(kw)?;
-        match token {
-            Token::StrLit(s) => Ok(Expr::new(ExprKind::StringLit(s), span)),
-            Token::QwList(words) => Ok(Expr::new(ExprKind::QwList(words), span)),
-            Token::QuoteSublexBegin(_, _) => self.parse_interpolated_string(span),
-            Token::RegexSublexBegin(kind, _delim) => {
-                let pattern = self.parse_interpolated()?;
-                let flags = self.scan_adjacent_word_chars();
-                if let Some(ref f) = flags {
-                    Self::validate_regex_flags(f, span)?;
-                }
-                Ok(Expr::new(ExprKind::Regex(kind, pattern, flags), span))
-            }
-            Token::SubstSublexBegin(delim) => {
-                let pattern = self.parse_interpolated()?;
-                self.finish_subst(delim, pattern, span)
-            }
-            Token::TranslitLit(from, to, flags) => {
-                if let Some(ref f) = flags {
-                    Self::validate_tr_flags(f, span)?;
-                }
-                Ok(Expr::new(ExprKind::Translit(from, to, flags), span))
-            }
-            other => Err(ParseError::new(format!("unexpected token from quote sublexer: {other:?}"), span)),
         }
     }
 
@@ -3556,10 +3526,10 @@ impl Parser {
     /// returns `Some((info, op_tok))`.  Returns `None` — leaving the cache intact — when the next token is not an
     /// operator or binds too loosely for this level, so an outer level can take it.
     ///
-    /// The one position-dependent fix-up is the `x` repeat operator written flush against its count (`x5`):
-    /// position-independent lexing scans the whole run as the identifier `x5`, so in operator position it is split back
-    /// into the `x` operator with its digit run left to re-lex as the integer operand.  A bare `x` already arrives as
-    /// `Keyword(X)` and needs no fix-up; every other cached token is reused unchanged.
+    /// The one position-dependent fix-up is the `x` repeat operator written flush against its count (`x5`, `x5x5`):
+    /// position-independent lexing scans the whole run as one identifier, so in operator position it is split at the
+    /// first `x` with everything after it left to re-lex.  A bare `x` already arrives as `Keyword(X)` and needs no
+    /// fix-up; every other cached token is reused unchanged.
     fn lex_operator(&mut self, min_prec: Precedence) -> Result<Option<(OpInfo, Spanned)>, ParseError> {
         let smartmatch_active = self.features.contains(Features::SMARTMATCH);
         self.peek_token();
@@ -3567,12 +3537,13 @@ impl Parser {
             return Err(e);
         }
 
-        // `x` flush against a digit run (`x5`): `scan_ident` over-consumed the operator and its operand into one
-        // identifier.  Split: emit the one-byte `x` operator, rewind so the digits re-lex as the integer operand.
+        // `x` flush against a digit run (`x5`, `x5x5`): `scan_ident` over-consumed the operator and its operand into
+        // one identifier.  Only the byte immediately after `x` needs to be a digit — the rewind puts everything after the
+        // `x` back for re-lexing, so `x5x5` correctly re-lexes as `x`, `5`, `x`, `5`.
         if let Some(Spanned { token: Token::Ident(s), span }) = &self.current
             && s.len() > 1
             && s.starts_with('x')
-            && s.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+            && s.as_bytes()[1].is_ascii_digit()
         {
             let info = OpInfo { prec: PREC_MUL, assoc: Assoc::Left };
             if info.left_prec() < min_prec {
