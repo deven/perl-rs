@@ -2067,8 +2067,8 @@ impl Parser {
     fn lex_word(&mut self) -> Result<Token, ParseError> {
         let name = self.scan_ident();
 
-        // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or, xor, not) are always emitted as Ident(name).  The
-        // parser recognizes them as operators in operator context via peek_op_info and token_to_binop.
+        // Word operators (eq, ne, lt, gt, le, ge, cmp, x, and, or, xor, not) are emitted as Keyword tokens via
+        // lookup_keyword below.  The parser maps them to their OpInfo in lex_operator via op_info_for_token.
 
         // Special double-underscore tokens.  __DATA__/__END__ have same-line-only autoquoting and trigger EOF.
         // __FILE__/__LINE__ must save their lex-time values before at_fat_comma (which may advance past newlines and

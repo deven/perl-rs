@@ -883,21 +883,22 @@ tokens before the parser sees them.
 The PerlOxide lexer takes a different approach: it produces
 consistent, unambiguous tokens regardless of parser state.  A `/`
 is always `Token::Slash`.  A `{` is always `Token::LeftBrace`.  The
-**parser** resolves the semantic ambiguity based on its own
+parsing code resolves the semantic ambiguity based on its own
 position in the grammar — `Token::Slash` in `parse_term` means
-regex, in `peek_op_info` means division.  No shared disambiguation
-state exists between the lexer and parser.
+regex, in `lex_operator` means division.  No shared disambiguation
+state exists between the lexing and parsing layers.
 
-Both lexer and parser live in the `perl-parser` crate as
-`pub(crate)` modules — the crate boundary is at the AST level.
-The parser calls specialized lexer methods for context-sensitive
-scanning (heredoc initiation, prototype scanning, substitution
-body partitioning), but the lexer never reads parser disambiguation
-state — there is no `Expect` enum or term-vs-operator flag.  The
-lexer does read pragma and feature state (`utf8_mode`, `features`)
-that the parser syncs to it at pragma change points, since these
-affect lexical behavior (Unicode identifier acceptance, NFC
-normalization, paired delimiter availability).
+Tokenization and parsing methods are all on the same `Parser`
+struct, organized into sibling source files (`lexer.rs` and
+`source.rs` for tokenization, `parser.rs` for grammar).  The
+crate boundary is at the AST level.  The tokenization methods
+perform context-sensitive scanning when called (heredoc initiation,
+prototype scanning, substitution body partitioning), but do not
+consult any disambiguation state — there is no `Expect` enum or
+term-vs-operator flag.  Tokenization does read pragma and feature
+state (`utf8_mode`, `features`) directly from `Parser` fields,
+since these affect lexical behavior (Unicode identifier acceptance,
+NFC normalization, paired delimiter availability).
 
 ### 5.2 Parser-Driven Disambiguation
 
@@ -908,22 +909,22 @@ needs distinct token types for different syntactic roles of the same
 character.
 
 The recursive descent parser eliminates this entirely.  There is no
-`Expect` enum, no shared state between the parser and lexer for
-disambiguation, and no re-lexing.  Instead, the parser resolves every
+`Expect` enum and no shared disambiguation state between the
+lexing and parsing layers.  Instead, the parsing code resolves every
 ambiguous token by virtue of knowing where it is in the grammar:
 
 **`/` (regex vs division).**  The Pratt expression parser calls
-`parse_term()` when expecting a value and `peek_op_info()` when
+`parse_term()` when expecting a value and `lex_operator()` when
 looking for an infix operator.  `parse_term()` handles `Token::Slash`
 as a regex start (calling `self.lexer.lex_body_str('/', true)` to
-scan the pattern body).  `peek_op_info()` maps `Token::Slash` to
+scan the pattern body).  `lex_operator()` maps `Token::Slash` to
 `OpInfo { prec: PREC_MUL, assoc: Left }` (division).  The parser's
 own call stack determines which interpretation applies — no shared
 state needed.
 
 **`//` (defined-or vs empty regex).**  Same mechanism.  In
 `parse_term()`, `Token::DefinedOr` is treated as an empty regex
-(with optional flags like `//gi`).  In `peek_op_info()`, it's the
+(with optional flags like `//gi`).  In `lex_operator()`, it's the
 defined-or operator.  List operators that prefer defined-or stop
 argument collection before `//`, matching `toke.c`'s UNIDOR behavior.
 
@@ -2518,14 +2519,17 @@ struct.
 
 ### 5.9 Lexer API Methods
 
-The lexer exposes a structured API for the parser.  Methods fall
-into three categories: tokenization (three methods, one per
-grammatical position), consumption (conditional token matching),
-and construct-specific scanning.  There is no shared mutable
-disambiguation state — the parser communicates context by choosing
-which method to call.  The parser has no one-token lookahead cache
-and no `peek_token()` / `next_token()` helpers; all token access
-goes through the lexer API directly.
+The lexing layer exposes a structured API for the parsing layer.
+Methods fall into three categories: tokenization (three methods,
+one per grammatical position), consumption (conditional token
+matching), and construct-specific scanning.  There is no shared
+mutable disambiguation state between the two layers — the parsing
+code communicates context by choosing which method to call.  A
+one-token lookahead cache (`self.current`) holds the
+position-independent lex; `peek_token()` fills it and
+`next_token()` consumes it, and the position-committed tokenization
+methods reinterpret or re-lex the cached token for the few ambiguous
+cases.
 
 #### 5.9.1 Tokenization methods:
 
@@ -2582,37 +2586,49 @@ the two entry points that know they are in term position — and
 from `parse_operator` when parsing the right-hand side of a binary
 operator.
 
-**`lex_operator(min_prec: Precedence) -> Option<(Token, OpInfo)>`**
-— operator-position tokenization with precedence gating.  Peeks at
-the next token, maps it to an `OpInfo` (precedence and
-associativity).  Three outcomes collapse into `Option`:
+**`lex_operator(min_prec) -> Result<Option<(OpInfo, Spanned)>, ParseError>`**
+— operator-position tokenization with precedence gating.  Fills the
+one-token cache via position-independent `lex_token()` if empty,
+maps the cached token to its `OpInfo` (precedence and
+associativity), and gates on `min_prec`.  Three outcomes collapse
+into `Option`:
 
-- Not an operator token → returns `None`, consumes nothing.
-- Operator but `left_prec < min_prec` → returns `None`, consumes
-  nothing.  The operator is left for the outer Pratt loop level.
+- Not an operator token → returns `None`, leaving the cache intact.
+- Operator but `left_prec < min_prec` → returns `None`, leaving the
+  cache intact.  The operator is left for the outer Pratt loop level.
 - Operator with `left_prec >= min_prec` → consumes the token and
-  returns `Some((token, info))`.
+  returns `Some((info, op_tok))`.
 
 This method drives the Pratt operator loop entirely:
 
 ```rust
-while let Some((token, info)) = self.lexer.lex_operator(min_prec) {
-    left = self.parse_operator(left, token, info)?;
+while let Some((info, op_tok)) = self.lex_operator(min_prec)? {
+    left = self.parse_operator(left, info, op_tok)?;
 }
 ```
 
-No separate `peek_op_info()` method is needed on the parser.  The
-precedence check, token consumption, and operator dispatch are a
-single step.
+The operator table itself lives in `op_info_for_token()`, an
+associated function keyed on the token and a snapshot of the
+SmartMatch feature bit.  `lex_operator()` is its sole caller.  The
+chain and trailing-non-associative lookaheads in `parse_operator`
+also use `lex_operator()` rather than a separate peek method —
+after `parse_expr(right_prec)` has consumed everything above, the
+`>= min_prec` gate effectively tests exact precedence.
 
-The `x` repeat operator is a unique special case handled by
-`lex_operator()`.  In operator position, `x` adjacent to a digit
-(`x5`) must be recognized as the repeat operator followed by an
-integer operand, not as the identifier `x5`.  `lex_operator()`
-checks for `x` as a single-character keyword before scanning a
-full identifier.  Only `x` has this behavior — all other keyword
-operators (`or`, `and`, `eq`, `lt`, etc.) are multi-letter and are
-always lexed as complete identifiers regardless of what follows.
+Most operator-position tokens are reused from the cache unchanged:
+the position-independent lex of `/` is already `Slash` (division),
+`.` is `Dot` (concatenation), and so on.  The one fix-up is the `x`
+repeat operator written flush against its count.  `lex_token()`
+scans `x5` as the single identifier `x5`, so in operator position
+`lex_operator()` splits it back into the `x` operator and rewinds
+over the digits to re-lex them as the integer operand.  A bare `x`
+already arrives as `Keyword(X)` — `lookup_keyword` recognizes it —
+and flows through the table with no fix-up; only `x` adjacent to a
+digit needs the split, since every other keyword operator (`or`,
+`and`, `eq`, `lt`, etc.) is multi-letter and a following digit keeps
+it one identifier.  When the split would bind too loosely for the
+current level the `x5` identifier stays cached for an outer level,
+so `$a ** $b x5` parses as `($a ** $b) x 5`.
 
 #### 5.9.2 Token consumption methods:
 
@@ -2728,8 +2744,11 @@ The parser operates on three cleanly separated layers:
    post-hoc reclassification is impossible in Perl 5's LALR(1)
    grammar, which must decide before the production is entered.
 
-The parser has no one-token lookahead cache.  Each lexer method
-handles its own peek-and-conditionally-consume logic internally.
+The parser holds a one-token lookahead cache (`self.current`),
+filled by position-independent `lex_token()`.  `lex_term()` and
+`lex_operator()` reinterpret the cached token for their position when
+it is one of the few ambiguous cases, and reuse it directly
+otherwise.
 
 #### 6.1.2 Core components on `Parser`:
 
@@ -2821,9 +2840,9 @@ which resolves ambiguous tokens (`/` as regex, `.` as leading-dot
 float, `<` as readline, `<<` as heredoc) in term position.  A token
 that cannot begin a term is a parse error.
 
-`parse_operator(left, token, info)` — called when `lex_operator()`
-has consumed an infix/postfix operator.  Receives the already-
-consumed operator token and its `OpInfo`.  Dispatches on the token:
+`parse_operator(left, info, op_tok)` — called when `lex_operator()`
+has consumed an infix/postfix operator.  Receives the operator's
+`OpInfo` and the already-consumed token.  Dispatches on the token:
 binary operators call `parse_expr` for the right operand (which
 calls `lex_term()` internally), postfix operators wrap the left
 operand, ternary `?:` parses the middle and right branches, `->`
@@ -2891,9 +2910,9 @@ fn parse_expr_continuation(
     mut left: Expr,
     min_prec: Precedence,
 ) -> Result<Expr, ParseError> {
-    while let Some((token, info)) =
-            self.lexer.lex_operator(min_prec) {
-        left = self.parse_operator(left, token, info)?;
+    while let Some((info, op_tok)) =
+            self.lex_operator(min_prec)? {
+        left = self.parse_operator(left, info, op_tok)?;
     }
     Ok(left)
 }
@@ -2906,12 +2925,14 @@ zero stack depth regardless of chain length.  Prefix chains
 recursion.  Deeply nested containers (`[[[1]]]`, `((((1))))`,
 `${${$ref}}`) push frames onto the heap-allocated stack.
 
-`lex_operator(min_prec)` (§5.9.1) handles the entire peek-check-
-consume cycle: it peeks at the next token, maps it to an `OpInfo`,
-checks `left_prec >= min_prec`, and either consumes and returns
-`Some((token, info))` or returns `None` without consuming.  The
-parser has no `peek_op_info()` method and no one-token lookahead
-cache — `lex_operator()` encapsulates the operator dispatch.
+`lex_operator(min_prec)` (§5.9.1) handles the entire check-and-
+consume cycle: it maps the cached token to an `OpInfo`, checks
+`left_prec >= min_prec`, and either consumes and returns
+`Some((info, op_tok))` or returns `None` leaving the cache intact.
+The chain and non-associative lookaheads inside `parse_operator`
+also call `lex_operator` directly — after parsing the RHS at
+`right_prec`, the only pending operator `lex_operator(info.prec)`
+can match has exactly that precedence.
 
 `parse_operator` always parses the right-hand side using
 `right_prec()` from the operator's `OpInfo`, regardless of whether
@@ -3608,9 +3629,14 @@ stamped node.
 
 ### 6.3 Parser–Lexer Communication
 
-The parser communicates with the lexer through explicit method
-calls.  There is no shared mutable state, no `Expect` enum, no
-re-lexing, and no one-token lookahead cache on the parser.
+The parsing layer communicates with the lexing layer through
+explicit method calls.  There is no shared mutable disambiguation
+state between the two layers and no `Expect` enum — the call site
+(`lex_term` vs `lex_operator`) determines how an ambiguous token
+is read, rather than a flag the tokenization code consults.  A
+one-token cache (`self.current`) holds the position-independent
+lex; the position-committed methods reinterpret or re-lex it only
+for the few ambiguous cases.
 
 #### 6.3.1 Three-method tokenization:
 
@@ -3622,11 +3648,13 @@ term-position tokens.  Resolves `/` as regex, `.5` as float, `<`
 as readline, `<<` as heredoc, `-f` as filetest.
 
 **`lex_operator(min_prec)`** — called by `parse_expr_continuation`
-for the Pratt operator loop.  Returns `Some((token, info))` if the
-next token is an operator with `left_prec >= min_prec`, consuming
-it.  Returns `None` otherwise, consuming nothing.  Handles the `x`
-repeat special case (breaking `x5` into operator `x` and operand
-`5` in operator position).
+for the Pratt operator loop, and by the chain and non-associative
+lookaheads inside `parse_operator`.  Returns `Some((info, op_tok))`
+if the next token is an operator with `left_prec >= min_prec`,
+consuming it; returns `None` otherwise, leaving the cache intact.
+Handles the `x` repeat special case (splitting `x5` into operator
+`x` and operand `5` in operator position).  The operator table
+lives in `op_info_for_token()`.
 
 **`lex_token()`** — called internally by `consume()`, `expect()`,
 and `consume_comma()` for position-independent structural tokens.

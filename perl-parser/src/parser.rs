@@ -2244,11 +2244,8 @@ impl Parser {
     /// Continue parsing an expression from a pre-built left-hand side.  Runs the Pratt operator loop without calling
     /// parse_term first.
     fn parse_expr_continuation(&mut self, mut left: Expr, min_prec: Precedence) -> Result<Expr, ParseError> {
-        while let Some(info) = self.peek_op_info() {
-            if info.left_prec() < min_prec {
-                break;
-            }
-            left = self.parse_operator(left, info)?;
+        while let Some((info, op_tok)) = self.lex_operator(min_prec)? {
+            left = self.parse_operator(left, info, op_tok)?;
         }
 
         Ok(left)
@@ -2536,7 +2533,7 @@ impl Parser {
             }
 
             // `.` in term position: try leading-dot float (`.5`, `.5e2`) or v-string (`.5.6`).  In operator position,
-            // `.` is concat (handled by peek_op_info) — same disambiguation pattern as `/` (regex vs division).
+            // `.` is concat (handled by lex_operator) — same disambiguation pattern as `/` (regex vs division).
             Token::Dot => match self.lex_leading_dot_float()? {
                 Some(Token::FloatLit(n)) => {
                     let end = self.peek_span().start;
@@ -3501,12 +3498,12 @@ impl Parser {
     }
 
     // ── Operator parsing ──────────────────────────────────────
-    fn peek_op_info(&mut self) -> Option<OpInfo> {
-        // Snapshot feature bits we may consult before the match on self.peek_token() — that call takes a mutable borrow
-        // of self, which we can't hold across further field access.
-        let smartmatch_active = self.pragmas.features.contains(Features::SMARTMATCH);
-
-        match self.peek_token() {
+    /// The operator table: map a token to its precedence and associativity, or `None` if it does not begin an infix or
+    /// postfix operator.  The single source of truth for operator binding, consulted by `lex_operator`.
+    /// `smartmatch_active` gates the feature-gated `~~`; the caller snapshots it from `self.features` before borrowing
+    /// the cached token.
+    fn op_info_for_token(tok: &Token, smartmatch_active: bool) -> Option<OpInfo> {
+        match tok {
             Token::OrOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::DefinedOr => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
             Token::LogicalXor => Some(OpInfo { prec: PREC_OR, assoc: Assoc::Left }),
@@ -3551,6 +3548,53 @@ impl Parser {
             Token::Keyword(Keyword::Xor) => Some(OpInfo { prec: PREC_OR_LOW, assoc: Assoc::Left }),
             Token::Keyword(Keyword::Isa) => Some(OpInfo { prec: PREC_ISA, assoc: Assoc::Non }),
             _ => None,
+        }
+    }
+
+    /// Operator-position tokenization with precedence gating.  Fills the cache via position-independent `lex_token` if
+    /// empty, maps the cached token to its `OpInfo`, and when it binds at least as tightly as `min_prec` consumes it and
+    /// returns `Some((info, op_tok))`.  Returns `None` — leaving the cache intact — when the next token is not an
+    /// operator or binds too loosely for this level, so an outer level can take it.
+    ///
+    /// The one position-dependent fix-up is the `x` repeat operator written flush against its count (`x5`):
+    /// position-independent lexing scans the whole run as the identifier `x5`, so in operator position it is split back
+    /// into the `x` operator with its digit run left to re-lex as the integer operand.  A bare `x` already arrives as
+    /// `Keyword(X)` and needs no fix-up; every other cached token is reused unchanged.
+    fn lex_operator(&mut self, min_prec: Precedence) -> Result<Option<(OpInfo, Spanned)>, ParseError> {
+        let smartmatch_active = self.features.contains(Features::SMARTMATCH);
+        self.peek_token();
+        if let Some(e) = self.lexer_error.take() {
+            return Err(e);
+        }
+
+        // `x` flush against a digit run (`x5`): `scan_ident` over-consumed the operator and its operand into one
+        // identifier.  Split: emit the one-byte `x` operator, rewind so the digits re-lex as the integer operand.
+        if let Some(Spanned { token: Token::Ident(s), span }) = &self.current
+            && s.len() > 1
+            && s.starts_with('x')
+            && s.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+        {
+            let info = OpInfo { prec: PREC_MUL, assoc: Assoc::Left };
+            if info.left_prec() < min_prec {
+                return Ok(None);
+            }
+            let start = span.start;
+            let rewind = s.len() - 1;
+            self.current = None;
+            self.rewind(rewind);
+            return Ok(Some((info, Spanned { token: Token::Keyword(Keyword::X), span: Span::new(start, start + 1) })));
+        }
+
+        let info = match &self.current {
+            Some(s) => Self::op_info_for_token(&s.token, smartmatch_active),
+            None => None,
+        };
+        match info {
+            Some(info) if info.left_prec() >= min_prec => {
+                let op_tok = self.next_token()?;
+                Ok(Some((info, op_tok)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -3629,8 +3673,7 @@ impl Parser {
         }
     }
 
-    fn parse_operator(&mut self, left: Expr, info: OpInfo) -> Result<Expr, ParseError> {
-        let op_spanned = self.next_token()?;
+    fn parse_operator(&mut self, left: Expr, info: OpInfo, op_spanned: Spanned) -> Result<Expr, ParseError> {
         let right_prec = info.right_prec();
 
         // Grouping parens are transparent to every infix operator.  Record whether the left operand was parenthesized
@@ -3737,37 +3780,26 @@ impl Parser {
 
                 match info.assoc {
                     Assoc::Chain => {
-                        // Check if more operators follow at the same precedence.
-                        if let Some(next_info) = self.peek_op_info()
-                            && next_info.prec == info.prec
-                        {
-                            if next_info.assoc == Assoc::Chain {
-                                // More chainable operators — build ChainedCmp.
-                                let mut ops = vec![binop];
-                                let start_span = left.span;
-                                let mut operands = vec![left, right];
-                                while let Some(next_info) = self.peek_op_info()
-                                    && next_info.prec == info.prec
-                                    && next_info.assoc == Assoc::Chain
-                                {
-                                    let next_tok = self.next_token()?;
-                                    ops.push(token_to_binop(&next_tok.token)?);
-                                    operands.push(self.parse_expr(right_prec)?);
-                                }
-
-                                // After the chain, reject a trailing Non at the same level
-                                // (e.g. `$a == $b != $c <=> $d`).
-                                if let Some(trail) = self.peek_op_info()
-                                    && trail.prec == info.prec
-                                {
-                                    return Err(ParseError::new("non-associative operator cannot be chained", operands.last().map_or(start_span, |e| e.span)));
-                                }
-                                let end_span = operands.last().map_or(start_span, |e| e.span);
-                                return Ok(Expr::new(ExprKind::ChainedCmp(ops, operands), start_span.merge(end_span)));
-                            } else {
+                        // After parse_expr(right_prec) consumed everything above info.prec, lex_operator(info.prec)
+                        // can only match operators at exactly that level — the `>=` vs `==` distinction vanishes.
+                        if let Some((next_info, next_tok)) = self.lex_operator(info.prec)? {
+                            if next_info.assoc != Assoc::Chain {
                                 // Non-chainable operator at same precedence (e.g. `$a == $b <=> $c`).
                                 return Err(ParseError::new("non-associative operator cannot be chained", right.span));
                             }
+                            let mut ops = vec![binop, token_to_binop(&next_tok.token)?];
+                            let start_span = left.span;
+                            let mut operands = vec![left, right, self.parse_expr(right_prec)?];
+                            while let Some((next_info, next_tok)) = self.lex_operator(info.prec)? {
+                                if next_info.assoc != Assoc::Chain {
+                                    // e.g. `$a == $b != $c <=> $d` — non-chainable trailing a chain.
+                                    return Err(ParseError::new("non-associative operator cannot be chained", operands.last().map_or(start_span, |e| e.span)));
+                                }
+                                ops.push(token_to_binop(&next_tok.token)?);
+                                operands.push(self.parse_expr(right_prec)?);
+                            }
+                            let end_span = operands.last().map_or(start_span, |e| e.span);
+                            return Ok(Expr::new(ExprKind::ChainedCmp(ops, operands), start_span.merge(end_span)));
                         }
                         let span = left.span.merge(right.span);
                         Ok(Expr::binop(binop, left, right, span))
@@ -3787,11 +3819,11 @@ impl Parser {
     }
 
     /// After parsing the RHS of a non-associative operator, check if another operator at the same precedence level
-    /// follows.  If so, it's a chaining error like `$x .. $y .. $z` or `$x <=> $y <=> $z`.
+    /// follows.  If so, it's a chaining error like `$x .. $y .. $z` or `$x <=> $y <=> $z`.  After
+    /// `parse_expr(right_prec)` consumed everything above `info.prec`, `lex_operator(info.prec)` can only match
+    /// operators at exactly that level.  Consuming is immaterial since every `Some` path errors.
     fn reject_non_assoc_chaining(&mut self, info: OpInfo, right: &Expr) -> Result<(), ParseError> {
-        if let Some(next_info) = self.peek_op_info()
-            && next_info.prec == info.prec
-        {
+        if self.lex_operator(info.prec)?.is_some() {
             return Err(ParseError::new("non-associative operator cannot be chained", right.span));
         }
         Ok(())

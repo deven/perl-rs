@@ -6396,6 +6396,53 @@ fn prec_repeat_at_mul_level() {
     }
 }
 
+#[test]
+fn repeat_flush_digit_scalar() {
+    // `$a x5` — `x` written flush against its count.  Position-independent lexing scans `x5` as one identifier;
+    // `lex_operator` splits it into the `x` operator and re-lexes `5` as the integer operand.
+    let e = parse_expr_str("$a x5;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Repeat, _, rhs) => assert!(matches!(rhs.kind, ExprKind::IntLit(5)), "expected count IntLit(5), got {:?}", rhs.kind),
+        other => panic!("expected Repeat, got {other:?}"),
+    }
+}
+
+#[test]
+fn repeat_flush_digit_string() {
+    // `"ab" x3` → Repeat("ab", 3).  The flush `x3` splits the same way against a string LHS.
+    let e = parse_expr_str(r#""ab" x3;"#);
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Repeat, _, rhs) => assert!(matches!(rhs.kind, ExprKind::IntLit(3)), "expected count IntLit(3), got {:?}", rhs.kind),
+        other => panic!("expected Repeat, got {other:?}"),
+    }
+}
+
+#[test]
+fn repeat_spaced_still_works() {
+    // Regression: bare `x` (a `Keyword(X)` token) flows through the operator table unchanged.
+    let e = parse_expr_str("$a x 5;");
+    assert!(matches!(e.kind, ExprKind::BinOp(BinOp::Repeat, _, _)), "expected Repeat, got {:?}", e.kind);
+}
+
+#[test]
+fn repeat_flush_digit_precedence() {
+    // `1 + 2 x3` → Add(1, Repeat(2, 3)) — the split `x` still binds at PREC_MUL, tighter than `+`.
+    let e = parse_expr_str("1 + 2 x3;");
+    match &e.kind {
+        ExprKind::BinOp(BinOp::Add, lhs, rhs) => {
+            assert!(matches!(lhs.kind, ExprKind::IntLit(1)), "expected lhs IntLit(1), got {:?}", lhs.kind);
+            match &rhs.kind {
+                ExprKind::BinOp(BinOp::Repeat, rl, rr) => {
+                    assert!(matches!(rl.kind, ExprKind::IntLit(2)), "expected Repeat lhs IntLit(2), got {:?}", rl.kind);
+                    assert!(matches!(rr.kind, ExprKind::IntLit(3)), "expected Repeat rhs IntLit(3), got {:?}", rr.kind);
+                }
+                other => panic!("expected Repeat on RHS of Add, got {other:?}"),
+            }
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
 // ── Mixed prefix/infix same token ────────────────────────
 
 #[test]
@@ -11122,7 +11169,7 @@ fn smartmatch_precedence_vs_equality() {
 #[test]
 fn smartmatch_disabled_without_feature() {
     // After `no feature ':all'`, smartmatch is off.  The lexer still emits Token::SmartMatch (it doesn't have feature
-    // state), but peek_op_info won't recognize it as an operator.  The expression `$a ~~ $b` fails to parse as a single
+    // state), but op_info_for_token won't recognize it as an operator.  The expression `$a ~~ $b` fails to parse as a single
     // expression — `$a` is one statement and `~~` is an unexpected token.
     //
     // A full solution would need lexer-level token demotion (splitting SmartMatch back into two Tildes), similar to
