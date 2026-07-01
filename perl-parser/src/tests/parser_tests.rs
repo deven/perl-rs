@@ -1105,7 +1105,7 @@ fn regex_interp_subscript() {
     // m/$h->{key}/ — regex bodies use the same interp machinery; chains should work there too.
     let e = parse_expr_str(r#"m/$h->{key}/;"#);
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => {
+        ExprKind::Regex(_, Some(pat), _) => {
             let parts = &pat.0;
 
             // Expect at least one ScalarInterp with the chain.
@@ -1179,7 +1179,7 @@ fn interp_direct_subscript_in_heredoc() {
 fn interp_chain_in_qr() {
     let e = parse_expr_str(r#"qr/$h->{key}/;"#);
     match &e.kind {
-        ExprKind::Regex(RegexKind::Qr, pat, _) => {
+        ExprKind::Regex(RegexKind::Qr, Some(pat), _) => {
             let has_chain = pat.0.iter().any(|p| {
                 matches!(
                     p,
@@ -1362,7 +1362,7 @@ fn interp_postderef_qq_with_surrounding_text() {
 fn parse_bare_regex() {
     let e = parse_expr_str("/foo/i;");
     match &e.kind {
-        ExprKind::Regex(_, pat, flags) => {
+        ExprKind::Regex(_, Some(pat), flags) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(flags.as_deref(), Some("i"));
         }
@@ -1387,8 +1387,7 @@ fn parse_empty_regex() {
     let e = parse_expr_str("$x =~ //;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-            ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(pat), "");
+            ExprKind::Regex(_, None, flags) => {
                 assert!(flags.is_none());
             }
             other => panic!("expected empty Regex, got {other:?}"),
@@ -1402,8 +1401,7 @@ fn parse_empty_regex_bare() {
     // // at statement level is an empty regex match against $_.
     let e = parse_expr_str("//;");
     match &e.kind {
-        ExprKind::Regex(_, pat, flags) => {
-            assert_eq!(pat_str(pat), "");
+        ExprKind::Regex(_, None, flags) => {
             assert!(flags.is_none());
         }
         other => panic!("expected empty Regex, got {other:?}"),
@@ -1416,8 +1414,7 @@ fn parse_empty_regex_with_flags() {
     let e = parse_expr_str("$x =~ //gi;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-            ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(pat), "");
+            ExprKind::Regex(_, None, flags) => {
                 assert_eq!(flags.as_deref(), Some("gi"));
             }
             other => panic!("expected empty Regex with flags, got {other:?}"),
@@ -1431,8 +1428,7 @@ fn parse_empty_regex_bare_with_flags() {
     // //gi at statement level is an empty regex with flags.
     let e = parse_expr_str("//gi;");
     match &e.kind {
-        ExprKind::Regex(_, pat, flags) => {
-            assert_eq!(pat_str(pat), "");
+        ExprKind::Regex(_, None, flags) => {
             assert_eq!(flags.as_deref(), Some("gi"));
         }
         other => panic!("expected empty Regex with flags, got {other:?}"),
@@ -1472,8 +1468,7 @@ fn parse_empty_regex_space_not_flags() {
     let e = parse_expr_str("$x =~ //gi;");
     match &e.kind {
         ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-            ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(pat), "");
+            ExprKind::Regex(_, None, flags) => {
                 assert_eq!(flags.as_deref(), Some("gi"));
             }
             other => panic!("expected Regex, got {other:?}"),
@@ -1485,8 +1480,7 @@ fn parse_empty_regex_space_not_flags() {
     let e2 = parse_expr_str("$x =~ // gi;");
     match &e2.kind {
         ExprKind::BinOp(BinOp::Binding, _, right) => match &right.kind {
-            ExprKind::Regex(_, pat, flags) => {
-                assert_eq!(pat_str(pat), "");
+            ExprKind::Regex(_, None, flags) => {
                 assert!(flags.is_none());
             }
             other => panic!("expected Regex with empty flags, got {other:?}"),
@@ -1708,6 +1702,34 @@ fn subst_e_empty_replacement() {
         }
         other => panic!("expected Subst with /e eval replacement, got {other:?}"),
     }
+}
+
+// The `/e` body is a sublex block that terminates at SublexEnd, not at '}' .  A '}' inside the replacement is
+// content (the inner block's closing brace), not the sublex terminator.
+#[test]
+fn subst_e_body_with_braces() {
+    let e = parse_expr_str("s/x/do { 42 }/e;");
+    match &e.kind {
+        ExprKind::Subst(_, SubstReplacement::Eval { block, evals }, _) => {
+            assert_eq!(*evals, 1);
+            assert_eq!(block.statements.len(), 1, "the do-block is a single statement in the /e body");
+        }
+        other => panic!("expected Subst with /e, got {other:?}"),
+    }
+}
+
+// An unterminated brace block (EOF before '}' ) produces a parse error.
+#[test]
+fn unterminated_brace_block() {
+    let msg = parse_fails("{ 1;");
+    assert!(msg.contains("unterminated"), "expected unterminated block error, got: {msg}");
+}
+
+// An unterminated block inside a control structure.
+#[test]
+fn unterminated_if_block() {
+    let msg = parse_fails("if (1) { 1;");
+    assert!(msg.contains("unterminated"), "expected unterminated block error, got: {msg}");
 }
 
 // ── Heredoc tests ─────────────────────────────────────────
@@ -5453,7 +5475,7 @@ fn regex_many_flags() {
 fn regex_character_class() {
     let e = parse_expr_str(r#"/[a-z\d\s]+/;"#);
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => {
+        ExprKind::Regex(_, Some(pat), _) => {
             let s = pat_str(pat);
             assert!(s.contains("[a-z") && s.contains("]"), "expected char class in pattern, got {s:?}");
         }
@@ -7999,7 +8021,7 @@ fn parse_empty_statements() {
 fn parse_regex_with_many_flags() {
     let e = parse_expr_str("/foo/imsxg;");
     match &e.kind {
-        ExprKind::Regex(_, pat, flags) => {
+        ExprKind::Regex(_, Some(pat), flags) => {
             assert_eq!(pat_str(pat), "foo");
             assert_eq!(flags.as_deref(), Some("imsxg"));
         }
@@ -8011,7 +8033,7 @@ fn parse_regex_with_many_flags() {
 fn parse_qr_regex() {
     let e = parse_expr_str("qr/\\d+/;");
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => assert_eq!(pat_str(pat), "\\d+"),
+        ExprKind::Regex(_, Some(pat), _) => assert_eq!(pat_str(pat), "\\d+"),
         other => panic!("expected Regex (qr), got {other:?}"),
     }
 }
@@ -8021,7 +8043,7 @@ fn parse_regex_with_interp() {
     // m/foo$bar/ should produce an Interpolated pattern, not plain string.
     let e = parse_expr_str("m/foo$bar/;");
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => {
+        ExprKind::Regex(_, Some(pat), _) => {
             assert!(pat.as_plain_string().is_none(), "expected interpolated pattern");
             assert!(pat.0.len() >= 2);
             assert!(matches!(&pat.0[0], InterpPart::Const(s) if s == "foo"));
@@ -8036,7 +8058,7 @@ fn parse_regex_literal_no_interp() {
     // m'foo$bar' should NOT interpolate — pattern is plain string.
     let e = parse_expr_str("m'foo$bar';");
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => {
+        ExprKind::Regex(_, Some(pat), _) => {
             assert_eq!(pat_str(pat), "foo$bar");
         }
         other => panic!("expected Regex, got {other:?}"),
@@ -8048,7 +8070,7 @@ fn parse_regex_literal_with_code_block() {
     // m'...' still recognizes (?{...}) code blocks.
     let e = parse_expr_str("m'foo(?{ 1 })bar';");
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => {
+        ExprKind::Regex(_, Some(pat), _) => {
             assert!(pat.as_plain_string().is_none(), "expected interpolated pattern with code block");
             assert!(pat.0.iter().any(|p| matches!(p, InterpPart::RegexCode(_, _))));
         }
@@ -9502,7 +9524,7 @@ fn regex_escaped_delimiter() {
     // `m/foo\/bar/` — escaped forward slash inside regex.
     let e = parse_expr_str(r#"m/foo\/bar/;"#);
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => {
+        ExprKind::Regex(_, Some(pat), _) => {
             let s = pat_str(pat);
             assert!(s.contains('/') || s.contains("\\/"), "expected escaped slash in pattern, got {s:?}");
         }
@@ -9529,7 +9551,7 @@ fn regex_brace_delim_no_escape_needed() {
     // `m{foo/bar}` — with brace delimiters, `/` doesn't need escaping.
     let e = parse_expr_str("m{foo/bar};");
     match &e.kind {
-        ExprKind::Regex(_, pat, _) => {
+        ExprKind::Regex(_, Some(pat), _) => {
             let s = pat_str(pat);
             assert!(s.contains('/'), "expected literal / in pattern, got {s:?}");
         }
@@ -12164,7 +12186,7 @@ fn regex_code_block_raw_source() {
     // (?{code}) — verify both raw source and parsed expression.
     let e = parse_expr_str("m/(?{ 1 + 2 })/;");
     match &e.kind {
-        ExprKind::Regex(_, interp, _) => {
+        ExprKind::Regex(_, Some(interp), _) => {
             let code_parts: Vec<_> = interp
                 .0
                 .iter()
@@ -12186,7 +12208,7 @@ fn regex_cond_code_block_raw_source() {
     // (??{code}) — verify raw source capture.
     let e = parse_expr_str("m/(??{ $re })/;");
     match &e.kind {
-        ExprKind::Regex(_, interp, _) => {
+        ExprKind::Regex(_, Some(interp), _) => {
             let code_parts: Vec<_> = interp
                 .0
                 .iter()
@@ -12207,7 +12229,7 @@ fn regex_optimistic_code_block_raw_source() {
     // (*{code}) — optimistic code block, same structure as (?{}).
     let e = parse_expr_str("m/(*{ $n })/;");
     match &e.kind {
-        ExprKind::Regex(_, interp, _) => {
+        ExprKind::Regex(_, Some(interp), _) => {
             let code_parts: Vec<_> = interp
                 .0
                 .iter()
@@ -12983,7 +13005,7 @@ fn nfc_in_regex_body() {
         .find_map(|s| {
             if let StmtKind::Expr(e) = &s.kind
                 && let ExprKind::BinOp(BinOp::Binding, _, rhs) = &e.kind
-                && let ExprKind::Regex(_, Interpolated(parts), _) = &rhs.kind
+                && let ExprKind::Regex(_, Some(Interpolated(parts)), _) = &rhs.kind
             {
                 parts.iter().find_map(|p| if let InterpPart::Const(s) = p { Some(s.clone()) } else { None })
             } else {
@@ -13004,7 +13026,7 @@ fn memchr_utf8_regex_body() {
         .find_map(|s| {
             if let StmtKind::Expr(e) = &s.kind
                 && let ExprKind::BinOp(BinOp::Binding, _, rhs) = &e.kind
-                && let ExprKind::Regex(_, Interpolated(parts), _) = &rhs.kind
+                && let ExprKind::Regex(_, Some(Interpolated(parts)), _) = &rhs.kind
             {
                 parts.iter().find_map(|p| if let InterpPart::Const(s) = p { Some(s.clone()) } else { None })
             } else {
@@ -13139,7 +13161,7 @@ fn hard_empty_regex_from_defined_or_in_term_position() {
             assert_eq!(args.len(), 1);
             assert!(matches!(
                 args[0].kind,
-                ExprKind::Regex(RegexKind::Match, Interpolated(_), Some(ref flags))
+                ExprKind::Regex(RegexKind::Match, None, Some(ref flags))
                     if flags == "ms"
             ));
         }

@@ -1070,6 +1070,133 @@ impl Parser {
         self.lex_normal_token()
     }
 
+    // ── Context-dependent token reinterpretation ────────────────
+
+    /// Term-position reinterpretation.  Takes a position-independent token (already lexed by `lex_token`) and
+    /// transforms `self.tok` in place for the cases that need term-context fixup:
+    ///
+    /// - Quote keywords (`q`, `qq`, `qw`, `qr`, `qx`, `m`, `s`, `tr`, `y`) → initiate sublexing via
+    ///   `begin_quote_sublex`, replacing the token (or producing `StrLit`/`QwList`/`TranslitLit` for single-pass cases).
+    /// - `Slash` → start the regex sublex frame (delimiter `/`, `FrameRole::Regex`), producing `RegexSublexBegin`.
+    /// - `Assign(DivEq)` → rewind the `=`, start the regex sublex frame, producing `RegexSublexBegin`.
+    /// - `ShiftLeft` → attempt heredoc via `lex_heredoc_after_shift_left`.
+    /// - `Dot` → attempt leading-dot float via `lex_leading_dot_float`.
+    /// - `NumLt` → attempt readline/glob via `lex_readline_after_lt`.
+    /// - `DefinedOr` → scan adjacent flags, produce `EmptyRegex(flags)`.
+    ///
+    /// Everything else passes through unchanged.  `Minus` (negative bareword / filetest) is handled inside
+    /// `parse_term` — filetests require parser-grammar knowledge that does not belong in the tokenization layer.
+    pub(crate) fn lex_term(&mut self) -> Result<(), ParseError> {
+        match &self.tok.token {
+            // Quote keywords → begin sublexing.
+            Token::Keyword(kw) if keyword::is_quote_keyword(*kw) => {
+                let kw = *kw;
+                let span = self.tok.span;
+                // EOF after keyword → bareword.
+                if self.skip_ws_and_peek_byte().is_none() {
+                    let name: &str = kw.into();
+                    self.tok = Spanned { token: Token::Ident(name.to_string()), span };
+                    return Ok(());
+                }
+                let token = self.begin_quote_sublex(kw)?;
+                self.tok = Spanned { token, span };
+                Ok(())
+            }
+
+            // `/` in term position → regex, not division.  Start the regex sublex frame with delimiter `/` so the body
+            // scanner handles interpolation and produces "Search pattern not terminated" on error.
+            Token::Slash => {
+                let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+                self.start_delimited_body(LexContext::new(Some('/'), FrameRole::Regex), extra)?;
+                self.tok = Spanned { token: Token::RegexSublexBegin(RegexKind::Match, '/'), span: self.tok.span };
+                Ok(())
+            }
+
+            // `/=` in term position → regex starting with `=`, not division-assign.  Rewind the `=` so it becomes the
+            // first byte of the pattern body.
+            Token::Assign(AssignOp::DivEq) => {
+                self.rewind(1);
+                let extra = self.features.contains(Features::EXTRA_PAIRED_DELIMITERS);
+                self.start_delimited_body(LexContext::new(Some('/'), FrameRole::Regex), extra)?;
+                self.tok = Spanned { token: Token::RegexSublexBegin(RegexKind::Match, '/'), span: self.tok.span };
+                Ok(())
+            }
+
+            // `<<` in term position → heredoc, not shift-left.
+            Token::ShiftLeft => match self.lex_heredoc_after_shift_left()? {
+                Some(token) => {
+                    self.tok = Spanned { token, span: self.tok.span };
+                    Ok(())
+                }
+                None => Err(ParseError::new("expected heredoc tag after <<", self.tok.span)),
+            },
+
+            // `.` in term position → leading-dot float or version, not concat.
+            Token::Dot => {
+                match self.lex_leading_dot_float()? {
+                    Some(token) => {
+                        let end = self.pos() as u32;
+                        self.tok = Spanned { token, span: Span::new(self.tok.span.start, end) };
+                        Ok(())
+                    }
+                    // No digit after `.` — pass Dot through for parse_term to error on.
+                    None => Ok(()),
+                }
+            }
+
+            // `<` in term position → readline/glob, not less-than.
+            Token::NumLt => match self.lex_readline_after_lt() {
+                Some(token) => {
+                    let end = self.pos() as u32;
+                    self.tok = Spanned { token, span: Span::new(self.tok.span.start, end) };
+                    Ok(())
+                }
+                None => Err(ParseError::new("expected readline or glob after <", self.tok.span)),
+            },
+
+            // '//' in term position → empty regex, not defined-or.  Scan any adjacent flag characters and produce an
+            // EmptyRegex token.  This must happen before next_token() advances the byte stream past the flags.
+            Token::DefinedOr => {
+                let span = self.tok.span;
+                let flags = self.scan_adjacent_word_chars();
+                if let Some(ref f) = flags {
+                    Self::validate_regex_flags(f, span)?;
+                }
+                self.tok = Spanned { token: Token::EmptyRegex(flags), span };
+                Ok(())
+            }
+
+            // Not in the re-lex set — return the token as-is.
+            _ => Ok(()),
+        }
+    }
+
+    /// Operator-position reinterpretation.  Takes a position-independent token and returns it unchanged unless it is
+    /// the one ambiguous case: an `Ident` starting with `x` followed by a digit (`x5`, `x5x5`), which `scan_ident`
+    /// over-consumed.  In that case, the token is split: the `x` operator is returned, and everything after it is
+    /// rewound for re-lexing.  A bare `x` already arrives as `Keyword(X)` and needs no fix-up.
+    pub(crate) fn lex_operator(&mut self) -> Result<(), ParseError> {
+        if let Token::Ident(ref s) = self.tok.token
+            && s.len() > 1
+            && s.starts_with('x')
+            && s.as_bytes()[1].is_ascii_digit()
+        {
+            let start = self.tok.span.start;
+            let rewind = s.len() - 1;
+            self.rewind(rewind);
+            self.tok = Spanned { token: Token::Keyword(Keyword::X), span: Span::new(start, start + 1) };
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// Consume the current token and advance to the next.  Returns the old `self.tok` (the consumed token) by
+    /// ownership transfer — `std::mem::replace` swaps the new token in and the old one out with zero clones.
+    pub(crate) fn next_token(&mut self) -> Result<Spanned, ParseError> {
+        let new = self.lex_token()?;
+        Ok(std::mem::replace(&mut self.tok, new))
+    }
+
     /// Lex a token in normal (code) mode.
     fn lex_normal_token(&mut self) -> Result<Spanned, ParseError> {
         if self.logical_eof {

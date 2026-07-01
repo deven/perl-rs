@@ -234,6 +234,11 @@ pub enum Token {
     /// Start of regex: `m/`, `qr/`, bare `//`, or `s/`.
     RegexSublexBegin(RegexKind, char),
 
+    /// Empty regex `//` with optional flags — produced by `lex_term` when `DefinedOr` appears in term position.
+    /// Avoids setting up a sublex frame for an empty body.  Maps to the same `ExprKind::Regex` AST node as any
+    /// other match.
+    EmptyRegex(Option<String>),
+
     /// `(?{` — embedded code block in a regex pattern.  Lexer switches to normal code mode until `}`.
     RegexCodeStart,
 
@@ -442,6 +447,7 @@ impl Token {
                 | Token::Keyword(_)
                 | Token::QuoteSublexBegin(_, _)
                 | Token::RegexSublexBegin(_, _)
+                | Token::EmptyRegex(_)
                 | Token::HeredocBegin(_, _)
                 | Token::SubstSublexBegin(_)
                 | Token::TranslitLit(_, _, _)

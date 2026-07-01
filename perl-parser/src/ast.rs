@@ -404,7 +404,11 @@ impl Expr {
             // ── Interpolated / regex / transliteration: interpolated sub-expressions carry their own context
             // (scalar-interp is scalar, array-interp is list); push them onto the queue. ──
             ExprKind::InterpolatedString(parts) => parts.save_context(queue),
-            ExprKind::Regex(_, parts, _) => parts.save_context(queue),
+            ExprKind::Regex(_, parts, _) => {
+                if let Some(p) = parts {
+                    p.save_context(queue);
+                }
+            }
             ExprKind::Subst(pat, repl, _) => {
                 pat.save_context(queue);
                 match repl {
@@ -838,7 +842,7 @@ pub enum ExprKind {
     Undef,
 
     /// Regex literal: `m/.../flags`, `/.../flags`, or `qr/.../flags`.
-    Regex(RegexKind, Interpolated, Option<String>),
+    Regex(RegexKind, Option<Interpolated>, Option<String>),
 
     // ── Variables ─────────────────────────────────────────────
     ScalarVar(String),
