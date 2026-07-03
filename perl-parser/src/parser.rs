@@ -1891,6 +1891,11 @@ impl Parser {
     /// Forward phase: consume prefix operators and opening delimiters, pushing continuation frames.
     fn parse_expr_forward(&mut self, stack: &mut Vec<ExprFrame>, current_prec: &mut Precedence) -> Result<Expr, ParseError> {
         loop {
+            // Normalize the current token for term context before any term-position dispatch: prefix operators are
+            // term-position constructs too, so lex_term's reinterpretations (`~~` → two complements, `//` → empty
+            // regex, column-0 `=word` → `=`) must land before try_prefix examines the token, not only before
+            // parse_term does.
+            self.lex_term()?;
             match self.try_prefix(*current_prec)? {
                 Some(PrefixResult::Frame(frame, inner_prec)) => {
                     stack.push(frame);
@@ -2083,7 +2088,7 @@ impl Parser {
                         while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                             let expr = self.parse_expr(PREC_COMMA + 1)?;
                             args.push(expr);
-                            if self.tok.token == Token::Comma {
+                            if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                                 self.tok = self.lex_token()?;
                             } else {
                                 break;
@@ -2240,7 +2245,7 @@ impl Parser {
             }
             ExprFrame::ArrayRef { mut elems, span, min_prec } => {
                 elems.push(operand);
-                if self.tok.token == Token::Comma {
+                if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                     self.tok = self.lex_token()?;
                     if self.tok.token == Token::RightBracket {
                         // Trailing comma: `[1, 2, 3,]`
@@ -2330,8 +2335,9 @@ impl Parser {
     }
 
     // ── Term parsing ──────────────────────────────────────────
+    /// Parse a single term.  The current token has already been normalized for term context (`lex_term`) by
+    /// `parse_expr_forward`'s loop — the sole caller — so `self.tok` is term-ready on entry.
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
-        self.lex_term()?;
         let span = self.tok.span;
 
         // Weak keyword override: if this keyword has been declared as a sub (via `use subs`, `sub name;`, etc.), treat
@@ -2557,7 +2563,7 @@ impl Parser {
             while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                 let expr = self.parse_expr(PREC_COMMA + 1)?;
                 args.push(expr);
-                if self.tok.token == Token::Comma {
+                if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                     self.tok = self.lex_token()?;
                 } else {
                     break;
@@ -2597,7 +2603,7 @@ impl Parser {
                         while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                             let expr = self.parse_expr(PREC_COMMA + 1)?;
                             args.push(expr);
-                            if self.tok.token == Token::Comma {
+                            if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                                 self.tok = self.lex_token()?;
                             } else {
                                 break;
@@ -2620,7 +2626,7 @@ impl Parser {
                         while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                             let expr = self.parse_expr(PREC_COMMA + 1)?;
                             args.push(expr);
-                            if self.tok.token == Token::Comma {
+                            if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                                 self.tok = self.lex_token()?;
                             } else {
                                 break;
@@ -3158,7 +3164,7 @@ impl Parser {
             while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                 let expr = self.parse_expr(PREC_COMMA + 1)?;
                 args.push(expr);
-                if self.tok.token == Token::Comma {
+                if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                     self.tok = self.lex_token()?;
                 } else {
                     break;
@@ -3760,7 +3766,7 @@ impl Parser {
                 while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                     let expr = self.parse_expr(PREC_COMMA + 1)?;
                     args.push(expr);
-                    if self.tok.token == Token::Comma {
+                    if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                         self.tok = self.lex_token()?;
                     } else {
                         break;
@@ -3803,7 +3809,7 @@ impl Parser {
                 while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                     let expr = self.parse_expr(PREC_COMMA + 1)?;
                     args.push(expr);
-                    if self.tok.token == Token::Comma {
+                    if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                         self.tok = self.lex_token()?;
                     } else {
                         break;
@@ -3826,7 +3832,7 @@ impl Parser {
                     while self.tok.token != Token::RightParen && self.tok.token != Token::Eof {
                         let expr = self.parse_expr(PREC_COMMA + 1)?;
                         args.push(expr);
-                        if self.tok.token == Token::Comma {
+                        if self.tok.token == Token::Comma || self.tok.token == Token::FatComma {
                             self.tok = self.lex_token()?;
                         } else {
                             break;

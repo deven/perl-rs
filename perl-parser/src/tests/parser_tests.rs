@@ -17337,6 +17337,22 @@ fn qw_vertical_tab_is_a_separator() {
 // Verified: perl accepts f(a => 1) with the bareword autoquoted; => is a comma everywhere a comma is legal.
 
 #[test]
+fn anon_array_accepts_fat_comma() {
+    // Verified: [1 => 2, 3 =>] is a three-element array — => separates anon-array elements and a trailing => acts
+    // like a trailing comma.  Numbers are not autoquoted; only a preceding bareword is.
+    let rhs = first_assign_rhs(&parse("my $r = [1 => 2, 3 =>];"));
+    match &rhs.kind {
+        ExprKind::AnonArray(elems) => {
+            assert_eq!(elems.len(), 3, "three elements");
+            assert!(matches!(elems[0].kind, ExprKind::IntLit(1)), "first element is 1, got {:?}", elems[0].kind);
+            assert!(matches!(elems[1].kind, ExprKind::IntLit(2)), "second element is 2, got {:?}", elems[1].kind);
+            assert!(matches!(elems[2].kind, ExprKind::IntLit(3)), "third element is 3, got {:?}", elems[2].kind);
+        }
+        other => panic!("expected AnonArray, got {other:?}"),
+    }
+}
+
+#[test]
 fn fat_comma_autoquotes_in_func_call_args() {
     let e = parse_expr_str("f(a => 1);");
     match &e.kind {

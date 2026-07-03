@@ -1072,9 +1072,12 @@ impl Parser {
     /// - `Dot` → attempt leading-dot float via `lex_leading_dot_float`.
     /// - `NumLt` → attempt readline/glob via `lex_readline_after_lt`.
     /// - `DefinedOr` → scan adjacent flags, produce `EmptyRegex(flags)`.
+    /// - `SmartMatch` (`~~`) → two bitwise complements: keep one `Tilde` and rewind the other byte for re-lexing.
+    /// - `PodCommand` (`=word` at column 0) → `Assign(Eq)`; in term position the `=` can only be assignment.
     ///
-    /// Everything else passes through unchanged.  `Minus` (negative bareword / filetest) is handled inside
-    /// `parse_term` — filetests require parser-grammar knowledge that does not belong in the tokenization layer.
+    /// Everything else passes through unchanged.  `Minus` (negative bareword / filetest) is handled by the parser's
+    /// prefix layer (`try_prefix`) — filetests require parser-grammar knowledge that does not belong in the
+    /// tokenization layer.
     pub(crate) fn lex_term(&mut self) -> Result<(), ParseError> {
         match &self.tok.token {
             // Quote keywords → begin sublexing.
