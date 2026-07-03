@@ -663,4 +663,126 @@ mod tests {
         assert!(sv.flags().contains(ScalarFlags::STR_VALID));
         assert!(sv.flags().contains(ScalarFlags::INT_VALID));
     }
+
+    // ── Truthiness vs cached numeric coercions (verified against perl 5.38.2) ─────
+    //
+    // Perl's SvTRUE consults the string representation first when one exists.  A numeric coercion caches a *lossy*
+    // value (perl marks it IOKp/NOKp — private — precisely so truth and stringification never consult it), so using a
+    // string as a number must never change its truth value or how it prints.
+
+    #[test]
+    fn truthiness_of_str_zero_zero_survives_numeric_use() {
+        // Verified: perl keeps "0.0" true after ("0.0" + 0).
+        let mut sv = Scalar::from_str("0.0");
+        assert!(sv.is_true(), "\"0.0\" is a true string");
+        let _ = sv.get_num();
+        assert!(sv.is_true(), "\"0.0\" must stay true after numeric coercion caches 0.0");
+    }
+
+    #[test]
+    fn truthiness_of_str_abc_survives_numeric_use() {
+        // Verified: perl keeps "abc" true after ("abc" + 0) numifies it to 0.
+        let mut sv = Scalar::from_str("abc");
+        let _ = sv.get_num();
+        assert!(sv.is_true(), "\"abc\" must stay true after numeric coercion caches 0.0");
+    }
+
+    #[test]
+    fn truthiness_of_str_zero_point_five_survives_int_use() {
+        // get_int on "0.5" caches int 0; perl keeps the scalar true.
+        let mut sv = Scalar::from_str("0.5");
+        let _ = sv.get_int();
+        assert!(sv.is_true(), "\"0.5\" must stay true after integer coercion caches 0");
+    }
+
+    #[test]
+    fn lossy_int_cache_does_not_poison_stringify_of_str() {
+        let mut sv = Scalar::from_str("0.5");
+        assert_eq!(sv.get_int(), 0);
+        assert_eq!(sv.stringify().as_str(), Some("0.5"), "string representation is authoritative over a lossy int cache");
+    }
+
+    #[test]
+    fn lossy_int_cache_does_not_poison_stringify_of_num() {
+        // Verified: perl prints 0.5 after int(0.5) has been taken of the same scalar.
+        let mut sv = Scalar::from_num(0.5);
+        assert_eq!(sv.get_int(), 0);
+        assert_eq!(sv.get_str(), Some("0.5"), "float representation is authoritative over a lossy int cache");
+    }
+
+    #[test]
+    fn pure_string_truthiness_regressions() {
+        // No coercion involved — the string rules themselves.
+        assert!(!Scalar::from_str("").is_true());
+        assert!(!Scalar::from_str("0").is_true());
+        assert!(Scalar::from_str("0.0").is_true());
+        assert!(Scalar::from_str("00").is_true());
+        assert!(Scalar::from_str(" ").is_true());
+    }
+
+    // ── References held in a full Scalar (consistency with the compact Value::Ref path) ─────
+
+    #[test]
+    fn ref_scalar_numifies_to_address() {
+        // Perl numifies a reference to its address — never 0.
+        let mut sv = Scalar::from_ref(Value::Int(7));
+        assert_ne!(sv.get_int(), 0, "a reference numifies to its address, not 0");
+        assert!(sv.get_num() != 0.0);
+    }
+
+    #[test]
+    fn ref_scalar_stringifies_like_value_ref() {
+        // Value::Ref stringifies as "SCALAR(0xADDR)"; the same reference held in a full Scalar must not stringify
+        // as the empty string.
+        let mut sv = Scalar::from_ref(Value::Int(7));
+        let ps = sv.stringify();
+        let bytes = ps.as_bytes();
+        assert!(bytes.starts_with(b"SCALAR(0x"), "expected SCALAR(0x...) form, got {:?}", String::from_utf8_lossy(bytes));
+    }
+
+    #[test]
+    fn ref_scalar_is_true() {
+        assert!(Scalar::from_ref(Value::Int(0)).is_true(), "references are always true");
+    }
+
+    // ── format_nv vs perl's %.15g (all values verified against perl 5.38.2 print output) ─────
+
+    #[test]
+    fn format_nv_matches_perl_g15_rounding() {
+        // print 0.1+0.2 gives "0.3" in perl (%.15g rounds away the representation noise); Rust's shortest
+        // round-trip Display gives "0.30000000000000004".
+        assert_eq!(format_nv(0.1 + 0.2), "0.3");
+    }
+
+    #[test]
+    fn format_nv_switches_to_exponent_at_16_digits() {
+        // %.15g uses exponent form once the exponent reaches the precision: perl prints 1e15 as "1e+15" and
+        // 1e21 as "1e+21".
+        assert_eq!(format_nv(1e15), "1e+15");
+        assert_eq!(format_nv(1e21), "1e+21");
+        assert_eq!(format_nv(999999999999999.0), "999999999999999");
+    }
+
+    #[test]
+    fn format_nv_small_magnitude_exponent_form() {
+        // perl prints 1e-5 as "1e-05" (two-digit exponent).
+        assert_eq!(format_nv(1e-5), "1e-05");
+    }
+
+    #[test]
+    fn format_nv_specials_capitalization() {
+        // perl prints Inf / -Inf / NaN.
+        assert_eq!(format_nv(f64::INFINITY), "Inf");
+        assert_eq!(format_nv(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(format_nv(f64::NAN), "NaN");
+    }
+
+    #[test]
+    fn format_nv_plain_values_regressions() {
+        assert_eq!(format_nv(0.5), "0.5");
+        assert_eq!(format_nv(3.125), "3.125");
+        assert_eq!(format_nv(100.0), "100");
+        assert_eq!(format_nv(0.0), "0");
+        assert_eq!(format_nv(-2.5), "-2.5");
+    }
 }

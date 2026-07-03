@@ -17035,3 +17035,548 @@ fn refgen_double_paren_collapses_to_list() {
         other => panic!("expected Ref, got {other:?}"),
     }
 }
+
+// ═══ Edge-case coverage from the 2026-07 code review ═══════
+// Expectations below are verified against perl 5.38.2 (container) and, for escape scanning, against perl 5.42.2
+// dquote.c (grok_bslash_x / grok_bslash_o).  Tests marked "regression" pin behavior that is already correct.
+
+/// Parse a full program, returning the result for expect-ok / expect-error assertions.
+fn try_parse(src: &str) -> Result<Program, ParseError> {
+    Parser::new(src.as_bytes()).and_then(|mut p| p.parse_program())
+}
+
+/// The plain constant text of the first string initializer, when it is a compile-time constant.  `None` when the
+/// initializer contains runtime interpolation (or is not a string at all).
+fn assign_plain_str(src: &str) -> Option<String> {
+    match &first_assign_rhs(&parse(src)).kind {
+        ExprKind::StringLit(s) => Some(s.clone()),
+        ExprKind::InterpolatedString(i) => i.as_plain_string(),
+        _ => None,
+    }
+}
+
+/// True when the first string initializer parses to a plain constant whose text still contains a literal `$` —
+/// i.e. the lexer failed to treat a `$...` form inside the string as interpolation.
+fn assign_str_has_literal_dollar(src: &str) -> bool {
+    assign_plain_str(src).is_some_and(|s| s.contains('$'))
+}
+
+// ── Adjacent-# quote delimiters ────────────────────────────
+// Perl's rule (toke.c scan_str, verified against perl 5.38.2): a `#` immediately adjacent to a quote-like operator
+// is the delimiter; a `#` after whitespace begins a comment.
+
+#[test]
+fn parse_q_hash_delimiter() {
+    // Verified: perl parses q#hello# as the string "hello".
+    assert_eq!(first_assign_str(&parse("my $x = q#hello#;")), "hello");
+}
+
+#[test]
+fn parse_m_hash_delimiter() {
+    let e = parse_expr_str("m#pat#;");
+    match &e.kind {
+        ExprKind::Regex(_, Some(pat), _) => assert_eq!(pat_str(pat), "pat"),
+        other => panic!("expected Regex with adjacent-# delimiter, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_s_hash_delimiter() {
+    let e = parse_expr_str("s#X#Y#;");
+    match &e.kind {
+        ExprKind::Subst(pat, SubstReplacement::Interp(repl), _) => {
+            assert_eq!(pat_str(pat), "X");
+            assert_eq!(repl.as_plain_string().as_deref(), Some("Y"));
+        }
+        other => panic!("expected Subst with adjacent-# delimiter, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tr_hash_delimiter() {
+    let e = parse_expr_str("tr#a#b#;");
+    match &e.kind {
+        ExprKind::Translit(from, to, flags) => {
+            assert_eq!(from, "a");
+            assert_eq!(to, "b");
+            assert!(flags.is_none());
+        }
+        other => panic!("expected Translit with adjacent-# delimiter, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_q_space_hash_comment_regression() {
+    // Verified: with whitespace before it, the # is a comment; perl finds the delimiter on the next line.
+    assert_eq!(first_assign_str(&parse("my $x = q #comment\n(world);")), "world");
+}
+
+// ── `$#` on references ──────────────────────────────────────
+// Verified: perl accepts `$#$aref`, `$#{$aref}`, and the spaced block form as the last index of the referenced
+// array.
+
+#[test]
+fn arraylen_of_reference_forms() {
+    assert!(try_parse("my $n = $#$aref;").is_ok(), "$#$aref is the last index of @$aref");
+    assert!(try_parse("my $n = $#{$aref};").is_ok(), "$# with a block is the last index of the referenced array");
+    assert!(try_parse("my $n = $#{ $aref };").is_ok(), "the block form admits interior whitespace");
+}
+
+// ── Escape sequences ────────────────────────────────────────
+// All values verified against perl 5.38.2 and cross-checked against 5.42.2 dquote.c, which has identical scanning
+// rules for these forms.
+
+#[test]
+fn escape_octal_with_leading_zero() {
+    // \0 followed by octal digits continues the octal escape: "\015\012" is CRLF and "\05" is chr(5).
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\015\012";"#)), "\r\n");
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\05";"#)), "\u{5}");
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\00";"#)).len(), 1, "double-zero is a single NUL");
+}
+
+#[test]
+fn escape_octal_regressions() {
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\0";"#)), "\u{0}");
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\101";"#)), "A");
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\777";"#)), "\u{1ff}");
+}
+
+#[test]
+fn escape_x_brace_nonhex_consumes_to_brace() {
+    // 5.42.2 grok_bslash_x: a non-hex character inside the braces warns under -w ("Non-hex character 'G'
+    // terminates \x early") and the scan still consumes through the '}'.  Never fatal.  The result is chr(1)
+    // alone — the 'G' and the '}' must not be left behind as literal text.
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\x{1G}";"#)), "\u{1}");
+}
+
+#[test]
+fn escape_x_brace_blanks_and_underscores() {
+    // grok_bslash_x skips blanks adjacent to the braces and allows underscores between digits.  Verified: both
+    // forms give "A".
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\x{ 41 }";"#)), "A");
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\x{4_1}";"#)), "A");
+}
+
+#[test]
+fn escape_x_brace_empty_regression() {
+    // Verified: an empty brace pair is chr(0), non-fatal.
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\x{}";"#)), "\u{0}");
+}
+
+#[test]
+fn escape_x_bare_regressions() {
+    // Verified: \x with no hex digits is NUL; a following non-hex character stays literal.
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\xZ";"#)), "\u{0}Z");
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\x";"#)), "\u{0}");
+}
+
+#[test]
+fn escape_x_unterminated_brace_is_error() {
+    // Verified: perl fatals with "Missing right brace on \x{}" when the escape opens a brace that never closes.
+    assert!(try_parse(r#"my $x = "\x{1";"#).is_err(), "unterminated brace escape must be a parse error");
+}
+
+#[test]
+fn escape_o_error_forms() {
+    // Verified fatals: "Empty \o{}", "Missing right brace on \o{}", and "Missing braces on \o{}" for the bare form.
+    assert!(try_parse(r#"my $x = "\o{}";"#).is_err(), "empty braces are fatal for octal escapes");
+    assert!(try_parse(r#"my $x = "\o{1";"#).is_err(), "unterminated octal brace escape is fatal");
+    assert!(try_parse(r#"my $x = "\o7";"#).is_err(), "octal escape without braces is fatal");
+}
+
+#[test]
+fn escape_o_brace_nonoctal_consumes_to_brace() {
+    // Same rule as \x: the non-octal digit warns under -w and the scan consumes through the '}'.  Verified: chr(1).
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\o{19}";"#)), "\u{1}");
+}
+
+#[test]
+fn escape_c_trailing_is_error() {
+    // Verified: perl fatals with "Missing control char name in \c".
+    assert!(try_parse(r#"my $x = "ab\c";"#).is_err(), "trailing control escape must be a parse error");
+}
+
+#[test]
+fn escape_c_regressions() {
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\cA";"#)), "\u{1}");
+    assert_eq!(first_assign_str(&parse(r#"my $x = "\ca";"#)), "\u{1}");
+}
+
+#[test]
+fn escape_x_super_unicode_not_dropped() {
+    // Verified: perl accepts \x with code points above U+10FFFF (ord gives 1114112) and surrogates (55296), with
+    // warnings only.  Rust `char` cannot represent either, so the exact representation is a design.md §2.3
+    // concern; this test pins only that the character is not silently dropped from the literal.
+    let super_cp = assign_plain_str(r#"my $x = "\x{110000}";"#);
+    assert!(super_cp.is_none_or(|s| !s.is_empty()), "code point above Unicode must not be silently dropped");
+    let surrogate = assign_plain_str(r#"my $x = "\x{D800}";"#);
+    assert!(surrogate.is_none_or(|s| !s.is_empty()), "surrogate code point must not be silently dropped");
+}
+
+#[test]
+fn escape_x_brace_large_values() {
+    // The accumulator must widen past u32: \x with nine hex digits (2**32) is a valid perl code point (below
+    // UV_MAX) and must parse without overflow.  Beyond UV_MAX, 5.42.2 fatals via form_cp_too_large_msg.
+    let ok = try_parse(r#"my $x = "\x{100000000}";"#);
+    assert!(ok.is_ok(), "code point 2**32 is valid in perl and must not overflow the accumulator");
+    assert!(try_parse(r#"my $x = "\x{FFFFFFFFFFFFFFFFFF}";"#).is_err(), "code point beyond UV_MAX is fatal in perl");
+}
+
+#[test]
+fn escape_named_char_super_unicode() {
+    // Verified: perl resolves \N with U+110000 to the real code point 1114112 — it must not degrade to U+FFFD.
+    let s = assign_plain_str(r#"my $x = "\N{U+110000}";"#);
+    assert!(s.is_none_or(|s| !s.contains('\u{FFFD}')), "valid code point must not become the replacement character");
+}
+
+#[test]
+fn escape_close_delimiter_beats_standard_escape() {
+    // With an alphanumeric delimiter, a backslashed delimiter is the delimiter — the standard-escape meaning does
+    // not apply.  Verified: perl parses qq with delimiter n and body a\nb as "anb".
+    assert_eq!(first_assign_str(&parse(r"my $x = qq na\nbn;")), "anb");
+}
+
+// ── Interpolation of punctuation and digit variables ───────
+// Verified: perl interpolates $1 (and multi-digit $10), $&, $!, and $$ inside double-quoted strings, and "$$rx" is
+// the dereference of $rx.  The token/AST shape of the fix is free; the requirement is only that these do not
+// remain literal text.
+
+#[test]
+fn interp_special_variables_are_not_literal() {
+    assert!(!assign_str_has_literal_dollar(r#"my $x = "cap $1 end";"#), "$1 interpolates");
+    assert!(!assign_str_has_literal_dollar(r#"my $x = "pid $$ end";"#), "$$ interpolates as the PID");
+    assert!(!assign_str_has_literal_dollar(r#"my $x = "err $! end";"#), "$! interpolates");
+    assert!(!assign_str_has_literal_dollar(r#"my $x = "match $& end";"#), "$& interpolates");
+    assert!(!assign_str_has_literal_dollar(r#"my $x = "deref $$rx end";"#), "$$rx interpolates as a dereference");
+}
+
+// ── Numeric literal edges ───────────────────────────────────
+
+#[test]
+fn uv_range_integer_literals_parse() {
+    // Verified: perl accepts all three (printf %u round-trips them).  The values exceed i64, and the token model
+    // for UV-range integers is a pending design question — so this pins only that they lex and parse.
+    assert!(try_parse("my $x = 0xFFFFFFFFFFFFFFFF;").is_ok(), "UV_MAX hex literal is valid perl");
+    assert!(try_parse("my $x = 0x8000000000000000;").is_ok(), "IV_MAX + 1 hex literal is valid perl");
+    assert!(try_parse("my $x = 18446744073709551615;").is_ok(), "UV_MAX decimal literal is valid perl");
+}
+
+#[test]
+fn leading_zero_float_illegal_octal() {
+    // Verified: perl fatals with "Illegal octal digit '8'" — the leading zero commits to octal even when a
+    // fractional part follows.
+    assert!(try_parse("my $x = 08.5;").is_err(), "08.5 is an illegal octal literal in perl");
+    assert!(try_parse("my $x = 09;").is_err(), "09 is an illegal octal literal (regression)");
+}
+
+#[test]
+fn hex_float_requires_exponent_digits() {
+    // Verified: perl rejects 0x1p as a syntax error; 0x1p3 is 8.0.
+    assert!(try_parse("my $x = 0x1p;").is_err(), "hex float with a dangling p is a syntax error in perl");
+    match first_assign_rhs(&parse("my $x = 0x1p3;")).kind {
+        ExprKind::FloatLit(f) => assert!((f - 8.0).abs() < 1e-12, "0x1p3 is 8.0, got {f}"),
+        other => panic!("expected FloatLit for 0x1p3, got {other:?}"),
+    }
+}
+
+#[test]
+fn hex_float_long_mantissa_precision() {
+    // Verified: printf %.17g of this literal gives 0.066666666666666652 — extra mantissa digits round rather than
+    // zeroing the value.  The Rust literal below is that same double written at round-trip precision (perl confirms
+    // the two spellings compare equal), which keeps clippy::excessive_precision quiet.
+    match first_assign_rhs(&parse("my $x = 0x0.11111111111111111p0;")).kind {
+        ExprKind::FloatLit(f) => {
+            assert!((f - 0.066_666_666_666_666_65).abs() < 1e-15, "long hex mantissa must round, got {f}");
+        }
+        other => panic!("expected FloatLit, got {other:?}"),
+    }
+}
+
+// ── qw splits on ASCII whitespace only ──────────────────────
+
+#[test]
+fn qw_nbsp_is_not_a_separator() {
+    // Verified: under use utf8, qw with a NBSP between a and b yields one word — perl splits qw on ASCII
+    // whitespace only.
+    let rhs = first_assign_rhs(&parse("use utf8;\nmy @w = qw(a\u{a0}b);"));
+    match &rhs.kind {
+        ExprKind::QwList(words) => {
+            assert_eq!(words.len(), 1, "NBSP is not a qw separator");
+            assert_eq!(words[0], "a\u{a0}b");
+        }
+        other => panic!("expected QwList, got {other:?}"),
+    }
+}
+
+// ── Fat comma in argument lists ─────────────────────────────
+// Verified: perl accepts f(a => 1) with the bareword autoquoted; => is a comma everywhere a comma is legal.
+
+#[test]
+fn fat_comma_autoquotes_in_func_call_args() {
+    let e = parse_expr_str("f(a => 1);");
+    match &e.kind {
+        ExprKind::FuncCall(name, args) => {
+            assert_eq!(name, "main::f");
+            assert_eq!(args.len(), 2, "a => 1 is two arguments");
+            assert!(matches!(&args[0].kind, ExprKind::StringLit(s) if s == "a"), "bareword key autoquotes, got {:?}", args[0].kind);
+            assert!(matches!(args[1].kind, ExprKind::IntLit(1)), "value follows, got {:?}", args[1].kind);
+        }
+        other => panic!("expected FuncCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn fat_comma_multiple_pairs_in_call_args() {
+    let e = parse_expr_str("f(a => 1, b => 2);");
+    match &e.kind {
+        ExprKind::FuncCall(_, args) => assert_eq!(args.len(), 4, "two pairs are four arguments"),
+        other => panic!("expected FuncCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn fat_comma_in_method_call_args() {
+    let e = parse_expr_str("$o->m(a => 1);");
+    match &e.kind {
+        ExprKind::MethodCall(_, _, args) | ExprKind::ArrowDeref(_, ArrowTarget::MethodCall(_, args)) => {
+            assert_eq!(args.len(), 2, "a => 1 is two arguments in a method call");
+        }
+        other => panic!("expected a method call, got {other:?}"),
+    }
+}
+
+#[test]
+fn fat_comma_in_amp_and_coderef_calls() {
+    let e = parse_expr_str("&f(a => 1);");
+    match &e.kind {
+        ExprKind::FuncCall(_, args) => assert_eq!(args.len(), 2, "a => 1 is two arguments in an & call"),
+        other => panic!("expected FuncCall for &f, got {other:?}"),
+    }
+    assert!(try_parse("my $c; $c->(a => 1);").is_ok(), "fat comma is valid in coderef call arguments");
+}
+
+// ── Slices on dereferences ──────────────────────────────────
+// Verified: perl accepts array, hash, and key/value slices on both the sigil-$var and sigil-block deref spellings.
+// The receiver shape is pinned only as far as "a Deref node" — the sigil it carries is a design choice.
+
+#[test]
+fn array_slices_on_dereferences() {
+    let e = parse_expr_str("@$aref[0];");
+    match &e.kind {
+        ExprKind::ArraySlice(recv, idx) => {
+            assert_eq!(idx.len(), 1);
+            assert!(matches!(recv.kind, ExprKind::Deref(_, _)), "receiver is a deref, got {:?}", recv.kind);
+        }
+        other => panic!("expected ArraySlice, got {other:?}"),
+    }
+
+    let e = parse_expr_str("@$aref[0, 1];");
+    match &e.kind {
+        ExprKind::ArraySlice(_, idx) => assert_eq!(idx.len(), 2),
+        other => panic!("expected ArraySlice, got {other:?}"),
+    }
+
+    let e = parse_expr_str("@{$aref}[1];");
+    match &e.kind {
+        ExprKind::ArraySlice(recv, idx) => {
+            assert_eq!(idx.len(), 1);
+            assert!(matches!(recv.kind, ExprKind::Deref(_, _)), "receiver is a deref, got {:?}", recv.kind);
+        }
+        other => panic!("expected ArraySlice on block deref, got {other:?}"),
+    }
+}
+
+#[test]
+fn hash_and_kv_slices_on_dereferences() {
+    let e = parse_expr_str("@$h{'k'};");
+    match &e.kind {
+        ExprKind::HashSlice(recv, keys) => {
+            assert_eq!(keys.len(), 1);
+            assert!(matches!(recv.kind, ExprKind::Deref(_, _)), "receiver is a deref, got {:?}", recv.kind);
+        }
+        other => panic!("expected HashSlice, got {other:?}"),
+    }
+
+    let e = parse_expr_str("@{$h}{'a', 'b'};");
+    match &e.kind {
+        ExprKind::HashSlice(_, keys) => assert_eq!(keys.len(), 2),
+        other => panic!("expected HashSlice on block deref, got {other:?}"),
+    }
+
+    let e = parse_expr_str("%$h{'k'};");
+    match &e.kind {
+        ExprKind::KvHashSlice(recv, keys) => {
+            assert_eq!(keys.len(), 1);
+            assert!(matches!(recv.kind, ExprKind::Deref(_, _)), "receiver is a deref, got {:?}", recv.kind);
+        }
+        other => panic!("expected KvHashSlice, got {other:?}"),
+    }
+}
+
+// ── Double bit-not in term position ─────────────────────────
+
+#[test]
+fn double_tilde_is_two_complements() {
+    // Verified: perl parses ~~@a in term position as two bitwise complements (numifying @a); smartmatch is
+    // infix-only and cannot appear here.
+    let rhs = first_assign_rhs(&parse("my $n = ~~@a;"));
+    match &rhs.kind {
+        ExprKind::UnaryOp(UnaryOp::BitNot, inner) => match &inner.kind {
+            ExprKind::UnaryOp(UnaryOp::BitNot, arr) => {
+                assert!(matches!(&arr.kind, ExprKind::ArrayVar(n) if n == "a"), "innermost operand is @a, got {:?}", arr.kind);
+            }
+            other => panic!("expected inner BitNot, got {other:?}"),
+        },
+        other => panic!("expected outer BitNot, got {other:?}"),
+    }
+}
+
+// ── Lvalue built-ins and ternary ────────────────────────────
+// Verified: all five forms assign successfully in perl 5.38.2.
+
+#[test]
+fn lvalue_builtin_and_ternary_forms() {
+    assert!(try_parse(r#"my $s = "ab"; substr($s, 0, 1) = "X";"#).is_ok(), "substr is an lvalue");
+    assert!(try_parse("my $s; pos($s) = 0;").is_ok(), "pos is an lvalue");
+    assert!(try_parse("my %h; keys(%h) = 64;").is_ok(), "keys is an lvalue (bucket presize)");
+    assert!(try_parse("my $v; vec($v, 0, 8) = 65;").is_ok(), "vec is an lvalue");
+    assert!(try_parse("my ($c, $x, $y); ($c ? $x : $y) = 9;").is_ok(), "a ternary of lvalues is an lvalue");
+}
+
+// ── `&foo;` is distinct from `foo();` ───────────────────────
+
+#[test]
+fn amp_call_is_distinct_from_plain_call() {
+    // `&foo;` reuses the caller's @_ and bypasses prototypes; `foo();` passes an empty list.  The AST must record
+    // the difference somehow — this compares Debug renderings so it stays agnostic about which marker design is
+    // chosen.  Zero-argument forms are used so child spans cannot differ.
+    let plain = parse_expr_str("foo();");
+    let amp = parse_expr_str("&foo;");
+    assert_ne!(format!("{:?}", plain.kind), format!("{:?}", amp.kind), "&foo must be distinguishable from foo() in the AST");
+}
+
+// ── Braced scalar identifiers ───────────────────────────────
+// Verified: under strict, perl reads ${ foo } as $foo (whitespace inside the braces is fine), and under use utf8
+// the same holds for Unicode identifiers.
+
+#[test]
+fn braced_scalar_ident_with_spaces() {
+    let e = parse_expr_str("${ foo };");
+    match &e.kind {
+        ExprKind::ScalarVar(name) => assert_eq!(name, "foo"),
+        other => panic!("expected ScalarVar for spaced braced ident, got {other:?}"),
+    }
+}
+
+#[test]
+fn braced_scalar_unicode_ident() {
+    let rhs = first_assign_rhs(&parse("use utf8;\nmy $x = ${\u{e9}};"));
+    assert!(matches!(&rhs.kind, ExprKind::ScalarVar(n) if n == "\u{e9}"), "expected ScalarVar for Unicode braced ident, got {:?}", rhs.kind);
+
+    let rhs = first_assign_rhs(&parse("use utf8;\nmy $x = ${ \u{e9} };"));
+    assert!(matches!(&rhs.kind, ExprKind::ScalarVar(n) if n == "\u{e9}"), "expected ScalarVar for spaced Unicode braced ident, got {:?}", rhs.kind);
+}
+
+#[test]
+fn braced_scalar_tight_regression() {
+    let e = parse_expr_str("${bar};");
+    match &e.kind {
+        ExprKind::ScalarVar(name) => assert_eq!(name, "bar"),
+        other => panic!("expected ScalarVar, got {other:?}"),
+    }
+}
+
+// ── V-strings do not continue across newlines ───────────────
+
+#[test]
+fn vstring_does_not_continue_across_newline() {
+    // Verified: perl parses v5 followed by a newline and .26 as chr(5) . 26 — %vd shows 5.50.54, i.e. the string
+    // chr(5), "2", "6".  The fat-comma probe must not splice the next line into the v-string.
+    let rhs = first_assign_rhs(&parse("my $v = v5\n.26;"));
+    match &rhs.kind {
+        ExprKind::BinOp(BinOp::Concat, left, _) => {
+            assert!(matches!(left.kind, ExprKind::VersionLit(_)), "left operand is the bare v5 v-string, got {:?}", left.kind);
+        }
+        other => panic!("expected concatenation across the newline, got {other:?}"),
+    }
+}
+
+#[test]
+fn vstring_same_line_regression() {
+    // Verified: v5.26 on one line is a single v-string (%vd gives 5.26).
+    let rhs = first_assign_rhs(&parse("my $v = v5.26;"));
+    assert!(matches!(rhs.kind, ExprKind::VersionLit(_)), "expected VersionLit, got {:?}", rhs.kind);
+}
+
+// ── Non-UTF-8 sources keep byte semantics ───────────────────
+
+#[test]
+fn non_utf8_source_bytes_are_characters() {
+    // Without use utf8, each source byte is a character.  The two bytes 0xC3 0xA9 (UTF-8 for e-acute) must stay
+    // two characters U+00C3 U+00A9, not decode to one — perl gives length 5 for this literal.
+    let mut parser = Parser::new(b"my $x = q(caf\xc3\xa9);\n").unwrap();
+    let prog = parser.parse_program().unwrap();
+    let s = first_assign_str(&prog);
+    assert_eq!(s.chars().count(), 5, "bytes must not be UTF-8 decoded without use utf8");
+    assert_eq!(s, "caf\u{c3}\u{a9}");
+}
+
+// ── x-operator split must rewind by source length ───────────
+
+#[test]
+fn x_operator_split_rewind_nfd() {
+    // The identifier x5e-combining-acute is 5 source bytes but its NFC form is 4; the x-operator split must rewind
+    // using the source length or it silently drops the count digit.  Perl rejects this as a syntax error (verified
+    // via the ASCII analog: $a x5z is "Bareword found where operator expected").
+    assert!(try_parse("use utf8;\nmy $b = $a x5e\u{301};").is_err(), "x-split with an NFD identifier must not silently drop the digit");
+}
+
+// ── Heredoc tag with an unterminated quote ──────────────────
+
+#[test]
+fn heredoc_unterminated_quoted_tag_is_error_regression() {
+    // Verified: perl fatals with "Unterminated delimiter for here document".  PerlOxide also errors today (the
+    // terminator is never found); this pins that the failure stays an error rather than silently taking the rest
+    // of the line as the tag.
+    assert!(try_parse("my $x = <<\"TAG;\nbody\nTAG\n").is_err(), "heredoc tag with an unterminated quote is fatal in perl");
+}
+
+// ── POD inside interpolated code in heredoc bodies ──────────
+// Constant body text is never POD, but an interpolation re-lexes its contents as code, and yylex's POD gate
+// (5.42.2 toke.c, case '=': PL_expect == XSTATE, isALPHA next, at line start) fires against the *sublexed buffer*.
+// In the sublex state the skip is the bounded branch — scan forward within the frame for a line beginning =cut —
+// not the file-level in_pod mode.  For <<~ the indentation strip runs at collection, before the sublex, so
+// indented directives become line-start text by the time the inner lexer sees them; column-0 directives never get
+// that far because the strip pass croaks on them first.  All four cases verified on perl 5.38.2 (the accepted
+// forms print 4).
+
+#[test]
+fn pod_in_interpolated_code_indented_heredoc() {
+    // Directives indented to match the terminator survive collection, are de-indented by the strip, and are then
+    // skipped as POD by the inner code lexer — the do block is 5; then +4.
+    let src = "my $x = <<~END;\n    @{[do {\n    5;\n    =pod\n    doc\n    =cut\n    +4}]}\n    END\n";
+    assert!(try_parse(src).is_ok(), "indented POD inside an interpolation is skipped after the <<~ strip");
+}
+
+#[test]
+fn pod_in_interpolated_code_plain_heredoc() {
+    // With no strip, the directives must sit at column 0 of the source to be at line start in the sublex buffer.
+    let src = "my $x = <<END;\n@{[do {\n5;\n=pod\ndoc\n=cut\n+4}]}\nEND\n";
+    assert!(try_parse(src).is_ok(), "column-0 POD inside an interpolation is skipped in a plain heredoc");
+}
+
+#[test]
+fn pod_indented_in_plain_heredoc_interpolation_is_code() {
+    // Without the strip, an indented directive is not at line start; the = lexes as an operator and the construct
+    // is a syntax error (perl: syntax error near the =).
+    let src = "my $x = <<END;\n@{[do {\n5;\n  =pod\ndoc\n  =cut\n+4}]}\nEND\n";
+    assert!(try_parse(src).is_err(), "indented POD in a plain heredoc interpolation is ordinary (broken) code");
+}
+
+#[test]
+fn pod_at_column_zero_in_indented_heredoc_croaks_regression() {
+    // The strip pass runs at collection, oblivious to the open interpolation, and croaks on the column-0 lines
+    // before the inner lexer could ever recognize them as POD.
+    let src = "my $x = <<~END;\n    @{[do {\n    5;\n=pod\ndoc\n=cut\n    +4}]}\n    END\n";
+    assert!(try_parse(src).is_err(), "column-0 lines inside <<~ are an indentation croak even inside an interpolation");
+}

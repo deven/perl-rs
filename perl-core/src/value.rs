@@ -1184,4 +1184,76 @@ mod tests {
         // String: "10" lt "9" (lexicographic: "1" < "9")
         assert!(Value::from("10").str_lt(&Value::from("9")));
     }
+
+    // ── Modulo follows the right operand's sign (verified against perl 5.38.2) ─────
+
+    #[test]
+    fn modulo_takes_sign_of_right_operand() {
+        // perl: -7 % 3 == 2 and 7 % -3 == -2 (result lies in [0, rhs) for positive rhs, (rhs, 0] for negative).
+        // Rust's `%` truncates toward zero and gives -1 and 1 respectively.
+        assert!(matches!(Value::Int(-7).modulo(&Value::Int(3)), Value::Int(2)));
+        assert!(matches!(Value::Int(7).modulo(&Value::Int(-3)), Value::Int(-2)));
+    }
+
+    #[test]
+    fn modulo_both_negative_regression() {
+        // perl: -7 % -3 == -1 (Rust's truncating `%` happens to agree here).
+        assert!(matches!(Value::Int(-7).modulo(&Value::Int(-3)), Value::Int(-1)));
+        assert!(matches!(Value::Int(7).modulo(&Value::Int(3)), Value::Int(1)));
+    }
+
+    #[test]
+    fn modulo_int_min_by_negative_one() {
+        // perl: -9223372036854775808 % -1 == 0.  Rust's `%` on (i64::MIN, -1) is an arithmetic overflow — this must
+        // not panic.
+        assert!(matches!(Value::Int(i64::MIN).modulo(&Value::Int(-1)), Value::Int(0)));
+    }
+
+    // ── <=> with NaN yields undef (verified against perl 5.38.2) ─────
+
+    #[test]
+    fn num_cmp_with_nan_is_undef() {
+        // perl: (NaN <=> 1) is undef, not 0.
+        assert!(matches!(Value::Float(f64::NAN).num_cmp(&Value::Int(1)), Value::Undef));
+        assert!(matches!(Value::Int(1).num_cmp(&Value::Float(f64::NAN)), Value::Undef));
+    }
+
+    #[test]
+    fn num_cmp_ordinary_regressions() {
+        assert!(matches!(Value::Int(1).num_cmp(&Value::Int(2)), Value::Int(-1)));
+        assert!(matches!(Value::Int(2).num_cmp(&Value::Int(1)), Value::Int(1)));
+        assert!(matches!(Value::Int(2).num_cmp(&Value::Int(2)), Value::Int(0)));
+    }
+
+    // ── Hash in scalar context is the key count since 5.26 (verified against perl 5.38.2) ─────
+
+    #[test]
+    fn hash_stringifies_to_key_count() {
+        // perl 5.26+: scalar(%h) is the number of keys — the "N/M" bucket form is gone.  Verified: a two-key hash
+        // gives "2".
+        let mut map = HashMap::new();
+        map.insert(PerlString::from_str("a"), Value::Int(1));
+        map.insert(PerlString::from_str("b"), Value::Int(2));
+        let hv = Arc::new(RwLock::new(map));
+        assert_eq!(Value::Hash(hv).stringify().as_bytes(), b"2");
+    }
+
+    #[test]
+    fn empty_hash_stringifies_to_zero_regression() {
+        let hv = Arc::new(RwLock::new(HashMap::new()));
+        assert_eq!(Value::Hash(hv).stringify().as_bytes(), b"0");
+    }
+
+    // ── A ref held in a full Scalar behaves like the compact Value::Ref ─────
+
+    #[test]
+    fn scalar_held_ref_stringifies_and_numifies() {
+        // Value::Ref gives "SCALAR(0xADDR)" and a nonzero address; the same reference living inside a full Scalar
+        // (as after an upgrade for magic/blessing) must not degrade to "" and 0.
+        let inner = crate::scalar::Scalar::from_ref(Value::Int(5));
+        let v = Value::Scalar(Arc::new(RwLock::new(inner)));
+        let ps = v.stringify();
+        assert!(ps.as_bytes().starts_with(b"SCALAR(0x"), "expected SCALAR(0x...) form, got {:?}", String::from_utf8_lossy(ps.as_bytes()));
+        assert_ne!(v.coerce_to_int(), 0, "a reference numifies to its address");
+    }
 }

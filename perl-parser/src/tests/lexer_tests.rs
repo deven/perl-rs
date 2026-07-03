@@ -2597,3 +2597,55 @@ fn apos_scan_ident_stops_at_close_delimiter() {
     );
     assert!(tokens.iter().any(|t| matches!(t, Token::Ident(s) if s == "bar")), "expected Ident(bar) after close delimiter, got: {:?}", tokens);
 }
+
+// ── Adjacent-# quote delimiters ────────────────────────────
+// Perl's rule (toke.c scan_str, verified against perl 5.38.2): a `#` immediately adjacent to a quote-like operator is
+// the delimiter; a `#` after whitespace begins a comment.  `read_quote_delimiter` implements this correctly, but the
+// bytes must survive until it runs.
+
+#[test]
+fn lex_q_hash_delimiter() {
+    // Verified: perl parses q#hello# as the string "hello".
+    let tokens = lex_all("q#hello#;");
+    assert_eq!(tokens, vec![Token::StrLit("hello".into()), Token::Semi], "adjacent # is the q delimiter, not a comment");
+}
+
+#[test]
+fn lex_q_space_hash_is_comment_regression() {
+    // Verified: perl treats the # after whitespace as a comment and finds the delimiter on the next line —
+    // q #c(newline)(world) is the string "world".
+    let tokens = lex_all("q #comment\n(world);");
+    assert_eq!(tokens, vec![Token::StrLit("world".into()), Token::Semi]);
+}
+
+// ── `$$` token boundary ─────────────────────────────────────
+// Perl's rule (toke.c, verified against perl 5.38.2): after `$$`, only an identifier start, '{', or another `$`
+// makes it a dereference prefix; any other following byte means the PID variable.  Verified: `print $$."\n"` prints
+// the pid, and `$$==$$` is a pid comparison.
+
+#[test]
+fn lex_pid_before_semicolon() {
+    let tokens = lex_all("$$;");
+    assert_eq!(tokens, vec![Token::SpecialVar("$".into()), Token::Semi], "$$ before ; is the PID variable");
+}
+
+#[test]
+fn lex_pid_before_numeric_equality() {
+    let tokens = lex_all("$$==5");
+    assert_eq!(tokens, vec![Token::SpecialVar("$".into()), Token::NumEq, Token::IntLit(5)], "$$ before == is the PID variable");
+}
+
+#[test]
+fn lex_pid_before_comma() {
+    let tokens = lex_all("$$,1");
+    assert_eq!(tokens, vec![Token::SpecialVar("$".into()), Token::Comma, Token::IntLit(1)], "$$ before , is the PID variable");
+}
+
+#[test]
+fn lex_dollar_dollar_deref_regressions() {
+    // Identifier start, '{', or '$' after `$$` is a deref chain — these must stay Dollar-prefixed.
+    assert_eq!(lex_all("$$x"), vec![Token::Dollar, Token::ScalarVar("x".into())]);
+    assert_eq!(lex_all("$$$rr"), vec![Token::Dollar, Token::Dollar, Token::ScalarVar("rr".into())]);
+    // Whitespace after `$$` is PID today and must stay so.
+    assert_eq!(lex_all("$$ ;"), vec![Token::SpecialVar("$".into()), Token::Semi]);
+}

@@ -480,10 +480,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_iv_hex_and_binary() {
-        assert_eq!(PerlString::from_str("0xff").parse_iv(), 255);
-        assert_eq!(PerlString::from_str("0b1010").parse_iv(), 10);
-        assert_eq!(PerlString::from_str("-0xff").parse_iv(), -255);
+    fn parse_iv_ignores_radix_prefixes() {
+        // Perl's string-to-number conversion does NOT interpret 0x/0b prefixes — only literals and hex()/oct() do.
+        // Verified: perl 5.38.2 gives ("0xff"+0) == 0 and ("0b101"+0) == 0; numification parses the leading "0" and
+        // stops at the 'x'/'b'.
+        assert_eq!(PerlString::from_str("0xff").parse_iv(), 0);
+        assert_eq!(PerlString::from_str("0b1010").parse_iv(), 0);
+        assert_eq!(PerlString::from_str("-0xff").parse_iv(), 0);
     }
 
     #[test]
@@ -589,5 +592,31 @@ mod tests {
     fn from_bytes_accepts_static_slice() {
         let s = PerlString::from_bytes(&b"static"[..]);
         assert_eq!(s.as_bytes(), b"static");
+    }
+
+    // ── Numification edges (verified against perl 5.38.2) ─────
+
+    #[test]
+    fn parse_nv_dangling_exponent_backtracks() {
+        // Perl numifies "1e" and "1e+" as 1: the exponent marker without digits is not part of the number.
+        // Verified: perl gives ("1e"+0) == 1 and ("1e+"+0) == 1.
+        assert!((PerlString::from_str("1e").parse_nv() - 1.0).abs() < f64::EPSILON);
+        assert!((PerlString::from_str("1e+").parse_nv() - 1.0).abs() < f64::EPSILON);
+        assert!((PerlString::from_str("2.5E-").parse_nv() - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_nv_integer_beyond_iv_range() {
+        // Perl numifies "9223372036854775808" (IV_MAX + 1) via NV.  Verified: perl gives 9.22337203685478e+18.
+        let nv = PerlString::from_str("9223372036854775808").parse_nv();
+        assert!((nv - 9.223372036854776e18).abs() < 1e4, "expected ~9.223372036854776e18, got {nv}");
+    }
+
+    #[test]
+    fn parse_iv_integer_beyond_iv_range_is_not_zero() {
+        // The IV result for an out-of-IV-range decimal string is operation-dependent in perl (printf %d gives the
+        // wrapped cast, bitwise ops go through UV), but it is never 0.  The exact contract belongs to a design
+        // section; this pins the one certainly-wrong answer.
+        assert_ne!(PerlString::from_str("9223372036854775808").parse_iv(), 0);
     }
 }
