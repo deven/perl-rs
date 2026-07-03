@@ -17205,8 +17205,8 @@ fn escape_c_regressions() {
 #[test]
 fn escape_x_super_unicode_not_dropped() {
     // Verified: perl accepts \x with code points above U+10FFFF (ord gives 1114112) and surrogates (55296), with
-    // warnings only.  Rust `char` cannot represent either, so the exact representation is a design.md §2.3
-    // concern; this test pins only that the character is not silently dropped from the literal.
+    // warnings only.  Rust `char` cannot represent either, so the exact representation is a design.md §2.3.2
+    // (extended UTF-8) concern; this test pins only that the character is not silently dropped from the literal.
     let super_cp = assign_plain_str(r#"my $x = "\x{110000}";"#);
     assert!(super_cp.is_none_or(|s| !s.is_empty()), "code point above Unicode must not be silently dropped");
     let surrogate = assign_plain_str(r#"my $x = "\x{D800}";"#);
@@ -17270,6 +17270,20 @@ fn leading_zero_float_illegal_octal() {
 }
 
 #[test]
+fn leading_zero_octal_then_dot_is_concat() {
+    // Verified: perl deparses `my $x = 01.5;` to `my $x = '15';` — the leading-zero run is the octal integer 01,
+    // and the dot is the concatenation operator, not a decimal point.
+    let rhs = first_assign_rhs(&parse("my $x = 01.5;"));
+    match &rhs.kind {
+        ExprKind::BinOp(BinOp::Concat, l, r) => {
+            assert!(matches!(l.kind, ExprKind::IntLit(1)), "left of the concat is octal 01, got {:?}", l.kind);
+            assert!(matches!(r.kind, ExprKind::IntLit(5)), "right of the concat is 5, got {:?}", r.kind);
+        }
+        other => panic!("expected Concat of IntLit(1) and IntLit(5) for 01.5, got {other:?}"),
+    }
+}
+
+#[test]
 fn hex_float_requires_exponent_digits() {
     // Verified: perl rejects 0x1p as a syntax error; 0x1p3 is 8.0.
     assert!(try_parse("my $x = 0x1p;").is_err(), "hex float with a dangling p is a syntax error in perl");
@@ -17304,6 +17318,17 @@ fn qw_nbsp_is_not_a_separator() {
             assert_eq!(words.len(), 1, "NBSP is not a qw separator");
             assert_eq!(words[0], "a\u{a0}b");
         }
+        other => panic!("expected QwList, got {other:?}"),
+    }
+}
+
+#[test]
+fn qw_vertical_tab_is_a_separator() {
+    // Verified: qw with a vertical tab (0x0B) between a and b yields two words — perl's isSPACE set includes VT,
+    // which Rust's `is_ascii_whitespace` does not (regression guard for the explicit split set).
+    let rhs = first_assign_rhs(&parse("my @w = qw(a\u{b}b);"));
+    match &rhs.kind {
+        ExprKind::QwList(words) => assert_eq!(words, &["a", "b"], "VT separates qw words"),
         other => panic!("expected QwList, got {other:?}"),
     }
 }

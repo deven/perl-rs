@@ -1149,6 +1149,16 @@ impl Parser {
                 Ok(())
             }
 
+            // `~~` in term position is two bitwise complements — smartmatch is infix-only, so a term-position
+            // `~~@a` numifies the array twice over (perl prints the element count, verified 5.38.2).  Split like
+            // `//` above: keep one `~` and rewind the other for re-lexing.
+            Token::SmartMatch => {
+                let start = self.tok.span.start;
+                self.rewind(1);
+                self.tok = Spanned { token: Token::Tilde, span: Span::new(start, start + 1) };
+                Ok(())
+            }
+
             // `=word` at column 0 in term position is NOT POD — it's the `=` operator followed by a bareword.
             // The `=` was already consumed by `lex_normal_token`; the next byte is alpha, so `Assign(Eq)` is the
             // only possible interpretation.
@@ -1177,7 +1187,10 @@ impl Parser {
             && s.as_bytes()[1].is_ascii_digit()
         {
             let start = self.tok.span.start;
-            let rewind = s.len() - 1;
+            // Rewind by the ident's source byte length from the span, not the NFC string's length: under `use utf8`
+            // the two differ when normalization contracts a combining sequence, and an NFC-based distance lands
+            // mid-ident and silently drops source bytes (an NFD `x5e` + combining acute lost the `5`).
+            let rewind = (self.tok.span.end - self.tok.span.start) as usize - 1;
             self.rewind(rewind);
             self.tok = Spanned { token: Token::Keyword(Keyword::X), span: Span::new(start, start + 1) };
             return Ok(());
@@ -1408,6 +1421,15 @@ impl Parser {
         // Decimal integer or float
         self.scan_digits();
 
+        // A multi-digit run with a leading zero is an octal integer, and in perl the run commits the literal: a
+        // following `.` is the concatenation operator (`01.5` deparses to '15') and a following `e` starts a
+        // bareword (`01e2` is a syntax error) — both verified 5.38.2.  Only the `p`-exponent legacy octal float
+        // (`07.65p2`, also verified) continues past the run.
+        let int_octal = {
+            let s = self.line_slice_str(start)?;
+            s.len() > 1 && s.starts_with('0')
+        };
+
         if self.peek_byte() == Some(b'.') && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_digit() || b == b'_') {
             // Before committing to float: check if this is a v-string without the `v` prefix.  If there are 2+ dots
             // (e.g. 102.111.111), it's a v-string per perldata.
@@ -1443,10 +1465,19 @@ impl Parser {
             if (self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P')) && self.line_slice_str(start)?.starts_with('0') {
                 let int_s = self.line_slice_str(start)?.split('.').next().unwrap_or("0").replace('_', "");
                 let frac_s = self.line_slice_str(frac_start)?.replace('_', "");
-                let exp = self.scan_p_exponent();
-                let int_val = u64::from_str_radix(&int_s, 8).unwrap_or(0) as f64;
-                let frac_val = if frac_s.is_empty() { 0.0 } else { u64::from_str_radix(&frac_s, 8).unwrap_or(0) as f64 / 8f64.powi(frac_s.len() as i32) };
+                let exp = self.scan_p_exponent()?;
+                let int_val = Self::fold_radix_f64(&int_s, 8);
+                let frac_val = if frac_s.is_empty() { 0.0 } else { Self::fold_radix_f64(&frac_s, 8) / 8f64.powi(frac_s.len() as i32) };
                 return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
+            }
+
+            if int_octal {
+                // Octal run followed by `.` without a `p` exponent: the number ends at the run, and the dot lexes
+                // as concatenation on the next pass.
+                if let Some(line) = self.line.as_mut() {
+                    line.pos = saved_pos as u32;
+                }
+                return self.finish_integer_literal(start);
             }
 
             self.scan_exponent();
@@ -1455,6 +1486,11 @@ impl Parser {
             let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
             Ok(Token::FloatLit(n))
         } else if self.peek_byte() == Some(b'e') || self.peek_byte() == Some(b'E') {
+            if int_octal {
+                // Octal run followed by `e`: the number ends at the run, and the `e...` lexes as a bareword on the
+                // next pass (a syntax error downstream, as in perl).
+                return self.finish_integer_literal(start);
+            }
             // Float with exponent
             self.scan_exponent();
             let s = self.line_slice_str(start)?;
@@ -1462,22 +1498,27 @@ impl Parser {
             let n: f64 = s.parse().map_err(|_| ParseError::new("invalid float literal", self.span_from(start)))?;
             Ok(Token::FloatLit(n))
         } else {
-            // Integer
-            let s = self.line_slice_str(start)?;
-            let s = s.replace('_', "");
+            self.finish_integer_literal(start)
+        }
+    }
 
-            // Leading zero means octal in Perl 5.
-            if s.len() > 1 && s.starts_with('0') {
-                // Check for illegal octal digits (8, 9).
-                if let Some(bad) = s.bytes().skip(1).find(|b| *b == b'8' || *b == b'9') {
-                    return Err(ParseError::new(format!("Illegal octal digit '{}'", bad as char), self.span_from(start)));
-                }
-                let n = i64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
-                Ok(Token::IntLit(n))
-            } else {
-                let n: i64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", self.span_from(start)))?;
-                Ok(Token::IntLit(n))
+    /// Finish a decimal-scanned digit run as an integer literal: a multi-digit run with a leading zero is octal
+    /// (with 8 and 9 fatal, matching perl's "Illegal octal digit"), anything else is decimal.
+    fn finish_integer_literal(&mut self, start: usize) -> Result<Token, ParseError> {
+        let s = self.line_slice_str(start)?;
+        let s = s.replace('_', "");
+
+        // Leading zero means octal in Perl 5.
+        if s.len() > 1 && s.starts_with('0') {
+            // Check for illegal octal digits (8, 9).
+            if let Some(bad) = s.bytes().skip(1).find(|b| *b == b'8' || *b == b'9') {
+                return Err(ParseError::new(format!("Illegal octal digit '{}'", bad as char), self.span_from(start)));
             }
+            let n = i64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
+            Ok(Token::IntLit(n))
+        } else {
+            let n: i64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", self.span_from(start)))?;
+            Ok(Token::IntLit(n))
         }
     }
 
@@ -1501,9 +1542,11 @@ impl Parser {
         }
     }
 
-    /// Scan a `p`/`P` power-of-2 exponent for hex/octal/binary floats.  Assumes the cursor is on `p` or `P`.  Returns
-    /// the signed exponent.
-    fn scan_p_exponent(&mut self) -> i32 {
+    /// Scan a `p`/`P` power-of-2 exponent for hex/octal/binary floats.  Assumes the cursor is on `p` or `P`.  At
+    /// least one digit is required: perl rejects a dangling `p` (`0x1p` is a syntax error, verified 5.38.2), so an
+    /// empty exponent is a parse error rather than a silent zero.  Returns the signed exponent.
+    fn scan_p_exponent(&mut self) -> Result<i32, ParseError> {
+        let p_start = self.line_pos();
         self.skip(1); // skip p/P
         let neg = if self.peek_byte() == Some(b'-') {
             self.skip(1);
@@ -1518,9 +1561,19 @@ impl Parser {
         while self.peek_byte().is_some_and(|b| b.is_ascii_digit()) {
             self.skip(1);
         }
-        let exp_s = std::str::from_utf8(self.line_slice(exp_start)).unwrap_or("0");
+        let exp_s = std::str::from_utf8(self.line_slice(exp_start)).unwrap_or("");
+        if exp_s.is_empty() {
+            return Err(ParseError::new("'p' exponent requires at least one digit", self.span_from(p_start)));
+        }
         let exp: i32 = exp_s.parse().unwrap_or(0);
-        if neg { -exp } else { exp }
+        Ok(if neg { -exp } else { exp })
+    }
+
+    /// Fold radix digits into an `f64` the way perl accumulates hex/octal/binary float mantissas (`nv = nv * radix +
+    /// digit`): a mantissa longer than a fixed-width integer rounds instead of degrading to zero — a 17-hex-digit
+    /// fraction rounds to the nearest double, matching perl's %.17g output (verified 5.38.2).
+    fn fold_radix_f64(digits: &str, radix: u32) -> f64 {
+        digits.chars().fold(0f64, |acc, c| acc * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0)))
     }
 
     fn lex_hex(&mut self) -> Result<Token, ParseError> {
@@ -1553,18 +1606,18 @@ impl Parser {
             if self.peek_byte() != Some(b'p') && self.peek_byte() != Some(b'P') {
                 return Err(ParseError::new("hex float requires 'p' exponent", self.span_from(start)));
             }
-            let exp = self.scan_p_exponent();
+            let exp = self.scan_p_exponent()?;
 
-            let int_val = u64::from_str_radix(&int_str, 16).unwrap_or(0) as f64;
-            let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 16).unwrap_or(0) as f64 / 16f64.powi(frac_str.len() as i32) };
+            let int_val = Self::fold_radix_f64(&int_str, 16);
+            let frac_val = if frac_str.is_empty() { 0.0 } else { Self::fold_radix_f64(&frac_str, 16) / 16f64.powi(frac_str.len() as i32) };
             let val = (int_val + frac_val) * 2f64.powi(exp);
             return Ok(Token::FloatLit(val));
         }
 
         // Check for hex float without fraction: 0xHHpEE
         if self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P') {
-            let exp = self.scan_p_exponent();
-            let int_val = u64::from_str_radix(&int_str, 16).unwrap_or(0) as f64;
+            let exp = self.scan_p_exponent()?;
+            let int_val = Self::fold_radix_f64(&int_str, 16);
             let val = int_val * 2f64.powi(exp);
             return Ok(Token::FloatLit(val));
         }
@@ -1604,14 +1657,14 @@ impl Parser {
             if self.peek_byte() != Some(b'p') && self.peek_byte() != Some(b'P') {
                 return Err(ParseError::new("binary float requires 'p' exponent", self.span_from(start)));
             }
-            let exp = self.scan_p_exponent();
-            let int_val = u64::from_str_radix(&bin_str, 2).unwrap_or(0) as f64;
-            let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 2).unwrap_or(0) as f64 / 2f64.powi(frac_str.len() as i32) };
+            let exp = self.scan_p_exponent()?;
+            let int_val = Self::fold_radix_f64(&bin_str, 2);
+            let frac_val = if frac_str.is_empty() { 0.0 } else { Self::fold_radix_f64(&frac_str, 2) / 2f64.powi(frac_str.len() as i32) };
             return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
         }
         if self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P') {
-            let exp = self.scan_p_exponent();
-            let int_val = u64::from_str_radix(&bin_str, 2).unwrap_or(0) as f64;
+            let exp = self.scan_p_exponent()?;
+            let int_val = Self::fold_radix_f64(&bin_str, 2);
             return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
         }
 
@@ -1650,14 +1703,14 @@ impl Parser {
             if self.peek_byte() != Some(b'p') && self.peek_byte() != Some(b'P') {
                 return Err(ParseError::new("octal float requires 'p' exponent", self.span_from(start)));
             }
-            let exp = self.scan_p_exponent();
-            let int_val = u64::from_str_radix(&oct_str, 8).unwrap_or(0) as f64;
-            let frac_val = if frac_str.is_empty() { 0.0 } else { u64::from_str_radix(&frac_str, 8).unwrap_or(0) as f64 / 8f64.powi(frac_str.len() as i32) };
+            let exp = self.scan_p_exponent()?;
+            let int_val = Self::fold_radix_f64(&oct_str, 8);
+            let frac_val = if frac_str.is_empty() { 0.0 } else { Self::fold_radix_f64(&frac_str, 8) / 8f64.powi(frac_str.len() as i32) };
             return Ok(Token::FloatLit((int_val + frac_val) * 2f64.powi(exp)));
         }
         if self.peek_byte() == Some(b'p') || self.peek_byte() == Some(b'P') {
-            let exp = self.scan_p_exponent();
-            let int_val = u64::from_str_radix(&oct_str, 8).unwrap_or(0) as f64;
+            let exp = self.scan_p_exponent()?;
+            let int_val = Self::fold_radix_f64(&oct_str, 8);
             return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
         }
 
@@ -1755,41 +1808,13 @@ impl Parser {
                 return Ok(Token::Dollar);
             }
             Some(b'$') => {
-                // $$name is scalar dereference; $$ alone is PID.  Return Dollar (deref prefix) if the byte after the
-                // second $ could start any variable expression ($name, ${expr}, $0, $$nested, $!, etc.).  Only return
-                // SpecialVar("$") (PID) when nothing variable-like follows.
+                // `$$name` is a scalar dereference; `$$` alone is the PID.  The deref reading requires the byte
+                // after the second `$` to start a variable name: an identifier character (`$$x`; `$$1` is `${$1}`,
+                // verified 5.38.2 deparse), an opening brace (`$${...}`), another `$` (`$$$x`), or — under
+                // `use utf8` — a non-ASCII identifier byte.  Anything else (`;`, `.`, `==`, `,`, whitespace, EOF)
+                // is the PID: `print $$."\n"` prints the pid and `$$==$$` compares it (both verified 5.38.2).
                 if let Some(b) = self.peek_byte_at(1)
-                    && (b == b'_'
-                        || b.is_ascii_alphabetic()
-                        || b == b'{'
-                        || b == b'$'
-                        || b.is_ascii_digit()
-                        || b == b'!'
-                        || b == b'@'
-                        || b == b'/'
-                        || b == b'\\'
-                        || b == b';'
-                        || b == b','
-                        || b == b'^'
-                        || b == b'+'
-                        || b == b'-'
-                        || b == b'#'
-                        || b == b'&'
-                        || b == b'"'
-                        || b == b'.'
-                        || b == b'|'
-                        || b == b'?'
-                        || b == b'`'
-                        || b == b'\''
-                        || b == b'('
-                        || b == b')'
-                        || b == b'<'
-                        || b == b'>'
-                        || b == b']'
-                        || b == b'%'
-                        || b == b':'
-                        || b == b'='
-                        || b == b'~')
+                    && (b == b'_' || b == b'{' || b == b'$' || b.is_ascii_alphanumeric() || (b >= 0x80 && self.utf8_mode))
                 {
                     return Ok(Token::Dollar);
                 }
@@ -2633,6 +2658,19 @@ impl Parser {
     /// Process a backslash escape inside a double-quoted string.  The backslash has already been consumed.
     fn process_escape(&mut self, s: &mut String, close: Option<char>) -> Result<(), ParseError> {
         match self.peek_byte() {
+            // A backslashed closing delimiter is the delimiter, taking precedence over any standard-escape meaning
+            // the character carries: with `n` as the delimiter, `qq na\nbn` is "anb", not "a<newline>b" (verified
+            // 5.38.2).  This arm therefore precedes every named escape below.
+            Some(b)
+                if close.is_some_and(|c| {
+                    let mut buf = [0u8; 4];
+                    self.remaining().starts_with(c.encode_utf8(&mut buf).as_bytes())
+                }) =>
+            {
+                let close_ch = close.unwrap_or(b as char);
+                self.skip(close_ch.len_utf8());
+                s.push(close_ch);
+            }
             Some(b'n') => {
                 self.skip(1);
                 s.push('\n');
@@ -2657,10 +2695,6 @@ impl Parser {
                 self.skip(1);
                 s.push('@');
             }
-            Some(b'0') => {
-                self.skip(1);
-                s.push('\0');
-            }
             Some(b'a') => {
                 self.skip(1);
                 s.push('\x07');
@@ -2677,36 +2711,77 @@ impl Parser {
                 self.skip(1);
                 s.push('\x1B');
             }
-            Some(b)
-                if close.is_some_and(|c| {
-                    let mut buf = [0u8; 4];
-                    self.remaining().starts_with(c.encode_utf8(&mut buf).as_bytes())
-                }) =>
-            {
-                let close_ch = close.unwrap_or(b as char);
-                self.skip(close_ch.len_utf8());
-                s.push(close_ch);
-            }
             Some(b'x') => {
                 self.skip(1);
                 let mut val = 0u8;
                 if self.peek_byte() == Some(b'{') {
-                    // \x{HH...} — Unicode escape
+                    // \x{...} — braced hex escape, following 5.42.2 grok_bslash_x (each case verified against perl):
+                    // blanks are allowed next to the braces and underscores between digits; a non-hex character (or
+                    // a digit after trailing blanks) warns in perl, keeps the digits scanned so far, and consumes
+                    // through the closing brace; a missing closing brace is fatal; a value beyond UV_MAX is fatal.
+                    let escape_start = self.span_pos();
                     self.skip(1);
-                    let mut n = 0u32;
-                    while let Some(b) = self.peek_byte() {
-                        if b == b'}' {
-                            self.skip(1);
-                            break;
-                        }
-                        if b.is_ascii_hexdigit() {
-                            self.skip(1);
-                            n = n * 16 + hex_digit(b) as u32;
-                        } else {
-                            break;
+                    let mut n: u64 = 0;
+                    let mut too_large = false;
+                    let mut prev_digit = false;
+                    let mut trailing = false;
+                    loop {
+                        match self.peek_byte() {
+                            None => {
+                                return Err(ParseError::new("Missing right brace on \\x{}", Span::new(escape_start, self.span_pos())));
+                            }
+                            Some(b'}') => {
+                                self.skip(1);
+                                break;
+                            }
+                            Some(b) if b.is_ascii_hexdigit() && !trailing => {
+                                self.skip(1);
+                                if n > (u64::MAX - 15) / 16 {
+                                    too_large = true;
+                                } else {
+                                    n = n * 16 + u64::from(hex_digit(b));
+                                }
+                                prev_digit = true;
+                            }
+                            Some(b' ' | b'\t') => {
+                                self.skip(1);
+                                if prev_digit {
+                                    trailing = true;
+                                }
+                                prev_digit = false;
+                            }
+                            Some(b'_') if prev_digit && self.peek_byte_at(1).is_some_and(|nb| nb.is_ascii_hexdigit()) => {
+                                self.skip(1);
+                            }
+                            Some(_) => {
+                                // Alien character: perl warns and resolves to the digits scanned so far, consuming
+                                // everything through the closing brace.  No brace before end of input is the same
+                                // missing-brace fatal as above.
+                                loop {
+                                    match self.peek_byte() {
+                                        Some(b'}') => {
+                                            self.skip(1);
+                                            break;
+                                        }
+                                        Some(_) => self.skip(1),
+                                        None => {
+                                            return Err(ParseError::new("Missing right brace on \\x{}", Span::new(escape_start, self.span_pos())));
+                                        }
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
-                    if let Some(c) = char::from_u32(n) {
+                    if too_large {
+                        return Err(ParseError::new("Use of a code point above 0xFFFFFFFFFFFFFFFF is not allowed", Span::new(escape_start, self.span_pos())));
+                    }
+                    // Surrogates and code points above U+10FFFF are legal in perl (warnings at most) but have no
+                    // Rust `char` representation; they are dropped until the extended-UTF-8 string representation
+                    // (design.md §2.3.2) lands.  The parser tests pin this gap.
+                    if n <= u64::from(u32::MAX)
+                        && let Some(c) = char::from_u32(n as u32)
+                    {
                         s.push(c);
                     }
                 } else {
@@ -2756,46 +2831,103 @@ impl Parser {
                 }
             }
             Some(b'o') => {
-                // \o{NNN} — octal escape with braces.
+                // \o{NNN} — braced octal escape, following 5.42.2 grok_bslash_o (blank handling verified:
+                // `"\o{ 21 }"` is chr 17).  Braces are mandatory (`\o` without them is fatal, as is an empty or
+                // blank-only brace pair); blanks next to the braces and underscores between digits are allowed; a
+                // non-octal character consumes through the closing brace with the scanned digits as the value; a
+                // missing closing brace is fatal; a value beyond UV_MAX is fatal.
+                let escape_start = self.span_pos();
                 self.skip(1);
-                if self.peek_byte() == Some(b'{') {
-                    self.skip(1);
-                    let mut n = 0u32;
-                    while let Some(b) = self.peek_byte() {
-                        if b == b'}' {
+                if self.peek_byte() != Some(b'{') {
+                    return Err(ParseError::new("Missing braces on \\o{}", Span::new(escape_start, self.span_pos())));
+                }
+                self.skip(1);
+                let mut n: u64 = 0;
+                let mut digits = 0usize;
+                let mut saw_alien = false;
+                let mut too_large = false;
+                let mut prev_digit = false;
+                let mut trailing = false;
+                loop {
+                    match self.peek_byte() {
+                        None => {
+                            return Err(ParseError::new("Missing right brace on \\o{}", Span::new(escape_start, self.span_pos())));
+                        }
+                        Some(b'}') => {
                             self.skip(1);
                             break;
                         }
-                        if (b'0'..=b'7').contains(&b) {
+                        Some(b @ b'0'..=b'7') if !trailing => {
                             self.skip(1);
-                            n = n * 8 + (b - b'0') as u32;
-                        } else {
+                            if n > (u64::MAX - 7) / 8 {
+                                too_large = true;
+                            } else {
+                                n = n * 8 + u64::from(b - b'0');
+                            }
+                            digits += 1;
+                            prev_digit = true;
+                        }
+                        Some(b' ' | b'\t') => {
+                            self.skip(1);
+                            if prev_digit {
+                                trailing = true;
+                            }
+                            prev_digit = false;
+                        }
+                        Some(b'_') if prev_digit && self.peek_byte_at(1).is_some_and(|nb| (b'0'..=b'7').contains(&nb)) => {
+                            self.skip(1);
+                        }
+                        Some(_) => {
+                            saw_alien = true;
+                            loop {
+                                match self.peek_byte() {
+                                    Some(b'}') => {
+                                        self.skip(1);
+                                        break;
+                                    }
+                                    Some(_) => self.skip(1),
+                                    None => {
+                                        return Err(ParseError::new("Missing right brace on \\o{}", Span::new(escape_start, self.span_pos())));
+                                    }
+                                }
+                            }
                             break;
                         }
                     }
-                    if let Some(c) = char::from_u32(n) {
-                        s.push(c);
-                    }
-                } else {
-                    // Bare \o without braces — literal.
-                    s.push('\\');
-                    s.push('o');
+                }
+                if digits == 0 && !saw_alien {
+                    return Err(ParseError::new("Empty \\o{}", Span::new(escape_start, self.span_pos())));
+                }
+                if too_large {
+                    return Err(ParseError::new("Use of a code point above 0xFFFFFFFFFFFFFFFF is not allowed", Span::new(escape_start, self.span_pos())));
+                }
+                // Same representation gap as the braced \x above (design.md §2.3.2).
+                if n <= u64::from(u32::MAX)
+                    && let Some(c) = char::from_u32(n as u32)
+                {
+                    s.push(c);
                 }
             }
             Some(b'c') => {
                 // \cX — control character.  The character following \c is XORed with 0x40 to produce the control char.
                 self.skip(1);
-                if let Some(next) = self.peek_byte() {
+                if let Some(next) = self.peek_byte()
+                    && close != Some(next as char)
+                {
                     self.skip(1);
                     let ctrl = (next.to_ascii_uppercase()) ^ 0x40;
                     s.push(ctrl as char);
                 } else {
-                    s.push('\\');
-                    s.push('c');
+                    // Nothing after \c is fatal in perl, not a literal backslash-c.  The closing delimiter counts as
+                    // nothing: perl's terminator scan ends the string before \c receives an argument, so `"\c"` dies
+                    // with the same message rather than consuming the quote.
+                    return Err(ParseError::new("Missing control char name in \\c", Span::new(self.span_pos(), self.span_pos())));
                 }
             }
-            Some(b'1'..=b'7') => {
-                // \NNN — octal escape (1–3 digits, no braces).  Note: \0 is handled separately above.
+            Some(b'0'..=b'7') => {
+                // \NNN — octal escape (1–3 digits, no braces).  \0 is simply the zero-first-digit case and continues
+                // into following octal digits like any other: "\015\012" is CRLF, not NUL-15-NUL-12 (verified
+                // 5.38.2).
                 let mut n = 0u32;
                 for _ in 0..3 {
                     if let Some(b) = self.peek_byte() {
@@ -3054,8 +3186,11 @@ impl Parser {
         let delim = self.read_quote_delimiter()?;
 
         // qw is documented as equivalent to split(' ', q/.../).  Use literal (q//) escape mode: \\ → \, \delim → delim.
+        // The split is on perl's ASCII isSPACE set — space, tab, newline, VT, FF, CR — not Unicode whitespace: NBSP
+        // does not separate words while vertical tab does (both verified 5.38.2).
         let body = self.lex_body_str(delim, FrameRole::QuoteWords)?;
-        let words: Vec<String> = body.split_whitespace().map(String::from).collect();
+        let is_qw_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r');
+        let words: Vec<String> = body.split(is_qw_space).filter(|w| !w.is_empty()).map(String::from).collect();
         Ok(Token::QwList(words))
     }
 
@@ -3563,13 +3698,17 @@ impl Parser {
     /// Scan a quoted heredoc tag (between matching quotes).
     fn scan_heredoc_tag(&mut self, close: u8) -> Result<String, ParseError> {
         let start = self.line_pos();
-        while self.peek_byte().is_some_and(|b| b != close) {
+        while self.peek_byte().is_some_and(|b| b != close && b != b'\n') {
             self.skip(1);
         }
-        let tag = String::from_utf8_lossy(self.line_slice(start)).into_owned();
-        if self.peek_byte() == Some(close) {
-            self.skip(1); // skip closing quote
+        if self.peek_byte() != Some(close) {
+            // The closing quote never appears on the marker line.  Perl fatals here (verified 5.38.2); the tag
+            // cannot continue onto the next line, and scanning past it would carry this line's offsets into later,
+            // shorter lines.
+            return Err(ParseError::new("Unterminated delimiter for here document", self.span_from(start)));
         }
+        let tag = String::from_utf8_lossy(self.line_slice(start)).into_owned();
+        self.skip(1); // skip closing quote
         Ok(tag)
     }
 
