@@ -367,6 +367,15 @@ impl Parser {
             return Ok(Statement { kind: StmtKind::Empty, span: start, terminated: true });
         }
 
+        // POD block: `=word` at column 0 in statement context.  Skip the entire block (through `=cut`) and parse the
+        // next statement.  This is the grammar-appropriate position for POD — mid-expression, `lex_term`/`lex_operator`
+        // reinterpret it as `Assign(Eq)` instead.
+        if self.tok.token == Token::PodCommand {
+            self.skip_pod()?;
+            self.tok = self.lex_token()?;
+            return self.parse_statement();
+        }
+
         let kind = match &self.tok.token {
             // Statement-level keywords: consume first, then dispatch to handler.  Fat-comma autoquoting
             // (e.g. `if => 1`) is handled by the lexer, which returns StrLit instead of Keyword.

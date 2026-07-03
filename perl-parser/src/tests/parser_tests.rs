@@ -1356,6 +1356,49 @@ fn interp_postderef_qq_with_surrounding_text() {
     assert!(matches!(&parts[2], InterpPart::Const(s) if s == " end"));
 }
 
+// ── Hash-delimited quote tests ────────────────────────────
+
+// `#` adjacent to a quote keyword is the delimiter, not a comment.  This was bug A1: `at_fat_comma` called
+// `skip_ws_and_comments` which ate `#hello#` as a comment before `read_quote_delimiter` ever ran.
+#[test]
+fn q_hash_delimiter() {
+    let e = parse_expr_str("q#hello#;");
+    match &e.kind {
+        ExprKind::StringLit(s) => assert_eq!(s, "hello"),
+        other => panic!("expected StringLit from q#hello#, got {other:?}"),
+    }
+}
+
+#[test]
+fn m_hash_delimiter() {
+    let e = parse_expr_str("m#test#;");
+    match &e.kind {
+        ExprKind::Regex(RegexKind::Match, Some(pat), _) => assert_eq!(pat_str(pat), "test"),
+        other => panic!("expected Regex from m#test#, got {other:?}"),
+    }
+}
+
+#[test]
+fn s_hash_delimiter() {
+    let e = parse_expr_str("s#old#new#;");
+    match &e.kind {
+        ExprKind::Subst(_, _, _) => {}
+        other => panic!("expected Subst from s#old#new#, got {other:?}"),
+    }
+}
+
+// `q => 1` is fat-comma autoquoting, NOT `q` with `=` as delimiter.
+#[test]
+fn q_fat_comma_autoquotes() {
+    let e = parse_expr_str("q => 1;");
+    match &e.kind {
+        ExprKind::Comma(items) => {
+            assert!(matches!(&items[0].kind, ExprKind::StringLit(s) if s == "q"));
+        }
+        other => panic!("expected Comma from q => 1, got {other:?}"),
+    }
+}
+
 // ── Regex / substitution / transliteration tests ──────────
 
 #[test]
@@ -2425,6 +2468,39 @@ fn parse_pod_skipped() {
         })
         .count();
     assert_eq!(my_count, 2);
+}
+
+// POD is only recognized in statement context (Perl gates on PL_expect == XSTATE).  Mid-expression, `=word` at
+// column 0 is the `=` operator followed by a bareword, not a POD block.
+#[test]
+fn pod_rejected_mid_expression() {
+    // `1 +` then `=pod` at column 0 — the `=` is not POD, it's an operator (misplaced assignment), producing a
+    // parse error.  Perl: "syntax error at ... near '='"
+    let msg = parse_fails("1 +\n=pod\nstuff\n=cut\n");
+    assert!(!msg.is_empty(), "expected parse error for mid-expression =pod, got success");
+}
+
+// POD inside an indented heredoc's embedded code block.  The `<<~` indent sets `pos = indent` on body lines, so
+// `=pod` at the indent boundary hits `at_line_start()` and is recognized as POD in statement context.  `skip_pod`
+// must also check `=cut` from the indent position, not from byte 0 of the raw line content.
+#[test]
+fn pod_in_indented_heredoc_code_block() {
+    // The do-block has `1;` then POD then `2` — POD is skipped, do returns 2.
+    let prog = parse("<<~END;\n    @{[do {\n    1;\n\n    =pod\n\n    docs\n\n    =cut\n\n    2\n    }]}\n    END\n");
+    assert!(!prog.statements.is_empty(), "indented heredoc with POD in code block should parse");
+}
+
+// POD between statements inside a block (not just at the top level).
+#[test]
+fn pod_between_statements_in_block() {
+    let prog = parse("if (1) {\n    my $x = 1;\n\n=pod\n\ndocumentation\n\n=cut\n\n    my $y = 2;\n}\n");
+    // The if block should have two my-declarations, POD invisible.
+    match &prog.statements[0].kind {
+        StmtKind::If(if_stmt) => {
+            assert_eq!(if_stmt.then_block.statements.len(), 2, "both statements should survive POD skip");
+        }
+        other => panic!("expected If, got {other:?}"),
+    }
 }
 
 // ── C-style for loop tests ────────────────────────────────

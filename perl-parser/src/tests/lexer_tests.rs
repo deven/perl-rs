@@ -45,17 +45,25 @@ fn lex_all(src: &str) -> Vec<Token> {
             spanned.token = tok;
         }
 
-        // In term context, quote keywords start sublexing — mimic the parser's `parse_quote_keyword` by skipping
-        // whitespace and calling `begin_quote_sublex`.  Fat-comma autoquoting (`q => 1`) is handled by the lexer, which
-        // returns StrLit instead of the keyword.
+        // In term context, quote keywords start sublexing — mimic `lex_term`'s quote keyword arm by calling
+        // `begin_quote_sublex` directly.  Fat-comma autoquoting (`q => 1`) is handled by the lexer, which returns
+        // StrLit instead of the keyword.
         if let Token::Keyword(kw) = &spanned.token
             && keyword::is_quote_keyword(*kw)
             && term_context
         {
-            let raw = lexer.skip_ws_and_peek_byte();
-            if raw.is_some() {
-                let tok = lexer.begin_quote_sublex(*kw).unwrap();
-                spanned.token = tok;
+            let tok = lexer.begin_quote_sublex(*kw).unwrap();
+            spanned.token = tok;
+        }
+
+        // PodCommand: `=word` at column 0.  In statement/term context → skip the POD block.  In operator context →
+        // the `=` was already consumed, just replace with Assign(Eq).
+        if spanned.token == Token::PodCommand {
+            if term_context {
+                lexer.skip_pod().unwrap();
+                continue;
+            } else {
+                spanned.token = Token::Assign(AssignOp::Eq);
             }
         }
 
@@ -2013,7 +2021,7 @@ fn fat_comma_across_newline_qx() {
 // print "$_\n";  # → "pod\n\ntesting\n\n"
 // ```
 //
-// The lexer achieves this by using `skip_ws_and_comments_no_pod` for the delim-search whitespace skip.  Outside that
+// The lexer achieves this by using `skip_ws_and_comments` for the delim-search whitespace skip.  Outside that
 // context, `=word` at col 0 still starts a pod block as usual.
 
 #[test]

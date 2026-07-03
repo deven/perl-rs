@@ -419,6 +419,12 @@ impl Parser {
         self.line.as_ref().map_or(0, |l| l.pos as usize)
     }
 
+    /// Whether the cursor is at the effective start of the line: position 0 for normal lines, the required indent for
+    /// `<<~` heredoc body lines.  Used for column-0 constructs like POD (`=word`) and `# line` directives.
+    fn at_line_start(&self) -> bool {
+        self.line.as_ref().is_some_and(|l| l.pos == l.indent)
+    }
+
     /// Global position as u32 for span construction.
     fn span_pos(&self) -> u32 {
         match &self.line {
@@ -451,6 +457,16 @@ impl Parser {
     pub(crate) fn rewind(&mut self, n: usize) {
         if let Some(line) = self.line.as_mut() {
             line.pos -= n as u32;
+        }
+    }
+
+    /// Advance the cursor past the end of the current line, including the virtual newline for terminated lines.  After
+    /// this call, `peek_byte()` returns `None` for the current line, triggering a `next_line` auto-load on the next
+    /// access.  Used when a comment at EOF has no following line — `next_line` returns `None`, so the cursor must be
+    /// moved past the exhausted content to prevent `peek_byte` from re-reading the `#`.
+    fn skip_to_line_end(&mut self) {
+        if let Some(line) = self.line.as_mut() {
+            line.pos = line.line.len() as u32 + line.terminated as u32;
         }
     }
 
@@ -893,55 +909,24 @@ impl Parser {
     }
 
     // ── Skip whitespace and comments ──────────────────────────
+    /// Skip whitespace (space, tab, newline) and `#` comments.  Does NOT skip POD — POD is a grammar construct, not
+    /// whitespace, and is handled at grammar-appropriate positions (e.g. between tokens in `lex_normal_token`).
     fn skip_ws_and_comments(&mut self) -> Result<(), ParseError> {
         loop {
-            // peek_byte auto-loads lines. \n is a byte, skipped as whitespace.
             match self.peek_byte() {
                 Some(b' ') | Some(b'\t') | Some(b'\n') => self.skip(1),
                 Some(b'#') => {
-                    // Check for `# line N "file"` directive at column 0.
-                    if self.line_pos() == 0 {
+                    // Check for `# line N "file"` directive at the effective start of line.
+                    if self.at_line_start() {
                         self.try_line_directive();
                     }
-
-                    // Comment — drop entire line.
-                    self.line = None;
-                }
-                Some(b'=') if self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphabetic()) && self.line_pos() == 0 => {
-                    self.skip_pod()?;
-                }
-                _ => break, // Non-whitespace byte or EOF
-            }
-        }
-        Ok(())
-    }
-
-    /// Skip whitespace and `#` comments only — **not** POD.  For use when the lexer is inside a quote-operator's
-    /// delimiter-finding scan: per Perl, POD is suspended until the delimiter is found, so
-    ///
-    /// ```perl
-    /// $_ = qq
-    ///
-    /// =pod
-    ///
-    /// testing
-    ///
-    /// =;
-    /// ```
-    ///
-    /// is a qq-string with body `"pod\n\ntesting\n\n"`, not a pod block.  `=pod` at column 0 would start a pod block
-    /// in normal code context, but once we've committed to a quote op waiting for its delimiter, the `=` is just a
-    /// candidate delimiter byte.
-    fn skip_ws_and_comments_no_pod(&mut self) -> Result<(), ParseError> {
-        loop {
-            match self.peek_byte() {
-                Some(b' ') | Some(b'\t') | Some(b'\n') => self.skip(1),
-                Some(b'#') => {
-                    // Check for `# line N "file"` directive at column 0, same as skip_ws_and_comments.
-                    if self.line_pos() == 0 {
-                        self.try_line_directive();
+                    // Advance to the next line.  Uses `next_line` rather than `self.line = None` so that during a
+                    // lookahead scan the comment line is captured for re-delivery (and any `# line` directive on it
+                    // is processed on the real pass).  At EOF, advance the cursor past the end of the current line
+                    // so `peek_byte` returns `None` and the loop breaks naturally.
+                    if self.next_line()?.is_none() {
+                        self.skip_to_line_end();
                     }
-                    self.line = None;
                 }
                 _ => break,
             }
@@ -951,17 +936,21 @@ impl Parser {
 
     /// Skip a pod block: everything from `=word` to `=cut\n`.  Matches Perl 5's behavior: `=cut` must be at start of
     /// line, followed by a non-alphabetic character (or EOF).
-    fn skip_pod(&mut self) -> Result<(), ParseError> {
+    pub(crate) fn skip_pod(&mut self) -> Result<(), ParseError> {
         // Skip the current =word line.
         self.line = None;
 
-        // Read lines until =cut at start of line.
+        // Read lines until =cut at the effective start of line.  For `<<~` heredoc body lines, the effective start
+        // is at the indent position, not byte 0 — the raw content includes leading whitespace.
         loop {
             // peek_byte auto-loads the next line.
             if self.peek_byte().is_none() {
                 break; // EOF inside pod — not an error per Perl
             }
-            let is_cut = self.line.as_ref().is_some_and(|line| line.line.starts_with(b"=cut") && !line.line.get(4).is_some_and(|b| b.is_ascii_alphabetic()));
+            let is_cut = self.line.as_ref().is_some_and(|line| {
+                let start = line.indent as usize;
+                line.line.get(start..).is_some_and(|s| s.starts_with(b"=cut") && !s.get(4).is_some_and(|b| b.is_ascii_alphabetic()))
+            });
             self.line = None; // skip this line
             if is_cut {
                 break;
@@ -1092,12 +1081,6 @@ impl Parser {
             Token::Keyword(kw) if keyword::is_quote_keyword(*kw) => {
                 let kw = *kw;
                 let span = self.tok.span;
-                // EOF after keyword → bareword.
-                if self.skip_ws_and_peek_byte().is_none() {
-                    let name: &str = kw.into();
-                    self.tok = Spanned { token: Token::Ident(name.to_string()), span };
-                    return Ok(());
-                }
                 let token = self.begin_quote_sublex(kw)?;
                 self.tok = Spanned { token, span };
                 Ok(())
@@ -1166,15 +1149,27 @@ impl Parser {
                 Ok(())
             }
 
+            // `=word` at column 0 in term position is NOT POD — it's the `=` operator followed by a bareword.
+            // The `=` was already consumed by `lex_normal_token`; the next byte is alpha, so `Assign(Eq)` is the
+            // only possible interpretation.
+            Token::PodCommand => {
+                self.tok.token = Token::Assign(AssignOp::Eq);
+                Ok(())
+            }
+
             // Not in the re-lex set — return the token as-is.
             _ => Ok(()),
         }
     }
 
     /// Operator-position reinterpretation.  Takes a position-independent token and returns it unchanged unless it is
-    /// the one ambiguous case: an `Ident` starting with `x` followed by a digit (`x5`, `x5x5`), which `scan_ident`
-    /// over-consumed.  In that case, the token is split: the `x` operator is returned, and everything after it is
-    /// rewound for re-lexing.  A bare `x` already arrives as `Keyword(X)` and needs no fix-up.
+    /// one of two ambiguous cases:
+    ///
+    /// - An `Ident` starting with `x` followed by a digit (`x5`, `x5x5`), which `scan_ident` over-consumed.  The
+    ///   token is split: the `x` operator is returned, and everything after it is rewound for re-lexing.  A bare `x`
+    ///   already arrives as `Keyword(X)` and needs no fix-up.
+    /// - `PodCommand` (`=word` at column 0) — in operator position this is the `=` assignment operator, not POD.
+    ///   Re-lexed as `lex_equals()`.
     pub(crate) fn lex_operator(&mut self) -> Result<(), ParseError> {
         if let Token::Ident(ref s) = self.tok.token
             && s.len() > 1
@@ -1186,6 +1181,9 @@ impl Parser {
             self.rewind(rewind);
             self.tok = Spanned { token: Token::Keyword(Keyword::X), span: Span::new(start, start + 1) };
             return Ok(());
+        }
+        if self.tok.token == Token::PodCommand {
+            self.tok.token = Token::Assign(AssignOp::Eq);
         }
         Ok(())
     }
@@ -1255,7 +1253,18 @@ impl Parser {
             b'.' => self.lex_dot(),
             b'<' => self.lex_less_than()?,
             b'>' => self.lex_greater_than(),
-            b'=' => self.lex_equals(),
+            b'=' => {
+                // `=word` at column 0 is a POD command, not an operator.  Consume the `=` (like every other token)
+                // and emit `PodCommand`.  `parse_statement` calls `skip_pod()` to consume the block;
+                // `lex_term`/`lex_operator` replace with `Assign(Eq)` — the byte after `=` is always alpha here, so
+                // that's the only possible `=`-token.
+                if self.at_line_start() && self.peek_byte_at(1).is_some_and(|b| b.is_ascii_alphabetic()) {
+                    self.skip(1);
+                    Token::PodCommand
+                } else {
+                    self.lex_equals()
+                }
+            }
             b'!' => self.lex_bang(),
             b'&' => self.lex_ampersand(),
             b'|' => self.lex_pipe(),
@@ -1662,9 +1671,9 @@ impl Parser {
 
         // Per perldata: "It is legal, but not recommended, to separate a variable's sigil from its name by space and/or
         // tab characters."  Only whitespace triggers this — `$#` is ArrayLen, not a comment.  Once inside the skip,
-        // skip_ws_and_comments_no_pod handles any comments encountered along the way (e.g. `$  # comment\n x`).
+        // skip_ws_and_comments handles any comments encountered along the way (e.g. `$  # comment\n x`).
         if matches!(self.peek_byte(), Some(b' ' | b'\t' | b'\n')) {
-            self.skip_ws_and_comments_no_pod()?;
+            self.skip_ws_and_comments()?;
             if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
@@ -1947,7 +1956,7 @@ impl Parser {
 
         // Whitespace between sigil and name.
         if matches!(self.peek_byte(), Some(b' ' | b'\t' | b'\n')) {
-            self.skip_ws_and_comments_no_pod()?;
+            self.skip_ws_and_comments()?;
             if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
@@ -2024,7 +2033,7 @@ impl Parser {
     pub(crate) fn lex_hash_var_after_percent(&mut self) -> Result<Option<Token>, ParseError> {
         // Whitespace between sigil and name.
         if matches!(self.peek_byte(), Some(b' ' | b'\t' | b'\n')) {
-            self.skip_ws_and_comments_no_pod()?;
+            self.skip_ws_and_comments()?;
             if self.peek_byte().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic() || (self.effective_utf8 && b >= 0x80)) {
                 let name = self.scan_ident();
                 if !name.is_empty() {
@@ -2246,8 +2255,15 @@ impl Parser {
         // Fat-comma autoquoting: `if => 1`, `foo => 1`, `v5 => 1`, `__PACKAGE__ => 1`, etc.  The four tokens above
         // (__DATA__, __END__, __FILE__, __LINE__) already handled their own fat-comma checks; everything else goes
         // through here.  Must be before the v-string check so that `v5 => 1` autoquotes as "v5" instead of producing
-        // VersionLit("v5").
-        if self.at_fat_comma() {
+        // VersionLit("v5").  `at_fat_comma` uses `lookahead()` so the cursor is unchanged after the check — v-string
+        // `.` adjacency is not disturbed.
+        //
+        // Skip the check when a quote keyword (`q`, `qq`, `m`, `s`, etc.) has `#` as the immediately adjacent byte.
+        // `#` adjacent to a quote keyword is a delimiter (`q#hello#`), not a comment — but `at_fat_comma`'s
+        // `skip_ws_and_comments` can't distinguish the two.  It would eat `#hello#\n` as a comment, find `=>`
+        // on the next line, and incorrectly autoquote `q`.  When `#` has whitespace before it (`q  #...`), it IS a
+        // comment and the fat-comma check is safe.
+        if !(self.peek_byte() == Some(b'#') && keyword::is_quote_keyword_str(&name)) && self.at_fat_comma() {
             return Ok(Token::StrLit(name));
         }
 
@@ -2297,20 +2313,17 @@ impl Parser {
         }
     }
 
-    /// Skip whitespace and `#` comments (not POD), then return the next raw byte without consuming it.  Used by the
-    /// parser to inspect the delimiter byte after a quote keyword without triggering tokenization.  Returns `None` at
-    /// EOF.
-    pub(crate) fn skip_ws_and_peek_byte(&mut self) -> Option<u8> {
-        let _ = self.skip_ws_and_comments_no_pod();
-        self.peek_byte()
-    }
-
-    /// Skip whitespace/newlines/comments (not POD) and check if `=>` (fat comma) follows.  Used by `lex_word` to
-    /// autoquote keywords and identifiers at lex time.  Consumes the whitespace regardless of the result — the next
-    /// `lex_normal_token` call would have skipped it anyway.
+    /// Check whether `=>` (fat comma) follows the current position, skipping whitespace, newlines, and `#` comments.
+    /// Used by `lex_word` to autoquote keywords and identifiers at lex time.
+    ///
+    /// Uses the `lookahead()` mechanism so the scan is non-destructive: the cursor is restored to its pre-call position
+    /// regardless of the result.  This is critical because `skip_ws_and_comments` would otherwise permanently
+    /// consume bytes whose interpretation is position-dependent — `#` adjacent to a quote keyword is a delimiter, not a
+    /// comment, and a newline between `v5` and `.26` separates two tokens rather than joining one v-string.
     fn at_fat_comma(&mut self) -> bool {
-        let _ = self.skip_ws_and_comments_no_pod();
-        self.peek_byte() == Some(b'=') && self.peek_byte_at(1) == Some(b'>')
+        let mut g = self.lookahead();
+        let _ = g.skip_ws_and_comments();
+        g.peek_byte() == Some(b'=') && g.peek_byte_at(1) == Some(b'>')
     }
 
     // ── Strings ───────────────────────────────────────────────
@@ -3148,14 +3161,14 @@ impl Parser {
         // uses `/`.
         //
         // Uses the no-pod skipper: inside a quote op's delimiter scan, `=pod` at column 0 is a candidate delimiter
-        // byte, not a pod block.  See `skip_ws_and_comments_no_pod`.
+        // byte, not a pod block.  See `skip_ws_and_comments`.
         match self.peek_byte() {
-            Some(b) if b == b' ' || b == b'\t' => {
-                self.skip_ws_and_comments_no_pod()?;
+            Some(b' ' | b'\t' | b'\n') => {
+                self.skip_ws_and_comments()?;
             }
             None => {
                 // End of line — need to cross to next line.
-                self.skip_ws_and_comments_no_pod()?;
+                self.skip_ws_and_comments()?;
             }
             _ => {}
         }

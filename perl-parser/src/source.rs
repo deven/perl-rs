@@ -403,7 +403,6 @@ impl Parser {
     /// normal line API (`next_line`, `peek_byte`, …) and `# line` directive setters are suppressed.  On drop the lexer
     /// snaps back to the line and cursor where the scan began, and the previewed lines are re-queued for normal
     /// re-delivery — unless the consumer then calls [`Self::consume_lookahead`] to commit to where the scan ended.
-    #[allow(dead_code)] // No consumers yet — the primitive lands ahead of its first user (e.g. fat-comma autoquoting).
     pub(crate) fn lookahead(&mut self) -> Lookahead<'_> {
         // A new lookahead supersedes any still-open consume window from a previous one.
         self.lookahead_offset = None;
@@ -418,7 +417,6 @@ impl Parser {
     /// cannot escape it — used by the heredoc terminator scan to search down to the host's EOF without targeting a
     /// frame (§5.4.5, §5.4.11).  The original bound is saved and restored when the guard drops, on every path.  The
     /// ceiling must be in place before the first `next_line`, so it is taken at construction.
-    #[allow(dead_code)] // No consumers yet — paired with `start_heredoc`.
     pub(crate) fn lookahead_to(&mut self, ceiling: Option<u32>) -> Lookahead<'_> {
         self.lookahead_offset = None;
         self.lookahead_pos = None;
@@ -742,7 +740,6 @@ impl Parser {
 /// RAII guard for a speculative lookahead, returned by [`Parser::lookahead`].  Derefs to the `Lexer` so the consumer
 /// scans with the normal line API.  On drop it snaps the lexer back to the line and cursor where the scan began,
 /// leaving the previewed lines queued for re-delivery and recording where the scan ended for `consume_lookahead`.
-#[allow(dead_code)] // Constructed only by `lookahead`, which has no consumers yet.
 pub(crate) struct Lookahead<'a> {
     lexer: &'a mut Parser,
     /// Cursor position on the current line at the moment the scan began.

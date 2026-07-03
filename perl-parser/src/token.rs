@@ -316,6 +316,12 @@ pub enum Token {
     /// `<STDIN>`, `<$fh>`, `<*.txt>` — readline or glob.  The bool is `true` for `<<>>` (safe double diamond, 3-arg
     /// open).
     Readline(String, bool),
+
+    /// `=word` at column 0 — a POD command.  Position-independent: the lexer always emits this when `=` is at column
+    /// 0 followed by an ASCII letter.  In statement context the parser calls `skip_pod()` to consume the block; in
+    /// term/operator position, `lex_term`/`lex_operator` reinterpret it as `Assign(Eq)` and word gets re-lexed,
+    /// matching Perl's behavior where mid-expression `=word` is an assignment, not POD.
+    PodCommand,
 }
 
 /// Kind of quote-like construct.
@@ -448,6 +454,7 @@ impl Token {
                 | Token::QuoteSublexBegin(_, _)
                 | Token::RegexSublexBegin(_, _)
                 | Token::EmptyRegex(_)
+                | Token::PodCommand
                 | Token::HeredocBegin(_, _)
                 | Token::SubstSublexBegin(_)
                 | Token::TranslitLit(_, _, _)

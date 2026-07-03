@@ -853,6 +853,12 @@ pub fn is_quote_keyword(kw: Keyword) -> bool {
     matches!(kw, Keyword::Q | Keyword::Qq | Keyword::Qw | Keyword::Qr | Keyword::Qx | Keyword::M | Keyword::S | Keyword::Tr | Keyword::Y)
 }
 
+/// String-based variant of `is_quote_keyword`, for use before keyword lookup has run (e.g. the `#`-delimiter guard
+/// in `lex_word`).
+pub fn is_quote_keyword_str(name: &str) -> bool {
+    matches!(name, "q" | "qq" | "qw" | "qr" | "qx" | "m" | "s" | "tr" | "y")
+}
+
 /// Is this keyword a named unary operator?  After a named unary, the next thing is a term (so `/` is regex).
 pub fn is_named_unary(kw: Keyword) -> bool {
     matches!(
