@@ -252,27 +252,9 @@ fn perl_atoi(s: &str) -> i64 {
         (false, s)
     };
 
-    // Hex
-    if s.starts_with("0x") || s.starts_with("0X") {
-        let hex = &s[2..];
-        let end = hex.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(hex.len());
-        if end == 0 {
-            return 0;
-        }
-        let val = i64::from_str_radix(&hex[..end], 16).unwrap_or(0);
-        return if negative { -val } else { val };
-    }
-
-    // Binary
-    if s.starts_with("0b") || s.starts_with("0B") {
-        let bin = &s[2..];
-        let end = bin.find(|c: char| c != '0' && c != '1').unwrap_or(bin.len());
-        if end == 0 {
-            return 0;
-        }
-        let val = i64::from_str_radix(&bin[..end], 2).unwrap_or(0);
-        return if negative { -val } else { val };
-    }
+    // Perl's string numification never interprets 0x/0b/0o radix prefixes — only literals and hex()/oct() do
+    // (verified 5.38.2: "0xff"+0 is 0).  The decimal scan below naturally stops at the 'x'/'b', yielding the
+    // leading 0.
 
     // Decimal
     let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -306,14 +288,19 @@ fn perl_atof(s: &str) -> f64 {
         }
     }
 
-    // Exponent
+    // Exponent — committed only when at least one digit follows the marker (and optional sign).  Perl numifies
+    // "1e" and "1e+" as 1: a dangling exponent marker is not part of the number (verified 5.38.2).
     if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
-        end += 1;
-        if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-            end += 1;
+        let mut exp_end = end + 1;
+        if exp_end < bytes.len() && (bytes[exp_end] == b'+' || bytes[exp_end] == b'-') {
+            exp_end += 1;
         }
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
+        let exp_digits_start = exp_end;
+        while exp_end < bytes.len() && bytes[exp_end].is_ascii_digit() {
+            exp_end += 1;
+        }
+        if exp_end > exp_digits_start {
+            end = exp_end;
         }
     }
 

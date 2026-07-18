@@ -180,6 +180,11 @@ impl Scalar {
     // ── Integer access (with lazy coercion) ───────────────────────
     /// Get the integer value, coercing from other representations if needed.  Caches the result by setting INT_VALID.
     pub fn get_int(&mut self) -> i64 {
+        if self.flags.contains(ScalarFlags::REF_VALID) {
+            // A reference numifies to its referent's address (perl's PTR2IV).  Not cached: setting INT_VALID would
+            // claim an authoritative integer representation the reference does not have.
+            return self.ref_parts().1 as i64;
+        }
         if self.flags.contains(ScalarFlags::INT_VALID) {
             return self.int;
         }
@@ -217,6 +222,10 @@ impl Scalar {
     // ── Float access (with lazy coercion) ─────────────────────────
     /// Get the float value, coercing from other representations if needed.  Caches the result by setting NUM_VALID.
     pub fn get_num(&mut self) -> f64 {
+        if self.flags.contains(ScalarFlags::REF_VALID) {
+            // Same address rule as get_int.
+            return self.ref_parts().1 as f64;
+        }
         if self.flags.contains(ScalarFlags::NUM_VALID) {
             return self.num;
         }
@@ -252,6 +261,15 @@ impl Scalar {
     /// Get a string view, coercing from other representations if needed.  Caches the result by setting STR_VALID.
     /// Returns `None` only for undef.
     pub fn get_bytes(&mut self) -> Option<&[u8]> {
+        if self.flags.contains(ScalarFlags::REF_VALID) {
+            // A reference stringifies as PREFIX(0xADDR), like the compact Value::Ref path.  The rendering goes into
+            // the byte slot so it can be borrowed, but STR_VALID stays clear — it is a per-read rendering, not a
+            // string representation the scalar owns.
+            let (prefix, addr) = self.ref_parts();
+            let rendered = format!("{}(0x{:x})", prefix, addr);
+            self.bytes.set_str(&rendered);
+            return self.bytes.as_bytes();
+        }
         if self.flags.contains(ScalarFlags::STR_VALID) {
             return self.bytes.as_bytes();
         }
@@ -313,6 +331,22 @@ impl Scalar {
     }
 
     // ── Reference access ──────────────────────────────────────────
+    /// The stringification prefix and address for a reference scalar, matching perl's SCALAR(0x...)/ARRAY(0x...)
+    /// forms and PTR2IV numification.  Arc-backed targets use the Arc's address; compact targets (immediate values
+    /// as constructed by tests) use the address of the stored Value slot, which is stable for this Scalar's life.
+    fn ref_parts(&self) -> (&'static str, usize) {
+        match self.reference.as_ref() {
+            Some(Value::Array(av)) => ("ARRAY", Arc::as_ptr(av) as usize),
+            Some(Value::Hash(hv)) => ("HASH", Arc::as_ptr(hv) as usize),
+            Some(Value::Code(cv)) => ("CODE", Arc::as_ptr(cv) as usize),
+            Some(Value::Regex(re)) => ("Regexp", Arc::as_ptr(re) as usize),
+            Some(Value::Scalar(sv)) => ("SCALAR", Arc::as_ptr(sv) as usize),
+            Some(Value::Ref(sv)) => ("REF", Arc::as_ptr(sv) as usize),
+            Some(other) => ("SCALAR", other as *const Value as usize),
+            None => ("SCALAR", 0),
+        }
+    }
+
     /// Get the reference target, if this is a reference.
     pub fn get_rv(&self) -> Option<&Value> {
         if self.flags.contains(ScalarFlags::REF_VALID) { self.reference.as_ref() } else { None }
@@ -353,15 +387,47 @@ impl Scalar {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-/// Format a float the way Perl does.  Perl uses Gconvert which is essentially `sprintf("%.15g", n)` — shortest
-/// representation that round-trips.  Rust doesn't have %g, so we approximate: use Display (which gives shortest round-
-/// trip representation), falling back to LowerExp for very large/small values.
+/// Format a float the way perl does: `sprintf("%.15g", n)` (Gconvert at NV_DIG significant digits), with perl's
+/// "Inf"/"-Inf"/"NaN" capitalizations.  Note %.15g is a fixed significant-digit count, not shortest-round-trip —
+/// which is exactly why perl prints 0.1+0.2 as "0.3".
 pub(crate) fn format_nv(n: f64) -> String {
+    // Rust has no %g formatter, so build it: render at 15 significant digits in exponent form, then choose fixed or
+    // exponent presentation by the %g rule and strip trailing fraction zeros.  All shapes verified against perl
+    // 5.38.2 print output: 0.1+0.2 is "0.3", 1e15 is "1e+15", 1e-5 is "1e-05".
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Inf".to_string() } else { "Inf".to_string() };
+    }
     if n == 0.0 {
         return "0".to_string();
     }
-    // Rust's Display for f64 gives shortest round-trip representation which is close to %g behavior.
-    format!("{}", n)
+    // "{:.14e}" gives a normalized d.dddddddddddddd form — 15 significant digits, correctly rounded.
+    let rendered = format!("{:.14e}", n);
+    let (mantissa, exp) = rendered.split_once('e').expect("exponent form always contains 'e'");
+    let exp: i32 = exp.parse().expect("exponent is a decimal integer");
+    let sign = if mantissa.starts_with('-') { "-" } else { "" };
+    let all_digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits = all_digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    // %g uses exponent form when the decimal exponent is below -4 or at/above the precision (15).
+    if !(-4..15).contains(&exp) {
+        let frac = &digits[1..];
+        let point = if frac.is_empty() { String::new() } else { format!(".{frac}") };
+        let exp_sign = if exp < 0 { '-' } else { '+' };
+        return format!("{sign}{}{point}e{exp_sign}{:02}", &digits[..1], exp.abs());
+    }
+    if exp >= 0 {
+        let int_len = exp as usize + 1;
+        if digits.len() <= int_len {
+            format!("{sign}{digits}{}", "0".repeat(int_len - digits.len()))
+        } else {
+            format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
+        }
+    } else {
+        format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize))
+    }
 }
 
 /// Perl string falseness: `""` (empty) and `"0"` are false.  Everything else is true.

@@ -332,7 +332,14 @@ impl Value {
             // Perl dies on modulo by zero; for now return 0.  The runtime will handle the error.
             return Value::Int(0);
         }
-        Value::Int(a % b)
+        // Perl's % takes the sign of the RIGHT operand: -7 % 3 is 2 and 7 % -3 is -2 (verified 5.38.2), where
+        // Rust's remainder follows the left.  The i64::MIN % -1 case is also perl's 0, where Rust's `%` is a
+        // checked-arithmetic overflow — the guard must come before the remainder.
+        if b == -1 {
+            return Value::Int(0);
+        }
+        let r = a % b;
+        if r != 0 && (r < 0) != (b < 0) { Value::Int(r + b) } else { Value::Int(r) }
     }
 
     /// Unary negation (`-$a`).
@@ -405,6 +412,10 @@ impl Value {
     pub fn num_cmp(&self, other: &Value) -> Value {
         let a = self.coerce_to_num();
         let b = other.coerce_to_num();
+        // Perl's <=> with a NaN operand is undef, not 0 (verified 5.38.2).
+        if a.is_nan() || b.is_nan() {
+            return Value::Undef;
+        }
         Value::Int(if a < b {
             -1
         } else if a > b {
@@ -504,7 +515,7 @@ impl Value {
     /// - `Ref(sv)` → `"SCALAR(0xADDR)"`
     /// - `Scalar(sv)` → delegates through lock, coerces if needed
     /// - `Array(av)` → element count (Perl's `@arr` in string context)
-    /// - `Hash(hv)` → `"N/M"` buckets string (Perl 5 behavior)
+    /// - `Hash(hv)` → key count (Perl 5.26+ scalar-context behavior)
     /// - `Code` → `"CODE(0xADDR)"`
     /// - `Regex` → `"Regex(0xADDR)"` (placeholder)
     pub fn stringify(&self) -> PerlString {
@@ -527,10 +538,10 @@ impl Value {
                 PerlString::from_str(&len.to_string())
             }
             Value::Hash(hv) => {
-                // Perl 5 stringifies a hash as "N/M" where N = used buckets, M = total buckets.  We approximate with
-                // "N/N" (key count).
+                // Since perl 5.26, a hash in scalar context is simply the key count — the pre-5.26 "N/M" bucket
+                // form is gone (verified 5.38.2: a two-key hash gives "2").
                 let len = hv.read().map(|h| h.len()).unwrap_or(0);
-                if len == 0 { PerlString::from_str("0") } else { PerlString::from_str(&format!("{}/{}", len, len)) }
+                PerlString::from_str(&len.to_string())
             }
             Value::Code(c) => {
                 let addr = Arc::as_ptr(c) as usize;
@@ -942,12 +953,12 @@ mod tests {
         let hv = Arc::new(RwLock::new(HashMap::new()));
         assert_eq!(format!("{}", Value::Hash(hv)), "0");
 
-        // Non-empty hash → "N/N"
+        // Non-empty hash → key count (perl 5.26+ scalar-context behavior; the "N/M" bucket form is gone)
         let mut map = HashMap::new();
         map.insert(PerlString::from_str("a"), Value::Int(1));
         map.insert(PerlString::from_str("b"), Value::Int(2));
         let hv = Arc::new(RwLock::new(map));
-        assert_eq!(format!("{}", Value::Hash(hv)), "2/2");
+        assert_eq!(format!("{}", Value::Hash(hv)), "2");
     }
 
     #[test]
