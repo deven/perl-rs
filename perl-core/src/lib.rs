@@ -24,6 +24,7 @@
 //! - **Flag-driven coercion.**  The `Scalar` struct uses `ScalarFlags` to track which representation slots are valid.
 //!   The coercion engine checks flags for the fast path and caches new representations lazily.
 
+pub mod cow_buffer;
 pub mod flags;
 pub mod perl_string;
 pub mod scalar;

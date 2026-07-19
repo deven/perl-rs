@@ -299,6 +299,12 @@ mutation, nothing else.  Details:
   stays `Heap` (capacity retained for regrowth); promotion from
   `Inline` at the growth point is one-way, as in the original
   design.
+- **Allocation failure is a `Result`** (`AllocError`), including
+  capacity arithmetic overflow, so the runtime can map exhaustion to
+  perl's trappable `Out of memory!` die rather than aborting the
+  process.  Every allocating operation on the buffer (construction,
+  reserve, append, COW break — hence also truncate and mutable
+  access on a shared buffer) is fallible; clone and drop are not.
 - **Containment.**  The unsafe lives in one module with the
   invariants documented per function, exercised under Miri, with
   boundary tests at every size-class and COW transition; the
