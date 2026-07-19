@@ -105,418 +105,839 @@ References to any of these create arbitrary graph structures, including
 cycles, which Perl 5 leaks unless you break them manually or use
 `Scalar::Util::weaken`.
 
-### 2.2 Arc-Based Allocation
+### 2.2 The Two-Tier Value Model
 
-Values that need heap allocation use `Arc<RwLock<T>>` — Rust's
-standard shared-ownership, thread-safe pointer.  This replaces the
-arena-based allocation model that earlier drafts used.
+Every Perl value lives in one of two tiers:
 
-#### 2.2.1 Why `Arc<RwLock<T>>` instead of arenas:
+- **Compact tier.**  A `Value` — a 24-byte enum stored directly in its
+  slot (pad entry, array element, hash entry).  No heap allocation, no
+  reference count, no lock.  A compact value has no address identity:
+  assignment copies it.
+- **Promoted tier.**  A `ScalarRef` — a shared, stably addressed,
+  reference-counted identity holding a `ScalarCell`.  A value is
+  promoted the moment something requires identity: taking `\$x`,
+  aliasing through `@_` or `foreach`, `tie`, `bless \$x`, weakening.
 
-The original rationale for arenas was borrow-checker friendliness
-with a per-interpreter `&mut Heap`.  With the shared heap design
-(§3.1, §13.3), there is no `&mut Heap` — every access already goes
-through per-value locking.  The borrow-checker advantage is gone,
-and arenas add complexity (free lists, generation counters, slot
-reuse, fragmentation, bounds checking) without compensating benefit.
+The structural bet, stated in memory terms: Perl 5 pays when
+*representations* accumulate (its SV body ladder), and pays for stable
+identity on every scalar up front (every SV is a heap object behind a
+pointer).  PerlOxide pays only when *identity* accumulates.
+Representation-mixing (numbers used as strings) is constant in real
+Perl programs; identity-taking (references to lexicals, ties) is rare.
+The two-tier model puts the cheap case inline and the rare case behind
+one allocation.
 
-`Arc<RwLock<T>>`:
+**Once promoted, never demoted.**  Identity is the `Arc` address; any
+reference holding it must remain valid forever.  All upgrades happen
+inside the allocation (§2.3.2), never by replacing it.
 
-- **Prevents use-after-free by construction.**  A value lives as long
-  as any `Arc` referencing it exists.  No generation check needed.
-- **Standard Rust pattern.**  Familiar to Rust programmers, well-
-  tested, well-optimized by the allocator.
-- **No arena bookkeeping.**  No free list, no generation counter,
-  no slot compaction.
-- **Values are independent.**  No coupling to an arena container.
-  Values can be shared, moved between data structures, and dropped
-  independently.
-
-#### 2.2.2 Concrete types:
+#### 2.2.1 `Value` — the universal slot value:
 
 ```rust
-type Sv = Arc<RwLock<Scalar>>;     // full scalar (multi-rep, magic, blessed)
-type Av = Arc<RwLock<Vec<Value>>>; // shared array
-type Hv = Arc<RwLock<HashMap<PerlString, Value>>>;  // shared hash
-
 enum Value {
-    // Compact forms — no heap allocation, no Arc, no locking
-    Undef,
-    Int(i64),                 // just an integer
-    Float(f64),               // just a float
-    SmallStr(SmallString),    // short string, inline (≤38 bytes)
-    Str(PerlString),          // longer string, heap-allocated
-    Ref(Sv),                  // just a reference (points to a full Scalar)
+    // Compact scalar payloads (identical to ScalarPayload variants)
+    Undef(Tainted),            // yes, tainted undef is real — see below
+    Int(i64, Tainted),         // taint bool rides envelope padding
+    Float(f64, Tainted),
+    String(PerlString),        // <= 22 bytes inline; taint in the tag
+    True,                      // canonical boolean true  (see 2.3.3)
+    False,                     // canonical boolean false (see 2.3.3)
+    ScalarRef(ScalarRef, Tainted),
+    ArrayRef(ArrayRef, Tainted),
+    HashRef(HashRef, Tainted),
+    CodeRef(CodeRef, Tainted),
+    RegexRef(RegexRef, Tainted),
 
-    // Full scalar — all the Perl SV machinery
-    Scalar(Sv),               // multi-rep caching, magic, blessing, etc.
+    // A promoted scalar occupying this slot (the slot aliases it)
+    Scalar(ScalarRef),
 
-    // Container and code types
-    Array(Av),
-    Hash(Hv),
-    Code(Arc<Code>),
-    Regex(Arc<CompiledRegex>),
-
-    // Typed value (see §14).  Holds any Rust type
-    // that is Send + Sync.
+    // Typed value (see 14).  Any Rust type that is Send + Sync.
     Typed(Box<dyn TypedVal>),
 }
-
-/// Inline short string — covers hash keys, method names, short
-/// literals, numeric stringifications, and most temporary strings.
-/// Avoids a heap allocation for one of the hottest scalar cases.
-struct SmallString {
-    len: u8,
-    flags: u8,        // see string flags below
-    buf: [u8; 38],
-}
 ```
 
-The threshold of 38 bytes is chosen to keep `SmallString` the same
-size as `PerlString` (which is `Bytes` at 32 bytes + `flags` at
-1 byte + 7 bytes padding = 40 bytes), so the `Value` enum doesn't
-grow.  38 bytes covers the vast majority
-of short strings: hash keys, field names, small literals, numeric
-stringifications like `"42"` or `"3.14159"`, single characters,
-and short identifiers.
+`Value` is 24 bytes, `Option<Value>` is 24 bytes; both are enforced by
+compile-time assertions (§2.3.6).  Reference variants are flattened
+(one variant per referent kind, not a nested target enum) because
+`ref()`, dereference ops, and `ARRAY(0x...)`-style stringification all
+branch on referent kind first; the flattened arms sit where the code
+wants to branch.  Both shapes measure 24 bytes; ergonomics decided.
 
-When a `SmallStr` grows past 38 bytes (via `.=`, `substr` assignment,
-etc.), it promotes to `Str(PerlString)` — one heap allocation at the
-growth point.  This promotion is one-way; a `Str` that shrinks does
-not demote back to `SmallStr`.
+**Array slots.**  Arrays store `ArraySlot = Option<Value>`:
 
-The compact forms (`Int`, `Float`, `Str`) are inline — no heap
-allocation, no `Arc`, no locking overhead.  The vast majority of
-Perl values are simple: just a number, just a string, just a
-reference.  Only values that need full Perl SV semantics are
-upgraded to `Scalar(Sv)`.
+- `None` — nonexistent element (a hole): `exists $a[$i]` is false.
+- `Some(Value::Undef)` — an existing element holding undef.
 
-#### 2.2.3 Upgrade from compact to full Scalar:
+Verified against container perl 5.38: `delete $a[$mid]` leaves a hole
+with the length unchanged; `delete` of the *last* element truncates
+the array through any trailing holes (deleting index 2 of a 3-element
+array whose index 1 was already a hole yields length 1, not 2).  The
+delete-at-end rule is therefore: truncate through trailing `None`s.
 
-A compact value is upgraded to `Value::Scalar(Sv)` when any of
-these occur:
+Hashes have no slot wrapper: nonexistence is absence of the map entry.
+`exists` is `contains_key`.  The asymmetry is Perl's semantics —
+arrays can have holes below their length; hashes cannot.
 
-- **Multi-representation caching.**  `$x = "42"; $x + 0` needs to
-  cache both the string and integer forms.  The compact `Str` can
-  only hold one.
-- **Taking a reference.**  `\$x` needs a stable identity that the
-  reference can point to.  The compact `Int(42)` is a copy with no
-  address.  Upgrade to `Scalar(Sv)`, then `\$x` clones the `Arc`.
-- **`@_` aliasing.**  When a compact value is passed to a `sub`,
-  the callee needs to alias the caller's storage.  Upgrade to
-  `Scalar(Sv)` so both sides share the same `Arc`.
-- **Magic, blessing, taint, read-only.**  These require the `Scalar`
-  struct's `magic`, `stash`, and `flags` fields.
+#### 2.2.2 `ScalarPayload` — the authoritative datum:
 
-**Once upgraded, never downgrade.**  The complexity of reversing an
-upgrade is not worth it, and identity (via `Arc` address) must be
-preserved — anything holding a reference to the `Sv` would break if
-the value reverted to a compact form.
+The single most important principle of the scalar model:
 
-#### 2.2.4 Interaction with `\$x` references:
-
-```perl
-my $x = 42;              # Value::Int(42) — compact, no allocation
-my $ref = \$x;           # $x upgrades to Value::Scalar(Sv)
-                          # $ref = Value::Ref(Sv) — same Arc, refcount 2
-my $ref2 = \$x;          # Arc clone — refcount 3
-$$ref = "hello";          # mutates through the Arc — $x, $$ref, $$ref2 all see "hello"
-```
-
-For typed values (§14.9), `\$x` upgrades to `Arc<T>` as described
-in the ownership model.
+> **A scalar has exactly one authoritative payload.  Everything else —
+> cached conversions, warn-once state — is derived, and derived state
+> can never be consulted for anything the payload answers.**
 
 ```rust
-trait TypedVal: Send + Sync + Any {
-    fn type_name(&self) -> &'static str;
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn clone_boxed(&self) -> Box<dyn TypedVal>;
-    fn to_perl_value(&self) -> Value;   // coerce to compat value
+enum ScalarPayload {
+    Undef(Tainted),
+    Int(i64, Tainted),         // Tainted is a bool newtype; rides padding
+    Float(f64, Tainted),
+    String(PerlString),        // taint in the PerlString tag
+    True,
+    False,
+    ScalarRef(ScalarRef, Tainted),
+    ArrayRef(ArrayRef, Tainted),
+    HashRef(HashRef, Tainted),
+    CodeRef(CodeRef, Tainted),
+    RegexRef(RegexRef, Tainted),
 }
 ```
 
-### 2.3 The Scalar Internals
+Taint state appears in the listings above as the `Tainted` fields
+and the `PerlString` tag bit; its placement rules, semantics,
+laundering contract, and authoring API are §2.6.
 
-When a value is upgraded from a compact `Value` variant to a full
-`Scalar` (see upgrade triggers in §2.2), it gains multi-representation
-caching with flag-driven validity.  This matches Perl 5's SV model
-where `$x = "42"` sets STR_VALID, then `$x + 0` sets INT_VALID and caches 42 in
-`int` without clearing the string.  Multiple representations coexist:
+Truthiness, stringification, and numification are each answered by one
+`match` on the payload, written once.  A write replaces the payload
+and drops all derived state at a single choke point.
+
+This model deliberately replaces the earlier flag-matrix design
+(validity bits over parallel `int`/`num`/`bytes` cache slots).  The
+flag matrix reproduced Perl 5's SV architecture, where correctness
+depends on flag discipline that nothing enforces structurally; the
+recurring bug class in that design (stale caches consulted as
+authoritative, lossy caches poisoning stringification) is
+*unrepresentable* here.
+
+The dissolution is faithful, not divergent.  Perl's own flags encode
+this exact distinction: public `IOK` means "the IV *is* the value";
+private `IOKp` means "the IV is a memoized conversion."  Verified
+against container perl 5.38 via `Devel::Peek`:
+
+- `my $x = 3.7` used as an integer: `FLAGS = (NOK,pIOK,pNOK)`,
+  `IV = 3`.  The truncated 3 is cached privately; the NV remains
+  authoritative; `"$x"` still gives `"3.7"`.
+- `my $x = 4.0` used as an integer: `FLAGS = (IOK,NOK,pIOK,pNOK)`.
+  Public IOK, because the conversion is exact.
+- `Inf`, `-Inf`, and `NaN` in integer context cache `UV_MAX`,
+  `IV_MIN`, and `0` respectively — always with only the private flag.
+  The NV stays authoritative; stringification still gives `Inf`.
+
+The uniform rule beneath all three: every NV-to-IV coercion may cache;
+the result is authoritative iff the round-trip is exact.  In the
+payload model, "authoritative" is the payload and "cached" is a
+derived slot, so the rule holds by construction: `Float(3.7)` remains
+the payload forever, non-finite values need zero special-casing, and
+the exact cached integer values above are pinned by tests for
+bit-compatibility in `%d`-style contexts.  (The `IsUV` wrinkle — Inf
+and NaN cache into perl's *unsigned* slot — is noted and deferred: UV
+semantics are a separate design section; this section pins only the
+i64-visible behavior.)
+
+#### 2.2.3 `PerlString` — the string type:
+
+A Perl string is an octet sequence plus per-string state.  Two
+storage kinds:
 
 ```rust
-struct Scalar {
-    flags: ScalarFlags,                    // validity + metadata bits
-    int: i64,                          // integer cache
-    num: f64,                          // float cache
-    bytes: PerlStringSlot,             // string cache (with small-string optimization)
-    reference: Option<Value>,          // reference target
-    magic: Option<Box<MagicChain>>,
-    stash: Option<Arc<Stash>>,         // blessed package (for objects)
-}
-
-/// Small-string optimization within the Scalar's string cache.
-/// Even after upgrading to a full Scalar, short strings avoid a
-/// heap allocation for the bytes field.
-enum PerlStringSlot {
-    None,
-    Inline { buf: [u8; 24], len: u8, flags: u8 },
-    Heap(PerlString),
+// Conceptual shape; the literal variant set folds the per-value
+// state dimensions below into the tag byte and is macro-generated
+// behind accessors (storage_kind(), is_utf8(), is_warned(),
+// is_tainted(), scan-state and tag-transition methods).
+enum PerlString {
+    Inline { len: u8, buf: [u8; 22] },   // no heap allocation
+    Heap(CowBuffer),                     // refcounted COW buffer
 }
 ```
 
-Note that small-string optimization exists at two levels:
-`Value::SmallStr` for simple values that are just a short string
-(no `Arc`, no `Scalar` struct), and `PerlStringSlot::Inline` for
-the string cache inside a full `Scalar` (already behind `Arc`).
+`CowBuffer` is the custom copy-on-write byte buffer (ruled: custom
+over `bytes::Bytes`, `ecow`, and a tendril hybrid — see the ledger
+in §2.3.6).  Its specification fits in a sentence: a `Send + Sync`
+refcounted growable byte buffer with a `(ptr, len)` handle and a
+`{refcount, len, capacity, scan}` header — COW clone, unique-check
+mutation, nothing else.  Details:
 
-#### 2.3.1 Flag discipline:
+- **Handle: `(NonNull<u8>, usize)`, 16 bytes.**  The length is
+  mirrored into the handle from the header, exploiting envelope
+  padding that is charged regardless (measured: a 16-byte heap
+  payload threads the niche through `PerlString`, `ScalarPayload`,
+  `ScalarCell`, and `Value`, all at 24).  Coherence falls out of
+  COW: a shared buffer is immutable, so its header length never
+  changes under any handle; mutation requires this handle's `&mut`
+  (COW-break first if shared) and updates both copies.  `length`,
+  emptiness, bounds checks, and the compare-lengths-first `eq`
+  short-circuit all skip the dereference.  The `NonNull` supplies
+  the niche.
+- **Header: `{refcount: AtomicUsize, len, capacity, scan: AtomicU8}`**
+  followed by the data.  This is perl's own `CowREFCNT` trick — the
+  COW refcount stored with the string buffer — done with a real
+  atomic.  "Owned" is not a separate kind: it is the refcount == 1
+  *state*, checked with acquire ordering before in-place mutation.
+- **Clone** is a relaxed refcount increment (`clone_cow` in the
+  original design's vocabulary; the mechanism carried forward from
+  its `Bytes`/`BytesMut` model).  **Mutation**: unique → mutate in
+  place with amortized growth against the header capacity (the
+  `BytesMut` reclaim path); shared → copy out into a fresh unique
+  buffer (the COW break), leaving other sharers undisturbed.
+  Drop follows the standard Arc release/acquire protocol.
+- **Growth** allocates with headroom (perl's `sv_grow` uses roughly
+  25%; the exact policy is an implementation constant to be tuned)
+  and rounds to allocator size classes.
+- **Scans** (`is_ascii`, UTF-8 validation) use SIMD-accelerated
+  byte search (`memchr`-class routines) — the one dependency this
+  ruling leaves optional.
+- **No demotion.**  A `Heap` string that shrinks below 23 bytes
+  stays `Heap` (capacity retained for regrowth); promotion from
+  `Inline` at the growth point is one-way, as in the original
+  design.
+- **Containment.**  The unsafe lives in one module with the
+  invariants documented per function, exercised under Miri, with
+  boundary tests at every size-class and COW transition; the
+  refcount protocol gets targeted concurrency tests.  This module
+  is the string memory model; it is tested like it.
 
-`ScalarFlags` separates cache-validity bits from orthogonal metadata:
+**The 22-byte inline bound is semantic, not incidental.**  Perl's
+`%.15g` float stringification maxes out at exactly 22 characters
+(`-2.22507385850720e-308`: sign + digit + point + 14 mantissa digits
++ 5-character exponent); `i64::MIN` stringifies to 20.  Therefore
+**every numeric stringification the interpreter can produce stays
+inline** — allocation-free — and numeric stringification is constant
+traffic (every printed number, every number used as a hash key, every
+interpolation).  This invariant is the deciding argument for the
+24-byte envelope over the denser 16-byte alternative (§2.3.6).
 
-```rust
-struct ScalarFlags(u16);
+**Per-value state vs. per-buffer facts.**  String state splits into
+two locations by one criterion: copies duplicate the tag and share
+the buffer, so state that must be independent per copy lives in the
+tag, and facts about the bytes themselves live with the bytes.
 
-impl ScalarFlags {
-    // Cache validity — which representations are current
-    const INT_VALID  = 1 << 0;   // int is valid
-    const NUM_VALID  = 1 << 1;   // num is valid
-    const STR_VALID  = 1 << 2;   // bytes is valid
-    const REF_VALID  = 1 << 3;   // ref is valid (this is a reference)
+In the tag (per-value):
 
-    // Metadata — orthogonal to cache validity
-    const UTF8       = 1 << 4;   // bytes is valid UTF-8
-    const READONLY   = 1 << 5;   // value is immutable
-    const TAINT      = 1 << 6;   // value is tainted
-    const MAGICAL    = 1 << 7;   // magic chain is attached
-    const WEAK       = 1 << 8;   // this is a weak reference
-}
-```
+- **Storage kind** (`Inline` / `Heap`).
+- **The Perl utf8 flag** (`SvUTF8`) — a per-SV *semantic claim*
+  ("interpret these bytes as characters via perl-extended UTF-8"),
+  not a validity fact.  In perl it lives in SV flags, not the PV;
+  two values can share a buffer while claiming different
+  interpretations.
+- **Warned** (§2.3.4) — verified per-copy: copying an unwarned
+  string before first numification yields two warnings, one per
+  copy, so a buffer-shared bit would diverge.
+- **Tainted** — untainting one copy must not untaint another.
 
-The validity bits drive the lazy coercion engine: reading `$x` as a
-number checks INT_VALID first (fast path — return `int`), falls back
-to NUM_VALID, falls back to computing numeric value from `bytes`,
-caches the result by setting INT_VALID/NUM_VALID.  Writing
-invalidates the other caches (e.g., assigning a new string clears
-INT_VALID and NUM_VALID, sets STR_VALID).
+In the buffer header (per-buffer, `Heap` only):
 
-`PerlString` is the heap-allocated string type used by the `Heap`
-variant of `PerlStringSlot` (and throughout the runtime for string
-keys, identifiers, etc.).  Perl strings are octet sequences with
-metadata flags, not Rust `String`.
+- **The byte-content scan cache** (§2.2.4) — ASCII-ness and Rust
+  UTF-8 validity are facts about the bytes; when a buffer is shared,
+  one holder's scan benefits every sharer.  The scan byte rides in
+  the `CowBuffer` header next to the length (same
+  cache line as the length whenever the deref is in flight.
 
-`Bytes` / `BytesMut` from the `bytes` crate is the backing store,
-providing Perl 5's copy-on-write (COW) string semantics:
+`Inline` strings have no heap header; their scan state lives in the
+tag — and needs only the three *terminal* states, because inline
+strings are scanned eagerly at construction (§2.2.7): checking at
+most 22 bytes is nearly free.  Tag-state arithmetic: Inline
+3 (scan) × 2 (utf8) × 2 (warned) × 2 (tainted) = 24; Heap
+2 × 2 × 2 = 8; 32 tag states total, leaving ample niche encodings
+for the enclosing `Value`/`ScalarCell` layouts (§2.3.6).
 
-- **Shared / COW state (`Bytes`):** Multiple SVs can reference the
-  same underlying buffer.  Operations like `substr($x, 0, 5)` as an
-  rvalue produce a zero-copy `Bytes::slice()`.  `Bytes` is immutable
-  and reference-counted — cloning is a cheap refcount bump.
+**The Perl flag and the scan cache must never be conflated.**
+Verified against container perl 5.38: `chr(0x110000)` is legal core
+perl — length 1, `UTF8` flag set, stored as bytes `F4 90 80 80` —
+and Rust's `str::from_utf8` rejects those bytes (Rust UTF-8 tops out
+at U+10FFFF; surrogates via `chr(0xD800)` are the same class, and
+`Encode::_utf8_on()` can set the flag with no validation at all).
+A utf8-flagged string can therefore be scan-state `INVALID_UTF8`
+without contradiction, and no code path may derive
+`from_utf8_unchecked` from the Perl flag.  The two-location split
+makes the distinction structural rather than a discipline: there is
+no single field to confuse.
 
-- **Mutation (`BytesMut`):** When a string is mutated (`.=`, `chop`,
-  `chomp`, `substr` assignment, `s///`, `vec()`), the `Bytes` handle
-  is checked for unique ownership.  If uniquely held, it converts to
-  `BytesMut` in place (no copy).  If shared, copy-on-write triggers:
-  a new `BytesMut` is allocated, the content is copied, then mutated.
+How `PerlString` represents perl-extended sequences that Rust `str`
+cannot hold (code points above U+10FFFF, surrogates) — and the
+consequences for `length`, `substr`, `ord`, and iteration — is an
+open subsection to be designed; byte-level storage with
+extended-encoding-aware character operations is the expected shape.
 
-This maps directly to Perl 5's `SvPV_COW` mechanism.
+**`use bytes` is not value state.**  Verified: the same unchanged
+value answers `length` as 1, then 4 inside a `use bytes` block, then
+1 again after it, with its flags untouched.  The pragma is a lexical
+property of the *observing scope*, handled by the compile-time hints
+machinery (`HINT_BYTES` in perl; §8 lowering here): ops compiled in
+its extent take byte-semantics paths.  The value model already has a
+"raw byte buffer" concept — the unflagged state — and `use bytes`
+merely makes flagged strings answer as if unflagged.  The same hints
+mechanism serves `use warnings` categories (§2.3.4 consults the use
+site's scope) and `use locale`.
 
-#### 2.3.2 String flags:
+**Relation to `Bytes`.**  The lexer continues to use `bytes::Bytes`,
+whose 32-byte fat handle buys zero-copy slicing of source buffers —
+the right tool there.  At the parse/compile boundary, a string
+literal's bytes are copied once out of the lexer's `Bytes` into the
+value representation: an 8-byte thin pointer cannot alias into a
+`Bytes` buffer.  One copy per literal at compile time is the price of
+8-byte handles at runtime.
 
-A single `flags: u8` byte carries two independent concerns:
+**Substring sharing.**  Rvalue `substr` and regex captures against
+large strings are where perl plays COW games.  A third storage kind
+over the same allocation family is additive if the regex-engine
+section (§11) needs it: the header refcount already supports views,
+and the packed form `SharedSlice { base: NonNull<u8>, offset: u32,
+len: u32 }` (16 bytes) fits the envelope.  Because taint is
+per-value (tag) rather than per-buffer, a capture can be a
+zero-copy view into a *tainted* source's buffer while carrying a
+clean tag — the sanctioned untaint path (§2.6.2) costs no copy, a
+third dividend of the per-value/per-buffer criterion.  A full-`usize` slice form
+(24 bytes of payload) would not fit; slices at offsets past 4GB fall
+back to a copy — an acceptable bound for a view optimization.  The
+name
+`Str` is reserved for a borrowed-view type (lvalue `substr` returns,
+capture views) to be designed with lvalues.
 
-```text
-bit 0:     Perl UTF-8 flag (SvUTF8) — Perl's semantic "treat as characters"
-bits 1-3:  Rust byte-content cache (3 bits, 5 used states):
-```
+#### 2.2.4 String content scan states:
 
-| bits 1-3 | ASCII | valid UTF-8 | description |
+The scan cache distinguishes what is *known* about the bytes from
+what the Perl flag *claims* about them.  Five states over two facts
+(is the content pure 7-bit ASCII?  is it valid Rust UTF-8?):
+
+| state | ASCII | valid UTF-8 | description |
 |---|---|---|---|
-| `000` | yes | yes | pure 7-bit ASCII |
-| `001` | no | yes | valid UTF-8 but non-ASCII |
-| `010` | no | no | invalid UTF-8 |
-| `011` | unknown | yes | valid UTF-8, possibly ASCII |
-| `100` | no | unknown | non-ASCII, UTF-8 unknown |
-| `111` | unknown | unknown | completely unknown |
+| `ASCII` | yes | yes | pure 7-bit ASCII |
+| `UTF8_NON_ASCII` | no | yes | valid UTF-8 but non-ASCII |
+| `INVALID_UTF8` | no | no | invalid UTF-8 |
+| `UTF8_MAYBE_ASCII` | unknown | yes | valid UTF-8, possibly ASCII |
+| `NON_ASCII_UNKNOWN` | no | unknown | non-ASCII, UTF-8 unknown |
+| `UNKNOWN` | unknown | unknown | completely unknown |
 
-States `101` and `110` are unused (ASCII implies valid UTF-8).
+(The remaining two encodings of the fact pair are unused: ASCII
+implies valid UTF-8.)
 
-The Perl UTF-8 flag (bit 0) is independent of the Rust cache.
-Perl's "extended UTF-8" can represent code points above U+10FFFF
-and surrogates that Rust rejects, and `Encode::_utf8_on()` sets
-the Perl flag without validation.
+The Perl UTF-8 flag is independent of this cache.  Perl's "extended
+UTF-8" can represent code points above U+10FFFF and surrogates that
+Rust rejects, and `Encode::_utf8_on()` sets the Perl flag without
+validation (§2.2.3).
 
-#### 2.3.3 State transitions — scans only narrow, never re-widen:
+The motivating hot consumer is §2.3.5 string equality and hashing:
+the both-`ASCII` fast path compares bytes regardless of flags, the
+cross-flag path needs validity, and downgrade-canonical hashing
+needs character-range knowledge.  Without the cache, every
+mixed-provenance comparison rescans.
 
-- `is_ascii()` scan: `111` → `000` or `100`; `011` → `000` or `001`
-- `as_str()` scan: `111` → `000` or `001` or `010`;
-  `100` → `001` or `010`
+#### 2.2.5 State transitions — scans only narrow, never re-widen:
+
+- `is_ascii()` scan: `UNKNOWN` → `ASCII` or `NON_ASCII_UNKNOWN`;
+  `UTF8_MAYBE_ASCII` → `ASCII` or `UTF8_NON_ASCII`
+- `as_str()` scan: `UNKNOWN` → `ASCII` or `UTF8_NON_ASCII` or
+  `INVALID_UTF8`; `NON_ASCII_UNKNOWN` → `UTF8_NON_ASCII` or
+  `INVALID_UTF8`
 
 Once a state is narrowed, no subsequent operation widens it unless
-the bytes are mutated.  Mutation rules for the Rust cache (bits
-1-3), preserving the Perl UTF-8 flag (bit 0) independently:
+the bytes are mutated.  Because narrowing records a fact about
+immutable-at-that-moment bytes, it may happen through a shared
+reference: the header scan byte is an `AtomicU8` written with
+relaxed ordering.  Races are benign by the lattice: concurrent
+scanners of a shared (immutable) buffer compute compatible
+narrowings of the same bytes, and monotone writes of identical
+terminal states commute.  Mutation requires `&mut` on a unique
+buffer (COW extraction first when shared), so the transition rules
+below apply at mutation sites exactly as written:
 
-- **Appending or prepending pure ASCII bytes**: no flag change.
+- **Appending or prepending pure ASCII bytes**: no state change.
   Cannot affect UTF-8 validity or introduce non-ASCII content.
 
 - **Appending or prepending `&str`** to a valid UTF-8 string:
-  preserves `001` or `011`.  Valid UTF-8 concatenated with valid
-  UTF-8 is valid UTF-8.
+  preserves `UTF8_NON_ASCII` or `UTF8_MAYBE_ASCII`.  Valid UTF-8
+  concatenated with valid UTF-8 is valid UTF-8.
 
 - **Inserting mid-string** into any string results in invalid
   UTF-8 if the byte at the insertion point is a UTF-8 continuation
   byte (`0x80..0xBF`), because this splits a multi-byte sequence
-  — transition to `010` (invalid).  This check can be skipped for
-  `000` (insertion point is guaranteed ASCII) and for `010`/`111`
-  (no validity claim to protect).
+  — transition to `INVALID_UTF8`.  This check can be skipped for
+  `ASCII` (insertion point is guaranteed ASCII) and for
+  `INVALID_UTF8`/`UNKNOWN` (no validity claim to protect).
+  Conversely, inserting known-valid UTF-8 *at a character boundary*
+  of a valid UTF-8 string preserves validity (ASCII status per the
+  addition rules below).
 
-- **Adding to an ASCII string** (`000`) inherits the flags of the
+- **Adding to an ASCII string** (`ASCII`) inherits the state of the
   content being added.
 
 - **Adding valid UTF-8** (`&str`, `String`, or a string with known
-  `001`/`011` flags) to a valid UTF-8 string preserves UTF-8
-  validity.  ASCII status: `001` stays `001`; `000` transitions to
-  `001` if the added content is non-ASCII.
+  `UTF8_NON_ASCII`/`UTF8_MAYBE_ASCII` state) to a valid UTF-8 string
+  preserves UTF-8 validity.  ASCII status: `UTF8_NON_ASCII` stays
+  `UTF8_NON_ASCII`; `ASCII` transitions to `UTF8_NON_ASCII` if the
+  added content is non-ASCII.
 
 - **Removing valid UTF-8 characters** from a valid UTF-8 string
   (respecting character boundaries, not splitting a multi-byte
-  sequence): `001` resets to `011` (removing non-ASCII characters
-  might leave only ASCII).  `011` stays `011`.
+  sequence): `UTF8_NON_ASCII` resets to `UTF8_MAYBE_ASCII` (removing
+  non-ASCII characters might leave only ASCII).  `UTF8_MAYBE_ASCII`
+  stays `UTF8_MAYBE_ASCII`.
 
-- **Removing non-ASCII bytes**: reset to `111` (remaining content
-  is unknown).
+- **Removing non-ASCII bytes**: reset to `UNKNOWN` (remaining
+  content is unknown).
 
 - **Any other byte-level mutation** (raw writes, `vec()`, `s///`
-  with byte-level replacement): reset to `111`.
+  with byte-level replacement): reset to `UNKNOWN`.
 
 These rules are optimizations, not requirements.  The blanket
-fallback — reset bits 1-3 to `111` on any mutation — is always
-correct.  The lazy scan recovers the information if needed later.
-Smart preservation avoids unnecessary re-scanning for common
+fallback — reset the scan state to `UNKNOWN` on any mutation — is
+always correct.  The lazy scan recovers the information if needed
+later.  Smart preservation avoids unnecessary re-scanning for common
 operations like string concatenation and `chomp`.
 
-#### 2.3.4 `flags == 0` fast path:
+#### 2.2.6 Encoding and the fast path:
 
-When all bits are zero (`flags == 0`), the string is pure ASCII with
-no Perl UTF-8 flag — the overwhelmingly common case for typical Perl
-code.  A single comparison handles it: safe for `as_str()`, no
-multi-byte characters, no special semantics.  This is also the
-natural zero-initialized state for strings built from known-ASCII
-source bytes.
+`UNKNOWN` is encoded as zero: the natural zero-initialized state of
+a fresh header byte must be the no-knowledge top of the lattice, so
+that forgotten initialization can never assert a validity claim.
+The common-case fast path is unharmed — testing the scan byte
+against the `ASCII` constant is the same single comparison as
+testing against zero.
 
-#### 2.3.5 Construction policy:
+#### 2.2.7 Construction policy:
 
-- `SmallString`: always scan for ASCII at construction (checking ≤38
-  bytes for a high bit is nearly free).  From raw bytes: `000` (ASCII)
-  or `100` (non-ASCII, UTF-8 unknown).  From Rust `&str`/`String`:
-  `000` (ASCII) or `001` (non-ASCII, valid UTF-8 from type).  This
-  is the only eager scan.
-- `PerlString` from Rust `&str` or `String`: set `011` (valid UTF-8
-  from type, ASCII status deferred).  `String` ownership transfer is
-  zero-copy via `Bytes::from()`.
-- `PerlString` from arbitrary bytes (I/O, XS, `Encode`, lexer
-  literals): set `111`, defer all scanning.
+- `Inline`: always scan for ASCII at construction (checking ≤22
+  bytes for a high bit is nearly free).  From raw bytes: `ASCII` or
+  `NON_ASCII_UNKNOWN`.  From Rust `&str`/`String`: `ASCII` or
+  `UTF8_NON_ASCII` (validity known from the type).  This is the only
+  eager scan; inline scan states are therefore always terminal and
+  live in the tag (§2.2.3).
+- `Heap` from Rust `&str` or `String`: set `UTF8_MAYBE_ASCII`
+  (valid UTF-8 from the type, ASCII status deferred).  Construction
+  from a Rust `String` costs one copy into the headered layout (the
+  header precedes the data, so `String` ownership cannot transfer in
+  place — a deliberate trade against the compact handle, §2.2.3).
+- `Heap` from arbitrary bytes (I/O, XS, `Encode`, lexer literals):
+  set `UNKNOWN`, defer all scanning.
+
+#### 2.2.8 Upgrade triggers:
+
+A compact value is promoted to the `Scalar(ScalarRef)` form when any
+of these occur:
+
+- **Taking a reference.**  `\$x` needs a stable identity.
+- **Aliasing.**  `@_`, `foreach` loop variables, `local`, symbol-table
+  aliasing: two names must observe one storage.
+- **Magic, blessing, tie, weakening.**  These attach state to an
+  identity.
+- **First numification warning** on an unshared non-numeric string —
+  see §2.3.4; the warn-once bit is carried in the `PerlString` tag,
+  so this trigger applies only where the tag route is unavailable.
+
+Multi-representation caching is *not* an upgrade trigger (it was in
+the flag-matrix design): compact values recompute conversions, which
+is cheap for numbers and small strings.  If profiling ever shows
+recompute costs on hot unshared values, the recorded escape hatches
+are promotion or slot-level caches with generation stamps; the latter
+is deliberately deferred (§2.3.6).
+
+### 2.3 Promoted Scalars
+
+#### 2.3.1 `ScalarRef` — shared identity:
 
 ```rust
-struct PerlString {
-    buf: Bytes,
-    flags: u8,
-}
-
-impl PerlString {
-    const PERL_UTF8: u8   = 0b0001;
-    const ASCII: u8       = 0b0000;  // bits 1-3
-    const UTF8_NON_ASCII: u8 = 0b0010;
-    const INVALID_UTF8: u8 = 0b0100;
-    const UTF8_MAYBE_ASCII: u8 = 0b0110;
-    const NON_ASCII_UNKNOWN: u8 = 0b1000;
-    const UNKNOWN: u8     = 0b1110;
-    const CACHE_MASK: u8  = 0b1110;
-
-    /// Zero-cost &str view when Rust UTF-8 validity is known.
-    /// Triggers a validation scan if needed.
-    fn as_str(&mut self) -> Option<&str> {
-        match self.flags & Self::CACHE_MASK {
-            Self::ASCII | Self::UTF8_NON_ASCII | Self::UTF8_MAYBE_ASCII => {
-                // Known valid UTF-8 (all three states).
-                Some(unsafe { std::str::from_utf8_unchecked(&self.buf) })
-            }
-            Self::INVALID_UTF8 => None,
-            _ => {
-                // UNKNOWN or NON_ASCII_UNKNOWN — need UTF-8 scan.
-                match std::str::from_utf8(&self.buf) {
-                    Ok(s) => {
-                        let cache = if s.is_ascii() { Self::ASCII } else { Self::UTF8_NON_ASCII };
-                        self.flags = (self.flags & Self::PERL_UTF8) | cache;
-                        Some(unsafe { std::str::from_utf8_unchecked(&self.buf) })
-                    }
-                    Err(_) => {
-                        self.flags = (self.flags & Self::PERL_UTF8) | Self::INVALID_UTF8;
-                        None
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check whether the string is pure 7-bit ASCII.
-    /// Triggers an ASCII scan if needed.
-    fn is_ascii(&mut self) -> bool {
-        match self.flags & Self::CACHE_MASK {
-            Self::ASCII => true,
-            Self::UTF8_NON_ASCII | Self::INVALID_UTF8 | Self::NON_ASCII_UNKNOWN => false,
-            Self::UTF8_MAYBE_ASCII => {
-                // Valid UTF-8 but haven't checked ASCII.
-                if self.buf.iter().all(|&b| b < 128) {
-                    self.flags = (self.flags & Self::PERL_UTF8) | Self::ASCII;
-                    true
-                } else {
-                    self.flags = (self.flags & Self::PERL_UTF8) | Self::UTF8_NON_ASCII;
-                    false
-                }
-            }
-            _ => {
-                // UNKNOWN — full scan.
-                if self.buf.iter().all(|&b| b < 128) {
-                    self.flags = (self.flags & Self::PERL_UTF8) | Self::ASCII;
-                    true
-                } else {
-                    self.flags = (self.flags & Self::PERL_UTF8) | Self::NON_ASCII_UNKNOWN;
-                    false
-                }
-            }
-        }
-    }
-
-    /// Zero-copy construction from a Rust String.
-    fn from_string(s: String) -> PerlString {
-        PerlString {
-            buf: Bytes::from(s.into_bytes()),
-            flags: Self::UTF8_MAYBE_ASCII,  // valid from type, ASCII unknown
-        }
-    }
-
-    /// Construction from a Rust &str — known valid UTF-8, ASCII deferred.
-    fn from_str(s: &str) -> PerlString {
-        PerlString { buf: Bytes::from(s.as_bytes().to_vec()), flags: Self::UTF8_MAYBE_ASCII }
-    }
-
-    /// Always-available byte view (zero-cost — Bytes derefs to &[u8]).
-    fn as_bytes(&self) -> &[u8] {
-        &self.buf
-    }
-
-    /// Clone for COW — cheap refcount bump when shared.
-    fn clone_cow(&self) -> PerlString {
-        PerlString { buf: self.buf.clone(), flags: self.flags }
-    }
+enum ScalarRef {
+    Mut(Arc<RwLock<ScalarCell>>),   // ordinary mutable scalar
+    Const(Arc<ConstScalar>),        // truly immutable; no lock
 }
 ```
 
-For code that wants real Rust `String` or `Bytes` values directly — with
-their full performance characteristics and zero-cost FFI — see §14
-(Typed Values in Modern Mode).
+- Reference identity is `Arc::ptr_eq`; `==` on Perl references
+  compares it.
+- Reads unify behind an accessor returning a guard that derefs to the
+  cell either way.  `Const` reads take no lock: no acquisition, no
+  contention, freely concurrent.
+- `write()` on a `Const` has no lock to hand out: the mutation failure
+  is *structural*, surfacing as the error the runtime maps to Perl's
+  "Modification of a read-only value attempted."  Immutability is not
+  a flag check that must be remembered; it is a state the type system
+  cannot express a mutation of.
+- The `RwLock` is `parking_lot`'s: no poisoning (std poisoning is
+  noise under the no-panic policy), 8 bytes, and consistent with the
+  cardinal lock invariants (§13): no user code (magic, tie, overload)
+  runs while a cell lock is held, and no guard is held across an
+  `.await`.  Magic dispatch snapshots under the lock and runs user
+  callbacks unlocked.
+- `Const` cells can never upgrade: blessing, tying, magic, and
+  un-readonly-ing are mutations, structurally impossible there.
+  Dynamic readonly (`Internals::SvREADONLY`, toggleable) remains a
+  flag on `Mut` cells; `Const` is for values frozen at birth
+  (immortals, `use constant`, folded literals).  This is a deliberate,
+  documented divergence in *mechanism* only: `use constant` values in
+  perl are also die-on-modify, so behavior matches.
+- The variant set is extensible by design: a future `Swap` variant
+  (ArcSwap-backed read-mostly storage class, §13) is additive, and the
+  accessor API is written against the guard abstraction, not
+  `RwLock`'s guards.
 
+#### 2.3.2 `ScalarCell` — the mutable interior:
+
+```rust
+enum ScalarCell {
+    Plain(ScalarPayload),      // the common promoted case: 24 bytes
+    Full(Box<FullScalar>),     // rare state; payload moves into the box
+}
+
+struct FullScalar {
+    payload: ScalarPayload,
+    // Derived caches (lazy):
+    cached_int: ...,           // exact conversions may also be cached
+    cached_float: ...,
+    cached_string: ...,
+    // Rare identity state:
+    magic: Option<Box<MagicChain>>,
+    stash: Option<Arc<Stash>>,
+    meta: ...,                 // readonly flag, weakref bookkeeping
+}
+```
+
+`ScalarCell` is 24 bytes: the `Full` variant is a single pointer that
+threads through the payload's spare niche encodings (measured;
+§2.3.6).  Upgrade from `Plain` to `Full` happens **in place under the
+write lock** — the `Arc` address never changes, preserving every
+outstanding reference.  This is the same invariant perl's
+`sv_upgrade` maintains by swapping bodies behind a stable head; the
+mechanism differs (variant rewrite vs. body pointer), the identity
+guarantee is identical.
+
+Cost ledger for a promoted scalar (64-bit, parking_lot):
+
+```text
+Plain:  Arc header 16 + RwLock 8 + cell 24  =  48 heap bytes,
+        one allocation, payload inline, hot access = lock + match.
+Full:   48 + one extension allocation; payload and rare state
+        colocated in one box (better locality for magic ops than a
+        split layout); full-cell payload reads pay one indirection —
+        acceptable because full cells are rare: mainstream OO blesses
+        the referent container, not the ref scalar, so hash-based
+        objects never create Full scalar cells.
+```
+
+48 bytes lands exactly on a common allocator size class.  Comparison
+against perl 5 (head 24 + body ladder + separate string buffers +
+8-byte slot pointers; figures re-derived from the 5.42.2 reference
+sources): compact numbers beat perl's 32-bytes-plus-a-dereference
+array elements by 25% and all of the pointer chasing; short strings
+beat perl's three-allocation ~50 bytes with zero allocations; the one
+concession is the heavily aliased plain scalar (48 vs. perl's 24),
+inherent to the two-tier bet, not the envelope.
+
+The lazy-cache slots exist because exact conversions of *shared*
+scalars are worth memoizing once at the identity rather than
+recomputed per reader.  The fill mechanism (populate under read lock
+via once-cells vs. write lock) is an open implementation choice; the
+design constraint is only that readers stay concurrent on the read
+path.
+
+#### 2.3.3 `ConstScalar` and the boolean immortals:
+
+```rust
+struct ConstScalar {
+    payload: ScalarPayload,
+    // All coercions materialized at construction — plain fields,
+    // no interior mutability:
+    int: i64,
+    float: f64,
+    string: PerlString,
+    // The single exception (only present when the payload can warn):
+    numify_warned: AtomicBool,
+}
+```
+
+Const cells are **eagerly materialized**: every coercion is computed
+at construction (at most two short strings and two numbers), so reads
+are plain field access with no lock, no once-cell machinery, and the
+type is trivially `Sync`.
+
+**`Value::True` / `Value::False`** are unit variants — the canonical
+instance property is free (a unit variant *is* its single value).
+Their promoted forms are two immortal singletons
+(`static LazyLock<ScalarRef>`), constructed once as `Const` cells:
+
+- true: `Int(1)` payload, materialized as 1 / 1.0 / `"1"`.
+- false: dualvar — numerically 0, string `""` (not `"0"`).  Verified
+  container 5.38: `(1==0)."" ` has length 0.
+- Sharing is observably correct, not just fast: `\(1==1)` twice in
+  perl yields the same address.  Upgrading `Value::True` returns a
+  clone of the singleton `Arc`.
+- Assignment copies, aliasing shares: `my $x = (1==1); $x = 5` is
+  legal (the *slot's* value is replaced); mutation of the immortal
+  itself (through a ref or `foreach` alias) dies read-only.
+- `builtin::is_bool` answers from the variant, trivially.
+
+The singleton contract is pinned by perl-core tests requiring no
+runtime: `Arc::ptr_eq` across separate upgrades of `True` (and of
+`False`); the two singletons distinct; upgrades yield `Const`;
+pre-materialized values as above; mutation attempts yield the
+readonly error, never a panic; cross-thread upgrades still `ptr_eq`
+(guarding `LazyLock` initialization races).
+
+#### 2.3.4 Numification warnings:
+
+Container-verified contract (perl 5.38, all under `-w`):
+
+- `"abc" + 1` twice warns **once** — the warn state rides the same
+  per-SV caching event as `pIOK`.
+- The state is **copied on assignment**: copy after first
+  numification, the copy is silent; copy before, both warn.
+- `"12abc" + 1` warns: the predicate is "not cleanly numeric in its
+  entirety," not "no leading number."  The exact boundary (leading
+  and trailing whitespace, `"0 but true"`, partial exponents) is an
+  open item requiring a container-mapped table.
+- The quoted fragment in the message is a *rendering*: truncated at
+  ~56 characters with `...`, control characters caret-escaped
+  (`^A`).  Nothing is precomputed; the message (fragment, op name,
+  use-site location) is composed entirely at emit time.
+
+Mechanism: the would-warn property is decidable from the payload at
+construction; the once-only state is one bit.  For strings it rides
+the `PerlString` tag (a tag transition at first numification — zero
+allocation, and slot-to-slot copies carry it automatically, matching
+the verified copy semantics).  For `Const` cells it is the
+`numify_warned` `AtomicBool`, present only when the payload can warn
+(most Const cells statically cannot and carry nothing).  Eager
+knowledge, lazy surfacing.
+
+#### 2.3.5 String equality and hashing:
+
+Perl `eq` compares **character sequences**; the utf8 flag changes the
+byte-to-character mapping, so:
+
+- Same bytes, different flags can be *different* strings: bytes
+  `C3 A9` unflagged are two characters, flagged are `"é"` — not `eq`.
+- Different bytes can be the *same* string: unflagged `E9` (latin-1
+  `é`) and flagged `C3 A9` (UTF-8 `é`) — `eq`.
+
+Therefore neither derived struct equality (flag-sensitive) nor
+flag-blind byte comparison is correct.  `PerlString` implements
+`Eq`/`Hash` manually with perl's own rule (`sv_eq`): flags equal →
+byte compare; flags differ → upgrade the unflagged side and compare;
+both-ASCII fast path compares bytes directly.  `Hash` uses the
+canonical downgraded-when-possible form, so `$h{$utf8_e}` and
+`$h{$latin1_e}` are one key (verified 5.38: utf8::upgrade/downgrade
+variants of a key collide, `scalar keys` is 1).  Canonicalization
+also zeroes the warned and tainted tag bits on the stored key: keys
+returned by `keys`/`each` are clean *structurally*, implementing the
+documented hash-key untaint contract (§2.6.2) rather than scrubbing
+on read.  Equality already ignores those bits, so tainted-key lookup
+against clean stored keys needs no special case.  Under `use bytes`
+the ops layer selects a third comparison mode — raw bytes, flags
+ignored — by compile-time hint (§2.2.3, §8); it is not a property of
+the strings.  The warned and
+tainted tag bits are ignored by equality and hashing.  This section
+supersedes any notion of "internal representation equality" — string
+equality in perl-core *is* Perl-level string equality.
+
+#### 2.3.6 Layout law:
+
+All sizes below are measured (probe programs preserved in the repo)
+and enforced at compile time:
+
+```rust
+const _: () = assert!(size_of::<Value>() == 24);
+const _: () = assert!(size_of::<Option<Value>>() == 24);
+const _: () = assert!(size_of::<ScalarPayload>() == 24);
+const _: () = assert!(size_of::<ScalarCell>() == 24);
+const _: () = assert!(size_of::<Option<ScalarCell>>() == 24);
+const _: () = assert!(size_of::<PerlString>() == 24);
+```
+
+The load-bearing layout facts:
+
+- **The envelope is 24 bytes** (ruled): full inline `i64` and `f64`,
+  22 inline string bytes covering all numeric stringifications, thin
+  heap pointers, `Option` at no cost.  The denser 16-byte layout was
+  measured reachable (14 inline bytes, taint as parallel variants)
+  and rejected: it taxes numeric<->string conversion — Perl's
+  characteristic hot path — to optimize storage density, and packed
+  containers are the better remedy if dense numeric arrays ever
+  dominate profiles.
+- **Padding placement follows variant size.**  Sub-maximal variants
+  may carry redundant or flag fields in their padding for free,
+  provided every mutation path that invalidates the redundancy
+  passes through `&mut` on the same handle (the taint bools on
+  `Int`/`Float`/`Ref`, the mirrored length in the string handle);
+  maximal variants (strings) must fold flags into the *inner*
+  type's discriminant —
+  adding outer `Value` variants that carry `PerlString` defeats the
+  niche and costs 8 bytes globally (measured: even two such variants
+  regress 24 → 32-class layouts).  Hence utf8/warned/tainted live in
+  the `PerlString` tag.
+- **The `Full` variant threads the niche** because its payload is one
+  pointer; a two-field `Full(payload, ptr)` is irreducibly 32
+  (measured both ways).
+- Enum niche layout is a rustc behavior, not a language guarantee.  A
+  regression costs bytes and fails the build via the assertions
+  above; it can never cost memory safety.
+
+Considered and rejected (recorded so the questions stay settled):
+
+- **Manually tagged `repr(C)` union.**  Achieves parity with the safe
+  enum at the same envelope — full i64/f64, 14-or-22 inline bytes,
+  thin pointers — while making tag/payload coherence, refcount-correct
+  `Clone`, and active-payload `Drop` programmer-maintained invariants.
+  That is the SV flag-discipline architecture this design exists to
+  eliminate, rebuilt in `unsafe` at the representation layer.  No
+  capacity advantage; rejected.
+- **NaN-boxing.**  8-byte values, but full 64-bit IVs need overflow
+  and boxing paths in exactly the numeric corners under
+  container-verification; all strings exiled to the heap (Perl is a
+  string-processing language; JS-engine tradeoffs do not transfer);
+  heavy `unsafe`.  Rejected.
+- **`dyn` trait scalars.**  Payloads move to the heap (allocation per
+  integer), reads gain a dependent load, dispatch defeats inlining;
+  the open-type-set benefit is useless because Perl's scalar kinds
+  are closed and user extension (bless/overload/tie) is data-driven.
+  `dyn` belongs at the behavioral extension points (`Magic`, tie
+  handlers, IO layers), off the value path.  Rejected for values.
+- **Slot-level coercion caches** (caches in the variable slot rather
+  than the cell).  Requires an epoch/generation invalidation protocol
+  against aliased writes and fattens every container element.
+  Deferred as a measured-optimization candidate; a generation counter
+  on cells is additive if ever needed.
+- **Separate `Arc` types for plain vs. full cells.**  Breaks identity
+  stability on upgrade (`bless \$x` on an aliased scalar); handles
+  cannot be found and rewritten.  The distinction lives *inside* the
+  stable allocation instead.
+- **`bytes::Bytes` as the heap string payload.**  Sound (the
+  original design used it, and its COW model is carried forward in
+  mechanism), but its 32-byte fat handle repeals the 24-byte
+  envelope wholesale — `Value` returns to 40 and every downstream
+  layout reverts.  Storing it *behind* a pointer is dominated both
+  ways: `Box<Bytes>` allocates per clone (recreating the copy-cost
+  regression); `Arc<Bytes>` stacks two refcounts, double-derefs
+  every access, and churns allocations at the COW break.
+- **`ecow::EcoVec<u8>`.**  The strongest crate candidate (measured:
+  16-byte handle, envelope holds); rejected only because it has no
+  header field for the shared scan byte, and the buffer type is the
+  string memory model — worth owning outright.  Recorded as the
+  fallback if the custom module underdelivers; the handle shape is
+  identical, so migration is contained.
+- **`tendril` (or a tendril-under-4GB hybrid).**  Disqualified on
+  measurement: `Tendril<_, Atomic>` is `Send` but not `Sync`
+  (handle-local `Cell` refcount), which makes any containing
+  `RwLock` non-`Sync` and the shared heap unshareable.  Its u32
+  lengths cap strings at 4GB — a semantic break, not a performance
+  trade.  The hybrid inverts its own economics: the over-4GB
+  fallback must implement the full operation surface, i.e. it *is*
+  the all-sizes solution, making tendril a second representation on
+  top plus a boundary-migration path where bugs live.  Its
+  sub-tendril slicing is the one feature worth reproducing natively
+  (the `SharedSlice` note in §2.2.3).
+- **Parallel tainted variants** (`TaintedInt(i64)` etc.) instead of
+  padding fields.  Measured layout-equivalent at 24 bytes (and
+  *required* at 16, where payload bools break the niche).  The
+  genuine argument for them — exhaustiveness forces every match to
+  confront taint — points at the wrong discipline: taint handling
+  belongs in one centralized ops-layer propagation function, not
+  scattered per-match arms, and under that structure a uniform
+  field is the right shape while variants double every exhaustive
+  match forever for a mode most programs never enable.  Also
+  violates the padding-placement rule without layout forcing it.
+  The anti-laundering concern is answered by the `Tainted` API
+  contract instead.  Recorded as the required fallback shape should
+  the envelope ever drop to 16.
+- **Taint as magic** (perl's own mechanism).  Correct but
+  architecture-mismatched: perl amortizes the one-time `PVMG`
+  upgrade over a persistent SV's lifetime, while our compact values
+  are ephemeral — every op produces a fresh `Value`, so magic-borne
+  taint means an allocation per operation on tainted data, an
+  allocation storm on the canonical `-T` workload.  Right for perl,
+  wrong for this model.
+- **Taint as an outer wrapper** (`enum { Clean(Value),
+  Tainted(Value) }`).  Measured 32 bytes: niche freeness is
+  proportional to *payload-free* states — `Option`-shaped wrappers
+  (one empty state) are free, `Either`-shaped wrappers (two full
+  states) need a mirrored encoding space the niche cannot hold.
+  The same law from the wrapper side that forbade outer string
+  variants.
+- **Runtime `Shape` projection** for dispatch.  Measured identical
+  codegen in release (opcode-diffed) but call-per-abstraction-layer
+  in debug (~7 calls/op with `#[inline]`, ~2× instructions with
+  `#[inline(always)]`), an 11.5× total debug-vs-release gap on the
+  hot path.  Superseded by `taint_match!`, which is compile-time
+  rewriting — no runtime projection value exists to cost anything.
+  A reified view enum remains available if a future consumer needs
+  one.
+- **Parallel tainted variants with a strip-and-redispatch
+  trampoline.**  Measured: naive recursion defeats the optimizer
+  (215 instructions); hot/cold split reaches only executed-parity
+  with fields (~17 vs ~16) while paying a jump-table dispatch and
+  1.85× code size, plus guard-arm asymmetry for tag-carried string
+  taint.  Fields with `taint_match!` dominate.  (Parallel variants
+  remain the *required* shape at a 16-byte envelope, as previously
+  recorded.)
+- **A survey of the string-crate ecosystem** (several dozen
+  candidates) collapses against the requirement profile — arbitrary
+  bytes, mutable with amortized growth, refcounted COW, atomic,
+  handle ≤ 16 bytes, no crate-level SSO, no u32 length cap — to
+  exactly `ecow` and the custom buffer.  UTF-8-only types,
+  immutable-only types, fat-handle `bytes` wrappers, and interners
+  all fail structurally; `hipstr` independently converges on our
+  inline-over-Arc shape but is a whole-`PerlString` competitor, not
+  a buffer.  Adjacent keeps: `memchr` for SIMD scans; `bstr`-style
+  algorithms at the ops layer; interners (`lasso`/`ustr`) as a
+  future candidate for stash and symbol-table keys only.
+
+The byte-content scan cache is carried forward from the previous
+design (now §2.2.4-§2.2.7) with its state lattice and transition
+rules intact; representation moved to the buffer header for heap
+storage kinds and to eager terminal tag states for `Inline`, per the
+per-value/per-buffer criterion in §2.2.3.
+
+#### 2.3.7 Naming:
+
+Cryptic perl-internals names (SV, IV, PV, IOK) are not reproduced;
+behavior is matched, vocabulary is not.  The type roster:
+
+```text
+PerlString    a Perl string: bytes + utf8/warned/tainted in its tag
+CowBuffer     custom COW byte buffer: (ptr, len) handle;
+              {refcount, len, capacity, scan} header
+Value         the universal 24-byte slot value
+ScalarPayload the authoritative datum of one scalar
+ArraySlot     Option<Value>: None = hole, Some(Undef) = undef element
+ScalarRef     shared identity of a promoted scalar (Mut | Const)
+ScalarCell    mutable cell interior (Plain | Full), upgraded in place
+FullScalar    boxed rare state: payload + caches + magic + stash
+ConstScalar   lockless immutable cell, coercions materialized at birth
+PerlArray     Vec<ArraySlot> + array-level state
+PerlHash      HashMap<PerlString, Value> + iterator state
+ArrayRef, HashRef, CodeRef, RegexRef
+              Arc-backed shared identities of the container/code types
+MagicChain, Stash
+              carried over
+ScalarError   fallible-operation error (readonly modification, ...)
+Tainted       bool newtype for the per-value taint bit; explicit
+              construction, no Default, no public clearing — the
+              untaint capability is confined to the two documented
+              laundering paths (§2.6.2)
+Str           RESERVED: borrowed string-view type (lvalue substr,
+              capture views); do not use for owned types
+```
+
+Deleted from the previous design: `ScalarFlags` (no flag matrix
+exists), the `Sv`/`Av`/`Hv` aliases, `SmallString` and
+`PerlStringSlot` (subsumed by `PerlString::Inline`), and the
+standalone small-string maximum (now the `PerlString` inline
+constant).
+
+Open items awaiting rulings or container work, marked here rather
+than scattered: the would-warn predicate table (§2.3.4); the
+lazy-cache fill mechanism (§2.3.2); the
+perl-extended-UTF-8 representation subsection (§2.2.3); which 5.42
+constant-declaration surfaces map to `Const` construction.  (The
+buffer ruling is settled: custom `CowBuffer`, no new required
+dependencies; `memchr` optional for scan acceleration.)
 ### 2.4 Reference Counting and Cycle Collection
 
 `Arc` provides atomic reference counting.  When the last `Arc` to a
@@ -569,10 +990,10 @@ Model this as an optional chain of trait objects attached to a scalar:
 
 ```rust
 trait Magic: Send + Sync {
-    fn mg_get(&self, interp: &mut Interpreter, sv: &Sv) -> Result<()>;
-    fn mg_set(&self, interp: &mut Interpreter, sv: &Sv) -> Result<()>;
-    fn mg_clear(&self, interp: &mut Interpreter, sv: &Sv) -> Result<()>;
-    fn mg_free(&self, interp: &mut Interpreter, sv: &Sv) -> Result<()>;
+    fn mg_get(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
+    fn mg_set(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
+    fn mg_clear(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
+    fn mg_free(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
     fn mg_type(&self) -> MagicType;
 }
 ```
@@ -586,6 +1007,135 @@ invariant (§13.11), magic callbacks never execute while any internal
 lock is held.
 
 ---
+
+### 2.6 Taint
+
+#### 2.6.1 Placement:
+
+**Taint placement.**  Taint is per-value, copied on assignment, and
+lives where each variant affords it free storage: envelope padding
+for the sub-maximal variants, the `PerlString` tag for strings
+(§2.2.3), the cell's payload for promoted scalars.  Every payload
+kind can carry taint **including `Undef`**: readline at EOF returns
+a *tainted undef* (container-verified: `PVMG` with taint magic and
+no value flags; taint copies on assignment; `eval` on it dies
+"Insecure dependency") — an everyday value, the terminator of every
+`while (<$fh>)` loop — and perl's own `t/op/taint.t` asserts both
+that it exists and, via a `reset()` regression, that undef must not
+be tainted spuriously.  So `Undef(Tainted)` carries the padding bit
+like its siblings, and `Value`'s `Default` is a manual impl (a
+fielded variant cannot be a derived default).  Not every
+undef-producing source taints — a missing `%ENV` key and an
+unmatched capture group are verified clean, including under
+`use locale` — so taint follows the *producing operation*, exactly
+as the ops-layer propagation model expects.  `True` and `False`
+alone carry no taint state: comparison results are verified clean
+even with tainted operands — perl returns the immortal booleans,
+which are never tainted — so untainted unit variants reproduce that
+by construction.  (A reference to a tainted scalar is also verified
+clean; the `*Ref` taint bits exist for propagation through
+expressions, not inheritance from referents.)
+
+This is a deliberate mechanism divergence: perl implements taint as
+`PERL_MAGIC_taint` — get/set magic requiring a body upgrade to
+`PVMG` on every tainted scalar (verified via `Devel::Peek`).  A
+padding bit with no promotion and no magic dispatch is strictly
+cheaper with identical observable behavior; taint *checking* and
+propagation rules are ops-layer concerns gated on taint mode
+(§10).
+
+#### 2.6.2 Untainting — the laundering contract:
+
+**Untainting is a capability, not an operation.**  Perlsec's
+documented contract is that exactly two mechanisms launder taint:
+regex capture extraction, and use as a hash key ("Values may be
+untainted by using them as keys in a hash; otherwise the only way to
+bypass the tainting mechanism is by referencing subpatterns from a
+regular expression match").  The hash-key path is a deliberately
+ratified hole, not an accident: hash keys have been mechanically
+untaintable since taint existed (perl's shared HEKs carry no taint
+field), and p5p blessed the behavior as contract in perl 5.8.3
+(maint commit `916af9ea`, 2003-12-22, from the [perl #24651]
+thread) — the prior wording said captures were the *only* way.  The
+design enforces the contract structurally: `Tainted` has explicit
+construction, no `Default`, OR-combination for propagation, and
+**no public clearing method**.  The clean-from-tainted construction
+exists as a non-public capability with exactly two consumers — the
+regex engine's capture-materialization path (§11) and `PerlHash`'s
+key-canonicalization path (§2.3.5) — so accidental untainting is
+not a tested-against bug class but uncompilable code.  Assignment
+needs no clearing: it replaces the value, taint bit included.  This
+is a guarantee perl itself cannot make (any XS code can call
+`SvTAINTED_off`); behavior is identical, enforcement is stronger.
+
+#### 2.6.3 The taint API and `taint_match!`:
+
+**The taint API: monotone algebra and `taint_match!`.**  Three verbs
+with three strictness levels: propagation is automatic, observation
+is explicit, clearing is impossible.
+
+- `Tainted` is monotone: constructors produce clean values, the only
+  public combinator is OR (`tainted_by` raises, never lowers), and
+  the clean-from-tainted constructor is private to the taint module.
+  Its two sanctioned consumers (§2.6.2) reach it through perl-core
+  APIs: the regex engine hands match extents to a perl-core
+  capture-materialization function (which unaints, hint-conditional
+  on `use locale`), and `PerlHash` key canonicalization untaints
+  in-crate.  Laundering is not a reviewed-against bug class; it is
+  uncompilable code.
+- Semantic dispatch over values is authored through `taint_match!`,
+  a match-wrapper macro that rewrites clean-looking arms into direct
+  storage matches.  Operand grammar is arity-overloaded per variant:
+  `Int(p)` hides the taint field; `Int(p, t)` additionally binds it
+  to the user identifier `t` (per-operand — `Int(p, t1), Int(q, t2)`
+  attributes taint separately).  For `String`, whose taint lives in
+  the tag rather than a field, the arity-2 form binds via the tag
+  accessor — one uniform two-slot surface over heterogeneous
+  storage.  Binding never suppresses propagation: the macro ORs the
+  matched operands' taint into the arm's result unconditionally
+  (arms producing `True`/`False` get a structural no-op, which *is*
+  perl's clean-comparison-results behavior).  Arms may raise further
+  taint (`use locale` sources) via `tainted_by`; nothing can lower.
+  The second operand slot is an identifier, not a full pattern —
+  refutable taint-matching is deferred (it would need guard
+  synthesis for the tag-carried string case).  A `raw` arm escape
+  for non-`Value`-producing arms is specified but the string tag arm
+  and escape are design-stated, not yet probe-covered.
+- Mechanism contract, pinned by probes: expansion emits the user's
+  payload and taint identifiers (call-site tokens, hence visible to
+  arm bodies — hygiene is origin-based; `:ident` is the grammatical
+  gate for binding position, not the sharing mechanism) while the
+  macro's own accumulators are hygiene-isolated and verified
+  unreachable (compile-fail probe).  The taint slot double-binds via
+  `__acc @ user_ident`, feeding propagation and observation from one
+  pattern.
+- Cost, measured: in optimized builds the expansion is *identical*
+  to the hand-written direct match — LLVM's identical-code-folding
+  merges the two functions into one symbol (the strongest possible
+  equivalence).  In unoptimized builds the post-applied `tainted_by`
+  costs ~2.3× instructions (no calls); the standing project
+  configuration is `[profile.dev.package.perl-core] opt-level = 3`
+  (temporarily lowered when debugging perl-core itself under a
+  debugger), at which the identity holds.  Sinks (`eval`, `system`,
+  filesystem ops) are not `taint_match!` territory: they read
+  operand taint through the plain accessor before acting.
+
+#### 2.6.4 Container-verified facts:
+
+Container-verified facts pinned for the ops layer: a capture from a
+tainted string is clean; a tainted string used as a hash key stores
+and returns a clean key via `keys`; a tainted *value* in a hash
+stays tainted; and under `use locale`, a capture is tainted **even
+from clean input** — locale is itself a taint source, so the regex
+engine's untaint capability is hint-conditional (`use locale`
+branches skip it and mark results tainted; the hints machinery of
+§2.2.3/§8 again).  The 2003 commit also softened propagation from
+"will itself be tainted" to "may be considered tainted" — perl
+reserves the right to over-taint conservatively, and the §10
+propagation table inherits that latitude.  Residual container
+chores: keys-under-`use locale`, and cross-checking the perlsec
+wording against the 5.42 reference documentation.
+
 
 ## 3. Memory Management Details
 
@@ -4218,9 +4768,9 @@ typeglob containing slots for scalar, array, hash, code, IO, and format:
 
 ```rust
 struct Glob {
-    scalar: Option<Sv>,
-    array: Option<Av>,
-    hash: Option<Hv>,
+    scalar: Option<ScalarRef>,
+    array: Option<ArrayRef>,
+    hash: Option<HashRef>,
     code: Option<Arc<Code>>,
     io: Option<Arc<RwLock<IoHandle>>>,
     format: Option<Arc<Format>>,
@@ -8094,8 +8644,8 @@ experience is expected to evolve significantly during implementation.
 - **Typed values are self-describing.**  A `struct User { name:
   String, age: i64 }` knows its own field names and types at
   runtime.  Pretty-printing it is trivial.
-- **Untyped values have observable state.**  `ScalarFlags` tells you
-  which representations are cached (INT_VALID, STR_VALID, etc.),
+- **Untyped values have observable state.**  The payload kind and
+  derived state are inspectable: which conversions are cached,
   whether magic is attached, whether the value is read-only.
 - **Async-aware.**  The runtime knows about all active Tokio tasks,
   their states, and their call stacks.
@@ -8277,8 +8827,8 @@ perl> :methods Foo
 Foo: new, value, label, to_string
   ISA: Base: serialize, deserialize
 
-perl> :flags $obj
-ScalarFlags: STR_VALID | REF_VALID | MAGICAL
+perl> :inspect $obj
+payload: ScalarRef -> Full cell
   blessed into: Foo
   magic: TIEDSCALAR
 
@@ -8504,97 +9054,96 @@ producing passing tests.
 
 ## 21. Implementation Order
 
-This is a recommended sequence of implementation work, ordered to
-maximize the ratio of "useful progress" to "infrastructure investment"
-at each step.
+This section records the dependency ordering of implementation work
+and the testing strategy at each layer — what must exist before what,
+and why.  It is ordering rationale, not a schedule and not a status
+record: build state belongs to git and the test suite (§0).
 
-### 21.1 Value model (2-3 weeks)
+### 21.1 Value model
 
 **This is the foundation everything else stands on.**
 
-Build the `perl-core` crate first.  Every other crate depends on
-it, and design mistakes here are the most expensive to fix later.
+Build the `perl-core` crate first.  Every other crate depends on it,
+and design mistakes here are the most expensive to fix later.  The
+internal ordering follows the dependency structure of §2:
 
-#### 21.1.1 Week 1: Strings and core value types
+1. `CowBuffer` — the custom COW byte buffer (§2.2.3): handle and
+   header layout, clone/unique-check-mutation/COW-break, growth.
+   This module is the string memory model; it carries the heaviest
+   test obligations in the crate (Miri, size-class and COW-transition
+   boundary tests, refcount concurrency tests) and no other module
+   proceeds until they pass.
 
-1. `PerlString` — `Bytes` + `flags: u8` (Perl UTF-8 flag, Rust
-   validity cache).  Methods: `as_str()`, `from_str()`, `as_bytes()`,
-   `clone_cow()`, concatenation, comparison, `substr`, `length`
-   (byte and character).  Extensive tests for flag maintenance across
-   mutation and COW transitions.
+2. `PerlString` — the two storage kinds over `CowBuffer`, the tag
+   with its folded state dimensions, the scan-state lattice and
+   transition rules (§2.2.4-§2.2.7), character-sequence `Eq`/`Hash`
+   (§2.3.5).  Container-verified equality tests for the mixed-flag
+   cases; layout assertions from §2.3.6.
 
-2. `SmallString` — 38-byte inline string.  Construction, conversion
-   to/from `PerlString`, boundary behavior at exactly 38 bytes.
+3. `ScalarPayload` and `Value` — the variant sets, truthiness /
+   stringification / numification as single matches on the payload,
+   coercion recompute semantics with the exactness rule (§2.2.2),
+   `ArraySlot` hole semantics with the trailing-truncation rule
+   (§2.2.1).
 
-3. `ScalarFlags` — bitflags struct with INT_VALID, NUM_VALID, STR_VALID,
-   REF_VALID, READONLY, UTF8, MAGICAL, TAINT, WEAK.
+4. `ScalarRef`, `ScalarCell`, `FullScalar`, `ConstScalar` — the
+   Mut/Const split, in-place `Plain`→`Full` upgrade, the readonly
+   error path, the boolean immortal singletons with their full
+   pinned contract (§2.3.1-§2.3.3), numification-warning state and
+   copy semantics (§2.3.4).
 
-4. `PerlStringSlot` — the `None`/`Inline`/`Heap` enum.
+5. Reference creation and dereference — `\$x` promotion returning
+   `ScalarRef` clones, `ptr_eq` identity, upgrade triggers (§2.2.8).
 
-#### 21.1.2 Week 2: `Scalar`, `Value`, and coercion
+6. Containers — `PerlArray`/`PerlHash` with their handle types,
+   exists/delete semantics against the slot model.
 
-5. `Scalar` — full struct with `int`, `num`, `bytes`, `reference`, `magic`,
-   `stash`.  Coercion methods: `get_int()`, `get_num()`,
-   `get_bytes()`, `get_str()`, `set_int()`, `set_str()`, `set_ref()`.
-   Each respects flag discipline — reads check the validity flag
-   first, writes invalidate other caches.
-
-6. `Value` — the enum with compact variants (`Undef`, `Int`,
-   `Float`, `SmallStr`, `Str`, `Ref`) and `Scalar(Sv)`.
-   Upgrade logic: triggers for multi-rep, reference-taking,
-   magic attachment.  Once upgraded, never downgrade.
-
-7. `Sv`, `Av`, `Hv` type aliases — `Arc<RwLock<Scalar>>`, etc.
-   Basic operations: clone (Arc refcount bump), read through
-   RwLock, write through RwLock.
-
-#### 21.1.3 Week 3: References, cycle collection, mortal stack
-
-8. Reference creation — `\$x` upgrades compact Value to
-   `Scalar(Sv)`, returns `Ref(Sv)` pointing to the same Arc.
-   Dereference in both directions.
-
-9. Cycle collection scaffolding — candidate set, `weaken` support,
+7. Cycle collection scaffolding — candidate set, `weaken` support,
    Bacon-Rajan trial deletion.  Can be a stub initially, but the
    hooks for tracking candidates should be in place.
 
-10. Mortal stack — `Vec<Value>` per interpreter, scope-entry marks,
-    scope-exit drops.
+8. Mortal stack — `Vec<Value>` per interpreter, scope-entry marks,
+   scope-exit drops.
 
-11. Task-local `local` mechanism — `Option<Box<LocalStack>>` with
-    `WasInactive`/`WasActive` save stack.  Test with simulated
-    scope entry/exit.
+9. Task-local `local` mechanism — `Option<Box<LocalStack>>` with
+   `WasInactive`/`WasActive` save stack.  Test with simulated
+   scope entry/exit.
 
 Each of these is independently testable with `#[test]` functions.
 No lexer, no parser, no interpreter — just data structures and
-their operations:
+their operations.  Behavioral expectations are container-verified
+before being pinned (§1.1); layout expectations are compile-time
+assertions (§2.3.6).  Illustrative tests in the §2 vocabulary:
 
 ```rust
 #[test]
-fn string_coercion() {
-    let mut sv = Scalar::from_str("42");
-    assert!(sv.flags.contains(ScalarFlags::STR_VALID));
-    assert_eq!(sv.get_int(), 42);
-    assert!(sv.flags.contains(ScalarFlags::INT_VALID));
+fn payload_stays_authoritative_through_coercion() {
+    // Verified perl 5.38: my $x = 3.7 used as an integer still
+    // stringifies as "3.7" (FLAGS = NOK,pIOK — private cache only).
+    let mut cell = ScalarCell::from_float(3.7);
+    assert_eq!(cell.to_int(), 3);          // truncating coercion
+    assert_eq!(cell.to_string_repr(), "3.7");  // payload answers
 }
 
 #[test]
-fn compact_value_upgrade() {
-    let val = Value::Int(42);
-    let sv = val.to_scalar();  // upgrade
-    assert!(matches!(sv, Value::Scalar(_)));
+fn boolean_immortals_share_identity() {
+    // Verified perl 5.38: \(1==1) yields the same address twice.
+    let a = Value::True.upgrade_to_scalar();
+    let b = Value::True.upgrade_to_scalar();
+    assert!(ScalarRef::ptr_eq(&a, &b));
+    assert!(matches!(a, ScalarRef::Const(_)));
 }
 
 #[test]
 fn reference_identity() {
-    let val = Value::SmallStr(SmallString::from("hello"));
-    let (val, ref1) = val.take_ref();  // upgrades, returns Ref
-    let (_, ref2) = val.take_ref();    // same Arc, refcount 3
-    // ref1 and ref2 point to the same Scalar
+    let mut val = Value::Int(42);
+    let r1 = val.take_ref();   // promotes in place
+    let r2 = val.take_ref();   // same identity
+    assert!(ScalarRef::ptr_eq(&r1, &r2));
 }
 ```
 
-### 21.2 Lexer, parser, and AST (5-7 weeks)
+### 21.2 Lexer, parser, and AST
 
 Build the lexer and parser together in the `perl-parser` crate.
 The lexer produces consistent, unambiguous tokens; the parser
@@ -8613,48 +9162,48 @@ Target passing `t/base/lex.t` and parsing the `t/base/` test files.
 This is the hardest front-end component and should be done
 thoroughly.
 
-### 21.3 Minimal interpreter via AST walking (1-2 weeks)
+### 21.3 Minimal interpreter via AST walking
 
 Build a quick-and-dirty AST-walking interpreter in `perl-runtime` —
 just enough to run `print`, basic arithmetic, string operations,
 conditionals, and loops.  This is throwaway scaffolding to get rapid
 feedback from the test suite.
 
-### 21.4 Compile-time execution (`BEGIN`, `use`) (1-2 weeks)
+### 21.4 Compile-time execution (`BEGIN`, `use`)
 
 Implement the `Executor` trait (§22.1) and the
 compilation/execution interleaving so that `use strict`,
 `use warnings`, `use constant`, and simple `BEGIN` blocks work.
 This unblocks virtually all real Perl code.
 
-### 21.5 Lowering and IR (2-3 weeks)
+### 21.5 Lowering and IR
 
 Build the HIR lowering and IR code generation in `perl-compiler`.
 Migrate the interpreter from AST walking to IR execution.  The AST
 walker can remain as a fallback during transition.
 
-### 21.6 Regex engine (3-4 weeks)
+### 21.6 Regex engine
 
 Build the backtracking regex engine.  Target passing `t/base/pat.t`
 and then `t/op/re_tests`.
 
-### 21.7 Subroutines, closures, and packages (2-3 weeks)
+### 21.7 Subroutines, closures, and packages
 
 Implement closure captures as `Vec<Value>` (not Perl 5-style pads),
 package declarations, method dispatch, and `@ISA`-based inheritance.
 
-### 21.8 Module loading (1-2 weeks)
+### 21.8 Module loading
 
 Implement `require`, `use`, `do`, `@INC` search, and the standard
 import/export mechanisms.  Module registry for concurrent `require`
 (§13.11).
 
-### 21.9 Core builtins (ongoing)
+### 21.9 Core builtins
 
 Implement builtins incrementally, guided by which upstream tests are
 closest to passing.
 
-### 21.10 Concurrency (when core is stable)
+### 21.10 Concurrency
 
 Implement per-value synchronization, `spawn`/`spawn blocking`/
 `spawn thread`, and Tokio integration.  The `Arc<RwLock<T>>` value
@@ -8662,14 +9211,14 @@ model is concurrent from day one; this step adds the multi-task
 execution paths, the Tokio event loop, and the cardinal invariant
 enforcement (§13.11).
 
-### 21.11 Typed layer (incremental, alongside other steps)
+### 21.11 Typed layer
 
 `let`/`fn` keyword registration and parsing can begin as soon as
 the parser exists (Step 2).  Type checking and typed IR generation
 build on Step 5.  `struct`/`enum`/`impl`/`trait` follow.  `extern fn`
 and AOT Rust codegen can proceed independently once the IR is stable.
 
-### 21.12 REPL (when interpreter is usable)
+### 21.12 REPL
 
 Build the REPL module in `perl-runtime` (behind the `repl` feature
 flag) on `reedline` once the interpreter can execute basic code
