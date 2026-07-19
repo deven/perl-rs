@@ -239,4 +239,36 @@ mod tests {
         let slot = PerlStringSlot::None;
         assert!(slot.to_perl_string().is_none());
     }
+
+    // ── Boundary and behavior tests ───────────────────────────────────
+
+    #[test]
+    fn slot_inline_max_exceeds_small_string_max() {
+        // SLOT_INLINE_MAX (24) is intentionally larger than SMALL_STRING_MAX (22): PerlStringSlot::Inline rides inside
+        // a Scalar (already behind Arc) so its size is bounded by the Heap variant's footprint, not by Value enum
+        // size.  SmallString rides directly in the Value enum and must stay 24 bytes total.
+        assert_eq!(SLOT_INLINE_MAX, 24);
+        assert_eq!(crate::SMALL_STRING_MAX, 22);
+    }
+
+    #[test]
+    fn set_perl_string_does_not_demote_to_inline() {
+        // Documented behavior: set_perl_string always stores as Heap, even when the contents would fit Inline.
+        let mut slot = PerlStringSlot::None;
+        let short = PerlString::from_str("hi"); // 2 bytes — fits Inline easily
+        slot.set_perl_string(short);
+        assert!(matches!(slot, PerlStringSlot::Heap(_)), "set_perl_string must not demote to Inline (documented behavior)");
+    }
+
+    #[test]
+    fn equality_is_storage_form_sensitive() {
+        // PartialEq is derived, so an Inline slot and a Heap slot containing the same bytes and flag compare UNEQUAL.
+        // This is internal-representation equality, consistent with PerlString's documented equality semantics;
+        // Perl-level string equality is the runtime's job.  Pin the current behavior.
+        let mut a = PerlStringSlot::None;
+        let mut b = PerlStringSlot::None;
+        a.set_str("hello");
+        b.set_perl_string(PerlString::from_str("hello"));
+        assert_ne!(a, b);
+    }
 }

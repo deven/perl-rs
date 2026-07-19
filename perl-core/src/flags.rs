@@ -213,4 +213,82 @@ mod tests {
         assert!(f.contains(ScalarFlags::READONLY));
         assert!(!f.contains(ScalarFlags::STR_VALID));
     }
+
+    // ── Structural guards ─────────────────────────────────────────────
+
+    #[test]
+    fn all_bit_positions_are_distinct() {
+        // Guard against accidental flag-bit collisions if new flags are added.  Each constant must occupy a unique
+        // single bit.
+        let all = [
+            ("INT_VALID", ScalarFlags::INT_VALID),
+            ("NUM_VALID", ScalarFlags::NUM_VALID),
+            ("STR_VALID", ScalarFlags::STR_VALID),
+            ("REF_VALID", ScalarFlags::REF_VALID),
+            ("READONLY", ScalarFlags::READONLY),
+            ("UTF8", ScalarFlags::UTF8),
+            ("TAINT", ScalarFlags::TAINT),
+            ("MAGICAL", ScalarFlags::MAGICAL),
+            ("WEAK", ScalarFlags::WEAK),
+        ];
+        for (i, (name_i, flag_i)) in all.iter().enumerate() {
+            assert_ne!(flag_i.bits(), 0, "{} has zero bit", name_i);
+            assert!(flag_i.bits().is_power_of_two(), "{} not a single bit", name_i);
+            for (name_j, flag_j) in all.iter().skip(i + 1) {
+                assert_ne!(flag_i.bits(), flag_j.bits(), "{} and {} collide on bit position", name_i, name_j);
+            }
+        }
+    }
+
+    #[test]
+    fn not_operator_inverts_bits() {
+        let f = ScalarFlags::INT_VALID | ScalarFlags::STR_VALID;
+        let inv = !f;
+        // The original bits should be unset in the inversion.
+        assert!(!inv.contains(ScalarFlags::INT_VALID));
+        assert!(!inv.contains(ScalarFlags::STR_VALID));
+        // And other bits should be set.
+        assert!(inv.contains(ScalarFlags::NUM_VALID));
+        assert!(inv.contains(ScalarFlags::READONLY));
+    }
+
+    #[test]
+    fn union_and_difference() {
+        let f = ScalarFlags::INT_VALID | ScalarFlags::STR_VALID;
+        let g = ScalarFlags::STR_VALID | ScalarFlags::NUM_VALID;
+        let u = f.union(g);
+        assert!(u.contains(ScalarFlags::INT_VALID));
+        assert!(u.contains(ScalarFlags::STR_VALID));
+        assert!(u.contains(ScalarFlags::NUM_VALID));
+        let d = f.difference(g);
+        assert!(d.contains(ScalarFlags::INT_VALID));
+        assert!(!d.contains(ScalarFlags::STR_VALID)); // present in g, removed
+        assert!(!d.contains(ScalarFlags::NUM_VALID)); // not in f to begin with
+    }
+
+    #[test]
+    fn metadata_flags_independent_of_validity() {
+        // Setting metadata bits should not affect ANY_VAL detection.
+        let f = ScalarFlags::READONLY | ScalarFlags::MAGICAL | ScalarFlags::TAINT | ScalarFlags::WEAK;
+        assert!(!f.intersects(ScalarFlags::ANY_VAL));
+        assert!(!f.intersects(ScalarFlags::REF_VALID));
+        // Bits all present individually.
+        assert!(f.contains(ScalarFlags::READONLY));
+        assert!(f.contains(ScalarFlags::MAGICAL));
+        assert!(f.contains(ScalarFlags::TAINT));
+        assert!(f.contains(ScalarFlags::WEAK));
+    }
+
+    #[test]
+    fn utf8_flag_independent_of_str_valid() {
+        // UTF8 is a *property* of the string payload; STR_VALID indicates whether there is a string payload at all.
+        // The two flags are independent.
+        let only_utf8 = ScalarFlags::UTF8;
+        assert!(only_utf8.contains(ScalarFlags::UTF8));
+        assert!(!only_utf8.contains(ScalarFlags::STR_VALID));
+
+        let str_no_utf8 = ScalarFlags::STR_VALID;
+        assert!(str_no_utf8.contains(ScalarFlags::STR_VALID));
+        assert!(!str_no_utf8.contains(ScalarFlags::UTF8));
+    }
 }

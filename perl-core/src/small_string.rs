@@ -229,4 +229,31 @@ mod tests {
         let s = SmallString::from_str("hello").unwrap();
         assert_eq!(format!("{}", s), "hello");
     }
+
+    // ── UTF-8 boundary tests ──────────────────────────────────────────
+
+    #[test]
+    fn utf8_multibyte_filling_22_bytes() {
+        // Eleven é characters (each 2 bytes UTF-8) = 22 bytes exactly.
+        let s = "é".repeat(11);
+        assert_eq!(s.len(), 22);
+        let ss = SmallString::from_str(&s).unwrap();
+        assert!(ss.is_utf8());
+        assert_eq!(ss.as_str(), Some(s.as_str()));
+    }
+
+    #[test]
+    fn utf8_overflow_at_multibyte_boundary() {
+        // Adding one more multi-byte char overflows the 22-byte limit — should be None.
+        let s = format!("{}é", "é".repeat(11));
+        assert_eq!(s.len(), 24);
+        assert!(SmallString::from_str(&s).is_none());
+    }
+
+    #[test]
+    fn from_bytes_with_flag_valid_utf8() {
+        let ss = SmallString::from_bytes_with_flag(b"hello", true).unwrap();
+        assert!(ss.is_utf8());
+        assert_eq!(ss.as_str(), Some("hello"));
+    }
 }

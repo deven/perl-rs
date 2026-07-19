@@ -674,6 +674,7 @@ impl From<bool> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flags::ScalarFlags;
 
     #[test]
     fn undef() {
@@ -1266,5 +1267,111 @@ mod tests {
         let ps = v.stringify();
         assert!(ps.as_bytes().starts_with(b"SCALAR(0x"), "expected SCALAR(0x...) form, got {:?}", String::from_utf8_lossy(ps.as_bytes()));
         assert_ne!(v.coerce_to_int(), 0, "a reference numifies to its address");
+    }
+
+    // ── Variant-selection boundaries and upgrade behavior ─────────────
+
+    #[test]
+    fn from_str_boundary_22_bytes_uses_smallstr() {
+        let s22 = "a".repeat(22);
+        let v = Value::from(s22.as_str());
+        assert!(matches!(v, Value::SmallStr(_)));
+        assert_eq!(v.as_str(), Some(s22.as_str()));
+    }
+
+    #[test]
+    fn from_str_boundary_23_bytes_uses_str() {
+        let s23 = "a".repeat(23);
+        let v = Value::from(s23.as_str());
+        assert!(matches!(v, Value::Str(_)));
+        assert_eq!(v.as_str(), Some(s23.as_str()));
+    }
+
+    #[test]
+    fn from_string_boundary_22_bytes() {
+        let s = "a".repeat(22);
+        let v = Value::from(s.clone());
+        assert!(matches!(v, Value::SmallStr(_)));
+        assert_eq!(v.as_str(), Some(s.as_str()));
+    }
+
+    #[test]
+    fn from_perl_string_always_uses_str() {
+        // From<PerlString> doesn't try to inline short strings — even a short PerlString becomes Value::Str.
+        let ps = PerlString::from_str("hi");
+        let v = Value::from(ps);
+        assert!(matches!(v, Value::Str(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot upgrade Array/Hash/Code/Regex to Scalar")]
+    fn upgrade_array_currently_panics() {
+        // Pins the current panic behavior on container upgrade.
+        let mut v = Value::Array(Arc::new(RwLock::new(vec![Value::Int(1)])));
+        let _ = v.upgrade_to_scalar();
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot upgrade Array/Hash/Code/Regex to Scalar")]
+    fn upgrade_hash_currently_panics() {
+        let empty: HashMap<PerlString, Value> = HashMap::new();
+        let mut v = Value::Hash(Arc::new(RwLock::new(empty)));
+        let _ = v.upgrade_to_scalar();
+    }
+
+    #[test]
+    fn upgrade_ref_round_trips() {
+        // Build a Value::Ref pointing to a scalar holding 42, upgrade the Ref to a Scalar, verify the resulting
+        // Scalar identifies as a reference and the underlying target is preserved.
+        let mut as_value = Value::Int(42);
+        let target_sv = as_value.upgrade_to_scalar();
+        let mut ref_val = Value::Ref(target_sv);
+        let scalar_holding_ref = ref_val.upgrade_to_scalar();
+        let guard = scalar_holding_ref.read().unwrap();
+        assert!(guard.is_ref());
+        // The reference target is itself a Value::Scalar wrapping the inner Sv.
+        match guard.get_rv() {
+            Some(Value::Scalar(inner_sv)) => {
+                let inner = inner_sv.read().unwrap();
+                assert!(inner.flags().contains(ScalarFlags::INT_VALID));
+            }
+            other => panic!("expected Value::Scalar wrapping the target, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn as_methods_return_none_for_unrelated_variants() {
+        // Pin the contract: as_int/as_num on a string yields None; as_str/as_bytes on a number yields None.
+        let v_int = Value::Int(42);
+        assert_eq!(v_int.as_str(), None);
+        assert_eq!(v_int.as_bytes(), None);
+
+        let v_str: Value = "hello".into();
+        assert_eq!(v_str.as_int(), None);
+        assert_eq!(v_str.as_num(), None);
+
+        let v_undef = Value::Undef;
+        assert_eq!(v_undef.as_int(), None);
+        assert_eq!(v_undef.as_num(), None);
+        assert_eq!(v_undef.as_str(), None);
+        assert_eq!(v_undef.as_bytes(), None);
+    }
+
+    #[test]
+    fn upgrade_float_preserves_num_valid() {
+        let mut v = Value::Float(3.5);
+        let sv = v.upgrade_to_scalar();
+        let guard = sv.read().unwrap();
+        assert!(guard.flags().contains(ScalarFlags::NUM_VALID));
+    }
+
+    #[test]
+    fn upgrade_smallstr_preserves_utf8_flag() {
+        let mut v: Value = "hi".into();
+        assert!(matches!(v, Value::SmallStr(_)));
+        let sv = v.upgrade_to_scalar();
+        let guard = sv.read().unwrap();
+        assert!(guard.flags().contains(ScalarFlags::STR_VALID));
+        assert!(guard.flags().contains(ScalarFlags::UTF8));
     }
 }

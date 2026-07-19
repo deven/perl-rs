@@ -851,4 +851,81 @@ mod tests {
         assert_eq!(format_nv(0.0), "0");
         assert_eq!(format_nv(-2.5), "-2.5");
     }
+
+    // ── Coercion and flag-discipline edge cases ───────────────────────
+
+    #[test]
+    fn from_int_negative_round_trip() {
+        let mut sv = Scalar::from_int(-42);
+        assert_eq!(sv.get_int(), -42);
+        assert_eq!(sv.get_str(), Some("-42"));
+        // Reading the string didn't disturb the cached int.
+        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
+        assert_eq!(sv.get_int(), -42);
+    }
+
+    #[test]
+    fn float_to_int_truncates_toward_zero() {
+        // Rust's `as i64` truncates toward zero, matching Perl's int() behavior on floats within i64 range.
+        let mut a = Scalar::from_num(3.7);
+        assert_eq!(a.get_int(), 3);
+        let mut b = Scalar::from_num(-3.7);
+        assert_eq!(b.get_int(), -3);
+    }
+
+    #[test]
+    fn float_nan_coerces_to_zero() {
+        // Rust f64::NAN `as i64` is 0 (saturating-cast rules).  Perl's int(0+"nan") is also 0.  Match.
+        let mut sv = Scalar::from_num(f64::NAN);
+        assert_eq!(sv.get_int(), 0);
+    }
+
+    #[test]
+    fn set_ref_clears_all_other_flags() {
+        // After set_rv, only REF_VALID should be set among the validity flags.
+        let mut sv = Scalar::from_str("hello");
+        sv.set_int(42); // STR_VALID cleared, INT_VALID set
+        let _ = sv.get_num(); // NUM_VALID now also set (cached from INT_VALID)
+        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
+        assert!(sv.flags().contains(ScalarFlags::NUM_VALID));
+        sv.set_rv(Value::Int(99));
+        assert!(sv.flags().contains(ScalarFlags::REF_VALID));
+        assert!(!sv.flags().contains(ScalarFlags::INT_VALID));
+        assert!(!sv.flags().contains(ScalarFlags::NUM_VALID));
+        assert!(!sv.flags().contains(ScalarFlags::STR_VALID));
+        assert!(!sv.flags().contains(ScalarFlags::UTF8));
+    }
+
+    #[test]
+    fn from_perl_string_utf8_flag_propagates() {
+        let ps_utf8 = PerlString::from_str("hello");
+        let sv = Scalar::from_perl_string(ps_utf8);
+        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
+        assert!(sv.flags().contains(ScalarFlags::UTF8));
+
+        let ps_bytes = PerlString::from_bytes(vec![0xff, 0xfe]);
+        let sv2 = Scalar::from_perl_string(ps_bytes);
+        assert!(sv2.flags().contains(ScalarFlags::STR_VALID));
+        assert!(!sv2.flags().contains(ScalarFlags::UTF8));
+    }
+
+    #[test]
+    fn set_bytes_clears_utf8_flag() {
+        let mut sv = Scalar::from_str("hello");
+        assert!(sv.flags().contains(ScalarFlags::UTF8));
+        sv.set_bytes([0xff, 0xfe]);
+        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
+        assert!(!sv.flags().contains(ScalarFlags::UTF8));
+        assert!(!sv.flags().contains(ScalarFlags::INT_VALID));
+        assert!(!sv.flags().contains(ScalarFlags::NUM_VALID));
+    }
+
+    #[test]
+    fn double_coercion_then_read_back() {
+        // $x = 42, read as string, read as int again: should still be 42 throughout.
+        let mut sv = Scalar::from_int(42);
+        assert_eq!(sv.get_str(), Some("42"));
+        assert_eq!(sv.get_int(), 42);
+        assert_eq!(sv.get_str(), Some("42"));
+    }
 }

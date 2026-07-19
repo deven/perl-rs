@@ -606,4 +606,58 @@ mod tests {
         // section; this pins the one certainly-wrong answer.
         assert_ne!(PerlString::from_str("9223372036854775808").parse_iv(), 0);
     }
+
+    // ── Numeric coercion edge cases (verified against perl 5.38) ──────
+
+    #[test]
+    fn parse_iv_leading_plus() {
+        // Verified perl 5.38: "+42" + 0 gives 42; "  +42" + 0 gives 42 (whitespace then sign).
+        assert_eq!(PerlString::from_str("+42").parse_iv(), 42);
+        assert_eq!(PerlString::from_str("  +42").parse_iv(), 42);
+    }
+
+    #[test]
+    fn parse_iv_010_is_decimal_not_octal() {
+        // Verified perl 5.38: "010" + 0 gives 10.  (Numeric coercion treats leading-zero strings as decimal; only
+        // oct() parses them as octal.)
+        assert_eq!(PerlString::from_str("010").parse_iv(), 10);
+    }
+
+    #[test]
+    fn parse_iv_sign_only_yields_zero() {
+        // Verified perl 5.38: "-" + 0 gives 0, "+" + 0 gives 0.
+        assert_eq!(PerlString::from_str("-").parse_iv(), 0);
+        assert_eq!(PerlString::from_str("+").parse_iv(), 0);
+    }
+
+    #[test]
+    fn parse_iv_bare_and_invalid_radix_prefixes() {
+        // Verified perl 5.38: "0x" + 0 gives 0 and "0b234" + 0 gives 0 — the scan reads the leading "0" and stops.
+        // Complements parse_iv_ignores_radix_prefixes with the bare-prefix and invalid-digits cases.
+        assert_eq!(PerlString::from_str("0x").parse_iv(), 0);
+        assert_eq!(PerlString::from_str("0b234").parse_iv(), 0);
+    }
+
+    #[test]
+    fn parse_iv_unicode_digit_yields_zero() {
+        // Verified perl 5.38: Arabic-Indic 7 ("\x{0667}") + 0 gives 0.  (Default numeric coercion only recognizes
+        // ASCII digits.)
+        assert_eq!(PerlString::from_str("\u{0667}").parse_iv(), 0);
+    }
+
+    #[test]
+    fn parse_nv_leading_dot() {
+        // Verified perl 5.38: ".5" + 0 gives 0.5; "5." + 0 gives 5; ".  5" + 0 gives 0 (whitespace between the dot
+        // and the digit stops the parse).
+        assert!((PerlString::from_str(".5").parse_nv() - 0.5).abs() < 1e-10);
+        assert_eq!(PerlString::from_str("5.").parse_nv(), 5.0);
+        assert_eq!(PerlString::from_str(".  5").parse_nv(), 0.0);
+    }
+
+    #[test]
+    fn parse_nv_scientific_overflow_and_underflow() {
+        // Verified perl 5.38: "1e500" + 0 gives Inf; "1e-500" + 0 underflows to 0.
+        assert!(PerlString::from_str("1e500").parse_nv().is_infinite());
+        assert_eq!(PerlString::from_str("1e-500").parse_nv(), 0.0);
+    }
 }
