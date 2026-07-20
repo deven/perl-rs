@@ -205,6 +205,24 @@ macro_rules! impl_coercions {
 impl_coercions!(ScalarPayload);
 impl_coercions!(Value);
 
+impl Value {
+    /// `builtin::is_bool`, answered from the variant (§2.3.3).
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Value::True | Value::False)
+    }
+
+    /// Promote to a shared scalar identity.  The booleans return clones of the immortal singletons (§2.3.3: sharing is
+    /// observably correct — `\(1==1)` twice yields the same address).  Non-boolean promotion rewrites the slot through
+    /// the `Scalar` variant and arrives with §21.1 step 5; until then this answers `None` for other variants.
+    pub fn upgrade_to_scalar(&self) -> Option<crate::cell::ScalarRef> {
+        match self {
+            Value::True => Some(crate::cell::TRUE_SCALAR.clone()),
+            Value::False => Some(crate::cell::FALSE_SCALAR.clone()),
+            _ => None,
+        }
+    }
+}
+
 // ── Array slots (§2.2.1) ──────────────────────────────────────────
 /// `None` = nonexistent element (a hole); `Some(Value::Undef)` = an existing element holding undef.
 pub type ArraySlot = Option<Value>;
@@ -408,6 +426,75 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
     // The scanned span is ASCII digits/'.'/'e'/sign by construction.
     let magnitude = std::str::from_utf8(&rest[..end]).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
     if negative { -magnitude } else { magnitude }
+}
+
+/// The §2.3.4 would-warn predicate over the container-mapped boundary table: a string is silent iff it is exactly
+/// `"0 but true"` (case-sensitive, no surrounding whitespace) or, after trimming ASCII whitespace from both ends, the
+/// entire remainder is one complete numeric token — `[sign] (digits [. digits?] | . digits) [e/E [sign] digits+]` with
+/// at least one mantissa digit, or case-insensitive signed `inf`/`infinity`/`nan` whole.  Independent of what the parse
+/// salvages: `"1e"` numifies as 1 yet warns.
+pub fn string_would_warn(bytes: &[u8]) -> bool {
+    if bytes == b"0 but true" {
+        return false;
+    }
+
+    let mut start = 0;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = bytes.len();
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let token = &bytes[start..end];
+    if token.is_empty() {
+        return true; // empty and whitespace-only strings warn
+    }
+
+    let body = match token[0] {
+        b'+' | b'-' => &token[1..],
+        _ => token,
+    };
+
+    // Signed case-insensitive inf/infinity/nan, entire.
+    let lower: Vec<u8> = body.iter().map(u8::to_ascii_lowercase).collect();
+    if lower == b"inf" || lower == b"infinity" || lower == b"nan" {
+        return false;
+    }
+
+    // The complete numeric token grammar.
+    let mut i = 0;
+    let mut mantissa_digits = 0usize;
+    while i < body.len() && body[i].is_ascii_digit() {
+        i += 1;
+        mantissa_digits += 1;
+    }
+    if i < body.len() && body[i] == b'.' {
+        i += 1;
+        while i < body.len() && body[i].is_ascii_digit() {
+            i += 1;
+            mantissa_digits += 1;
+        }
+    }
+    if mantissa_digits == 0 {
+        return true;
+    }
+    if i < body.len() && (body[i] == b'e' || body[i] == b'E') {
+        let mut j = i + 1;
+        if j < body.len() && (body[j] == b'+' || body[j] == b'-') {
+            j += 1;
+        }
+        let digits_start = j;
+        while j < body.len() && body[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == digits_start {
+            return true; // dangling exponent marker: "1e", "1e+"
+        }
+        i = j;
+    }
+
+    i != body.len()
 }
 
 /// String numification classification: an exactly-integral token within i64 range numifies as an integer; everything

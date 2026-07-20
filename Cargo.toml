@@ -16,6 +16,7 @@ license = "MIT"
 [workspace.dependencies]
 bytes                 = "1.11.1"
 memchr                = "2.8.0"
+parking_lot           = "0.12.5"
 phf                   = { version = "0.13.1", features = ["macros"] }
 phf_codegen           = "0.13.1"
 phf_generator         = "0.13.1"

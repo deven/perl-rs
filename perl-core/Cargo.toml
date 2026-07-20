@@ -6,4 +6,5 @@ license.workspace = true
 description = "Perl core types"
 
 [dependencies]
-bytes = { workspace = true }
+bytes       = { workspace = true }
+parking_lot = { workspace = true }

@@ -897,8 +897,9 @@ instance property is free (a unit variant *is* its single value).
 Their promoted forms are two immortal singletons
 (`static LazyLock<ScalarRef>`), constructed once as `Const` cells:
 
-- true: `Int(1)` payload, materialized as 1 / 1.0 / `"1"`.
-- false: dualvar — numerically 0, string `""` (not `"0"`).  Verified
+- true: `ScalarPayload::True`, materialized as 1 / 1.0 / `"1"`.
+- false: `ScalarPayload::False`, the dualvar — numerically 0, string
+  `""` (not `"0"`).  Verified
   container 5.38: `(1==0)."" ` has length 0.
 - Sharing is observably correct, not just fast: `\(1==1)` twice in
   perl yields the same address.  Upgrading `Value::True` returns a
@@ -924,9 +925,23 @@ Container-verified contract (perl 5.38, all under `-w`):
 - The state is **copied on assignment**: copy after first
   numification, the copy is silent; copy before, both warn.
 - `"12abc" + 1` warns: the predicate is "not cleanly numeric in its
-  entirety," not "no leading number."  The exact boundary (leading
-  and trailing whitespace, `"0 but true"`, partial exponents) is an
-  open item requiring a container-mapped table.
+  entirety," not "no leading number" — and independent of what the
+  parse salvages: `"1e" + 1` numifies as 1 (dangling-exponent
+  backtrack) yet warns, as do `"infx"`/`"nanx"` despite parsing as
+  Inf/NaN.  The boundary is container-mapped (perl 5.38, all forms
+  probed under `-w`): a string is **silent** iff it equals
+  `"0 but true"` *exactly* (case-sensitive; `" 0 but true"`,
+  `"0 but true "`, and `"0 But True"` all warn) or, after trimming
+  ASCII whitespace from both ends, the entire remainder is one
+  complete numeric token: `[sign] (digits [. digits?] | . digits)
+  [e/E [sign] digits+]` (at least one mantissa digit, so `"5."` and
+  `".5"` are silent but `"."` warns; the exponent needs a digit),
+  or case-insensitive `inf`/`infinity`/`nan` with optional sign,
+  entire (`"-inf"` and `"INFINITY"` silent).  Everything else warns:
+  empty and whitespace-only strings, `"0x10"` (radix prefixes),
+  `"1_000"` (underscores are literal syntax only), `"0.5.3"`,
+  `"0 but false"`.  (`\x0B` in the whitespace set is unprobed — a
+  note for the ops layer, not a blocker.)
 - The quoted fragment in the message is a *rendering*: truncated at
   ~56 characters with `...`, control characters caret-escaped
   (`^A`).  Nothing is precomputed; the message (fragment, op name,
