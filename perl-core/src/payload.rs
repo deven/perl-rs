@@ -29,6 +29,11 @@
 //! - Truthiness: NaN is true; `-0.0` is false; the strings `""` and `"0"` are false, everything else (including
 //!   `"0.0"`, `"00"`, `" "`) is true.
 
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+use crate::cell::{ConstScalar, ScalarCell, ScalarRef};
 use crate::cow_buffer::AllocError;
 use crate::string::PerlString;
 
@@ -79,6 +84,13 @@ pub enum ScalarPayload {
     String(PerlString),
     True,
     False,
+
+    /// A reference to a mutable scalar (§2.2.1, flattened per mutability — measured: the nested identity enum defeats
+    /// niche-folding).  The referent carries its own taint; this is the reference value's.
+    ScalarRefMut(Arc<RwLock<ScalarCell>>, Tainted),
+
+    /// A reference to a frozen scalar (§2.3.1 `Const`: immortals, `use constant`, folded literals).
+    ScalarRefConst(Arc<ConstScalar>, Tainted),
 }
 
 /// The universal slot value (§2.2.1): the compact scalar payloads, plus (in later §21.1 steps) the reference variants,
@@ -91,6 +103,15 @@ pub enum Value {
     String(PerlString),
     True,
     False,
+    ScalarRefMut(Arc<RwLock<ScalarCell>>, Tainted),
+    ScalarRefConst(Arc<ConstScalar>, Tainted),
+
+    /// A promoted mutable scalar occupying this slot — the slot aliases it (§2.2.1).  Coercions read through the cell:
+    /// aliasing transparency.
+    ScalarMut(Arc<RwLock<ScalarCell>>),
+
+    /// A promoted frozen scalar occupying this slot (e.g. `foreach` aliasing over literal list elements).
+    ScalarConst(Arc<ConstScalar>),
 }
 
 /// A fielded variant cannot be a derived default (§2.6.1): the manual impl names the clean undef.
@@ -117,7 +138,7 @@ pub enum Numeric {
 }
 
 macro_rules! impl_coercions {
-    ($ty:ident) => {
+    ($ty:ident $(, $smut:ident, $sconst:ident)?) => {
         impl $ty {
             /// Perl truthiness, one match on the payload.  Container-verified: NaN is true, `-0.0` is false, `""` and
             /// `"0"` are the only false strings.
@@ -129,6 +150,9 @@ macro_rules! impl_coercions {
                     $ty::String(s) => !matches!(s.as_bytes(), b"" | b"0"),
                     $ty::True => true,
                     $ty::False => false,
+                    $ty::ScalarRefMut(..) | $ty::ScalarRefConst(..) => true, // refs are always true (verified)
+                    $($ty::$smut(c) => c.read().to_bool(),)?
+                    $($ty::$sconst(c) => c.to_bool(),)?
                 }
             }
 
@@ -141,6 +165,10 @@ macro_rules! impl_coercions {
                     $ty::String(s) => parse_int_i64_visible(s.as_bytes()),
                     $ty::True => 1,
                     $ty::False => 0,
+                    $ty::ScalarRefMut(c, _) => Arc::as_ptr(c) as usize as i64, // the address (verified)
+                    $ty::ScalarRefConst(c, _) => Arc::as_ptr(c) as usize as i64,
+                    $($ty::$smut(c) => c.read().to_int(),)?
+                    $($ty::$sconst(c) => c.to_int(),)?
                 }
             }
 
@@ -153,6 +181,10 @@ macro_rules! impl_coercions {
                     $ty::String(s) => parse_float(s.as_bytes()),
                     $ty::True => 1.0,
                     $ty::False => 0.0,
+                    $ty::ScalarRefMut(c, _) => Arc::as_ptr(c) as usize as f64,
+                    $ty::ScalarRefConst(c, _) => Arc::as_ptr(c) as usize as f64,
+                    $($ty::$smut(c) => c.read().to_float(),)?
+                    $($ty::$sconst(c) => c.to_float(),)?
                 }
             }
 
@@ -166,6 +198,10 @@ macro_rules! impl_coercions {
                     $ty::String(s) => classify_numeric(s.as_bytes()),
                     $ty::True => Numeric::Int(1),
                     $ty::False => Numeric::Int(0),
+                    $ty::ScalarRefMut(c, _) => Numeric::Int(Arc::as_ptr(c) as usize as i64),
+                    $ty::ScalarRefConst(c, _) => Numeric::Int(Arc::as_ptr(c) as usize as i64),
+                    $($ty::$smut(c) => c.read().payload().numify(),)?
+                    $($ty::$sconst(c) => c.payload().numify(),)?
                 }
             }
 
@@ -181,6 +217,11 @@ macro_rules! impl_coercions {
                     $ty::String(s) => return Ok(s.clone()),
                     $ty::True => (std::borrow::Cow::Borrowed("1"), Tainted::CLEAN),
                     $ty::False => (std::borrow::Cow::Borrowed(""), Tainted::CLEAN),
+                    // Container-verified form: SCALAR(0x...) with lowercase hex.
+                    $ty::ScalarRefMut(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", Arc::as_ptr(c) as usize)), *t),
+                    $ty::ScalarRefConst(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", Arc::as_ptr(c) as usize)), *t),
+                    $($ty::$smut(c) => return c.read().to_string_repr(),)?
+                    $($ty::$sconst(c) => return Ok(c.to_string_repr().clone()),)?
                 };
                 let mut out: PerlString = text.parse()?;
                 if taint.is_tainted() {
@@ -193,9 +234,15 @@ macro_rules! impl_coercions {
             /// parallel to `PerlString::is_tainted`; `PerlString::taint` is the tag *setter*.
             pub fn is_tainted(&self) -> bool {
                 match self {
-                    $ty::Undef(t) | $ty::Int(_, t) | $ty::Float(_, t) => t.is_tainted(),
+                    $ty::Undef(t)
+                    | $ty::Int(_, t)
+                    | $ty::Float(_, t)
+                    | $ty::ScalarRefMut(_, t)
+                    | $ty::ScalarRefConst(_, t) => t.is_tainted(),
                     $ty::String(s) => s.is_tainted(),
                     $ty::True | $ty::False => false,
+                    $($ty::$smut(c) => c.read().is_tainted(),)?
+                    $($ty::$sconst(c) => c.is_tainted(),)?
                 }
             }
         }
@@ -203,7 +250,7 @@ macro_rules! impl_coercions {
 }
 
 impl_coercions!(ScalarPayload);
-impl_coercions!(Value);
+impl_coercions!(Value, ScalarMut, ScalarConst);
 
 impl Value {
     /// `builtin::is_bool`, answered from the variant (§2.3.3).
@@ -211,13 +258,69 @@ impl Value {
         matches!(self, Value::True | Value::False)
     }
 
-    /// Promote to a shared scalar identity.  The booleans return clones of the immortal singletons (§2.3.3: sharing is
-    /// observably correct — `\(1==1)` twice yields the same address).  Non-boolean promotion rewrites the slot through
-    /// the `Scalar` variant and arrives with §21.1 step 5; until then this answers `None` for other variants.
-    pub fn upgrade_to_scalar(&self) -> Option<crate::cell::ScalarRef> {
+    /// Promote a *temporary* to a shared scalar identity.  The booleans return clones of the immortal singletons
+    /// (§2.3.3: `\(1==1)` twice yields the same address — but a boolean held in a *variable* promotes to its own cell
+    /// via [`Value::take_ref`]; container-verified distinct).  Other temporaries answer `None`: non-slot temporaries
+    /// reach references through the ops layer's temp materialization.
+    pub fn upgrade_to_scalar(&self) -> Option<ScalarRef> {
         match self {
             Value::True => Some(crate::cell::TRUE_SCALAR.clone()),
             Value::False => Some(crate::cell::FALSE_SCALAR.clone()),
+            _ => None,
+        }
+    }
+
+    /// `\$x` — the taking-a-reference upgrade trigger (§2.2.8): promote the slot in place through the `Scalar` variant
+    /// (a stable identity the slot now aliases) and return the reference value.  Idempotent on identity: taking twice
+    /// yields `ptr_eq` references.  The reference value itself is clean — taint belongs to the referent.
+    pub fn take_ref(slot: &mut Value) -> Value {
+        match slot {
+            Value::ScalarMut(c) => return Value::ScalarRefMut(c.clone(), Tainted::CLEAN),
+            Value::ScalarConst(c) => return Value::ScalarRefConst(c.clone(), Tainted::CLEAN),
+            _ => {}
+        }
+
+        let payload = match std::mem::take(slot) {
+            Value::Undef(t) => ScalarPayload::Undef(t),
+            Value::Int(n, t) => ScalarPayload::Int(n, t),
+            Value::Float(f, t) => ScalarPayload::Float(f, t),
+            Value::String(s) => ScalarPayload::String(s),
+            Value::True => ScalarPayload::True,
+            Value::False => ScalarPayload::False,
+            Value::ScalarRefMut(c, t) => ScalarPayload::ScalarRefMut(c, t),
+            Value::ScalarRefConst(c, t) => ScalarPayload::ScalarRefConst(c, t),
+            Value::ScalarMut(c) => {
+                // Unreachable (handled above); restore and share rather than panic.
+                *slot = Value::ScalarMut(c.clone());
+                return Value::ScalarRefMut(c, Tainted::CLEAN);
+            }
+            Value::ScalarConst(c) => {
+                *slot = Value::ScalarConst(c.clone());
+                return Value::ScalarRefConst(c, Tainted::CLEAN);
+            }
+        };
+
+        let cell = Arc::new(RwLock::new(ScalarCell::Plain(payload)));
+        *slot = Value::ScalarMut(cell.clone());
+        Value::ScalarRefMut(cell, Tainted::CLEAN)
+    }
+
+    /// `$$r` — scalar dereference: the identity behind a reference value (through the aliasing variant if the slot is
+    /// promoted).  `None` for non-references; the "Not a SCALAR reference" error is ops-layer.
+    pub fn deref_scalar(&self) -> Option<ScalarRef> {
+        fn from_payload(p: &ScalarPayload) -> Option<ScalarRef> {
+            match p {
+                ScalarPayload::ScalarRefMut(c, _) => Some(ScalarRef::Mut(c.clone())),
+                ScalarPayload::ScalarRefConst(c, _) => Some(ScalarRef::Const(c.clone())),
+                _ => None,
+            }
+        }
+
+        match self {
+            Value::ScalarRefMut(c, _) => Some(ScalarRef::Mut(c.clone())),
+            Value::ScalarRefConst(c, _) => Some(ScalarRef::Const(c.clone())),
+            Value::ScalarMut(cell) => from_payload(cell.read().payload()),
+            Value::ScalarConst(cs) => from_payload(cs.payload()),
             _ => None,
         }
     }
@@ -539,6 +642,22 @@ mod tests {
         Value::String(text.parse().unwrap())
     }
 
+    impl Value {
+        /// Test-only: rehydrate a payload as a slot value (the ops layer owns this mapping in production).
+        fn from_payload_for_test(p: ScalarPayload) -> Value {
+            match p {
+                ScalarPayload::Undef(t) => Value::Undef(t),
+                ScalarPayload::Int(n, t) => Value::Int(n, t),
+                ScalarPayload::Float(f, t) => Value::Float(f, t),
+                ScalarPayload::String(s) => Value::String(s),
+                ScalarPayload::True => Value::True,
+                ScalarPayload::False => Value::False,
+                ScalarPayload::ScalarRefMut(c, t) => Value::ScalarRefMut(c, t),
+                ScalarPayload::ScalarRefConst(c, t) => Value::ScalarRefConst(c, t),
+            }
+        }
+    }
+
     // ── The payload principle (§2.2.2): the retired flag-matrix bug class ─────
     #[test]
     fn payload_stays_authoritative_through_coercion() {
@@ -747,6 +866,116 @@ mod tests {
         assert!(array_exists(&c, 0));
         let _ = array_delete(&mut c, 0);
         assert!(c.is_empty(), "deleting the last (undef) element truncates");
+    }
+
+    // ── References (§2.2.8, step 5; container-verified) ──────────
+    #[test]
+    fn take_ref_identity_is_idempotent_and_distinct_per_slot() {
+        let mut slot = s("hello");
+        let r1 = Value::take_ref(&mut slot);
+        let r2 = Value::take_ref(&mut slot);
+        assert_eq!(r1.to_int(), r2.to_int(), "same slot, same identity (address)");
+        assert!(crate::cell::ScalarRef::ptr_eq(&r1.deref_scalar().unwrap(), &r2.deref_scalar().unwrap()));
+
+        let mut other = s("hello");
+        let r3 = Value::take_ref(&mut other);
+        assert_ne!(r1.to_int(), r3.to_int(), "equal payloads, distinct identities");
+    }
+
+    #[test]
+    fn aliasing_transparency_and_write_through() {
+        let mut slot = Value::Int(5, Tainted::CLEAN);
+        let r = Value::take_ref(&mut slot);
+
+        // The promoted slot still answers as the payload: aliasing transparency.
+        assert!(matches!(slot, Value::ScalarMut(_)));
+        assert_eq!(slot.to_int(), 5);
+        assert!(slot.to_bool());
+        assert_eq!(slot.to_string_repr().unwrap().as_bytes(), b"5");
+
+        // Writes through the dereferenced identity are visible through the slot.
+        let view = r.deref_scalar().unwrap();
+        view.write().unwrap().assign(ScalarPayload::Int(9, Tainted::CLEAN)).unwrap();
+        assert_eq!(slot.to_int(), 9, "$$r = 9 observed via $x");
+    }
+
+    #[test]
+    fn boolean_slots_promote_to_their_own_cells() {
+        // Container-verified: \$x and \$y for two boolean variables are distinct, and distinct from the immortal
+        // (\(1==1)).
+        let mut x = Value::True;
+        let mut y = Value::True;
+        let rx = Value::take_ref(&mut x);
+        let ry = Value::take_ref(&mut y);
+        assert_ne!(rx.to_int(), ry.to_int(), "distinct cells per variable");
+
+        let immortal = Value::True.upgrade_to_scalar().unwrap();
+        assert!(!crate::cell::ScalarRef::ptr_eq(&rx.deref_scalar().unwrap(), &immortal));
+
+        // The promoted boolean keeps is_bool through the variant payload.
+        let view = rx.deref_scalar().unwrap();
+        assert!(matches!(view.read().payload(), ScalarPayload::True));
+    }
+
+    #[test]
+    fn reference_coercions_are_the_address() {
+        let mut slot = s("target");
+        let r = Value::take_ref(&mut slot);
+
+        assert!(r.to_bool(), "references are unconditionally true (container-verified)");
+        let addr = r.to_int();
+        assert!(addr != 0);
+        assert_eq!(r.to_float(), addr as f64);
+        assert_eq!(r.numify(), Numeric::Int(addr));
+        let rendered = r.to_string_repr().unwrap();
+        let expected = format!("SCALAR(0x{:x})", addr as usize);
+        assert_eq!(rendered.as_bytes(), expected.as_bytes(), "SCALAR(0x...) lowercase hex (verified)");
+    }
+
+    #[test]
+    fn ref_of_ref_chains() {
+        let mut base = s("x");
+        let r1 = Value::take_ref(&mut base);
+
+        let mut holder = r1; // a slot now holding the reference value
+        let r2 = Value::take_ref(&mut holder);
+
+        // $$$rr reaches the base cell: two derefs, then the payload.
+        let mid = r2.deref_scalar().unwrap();
+        let inner = mid.read().payload().clone();
+        let inner = Value::from_payload_for_test(inner);
+        let base_view = inner.deref_scalar().unwrap();
+        assert_eq!(base_view.read().to_string_repr().unwrap().as_bytes(), b"x");
+
+        // And writing through the chain is visible via the original slot.
+        base_view.write().unwrap().assign(ScalarPayload::Int(7, Tainted::CLEAN)).unwrap();
+        assert_eq!(base.to_int(), 7);
+    }
+
+    #[test]
+    fn reference_taint_belongs_to_the_referent() {
+        let mut ps: PerlString = "secret".parse().unwrap();
+        ps.taint();
+        let mut slot = Value::String(ps);
+
+        let r = Value::take_ref(&mut slot);
+        assert!(!r.is_tainted(), "the reference value is clean");
+        assert!(r.deref_scalar().unwrap().read().is_tainted(), "the referent carries the taint");
+        assert!(slot.is_tainted(), "and the slot still answers tainted through the alias");
+    }
+
+    #[test]
+    fn const_slots_alias_frozen_cells() {
+        let cs = crate::cell::ConstScalar::materialize(ScalarPayload::Float(3.7, Tainted::CLEAN)).unwrap();
+        let mut slot = Value::ScalarConst(std::sync::Arc::new(cs));
+
+        assert_eq!(slot.to_int(), 3);
+        assert_eq!(slot.to_string_repr().unwrap().as_bytes(), b"3.7");
+
+        let r = Value::take_ref(&mut slot);
+        assert!(matches!(r, Value::ScalarRefConst(..)));
+        let view = r.deref_scalar().unwrap();
+        assert!(matches!(view.write(), Err(crate::cell::ScalarError::ReadOnly)), "frozen through the ref");
     }
 
     // ── Layout (§2.3.6) ───────────────────────────────────────────

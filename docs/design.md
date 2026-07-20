@@ -142,14 +142,16 @@ enum Value {
     String(PerlString),        // <= 22 bytes inline; taint in the tag
     True,                      // canonical boolean true  (see 2.3.3)
     False,                     // canonical boolean false (see 2.3.3)
-    ScalarRef(ScalarRef, Tainted),
+    ScalarRefMut(Arc<RwLock<ScalarCell>>, Tainted),
+    ScalarRefConst(Arc<ConstScalar>, Tainted),
     ArrayRef(ArrayRef, Tainted),
     HashRef(HashRef, Tainted),
     CodeRef(CodeRef, Tainted),
     RegexRef(RegexRef, Tainted),
 
     // A promoted scalar occupying this slot (the slot aliases it)
-    Scalar(ScalarRef),
+    ScalarMut(Arc<RwLock<ScalarCell>>),
+    ScalarConst(Arc<ConstScalar>),
 
     // Typed value (see 14).  Any Rust type that is Send + Sync.
     Typed(Box<dyn TypedVal>),
@@ -161,7 +163,18 @@ compile-time assertions (§2.3.6).  Reference variants are flattened
 (one variant per referent kind, not a nested target enum) because
 `ref()`, dereference ops, and `ARRAY(0x...)`-style stringification all
 branch on referent kind first; the flattened arms sit where the code
-wants to branch.  Both shapes measure 24 bytes; ergonomics decided.
+wants to branch.  The scalar arms flatten one level further — per
+*mutability*, mirroring `ScalarRef`'s Mut/Const split — because the
+nested identity enum carries its own tag that rustc cannot relocate,
+measurably defeating the niche-folding that keeps the envelope at 24
+bytes (nested: 32; flattened: 24 — measured, and the write path
+branches on mutability exactly as deref branches on kind).
+`cell::ScalarRef` remains the API view type, reconstructed by `Arc`
+clone at the boundary.  Remaining reference kinds adopt the same
+flattening if their identity types measure the same way when built.
+Aliased slots carry both mutabilities: `foreach` over a literal list
+aliases the loop variable to readonly elements, so `ScalarConst`
+slots are real.
 
 **Array slots.**  Arrays store `ArraySlot = Option<Value>`:
 

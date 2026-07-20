@@ -108,6 +108,15 @@ pub enum ScalarCell {
     Full(Box<FullScalar>),
 }
 
+impl std::fmt::Debug for ScalarCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalarCell::Plain(p) => f.debug_tuple("Plain").field(p).finish(),
+            ScalarCell::Full(full) => f.debug_struct("Full").field("payload", &full.payload).finish_non_exhaustive(),
+        }
+    }
+}
+
 impl ScalarCell {
     /// The authoritative payload (§2.2.2).
     pub fn payload(&self) -> &ScalarPayload {
@@ -285,6 +294,12 @@ pub struct ConstScalar {
     numify_warned: Option<AtomicBool>,
 }
 
+impl std::fmt::Debug for ConstScalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstScalar").field("payload", &self.payload).finish_non_exhaustive()
+    }
+}
+
 impl ConstScalar {
     /// Materialize a payload into a frozen cell (at most two short strings and two numbers, §2.3.3).
     pub fn materialize(payload: ScalarPayload) -> Result<ConstScalar, AllocError> {
@@ -341,6 +356,16 @@ pub enum ScalarRef {
     Const(Arc<ConstScalar>),
 }
 
+impl std::fmt::Debug for ScalarRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            ScalarRef::Mut(_) => "Mut",
+            ScalarRef::Const(_) => "Const",
+        };
+        write!(f, "ScalarRef::{kind}(0x{:x})", self.addr())
+    }
+}
+
 impl ScalarRef {
     pub fn new_mut(payload: ScalarPayload) -> ScalarRef {
         ScalarRef::Mut(Arc::new(RwLock::new(ScalarCell::Plain(payload))))
@@ -348,6 +373,15 @@ impl ScalarRef {
 
     pub fn new_const(cell: ConstScalar) -> ScalarRef {
         ScalarRef::Const(Arc::new(cell))
+    }
+
+    /// The cell address — the value perl exposes when a reference is numified or stringified (`SCALAR(0x...)`); stable
+    /// for the identity's lifetime, shared by clones.
+    pub fn addr(&self) -> usize {
+        match self {
+            ScalarRef::Mut(c) => Arc::as_ptr(c) as usize,
+            ScalarRef::Const(c) => Arc::as_ptr(c) as usize,
+        }
     }
 
     /// Reference identity (§2.3.1): what `==` on Perl references compares.
