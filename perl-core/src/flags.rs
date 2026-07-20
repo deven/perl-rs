@@ -113,6 +113,7 @@ impl ScalarFlags {
 
 impl std::ops::BitOr for ScalarFlags {
     type Output = ScalarFlags;
+
     #[inline]
     fn bitor(self, rhs: ScalarFlags) -> ScalarFlags {
         ScalarFlags(self.0 | rhs.0)
@@ -128,6 +129,7 @@ impl std::ops::BitOrAssign for ScalarFlags {
 
 impl std::ops::BitAnd for ScalarFlags {
     type Output = ScalarFlags;
+
     #[inline]
     fn bitand(self, rhs: ScalarFlags) -> ScalarFlags {
         ScalarFlags(self.0 & rhs.0)
@@ -136,6 +138,7 @@ impl std::ops::BitAnd for ScalarFlags {
 
 impl std::ops::Not for ScalarFlags {
     type Output = ScalarFlags;
+
     #[inline]
     fn not(self) -> ScalarFlags {
         ScalarFlags(!self.0)
@@ -244,9 +247,11 @@ mod tests {
     fn not_operator_inverts_bits() {
         let f = ScalarFlags::INT_VALID | ScalarFlags::STR_VALID;
         let inv = !f;
+
         // The original bits should be unset in the inversion.
         assert!(!inv.contains(ScalarFlags::INT_VALID));
         assert!(!inv.contains(ScalarFlags::STR_VALID));
+
         // And other bits should be set.
         assert!(inv.contains(ScalarFlags::NUM_VALID));
         assert!(inv.contains(ScalarFlags::READONLY));
@@ -256,10 +261,12 @@ mod tests {
     fn union_and_difference() {
         let f = ScalarFlags::INT_VALID | ScalarFlags::STR_VALID;
         let g = ScalarFlags::STR_VALID | ScalarFlags::NUM_VALID;
+
         let u = f.union(g);
         assert!(u.contains(ScalarFlags::INT_VALID));
         assert!(u.contains(ScalarFlags::STR_VALID));
         assert!(u.contains(ScalarFlags::NUM_VALID));
+
         let d = f.difference(g);
         assert!(d.contains(ScalarFlags::INT_VALID));
         assert!(!d.contains(ScalarFlags::STR_VALID)); // present in g, removed
@@ -272,6 +279,7 @@ mod tests {
         let f = ScalarFlags::READONLY | ScalarFlags::MAGICAL | ScalarFlags::TAINT | ScalarFlags::WEAK;
         assert!(!f.intersects(ScalarFlags::ANY_VAL));
         assert!(!f.intersects(ScalarFlags::REF_VALID));
+
         // Bits all present individually.
         assert!(f.contains(ScalarFlags::READONLY));
         assert!(f.contains(ScalarFlags::MAGICAL));

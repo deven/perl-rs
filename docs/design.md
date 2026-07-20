@@ -263,8 +263,8 @@ enum PerlString {
 over `bytes::Bytes`, `ecow`, and a tendril hybrid — see the ledger
 in §2.3.6).  Its specification fits in a sentence: a `Send + Sync`
 refcounted growable byte buffer with a `(ptr, len)` handle and a
-`{refcount, len, capacity, scan}` header — COW clone, unique-check
-mutation, nothing else.  Details:
+`{refcount, len, capacity, char_count, scan}` header — COW clone,
+unique-check mutation, nothing else.  Details:
 
 - **Handle: `(NonNull<u8>, usize)`, 16 bytes.**  The length is
   mirrored into the handle from the header, exploiting envelope
@@ -277,7 +277,9 @@ mutation, nothing else.  Details:
   emptiness, bounds checks, and the compare-lengths-first `eq`
   short-circuit all skip the dereference.  The `NonNull` supplies
   the niche.
-- **Header: `{refcount: AtomicUsize, len, capacity, scan: AtomicU8}`**
+- **Header: `{refcount: AtomicUsize, len, capacity, char_count:
+  AtomicUsize, scan: AtomicU8}`** (40 bytes —
+  allocation-granularity noise, same class as before)
   followed by the data.  This is perl's own `CowREFCNT` trick — the
   COW refcount stored with the string buffer — done with a real
   atomic.  "Owned" is not a separate kind: it is the refcount == 1
@@ -348,12 +350,14 @@ In the buffer header (per-buffer, `Heap` only):
   cache line as the length whenever the deref is in flight.
 
 `Inline` strings have no heap header; their scan state lives in the
-tag — and needs only the three *terminal* states, because inline
-strings are scanned eagerly at construction (§2.2.7): checking at
-most 22 bytes is nearly free.  Tag-state arithmetic: Inline
-3 (scan) × 2 (utf8) × 2 (warned) × 2 (tainted) = 24; Heap
-2 × 2 × 2 = 8; 32 tag states total, leaving ample niche encodings
-for the enclosing `Value`/`ScalarCell` layouts (§2.3.6).
+tag — and needs only the five *terminal* states (`ASCII`,
+`UTF8_LATIN1`, `UTF8_NON_LATIN1`, `EXTENDED_UTF8`,
+`MALFORMED_UTF8`), because inline strings are scanned eagerly and
+completely at construction (§2.2.7): checking at most 22 bytes is
+nearly free.  Tag-state arithmetic: Inline 5 (scan) × 2 (utf8) ×
+2 (warned) × 2 (tainted) = 40; Heap 2 × 2 × 2 = 8; 48 tag states
+total, leaving ample niche encodings for the enclosing
+`Value`/`ScalarCell` layouts (§2.3.6).
 
 **The Perl flag and the scan cache must never be conflated.**
 Verified against container perl 5.38: `chr(0x110000)` is legal core
@@ -361,7 +365,7 @@ perl — length 1, `UTF8` flag set, stored as bytes `F4 90 80 80` —
 and Rust's `str::from_utf8` rejects those bytes (Rust UTF-8 tops out
 at U+10FFFF; surrogates via `chr(0xD800)` are the same class, and
 `Encode::_utf8_on()` can set the flag with no validation at all).
-A utf8-flagged string can therefore be scan-state `INVALID_UTF8`
+A utf8-flagged string can therefore be scan-state `MALFORMED_UTF8`
 without contradiction, and no code path may derive
 `from_utf8_unchecked` from the Perl flag.  The two-location split
 makes the distinction structural rather than a discipline: there is
@@ -392,6 +396,55 @@ value representation: an 8-byte thin pointer cannot alias into a
 `Bytes` buffer.  One copy per literal at compile time is the price of
 8-byte handles at runtime.
 
+**The equality inference grid and the single-scan rule.**  `eq`
+consults existing scan knowledge before touching bytes; the design
+principle is *short-circuit whenever possible, and never scan twice*.
+Decided-false rows, in evaluation order (lengths first — both are
+O(1) handle reads):
+
+1. *Length*: same flags and byte lengths differ ⇒ false (byte
+   comparison, free inside memcmp but stated for the grid).
+   Cross-flag: `bytelen(unflagged) > bytelen(flagged)` ⇒ false
+   (character count never exceeds byte count).  Cross-flag with the
+   flagged side known non-ASCII *and* Rust-valid (`UTF8_LATIN1`,
+   `UTF8_NON_ASCII`) and byte lengths equal ⇒ false (at least one
+   multi-byte sequence forces character count < byte count).
+2. *Same flags, both terminal, states differ* ⇒ false — the
+   exclusivity law (§2.2.4); no memcmp.  This subsumes, for both
+   flag settings at once: `UTF8_LATIN1` vs
+   `ASCII`/`UTF8_NON_LATIN1`/`EXTENDED_UTF8`/`MALFORMED_UTF8`, and
+   every other differing terminal pair, including `EXTENDED_UTF8`
+   vs `MALFORMED_UTF8`.  Flagged pairs where one side is terminal
+   Rust-invalid (`EXTENDED_UTF8`/`MALFORMED_UTF8`) and the other is
+   known Rust-valid (`UTF8_UNKNOWN_RANGE`/`UTF8_NON_ASCII`) are
+   also false: valid bytes cannot equal invalid bytes.
+3. *ASCII vs known-non-ASCII* (any flag combination): one side
+   `ASCII`, the other any of `UTF8_LATIN1`, `UTF8_NON_LATIN1`,
+   `UTF8_NON_ASCII`, `EXTENDED_UTF8`, `MALFORMED_UTF8`,
+   `NON_ASCII` ⇒ false.
+4. *Cross-flag disjointness*: if the flagged side is
+   `UTF8_NON_LATIN1`, `EXTENDED_UTF8`, or `MALFORMED_UTF8`, the
+   unflagged side cannot match ⇒ false.  (The first two contain a
+   character ≥ U+0100, which no unflagged string has; for the
+   third, perl's semantics is upgrade-then-compare, and the upgrade
+   of any unflagged string is valid UTF-8, which never byte-matches
+   malformed content.)  The
+   reverse orientation is *not* decided: an unflagged
+   `MALFORMED_UTF8`-classified string is a byte string whose
+   characters are its bytes, and can equal a flagged
+   `UTF8_LATIN1` string (unflagged `80` equals flagged `C2 80`).
+
+Rows the grid deliberately leaves undecided (`UNKNOWN`,
+`UTF8_UNKNOWN_RANGE`, cross-flag `UTF8_NON_ASCII` and `NON_ASCII`
+against compatible partners) go to the **single streaming
+dual-direction compare**: one simultaneous walk — flagged side
+decoded, unflagged side bytes-as-characters — short-circuiting at
+the first mismatch.  No pre-scan, no double scan.  When the walk
+*completes* (equality), it has proven both sides ≤ U+00FF and has
+tracked ASCII-ness for one bit of extra cost, so both sides narrow
+opportunistically (flagged → `ASCII`/`UTF8_LATIN1`; unflagged →
+`ASCII`/`NON_ASCII`); a short-circuited walk narrows nothing.
+
 **Substring sharing.**  Rvalue `substr` and regex captures against
 large strings are where perl plays COW games.  A third storage kind
 over the same allocation family is additive if the regex-engine
@@ -411,20 +464,51 @@ capture views) to be designed with lvalues.
 #### 2.2.4 String content scan states:
 
 The scan cache distinguishes what is *known* about the bytes from
-what the Perl flag *claims* about them.  Five states over two facts
-(is the content pure 7-bit ASCII?  is it valid Rust UTF-8?):
+what the Perl flag *claims* about them.  The states are tuned by
+**character range**, because range is the fact equality and hashing
+consume (§2.3.5): a flagged string whose characters all fit
+U+0000–U+00FF can equal an unflagged string; a flagged string known
+to contain a character ≥ U+0100 can equal *no* unflagged string —
+the comparison is skippable, guaranteed false.  Eight states:
 
-| state | ASCII | valid UTF-8 | description |
-|---|---|---|---|
-| `ASCII` | yes | yes | pure 7-bit ASCII |
-| `UTF8_NON_ASCII` | no | yes | valid UTF-8 but non-ASCII |
-| `INVALID_UTF8` | no | no | invalid UTF-8 |
-| `UTF8_MAYBE_ASCII` | unknown | yes | valid UTF-8, possibly ASCII |
-| `NON_ASCII_UNKNOWN` | no | unknown | non-ASCII, UTF-8 unknown |
-| `UNKNOWN` | unknown | unknown | completely unknown |
+| state | meaning |
+|---|---|
+| `ASCII` | entirely U+0000–U+007F |
+| `UTF8_LATIN1` | Rust-valid, entirely U+0000–U+00FF, non-ASCII |
+| `UTF8_NON_LATIN1` | Rust-valid, contains a character ≥ U+0100 |
+| `UTF8_UNKNOWN_RANGE` | Rust-valid; nothing further known (could narrow to any of the three above) |
+| `UTF8_NON_ASCII` | Rust-valid, known non-ASCII; Latin-1-range unresolved |
+| `EXTENDED_UTF8` | perl-decodable, Rust-invalid: contains a code point Rust rejects (a surrogate or ≥ U+110000), hence ≥ U+0100 |
+| `MALFORMED_UTF8` | violates the encoding patterns; invalid for Rust *and* perl |
+| `NON_ASCII` | a high bit is present; validity and range unknown |
+| `UNKNOWN` | completely unknown |
 
-(The remaining two encodings of the fact pair are unused: ASCII
-implies valid UTF-8.)
+The five fully-scanned terminals (`ASCII`, `UTF8_LATIN1`,
+`UTF8_NON_LATIN1`, `EXTENDED_UTF8`, `MALFORMED_UTF8`) are **mutually
+exclusive**: classification assigns exactly one, so `ASCII` content
+is *excluded* from `UTF8_LATIN1` by definition (`UTF8_LATIN1` means
+the high bit is known used).  This exclusivity underpins the
+equality inference grid (§2.3.5): two byte contents with different
+terminal classifications cannot be byte-identical.
+
+Derived predicates are single range tests under the numbering
+(`UNKNOWN` = 0 pinned by §2.2.6; then `ASCII` = 1, `UTF8_LATIN1`
+= 2, `UTF8_NON_LATIN1` = 3, `UTF8_UNKNOWN_RANGE` = 4,
+`UTF8_NON_ASCII` = 5, `EXTENDED_UTF8` = 6, `MALFORMED_UTF8` = 7,
+`NON_ASCII` = 8): Rust-valid ⟺ 1–5, perl-decodable ⟺ 1–6,
+known-downgradable ⟺ 1–2, known-not-downgradable ⟺ 3 or 6.
+Latin-1-range detection is free during a *full* pass: a Rust-valid
+string is entirely ≤ U+00FF iff every multi-byte lead byte is `C2`
+or `C3` (U+0100 begins at `C4 80`) — byte-wise, no decoding.  But
+full narrowing requires a full scan, which the cache exists to
+avoid: an ASCII probe can bail at the *first* high bit, while range
+classification must visit every byte.  So the cheap probe and the
+full classification narrow to different states: `is_ascii()` on
+`UTF8_UNKNOWN_RANGE` short-circuits to `ASCII` or
+`UTF8_NON_ASCII` (validity retained, range deferred), and only
+operations that genuinely need range (downgrade hashing, the
+equality fast path) pay the full lead-byte pass, narrowing
+`UTF8_UNKNOWN_RANGE`/`UTF8_NON_ASCII` to a terminal.
 
 The Perl UTF-8 flag is independent of this cache.  Perl's "extended
 UTF-8" can represent code points above U+10FFFF and surrogates that
@@ -437,13 +521,102 @@ cross-flag path needs validity, and downgrade-canonical hashing
 needs character-range knowledge.  Without the cache, every
 mixed-provenance comparison rescans.
 
+**Perl-valid vs. Rust-valid UTF-8: the `EXTENDED_UTF8` state.**
+Perl's UTF-8 is a superset of Rust's: surrogate code points, supra-
+Unicode code points (above U+10FFFF), and the extended `FE` (7-byte)
+and `FF` (13-byte) forms are all *decodable* by perl, while
+overlongs, bare continuation bytes, and truncated sequences are
+malformed for perl too.  Container-verified via `utf8::decode`:
+`ED A0 80` (surrogate), `F4 90 80 80` (U+110000), and a minimal
+`FE`-form all decode; `C0 80`, `80`, `C3`, and an overlong
+`FF`-form are rejected.  Form boundaries from perl's own encoder:
+6-byte forms reach 2^31-1, `FE` covers through 2^36-1, `FF` through
+2^63-1 (`IV_MAX`; `chr` refuses beyond), with the minimal-length
+rule enforced at every width — so validity is one generic rule:
+decode the value, require the minimal encoding length, allow
+surrogates and supra-Unicode, cap at `IV_MAX`.
+
+The scan lattice therefore distinguishes them: `UTF8_UNKNOWN_RANGE`
+means Rust-valid; **`EXTENDED_UTF8`** means perl-decodable but
+Rust-invalid (necessarily non-ASCII); `MALFORMED_UTF8` means
+malformed under perl's extended rules too.  `as_str` (a Rust-view
+question) excludes `EXTENDED_UTF8`; character-level operations on
+flagged strings (length, iteration, case, regex) include it and
+reject only `MALFORMED_UTF8`.  Inline strings gain a fourth terminal
+state (`Extended`), making the tag arithmetic Inline 4 x 2 x 2 x 2
+= 32 plus Heap 8 = 40 states — still ample niche headroom.  For
+character-sequence equality and hashing, extended and malformed
+regions need only be *distinguishable from all Latin-1 characters*
+(code points above 0xFF can never equal an unflagged byte), so the
+comparison iterator tokenizes them; a full extended decoder arrives
+with the character-operations design.  Cross-check against 5.42's
+`utf8.c` remains a listed chore.
+
+**The character count rides the same pass.**  Perl's `length()` on a
+flagged string is a character count — a fact the classification
+decode walks right past, so under the single-pass fusion law it is
+counted then and cached in the buffer header (`char_count`,
+sentinel 0 = unset; sound for heap buffers specifically, which
+exceed the inline maximum and hence hold at least two characters —
+inline strings recount their ≤ 22 bytes trivially).  Self-validating
+sentinel ⇒ relaxed atomics, by the same deterministic-content
+argument as the scan byte; shared across COW sharers like all
+per-buffer knowledge.  Appends maintain the count incrementally
+(prior + added, the added side counted by its own classification
+pass); the known-valid classifier's early bail legitimately forfeits
+its count — the bail is the point, the count is the completion
+bonus.  Malformed content has no character count (`char_len` is
+`None`; the ops layer owns perl's malformed-`length` warning
+behavior).  The count is one character per encoded sequence under
+perl semantics — container-verified: a lone surrogate is one
+character, a CESU-style surrogate pair is *two* (perl never merges
+pairs), distinct from the one-character astral code point the pair
+would denote in UTF-16.  Rust defines no count for surrogate
+content at all (rejected at the `str` boundary); for mutually
+accepted content the two counts are identical.
+
 #### 2.2.5 State transitions — scans only narrow, never re-widen:
 
-- `is_ascii()` scan: `UNKNOWN` → `ASCII` or `NON_ASCII_UNKNOWN`;
-  `UTF8_MAYBE_ASCII` → `ASCII` or `UTF8_NON_ASCII`
-- `as_str()` scan: `UNKNOWN` → `ASCII` or `UTF8_NON_ASCII` or
-  `INVALID_UTF8`; `NON_ASCII_UNKNOWN` → `UTF8_NON_ASCII` or
-  `INVALID_UTF8`
+- `is_ascii()` scan (high-bit scan, bails at the first high bit):
+  `UNKNOWN` → `ASCII` or `NON_ASCII`; `UTF8_UNKNOWN_RANGE` →
+  `ASCII` or `UTF8_NON_ASCII` (validity retained, range deferred).
+- Range classification (lead-byte pass; run only by consumers that
+  need range — downgrade hashing, the equality fast path):
+  `UTF8_UNKNOWN_RANGE` → `ASCII`, `UTF8_LATIN1`, or
+  `UTF8_NON_LATIN1`; `UTF8_NON_ASCII` → `UTF8_LATIN1` or
+  `UTF8_NON_LATIN1`.
+- Full classification (`as_str()` on a scan miss,
+  `is_perl_utf8_valid()`): `UNKNOWN`/`NON_ASCII` → any terminal
+  (`ASCII` — not from `NON_ASCII` — `UTF8_LATIN1`,
+  `UTF8_NON_LATIN1`, `EXTENDED_UTF8`, `MALFORMED_UTF8`).
+  **Single-fetch fusion law**: the fused scan fetches each byte
+  from main memory once, but may make multiple passes across
+  cache-resident blocks — the scarce resource is memory bandwidth,
+  not iterations.  No operation re-fetches bytes for answers a
+  previous fetch could already have supplied.  (Rust's extra
+  rejections — surrogates, values above U+10FFFF, sequences longer
+  than four bytes — are decidable per-sequence during the same
+  decode.)  The known-valid range classification bails legitimately
+  at the first lead ≥ `C4` — the answer is determined; under
+  blocking the bail is block-granular (at most one extra block
+  fetched).
+
+  **The blocked hybrid classifier** implements the law: per
+  cache-sized block (a named tunable; 64 KiB measured best in the
+  container), one exitless SIMD high-bit pass gates the block —
+  pure-ASCII blocks contribute `chars += len` and are done (one
+  pass, near memory bandwidth); non-ASCII blocks fall to the scalar
+  fused extended decoder over the cached bytes.  Early-exit
+  semantics live at block granularity because exitless inner loops
+  are what auto-vectorize; per-byte early exits defeat SIMD.
+  Sequences straddle block boundaries (up to 12 carry bytes under
+  the extended forms): the trailing partial sequence is held back
+  and stitched into the next block scalar-wise.  Container
+  measurements (64 MiB inputs; VM numbers, workspace re-benchmark a
+  listed chore): pure ASCII 27 GB/s hybrid vs 1.2 GB/s scalar
+  (22×); dense Latin-1 1.7 vs 1.4 GB/s; adversarial
+  every-block-mixed content bounded at roughly parity — the worst
+  case costs one extra vectorized pass per block.
 
 Once a state is narrowed, no subsequent operation widens it unless
 the bytes are mutated.  Because narrowing records a fact about
@@ -460,15 +633,17 @@ below apply at mutation sites exactly as written:
   Cannot affect UTF-8 validity or introduce non-ASCII content.
 
 - **Appending or prepending `&str`** to a valid UTF-8 string:
-  preserves `UTF8_NON_ASCII` or `UTF8_MAYBE_ASCII`.  Valid UTF-8
+  preserves `UTF8_UNKNOWN_RANGE` or `UTF8_UNKNOWN_RANGE`.  Valid UTF-8
   concatenated with valid UTF-8 is valid UTF-8.
 
 - **Inserting mid-string** into any string results in invalid
   UTF-8 if the byte at the insertion point is a UTF-8 continuation
   byte (`0x80..0xBF`), because this splits a multi-byte sequence
-  — transition to `INVALID_UTF8`.  This check can be skipped for
+  — transition to `MALFORMED_UTF8`.  This applies to
+  `EXTENDED_UTF8` as much as to the Rust-valid states (extended
+  sequences split just as badly).  The check can be skipped for
   `ASCII` (insertion point is guaranteed ASCII) and for
-  `INVALID_UTF8`/`UNKNOWN` (no validity claim to protect).
+  `MALFORMED_UTF8`/`UNKNOWN` (no validity claim to protect).
   Conversely, inserting known-valid UTF-8 *at a character boundary*
   of a valid UTF-8 string preserves validity (ASCII status per the
   addition rules below).
@@ -476,20 +651,34 @@ below apply at mutation sites exactly as written:
 - **Adding to an ASCII string** (`ASCII`) inherits the state of the
   content being added.
 
-- **Adding valid UTF-8** (`&str`, `String`, or a string with known
-  `UTF8_NON_ASCII`/`UTF8_MAYBE_ASCII` state) to a valid UTF-8 string
-  preserves UTF-8 validity.  ASCII status: `UTF8_NON_ASCII` stays
-  `UTF8_NON_ASCII`; `ASCII` transitions to `UTF8_NON_ASCII` if the
-  added content is non-ASCII.
+- **Adding valid UTF-8 to valid UTF-8** preserves validity, and the
+  result range is the *maximum* of the operand ranges (ranges join
+  upward: ASCII < Latin-1 < non-Latin-1): `ASCII` + Latin-1 content
+  → `UTF8_LATIN1`; `UTF8_LATIN1` + non-Latin-1 content →
+  `UTF8_NON_LATIN1`; `UTF8_NON_LATIN1` + anything valid stays
+  `UTF8_NON_LATIN1`; any + `UTF8_UNKNOWN_RANGE` content →
+  `UTF8_UNKNOWN_RANGE` (validity kept, range surrendered).
+  `UTF8_NON_ASCII` + ASCII or Latin-1 content stays
+  `UTF8_NON_ASCII`; + non-Latin-1 content → `UTF8_NON_LATIN1`;
+  `UTF8_UNKNOWN_RANGE` + known non-ASCII valid content →
+  `UTF8_NON_ASCII` (the addition proves non-ASCII).  The
+  added content's range is knowable cheaply (the same lead-byte
+  test).  Added to an `EXTENDED_UTF8` string, perl-decodable content
+  of any kind preserves `EXTENDED_UTF8` — the Rust-rejected code
+  point is still there.
 
 - **Removing valid UTF-8 characters** from a valid UTF-8 string
-  (respecting character boundaries, not splitting a multi-byte
-  sequence): `UTF8_NON_ASCII` resets to `UTF8_MAYBE_ASCII` (removing
-  non-ASCII characters might leave only ASCII).  `UTF8_MAYBE_ASCII`
-  stays `UTF8_MAYBE_ASCII`.
+  (respecting character boundaries): validity is preserved, range
+  knowledge weakens to `UTF8_UNKNOWN_RANGE` (from `UTF8_NON_ASCII`
+  and `UTF8_NON_LATIN1` alike: the removal may have taken the last
+  non-ASCII or non-Latin-1 character) — except from `ASCII` (stays
+  `ASCII`) and from `UTF8_LATIN1` (stays `UTF8_LATIN1`: removing
+  characters cannot raise the maximum).
 
 - **Removing non-ASCII bytes**: reset to `UNKNOWN` (remaining
-  content is unknown).
+  content is unknown).  This includes removal from `EXTENDED_UTF8`
+  strings: removing the Rust-rejected sequence may leave a Rust-valid
+  remainder, so no cheaper narrowing is available.
 
 - **Any other byte-level mutation** (raw writes, `vec()`, `s///`
   with byte-level replacement): reset to `UNKNOWN`.
@@ -511,13 +700,13 @@ testing against zero.
 
 #### 2.2.7 Construction policy:
 
-- `Inline`: always scan for ASCII at construction (checking ≤22
-  bytes for a high bit is nearly free).  From raw bytes: `ASCII` or
-  `NON_ASCII_UNKNOWN`.  From Rust `&str`/`String`: `ASCII` or
-  `UTF8_NON_ASCII` (validity known from the type).  This is the only
-  eager scan; inline scan states are therefore always terminal and
-  live in the tag (§2.2.3).
-- `Heap` from Rust `&str` or `String`: set `UTF8_MAYBE_ASCII`
+- `Inline`: always scan *fully* at construction — ASCII plus
+  validity including the extended forms (checking ≤22 bytes is
+  nearly free) — yielding one of the four terminal states.  From
+  Rust `&str`/`String` the validity half is known from the type.
+  This is the only eager scan; inline scan states are therefore
+  always terminal and live in the tag (§2.2.3).
+- `Heap` from Rust `&str` or `String`: set `UTF8_UNKNOWN_RANGE`
   (valid UTF-8 from the type, ASCII status deferred).  Construction
   from a Rust `String` costs one copy into the headered layout (the
   header precedes the data, so `String` ownership cannot transfer in

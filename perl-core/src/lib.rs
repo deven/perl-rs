@@ -2,8 +2,8 @@
 //!
 //! This crate provides the fundamental value representation:
 //!
-//! - [`Value`] — the top-level enum with compact variants for common cases (integers, floats, small strings) and `Arc`-
-//!   wrapped variants for shared values (full scalars, arrays, hashes, code, regex).
+//! - [`Value`] — the top-level enum with compact variants for common cases (integers, floats, small strings) and
+//!   `Arc`-wrapped variants for shared values (full scalars, arrays, hashes, code, regex).
 //!
 //! - [`Scalar`] — the full Perl SV: parallel int/num/string caches with flag-driven validity, magic chain, stash for
 //!   blessed objects.
@@ -29,6 +29,7 @@ pub mod flags;
 pub mod perl_string;
 pub mod scalar;
 pub mod small_string;
+pub mod string;
 pub mod string_slot;
 pub mod value;
 
