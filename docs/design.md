@@ -935,6 +935,40 @@ canonical downgraded-when-possible form, so `$h{$utf8_e}` and
 `$h{$latin1_e}` are one key (verified 5.38: utf8::upgrade/downgrade
 variants of a key collide, `scalar keys` is 1).
 
+Hashing routes through an internal 64-bit **content digest**: the
+`Hasher` API cannot fork mid-stream, and when a flagged string's
+range is unresolved the digest must be computed by **single-fetch
+dual calculation** (§2.2.5) — per cache-resident block, BOTH
+candidate digests advance, raw over the bytes and downgraded over
+the decoded characters (a character > 0xFF kills the downgraded
+candidate), and the end of the data decides which digest is the
+value's.  Every string therefore writes its digest — one `write_u64`
+— into the caller's hasher, for cross-provenance consistency.
+Pre-resolving the range instead would fetch the bytes twice,
+violating the single-fetch law.  The dual pass is a classification:
+its scan state and character count are kept like any other fused
+pass's.
+
+**HashDoS hardening.**  Perl hardened its hashing after the
+algorithmic-complexity attacks: per-process random seeding since
+5.8.1, the 5.18 overhaul (hardened default, build-selectable
+functions including SipHash, per-hash traversal perturbation), and
+since 5.28 the SBOX32/StadtX (Zaphod32 on 32-bit) construction
+keyed by `PL_hash_seed`.  The bit-level function is not observable
+semantics — iteration order is documented as unspecified — so what
+must be reproduced is the *property*: the content digest is keyed by
+a per-process random state (the `PL_hash_seed` analogue), created
+once and shared by every digest, so colliding keys cannot be
+precomputed offline.  The outer map's own seed cannot substitute:
+collisions in the inner digest collapse buckets regardless of it.
+The digest hasher must be a stream hasher (chunking-insensitive):
+the dual path writes in block-sized chunks while the known-state
+paths write whole slices, and their digests must agree.  Open
+compatibility question for the ops layer: `Hash::Util::hash_value`
+and `hash_seed` expose perl's internal hash numbers; matching them
+would require porting perl's exact functions there, independent of
+this digest.
+
 Canonicalization also zeroes the warned and tainted tag bits on the
 stored key: keys returned by `keys`/`each` are clean *structurally*,
 implementing the documented hash-key untaint contract (§2.6.2) rather

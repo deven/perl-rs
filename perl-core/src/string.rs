@@ -199,7 +199,7 @@ fn classify_full(bytes: &[u8]) -> (u8, usize) {
 
         // Non-ASCII block: scalar fused decode over the cached bytes, running to at least soft_end and completing any
         // sequence that straddles it.
-        match scalar_decode_span(bytes, pos, soft_end, &mut facts) {
+        match scalar_decode_span(bytes, pos, soft_end, &mut facts, |_| {}) {
             Some(next) => pos = next,
             None => return (scan::MALFORMED_UTF8, 0),
         }
@@ -234,7 +234,7 @@ impl ScanFacts {
 /// The scalar fused extended decoder over `bytes[start..]`, decoding whole sequences until the position reaches
 /// `soft_end` (a sequence beginning before `soft_end` completes past it; truncation is judged against the full slice).
 /// Returns the position where decoding stopped, or `None` on malformed content.
-fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut ScanFacts) -> Option<usize> {
+fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut ScanFacts, mut emit: impl FnMut(u64)) -> Option<usize> {
     /// Minimum code-point value for each sequence length (minimal-length / anti-overlong rule).
     fn min_for_len(len: usize) -> u64 {
         match len {
@@ -257,6 +257,7 @@ fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut S
         let (len, mut value): (usize, u64) = match lead {
             0x00..=0x7F => {
                 facts.chars += 1;
+                emit(lead as u64);
                 i += 1;
                 continue;
             }
@@ -295,6 +296,7 @@ fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut S
         facts.saw_beyond_latin1 |= value > 0xFF;
         facts.saw_rust_rejected |= len > 4 || value > 0x10_FFFF || (0xD800..=0xDFFF).contains(&value);
         facts.chars += 1;
+        emit(value);
         i += len;
     }
 
@@ -669,38 +671,6 @@ impl PerlString {
                     scan::is_perl_decodable(st)
                 }
             },
-        }
-    }
-
-    /// Resolve range knowledge to a terminal where a full pass is warranted (§2.2.5): the consumers are downgrade
-    /// hashing and the equality fast path.  No-op for inline (terminal at birth) and for heap states that are already
-    /// terminal or not Rust-valid.
-    fn resolve_range(&self) {
-        if let RawParts::Heap(cb) = self.raw_parts() {
-            match cb.scan() {
-                scan::UTF8_UNKNOWN_RANGE | scan::UTF8_NON_ASCII => {
-                    let (st, chars) = classify_known_valid(cb.as_slice());
-                    cb.narrow_scan(st);
-                    if chars > 0 {
-                        cb.set_char_count(chars);
-                    }
-                }
-                scan::UNKNOWN | scan::NON_ASCII => {
-                    let _ = self.is_perl_utf8_valid(); // full validation classifies fully
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Whether the value is *known* (from existing scan knowledge; no scan is performed) to contain a character
-    /// ≥ U+0100 — the equality fast-negative (§2.2.4): such a string can equal no unflagged string.
-    fn known_beyond_latin1(&self) -> bool {
-        match self.raw_parts() {
-            RawParts::Inline { .. } => {
-                matches!(self.inline_scan(), Some(InlineScan::NonLatin1) | Some(InlineScan::Extended))
-            }
-            RawParts::Heap(cb) => scan::is_known_beyond_latin1(cb.scan()),
         }
     }
 
@@ -1214,34 +1184,130 @@ impl PartialEq for PerlString {
 impl Eq for PerlString {}
 
 impl Hash for PerlString {
-    /// Canonical downgraded-when-possible form (§2.3.5): unflagged strings hash their bytes; flagged strings whose
-    /// characters all fit 0–255 hash the downgraded bytes (colliding with their unflagged equals, as required); flagged
-    /// strings with characters above 255 (which can equal only byte-identical flagged strings) hash their raw bytes.
-    /// Warned and tainted bits are ignored throughout (they are not part of string identity).
+    /// Canonical downgraded-when-possible form (§2.3.5), routed through an internal 64-bit content digest: the `Hasher`
+    /// API cannot fork mid-stream, and the single-fetch dual calculation (below) must run two candidate hashers and
+    /// pick the winner at the end, so every string writes its digest — one `write_u64` — for cross-provenance
+    /// consistency.  Warned and tainted bits are ignored (not part of string identity).
     fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.content_digest());
+    }
+}
+
+impl PerlString {
+    /// The 64-bit content digest (§2.3.5): unflagged strings digest their bytes; flagged strings whose characters all
+    /// fit 0–255 digest the downgraded bytes (colliding with their unflagged equals, as required); flagged strings with
+    /// characters above 255 or with malformed content digest their raw bytes.
+    ///
+    /// When the range is unresolved, deciding it first would fetch the bytes twice.  Instead, the single-fetch dual
+    /// calculation (§2.2.5): per cache-resident block, BOTH candidate digests advance — raw over the bytes, downgraded
+    /// over the decoded characters (until a character > 0xFF kills that candidate) — and the end of the data decides
+    /// which digest is the value's.  The pass is a classification, so its knowledge is kept: the scan state narrows and
+    /// the character count caches, like any other fused pass.
+    fn content_digest(&self) -> u64 {
+        use std::collections::hash_map::RandomState;
+        use std::hash::BuildHasher;
+        use std::sync::OnceLock;
+
+        /// The per-process digest key (§2.3.5): the analogue of perl's `PL_hash_seed`.  An unkeyed digest would let
+        /// attackers precompute colliding keys offline (the pre-5.8.1 HashDoS posture); collisions in this inner digest
+        /// collapse hash-map buckets regardless of the outer map's own seed, so the hardening must live here.  One
+        /// state per process: digests must agree within a process and need not (must not, for hardening) agree across
+        /// processes.
+        static DIGEST_KEY: OnceLock<RandomState> = OnceLock::new();
+        fn hasher() -> impl Hasher {
+            DIGEST_KEY.get_or_init(RandomState::new).build_hasher()
+        }
+
         let bytes = self.as_bytes();
 
-        if !self.is_utf8() || self.is_ascii() {
-            state.write(bytes);
-            state.write_u8(0xFF); // length delimiter, Hash-contract hygiene
-            return;
+        // Unflagged, or flagged with known-ASCII content: the raw bytes ARE the canonical downgraded form.
+        if !self.is_utf8() || self.scan_state() == scan::ASCII {
+            let mut h = hasher();
+            h.write(bytes);
+            return h.finish();
         }
 
-        // Flagged, non-ASCII: downgradability is range knowledge (§2.2.4) — resolve it via the scan cache rather than a
-        // trial decode.
-        self.resolve_range();
-        if self.known_beyond_latin1() || !self.is_perl_utf8_valid() {
-            // Contains a character ≥ U+0100 (can equal only byte-identical flagged strings), or malformed (characters
-            // undefined): hash the raw bytes.
-            state.write(bytes);
-        } else {
-            // Known Latin-1 range: emit the canonical downgraded bytes, single pass.
-            for c in flagged_chars(bytes) {
-                state.write_u8(c as u8);
+        match self.scan_state() {
+            // Known Latin-1 range: single decode-emit pass over the downgraded characters.
+            scan::UTF8_LATIN1 => {
+                count_full_scan();
+                let mut h = hasher();
+                let mut facts = ScanFacts::default();
+                let _ = scalar_decode_span(bytes, 0, bytes.len(), &mut facts, |v| h.write_u8(v as u8));
+                h.finish()
+            }
+            // Known beyond Latin-1 or invalid: the raw bytes are the canonical form.
+            st if scan::is_known_beyond_latin1(st) || st == scan::MALFORMED_UTF8 => {
+                let mut h = hasher();
+                h.write(bytes);
+                h.finish()
+            }
+            // Unresolved: the blocked dual calculation.
+            _ => {
+                count_full_scan();
+                let mut raw = hasher();
+                let mut down = hasher();
+                let mut downgradable = true;
+                let mut facts = ScanFacts::default();
+                let mut pos = 0usize;
+                let mut malformed = false;
+
+                while pos < bytes.len() {
+                    let soft_end = block_end(pos, bytes.len());
+
+                    // Exitless gate: a pure-ASCII block advances both candidates with the same bytes.
+                    let hi = bytes[pos..soft_end].iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
+                    if !hi {
+                        raw.write(&bytes[pos..soft_end]);
+                        if downgradable {
+                            down.write(&bytes[pos..soft_end]);
+                        }
+                        facts.chars += soft_end - pos;
+                        pos = soft_end;
+                        continue;
+                    }
+
+                    // Non-ASCII block: one cached decode advances the downgraded candidate per character (until a
+                    // character > 0xFF kills it) while the raw candidate takes the same byte span.
+                    let stop = scalar_decode_span(bytes, pos, soft_end, &mut facts, |v| {
+                        if v > 0xFF {
+                            downgradable = false;
+                        } else if downgradable {
+                            down.write_u8(v as u8);
+                        }
+                    });
+
+                    match stop {
+                        Some(next) => {
+                            raw.write(&bytes[pos..next]);
+                            pos = next;
+                        }
+                        None => {
+                            // Malformed: characters are undefined; the raw digest is the value's.  Finish the fetch
+                            // raw-only.
+                            raw.write(&bytes[pos..]);
+                            malformed = true;
+                            downgradable = false;
+                            pos = bytes.len();
+                        }
+                    }
+                }
+
+                // The pass classified the content — keep the knowledge (heap only; inline is terminal at birth).
+                if let RawParts::Heap(cb) = self.raw_parts() {
+                    if malformed {
+                        cb.narrow_scan(scan::MALFORMED_UTF8);
+                    } else {
+                        cb.narrow_scan(facts.state());
+                        if facts.chars > 0 {
+                            cb.set_char_count(facts.chars);
+                        }
+                    }
+                }
+
+                if downgradable { down.finish() } else { raw.finish() }
             }
         }
-
-        state.write_u8(0xFF);
     }
 }
 
@@ -1989,13 +2055,89 @@ mod tests {
         assert!(decided > pairs / 4, "sanity: a healthy fraction of pairs should be grid-decided ({decided}/{pairs})");
     }
 
-    // ── Blocked hybrid classifier boundaries (§2.2.5) ─────────────
+    // ── Dual-calculation hashing (§2.3.5) ─────────────────────────
+    fn digest_of(s: &PerlString) -> u64 {
+        s.content_digest()
+    }
 
-    /// Test-only reference: the scalar single-byte-scan classifier, transcribed as the oracle for the blocked
-    /// hybrid (same decode rules, no blocking).
+    #[test]
+    fn hash_dual_calculation_is_single_fetch_and_keeps_knowledge() {
+        // Unresolved flagged heap string: ONE fused pass computes both candidates, decides, and classifies.
+        let s = PerlString::from_str_impl(&"é".repeat(20)).unwrap(); // heap, flagged, UNKNOWN_RANGE
+        eq_probe::reset();
+        let d = digest_of(&s);
+        assert_eq!(eq_probe::scans(), (1, 0), "dual calculation is one fetch, no probes");
+        assert_eq!(s.scan_state(), scan::UTF8_LATIN1, "the pass's classification is kept");
+        eq_probe::reset();
+        assert_eq!(s.char_len(), Some(20), "and so is the character count");
+        assert_eq!(eq_probe::scans(), (0, 0));
+
+        // The downgraded digest matches the unflagged equal (the HashMap-key requirement).
+        let plain = PerlString::from_bytes(&[0xE9u8; 20]).unwrap();
+        assert_eq!(d, digest_of(&plain));
+
+        // A repeat hash uses the known-Latin-1 single-emission path: still exactly one fetch.
+        eq_probe::reset();
+        assert_eq!(digest_of(&s), d);
+        assert_eq!(eq_probe::scans().0, 1, "known-range emission is one pass, never two");
+    }
+
+    #[test]
+    fn hash_dual_calculation_wide_and_malformed_outcomes() {
+        // Wide content: the raw candidate wins; byte-identical flagged strings agree.
+        let a = PerlString::from_str_impl(&"字".repeat(14)).unwrap(); // heap, flagged, UNKNOWN_RANGE
+        let b = PerlString::from_str_impl(&"字".repeat(14)).unwrap();
+        eq_probe::reset();
+        let da = digest_of(&a);
+        assert_eq!(eq_probe::scans().0, 1);
+        assert_eq!(a.scan_state(), scan::UTF8_NON_LATIN1, "classification kept on the wide outcome too");
+        assert_eq!(da, digest_of(&b));
+
+        // Malformed discovered mid-pass: raw digest, MALFORMED_UTF8 recorded, agrees with the known-malformed path on
+        // byte-identical content.
+        let mut bad_bytes = vec![b'a'; 30];
+        bad_bytes.push(0xC0);
+        bad_bytes.push(0x80);
+        let mut m1 = PerlString::from_bytes(&bad_bytes).unwrap();
+        m1.set_utf8_for_test(); // flagged, heap UNKNOWN
+        eq_probe::reset();
+        let dm = digest_of(&m1);
+        assert_eq!(eq_probe::scans().0, 1);
+        assert_eq!(m1.scan_state(), scan::MALFORMED_UTF8);
+        let mut m2 = PerlString::from_bytes(&bad_bytes).unwrap();
+        m2.set_utf8_for_test();
+        assert!(!m2.is_perl_utf8_valid()); // pre-classify: takes the known-malformed digest path
+        assert_eq!(dm, digest_of(&m2), "dual-discovered and pre-known malformed digests agree");
+    }
+
+    #[test]
+    fn hash_dual_calculation_across_block_boundary() {
+        // A Latin-1 character straddling the grid boundary during the dual pass: the downgraded digest must still match
+        // the unflagged twin byte-for-byte.
+        let mut flagged_src = String::with_capacity(CLASSIFY_BLOCK + 8);
+        for _ in 0..CLASSIFY_BLOCK - 1 {
+            flagged_src.push('a');
+        }
+        flagged_src.push('é');
+        flagged_src.push_str("tail");
+        let f = PerlString::from_str_impl(&flagged_src).unwrap(); // flagged, UNKNOWN_RANGE
+
+        let mut twin = vec![b'a'; CLASSIFY_BLOCK - 1];
+        twin.push(0xE9);
+        twin.extend_from_slice(b"tail");
+        let p = PerlString::from_bytes(&twin).unwrap();
+
+        assert_eq!(digest_of(&f), digest_of(&p));
+        assert_eq!(f.scan_state(), scan::UTF8_LATIN1);
+        assert_eq!(f.char_len(), Some(CLASSIFY_BLOCK - 1 + 1 + 4));
+    }
+
+    // ── Blocked hybrid classifier boundaries (§2.2.5) ─────────────
+    /// Test-only reference: the scalar single-byte-scan classifier, transcribed as the oracle for the blocked hybrid
+    /// (same decode rules, no blocking).
     fn reference_classify(bytes: &[u8]) -> (u8, usize) {
         let mut facts = ScanFacts::default();
-        match scalar_decode_span(bytes, 0, bytes.len(), &mut facts) {
+        match scalar_decode_span(bytes, 0, bytes.len(), &mut facts, |_| {}) {
             Some(_) => (facts.state(), facts.chars),
             None => (scan::MALFORMED_UTF8, 0),
         }
@@ -2046,8 +2188,8 @@ mod tests {
 
     #[test]
     fn block_boundaries_realign_to_the_grid_after_straddles() {
-        // Sequences straddling TWO consecutive fixed grid boundaries: correctness here requires the second
-        // block to end at the absolute grid multiple, not at a drifted offset.
+        // Sequences straddling TWO consecutive fixed grid boundaries: correctness here requires the second block to end
+        // at the absolute grid multiple, not at a drifted offset.
         let mut bytes = vec![b'a'; CLASSIFY_BLOCK - 1];
         bytes.extend_from_slice("字".as_bytes()); // straddles boundary 1 (cut after 1 of 3 bytes)
         while bytes.len() < 2 * CLASSIFY_BLOCK - 1 {
@@ -2097,8 +2239,8 @@ mod tests {
             rng
         };
 
-        // Several compositions, each ~3 blocks long; the last snippet index drawn caps which classes appear so
-        // the corpus covers pure-ASCII, valid-only, extended, and malformed mixes.
+        // Several compositions, each ~3 blocks long; the last snippet index drawn caps which classes appear so the
+        // corpus covers pure-ASCII, valid-only, extended, and malformed mixes.
         for cap in [1usize, 3, 4, 6, 7] {
             let mut bytes = Vec::with_capacity(3 * CLASSIFY_BLOCK + 64);
             while bytes.len() < 3 * CLASSIFY_BLOCK {
