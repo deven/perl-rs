@@ -601,22 +601,36 @@ accepted content the two counts are identical.
   blocking the bail is block-granular (at most one extra block
   fetched).
 
-  **The blocked hybrid classifier** implements the law: per
-  cache-sized block (a named tunable; 64 KiB measured best in the
-  container), one exitless SIMD high-bit pass gates the block —
-  pure-ASCII blocks contribute `chars += len` and are done (one
-  pass, near memory bandwidth); non-ASCII blocks fall to the scalar
-  fused extended decoder over the cached bytes.  Early-exit
-  semantics live at block granularity because exitless inner loops
-  are what auto-vectorize; per-byte early exits defeat SIMD.
-  Sequences straddle block boundaries (up to 12 carry bytes under
-  the extended forms): the trailing partial sequence is held back
-  and stitched into the next block scalar-wise.  Container
-  measurements (64 MiB inputs; VM numbers, workspace re-benchmark a
-  listed chore): pure ASCII 27 GB/s hybrid vs 1.2 GB/s scalar
-  (22×); dense Latin-1 1.7 vs 1.4 GB/s; adversarial
-  every-block-mixed content bounded at roughly parity — the worst
-  case costs one extra vectorized pass per block.
+  **The blocked hybrid passes** implement the law: per
+  cache-resident block, one exitless SIMD high-bit pass gates the
+  block — pure-ASCII blocks are handled at vector speed with no
+  further passes; non-ASCII blocks fall to the scalar fused
+  extended decoder over the cached bytes.  Early-exit semantics
+  live at block granularity because exitless inner loops are what
+  auto-vectorize; per-byte early exits defeat SIMD.
+
+  **Block size.**  Two effects pull opposite ways.  The vector
+  pass's per-block overhead amortizes with size: variance-controlled
+  container measurement (9 trials, min/median/max) put its plateau
+  at 16 KiB — ≥16 KiB runs a tight 26–27 GB/s, 512 B–2 KiB about
+  23 GB/s, and 4–8 KiB was bimodal on the container VM (12–27 GB/s,
+  unexplained; the workspace re-benchmark chore must confirm the
+  plateau's location on real hardware).  Against that, a block whose
+  gate finds non-ASCII falls to the scalar decoder for its whole
+  remaining length, so sparse non-ASCII content costs proportionally
+  more in larger blocks (single-level sweep: é every 256 KiB ran
+  9.4 GB/s at 4 KiB vs 1.2 GB/s at 64 KiB).  `CLASSIFY_BLOCK` is
+  16 KiB, optimizing the vector pass (a tunable).  Boundaries are
+  the fixed **grid**: every multiple of `CLASSIFY_BLOCK`, never
+  drifting.  Small early blocks only pay for operations that can
+  *exit* early: the full-read passes (classification, the digest)
+  always read to the end, so for them geometric early blocks are
+  pure per-block overhead — measured 4× slower on 256-byte strings
+  and consistently slow-mode on long ASCII in the container —
+  and they gate uniform grid blocks.  A sequence straddling a boundary (up to 12 carry bytes
+  under the extended forms) is decoded whole past it; the next
+  block runs from there to the next ladder position, which is
+  merely a few bytes closer.
 
 Once a state is narrowed, no subsequent operation widens it unless
 the bytes are mutated.  Because narrowing records a fact about
@@ -919,18 +933,19 @@ byte compare; flags differ → upgrade the unflagged side and compare;
 both-ASCII fast path compares bytes directly.  `Hash` uses the
 canonical downgraded-when-possible form, so `$h{$utf8_e}` and
 `$h{$latin1_e}` are one key (verified 5.38: utf8::upgrade/downgrade
-variants of a key collide, `scalar keys` is 1).  Canonicalization
-also zeroes the warned and tainted tag bits on the stored key: keys
-returned by `keys`/`each` are clean *structurally*, implementing the
-documented hash-key untaint contract (§2.6.2) rather than scrubbing
-on read.  Equality already ignores those bits, so tainted-key lookup
-against clean stored keys needs no special case.  Under `use bytes`
-the ops layer selects a third comparison mode — raw bytes, flags
-ignored — by compile-time hint (§2.2.3, §8); it is not a property of
-the strings.  The warned and
-tainted tag bits are ignored by equality and hashing.  This section
-supersedes any notion of "internal representation equality" — string
-equality in perl-core *is* Perl-level string equality.
+variants of a key collide, `scalar keys` is 1).
+
+Canonicalization also zeroes the warned and tainted tag bits on the
+stored key: keys returned by `keys`/`each` are clean *structurally*,
+implementing the documented hash-key untaint contract (§2.6.2) rather
+than scrubbing on read.  Equality already ignores those bits, so
+tainted-key lookup against clean stored keys needs no special case.
+ Under `use bytes` the ops layer selects a third comparison mode —
+raw bytes, flags ignored — by compile-time hint (§2.2.3, §8); it is
+not a property of the strings.  The warned and tainted tag bits are
+ignored by equality and hashing.  This section supersedes any notion
+of "internal representation equality" — string equality in perl-core
+*is* Perl-level string equality.
 
 #### 2.3.6 Layout law:
 

@@ -152,18 +152,89 @@ fn count_probe_byte() {
     eq_probe::PROBE_BYTES.with(|c| c.set(c.get() + 1));
 }
 
-/// Single-pass full classification (§2.2.4/§2.2.5): ONE traversal decodes under perl's extended rules and determines
-/// perl-validity, Rust-validity, and both range facts simultaneously, emitting the terminal state.  No operation may
-/// re-iterate bytes for answers this pass already determined.
+/// Classification block size (§2.2.5): the blocked hybrid passes fetch each block from main memory once and may make
+/// multiple passes while it is cache-resident.  Variance-controlled container measurement (9 trials, min/median/max)
+/// put the vector pass's plateau at 16 KiB: ≥16 KiB runs a tight 26–27 GB/s, 512 B–2 KiB ~23 GB/s, and 4–8 KiB was
+/// bimodal on the container VM (12–27 GB/s; unexplained — workspace re-benchmark is a listed chore).  Larger blocks do
+/// lengthen the scalar-fallback span when non-ASCII appears mid-block; the 16 KiB choice optimizes the vector pass.
+/// A tunable.
+const CLASSIFY_BLOCK: usize = 16384;
+
+/// Fixed grid block boundaries (§2.2.5): the next multiple of CLASSIFY_BLOCK strictly after `pos` (which may sit a few
+/// bytes past a boundary after a sequence straddle; the grid itself never moves).
+fn block_end(pos: usize, len: usize) -> usize {
+    ((pos / CLASSIFY_BLOCK + 1) * CLASSIFY_BLOCK).min(len)
+}
+
+/// Blocked hybrid full classification (§2.2.4/§2.2.5), implementing the single-fetch fusion law: each byte is fetched
+/// from main memory once, and per cache-resident block one exitless SIMD high-bit pass gates the block — pure-ASCII
+/// blocks contribute `chars += len` and are done; non-ASCII blocks fall to the scalar fused extended decoder over the
+/// cached bytes.  Exitless inner loops are what auto-vectorize; early-exit semantics live at block granularity.  Blocks
+/// end at fixed multiples of CLASSIFY_BLOCK: sequences straddling a boundary are handled without copying — the scalar
+/// decoder's soft end is the grid boundary, but sequence reads bound against the full slice, so a straddling sequence
+/// completes past the boundary and the next block runs from there to the *next grid multiple* (boundaries never drift;
+/// a post-straddle block is merely a few bytes short).
 ///
-/// Perl's extended validity, container-verified: surrogates, supra-Unicode, and the FE (7-byte) / FF (13-byte) forms
-/// decode; overlongs (minimal-length rule at every width), bare continuations, and truncations are malformed; values
-/// cap at IV_MAX.  Rust additionally rejects surrogates, values above U+10FFFF, and any sequence longer than 4 bytes —
-/// decidable per-sequence during the same decode.
+/// One traversal (in the fetch sense) determines perl-validity, Rust-validity, both range facts, and the character
+/// count.  Perl's extended validity, container-verified: surrogates, supra-Unicode, and the FE (7-byte) / FF (13-byte)
+/// forms decode; overlongs (minimal-length rule at every width), bare continuations, and truncations are malformed;
+/// values cap at IV_MAX.  Rust additionally rejects surrogates, values above U+10FFFF, and any sequence longer than
+/// 4 bytes — decidable per-sequence during the same decode.
 fn classify_full(bytes: &[u8]) -> (u8, usize) {
     count_full_scan();
-    let mut chars = 0usize;
 
+    let mut facts = ScanFacts::default();
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        let soft_end = block_end(pos, bytes.len());
+
+        // Exitless SIMD gate over the block (a fold, not an early-exit scan — folds vectorize).
+        let hi = bytes[pos..soft_end].iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
+        if !hi {
+            facts.chars += soft_end - pos; // ASCII block: characters are bytes; no further passes
+            pos = soft_end;
+            continue;
+        }
+
+        // Non-ASCII block: scalar fused decode over the cached bytes, running to at least soft_end and completing any
+        // sequence that straddles it.
+        match scalar_decode_span(bytes, pos, soft_end, &mut facts) {
+            Some(next) => pos = next,
+            None => return (scan::MALFORMED_UTF8, 0),
+        }
+    }
+
+    (facts.state(), facts.chars)
+}
+
+/// Accumulated classification facts across blocks.
+#[derive(Default)]
+struct ScanFacts {
+    saw_multibyte: bool,
+    saw_beyond_latin1: bool,
+    saw_rust_rejected: bool,
+    chars: usize,
+}
+
+impl ScanFacts {
+    fn state(&self) -> u8 {
+        if self.saw_rust_rejected {
+            scan::EXTENDED_UTF8
+        } else if self.saw_beyond_latin1 {
+            scan::UTF8_NON_LATIN1
+        } else if self.saw_multibyte {
+            scan::UTF8_LATIN1
+        } else {
+            scan::ASCII
+        }
+    }
+}
+
+/// The scalar fused extended decoder over `bytes[start..]`, decoding whole sequences until the position reaches
+/// `soft_end` (a sequence beginning before `soft_end` completes past it; truncation is judged against the full slice).
+/// Returns the position where decoding stopped, or `None` on malformed content.
+fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut ScanFacts) -> Option<usize> {
     /// Minimum code-point value for each sequence length (minimal-length / anti-overlong rule).
     fn min_for_len(len: usize) -> u64 {
         match len {
@@ -179,16 +250,13 @@ fn classify_full(bytes: &[u8]) -> (u8, usize) {
         }
     }
 
-    let mut saw_multibyte = false;
-    let mut saw_beyond_latin1 = false;
-    let mut saw_rust_rejected = false;
-    let mut i = 0;
-    while i < bytes.len() {
+    let mut i = start;
+    while i < soft_end {
         let lead = bytes[i];
 
         let (len, mut value): (usize, u64) = match lead {
             0x00..=0x7F => {
-                chars += 1;
+                facts.chars += 1;
                 i += 1;
                 continue;
             }
@@ -199,65 +267,69 @@ fn classify_full(bytes: &[u8]) -> (u8, usize) {
             0xFC..=0xFD => (6, (lead & 0x01) as u64),
             0xFE => (7, 0),
             0xFF => (13, 0),
-            _ => return (scan::MALFORMED_UTF8, 0), // bare continuation byte
+            _ => return None, // bare continuation byte
         };
 
         if i + len > bytes.len() {
-            return (scan::MALFORMED_UTF8, 0); // truncated
+            return None; // truncated (judged against the full slice, not the block)
         }
 
         for &b in &bytes[i + 1..i + len] {
             if b & 0xC0 != 0x80 {
-                return (scan::MALFORMED_UTF8, 0); // malformed continuation
+                return None; // malformed continuation
             }
 
             // 12 continuations x 6 bits = 72 bits could overflow u64, but any value needing the high bits exceeds
             // IV_MAX and is rejected; checked arithmetic keeps the reasoning airtight.
             value = match value.checked_mul(64) {
                 Some(v) => v | (b & 0x3F) as u64,
-                None => return (scan::MALFORMED_UTF8, 0),
+                None => return None,
             };
         }
 
         if value < min_for_len(len) || value > 0x7FFF_FFFF_FFFF_FFFF {
-            return (scan::MALFORMED_UTF8, 0); // overlong for its form, or beyond IV_MAX
+            return None; // overlong for its form, or beyond IV_MAX
         }
 
-        saw_multibyte = true;
-        saw_beyond_latin1 |= value > 0xFF;
-        saw_rust_rejected |= len > 4 || value > 0x10_FFFF || (0xD800..=0xDFFF).contains(&value);
-        chars += 1;
+        facts.saw_multibyte = true;
+        facts.saw_beyond_latin1 |= value > 0xFF;
+        facts.saw_rust_rejected |= len > 4 || value > 0x10_FFFF || (0xD800..=0xDFFF).contains(&value);
+        facts.chars += 1;
         i += len;
     }
 
-    let state = if saw_rust_rejected {
-        scan::EXTENDED_UTF8
-    } else if saw_beyond_latin1 {
-        scan::UTF8_NON_LATIN1
-    } else if saw_multibyte {
-        scan::UTF8_LATIN1
-    } else {
-        scan::ASCII
-    };
-
-    (state, chars)
+    Some(i)
 }
 
-/// Single-pass range classification of *already Rust-valid* bytes (§2.2.4): one lead-byte traversal, with a legitimate
-/// early bail — the first lead ≥ `C4` determines the answer (U+0100 begins at `C4 80`), so quitting there skips no
-/// needed work.
+/// Blocked range classification of *already Rust-valid* bytes (§2.2.4): per cache-resident block, an exitless high-bit
+/// gate (ASCII block: characters are bytes), then an exitless `≥ C4` fold — the first block containing such a lead
+/// determines the answer (U+0100 begins at `C4 80`), a block-granular bail that legitimately forfeits the count.
+/// Rust-validity of the input means no sequence straddles awkwardly: continuation bytes are never counted as characters
+/// regardless of which block sees them.
 fn classify_known_valid(bytes: &[u8]) -> (u8, usize) {
     count_full_scan();
+
     let mut saw_high = false;
     let mut chars = 0usize;
+    let mut pos = 0usize;
 
-    for &b in bytes {
-        if b >= 0xC4 {
-            return (scan::UTF8_NON_LATIN1, 0); // answer determined; the bail legitimately forfeits the count
+    while pos < bytes.len() {
+        let end = block_end(pos, bytes.len());
+        let block = &bytes[pos..end];
+        pos = end;
+
+        let hi = block.iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
+        if !hi {
+            chars += block.len();
+            continue;
         }
 
-        saw_high |= b >= 0x80;
-        chars += usize::from(b & 0xC0 != 0x80); // non-continuation bytes are character starts
+        if block.iter().fold(0u8, |a, &b| a | u8::from(b >= 0xC4)) != 0 {
+            return (scan::UTF8_NON_LATIN1, 0); // answer determined; the block-granular bail forfeits the count
+        }
+
+        saw_high = true;
+        chars += block.iter().map(|&b| usize::from(b & 0xC0 != 0x80)).sum::<usize>();
     }
 
     (if saw_high { scan::UTF8_LATIN1 } else { scan::ASCII }, chars)
@@ -580,6 +652,26 @@ impl PerlString {
         }
     }
 
+    /// Whether the bytes are valid under perl's *extended* UTF-8 rules (§2.2.4) — the predicate character-level
+    /// operations on flagged strings use.  Narrows the heap lattice.
+    pub fn is_perl_utf8_valid(&self) -> bool {
+        match self.raw_parts() {
+            RawParts::Inline { .. } => !matches!(self.inline_scan(), Some(InlineScan::Malformed)),
+            RawParts::Heap(cb) => match cb.scan() {
+                st if scan::is_perl_decodable(st) => true,
+                scan::MALFORMED_UTF8 => false,
+                _ => {
+                    let (st, chars) = classify_full(cb.as_slice()); // the single pass
+                    cb.narrow_scan(st);
+                    if chars > 0 {
+                        cb.set_char_count(chars);
+                    }
+                    scan::is_perl_decodable(st)
+                }
+            },
+        }
+    }
+
     /// Resolve range knowledge to a terminal where a full pass is warranted (§2.2.5): the consumers are downgrade
     /// hashing and the equality fast path.  No-op for inline (terminal at birth) and for heap states that are already
     /// terminal or not Rust-valid.
@@ -601,34 +693,14 @@ impl PerlString {
         }
     }
 
-    /// Whether the value is *known* (from existing scan knowledge; no scan is performed) to contain a character ≥
-    /// U+0100 — the equality fast-negative (§2.2.4): such a string can equal no unflagged string.
+    /// Whether the value is *known* (from existing scan knowledge; no scan is performed) to contain a character
+    /// ≥ U+0100 — the equality fast-negative (§2.2.4): such a string can equal no unflagged string.
     fn known_beyond_latin1(&self) -> bool {
         match self.raw_parts() {
             RawParts::Inline { .. } => {
                 matches!(self.inline_scan(), Some(InlineScan::NonLatin1) | Some(InlineScan::Extended))
             }
             RawParts::Heap(cb) => scan::is_known_beyond_latin1(cb.scan()),
-        }
-    }
-
-    /// Whether the bytes are valid under perl's *extended* UTF-8 rules (§2.2.4) — the predicate character-level
-    /// operations on flagged strings use.  Narrows the heap lattice.
-    pub fn is_perl_utf8_valid(&self) -> bool {
-        match self.raw_parts() {
-            RawParts::Inline { .. } => !matches!(self.inline_scan(), Some(InlineScan::Malformed)),
-            RawParts::Heap(cb) => match cb.scan() {
-                st if scan::is_perl_decodable(st) => true,
-                scan::MALFORMED_UTF8 => false,
-                _ => {
-                    let (st, chars) = classify_full(cb.as_slice()); // the single pass
-                    cb.narrow_scan(st);
-                    if chars > 0 {
-                        cb.set_char_count(chars);
-                    }
-                    scan::is_perl_decodable(st)
-                }
-            },
         }
     }
 
@@ -1740,10 +1812,10 @@ mod tests {
         assert!(h_ascii.is_ascii());
         push("heap-ascii", h_ascii, scan::ASCII);
         let h_l1 = PerlString::from_str_impl(&"é".repeat(12)).unwrap();
-        h_l1.resolve_range();
+        let _ = h_l1.char_len(); // classifies via the fused pass
         push("heap-latin1", h_l1, scan::UTF8_LATIN1);
         let h_nl1 = PerlString::from_str_impl(&"字".repeat(8)).unwrap();
-        h_nl1.resolve_range();
+        let _ = h_nl1.char_len();
         push("heap-nonlatin1", h_nl1, scan::UTF8_NON_LATIN1);
         let h_ext = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
         assert!(h_ext.is_perl_utf8_valid());
@@ -1786,7 +1858,7 @@ mod tests {
         assert!(s.as_str().is_some());
         assert!(s.is_perl_utf8_valid());
         assert!(!s.is_ascii());
-        s.resolve_range();
+        assert_eq!(s.char_len(), Some(12));
         assert_eq!(eq_probe::scans(), (0, 0), "cached state must answer every subsequent question");
     }
 
@@ -1915,6 +1987,152 @@ mod tests {
 
         assert_eq!(pairs, n * n * 4);
         assert!(decided > pairs / 4, "sanity: a healthy fraction of pairs should be grid-decided ({decided}/{pairs})");
+    }
+
+    // ── Blocked hybrid classifier boundaries (§2.2.5) ─────────────
+
+    /// Test-only reference: the scalar single-byte-scan classifier, transcribed as the oracle for the blocked
+    /// hybrid (same decode rules, no blocking).
+    fn reference_classify(bytes: &[u8]) -> (u8, usize) {
+        let mut facts = ScanFacts::default();
+        match scalar_decode_span(bytes, 0, bytes.len(), &mut facts) {
+            Some(_) => (facts.state(), facts.chars),
+            None => (scan::MALFORMED_UTF8, 0),
+        }
+    }
+
+    #[test]
+    fn block_boundary_straddles_every_sequence_length() {
+        // Sequences of every length, split at every interior offset across the block boundary.
+        let mut ff_min = vec![0xFFu8]; // minimal FF form: 2^36
+        let mut v: u64 = 1 << 36;
+        let mut conts = [0u8; 12];
+        for slot in conts.iter_mut().rev() {
+            *slot = 0x80 | (v & 0x3F) as u8;
+            v >>= 6;
+        }
+        ff_min.extend_from_slice(&conts);
+
+        let mut fe_min = vec![0xFEu8]; // minimal FE form: 2^31
+        let mut v2: u64 = 1 << 31;
+        let mut c2 = [0u8; 6];
+        for slot in c2.iter_mut().rev() {
+            *slot = 0x80 | (v2 & 0x3F) as u8;
+            v2 >>= 6;
+        }
+        fe_min.extend_from_slice(&c2);
+
+        let cases: [(&[u8], u8); 5] = [
+            ("é".as_bytes(), scan::UTF8_LATIN1),
+            ("字".as_bytes(), scan::UTF8_NON_LATIN1),
+            ("\u{10000}".as_bytes(), scan::UTF8_NON_LATIN1),
+            (&fe_min, scan::EXTENDED_UTF8),
+            (&ff_min, scan::EXTENDED_UTF8),
+        ];
+
+        for (seq, want_state) in cases {
+            for cut in 1..seq.len() {
+                // The sequence begins `cut` bytes before the boundary, so the boundary falls inside it.
+                let lead_len = CLASSIFY_BLOCK - cut;
+                let mut bytes = vec![b'a'; lead_len];
+                bytes.extend_from_slice(seq);
+                bytes.extend_from_slice(b"tail");
+                let (st, chars) = classify_full(&bytes);
+                assert_eq!(st, want_state, "state for seq len {} cut {}", seq.len(), cut);
+                assert_eq!(chars, lead_len + 1 + 4, "chars for seq len {} cut {}", seq.len(), cut);
+            }
+        }
+    }
+
+    #[test]
+    fn block_boundaries_realign_to_the_grid_after_straddles() {
+        // Sequences straddling TWO consecutive fixed grid boundaries: correctness here requires the second
+        // block to end at the absolute grid multiple, not at a drifted offset.
+        let mut bytes = vec![b'a'; CLASSIFY_BLOCK - 1];
+        bytes.extend_from_slice("字".as_bytes()); // straddles boundary 1 (cut after 1 of 3 bytes)
+        while bytes.len() < 2 * CLASSIFY_BLOCK - 1 {
+            bytes.push(b'b');
+        }
+        bytes.extend_from_slice("é".as_bytes()); // straddles boundary 2 exactly
+        bytes.extend_from_slice(b"tail");
+
+        let (st, chars) = classify_full(&bytes);
+        assert_eq!(st, scan::UTF8_NON_LATIN1);
+        // chars: (BLOCK-1) a's + 字 + b-fill + é + 4 tail.
+        let b_fill = (2 * CLASSIFY_BLOCK - 1) - (CLASSIFY_BLOCK - 1 + 3);
+        assert_eq!(chars, (CLASSIFY_BLOCK - 1) + 1 + b_fill + 1 + 4);
+    }
+
+    #[test]
+    fn block_boundary_truncation_and_malformation() {
+        // Lead byte as the final byte of the slice, exactly at the boundary: truncated.
+        let mut t = vec![b'a'; CLASSIFY_BLOCK - 1];
+        t.push(0xC3);
+        assert_eq!(classify_full(&t), (scan::MALFORMED_UTF8, 0));
+
+        // Bad continuation lands in the next block: malformed.
+        let mut m = vec![b'a'; CLASSIFY_BLOCK - 1];
+        m.extend_from_slice(&[0xC3, 0x28]);
+        assert_eq!(classify_full(&m), (scan::MALFORMED_UTF8, 0));
+    }
+
+    #[test]
+    fn blocked_hybrid_matches_reference_on_corpus() {
+        // Deterministic pseudo-random corpus mixing every content class, sized to span multiple blocks.
+        let snippets: [&[u8]; 7] = [
+            b"plain ascii run ",
+            "éàçñ".as_bytes(),
+            "字典漢".as_bytes(),
+            "\u{10000}\u{10FFFF}".as_bytes(),
+            &[0xED, 0xA0, 0x80],       // surrogate: extended
+            &[0xF4, 0x90, 0x80, 0x80], // supra-Unicode: extended
+            &[0xC0, 0x80],             // overlong: malformed
+        ];
+
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        // Several compositions, each ~3 blocks long; the last snippet index drawn caps which classes appear so
+        // the corpus covers pure-ASCII, valid-only, extended, and malformed mixes.
+        for cap in [1usize, 3, 4, 6, 7] {
+            let mut bytes = Vec::with_capacity(3 * CLASSIFY_BLOCK + 64);
+            while bytes.len() < 3 * CLASSIFY_BLOCK {
+                let pick = (next() as usize) % cap;
+                bytes.extend_from_slice(snippets[pick]);
+            }
+            assert_eq!(classify_full(&bytes), reference_classify(&bytes), "corpus cap {cap}");
+        }
+    }
+
+    #[test]
+    fn blocked_known_valid_boundaries() {
+        // A Latin-1 sequence straddling the boundary: continuation byte in the next block is not a character.
+        let mut s = String::with_capacity(CLASSIFY_BLOCK + 8);
+        for _ in 0..CLASSIFY_BLOCK - 1 {
+            s.push('a');
+        }
+        s.push('é');
+        s.push_str("tail");
+        let (st, chars) = classify_known_valid(s.as_bytes());
+        assert_eq!(st, scan::UTF8_LATIN1);
+        assert_eq!(chars, CLASSIFY_BLOCK - 1 + 1 + 4);
+
+        // A wide character first appearing blocks later still bails (block-granular, count forfeited).
+        let mut w = String::with_capacity(2 * CLASSIFY_BLOCK + 8);
+        for _ in 0..2 * CLASSIFY_BLOCK {
+            w.push('a');
+        }
+        w.push('字');
+        assert_eq!(classify_known_valid(w.as_bytes()), (scan::UTF8_NON_LATIN1, 0));
+
+        // Multi-block pure Latin-1: exact count.
+        let l = "é".repeat(CLASSIFY_BLOCK); // 2 bytes each: two blocks
+        assert_eq!(classify_known_valid(l.as_bytes()), (scan::UTF8_LATIN1, CLASSIFY_BLOCK));
     }
 
     // ── Character-length cache (§2.2.4) ───────────────────────────
