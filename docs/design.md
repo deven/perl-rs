@@ -436,10 +436,31 @@ O(1) handle reads):
 
 Rows the grid deliberately leaves undecided (`UNKNOWN`,
 `UTF8_UNKNOWN_RANGE`, cross-flag `UTF8_NON_ASCII` and `NON_ASCII`
-against compatible partners) go to the **single streaming
+against compatible partners) go to the **blocked streaming
 dual-direction compare**: one simultaneous walk — flagged side
-decoded, unflagged side bytes-as-characters — short-circuiting at
-the first mismatch.  No pre-scan, no double scan.  When the walk
+decoded, unflagged side bytes-as-characters — under the same
+grid-block architecture as classification (§2.2.5).  Per
+flagged-side block, the exitless high-bit gate: a pure-ASCII block
+means characters are bytes there, so the whole span compares
+against the plain side's slice as one memcmp (hand-SIMD with
+internal early exits); a non-ASCII block falls to the scalar
+dual-cursor over the cached bytes, with the straddle rule.  An
+undecodable flagged sequence returns false directly — tokenized
+characters sit above the character space and can never equal a
+plain byte.
+
+The walk's schedule is two-step: one cache-line first block, then
+the uniform grid.  The workload model: walk inequalities
+overwhelmingly differ within the first bytes
+(unequal pairs that survive the grid are mostly different data
+entirely, and long-common-prefix shapes like pathnames are
+same-flag traffic that goes to memcmp, never the walk), while an
+identical 64-byte prefix — typically reached via digest equality —
+predicts full equality, requiring the whole scan regardless, where
+no schedule helps.  Intermediate block sizes therefore serve no
+populated case; container-measured: equal walks 10.9 GB/s vs
+0.6 GB/s scalar on sparse non-ASCII content, first-byte mismatch
+~9 ns.  No pre-scan, no double scan.  When the walk
 *completes* (equality), it has proven both sides ≤ U+00FF and has
 tracked ASCII-ness for one bit of extra cost, so both sides narrow
 opportunistically (flagged → `ASCII`/`UTF8_LATIN1`; unflagged →
@@ -627,10 +648,14 @@ accepted content the two counts are identical.
   always read to the end, so for them geometric early blocks are
   pure per-block overhead — measured 4× slower on 256-byte strings
   and consistently slow-mode on long ASCII in the container —
-  and they gate uniform grid blocks.  A sequence straddling a boundary (up to 12 carry bytes
-  under the extended forms) is decoded whole past it; the next
-  block runs from there to the next ladder position, which is
-  merely a few bytes closer.
+  and they gate uniform grid blocks.  The walk (§2.3.5), the one
+  early-exit consumer, prepends a single cache-line (64-byte) first
+  block, bounding a first-bytes mismatch at ~9 ns vs ~131 ns; the
+  block wins by being *small*, not by being scalar — at one cache
+  line, vector and scalar folds cost the same.  A sequence
+  straddling a boundary (up to 12 carry bytes under the extended
+  forms) is decoded whole past it; the next block runs from there
+  to the next grid boundary, which is merely a few bytes closer.
 
 Once a state is narrowed, no subsequent operation widens it unless
 the bytes are mutated.  Because narrowing records a fact about

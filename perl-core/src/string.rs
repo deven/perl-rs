@@ -3,20 +3,20 @@
 //! Two storage kinds and three per-value state dimensions fold into the enum discriminant:
 //!
 //! - **Storage**: `Inline` (≤ 22 bytes, no heap allocation) or `Heap` (a [`CowBuffer`]).
-//! - **The Perl utf8 flag** (`u`): a per-SV *semantic claim* ("interpret these bytes as characters"), not a validity
-//!   fact.  It can be set on bytes Rust rejects (perl-extended UTF-8; verified `chr(0x110000)`); no code path may
-//!   derive `from_utf8_unchecked` from it.  Rust-level validity comes from the scan cache only.
-//! - **Warned** (`w`): the numification-warning once-bit (§2.3.4).  Monotone: set, never cleared.
-//! - **Tainted** (`t`): the per-value taint bit (§2.6.1).  Cleared only through the laundering capability (§2.6.2).
+//! - **The Perl utf8 flag**: a per-SV *semantic claim* ("interpret these bytes as characters"), not a validity fact.
+//!   It can be set on bytes Rust rejects (perl-extended UTF-8; verified `chr(0x110000)`); no code path may derive
+//!   `from_utf8_unchecked` from it.  Rust-level validity comes from the scan cache only.
+//! - **Warned**: the numification-warning once-bit (§2.3.4).  Monotone: set, never cleared.
+//! - **Tainted**: the per-value taint bit (§2.6.1).  Cleared only through the laundering capability (§2.6.2).
 //!
-//! Inline strings additionally fold their **scan state** into the tag — and only the three *terminal* states
-//! (`A` = pure ASCII, `N` = valid UTF-8 non-ASCII, `X` = invalid UTF-8), because inline strings are scanned eagerly
-//! and completely at construction: a full validity scan of at most 22 bytes is nearly free.  Heap strings keep the
-//! full five-state lazy lattice in the buffer header (§2.2.4–§2.2.6).
+//! Inline strings additionally fold their **scan state** into the tag — and only the five mutually exclusive *terminal*
+//! states of the §2.2.4 lattice, because inline strings are scanned eagerly and completely at construction: a full
+//! classification of at most 22 bytes is nearly free.  Heap strings keep the full nine-state lazy lattice in the buffer
+//! header (§2.2.4–§2.2.6).
 //!
-//! Variant names are full words (no legend required): scan word first (`Ascii`, `Utf8` — Rust-valid non-ASCII —
-//! `Extended`, `Malformed`), then flag words in fixed order: `Flagged` (the *Perl* utf8 flag — a different thing
-//! from the scan's validity facts), `Warned`, `Tainted`.  E.g. `InlineUtf8FlaggedTainted`, `HeapWarned`.
+//! Variant names are full words: scan word first (`Ascii`, `Latin1`, `NonLatin1`, `Extended`, `Malformed`), then flag
+//! words in fixed order: `Flagged` (the *Perl* utf8 flag — a different thing from the scan's validity facts), `Warned`,
+//! `Tainted`.  E.g. `InlineLatin1FlaggedTainted`, `HeapWarned`.
 //!
 //! Equality and hashing are **character-sequence** semantics (§2.3.5): the utf8 flag changes the byte→character
 //! mapping, so same-bytes/different-flags can be different strings and different-bytes can be the same string.  Warned
@@ -159,6 +159,13 @@ fn count_probe_byte() {
 /// lengthen the scalar-fallback span when non-ASCII appears mid-block; the 16 KiB choice optimizes the vector pass.
 /// A tunable.
 const CLASSIFY_BLOCK: usize = 16384;
+
+/// First walk block: one cache line (§2.3.5).  Small early blocks only pay for operations that can *exit* early —
+/// full-read passes (classification, the digest) gate uniform grid blocks, measured 4× faster on short strings than a
+/// geometric ladder and free of the ladder's per-block overhead on long ones; the walk alone prepends this one small
+/// block, bounding a first-bytes mismatch at ~9 ns instead of ~131 ns.  The block is a win by being small, not by being
+/// scalar: at one cache line, vector and scalar folds cost the same.
+const WALK_FIRST_BLOCK: usize = 64;
 
 /// Fixed grid block boundaries (§2.2.5): the next multiple of CLASSIFY_BLOCK strictly after `pos` (which may sit a few
 /// bytes past a boundary after a sequence straddle; the grid itself never moves).
@@ -1028,6 +1035,7 @@ fn append_transition_heap(prior: u8, kind: AppendKind) -> u8 {
 /// and hashing this is exact, because every such token corresponds to a code point above 0xFF or a malformed byte,
 /// neither of which can equal any Latin-1 character from the unflagged side (§2.2.4).  The full extended decoder
 /// arrives with the character-operations design.
+#[cfg(test)]
 fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     struct Chars<'a> {
         rest: &'a [u8],
@@ -1124,7 +1132,6 @@ impl PartialEq for PerlString {
             grid_hit!();
             return false; // character count never exceeds byte count
         }
-
         if (sf == scan::UTF8_LATIN1 || sf == scan::UTF8_NON_ASCII) && plain.len() == flagged.len() {
             grid_hit!();
             return false; // a multi-byte sequence forces char count < byte count
@@ -1142,30 +1149,75 @@ impl PartialEq for PerlString {
             return false;
         }
 
-        // Undecided: the single streaming dual-direction compare, short-circuiting at first mismatch, narrowing
-        // opportunistically on a completed (equal) walk.
+        // Undecided: the blocked streaming dual-direction compare (§2.3.5) — the walk under the single-fetch law's
+        // block architecture.  Per ladder block of the flagged side, an exitless high-bit gate: a pure-ASCII block
+        // means characters are bytes there, so the whole span compares against the plain side's slice as one memcmp
+        // (hand-SIMD with internal early exits); a non-ASCII block falls to the scalar dual-cursor over the cached
+        // bytes, sequences completing past the soft end (the straddle rule).  The ladder bounds early-mismatch waste
+        // at one cache line.  An undecodable flagged sequence (extended or malformed) returns false directly: its
+        // tokenized characters sit above the character space and can never equal a plain byte.
         #[cfg(test)]
         eq_probe::WALK_ENTRIES.with(|c| c.set(c.get() + 1));
 
         let fb = flagged.as_bytes();
         let pb = plain.as_bytes();
         let mut saw_non_ascii = false;
-        let mut plain_iter = pb.iter();
+        let (mut i, mut j) = (0usize, 0usize);
 
-        for c in flagged_chars(fb) {
-            #[cfg(test)]
-            eq_probe::WALK_CHARS.with(|w| w.set(w.get() + 1));
+        while i < fb.len() {
+            // The walk's two-step schedule (§2.3.5): a single cache-line first block bounds early-mismatch cost; every
+            // later boundary is the uniform grid.
+            let end = if i == 0 { WALK_FIRST_BLOCK.min(fb.len()) } else { block_end(i, fb.len()) };
 
-            let Some(&b) = plain_iter.next() else { return false };
+            let hi = fb[i..end].iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
+            if !hi {
+                let n = end - i;
+                #[cfg(test)]
+                eq_probe::WALK_CHARS.with(|w| w.set(w.get() + n));
 
-            if c != b as u32 {
-                return false;
+                if j + n > pb.len() || fb[i..end] != pb[j..j + n] {
+                    return false;
+                }
+
+                i = end;
+                j += n;
+                continue;
             }
 
-            saw_non_ascii |= b >= 0x80;
+            // Non-ASCII block: scalar dual-cursor over the cached bytes.
+            while i < end {
+                let win_end = (i + 4).min(fb.len());
+                let (c, len) = match std::str::from_utf8(&fb[i..win_end]) {
+                    Ok(w) => match w.chars().next() {
+                        Some(ch) => (ch as u32, ch.len_utf8()),
+                        None => return false,
+                    },
+                    Err(e) if e.valid_up_to() > 0 => {
+                        // SAFETY: the error reports a valid prefix of this exact window.
+                        let w = unsafe { std::str::from_utf8_unchecked(&fb[i..i + e.valid_up_to()]) };
+                        match w.chars().next() {
+                            Some(ch) => (ch as u32, ch.len_utf8()),
+                            None => return false,
+                        }
+                    }
+                    // Extended or malformed: tokenized characters can never equal a plain byte.
+                    Err(_) => return false,
+                };
+
+                #[cfg(test)]
+                eq_probe::WALK_CHARS.with(|w| w.set(w.get() + 1));
+
+                if j >= pb.len() || c != pb[j] as u32 {
+                    return false;
+                }
+
+                saw_non_ascii |= pb[j] >= 0x80;
+                i += len;
+                j += 1;
+            }
         }
 
-        if plain_iter.next().is_some() {
+        if j != pb.len() {
             return false;
         }
 
@@ -2053,6 +2105,48 @@ mod tests {
 
         assert_eq!(pairs, n * n * 4);
         assert!(decided > pairs / 4, "sanity: a healthy fraction of pairs should be grid-decided ({decided}/{pairs})");
+    }
+
+    // ── Blocked walk (§2.3.5) ─────────────────────────────────────
+
+    #[test]
+    fn blocked_walk_gated_spans_and_ladder_straddle() {
+        // A Latin-1 character straddling the first ladder boundary (64): gated span, dirty block, gated tail.
+        let mut src = String::new();
+        for _ in 0..63 {
+            src.push('a');
+        }
+        src.push('é'); // bytes 63..65: straddles the 64 boundary
+        src.push_str(&"b".repeat(200));
+        let f = PerlString::from_str_impl(&src).unwrap();
+        let mut twin = vec![b'a'; 63];
+        twin.push(0xE9);
+        twin.extend_from_slice(&b"b".repeat(200));
+        let p = PerlString::from_bytes(&twin).unwrap();
+        assert_eq!(f, p);
+
+        // Long pure-ASCII cross-flag pair: decided entirely by gated memcmp spans, late mismatch caught.
+        let mut fa = PerlString::from_bytes(&b"a".repeat(9000)).unwrap();
+        fa.set_utf8_for_test();
+        let _ = fa.is_ascii(); // ASCII state on the flagged side would grid-decide vs known-non-ASCII only
+        let mut good = b"a".repeat(9000);
+        let eq_twin = PerlString::from_bytes(&good).unwrap();
+        assert_eq!(fa, eq_twin);
+        good[8999] = b'b';
+        let ne_twin = PerlString::from_bytes(&good).unwrap();
+        eq_probe::reset();
+        assert_ne!(fa, ne_twin);
+        let (_, _, consumed) = eq_probe::snapshot();
+        assert!(consumed >= 8192, "the walk must have streamed the long equal prefix, consumed {consumed}");
+
+        // Mismatch inside the FIRST ladder block of a long string: consumption bounded by one cache line.
+        let flagged_long = PerlString::from_str_impl(&"é".repeat(10_000)).unwrap();
+        let bad = vec![0xAAu8; 10_000];
+        let plain_bad = PerlString::from_bytes(&bad).unwrap();
+        eq_probe::reset();
+        assert_ne!(flagged_long, plain_bad);
+        let (_, _, chars0) = eq_probe::snapshot();
+        assert!(chars0 <= WALK_FIRST_BLOCK, "first-block mismatch must stay within the first walk block, consumed {chars0}");
     }
 
     // ── Dual-calculation hashing (§2.3.5) ─────────────────────────
