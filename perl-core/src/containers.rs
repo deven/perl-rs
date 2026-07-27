@@ -17,12 +17,11 @@
 //! 1 }`, which makes delete-current *exact*: the moved tail entry lands at the decremented cursor and is yielded next,
 //! so every remaining key is visited.
 
-use std::sync::Arc;
-
 use indexmap::IndexMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::cell::ScalarError;
+use crate::heap::HeapArc;
 use crate::payload::{ArraySlot, Value};
 use crate::string::PerlString;
 
@@ -319,21 +318,21 @@ macro_rules! container_handle {
     ($handle:ident, $container:ident, $doc:literal) => {
         #[doc = $doc]
         #[derive(Clone)]
-        pub struct $handle(Arc<RwLock<$container>>);
+        pub struct $handle(HeapArc<RwLock<$container>>);
 
         impl $handle {
             pub fn new(container: $container) -> $handle {
-                $handle(Arc::new(RwLock::new(container)))
+                $handle(HeapArc::new(RwLock::new(container)))
             }
 
             /// Reference identity: what `==` on Perl references compares.
             pub fn ptr_eq(a: &$handle, b: &$handle) -> bool {
-                Arc::ptr_eq(&a.0, &b.0)
+                HeapArc::ptr_eq(&a.0, &b.0)
             }
 
             /// The address perl exposes when the reference is numified or stringified.
             pub fn addr(&self) -> usize {
-                Arc::as_ptr(&self.0) as usize
+                HeapArc::as_ptr(&self.0) as usize
             }
 
             pub fn read(&self) -> RwLockReadGuard<'_, $container> {

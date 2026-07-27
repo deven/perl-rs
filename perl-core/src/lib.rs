@@ -30,6 +30,7 @@ pub mod cell;
 pub mod containers;
 pub mod cow_buffer;
 pub mod flags;
+pub mod heap;
 pub mod payload;
 pub mod perl_string;
 pub mod scalar;

@@ -29,13 +29,12 @@
 //! - Truthiness: NaN is true; `-0.0` is false; the strings `""` and `"0"` are false, everything else (including
 //!   `"0.0"`, `"00"`, `" "`) is true.
 
-use std::sync::Arc;
-
 use parking_lot::RwLock;
 
 use crate::cell::{ConstScalar, ScalarCell, ScalarRef};
 use crate::containers::{ArrayRef, HashRef};
 use crate::cow_buffer::AllocError;
+use crate::heap::HeapArc;
 use crate::string::PerlString;
 
 // ── Tainted (§2.6.1, §2.6.3) ──────────────────────────────────────
@@ -88,10 +87,10 @@ pub enum ScalarPayload {
 
     /// A reference to a mutable scalar (§2.2.1, flattened per mutability — measured: the nested identity enum defeats
     /// niche-folding).  The referent carries its own taint; this is the reference value's.
-    ScalarRefMut(Arc<RwLock<ScalarCell>>, Tainted),
+    ScalarRefMut(HeapArc<RwLock<ScalarCell>>, Tainted),
 
     /// A reference to a frozen scalar (§2.3.1 `Const`: immortals, `use constant`, folded literals).
-    ScalarRefConst(Arc<ConstScalar>, Tainted),
+    ScalarRefConst(HeapArc<ConstScalar>, Tainted),
 
     /// A reference to an array (§2.2.1).  The handle is a tagless newtype, so nesting preserves the niche.
     ArrayRef(ArrayRef, Tainted),
@@ -110,17 +109,17 @@ pub enum Value {
     String(PerlString),
     True,
     False,
-    ScalarRefMut(Arc<RwLock<ScalarCell>>, Tainted),
-    ScalarRefConst(Arc<ConstScalar>, Tainted),
+    ScalarRefMut(HeapArc<RwLock<ScalarCell>>, Tainted),
+    ScalarRefConst(HeapArc<ConstScalar>, Tainted),
     ArrayRef(ArrayRef, Tainted),
     HashRef(HashRef, Tainted),
 
     /// A promoted mutable scalar occupying this slot — the slot aliases it (§2.2.1).  Coercions read through the cell:
     /// aliasing transparency.
-    ScalarMut(Arc<RwLock<ScalarCell>>),
+    ScalarMut(HeapArc<RwLock<ScalarCell>>),
 
     /// A promoted frozen scalar occupying this slot (e.g. `foreach` aliasing over literal list elements).
-    ScalarConst(Arc<ConstScalar>),
+    ScalarConst(HeapArc<ConstScalar>),
 }
 
 /// A fielded variant cannot be a derived default (§2.6.1): the manual impl names the clean undef.
@@ -174,8 +173,8 @@ macro_rules! impl_coercions {
                     $ty::String(s) => parse_int_i64_visible(s.as_bytes()),
                     $ty::True => 1,
                     $ty::False => 0,
-                    $ty::ScalarRefMut(c, _) => Arc::as_ptr(c) as usize as i64, // the address (verified)
-                    $ty::ScalarRefConst(c, _) => Arc::as_ptr(c) as usize as i64,
+                    $ty::ScalarRefMut(c, _) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
+                    $ty::ScalarRefConst(c, _) => HeapArc::as_ptr(c) as usize as i64,
                     $ty::ArrayRef(r, _) => r.addr() as i64,
                     $ty::HashRef(r, _) => r.addr() as i64,
                     $($ty::$smut(c) => c.read().to_int(),)?
@@ -192,8 +191,8 @@ macro_rules! impl_coercions {
                     $ty::String(s) => parse_float(s.as_bytes()),
                     $ty::True => 1.0,
                     $ty::False => 0.0,
-                    $ty::ScalarRefMut(c, _) => Arc::as_ptr(c) as usize as f64,
-                    $ty::ScalarRefConst(c, _) => Arc::as_ptr(c) as usize as f64,
+                    $ty::ScalarRefMut(c, _) => HeapArc::as_ptr(c) as usize as f64,
+                    $ty::ScalarRefConst(c, _) => HeapArc::as_ptr(c) as usize as f64,
                     $ty::ArrayRef(r, _) => r.addr() as f64,
                     $ty::HashRef(r, _) => r.addr() as f64,
                     $($ty::$smut(c) => c.read().to_float(),)?
@@ -211,8 +210,8 @@ macro_rules! impl_coercions {
                     $ty::String(s) => classify_numeric(s.as_bytes()),
                     $ty::True => Numeric::Int(1),
                     $ty::False => Numeric::Int(0),
-                    $ty::ScalarRefMut(c, _) => Numeric::Int(Arc::as_ptr(c) as usize as i64),
-                    $ty::ScalarRefConst(c, _) => Numeric::Int(Arc::as_ptr(c) as usize as i64),
+                    $ty::ScalarRefMut(c, _) => Numeric::Int(HeapArc::as_ptr(c) as usize as i64),
+                    $ty::ScalarRefConst(c, _) => Numeric::Int(HeapArc::as_ptr(c) as usize as i64),
                     $ty::ArrayRef(r, _) => Numeric::Int(r.addr() as i64),
                     $ty::HashRef(r, _) => Numeric::Int(r.addr() as i64),
                     $($ty::$smut(c) => c.read().payload().numify(),)?
@@ -234,8 +233,8 @@ macro_rules! impl_coercions {
                     $ty::False => (std::borrow::Cow::Borrowed(""), Tainted::CLEAN),
 
                     // Container-verified form: SCALAR(0x...) with lowercase hex.
-                    $ty::ScalarRefMut(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", Arc::as_ptr(c) as usize)), *t),
-                    $ty::ScalarRefConst(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", Arc::as_ptr(c) as usize)), *t),
+                    $ty::ScalarRefMut(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
+                    $ty::ScalarRefConst(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
                     $ty::ArrayRef(r, t) => (std::borrow::Cow::Owned(format!("ARRAY(0x{:x})", r.addr())), *t),
                     $ty::HashRef(r, t) => (std::borrow::Cow::Owned(format!("HASH(0x{:x})", r.addr())), *t),
                     $($ty::$smut(c) => return c.read().to_string_repr(),)?
@@ -324,7 +323,7 @@ impl Value {
             }
         };
 
-        let cell = Arc::new(RwLock::new(ScalarCell::Plain(payload)));
+        let cell = HeapArc::new(RwLock::new(ScalarCell::Plain(payload)));
         *slot = Value::ScalarMut(cell.clone());
 
         Value::ScalarRefMut(cell, Tainted::CLEAN)
@@ -1044,7 +1043,7 @@ mod tests {
     #[test]
     fn const_slots_alias_frozen_cells() {
         let cs = crate::cell::ConstScalar::materialize(ScalarPayload::Float(3.7, Tainted::CLEAN)).unwrap();
-        let mut slot = Value::ScalarConst(std::sync::Arc::new(cs));
+        let mut slot = Value::ScalarConst(HeapArc::new(cs));
 
         assert_eq!(slot.to_int(), 3);
         assert_eq!(slot.to_string_repr().unwrap().as_bytes(), b"3.7");

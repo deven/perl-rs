@@ -11,7 +11,9 @@ use crate::payload::{Numeric, ScalarPayload, Tainted, string_would_warn};
 use crate::string::PerlString;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{LazyLock, OnceLock};
+
+use crate::heap::HeapArc;
 
 // ── Carried-over stubs (§2.3.7: "carried over") ───────────────────
 /// A chain of magic (tie, overload, ...) attached to a scalar.  Shape is a later design section.
@@ -70,7 +72,7 @@ pub struct FullScalar {
 
     // Rare identity state.
     magic: Option<Box<MagicChain>>,
-    stash: Option<Arc<Stash>>,
+    stash: Option<HeapArc<Stash>>,
 
     /// The dynamic readonly flag (`Internals::SvREADONLY`, toggleable) — `Mut`-cell readonly, distinct from the
     /// structural `Const` kind (§2.3.1).  Mutated under the write lock only.
@@ -266,7 +268,7 @@ impl ScalarCell {
     }
 
     /// Bless into a stash (upgrades to `Full`).
-    pub fn bless(&mut self, stash: Arc<Stash>) {
+    pub fn bless(&mut self, stash: HeapArc<Stash>) {
         self.upgrade_to_full().stash = Some(stash);
     }
 
@@ -376,8 +378,8 @@ impl ConstScalar {
 /// lock to hand out — the mutation failure is structural.
 #[derive(Clone)]
 pub enum ScalarRef {
-    Mut(Arc<RwLock<ScalarCell>>),
-    Const(Arc<ConstScalar>),
+    Mut(HeapArc<RwLock<ScalarCell>>),
+    Const(HeapArc<ConstScalar>),
 }
 
 impl std::fmt::Debug for ScalarRef {
@@ -392,27 +394,27 @@ impl std::fmt::Debug for ScalarRef {
 
 impl ScalarRef {
     pub fn new_mut(payload: ScalarPayload) -> ScalarRef {
-        ScalarRef::Mut(Arc::new(RwLock::new(ScalarCell::Plain(payload))))
+        ScalarRef::Mut(HeapArc::new(RwLock::new(ScalarCell::Plain(payload))))
     }
 
     pub fn new_const(cell: ConstScalar) -> ScalarRef {
-        ScalarRef::Const(Arc::new(cell))
+        ScalarRef::Const(HeapArc::new(cell))
     }
 
     /// The cell address — the value perl exposes when a reference is numified or stringified (`SCALAR(0x...)`); stable
     /// for the identity's lifetime, shared by clones.
     pub fn addr(&self) -> usize {
         match self {
-            ScalarRef::Mut(c) => Arc::as_ptr(c) as usize,
-            ScalarRef::Const(c) => Arc::as_ptr(c) as usize,
+            ScalarRef::Mut(c) => HeapArc::as_ptr(c) as usize,
+            ScalarRef::Const(c) => HeapArc::as_ptr(c) as usize,
         }
     }
 
     /// Reference identity (§2.3.1): what `==` on Perl references compares.
     pub fn ptr_eq(a: &ScalarRef, b: &ScalarRef) -> bool {
         match (a, b) {
-            (ScalarRef::Mut(x), ScalarRef::Mut(y)) => Arc::ptr_eq(x, y),
-            (ScalarRef::Const(x), ScalarRef::Const(y)) => Arc::ptr_eq(x, y),
+            (ScalarRef::Mut(x), ScalarRef::Mut(y)) => HeapArc::ptr_eq(x, y),
+            (ScalarRef::Const(x), ScalarRef::Const(y)) => HeapArc::ptr_eq(x, y),
             _ => false,
         }
     }
@@ -516,7 +518,7 @@ fn immortal(payload: ScalarPayload) -> ScalarRef {
         numify_warned: None,
     });
 
-    ScalarRef::Const(Arc::new(cell))
+    ScalarRef::Const(HeapArc::new(cell))
 }
 
 /// The true immortal: `ScalarPayload::True`, materialized as 1 / 1.0 / `"1"` (§2.3.3, as amended).
@@ -694,7 +696,7 @@ mod tests {
             let mut g = r.write().unwrap();
             assert!(!g.has_magic());
             g.set_magic(MagicChain { _private: () });
-            g.bless(Arc::new(Stash { _private: () }));
+            g.bless(HeapArc::new(Stash { _private: () }));
             assert!(g.has_magic());
         }
 
