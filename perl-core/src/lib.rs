@@ -24,13 +24,14 @@
 //! - **Flag-driven coercion.**  The `Scalar` struct uses `ScalarFlags` to track which representation slots are valid.
 //!   The coercion engine checks flags for the fast path and caches new representations lazily.
 
+mod release;
+
 pub mod cell;
 pub mod containers;
 pub mod cow_buffer;
 pub mod flags;
 pub mod payload;
 pub mod perl_string;
-pub mod release;
 pub mod scalar;
 pub mod small_string;
 pub mod string;

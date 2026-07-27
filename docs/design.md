@@ -1490,38 +1490,65 @@ finish DESTROY (the COMMIT CAS — a remove-$self-then-inspect
                   decision is one CAS on the combined word, the
                   same linearization principle as the last real
                   release):
+  Let k = the observed total of encoded strong units
+        = hold + the temporary $self + resurrecting real refs.
+
   DestroyingNormal / DestroyingCleanObjsChecked:
-    CAS (Destroying, 2, H) → (CommittedDead, 1, H) — removes the
-                  $self unit and commits death in one step.
+    CAS (Destroying, k=2, H) → (CommittedDead, 1, H) — removes
+                  the $self unit and commits death in one step.
     success:      rebless loop already done → clear class_id →
-                  kill weak backrefs → release hold → payload
-                  drops.  Weak upgrades observe CommittedDead and
-                  fail; there is no interval where only the hold
-                  remains yet upgrades are still accepted.
-    failure       (the count changed: a resurrection reference —
-                  copied weak, saved $self — exists):
-      DestroyingNormal (RUN / END): recompute → (Live, n, H);
-                  hold re-arms (perl runs DESTROY again on the
-                  next death — verified)
-      DestroyingCleanObjsChecked: fatal, perl-exact:
-                  "DESTROY created new reference to dead object
-                  '%s'" (sv.c, check_refcnt && PL_in_clean_objs)
+                  commit logical weak death: CommittedDead makes
+                  every HeapWeak upgrade fail, so Perl-visible
+                  weak values behave as plain undef — no
+                  backreference list exists to walk (§2.4.8) →
+                  release hold → payload drops (shallow; edges
+                  already extracted — §2.4.9).  There is no
+                  interval where only the hold remains yet
+                  upgrades are still accepted.
+    k > 2         (resurrection references exist):
+      DestroyingNormal (RUN / END): CAS loop →
+                  (Live, k-1, H) — the subtraction removes
+                  exactly the $self unit; the hold and the
+                  resurrecting references remain; retried
+                  against fresh k while upgrades race.  Hold
+                  re-arms (perl runs DESTROY again on the next
+                  death — verified).
+      DestroyingCleanObjsChecked: → (FatalCleanObjs, k, H): an
+                  explicit exceptional state that owns the hold,
+                  the $self unit, the resurrecting references,
+                  and the finalization obligation.  The
+                  perl-exact fatal error is the observable
+                  consequence ("DESTROY created new reference to
+                  dead object '%s'" — sv.c, check_refcnt &&
+                  PL_in_clean_objs); discharge of the owned
+                  units follows the ledgered fatal-cleanup
+                  policy (§2.4.11) — "fatal" names the Perl
+                  behavior, not a complete memory-state
+                  transition.
     DestroyingGlobalForced: no resurrection check.  The rebless
                   loop still applies (source: curse's do/while —
                   a destructor reblessing into a new class gets
                   that class's DESTROY too); the unconditional
-                  strip runs after the loop.  The commit is one
-                  CAS removing the $self unit AND the hold
-                  together, selecting the outcome by the observed
-                  count — a retained hidden unit would leak the
-                  node permanently:
-      no real refs: → CommittedDead; clear class_id → kill weak
-                  backrefs → payload drops
-      real refs remain: → (Live, n, no HOLD); class_id cleared —
-                  alive, unblessed, weak backrefs preserved (the
-                  referent lives on); no further DESTROY can
+                  strip runs after the loop, in this order —
+                  the reverse counterpart of first blessing's
+                  install-hold-then-publish-class:
+      1. Complete the rebless/DESTROY loop, still
+                  DestroyingGlobalForced (nonclaimable).
+      2. Release-store class_id = 0.
+      3. One CAS removing the $self unit AND the hold together,
+                  selecting by the observed k (retry loop against
+                  weak upgrades; class_id stays zero throughout):
+         k == 2:  → (CommittedDead, 0, no HOLD); every HeapWeak
+                  upgrade fails from here — logical weak death,
+                  no backreference list to walk
+         k > 2:   → (Live, k-2, no HOLD) — alive, unblessed;
+                  weak references remain upgradeable because the
+                  referent remains Live; no further DESTROY can
                   occur (no hold, no class)
-      (concurrent upgrades retry the CAS against the new count)
+                  A reader that observes hold-free Live therefore
+                  also observes the cleared class identity; a
+                  retained hidden unit would leak the node
+                  permanently.
 ```
 
 The rebless loop is shared by every destroying mode (perl's
@@ -1558,6 +1585,32 @@ CommittedDead                   upgrade fails; weak refs are undef
 finalizable blessed node; `Live` without `HOLD` is an ordinary
 node (never blessed, or unblessed by the forced sweep).
 
+Every reference-count operation gets the same state-sensitivity
+(the machine is not complete until clone is covered, not only
+upgrade).  `HeapArc::clone` from an existing real handle:
+
+```text
+Live (± HOLD)               allowed
+GlobalForcedPending         allowed (real handles may exist)
+Destroying*                 allowed ($self and other real handles)
+FatalCleanObjs              owned by the fatal-cleanup policy
+FinalizationPending /
+  CleanObjsPending          no real handle exists to clone from —
+                            the states are hold-only by
+                            construction (debug-asserted)
+CommittedDead               unreachable from a valid real handle
+Tombstoned-domain survivor  ownership clone allowed; semantic
+                            access is rejected by the checked
+                            handles, not by the count layer
+```
+
+Clone and every other arithmetic operation increments or
+decrements the count bits without altering state flags.
+`downgrade`, `strong_count`, and `ptr_eq` are unconditional on any
+live handle; the internal $self temporary is created by the
+drainer inside the pending→destroying claim, never by public
+clone.
+
 `DESTROY` exceptions never propagate as the result of reference
 release (perl calls the destructor with
 `G_DISCARD|G_EVAL|G_KEEPERR|G_VOID` — source-verified; container:
@@ -1592,7 +1645,10 @@ pending list through `finalizer_next` (Treiber push: load, store
 next, CAS head).  No allocation, no locks, no Perl, nothing that
 can panic — fully conformant with the no-panic policy inside
 `Drop`.  The drain side steals the whole batch with one
-`swap(null)`; push order is LIFO and the drainer reverses to FIFO
+`swap(null)`; push order is LIFO and the drainer reverses it for
+stable batch-local processing — FIFO *within the stolen batch*
+only, since concurrent producers, multiple steals, and
+owner-recursive drains make no domain-wide order claim
 (ordering here is defined-by-us).  The correct ABA claim is the
 narrow one: address reuse and re-enqueue create no *harmful* ABA
 under the queue's membership and lifetime invariants — a queued
@@ -1627,9 +1683,25 @@ not an implementation detail: the node's pending-state CAS occurs
 `finalizer_next = observed_head` Relaxed, then publishes with a
 Release CAS on the head (retrying against the newly observed head
 on failure); the drainer steals with `swap(null)` at Acquire (or
-stronger where the surrounding phase transition requires it) — so
-the steal observes the state transition and all preceding identity
-writes.
+stronger where the surrounding phase transition requires it) — The Acquire steal observes the producer's pending-state
+transition and the producer-local link initialization — and
+nothing more: independently published identity metadata is read
+through its own contract.  The synchronization proof is
+compositional per field: `rc_state` through the combined-word CAS
+ordering; `finalizer_next` and the list head through Release
+publication and Acquire steal; `class_id` through Release store
+on bless/rebless/unbless and Acquire load by dispatch and the
+sweep; `identity_flags` through field-specific ordering plus the
+authoritative under-lock recheck.  The custom `HeapArc` inherits
+the remainder wholesale: the ordinary strong/weak ordering proof
+is retained from the upstream implementation, every modified
+operation is enumerated in the state-machine document with its
+additional `rc_state` transitions preserving or strengthening the
+upstream synchronization, and payload destruction performs the
+same release/acquire synchronization as the upstream last-strong
+path.  Because this is unsafe ownership infrastructure, the Loom
+model checks the written contract; it is not a substitute for
+one.
 
 **Cross-type dispatch.**  One domain queue holds slots from
 different typed slabs (scalar, array, hash, and later code, glob,
@@ -1645,8 +1717,23 @@ PageHeader
     ops: &'static NodeOps
         visit_strong_slots     (every strong Value field — §2.4.6)
         begin_destroy          (takes the DestroyMode)
+        extract_edges          (moves every strong child out,
+                                into the release worklist)
+        drop_payload_shallow   (destroys a T that provably owns
+                                no strong Perl edge)
         demolish_edges         (drains into the ReleaseContext)
 ```
+
+Edge extraction and payload destruction are separate operations
+because the worklist alone does not prevent recursion — the
+normative invariant (§2.4.9): **no graph-bearing payload reaches
+Rust payload destruction while it still owns a strong Perl graph
+edge.**  Every death path preserves it: ordinary last drop,
+non-resurrecting `DESTROY`, level-1 demolition, forced-sweep
+death, and post-tombstone cleanup all extract edges first, then
+drop a payload whose remaining destructor is shallow.  (The
+std-façade `Drop` implementations already implement exactly this
+split; the slab backend keeps it as typed operations.)
 
 Pages are domain-dedicated (one logical domain per page until
 every slot frees), and the lease targets the `DomainCore` — which
@@ -1656,7 +1743,16 @@ and stash table.  The ownership direction is one-way: the
 process-global pool owns pages, each page owns its `DomainLease`,
 and `DomainCore` holds only non-owning page references — a
 domain that strongly owned pages holding strong leases back on
-it could never physically die.  Per-class queue heads drained to a fixed point are
+it could never physically die.  Pointer recovery from
+`*mut SlotMeta` to the containing typed slot is by construction,
+not arithmetic: `SlotMeta` is the first field of `#[repr(C)]
+Slot<T>`, making the addresses identical (the alternative —
+computing slot boundaries from the page and index — is recorded;
+unchecked container-of arithmetic without a provenance argument
+is prohibited).  When a page's last slot goes physically free:
+remove the page from the domain's non-owning index, release the
+`DomainLease`, reset routing and type state — only then may the
+pool assign the page to another domain.  Per-class queue heads drained to a fixed point are
 the recorded alternative if the ops table proves awkward.
 
 The two timing rules are distinct and both binding — boundary
@@ -1683,7 +1779,14 @@ would be an observable divergence.  Eligible-context rules for a
 of this design; thread selection and the wake mechanism are §13
 scheduling.  The embedding API exposes explicit
 `poll_finalizers` / `drain_finalizers` so a host with no live
-interpreter threads cannot strand pending objects unknowingly.
+interpreter threads cannot strand pending objects unknowingly —
+with the contract explicit: `Drop` guarantees *publication*, not
+callback completion; both polling calls may run arbitrary Perl
+code and may recurse; a host with no active interpreter either
+polls or accepts retention; domain tombstoning suppresses all
+later Perl callbacks; callback thread selection is unspecified
+until §13; and no ordering is guaranteed between external and
+interpreter-originated finalizations.
 After the domain is tombstoned the drop path short-circuits: a
 last release never queues Perl finalization again and performs
 only mechanical count/payload cleanup — at level 0 surviving
@@ -1715,17 +1818,67 @@ Domain phases:
         └── level 1+ → Demolishing  →  Tombstoned
 ```
 
+The last-real-drop algorithm maps every phase to a release mode
+— nothing is implicit:
+
+```text
+Phase                          blessed last real drop
+Running                        FinalizationPending (normal mode)
+EndPhase                       normal mode; resurrection allowed
+EnteringGlobalDestruction      normal mode — perl's equivalent
+                               window (PL_phase = DESTRUCT before
+                               sv_clean_objs) has PL_in_clean_objs
+                               false, so ordinary resurrection
+                               rules apply (probe-verifiable)
+CleaningObjects, checked pass  CleanObjsPending
+CleaningObjects, during forced
+  callbacks                    CleanObjsPending (an unreached
+                               node is still Live — §2.4.6 step 4)
+Demolishing                    no Perl finalization; mechanical
+Tombstoned                     no Perl finalization; mechanical
+```
+
+Context-free host drops follow the same table through the
+producer protocol's phase validation; unblessed nodes take the
+mechanical path in every phase.
+
 `Tombstoned`: the domain rejects interpreter operations,
 object-cleaning has completed, no remaining object ever requires
 Perl finalization, and checked handles reject semantic access —
 while physical payloads may (level 1+) or may not (level 0) have
 been demolished.  One phase name is deliberately not overloaded
 to mean both "logically unusable" and "all payloads demolished".
+At level 0 the distinction between *ownership liveness* and
+*semantic domain liveness* is load-bearing and explicit in the
+checked-handle API: a weak upgrade to a surviving unblessed node
+may succeed at the ownership layer while every semantic operation
+on the resulting handle is rejected because the domain is
+tombstoned; a later last real release runs no Perl and cleans up
+mechanically.
 
 The passes mirror `sv_clean_objs` (source-verified structure):
 
 1. Quiesce ordinary Perl execution; acquire slab enumeration
-   guards (pages stable while enumerators walk).
+   guards (pages stable while enumerators walk).  Page guards
+   keep page *memory* alive — they do not keep an individual
+   payload alive against a concurrent context-free last drop of
+   an *unblessed* node (blessed nodes are protected by their
+   holds; unblessed ones have none).  Payload access therefore
+   goes through the **internal enumeration pin**: a small
+   internal-pin field in `rc_state`, claimed by CAS against a
+   live state before the payload is touched and released after
+   the visit.  The pin blocks physical payload drop (a last real
+   release under pin defers the mechanical drop to pin release),
+   is invisible to resurrection arithmetic and to
+   `strong_count`, and never counts as a Perl reference.  This
+   protocol covers every enumerator: the checked pass, the
+   forced-sweep scan, level-1 demolition, diagnostic
+   enumeration, and the future on-demand cycle detector.
+   (Recorded alternatives: an exclusive domain operation gate —
+   rejected for taxing every ordinary clone/drop — and an
+   epoch/hazard scheme — deferred as the more complex escalation
+   if pin contention ever measures.)  Without a payload claim,
+   slab enumeration is not memory-safe.
 2. **Checked reference-severing pass.**  Visit every strong
    `Value` slot through the typed `visit_strong_slots` operation —
    array elements, hash values, scalar reference payloads, and
@@ -1740,7 +1893,24 @@ The passes mirror `sv_clean_objs` (source-verified structure):
    replace qualifying strong slots with undef, collect the
    removed values, unlock — then release the values and drain
    the finalizers they generate.  No finalizer ever runs under
-   the visited node's lock.  Incomplete slot visitation is a
+   the visited node's lock.  Because the edge is extracted before
+   any callback runs, the aliasing cases are defined for free: a
+   container referring to itself, multiple slots referring to one
+   blessed node, and a `DESTROY` reaching back into the container
+   its reference was removed from all observe the
+   already-severed state.  Recursive `DESTROY` mutates the heap
+   mid-pass; the traversal follows perl's finite arena-pass
+   structure rather than promising rescans of modified nodes —
+   actual coverage equivalence is the ledgered fixed-point probe
+   item.  The normative criterion: **every field whose ownership
+   contributes to a Perl referent's real strong count is visited
+   or explicitly exempted** — scalar reference payloads, array
+   elements, hash values, and later magic chains, closure
+   environments, glob and IO fields, code objects, runtime caches
+   that own values, and interpreter roots; `class_id` is exempt
+   as a table identifier, not a `HeapArc` edge.  A per-type audit
+   table accompanies the implementation.  Incomplete slot
+   visitation is a
    fidelity bug, not an optimization gap: a reference perl would sever in this pass
    must not survive into the forced pass, where resurrection
    semantics differ.  The containers' existing crate-private
@@ -1749,16 +1919,26 @@ The passes mirror `sv_clean_objs` (source-verified structure):
    drops — are drained as generated.
 3. The named-root/glob analogs of perl's two glob passes, when
    globs exist.
-4. **Forced sweep.**  Every node *still blessed and in `Live`*
-   is claimed through its existing hold — `Live →
-   GlobalForcedPending`, no count contamination; per ticket
-   exclusivity (§2.4.5), the scan skips pending, destroying, and
-   committed states (an ordinary pin would be indistinguishable
-   from a resurrecting reference at the post-`DESTROY` check) —
-   and processed as `DestroyingGlobalForced`: `DESTROY` runs, the
-   blessing is stripped regardless of retained references
-   (§2.4.4).  A race with a concurrent ordinary release resolves
-   by whichever CAS wins — one ticket either way.
+4. **Forced sweep — incremental, never preclaiming.**  The scan
+   proceeds one node at a time in arena order: find the next
+   still-blessed `Live` node; claim *that node alone* through its
+   existing hold — `Live → GlobalForcedPending`, no count
+   contamination (an ordinary pin would be indistinguishable
+   from a resurrecting reference at the post-`DESTROY` check);
+   per ticket exclusivity (§2.4.5) the scan skips pending,
+   destroying, and committed states.  Process the claimed node as
+   `DestroyingGlobalForced` (`DESTROY` runs, the blessing is
+   stripped regardless of retained references, §2.4.4), drain
+   all nested finalization the callback generated, and only then
+   continue scanning.  Batch-preclaiming even two nodes is a
+   fidelity bug: if A and B were both preclaimed and A::DESTROY
+   released B's last real reference, B would die in forced mode —
+   where perl's corresponding decrement lands in *checked*
+   destruction, with fatal resurrection semantics.  A node not
+   yet reached remains `Live`, so a real-zero during another
+   destructor correctly becomes `CleanObjsPending`.  A race with
+   a concurrent ordinary release resolves by whichever CAS wins —
+   one ticket either way.
 5. Objects created or made finalizable during destructors are
    processed under the pending-finalization rules
    (container-verified: an object blessed inside a shutdown
@@ -1772,17 +1952,26 @@ The passes mirror `sv_clean_objs` (source-verified structure):
    finalization producers even while Perl mutators are quiesced,
    so phase transitions use a producer-publication protocol whose
    critical section brackets the *entire* obligation-creating
-   transition, not just the push: increment the active-producer
-   count; read and validate the domain phase (on change: decrement
-   and retry); perform the `rc_state` CAS that creates the pending
-   state or selects the post-destruction mechanical path; publish
-   the intrusive entry if a ticket was created; decrement.
-   Bracketing only the push would let shutdown observe zero
-   producers between a node's pending CAS and its publication,
-   stranding an unpublished ticket.  Shutdown publishes the phase,
-   waits out producers that could have observed the old phase,
-   drains, rescans, and confirms both the count and the list
-   empty.  Loom-modeled.
+   transition — bracketing only the push would let shutdown
+   observe zero producers between a node's pending CAS and its
+   publication, stranding an unpublished ticket.  Normative
+   sequences:
+
+   Producer: (1) increment `active_producers`
+   (Acquire/Release); (2) load the phase; (3) validate that the
+   phase permits the intended transition — on mismatch decrement
+   and retry; (4) CAS `rc_state` into the corresponding pending
+   or mechanical state; (5) publish the intrusive entry if a
+   ticket was created; (6) decrement `active_producers`
+   (Release).
+
+   Shutdown: (1) Release-publish the new phase; (2) Acquire-wait
+   for old-phase producers to drain to zero; (3) drain tickets;
+   (4) rescan the relevant nodes; (5) recheck the producer count
+   and queue emptiness; (6) proceed only when the completion
+   predicate is stable.  The Loom model includes producers that
+   begin immediately before and immediately after each phase
+   publication.
 7. Level 0 ends here: the domain is marked logically unusable;
    unblessed cyclic structures remain physically live in the
    process-global pool, exactly as perl leaves them.  **Level 1**
@@ -1887,16 +2076,31 @@ backend swap is then module-local, the niche assertions are
 exercised now, and the code inventories the API the custom
 implementation must provide.  The slab backend is a self-contained
 component whose `clone`/`drop`/`upgrade` algorithms are **gated on
-a Loom model** of the `rc_state` transitions, the intrusive
-push/steal (batch steal racing a push; steal-drain-resurrect-
-re-enqueue of one address; global claim racing ordinary
-finalization; domain phase transition racing a producer;
-immediate slot reuse after final weak release; detach of a stolen
-node racing a fresh publish behind it; and the exclusivity
-assertion — no modeled interleaving may produce a failed
-pending→destroying claim), the sweep-claim
-races, and the drain-owner token; plus
-differential tests against `std::sync::Arc` on randomized operation
+a Loom model** covering, at minimum: last real drop racing weak
+upgrade; the completion commit racing weak upgrade; normal
+resurrection with repeated count changes; forced unblessing
+racing weak upgrade; `class_id` clearing before hold-free `Live`;
+a pending CAS racing a domain phase transition; an unpublished
+obligation protected by an active producer (producers starting
+immediately before and after each phase publication); Treiber
+push racing batch steal; steal, detach, resurrection, and
+same-address re-enqueue; the exclusivity assertion that no
+interleaving produces a failed pending→destroying claim; the
+incremental forced sweep racing another object's last drop; slot
+enumeration racing an unblessed payload's context-free drop (the
+most important addition); final weak release racing page
+enumeration; slot reuse after final weak release; page
+reassignment after the final domain lease; fatal checked
+resurrection retaining its ownership obligations; owner-recursive
+nested finalization; drain-owner acquisition by competing
+threads; wake notification racing park; `slot_state` publication
+and reuse; and reduced-width refcount overflow; plus
+differential tests against `std::sync::Arc` — scoped to the
+ordinary unblessed core (clone, downgrade, upgrade, releases,
+`ptr_eq`, payload dropped exactly once, control block released
+exactly once); finalizer holds, Perl weak-copy semantics,
+tombstoning, and global destruction get state-machine oracle
+tests instead — on randomized operation
 histories, aggressive slot-reuse stress (one-slot pages), and
 destructor accounting (constructed once, dropped once, released
 once, never touched after).  Sanitizer passes need nightly and run
@@ -1906,6 +2110,17 @@ upstream; `Clone` cannot return `Err`); finalizer publication from
 `HeapArc::drop` is allocation-free, while mechanical release uses
 a reusable worklist that may grow — allocation-free release needs
 a separately specified preallocation strategy if ever required.
+
+`slot_state` has its own machine: `Free → Constructing`
+(initialize `SlotMeta`, the `ArcInner` counters, and `T`) `→
+Occupied` (Release-published — an enumerator's Acquire load of
+`Occupied` observes complete initialization) `→ PayloadDropped`
+(only after `T` is mechanically dropped) `→ Free` (only after
+final weak ownership disappears).  Enumeration inspects only
+`Occupied` slots and still takes the payload pin (§2.4.6).
+Before returning to `Free`, the slot clears `finalizer_next`,
+`class_id`, identity flags, stale routing metadata, and bumps the
+debug serial — reuse begins from a provably clean slate.
 
 The first slab migration is `PerlArray` (the simplest graph-bearing
 node), validating layout, pinning, reuse, finalization queueing,
@@ -1942,7 +2157,26 @@ exceptions, by phase); the dynamic environment
 for the sweep (§13); drain-thread selection and wake mechanism
 (§13); cross-thread last-drop of an object whose class lives in
 another interpreter (§13; perl's ithreads cannot reach this
-state); ticket posture under exceptional shutdown; the release-context
+state); ticket posture under exceptional shutdown, and the full
+fatal-cleanup specification (whether cleanup continues for other
+objects, whether remaining tickets drain or abandon, domain
+poisoning, host-API surfacing, and the disposition of the
+drain-owner token and producer barrier — the discharge rules for
+`FatalCleanObjs`'s owned units); the exact rebless-loop algorithm
+(class capture before callback, revisiting previously processed
+classes, unblessing mid-loop, repeated reblessing, method-lookup
+failure, stash tombstoning during `DESTROY` — source- and
+probe-driven); the nested-`DESTROY` dynamic context under
+owner-recursive draining ($@ per depth, `caller`, inherited
+locals, a nested fatal checked error, unwinding the owner depth
+across a Perl exception); the `rc_state` bit allocation document
+(count width, hold encoding, immortal representation, overflow
+threshold and abort, why arithmetic never touches flag bits —
+tested near boundaries with a reduced-width model); the
+weak-count conventions (implicit weak unit, downgrade,
+last-strong release, freelist return, immortals, hold-only
+nodes); debug-serial semantics (never an ownership proof, never
+a stable Perl identity); the release-context
 posture during Rust TLS teardown (leaked per-thread context,
 domain fallback worklist, or a handle-holding restriction); the
 per-page
