@@ -34,6 +34,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::cell::{ConstScalar, ScalarCell, ScalarRef};
+use crate::containers::{ArrayRef, HashRef};
 use crate::cow_buffer::AllocError;
 use crate::string::PerlString;
 
@@ -91,6 +92,12 @@ pub enum ScalarPayload {
 
     /// A reference to a frozen scalar (§2.3.1 `Const`: immortals, `use constant`, folded literals).
     ScalarRefConst(Arc<ConstScalar>, Tainted),
+
+    /// A reference to an array (§2.2.1).  The handle is a tagless newtype, so nesting preserves the niche.
+    ArrayRef(ArrayRef, Tainted),
+
+    /// A reference to a hash (§2.2.1).
+    HashRef(HashRef, Tainted),
 }
 
 /// The universal slot value (§2.2.1): the compact scalar payloads, plus (in later §21.1 steps) the reference variants,
@@ -105,6 +112,8 @@ pub enum Value {
     False,
     ScalarRefMut(Arc<RwLock<ScalarCell>>, Tainted),
     ScalarRefConst(Arc<ConstScalar>, Tainted),
+    ArrayRef(ArrayRef, Tainted),
+    HashRef(HashRef, Tainted),
 
     /// A promoted mutable scalar occupying this slot — the slot aliases it (§2.2.1).  Coercions read through the cell:
     /// aliasing transparency.
@@ -150,7 +159,7 @@ macro_rules! impl_coercions {
                     $ty::String(s) => !matches!(s.as_bytes(), b"" | b"0"),
                     $ty::True => true,
                     $ty::False => false,
-                    $ty::ScalarRefMut(..) | $ty::ScalarRefConst(..) => true, // refs are always true (verified)
+                    $ty::ScalarRefMut(..) | $ty::ScalarRefConst(..) | $ty::ArrayRef(..) | $ty::HashRef(..) => true, // refs are always true (verified)
                     $($ty::$smut(c) => c.read().to_bool(),)?
                     $($ty::$sconst(c) => c.to_bool(),)?
                 }
@@ -167,6 +176,8 @@ macro_rules! impl_coercions {
                     $ty::False => 0,
                     $ty::ScalarRefMut(c, _) => Arc::as_ptr(c) as usize as i64, // the address (verified)
                     $ty::ScalarRefConst(c, _) => Arc::as_ptr(c) as usize as i64,
+                    $ty::ArrayRef(r, _) => r.addr() as i64,
+                    $ty::HashRef(r, _) => r.addr() as i64,
                     $($ty::$smut(c) => c.read().to_int(),)?
                     $($ty::$sconst(c) => c.to_int(),)?
                 }
@@ -183,6 +194,8 @@ macro_rules! impl_coercions {
                     $ty::False => 0.0,
                     $ty::ScalarRefMut(c, _) => Arc::as_ptr(c) as usize as f64,
                     $ty::ScalarRefConst(c, _) => Arc::as_ptr(c) as usize as f64,
+                    $ty::ArrayRef(r, _) => r.addr() as f64,
+                    $ty::HashRef(r, _) => r.addr() as f64,
                     $($ty::$smut(c) => c.read().to_float(),)?
                     $($ty::$sconst(c) => c.to_float(),)?
                 }
@@ -200,6 +213,8 @@ macro_rules! impl_coercions {
                     $ty::False => Numeric::Int(0),
                     $ty::ScalarRefMut(c, _) => Numeric::Int(Arc::as_ptr(c) as usize as i64),
                     $ty::ScalarRefConst(c, _) => Numeric::Int(Arc::as_ptr(c) as usize as i64),
+                    $ty::ArrayRef(r, _) => Numeric::Int(r.addr() as i64),
+                    $ty::HashRef(r, _) => Numeric::Int(r.addr() as i64),
                     $($ty::$smut(c) => c.read().payload().numify(),)?
                     $($ty::$sconst(c) => c.payload().numify(),)?
                 }
@@ -217,16 +232,21 @@ macro_rules! impl_coercions {
                     $ty::String(s) => return Ok(s.clone()),
                     $ty::True => (std::borrow::Cow::Borrowed("1"), Tainted::CLEAN),
                     $ty::False => (std::borrow::Cow::Borrowed(""), Tainted::CLEAN),
+
                     // Container-verified form: SCALAR(0x...) with lowercase hex.
                     $ty::ScalarRefMut(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", Arc::as_ptr(c) as usize)), *t),
                     $ty::ScalarRefConst(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", Arc::as_ptr(c) as usize)), *t),
+                    $ty::ArrayRef(r, t) => (std::borrow::Cow::Owned(format!("ARRAY(0x{:x})", r.addr())), *t),
+                    $ty::HashRef(r, t) => (std::borrow::Cow::Owned(format!("HASH(0x{:x})", r.addr())), *t),
                     $($ty::$smut(c) => return c.read().to_string_repr(),)?
                     $($ty::$sconst(c) => return Ok(c.to_string_repr().clone()),)?
                 };
+
                 let mut out: PerlString = text.parse()?;
                 if taint.is_tainted() {
                     out.taint();
                 }
+
                 Ok(out)
             }
 
@@ -238,7 +258,9 @@ macro_rules! impl_coercions {
                     | $ty::Int(_, t)
                     | $ty::Float(_, t)
                     | $ty::ScalarRefMut(_, t)
-                    | $ty::ScalarRefConst(_, t) => t.is_tainted(),
+                    | $ty::ScalarRefConst(_, t)
+                    | $ty::ArrayRef(_, t)
+                    | $ty::HashRef(_, t) => t.is_tainted(),
                     $ty::String(s) => s.is_tainted(),
                     $ty::True | $ty::False => false,
                     $($ty::$smut(c) => c.read().is_tainted(),)?
@@ -289,6 +311,8 @@ impl Value {
             Value::False => ScalarPayload::False,
             Value::ScalarRefMut(c, t) => ScalarPayload::ScalarRefMut(c, t),
             Value::ScalarRefConst(c, t) => ScalarPayload::ScalarRefConst(c, t),
+            Value::ArrayRef(r, t) => ScalarPayload::ArrayRef(r, t),
+            Value::HashRef(r, t) => ScalarPayload::HashRef(r, t),
             Value::ScalarMut(c) => {
                 // Unreachable (handled above); restore and share rather than panic.
                 *slot = Value::ScalarMut(c.clone());
@@ -302,11 +326,47 @@ impl Value {
 
         let cell = Arc::new(RwLock::new(ScalarCell::Plain(payload)));
         *slot = Value::ScalarMut(cell.clone());
+
         Value::ScalarRefMut(cell, Tainted::CLEAN)
     }
 
     /// `$$r` — scalar dereference: the identity behind a reference value (through the aliasing variant if the slot is
-    /// promoted).  `None` for non-references; the "Not a SCALAR reference" error is ops-layer.
+    /// promoted).  `None` for non-references; the "Not a SCALAR reference" error is ops-layer.  `@$r` — array
+    /// dereference: the shared identity behind an array-reference value (through the aliasing variant if the slot is
+    /// promoted).  "Not an ARRAY reference" is ops-layer.
+    pub fn deref_array(&self) -> Option<ArrayRef> {
+        fn from_payload(p: &ScalarPayload) -> Option<ArrayRef> {
+            match p {
+                ScalarPayload::ArrayRef(r, _) => Some(r.clone()),
+                _ => None,
+            }
+        }
+
+        match self {
+            Value::ArrayRef(r, _) => Some(r.clone()),
+            Value::ScalarMut(cell) => from_payload(cell.read().payload()),
+            Value::ScalarConst(cs) => from_payload(cs.payload()),
+            _ => None,
+        }
+    }
+
+    /// `%$r` — hash dereference.
+    pub fn deref_hash(&self) -> Option<HashRef> {
+        fn from_payload(p: &ScalarPayload) -> Option<HashRef> {
+            match p {
+                ScalarPayload::HashRef(r, _) => Some(r.clone()),
+                _ => None,
+            }
+        }
+
+        match self {
+            Value::HashRef(r, _) => Some(r.clone()),
+            Value::ScalarMut(cell) => from_payload(cell.read().payload()),
+            Value::ScalarConst(cs) => from_payload(cs.payload()),
+            _ => None,
+        }
+    }
+
     pub fn deref_scalar(&self) -> Option<ScalarRef> {
         fn from_payload(p: &ScalarPayload) -> Option<ScalarRef> {
             match p {
@@ -528,6 +588,7 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
 
     // The scanned span is ASCII digits/'.'/'e'/sign by construction.
     let magnitude = std::str::from_utf8(&rest[..end]).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
     if negative { -magnitude } else { magnitude }
 }
 
@@ -545,10 +606,12 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
     while start < bytes.len() && bytes[start].is_ascii_whitespace() {
         start += 1;
     }
+
     let mut end = bytes.len();
     while end > start && bytes[end - 1].is_ascii_whitespace() {
         end -= 1;
     }
+
     let token = &bytes[start..end];
     if token.is_empty() {
         return true; // empty and whitespace-only strings warn
@@ -572,6 +635,7 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
         i += 1;
         mantissa_digits += 1;
     }
+
     if i < body.len() && body[i] == b'.' {
         i += 1;
         while i < body.len() && body[i].is_ascii_digit() {
@@ -579,9 +643,11 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
             mantissa_digits += 1;
         }
     }
+
     if mantissa_digits == 0 {
         return true;
     }
+
     if i < body.len() && (body[i] == b'e' || body[i] == b'E') {
         let mut j = i + 1;
         if j < body.len() && (body[j] == b'+' || body[j] == b'-') {
@@ -654,6 +720,8 @@ mod tests {
                 ScalarPayload::False => Value::False,
                 ScalarPayload::ScalarRefMut(c, t) => Value::ScalarRefMut(c, t),
                 ScalarPayload::ScalarRefConst(c, t) => Value::ScalarRefConst(c, t),
+                ScalarPayload::ArrayRef(r, t) => Value::ArrayRef(r, t),
+                ScalarPayload::HashRef(r, t) => Value::HashRef(r, t),
             }
         }
     }
@@ -713,6 +781,7 @@ mod tests {
         assert_eq!(s("9223372036854775807").numify(), Numeric::Int(i64::MAX), "IV_MAX string is exact (verified)");
         assert_eq!(s("3.5").numify(), Numeric::Float(3.5));
         assert_eq!(s("1e2").numify(), Numeric::Float(100.0));
+
         // UV-exact-but-beyond-i64: Float under the deferred-UV rule; to_int supplies the pinned wrap.
         assert_eq!(s("9223372036854775808").numify(), Numeric::Float(9.223372036854776e18));
         assert_eq!(Value::True.numify(), Numeric::Int(1));

@@ -164,8 +164,10 @@ impl Value {
                     Value::SmallStr(ss) => Scalar::from_perl_string(ss.to_perl_string()),
                     Value::Str(ps) => Scalar::from_perl_string(ps),
                     Value::Ref(target_sv) => Scalar::from_ref(Value::Scalar(target_sv)),
+
                     // Already handled above
                     Value::Scalar(_) => unreachable!(),
+
                     // Containers/code/regex shouldn't upgrade to Scalar
                     other => {
                         // Put it back and panic — this is a logic error
@@ -175,6 +177,7 @@ impl Value {
                 };
                 let sv = Arc::new(RwLock::new(scalar));
                 *self = Value::Scalar(sv.clone());
+
                 sv
             }
         }
@@ -283,6 +286,7 @@ impl Value {
                 None => Value::Float(*a as f64 + *b as f64),
             };
         }
+
         Value::Float(self.coerce_to_num() + other.coerce_to_num())
     }
 
@@ -294,6 +298,7 @@ impl Value {
                 None => Value::Float(*a as f64 - *b as f64),
             };
         }
+
         Value::Float(self.coerce_to_num() - other.coerce_to_num())
     }
 
@@ -305,6 +310,7 @@ impl Value {
                 None => Value::Float(*a as f64 * *b as f64),
             };
         }
+
         Value::Float(self.coerce_to_num() * other.coerce_to_num())
     }
 
@@ -319,6 +325,7 @@ impl Value {
         {
             return Value::Int(*a / *b);
         }
+
         Value::Float(self.coerce_to_num() / other.coerce_to_num())
     }
 
@@ -332,6 +339,7 @@ impl Value {
             // Perl dies on modulo by zero; for now return 0.  The runtime will handle the error.
             return Value::Int(0);
         }
+
         // Perl's % takes the sign of the RIGHT operand: -7 % 3 is 2 and 7 % -3 is -2 (verified 5.38.2), where
         // Rust's remainder follows the left.  The i64::MIN % -1 case is also perl's 0, where Rust's `%` is a
         // checked-arithmetic overflow — the guard must come before the remainder.
@@ -339,6 +347,7 @@ impl Value {
             return Value::Int(0);
         }
         let r = a % b;
+
         if r != 0 && (r < 0) != (b < 0) { Value::Int(r + b) } else { Value::Int(r) }
     }
 
@@ -368,14 +377,17 @@ impl Value {
             let mut buf = Vec::with_capacity(a.len() + b.len());
             buf.extend_from_slice(a);
             buf.extend_from_slice(b);
+
             // UTF-8 if both inputs are UTF-8 strings
             let both_utf8 = self.as_str().is_some() && other.as_str().is_some();
             if both_utf8 {
                 // SAFETY: both sides are valid UTF-8
                 return Value::from(unsafe { String::from_utf8_unchecked(buf) });
             }
+
             return Value::Str(PerlString::from_bytes(buf));
         }
+
         // General case: stringify both sides
         let a = self.stringify();
         let b = other.stringify();
@@ -392,6 +404,7 @@ impl Value {
         if n <= 0 {
             return Value::from("");
         }
+
         let n = n as usize;
         let s = self.stringify();
         let bytes = s.as_bytes();
@@ -399,6 +412,7 @@ impl Value {
         for _ in 0..n {
             buf.extend_from_slice(bytes);
         }
+
         if s.is_utf8() {
             // SAFETY: repeating valid UTF-8 produces valid UTF-8
             Value::from(unsafe { String::from_utf8_unchecked(buf) })
@@ -412,10 +426,12 @@ impl Value {
     pub fn num_cmp(&self, other: &Value) -> Value {
         let a = self.coerce_to_num();
         let b = other.coerce_to_num();
+
         // Perl's <=> with a NaN operand is undef, not 0 (verified 5.38.2).
         if a.is_nan() || b.is_nan() {
             return Value::Undef;
         }
+
         Value::Int(if a < b {
             -1
         } else if a > b {
@@ -460,6 +476,7 @@ impl Value {
         let a = self.stringify();
         let b = other.stringify();
         let ord = a.as_bytes().cmp(b.as_bytes());
+
         Value::Int(match ord {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
@@ -473,6 +490,7 @@ impl Value {
         if let (Some(a), Some(b)) = (self.as_bytes(), other.as_bytes()) {
             return a == b;
         }
+
         self.stringify().as_bytes() == other.stringify().as_bytes()
     }
 
@@ -538,8 +556,8 @@ impl Value {
                 PerlString::from_str(&len.to_string())
             }
             Value::Hash(hv) => {
-                // Since perl 5.26, a hash in scalar context is simply the key count — the pre-5.26 "N/M" bucket
-                // form is gone (verified 5.38.2: a two-key hash gives "2").
+                // Since perl 5.26, a hash in scalar context is simply the key count — the pre-5.26 "N/M" bucket form is
+                // gone (verified 5.38.2: a two-key hash gives "2").
                 let len = hv.read().map(|h| h.len()).unwrap_or(0);
                 PerlString::from_str(&len.to_string())
             }
@@ -748,6 +766,7 @@ mod tests {
         let mut v = Value::from(42i64);
         let sv1 = v.upgrade_to_scalar();
         let sv2 = v.upgrade_to_scalar();
+
         // Both should be the same Arc (same allocation)
         assert!(Arc::ptr_eq(&sv1, &sv2));
     }
@@ -1012,6 +1031,7 @@ mod tests {
     #[test]
     fn add_integer_overflow() {
         let r = Value::Int(i64::MAX).add(&Value::Int(1));
+
         // Should overflow to float, not wrap
         assert!(matches!(r, Value::Float(_)));
     }
@@ -1074,6 +1094,7 @@ mod tests {
     #[test]
     fn div_by_zero() {
         let r = Value::Int(1).div(&Value::Int(0));
+
         // Returns Inf, not panic
         assert!(r.as_num().unwrap().is_infinite());
     }
@@ -1168,8 +1189,10 @@ mod tests {
     fn str_eq_basic() {
         assert!(Value::from("hello").str_eq(&Value::from("hello")));
         assert!(!Value::from("hello").str_eq(&Value::from("world")));
+
         // "42" eq "42" even though 42 == 42.0
         assert!(Value::from("42").str_eq(&Value::from("42")));
+
         // Int stringifies: 42 eq "42"
         assert!(Value::Int(42).str_eq(&Value::from("42")));
     }
@@ -1193,6 +1216,7 @@ mod tests {
     fn mixed_num_str_comparison() {
         // Numeric: "10" > "9" (10 > 9)
         assert!(Value::from("10").num_gt(&Value::from("9")));
+
         // String: "10" lt "9" (lexicographic: "1" < "9")
         assert!(Value::from("10").str_lt(&Value::from("9")));
     }
@@ -1201,8 +1225,8 @@ mod tests {
 
     #[test]
     fn modulo_takes_sign_of_right_operand() {
-        // perl: -7 % 3 == 2 and 7 % -3 == -2 (result lies in [0, rhs) for positive rhs, (rhs, 0] for negative).
-        // Rust's `%` truncates toward zero and gives -1 and 1 respectively.
+        // perl: -7 % 3 == 2 and 7 % -3 == -2 (result lies in [0, rhs) for positive rhs, (rhs, 0] for negative).  Rust's
+        // `%` truncates toward zero and gives -1 and 1 respectively.
         assert!(matches!(Value::Int(-7).modulo(&Value::Int(3)), Value::Int(2)));
         assert!(matches!(Value::Int(7).modulo(&Value::Int(-3)), Value::Int(-2)));
     }
@@ -1216,8 +1240,8 @@ mod tests {
 
     #[test]
     fn modulo_int_min_by_negative_one() {
-        // perl: -9223372036854775808 % -1 == 0.  Rust's `%` on (i64::MIN, -1) is an arithmetic overflow — this must
-        // not panic.
+        // perl: -9223372036854775808 % -1 == 0.  Rust's `%` on (i64::MIN, -1) is an arithmetic overflow — this must not
+        // panic.
         assert!(matches!(Value::Int(i64::MIN).modulo(&Value::Int(-1)), Value::Int(0)));
     }
 
@@ -1241,8 +1265,8 @@ mod tests {
 
     #[test]
     fn hash_stringifies_to_key_count() {
-        // perl 5.26+: scalar(%h) is the number of keys — the "N/M" bucket form is gone.  Verified: a two-key hash
-        // gives "2".
+        // perl 5.26+: scalar(%h) is the number of keys — the "N/M" bucket form is gone.  Verified: a two-key hash gives
+        // "2".
         let mut map = HashMap::new();
         map.insert(PerlString::from_str("a"), Value::Int(1));
         map.insert(PerlString::from_str("b"), Value::Int(2));
@@ -1260,8 +1284,8 @@ mod tests {
 
     #[test]
     fn scalar_held_ref_stringifies_and_numifies() {
-        // Value::Ref gives "SCALAR(0xADDR)" and a nonzero address; the same reference living inside a full Scalar
-        // (as after an upgrade for magic/blessing) must not degrade to "" and 0.
+        // Value::Ref gives "SCALAR(0xADDR)" and a nonzero address; the same reference living inside a full Scalar (as
+        // after an upgrade for magic/blessing) must not degrade to "" and 0.
         let inner = crate::scalar::Scalar::from_ref(Value::Int(5));
         let v = Value::Scalar(Arc::new(RwLock::new(inner)));
         let ps = v.stringify();
@@ -1321,14 +1345,15 @@ mod tests {
 
     #[test]
     fn upgrade_ref_round_trips() {
-        // Build a Value::Ref pointing to a scalar holding 42, upgrade the Ref to a Scalar, verify the resulting
-        // Scalar identifies as a reference and the underlying target is preserved.
+        // Build a Value::Ref pointing to a scalar holding 42, upgrade the Ref to a Scalar, verify the resulting Scalar
+        // identifies as a reference and the underlying target is preserved.
         let mut as_value = Value::Int(42);
         let target_sv = as_value.upgrade_to_scalar();
         let mut ref_val = Value::Ref(target_sv);
         let scalar_holding_ref = ref_val.upgrade_to_scalar();
         let guard = scalar_holding_ref.read().unwrap();
         assert!(guard.is_ref());
+
         // The reference target is itself a Value::Scalar wrapping the inner Sv.
         match guard.get_rv() {
             Some(Value::Scalar(inner_sv)) => {

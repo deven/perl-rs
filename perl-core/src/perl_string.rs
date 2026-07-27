@@ -109,6 +109,7 @@ impl PerlString {
         new_buf.extend_from_slice(&self.buf);
         new_buf.extend_from_slice(s.as_bytes());
         self.buf = new_buf.freeze();
+
         // If we were already UTF-8, appending a &str keeps us UTF-8.  If we weren't, appending UTF-8 doesn't make us
         // UTF-8.
     }
@@ -135,8 +136,8 @@ impl PerlString {
     /// Clear the string contents.
     pub fn clear(&mut self) {
         self.buf = Bytes::new();
-        // An empty string is trivially valid UTF-8, but we preserve the flag state for consistency with Perl 5
-        // behavior.
+
+        // An empty string is trivially valid UTF-8, but we preserve the flag state for consistency with Perl 5 behavior.
     }
 
     /// Truncate to `len` bytes.  Uses zero-copy slicing on the underlying `Bytes` buffer.  Clears UTF-8 flag if
@@ -159,6 +160,7 @@ impl PerlString {
         if self.is_utf8 {
             return true;
         }
+
         if std::str::from_utf8(&self.buf).is_ok() {
             self.is_utf8 = true;
             true
@@ -200,14 +202,17 @@ impl PerlString {
         if s.is_empty() {
             return 0;
         }
+
         // Fast path: try the whole trimmed string
         if let Ok(s) = std::str::from_utf8(s) {
             if let Ok(n) = s.parse::<i64>() {
                 return n;
             }
+
             // Perl-style: parse as much as possible from the front
             return perl_atoi(s);
         }
+
         0
     }
 
@@ -217,12 +222,14 @@ impl PerlString {
         if s.is_empty() {
             return 0.0;
         }
+
         if let Ok(s) = std::str::from_utf8(s) {
             if let Ok(n) = s.parse::<f64>() {
                 return n;
             }
             return perl_atof(s);
         }
+
         0.0
     }
 
@@ -232,6 +239,7 @@ impl PerlString {
         while start < self.buf.len() && self.buf[start].is_ascii_whitespace() {
             start += 1;
         }
+
         &self.buf[start..]
     }
 }
@@ -252,9 +260,8 @@ fn perl_atoi(s: &str) -> i64 {
         (false, s)
     };
 
-    // Perl's string numification never interprets 0x/0b/0o radix prefixes — only literals and hex()/oct() do
-    // (verified 5.38.2: "0xff"+0 is 0).  The decimal scan below naturally stops at the 'x'/'b', yielding the
-    // leading 0.
+    // Perl's string numification never interprets 0x/0b/0o radix prefixes — only literals and hex()/oct() do (verified
+    // 5.38.2: "0xff"+0 is 0).  The decimal scan below naturally stops at the 'x'/'b', yielding the leading 0.
 
     // Decimal
     let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -262,6 +269,7 @@ fn perl_atoi(s: &str) -> i64 {
         return 0;
     }
     let val = s[..end].parse::<i64>().unwrap_or(0);
+
     if negative { -val } else { val }
 }
 
@@ -288,17 +296,19 @@ fn perl_atof(s: &str) -> f64 {
         }
     }
 
-    // Exponent — committed only when at least one digit follows the marker (and optional sign).  Perl numifies
-    // "1e" and "1e+" as 1: a dangling exponent marker is not part of the number (verified 5.38.2).
+    // Exponent — committed only when at least one digit follows the marker (and optional sign).  Perl numifies "1e" and
+    // "1e+" as 1: a dangling exponent marker is not part of the number (verified 5.38.2).
     if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
         let mut exp_end = end + 1;
         if exp_end < bytes.len() && (bytes[exp_end] == b'+' || bytes[exp_end] == b'-') {
             exp_end += 1;
         }
+
         let exp_digits_start = exp_end;
         while exp_end < bytes.len() && bytes[exp_end].is_ascii_digit() {
             exp_end += 1;
         }
+
         if exp_end > exp_digits_start {
             end = exp_end;
         }
@@ -434,6 +444,7 @@ mod tests {
     #[test]
     fn truncate_splits_multibyte() {
         let mut s = PerlString::from_str("héllo"); // é is 2 bytes
+
         // "héllo" = [104, 195, 169, 108, 108, 111]
         s.truncate(2); // splits the é
         assert!(!s.is_utf8()); // flag cleared
@@ -495,6 +506,7 @@ mod tests {
     #[test]
     fn into_string_non_utf8_valid() {
         let s = PerlString::from_bytes(b"hello".to_vec());
+
         // Not flagged as UTF-8, but contents happen to be valid
         assert_eq!(s.into_string(), Ok(String::from("hello")));
     }
@@ -514,6 +526,7 @@ mod tests {
     #[test]
     fn display_non_utf8() {
         let s = PerlString::from_bytes(vec![0xff, 0xfe]);
+
         // Should not panic — uses lossy conversion
         let _ = format!("{}", s);
     }
@@ -533,6 +546,7 @@ mod tests {
         let b = PerlString::from_str("hello");
         let c = PerlString::from_bytes(b"hello".to_vec());
         assert_eq!(a, b);
+
         // Different UTF-8 flag, same bytes — should they be equal?  In Perl, "hello" eq "hello" regardless of internal
         // flags.  Our PartialEq derives from the struct, so flag matters.  This is intentional — internal
         // representation equality, not Perl-level equality (which is handled by the runtime).
@@ -544,6 +558,7 @@ mod tests {
     fn clone_is_shared() {
         let a = PerlString::from_str("hello world, this is a longer string");
         let b = a.clone();
+
         // Both should point to the same underlying buffer.
         assert_eq!(a.as_bytes().as_ptr(), b.as_bytes().as_ptr());
     }
@@ -553,6 +568,7 @@ mod tests {
         let s = PerlString::from_str("hello");
         let b = s.bytes();
         assert_eq!(&b[..], b"hello");
+
         // Original is still usable.
         assert_eq!(s.as_str(), Some("hello"));
     }
@@ -570,6 +586,7 @@ mod tests {
         let original_ptr = s.as_bytes().as_ptr();
         let mut t = s.clone();
         t.truncate(5);
+
         // After truncation, the pointer should still reference the same underlying allocation.
         assert_eq!(t.as_bytes().as_ptr(), original_ptr);
         assert_eq!(t.as_str(), Some("hello"));
@@ -585,8 +602,8 @@ mod tests {
 
     #[test]
     fn parse_nv_dangling_exponent_backtracks() {
-        // Perl numifies "1e" and "1e+" as 1: the exponent marker without digits is not part of the number.
-        // Verified: perl gives ("1e"+0) == 1 and ("1e+"+0) == 1.
+        // Perl numifies "1e" and "1e+" as 1: the exponent marker without digits is not part of the number.  Verified:
+        // perl gives ("1e"+0) == 1 and ("1e+"+0) == 1.
         assert!((PerlString::from_str("1e").parse_nv() - 1.0).abs() < f64::EPSILON);
         assert!((PerlString::from_str("1e+").parse_nv() - 1.0).abs() < f64::EPSILON);
         assert!((PerlString::from_str("2.5E-").parse_nv() - 2.5).abs() < f64::EPSILON);
@@ -602,8 +619,8 @@ mod tests {
     #[test]
     fn parse_iv_integer_beyond_iv_range_is_not_zero() {
         // The IV result for an out-of-IV-range decimal string is operation-dependent in perl (printf %d gives the
-        // wrapped cast, bitwise ops go through UV), but it is never 0.  The exact contract belongs to a design
-        // section; this pins the one certainly-wrong answer.
+        // wrapped cast, bitwise ops go through UV), but it is never 0.  The exact contract belongs to a design section;
+        // this pins the one certainly-wrong answer.
         assert_ne!(PerlString::from_str("9223372036854775808").parse_iv(), 0);
     }
 
@@ -618,8 +635,8 @@ mod tests {
 
     #[test]
     fn parse_iv_010_is_decimal_not_octal() {
-        // Verified perl 5.38: "010" + 0 gives 10.  (Numeric coercion treats leading-zero strings as decimal; only
-        // oct() parses them as octal.)
+        // Verified perl 5.38: "010" + 0 gives 10.  (Numeric coercion treats leading-zero strings as decimal; only oct()
+        // parses them as octal.)
         assert_eq!(PerlString::from_str("010").parse_iv(), 10);
     }
 
@@ -640,15 +657,15 @@ mod tests {
 
     #[test]
     fn parse_iv_unicode_digit_yields_zero() {
-        // Verified perl 5.38: Arabic-Indic 7 ("\x{0667}") + 0 gives 0.  (Default numeric coercion only recognizes
-        // ASCII digits.)
+        // Verified perl 5.38: Arabic-Indic 7 ("\x{0667}") + 0 gives 0.  (Default numeric coercion only recognizes ASCII
+        // digits.)
         assert_eq!(PerlString::from_str("\u{0667}").parse_iv(), 0);
     }
 
     #[test]
     fn parse_nv_leading_dot() {
-        // Verified perl 5.38: ".5" + 0 gives 0.5; "5." + 0 gives 5; ".  5" + 0 gives 0 (whitespace between the dot
-        // and the digit stops the parse).
+        // Verified perl 5.38: ".5" + 0 gives 0.5; "5." + 0 gives 5; ".  5" + 0 gives 0 (whitespace between the dot and
+        // the digit stops the parse).
         assert!((PerlString::from_str(".5").parse_nv() - 0.5).abs() < 1e-10);
         assert_eq!(PerlString::from_str("5.").parse_nv(), 5.0);
         assert_eq!(PerlString::from_str(".  5").parse_nv(), 0.0);

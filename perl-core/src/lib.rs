@@ -25,6 +25,7 @@
 //!   The coercion engine checks flags for the fast path and caches new representations lazily.
 
 pub mod cell;
+pub mod containers;
 pub mod cow_buffer;
 pub mod flags;
 pub mod payload;

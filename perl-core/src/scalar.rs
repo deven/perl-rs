@@ -95,12 +95,14 @@ impl Scalar {
     pub fn from_str(s: &str) -> Self {
         let mut bytes = PerlStringSlot::None;
         bytes.set_str(s);
+
         Scalar { flags: ScalarFlags::STR_VALID | ScalarFlags::UTF8, int: 0, num: 0.0, bytes, reference: None, magic: None, stash: None }
     }
 
     /// Create a scalar from a `PerlString`.  STR_VALID is set.
     pub fn from_perl_string(ps: PerlString) -> Self {
         let flags = if ps.is_utf8() { ScalarFlags::STR_VALID | ScalarFlags::UTF8 } else { ScalarFlags::STR_VALID };
+
         Scalar { flags, int: 0, num: 0.0, bytes: PerlStringSlot::Heap(ps), reference: None, magic: None, stash: None }
     }
 
@@ -185,6 +187,7 @@ impl Scalar {
             // claim an authoritative integer representation the reference does not have.
             return self.ref_parts().1 as i64;
         }
+
         if self.flags.contains(ScalarFlags::INT_VALID) {
             return self.int;
         }
@@ -226,6 +229,7 @@ impl Scalar {
             // Same address rule as get_int.
             return self.ref_parts().1 as f64;
         }
+
         if self.flags.contains(ScalarFlags::NUM_VALID) {
             return self.num;
         }
@@ -242,6 +246,7 @@ impl Scalar {
             } else {
                 self.num = 0.0;
             }
+
             self.flags.insert(ScalarFlags::NUM_VALID);
             return self.num;
         }
@@ -262,14 +267,15 @@ impl Scalar {
     /// Returns `None` only for undef.
     pub fn get_bytes(&mut self) -> Option<&[u8]> {
         if self.flags.contains(ScalarFlags::REF_VALID) {
-            // A reference stringifies as PREFIX(0xADDR), like the compact Value::Ref path.  The rendering goes into
-            // the byte slot so it can be borrowed, but STR_VALID stays clear — it is a per-read rendering, not a
-            // string representation the scalar owns.
+            // A reference stringifies as PREFIX(0xADDR), like the compact Value::Ref path.  The rendering goes into the
+            // byte slot so it can be borrowed, but STR_VALID stays clear — it is a per-read rendering, not a string
+            // representation the scalar owns.
             let (prefix, addr) = self.ref_parts();
             let rendered = format!("{}(0x{:x})", prefix, addr);
             self.bytes.set_str(&rendered);
             return self.bytes.as_bytes();
         }
+
         if self.flags.contains(ScalarFlags::STR_VALID) {
             return self.bytes.as_bytes();
         }
@@ -320,8 +326,10 @@ impl Scalar {
         if self.get_bytes().is_none() {
             return PerlString::new(); // undef → empty string
         }
+
         // Now bytes is guaranteed to be populated.  Read it.
         let is_utf8 = self.flags.contains(ScalarFlags::UTF8);
+
         if let Some(bytes) = self.bytes.as_bytes() {
             // SAFETY: if UTF8 flag is set, get_bytes ensured valid UTF-8.
             unsafe { PerlString::from_bytes_utf8_unchecked(bytes.to_vec(), is_utf8) }
@@ -331,9 +339,9 @@ impl Scalar {
     }
 
     // ── Reference access ──────────────────────────────────────────
-    /// The stringification prefix and address for a reference scalar, matching perl's SCALAR(0x...)/ARRAY(0x...)
-    /// forms and PTR2IV numification.  Arc-backed targets use the Arc's address; compact targets (immediate values
-    /// as constructed by tests) use the address of the stored Value slot, which is stable for this Scalar's life.
+    /// The stringification prefix and address for a reference scalar, matching perl's SCALAR(0x...)/ARRAY(0x...) forms
+    /// and PTR2IV numification.  Arc-backed targets use the Arc's address; compact targets (immediate values as
+    /// constructed by tests) use the address of the stored Value slot, which is stable for this Scalar's life.
     fn ref_parts(&self) -> (&'static str, usize) {
         match self.reference.as_ref() {
             Some(Value::Array(av)) => ("ARRAY", Arc::as_ptr(av) as usize),
@@ -388,21 +396,24 @@ impl Scalar {
 
 // ── Helpers ──────────────────────────────────────────────────────
 /// Format a float the way perl does: `sprintf("%.15g", n)` (Gconvert at NV_DIG significant digits), with perl's
-/// "Inf"/"-Inf"/"NaN" capitalizations.  Note %.15g is a fixed significant-digit count, not shortest-round-trip —
-/// which is exactly why perl prints 0.1+0.2 as "0.3".
+/// "Inf"/"-Inf"/"NaN" capitalizations.  Note %.15g is a fixed significant-digit count, not shortest-round-trip — which
+/// is exactly why perl prints 0.1+0.2 as "0.3".
 pub(crate) fn format_nv(n: f64) -> String {
     // Rust has no %g formatter, so build it: render at 15 significant digits in exponent form, then choose fixed or
-    // exponent presentation by the %g rule and strip trailing fraction zeros.  All shapes verified against perl
-    // 5.38.2 print output: 0.1+0.2 is "0.3", 1e15 is "1e+15", 1e-5 is "1e-05".
+    // exponent presentation by the %g rule and strip trailing fraction zeros.  All shapes verified against perl 5.38.2
+    // print output: 0.1+0.2 is "0.3", 1e15 is "1e+15", 1e-5 is "1e-05".
     if n.is_nan() {
         return "NaN".to_string();
     }
+
     if n.is_infinite() {
         return if n < 0.0 { "-Inf".to_string() } else { "Inf".to_string() };
     }
+
     if n == 0.0 {
         return "0".to_string();
     }
+
     // "{:.14e}" gives a normalized d.dddddddddddddd form — 15 significant digits, correctly rounded.
     let rendered = format!("{:.14e}", n);
     let (mantissa, exp) = rendered.split_once('e').expect("exponent form always contains 'e'");
@@ -411,6 +422,7 @@ pub(crate) fn format_nv(n: f64) -> String {
     let all_digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
     let digits = all_digits.trim_end_matches('0');
     let digits = if digits.is_empty() { "0" } else { digits };
+
     // %g uses exponent form when the decimal exponent is below -4 or at/above the precision (15).
     if !(-4..15).contains(&exp) {
         let frac = &digits[1..];
@@ -418,8 +430,10 @@ pub(crate) fn format_nv(n: f64) -> String {
         let exp_sign = if exp < 0 { '-' } else { '+' };
         return format!("{sign}{}{point}e{exp_sign}{:02}", &digits[..1], exp.abs());
     }
+
     if exp >= 0 {
         let int_len = exp as usize + 1;
+
         if digits.len() <= int_len {
             format!("{sign}{digits}{}", "0".repeat(int_len - digits.len()))
         } else {
@@ -701,6 +715,7 @@ mod tests {
         let ps = sv.stringify();
         assert_eq!(ps.as_str(), Some("42"));
         assert!(ps.is_utf8());
+
         // Should have cached the string (STR_VALID now set)
         assert!(sv.flags().contains(ScalarFlags::STR_VALID));
         assert!(sv.flags().contains(ScalarFlags::INT_VALID)); // still valid
@@ -798,8 +813,8 @@ mod tests {
 
     #[test]
     fn ref_scalar_stringifies_like_value_ref() {
-        // Value::Ref stringifies as "SCALAR(0xADDR)"; the same reference held in a full Scalar must not stringify
-        // as the empty string.
+        // Value::Ref stringifies as "SCALAR(0xADDR)"; the same reference held in a full Scalar must not stringify as
+        // the empty string.
         let mut sv = Scalar::from_ref(Value::Int(7));
         let ps = sv.stringify();
         let bytes = ps.as_bytes();
@@ -815,15 +830,15 @@ mod tests {
 
     #[test]
     fn format_nv_matches_perl_g15_rounding() {
-        // print 0.1+0.2 gives "0.3" in perl (%.15g rounds away the representation noise); Rust's shortest
-        // round-trip Display gives "0.30000000000000004".
+        // print 0.1+0.2 gives "0.3" in perl (%.15g rounds away the representation noise); Rust's shortest round-trip
+        // Display gives "0.30000000000000004".
         assert_eq!(format_nv(0.1 + 0.2), "0.3");
     }
 
     #[test]
     fn format_nv_switches_to_exponent_at_16_digits() {
-        // %.15g uses exponent form once the exponent reaches the precision: perl prints 1e15 as "1e+15" and
-        // 1e21 as "1e+21".
+        // %.15g uses exponent form once the exponent reaches the precision: perl prints 1e15 as "1e+15" and 1e21 as
+        // "1e+21".
         assert_eq!(format_nv(1e15), "1e+15");
         assert_eq!(format_nv(1e21), "1e+21");
         assert_eq!(format_nv(999999999999999.0), "999999999999999");
@@ -859,6 +874,7 @@ mod tests {
         let mut sv = Scalar::from_int(-42);
         assert_eq!(sv.get_int(), -42);
         assert_eq!(sv.get_str(), Some("-42"));
+
         // Reading the string didn't disturb the cached int.
         assert!(sv.flags().contains(ScalarFlags::INT_VALID));
         assert_eq!(sv.get_int(), -42);

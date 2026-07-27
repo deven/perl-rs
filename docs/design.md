@@ -191,6 +191,20 @@ Hashes have no slot wrapper: nonexistence is absence of the map entry.
 `exists` is `contains_key`.  The asymmetry is Perl's semantics —
 arrays can have holes below their length; hashes cannot.
 
+**Autovivification hook.**  The container API splits read access
+(`get` — never creates) from lvalue access (`ensure_element` /
+`entry_or_undef` — creates the undef element, container-verified:
+`\$a[3]` on an empty array yields length 4 with an existing undef
+element).  Perl's default behavior autovivifies intermediate
+containers even on *read* dereference chains (`$h{$a}{$b}{$c}` as an
+rvalue vivifies `$h{$a}` and `$h{$a}{$b}`), which is the compat
+default — but a planned option (in the spirit of the CPAN
+`autovivification` pragma) will let read-only dereference chains
+route through `get` instead, preventing the vivification.  The
+option's semantics (lexical scope, granularity) are an ops-layer
+design section; the container API split is its mechanism and is
+settled now.
+
 #### 2.2.2 `ScalarPayload` — the authoritative datum:
 
 The single most important principle of the scalar model:
@@ -1229,10 +1243,12 @@ standalone small-string maximum (now the `PerlString` inline
 constant).
 
 Open items awaiting rulings or container work, marked here rather
-than scattered: the would-warn predicate table (§2.3.4); the
-lazy-cache fill mechanism (§2.3.2); the
-perl-extended-UTF-8 representation subsection (§2.2.3); which 5.42
-constant-declaration surfaces map to `Const` construction.  (The
+than scattered: the perl-extended-UTF-8 representation subsection
+(§2.2.3); which 5.42 constant-declaration surfaces map to `Const`
+construction.  (Closed since first marked: the would-warn predicate
+table is container-mapped in §2.3.4; the cache-fill mechanism is
+ruled in §2.3.2 — atomics for the numeric slots, `OnceLock` for the
+string slot.)  (The
 buffer ruling is settled: custom `CowBuffer`, no new required
 dependencies; `memchr` optional for scan acceleration.)
 ### 2.4 Reference Counting and Cycle Collection

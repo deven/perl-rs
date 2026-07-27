@@ -112,9 +112,7 @@ pub(crate) mod eq_probe {
 
         /// Characters consumed by the streaming walk.
         pub static WALK_CHARS: Cell<usize> = const { Cell::new(0) };
-    }
 
-    thread_local! {
         /// Full-content passes performed (classification or validation — must visit every byte).
         pub static FULL_SCANS: Cell<usize> = const { Cell::new(0) };
 
@@ -530,6 +528,7 @@ impl PerlString {
     /// impl below.
     fn from_str_impl(s: &str) -> Result<PerlString, AllocError> {
         let bytes = s.as_bytes();
+
         if bytes.len() <= INLINE_MAX {
             let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Malformed/Extended impossible from &str
             let (len, buf) = inline_payload(bytes);
@@ -732,7 +731,6 @@ impl PerlString {
 
     /// Clear the taint bit.  Non-public: reachable only through the two sanctioned laundering paths (§2.6.2) — capture
     /// materialization and hash-key canonicalization, both inside perl-core.
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumers are the §21.1 capture and hash-key steps; API is design-mandated"))]
     pub(crate) fn untaint_for_sanctioned_path(&mut self) {
         self.rebuild_tag(|u, w, _t| (u, w, false));
     }
@@ -805,6 +803,7 @@ impl PerlString {
                 let prior_chars = cb.char_count();
                 cb.extend_from_slice(bytes)?; // resets buffer scan and count to unknown
                 cb.narrow_scan(append_transition_heap(prior, kind));
+
                 // Maintain the character count incrementally when both sides know theirs (§2.2.5): the appended
                 // content's own classification counted its characters in its own pass.
                 if let AppendKind::Valid { chars: added, .. } = kind
@@ -1013,14 +1012,17 @@ fn append_transition_heap(prior: u8, kind: AppendKind) -> u8 {
         AppendKind::Valid { class, .. } => match prior {
             // Valid + valid: the range join — result range is the max of the two (§2.2.5).
             scan::ASCII | scan::UTF8_LATIN1 | scan::UTF8_NON_LATIN1 => prior.max(class),
+
             // Range-unresolved priors: the addition can prove non-ASCII or beyond-Latin-1, never below.
             scan::UTF8_UNKNOWN_RANGE if class == scan::UTF8_NON_LATIN1 => scan::UTF8_NON_LATIN1,
             scan::UTF8_UNKNOWN_RANGE if class == scan::UTF8_LATIN1 => scan::UTF8_NON_ASCII,
             scan::UTF8_UNKNOWN_RANGE => scan::UTF8_UNKNOWN_RANGE,
             scan::UTF8_NON_ASCII if class == scan::UTF8_NON_LATIN1 => scan::UTF8_NON_LATIN1,
             scan::UTF8_NON_ASCII => scan::UTF8_NON_ASCII,
+
             // Perl-decodable onto extended: the Rust-rejected code point is still there.
             scan::EXTENDED_UTF8 => scan::EXTENDED_UTF8,
+
             // Prior validity unknown or invalid: blanket fallback, lazily recoverable (always correct).
             _ => scan::UNKNOWN,
         },
@@ -1052,6 +1054,7 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
             if self.raw_fallback {
                 let b = self.rest[0];
                 self.rest = &self.rest[1..];
+
                 // Offset raw bytes past char space so they can never equal a genuine character from the other side
                 // (prevents false equality during the interim fallback).
                 return Some(0x8000_0000 | b as u32);
@@ -1132,6 +1135,7 @@ impl PartialEq for PerlString {
             grid_hit!();
             return false; // character count never exceeds byte count
         }
+
         if (sf == scan::UTF8_LATIN1 || sf == scan::UTF8_NON_ASCII) && plain.len() == flagged.len() {
             grid_hit!();
             return false; // a multi-byte sequence forces char count < byte count
@@ -1200,6 +1204,7 @@ impl PartialEq for PerlString {
                             None => return false,
                         }
                     }
+
                     // Extended or malformed: tokenized characters can never equal a plain byte.
                     Err(_) => return false,
                 };
@@ -1288,12 +1293,14 @@ impl PerlString {
                 let _ = scalar_decode_span(bytes, 0, bytes.len(), &mut facts, |v| h.write_u8(v as u8));
                 h.finish()
             }
+
             // Known beyond Latin-1 or invalid: the raw bytes are the canonical form.
             st if scan::is_known_beyond_latin1(st) || st == scan::MALFORMED_UTF8 => {
                 let mut h = hasher();
                 h.write(bytes);
                 h.finish()
             }
+
             // Unresolved: the blocked dual calculation.
             _ => {
                 count_full_scan();
@@ -1445,6 +1452,7 @@ mod tests {
         let bytes = vec![b'x'; 40];
         let s = PerlString::from_bytes(&bytes).unwrap();
         assert_eq!(s.storage_kind(), StorageKind::Heap);
+
         // as_str triggers the lazy scan and narrows.
         assert_eq!(s.as_str(), Some("x".repeat(40).as_str()));
         assert!(s.is_ascii());
@@ -1556,6 +1564,7 @@ mod tests {
         assert_eq!(s.storage_kind(), StorageKind::Heap);
         assert_eq!(s.len(), 25);
         assert!(s.is_ascii(), "promotion carried the scan knowledge");
+
         // Shrinking (future truncate) must not demote — pinned when truncate lands.
     }
 
@@ -1564,6 +1573,7 @@ mod tests {
         let mut s = PerlString::from_str_impl(&"a".repeat(30)).unwrap(); // Heap, ASCII known
         s.push_str("é").unwrap();
         assert_eq!(s.as_str().map(|v| v.len()), Some(32));
+
         // ASCII + valid-non-ascii → UTF8_NON_ASCII, without rescanning.
         assert!(!s.is_ascii());
         let mut raw = PerlString::from_bytes(&[0x80u8; 30]).unwrap(); // Heap, UNKNOWN
@@ -2116,6 +2126,7 @@ mod tests {
         for _ in 0..63 {
             src.push('a');
         }
+
         src.push('é'); // bytes 63..65: straddles the 64 boundary
         src.push_str(&"b".repeat(200));
         let f = PerlString::from_str_impl(&src).unwrap();
@@ -2212,6 +2223,7 @@ mod tests {
         for _ in 0..CLASSIFY_BLOCK - 1 {
             flagged_src.push('a');
         }
+
         flagged_src.push('é');
         flagged_src.push_str("tail");
         let f = PerlString::from_str_impl(&flagged_src).unwrap(); // flagged, UNKNOWN_RANGE
@@ -2247,6 +2259,7 @@ mod tests {
             *slot = 0x80 | (v & 0x3F) as u8;
             v >>= 6;
         }
+
         ff_min.extend_from_slice(&conts);
 
         let mut fe_min = vec![0xFEu8]; // minimal FE form: 2^31
@@ -2289,11 +2302,13 @@ mod tests {
         while bytes.len() < 2 * CLASSIFY_BLOCK - 1 {
             bytes.push(b'b');
         }
+
         bytes.extend_from_slice("é".as_bytes()); // straddles boundary 2 exactly
         bytes.extend_from_slice(b"tail");
 
         let (st, chars) = classify_full(&bytes);
         assert_eq!(st, scan::UTF8_NON_LATIN1);
+
         // chars: (BLOCK-1) a's + 字 + b-fill + é + 4 tail.
         let b_fill = (2 * CLASSIFY_BLOCK - 1) - (CLASSIFY_BLOCK - 1 + 3);
         assert_eq!(chars, (CLASSIFY_BLOCK - 1) + 1 + b_fill + 1 + 4);
@@ -2352,6 +2367,7 @@ mod tests {
         for _ in 0..CLASSIFY_BLOCK - 1 {
             s.push('a');
         }
+
         s.push('é');
         s.push_str("tail");
         let (st, chars) = classify_known_valid(s.as_bytes());
@@ -2363,6 +2379,7 @@ mod tests {
         for _ in 0..2 * CLASSIFY_BLOCK {
             w.push('a');
         }
+
         w.push('字');
         assert_eq!(classify_known_valid(w.as_bytes()), (scan::UTF8_NON_LATIN1, 0));
 

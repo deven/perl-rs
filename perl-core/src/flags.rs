@@ -234,6 +234,7 @@ mod tests {
             ("MAGICAL", ScalarFlags::MAGICAL),
             ("WEAK", ScalarFlags::WEAK),
         ];
+
         for (i, (name_i, flag_i)) in all.iter().enumerate() {
             assert_ne!(flag_i.bits(), 0, "{} has zero bit", name_i);
             assert!(flag_i.bits().is_power_of_two(), "{} not a single bit", name_i);

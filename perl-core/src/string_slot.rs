@@ -48,6 +48,7 @@ impl PerlStringSlot {
     /// Set the cache from raw bytes.  Uses `Inline` if it fits.
     pub fn set_bytes(&mut self, bytes: impl AsRef<[u8]>) {
         let bytes = bytes.as_ref();
+
         if bytes.len() <= SLOT_INLINE_MAX {
             let mut buf = [0u8; SLOT_INLINE_MAX];
             buf[..bytes.len()].copy_from_slice(bytes);
@@ -129,6 +130,7 @@ impl PerlStringSlot {
             PerlStringSlot::None => None,
             PerlStringSlot::Inline { buf, len, is_utf8 } => {
                 let bytes = buf[..*len as usize].to_vec();
+
                 // SAFETY: if is_utf8, the bytes are valid UTF-8.
                 Some(unsafe { PerlString::from_bytes_utf8_unchecked(bytes, *is_utf8) })
             }
@@ -245,8 +247,8 @@ mod tests {
     #[test]
     fn slot_inline_max_exceeds_small_string_max() {
         // SLOT_INLINE_MAX (24) is intentionally larger than SMALL_STRING_MAX (22): PerlStringSlot::Inline rides inside
-        // a Scalar (already behind Arc) so its size is bounded by the Heap variant's footprint, not by Value enum
-        // size.  SmallString rides directly in the Value enum and must stay 24 bytes total.
+        // a Scalar (already behind Arc) so its size is bounded by the Heap variant's footprint, not by Value enum size.
+        // SmallString rides directly in the Value enum and must stay 24 bytes total.
         assert_eq!(SLOT_INLINE_MAX, 24);
         assert_eq!(crate::SMALL_STRING_MAX, 22);
     }

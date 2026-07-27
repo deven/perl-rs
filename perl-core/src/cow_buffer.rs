@@ -1,7 +1,7 @@
 //! `CowBuffer` — the copy-on-write byte buffer backing heap strings (§2.2.3).
 //!
-//! Specification: a `Send + Sync` refcounted growable byte buffer with a `(ptr, len)` handle and a
-//! `{refcount, len, capacity, char_count, scan}` header — COW clone, unique-check mutation, nothing else.
+//! Specification: a `Send + Sync` refcounted growable byte buffer with a `(ptr, len)` handle and a `{refcount, len,
+//! capacity, char_count, scan}` header — COW clone, unique-check mutation, nothing else.
 //!
 //! This is the analogue of perl's `SvPV_COW`/`CowREFCNT` mechanism (the COW refcount stored with the string buffer),
 //! done with a real atomic.  "Owned" is not a separate kind: it is the refcount == 1 *state*, checked before in-place
@@ -29,8 +29,8 @@
 //!    The `scan` byte is the sole exception (atomic, monotone-narrowing only).
 //!
 //! Verified by the test suite at every size-class and COW-transition boundary; the refcount protocol has targeted
-//! concurrency tests.  (Miri is unavailable under the container's apt toolchain — noted as an outstanding
-//! verification obligation for an environment that has it.)
+//! concurrency tests.  (Miri is unavailable under the container's apt toolchain — noted as an outstanding verification
+//! obligation for an environment that has it.)
 
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
@@ -74,6 +74,7 @@ const fn grow_headroom(needed: usize) -> usize {
 pub struct CowBuffer {
     /// Points at the data region (offset `HEADER_SIZE` into the allocation).
     ptr: NonNull<u8>,
+
     /// Mirrored from the header (coherent by COW; see module docs).
     len: usize,
 }

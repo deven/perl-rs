@@ -7,4 +7,5 @@ description = "Perl core types"
 
 [dependencies]
 bytes       = { workspace = true }
+indexmap    = { workspace = true }
 parking_lot = { workspace = true }
