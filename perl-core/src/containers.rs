@@ -158,8 +158,8 @@ impl PerlArray {
         self.readonly
     }
 
-    /// The collector traversal hook (§21.1 step 7): existing elements only.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the consumer is the §21.1 step-7 cycle collector"))]
+    /// The graph traversal hook (§2.4.6 demolition, §2.4.11 cycle detection): existing elements only.
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
     pub(crate) fn values_iter(&self) -> impl Iterator<Item = &Value> {
         self.slots.iter().filter_map(Option::as_ref)
     }
@@ -288,8 +288,8 @@ impl PerlHash {
         self.readonly
     }
 
-    /// The collector traversal hook (§21.1 step 7).
-    #[cfg_attr(not(test), expect(dead_code, reason = "the consumer is the §21.1 step-7 cycle collector"))]
+    /// The graph traversal hook (§2.4.6 demolition, §2.4.11 cycle detection).
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
     pub(crate) fn values_iter(&self) -> impl Iterator<Item = &Value> {
         self.map.values()
     }
