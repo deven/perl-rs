@@ -330,6 +330,32 @@ impl Value {
         Value::ScalarRefMut(cell, Tainted::CLEAN)
     }
 
+    /// Whether this value holds a strong graph edge (§2.4.9): the reference and aliasing variants.  Non-edge values
+    /// cannot recurse when dropped and skip the release worklist.
+    pub(crate) fn carries_strong_edge(&self) -> bool {
+        matches!(
+            self,
+            Value::ScalarRefMut(..) | Value::ScalarRefConst(..) | Value::ArrayRef(..) | Value::HashRef(..) | Value::ScalarMut(_) | Value::ScalarConst(_)
+        )
+    }
+
+    /// Rehydrate a payload as a slot value.  Consumers: the §2.4.9 release path (a dying cell's payload enters the
+    /// worklist as a value) and, eventually, the ops layer's slot writes.
+    pub(crate) fn from_payload(p: ScalarPayload) -> Value {
+        match p {
+            ScalarPayload::Undef(t) => Value::Undef(t),
+            ScalarPayload::Int(n, t) => Value::Int(n, t),
+            ScalarPayload::Float(f, t) => Value::Float(f, t),
+            ScalarPayload::String(s) => Value::String(s),
+            ScalarPayload::True => Value::True,
+            ScalarPayload::False => Value::False,
+            ScalarPayload::ScalarRefMut(c, t) => Value::ScalarRefMut(c, t),
+            ScalarPayload::ScalarRefConst(c, t) => Value::ScalarRefConst(c, t),
+            ScalarPayload::ArrayRef(r, t) => Value::ArrayRef(r, t),
+            ScalarPayload::HashRef(r, t) => Value::HashRef(r, t),
+        }
+    }
+
     /// `$$r` — scalar dereference: the identity behind a reference value (through the aliasing variant if the slot is
     /// promoted).  `None` for non-references; the "Not a SCALAR reference" error is ops-layer.  `@$r` — array
     /// dereference: the shared identity behind an array-reference value (through the aliasing variant if the slot is
@@ -708,24 +734,6 @@ mod tests {
         Value::String(text.parse().unwrap())
     }
 
-    impl Value {
-        /// Test-only: rehydrate a payload as a slot value (the ops layer owns this mapping in production).
-        fn from_payload_for_test(p: ScalarPayload) -> Value {
-            match p {
-                ScalarPayload::Undef(t) => Value::Undef(t),
-                ScalarPayload::Int(n, t) => Value::Int(n, t),
-                ScalarPayload::Float(f, t) => Value::Float(f, t),
-                ScalarPayload::String(s) => Value::String(s),
-                ScalarPayload::True => Value::True,
-                ScalarPayload::False => Value::False,
-                ScalarPayload::ScalarRefMut(c, t) => Value::ScalarRefMut(c, t),
-                ScalarPayload::ScalarRefConst(c, t) => Value::ScalarRefConst(c, t),
-                ScalarPayload::ArrayRef(r, t) => Value::ArrayRef(r, t),
-                ScalarPayload::HashRef(r, t) => Value::HashRef(r, t),
-            }
-        }
-    }
-
     // ── The payload principle (§2.2.2): the retired flag-matrix bug class ─────
     #[test]
     fn payload_stays_authoritative_through_coercion() {
@@ -1012,7 +1020,7 @@ mod tests {
         // $$$rr reaches the base cell: two derefs, then the payload.
         let mid = r2.deref_scalar().unwrap();
         let inner = mid.read().payload().clone();
-        let inner = Value::from_payload_for_test(inner);
+        let inner = Value::from_payload(inner);
         let base_view = inner.deref_scalar().unwrap();
         assert_eq!(base_view.read().to_string_repr().unwrap().as_bytes(), b"x");
 

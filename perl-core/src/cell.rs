@@ -108,6 +108,20 @@ pub enum ScalarCell {
     Full(Box<FullScalar>),
 }
 
+impl Drop for ScalarCell {
+    /// Iterative teardown (§2.4.9): a dying cell hands its payload to the release worklist instead of letting drop glue
+    /// recurse through a chain of referents.
+    fn drop(&mut self) {
+        let payload = match self {
+            ScalarCell::Plain(p) => std::mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN)),
+            ScalarCell::Full(f) => std::mem::replace(&mut f.payload, ScalarPayload::Undef(Tainted::CLEAN)),
+        };
+        if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
+            crate::release::release_payload(payload);
+        }
+    }
+}
+
 impl std::fmt::Debug for ScalarCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -292,6 +306,16 @@ pub struct ConstScalar {
     float: f64,
     string: PerlString,
     numify_warned: Option<AtomicBool>,
+}
+
+impl Drop for ConstScalar {
+    /// Iterative teardown (§2.4.9): frozen payloads can carry graph edges too (§2.4.10).
+    fn drop(&mut self) {
+        let payload = std::mem::replace(&mut self.payload, ScalarPayload::Undef(Tainted::CLEAN));
+        if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
+            crate::release::release_payload(payload);
+        }
+    }
 }
 
 impl std::fmt::Debug for ConstScalar {

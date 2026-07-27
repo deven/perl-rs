@@ -30,6 +30,7 @@ pub mod cow_buffer;
 pub mod flags;
 pub mod payload;
 pub mod perl_string;
+pub mod release;
 pub mod scalar;
 pub mod small_string;
 pub mod string;

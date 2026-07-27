@@ -37,6 +37,16 @@ pub struct PerlArray {
     readonly: bool,
 }
 
+impl Drop for PerlArray {
+    /// Iterative teardown (§2.4.9): drain elements through the release worklist rather than recursing through the
+    /// `Vec`'s drop glue.  Destruction is not perl-visible mutation, so the readonly flag is deliberately not consulted.
+    fn drop(&mut self) {
+        for v in self.slots.drain(..).flatten() {
+            crate::release::release_value(v);
+        }
+    }
+}
+
 impl PerlArray {
     pub fn new() -> PerlArray {
         PerlArray::default()
@@ -175,6 +185,15 @@ pub struct PerlHash {
     /// The `each` cursor: the next index to yield.
     cursor: usize,
     readonly: bool,
+}
+
+impl Drop for PerlHash {
+    /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
+    fn drop(&mut self) {
+        for (_key, v) in self.map.drain(..) {
+            crate::release::release_value(v);
+        }
+    }
 }
 
 impl PerlHash {
