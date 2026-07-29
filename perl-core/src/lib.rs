@@ -24,6 +24,7 @@
 //! - **Flag-driven coercion.**  The `Scalar` struct uses `ScalarFlags` to track which representation slots are valid.
 //!   The coercion engine checks flags for the fast path and caches new representations lazily.
 
+mod packed;
 mod release;
 
 pub mod cell;
