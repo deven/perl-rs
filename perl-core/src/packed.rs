@@ -2,8 +2,9 @@
 //!
 //! Strings drawn from a 16-symbol alphabet pack two characters per byte, raising the inline capacity for the
 //! digit-dense class — timestamps, IPs, numeric IDs, and every numeric stringification the interpreter can produce — to
-//! `MAX_PACKED_LEN` (28) characters inside the 16-byte envelope.  Three alphabets are defined, selected by format bits
-//! in the enclosing discriminant:
+//! `MAX_PACKED_LEN` (30) characters inside the 16-byte envelope, with no stored length: the logical length is one past
+//! the last nonzero nibble, unique because trailing spaces are unpackable.  Three alphabets are defined, selected by
+//! format bits in the enclosing discriminant:
 //!
 //! - **Numeric**: space, `+`, `-`, `.`, `0`-`9`, `E`, `e` — covers every `%.15g` float output and every `i64`
 //!   stringification (§2.2.3's 22-character bound), and both exponent spellings: perl emits lowercase by default but
@@ -41,14 +42,17 @@
 // moment they land.
 #![cfg_attr(not(test), expect(dead_code))]
 
-/// The packed-tier capacity in characters: 14 nibble bytes, two characters each.
-pub(crate) const MAX_PACKED_LEN: usize = 28;
+/// The packed-tier capacity in characters: 15 nibble bytes, two characters each.  No length is stored — the byte a
+/// length would occupy is two characters of capacity, and 29-30 characters is exactly where millisecond-offset and
+/// nanosecond-Zulu timestamps live.  Because trailing spaces are unpackable, the logical length is uniquely the
+/// position one past the last nonzero nibble.
+pub(crate) const MAX_PACKED_LEN: usize = 30;
 
 /// The nibble-array width in bytes.
 pub(crate) const PACKED_BYTES: usize = MAX_PACKED_LEN / 2;
 
-/// Which 16-symbol alphabet a packed string uses.  The discriminant value is the format bits stored in the enclosing
-/// enum's encoding — two bits, which with the 5-bit length still fits one byte beside the 14 nibble bytes.
+/// Which 16-symbol alphabet a packed string uses.  In the fused forms this is carried entirely by the enclosing enum's
+/// discriminant — the packed payload is 15 nibble bytes with no metadata byte.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PackedAlphabet {
     /// space `+` `-` `.` `0`-`9` `E` `e` — every numeric stringification fits here, in either exponent spelling.
@@ -61,15 +65,15 @@ pub(crate) enum PackedAlphabet {
     DateTimePlus = 2,
 }
 
-/// A packed string: the alphabet, the character count, and the pad-filled nibble array.
+/// A packed string: the alphabet and the pad-filled nibble array — no stored length.  In the fused `PerlString`/`Value`
+/// forms the alphabet lives in the enclosing discriminant and the payload is the 15 nibble bytes alone; the field here
+/// stands in for that discriminant.
 ///
-/// `len` is stored for O(1) length, not because the information is otherwise lost: since trailing spaces are rejected,
-/// the last character's nibble is nonzero, so the length is recoverable as one past the last nonzero nibble.  (The
-/// forward scan that served before the space joined the alphabets no longer works — an interior space is a zero nibble.)
+/// Unused nibbles are canonically zero at construction: equality, ordering, and length recovery all read the full
+/// array, so stale bits would be semantic corruption.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Packed {
     pub(crate) alphabet: PackedAlphabet,
-    pub(crate) len: u8,
     pub(crate) nibbles: [u8; PACKED_BYTES],
 }
 
@@ -115,9 +119,10 @@ const DATETIME_Z_DECODE: [u8; 16] = decode_table(DATETIME_Z_SYMBOLS);
 const DATETIME_PLUS_ENCODE: [u8; 256] = encode_table(DATETIME_PLUS_SYMBOLS);
 const DATETIME_PLUS_DECODE: [u8; 16] = decode_table(DATETIME_PLUS_SYMBOLS);
 
-const _: () = assert!(NUMERIC_SYMBOLS.len() == 16); // Exactly full.
-const _: () = assert!(DATETIME_Z_SYMBOLS.len() == 16); // Exactly full.
-const _: () = assert!(DATETIME_PLUS_SYMBOLS.len() == 16); // Exactly full.
+// Each alphabet is exactly full, with 16 symbols defined.
+const _: () = assert!(NUMERIC_SYMBOLS.len() == 16);
+const _: () = assert!(DATETIME_Z_SYMBOLS.len() == 16);
+const _: () = assert!(DATETIME_PLUS_SYMBOLS.len() == 16);
 
 impl PackedAlphabet {
     fn encode_table(self) -> &'static [u8; 256] {
@@ -173,6 +178,7 @@ pub(crate) fn pack(bytes: &[u8]) -> Option<Packed> {
     for (i, &b) in bytes.iter().enumerate() {
         let n = table[b as usize];
         debug_assert_ne!(n, INVALID, "feasibility pass admitted an out-of-alphabet byte");
+
         // High nibble first: byte order over the packed array mirrors character order.
         if i % 2 == 0 {
             nibbles[i / 2] = n << 4;
@@ -181,17 +187,31 @@ pub(crate) fn pack(bytes: &[u8]) -> Option<Packed> {
         }
     }
 
-    // The sole silent truncation risk is the length; checked above, so the cast is exact.
-    Some(Packed { alphabet, len: bytes.len() as u8, nibbles })
+    Some(Packed { alphabet, nibbles })
 }
 
 impl Packed {
+    /// The logical character count: one past the last nonzero nibble.  Unique because trailing spaces are unpackable —
+    /// the final character's nibble is always nonzero.  Bounded reverse scan over at most 15 resident bytes; under
+    /// canonical tier selection the strings living here are 16-30 characters, so the scan typically inspects only the
+    /// last few bytes.
+    pub(crate) fn len(&self) -> usize {
+        for i in (0..PACKED_BYTES).rev() {
+            let byte = self.nibbles[i];
+            if byte != 0 {
+                return 2 * i + if byte & 0x0F != 0 { 2 } else { 1 };
+            }
+        }
+
+        0
+    }
+
     /// Decode to raw bytes: the exact original, by the round-trip invariant.  Interior zero nibbles decode to spaces;
-    /// the padding is never reached because the walk is bounded by the stored length.
+    /// the padding is never reached because the walk is bounded by the length.
     pub(crate) fn unpack(&self) -> ([u8; MAX_PACKED_LEN], usize) {
         let table = self.alphabet.decode_table();
         let mut out = [0u8; MAX_PACKED_LEN];
-        let len = self.len as usize;
+        let len = self.len();
         for (i, slot) in out.iter_mut().enumerate().take(len) {
             let byte = self.nibbles[i / 2];
             let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
@@ -199,6 +219,52 @@ impl Packed {
         }
 
         (out, len)
+    }
+
+    /// Equality against a raw byte string, length-first: derive the length, reject on mismatch, then compare decoded
+    /// characters.  Length-first is normative because a zero nibble is ambiguous against a raw space or a raw
+    /// end-of-string (interior space versus padding), and the length resolves every such case up front with predictable
+    /// control flow.  A first-bytes decode-pair precheck and the speculative dual-interpretation comparator are
+    /// recorded measured options.
+    pub(crate) fn eq_bytes(&self, other: &[u8]) -> bool {
+        if other.len() > MAX_PACKED_LEN {
+            return false;
+        }
+
+        let len = self.len();
+        if len != other.len() {
+            return false;
+        }
+
+        let table = self.alphabet.decode_table();
+        for (i, &o) in other.iter().enumerate() {
+            let byte = self.nibbles[i / 2];
+            let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+            if table[n as usize] != o {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Ordering against a raw byte string, length-first for the same ambiguity reason — the pinned counterexample:
+    /// packed "2026" against raw "2026\n" must be Less (the packed string ended), but a naive decoder reading the zero
+    /// nibble as a space would answer Greater (space > newline).  Deriving the length first makes every zero's meaning
+    /// known before it is compared.
+    pub(crate) fn cmp_bytes(&self, other: &[u8]) -> std::cmp::Ordering {
+        let len = self.len();
+        let table = self.alphabet.decode_table();
+        for (i, &o) in other.iter().enumerate().take(len) {
+            let byte = self.nibbles[i / 2];
+            let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+            match table[n as usize].cmp(&o) {
+                std::cmp::Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+
+        len.cmp(&other.len())
     }
 
     /// Same-alphabet comparison on the packed representation: equals raw byte order.  The ASCII-order nibble assignment
@@ -297,13 +363,14 @@ mod tests {
             roundtrip(s);
         }
 
-        // The capacity boundary, exactly: Zulu leaves room for seven fractional digits, a numeric offset for two.
-        assert_eq!(b"2026-07-28T14:33:07.1234567Z".len(), MAX_PACKED_LEN);
-        roundtrip(b"2026-07-28T14:33:07.1234567Z");
-        assert_eq!(pack(b"2026-07-28T14:33:07.12345678Z"), None); // 29 characters.
-        assert_eq!(b"2026-07-28T14:33:07.12+05:00".len(), MAX_PACKED_LEN);
-        roundtrip(b"2026-07-28T14:33:07.12+05:00");
-        assert_eq!(pack(b"2026-07-28T14:33:07.123+05:00"), None); // 29 characters.
+        // The capacity boundary, exactly: Zulu leaves room for nine fractional digits — full nanoseconds — and a
+        // numeric offset for three; millisecond-plus-offset (29) and nanosecond-Zulu (30) both fit.
+        assert_eq!(b"2026-07-29T17:23:45.123456789Z".len(), MAX_PACKED_LEN);
+        roundtrip(b"2026-07-29T17:23:45.123456789Z");
+        roundtrip(b"2026-07-29 17:23:45.123-04:00"); // 29: millisecond precision with a numeric offset.
+        assert_eq!(pack(b"2026-07-29T17:23:45.1234567891Z"), None); // 31 characters.
+        assert_eq!(b"2026-07-28T14:33:07.123+05:00".len(), 29);
+        roundtrip(b"2026-07-28T14:33:07.123+05:00");
     }
 
     #[test]
@@ -335,9 +402,9 @@ mod tests {
 
     #[test]
     fn boundaries_and_rejections() {
-        assert!(pack(&[b'1'; 27]).is_some());
-        assert!(pack(&[b'1'; 28]).is_some());
-        assert_eq!(pack(&[b'1'; 29]), None, "over capacity");
+        assert!(pack(&[b'1'; 29]).is_some());
+        assert!(pack(&[b'1'; 30]).is_some());
+        assert_eq!(pack(&[b'1'; 31]), None, "over capacity");
         assert_eq!(pack(b"abc"), None);
         assert_eq!(pack(b"1,234"), None, "the comma is in no alphabet");
         assert_eq!(pack(b"1\t2"), None, "only the space is whitespace-encodable");
@@ -474,20 +541,59 @@ mod tests {
     }
 
     #[test]
-    fn length_is_recoverable_from_the_nibbles() {
-        // Not relied on by the code (len is stored for O(1) access), but the property that makes storage redundant:
-        // trailing spaces are rejected, so the last character's nibble is nonzero.
-        for s in [&b""[..], b"1", b"1 2", b" 12", b"2026-07-28 14:33:07Z", &[b'1'; 28][..]] {
+    fn derived_length_is_exact() {
+        // The length is load-bearing now (nothing stores it): odd and even endings, interior spaces and zeros of
+        // padding, empty, and both capacity extremes.
+        for s in [&b""[..], b"1", b"12", b"1 2", b" 12", b"2026-07-28 14:33:07Z", &[b'1'; 29][..], &[b'1'; 30][..]] {
             let p = pack(s).unwrap();
-            let derived = (0..MAX_PACKED_LEN)
-                .rev()
-                .find(|&i| {
-                    let byte = p.nibbles[i / 2];
-                    let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
-                    n != 0
-                })
-                .map_or(0, |i| i + 1);
-            assert_eq!(derived, s.len(), "derived length must match for {:?}", String::from_utf8_lossy(s));
+            assert_eq!(p.len(), s.len(), "derived length must match for {:?}", String::from_utf8_lossy(s));
+        }
+    }
+
+    #[test]
+    fn cross_representation_comparison_is_length_first_correct() {
+        // The pinned counterexample: a naive space-decoding of the zero nibble answers Greater; the truth is Less.
+        let p2026 = pack(b"2026").unwrap();
+        assert_eq!(p2026.cmp_bytes(b"2026\n"), std::cmp::Ordering::Less);
+        assert_eq!(p2026.cmp_bytes(b"2026 "), std::cmp::Ordering::Less);
+        assert_eq!(p2026.cmp_bytes(b"2026"), std::cmp::Ordering::Equal);
+        assert!(!p2026.eq_bytes(b"2026 "), "trailing space on the raw side is a length mismatch");
+        assert!(!p2026.eq_bytes(b"2026\n"));
+        assert!(p2026.eq_bytes(b"2026"));
+
+        // Interior spaces decode and compare as real characters.
+        let spaced = pack(b"2026 07").unwrap();
+        assert!(spaced.eq_bytes(b"2026 07"));
+        assert!(!spaced.eq_bytes(b"2026"));
+        assert!(!spaced.eq_bytes(b"2026\x0007")); // A NUL where the space sits: unequal characters.
+        assert_eq!(spaced.cmp_bytes(b"2026\n07"), std::cmp::Ordering::Greater); // Space > newline, in-string.
+
+        // The general property: cmp_bytes and eq_bytes agree with raw byte semantics against arbitrary raw strings,
+        // packable or not.
+        let corpus: Vec<&[u8]> =
+            vec![b"", b"1", b"12", b"1 2", b"2026", b"2026 07", b"192.168.100.200", b"2026-07-28T14:33:07Z", b"2026-07-29T17:23:45.123456789Z"];
+        let others: Vec<&[u8]> = vec![
+            b"",
+            b"1",
+            b"2026",
+            b"2026\n",
+            b"2026 ",
+            b"2026 07",
+            b"2026\x0007",
+            b"abc",
+            b"192.168.100.200",
+            b"2026-07-28T14:33:07Z",
+            b"zzz",
+            b"\x00",
+            b"2026-07-29T17:23:45.123456789Z",
+        ];
+
+        for a in &corpus {
+            let pa = pack(a).unwrap();
+            for b in &others {
+                assert_eq!(pa.cmp_bytes(b), a.cmp(b), "{:?} vs {:?}", String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+                assert_eq!(pa.eq_bytes(b), a == b, "{:?} vs {:?}", String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+            }
         }
     }
 }

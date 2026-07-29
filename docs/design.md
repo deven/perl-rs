@@ -885,12 +885,18 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
 
 - **Raw inline, ≤ 13 bytes**: the §2.2.4 scan machinery intact,
   eagerly scanned at construction.
-- **Nibble-packed, ≤ 28 characters**, for digit-dense text — two
-  characters per byte over 16-symbol alphabets.  Three alphabets,
-  selected by two format bits (which with the 5-bit length still
-  leave the byte intact): *numeric* {space, `+`, `-`, `.`, 0-9,
-  `E`, `e`}, *datetime-Z* {space, `-`, `.`, 0-9, `:`, `T`, `Z`}, and
-  *datetime-plus* {space, `+`, `-`, `.`, 0-9, `:`, `T`}.
+- **Nibble-packed, ≤ 30 characters**, for digit-dense text — two
+  characters per byte over 16-symbol alphabets, in 15 payload
+  bytes with **no stored length**: a length byte is two characters
+  of capacity, and 29-30 characters is exactly where
+  millisecond-offset and nanosecond-Zulu timestamps live.  The
+  logical length is one past the last nonzero nibble — unique
+  because trailing-space strings are unpackable — recovered by a
+  bounded reverse scan; unused nibbles are canonically zero at
+  construction.  Three alphabets, carried entirely by the
+  enclosing discriminant: *numeric* {space, `+`, `-`, `.`, 0-9,
+  `E`, `e`}, *datetime-Z* {space, `-`, `.`, 0-9, `:`, `T`, `Z`},
+  and *datetime-plus* {space, `+`, `-`, `.`, 0-9, `:`, `T`}.
   **The space is nibble 0, shared with the padding and
   disambiguated by position**: trailing zero nibbles are padding,
   interior zero nibbles are spaces, and a string ending in a
@@ -902,10 +908,11 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   grammar without a seventeenth symbol: a valid timestamp never
   needs `Z` and `+` together, since Zulu *is* the zero offset —
   so both offset forms, both date-time separators, and fractional
-  seconds are all encodable; the numeric alphabet likewise carries
-  both exponent spellings, since perl emits uppercase through `%E`
-  and `%G` and accepts either on numification (Zulu leaves room for seven
-  fractional digits, a numeric offset for two).  Nibble values
+  seconds are all encodable — Zulu through full nanoseconds, a
+  numeric offset through milliseconds; the numeric alphabet
+  likewise carries both exponent spellings, since perl emits
+  uppercase through `%E` and `%G` and accepts either on
+  numification.  Nibble values
   are assigned in ASCII order, so same-alphabet packed comparison
   is `memcmp` — prefix ordering survives the shared zero because
   a padded slot ties against an interior space and the longer
@@ -914,7 +921,14 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   cross-alphabet *equality* is decided by the alphabets alone,
   since deterministic classification maps each byte string to
   exactly one alphabet (fixed priority: numeric, datetime-Z,
-  datetime-plus).  Packing is
+  datetime-plus).  Comparison against an *unpacked*
+  representation derives the length first, normatively: a zero
+  nibble is ambiguous against a raw space or a raw end-of-string
+  (packed "2026" versus raw "2026\n" must order Less, where a
+  naive space-decoding of the zero answers Greater), and the
+  derived length resolves every zero's meaning before it is
+  compared.  A leading decode-pair precheck and a speculative
+  dual-interpretation single pass are recorded measured options.  Packing is
   an **encoding, never a canonicalization**: exact byte
   round-trip is the invariant, and a packed string is
   observationally identical to its raw form in every operation —
