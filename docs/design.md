@@ -109,8 +109,8 @@ cycles, which Perl 5 leaks unless you break them manually or use
 
 Every Perl value lives in one of two tiers:
 
-- **Compact tier.**  A `Value` — a 24-byte enum stored directly in its
-  slot (pad entry, array element, hash entry).  No heap allocation, no
+- **Compact tier.**  A `Value` — a 16-byte enum (§2.2.9) stored
+  directly in its slot (pad entry, array element, hash entry).  No heap allocation, no
   reference count, no lock.  A compact value has no address identity:
   assignment copies it.
 - **Promoted tier.**  A `ScalarRef` — a shared, stably addressed,
@@ -135,39 +135,45 @@ inside the allocation (§2.3.2), never by replacing it.
 
 ```rust
 enum Value {
-    // Compact scalar payloads (identical to ScalarPayload variants)
-    Undef(Tainted),            // yes, tainted undef is real — see below
-    Int(i64, Tainted),         // taint bool rides envelope padding
-    Float(f64, Tainted),
-    String(PerlString),        // <= 22 bytes inline; taint in the tag
+    // Compact scalar payloads (identical to ScalarPayload variants).
+    // Every payload-bearing variant has a Tainted twin discriminant
+    // (§2.2.9); the twins are elided here for readability, and
+    // tainted undef is real — see below.
+    Undef,
+    Int(i64),                  // + packed-decimal digit cache (§2.2.9)
+    Float(f64),                // + packed-decimal digit cache (§2.2.9)
+    StrInline(..),             // raw bytes <= 13, eagerly scanned
+    StrPacked(..),             // nibble-packed <= 28 chars (§2.2.9)
+    StrHeap(..),               // thin pointer; §2.2.3 buffer model
     True,                      // canonical boolean true  (see 2.3.3)
     False,                     // canonical boolean false (see 2.3.3)
-    ScalarRefMut(Arc<RwLock<ScalarCell>>, Tainted),
-    ScalarRefConst(Arc<ConstScalar>, Tainted),
-    ArrayRef(ArrayRef, Tainted),
-    HashRef(HashRef, Tainted),
-    CodeRef(CodeRef, Tainted),
-    RegexRef(RegexRef, Tainted),
+    ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
+    ScalarRefConst(HeapArc<ConstScalar>),
+    ArrayRef(ArrayRef),
+    HashRef(HashRef),
+    CodeRef(CodeRef),
+    RegexRef(RegexRef),
 
     // A promoted scalar occupying this slot (the slot aliases it)
-    ScalarMut(Arc<RwLock<ScalarCell>>),
-    ScalarConst(Arc<ConstScalar>),
+    ScalarMut(HeapArc<RwLock<ScalarCell>>),
+    ScalarConst(HeapArc<ConstScalar>),
 
-    // Typed value (see 14).  Any Rust type that is Send + Sync.
-    Typed(Box<dyn TypedVal>),
+    // Typed value (see 14), boxed thin: the trait object lives
+    // behind a sized header so the envelope holds one pointer.
+    Typed(Box<TypedCell>),
 }
 ```
 
-`Value` is 24 bytes, `Option<Value>` is 24 bytes; both are enforced by
-compile-time assertions (§2.3.6).  Reference variants are flattened
+`Value` is 16 bytes, `Option<Value>` is 16 bytes (§2.2.9); both are
+enforced by compile-time assertions (§2.3.6).  Reference variants are flattened
 (one variant per referent kind, not a nested target enum) because
 `ref()`, dereference ops, and `ARRAY(0x...)`-style stringification all
 branch on referent kind first; the flattened arms sit where the code
 wants to branch.  The scalar arms flatten one level further — per
 *mutability*, mirroring `ScalarRef`'s Mut/Const split — because the
 nested identity enum carries its own tag that rustc cannot relocate,
-measurably defeating the niche-folding that keeps the envelope at 24
-bytes (nested: 32; flattened: 24 — measured, and the write path
+measurably defeating the niche-folding that keeps the envelope at 16
+bytes (nested: 24; flattened: 16 — measured, and the write path
 branches on mutability exactly as deref branches on kind).
 `cell::ScalarRef` remains the API view type, reconstructed by `Arc`
 clone at the boundary.  Remaining reference kinds adopt the same
@@ -281,36 +287,44 @@ storage kinds:
 // behind accessors (storage_kind(), is_utf8(), is_warned(),
 // is_tainted(), scan-state and tag-transition methods).
 enum PerlString {
-    Inline { len: u8, buf: [u8; 22] },   // no heap allocation
-    Heap(CowBuffer),                     // refcounted COW buffer
+    Raw { len: u8, buf: [u8; 13] },      // no heap allocation
+    Packed { fmt_len: u8, nib: [u8; 14] }, // <= 28 chars (§2.2.9)
+    Heap(..),                            // thin handle; COW buffer
 }
 ```
 
 `CowBuffer` is the custom copy-on-write byte buffer (ruled: custom
 over `bytes::Bytes`, `ecow`, and a tendril hybrid — see the ledger
 in §2.3.6).  Its specification fits in a sentence: a `Send + Sync`
-refcounted growable byte buffer with a `(ptr, len)` handle and a
+refcounted growable byte buffer with a thin-pointer handle (a u48
+mirrored length rides the handle's spare bytes — §2.2.9) and a
 `{refcount, len, capacity, char_count, scan}` header — COW clone,
 unique-check mutation, nothing else.  Details:
 
-- **Handle: `(NonNull<u8>, usize)`, 16 bytes.**  The length is
-  mirrored into the handle from the header, exploiting envelope
-  padding that is charged regardless (measured: a 16-byte heap
-  payload threads the niche through `PerlString`, `ScalarPayload`,
-  `ScalarCell`, and `Value`, all at 24).  Coherence falls out of
-  COW: a shared buffer is immutable, so its header length never
-  changes under any handle; mutation requires this handle's `&mut`
-  (COW-break first if shared) and updates both copies.  `length`,
-  emptiness, bounds checks, and the compare-lengths-first `eq`
-  short-circuit all skip the dereference.  The `NonNull` supplies
-  the niche.
-- **Header: `{refcount: AtomicUsize, len, capacity, char_count:
-  AtomicUsize, scan: AtomicU8}`** (40 bytes —
-  allocation-granularity noise, same class as before)
-  followed by the data.  This is perl's own `CowREFCNT` trick — the
-  COW refcount stored with the string buffer — done with a real
-  atomic.  "Owned" is not a separate kind: it is the refcount == 1
-  *state*, checked with acquire ordering before in-place mutation.
+- **Handle: thin pointer plus mirrored length, in-envelope.**  The
+  heap form is a thin `NonNull` to the buffer, with a u48 length
+  mirror riding the envelope's spare bytes — a `(pointer, usize)`
+  fat handle is ruled out by the envelope's fat-pointer rule
+  (§2.2.9).  Coherence falls out of COW: a shared buffer is
+  immutable, so its header length never changes under any handle;
+  mutation requires this handle's `&mut` (COW-break first if
+  shared) and updates both copies.  `length`, emptiness, bounds
+  checks, and the compare-lengths-first `eq` short-circuit all
+  skip the dereference; lengths at or beyond 2^48 read the header
+  (the large-buffer form, below).  The `NonNull` supplies the
+  niche.
+- **Header: compact by default.**  The common buffer header is
+  u32-field: `{refcount: AtomicU32, len: u32, capacity: u32,
+  char_count: AtomicU32 (MAX = unknown), scan: AtomicU8, flags:
+  u8}` — 20 bytes at alignment 4 — where a usize-field layout
+  would cost 40, more than many of the strings it fronts.  A
+  `flags` bit selects the large-buffer header (usize lengths) for
+  buffers at or beyond 4 GiB, so no semantic length cap exists
+  (the tendril lesson); `len` stays authoritative in the header —
+  handles carry mirrors, and mutation under the unique-buffer rule
+  updates one place.  Perl's own 32-bit SV refcount is the
+  precedent for the count width; overflow promotes to the large
+  header before wrap.
 - **Clone** is a relaxed refcount increment (`clone_cow` in the
   original design's vocabulary; the mechanism carried forward from
   its `Bytes`/`BytesMut` model).  **Mutation**: unique → mutate in
@@ -340,15 +354,20 @@ unique-check mutation, nothing else.  Details:
   refcount protocol gets targeted concurrency tests.  This module
   is the string memory model; it is tested like it.
 
-**The 22-byte inline bound is semantic, not incidental.**  Perl's
-`%.15g` float stringification maxes out at exactly 22 characters
-(`-2.22507385850720e-308`: sign + digit + point + 14 mantissa digits
-+ 5-character exponent); `i64::MIN` stringifies to 20.  Therefore
-**every numeric stringification the interpreter can produce stays
-inline** — allocation-free — and numeric stringification is constant
-traffic (every printed number, every number used as a hash key, every
-interpolation).  This invariant is the deciding argument for the
-24-byte envelope over the denser 16-byte alternative (§2.3.6).
+**The 22-character numeric-stringification bound is semantic, not
+incidental.**  Perl's `%.15g` float stringification maxes out at
+exactly 22 characters (`-2.22507385850720e-308`: sign + digit +
+point + 14 mantissa digits + 5-character exponent); `i64::MIN`
+stringifies to 20.  Those outputs exceed the 13-byte raw-inline tier
+but draw entirely from the numeric alphabet of the nibble-packed
+tier (≤ 28 characters, §2.2.9), so **every numeric stringification
+the interpreter can produce stays inline** — encoded by table
+lookup, allocation-free — and numeric stringification is constant
+traffic (every printed number, every number used as a hash key,
+every interpolation).  This invariant is
+load-bearing for the envelope: the packed tier is what preserves
+it at 16 bytes (§2.2.9), and every alternative string design is
+measured against it.
 
 **Per-value state vs. per-buffer facts.**  String state splits into
 two locations by one criterion: copies duplicate the tag and share
@@ -380,11 +399,14 @@ In the buffer header (per-buffer, `Heap` only):
 tag — and needs only the five *terminal* states (`ASCII`,
 `UTF8_LATIN1`, `UTF8_NON_LATIN1`, `EXTENDED_UTF8`,
 `MALFORMED_UTF8`), because inline strings are scanned eagerly and
-completely at construction (§2.2.7): checking at most 22 bytes is
-nearly free.  Tag-state arithmetic: Inline 5 (scan) × 2 (utf8) ×
-2 (warned) × 2 (tainted) = 40; Heap 2 × 2 × 2 = 8; 48 tag states
-total, leaving ample niche encodings for the enclosing
-`Value`/`ScalarCell` layouts (§2.3.6).
+completely at construction (§2.2.7): checking at most 13 bytes is
+nearly free.  Discriminant-state arithmetic under the fused
+variants (§2.2.9): raw-inline 5 (scan) × 2 (utf8) × 2 (warned) ×
+2 (tainted) = 40; packed 2 (alphabet) × 2 (utf8) × 2 (warned) ×
+2 (tainted) = 16 (the scan state is fixed — packed alphabets are
+ASCII by construction); heap 2 × 2 × 2 = 8.  64 string encodings
+plus the non-string twins still leave ample niche encodings for
+the enclosing `Value`/`ScalarCell` layouts (§2.3.6).
 
 **The Perl flag and the scan cache must never be conflated.**
 Verified against container perl 5.38: `chr(0x110000)` is legal core
@@ -421,7 +443,7 @@ the right tool there.  At the parse/compile boundary, a string
 literal's bytes are copied once out of the lexer's `Bytes` into the
 value representation: an 8-byte thin pointer cannot alias into a
 `Bytes` buffer.  One copy per literal at compile time is the price of
-8-byte handles at runtime.
+thin-pointer handles at runtime.
 
 **The equality inference grid and the single-scan rule.**  `eq`
 consults existing scan knowledge before touching bytes; the design
@@ -497,8 +519,11 @@ opportunistically (flagged → `ASCII`/`UTF8_LATIN1`; unflagged →
 large strings are where perl plays COW games.  A third storage kind
 over the same allocation family is additive if the regex-engine
 section (§11) needs it: the header refcount already supports views,
-and the packed form `SharedSlice { base: NonNull<u8>, offset: u32,
-len: u32 }` (16 bytes) fits the envelope.  Because taint is
+and a compact `SharedSlice { base: NonNull<u8>, offset: u32,
+len: u32 }` (16 bytes) cannot fit beside a discriminant in the
+envelope (§2.2.9); capture views are therefore boxed
+behind a thin pointer — one small view allocation per materialized
+capture, with the buffer bytes themselves still shared zero-copy.  Because taint is
 per-value (tag) rather than per-buffer, a capture can be a
 zero-copy view into a *tainted* source's buffer while carrying a
 clean tag — the sanctioned untaint path (§2.6.2) costs no copy, a
@@ -517,7 +542,7 @@ what the Perl flag *claims* about them.  The states are tuned by
 consume (§2.3.5): a flagged string whose characters all fit
 U+0000–U+00FF can equal an unflagged string; a flagged string known
 to contain a character ≥ U+0100 can equal *no* unflagged string —
-the comparison is skippable, guaranteed false.  Eight states:
+the comparison is skippable, guaranteed false.  Nine states:
 
 | state | meaning |
 |---|---|
@@ -604,11 +629,13 @@ with the character-operations design.  Cross-check against 5.42's
 flagged string is a character count — a fact the classification
 decode walks right past, so under the single-pass fusion law it is
 counted then and cached in the buffer header (`char_count`,
-sentinel 0 = unset; sound for heap buffers specifically, which
-exceed the inline maximum and hence hold at least two characters —
-inline strings recount their ≤ 22 bytes trivially).  Self-validating
-sentinel ⇒ relaxed atomics, by the same deterministic-content
-argument as the scan byte; shared across COW sharers like all
+sentinel `MAX` = unknown — a zero sentinel is unsound because heap
+strings never demote and can truncate to empty; inline strings
+recount their ≤ 13 bytes trivially).  Relaxed atomic stores
+suffice here, unlike the scan byte: the character count of fixed
+bytes is unique, so racing writers store the *same* value through
+an atomic — benign by identity, where scan discoveries need the
+CAS-meet; shared across COW sharers like all
 per-buffer knowledge.  Appends maintain the count incrementally
 (prior + added, the added side counted by its own classification
 pass); the known-valid classifier's early bail legitimately forfeits
@@ -688,10 +715,15 @@ Once a state is narrowed, no subsequent operation widens it unless
 the bytes are mutated.  Because narrowing records a fact about
 immutable-at-that-moment bytes, it may happen through a shared
 reference: the header scan byte is an `AtomicU8` written with
-relaxed ordering.  Races are benign by the lattice: concurrent
-scanners of a shared (immutable) buffer compute compatible
-narrowings of the same bytes, and monotone writes of identical
-terminal states commute.  Mutation requires `&mut` on a unique
+relaxed ordering.  Races require a merge, not blind stores: two correct scanners of
+the same bytes can compute *different* narrowings — a cheap
+high-bit probe yields `NON_ASCII` while a full classification
+yields `UTF8_LATIN1` — and a plain last-wins store would widen the
+cache, discarding knowledge.  The scan byte is therefore written
+with a Relaxed CAS loop storing the lattice *meet* of the current
+and discovered states; the meet never replaces a state with a less
+precise one, and it is the identity exactly when the discovery
+adds nothing.  Mutation requires `&mut` on a unique
 buffer (COW extraction first when shared), so the transition rules
 below apply at mutation sites exactly as written:
 
@@ -699,8 +731,9 @@ below apply at mutation sites exactly as written:
   Cannot affect UTF-8 validity or introduce non-ASCII content.
 
 - **Appending or prepending `&str`** to a valid UTF-8 string:
-  preserves `UTF8_UNKNOWN_RANGE` or `UTF8_UNKNOWN_RANGE`.  Valid UTF-8
-  concatenated with valid UTF-8 is valid UTF-8.
+  yields a Rust-valid result: `UTF8_UNKNOWN_RANGE` in general, or
+  the wider of the two range classes when both sides are terminal.
+  Valid UTF-8 concatenated with valid UTF-8 is valid UTF-8.
 
 - **Inserting mid-string** into any string results in invalid
   UTF-8 if the byte at the insertion point is a UTF-8 continuation
@@ -736,10 +769,13 @@ below apply at mutation sites exactly as written:
 - **Removing valid UTF-8 characters** from a valid UTF-8 string
   (respecting character boundaries): validity is preserved, range
   knowledge weakens to `UTF8_UNKNOWN_RANGE` (from `UTF8_NON_ASCII`
-  and `UTF8_NON_LATIN1` alike: the removal may have taken the last
-  non-ASCII or non-Latin-1 character) — except from `ASCII` (stays
-  `ASCII`) and from `UTF8_LATIN1` (stays `UTF8_LATIN1`: removing
-  characters cannot raise the maximum).
+  and `UTF8_NON_LATIN1` alike, and from `UTF8_LATIN1` too: removal
+  cannot raise the range ceiling, but it can delete the last
+  non-ASCII character the state asserts is present — "éa" minus
+  "é" is pure ASCII) — except from `ASCII` (stays `ASCII`: removal
+  falsifies nothing a pure-ASCII classification asserts).  The
+  general rule: mutation may keep a state only if the state's
+  definition asserts nothing the mutation can falsify.
 
 - **Removing non-ASCII bytes**: reset to `UNKNOWN` (remaining
   content is unknown).  This includes removal from `EXTENDED_UTF8`
@@ -767,8 +803,8 @@ testing against zero.
 #### 2.2.7 Construction policy:
 
 - `Inline`: always scan *fully* at construction — ASCII plus
-  validity including the extended forms (checking ≤22 bytes is
-  nearly free) — yielding one of the four terminal states.  From
+  validity including the extended forms (checking ≤13 bytes is
+  nearly free) — yielding one of the five terminal states.  From
   Rust `&str`/`String` the validity half is known from the type.
   This is the only eager scan; inline scan states are therefore
   always terminal and live in the tag (§2.2.3).
@@ -800,6 +836,155 @@ is cheap for numbers and small strings.  If profiling ever shows
 recompute costs on hot unshared values, the recorded escape hatches
 are promotion or slot-level caches with generation stamps; the latter
 is deliberately deferred (§2.3.6).
+
+#### 2.2.9 The 16-byte envelope:
+
+**The envelope is 16 bytes** — `Value`, `ScalarPayload`, and
+`Option` of each.  The load-bearing invariant a wider envelope
+would buy — numeric stringifications inline (§2.2.3) — is
+delivered instead by the packed string tier below, so the choice
+reduces to density, where 16 wins outright.
+
+Why 16, against 24 and wider:
+
+- **The envelope is the one multiplier over every value slot** —
+  array elements, hash values, pads, stacks, temporaries, the
+  release worklist.  Against perl 5.42 fixed structures: a mixed
+  array element is 16 vs 32 (element pointer + bodyless SV), a
+  short-string element 16 vs ~48 + buffer, a plain scalar variable
+  16 vs 32 (SV + pad pointer), a promoted cell node 40 vs 72
+  (PVMG).  A 24-byte envelope reads 1.33×/2×/1.33×/1.5× on the
+  same rows.
+- **16 is a power of two**: two values per cache line exactly, no
+  element ever straddles a line (at 24, every third does), and
+  index arithmetic is a shift.  Composes with the 4 KiB page
+  geometry (§2.4).
+- **16 is the floor for this feature set**: a self-describing
+  envelope carrying a full-width `f64` needs the payload 8-aligned
+  with the discriminant outside it.  Everything below 16 is
+  NaN-boxing (rejected, §2.3.6).
+- **The regret is asymmetric**: 16's known weakness (the
+  14-22-byte raw-string window) is patchable afterward inside the
+  envelope — the packed tier below, prefix caches, interning;
+  24's weakness (8 bytes on every slot) is permanent.
+
+Variant consequences: taint moves into the discriminant as twin
+encodings per payload-bearing variant — activating the fallback
+shape recorded in §2.3.6, with the discipline unchanged (taint
+handling stays centralized in the ops-layer propagation function;
+the twins are a layout encoding, not per-match taint logic).
+`Typed` boxes thin (a sized header owns the trait object; one
+extra indirection on an embedder-facing rarity).  Fat pointers are
+forbidden in the envelope — any `Arc<str>`/`Box<dyn>`-shaped
+payload costs 8 bytes globally (measured), and the assertion
+battery is the tripwire.
+
+**The string tier** splits three ways, fused into the enclosing
+enum's discriminant (an opaque inner string type cannot fuse; the
+inner tag would cost a word — the §2.3.6 nesting lesson):
+
+- **Raw inline, ≤ 13 bytes**: the §2.2.4 scan machinery intact,
+  eagerly scanned at construction.
+- **Nibble-packed, ≤ 28 characters**, for digit-dense text — two
+  characters per byte over a 16-symbol alphabet.  Two alphabets,
+  selected by format bits: *numeric* {pad, 0-9, `-`, `.`, `e`,
+  `+`} and *datetime* {pad, 0-9, `-`, `.`, `:`, `T`, `Z`}.
+  Nibble values are assigned in ASCII order with pad below all
+  symbols, so same-alphabet packed comparison is `memcmp`;
+  cross-alphabet comparison decodes (table lookups).  Packing is
+  an **encoding, never a canonicalization**: exact byte
+  round-trip is the invariant, and a packed string is
+  observationally identical to its raw form in every operation —
+  length, index, substr, regex, numification and its warnings —
+  a stated test-battery obligation.  The datetime alphabet is
+  T-form ISO; space-separated timestamps take the raw or heap
+  tier (the 17th-symbol trade, recorded).  Every `%.15g` output
+  and every `i64` stringification fits the numeric alphabet.
+- **Heap, thin pointer** to the string node; the §2.2.3-§2.2.6
+  buffer architecture (single-fetch, scan header, COW) carries
+  forward unchanged.
+
+The standalone `PerlString` is 16 bytes too — the tag budget
+closes in one byte (kind 2 bits, scan 3, utf8/warned/tainted 3),
+leaving 15 payload bytes: raw ≤ 13 and packed ≤ 28, identical to
+the fused tiers, with the heap kind a thin pointer plus a u48
+mirrored length in the spare bytes.  Its tiers and capacities are identical to the fused variants, and
+the `Value`↔key boundary is an exhaustive-match reconstruction —
+which the optimizer reduces to a copy plus tag write in practice,
+but is **never a transmute**: the size assertions pin neither
+discriminant placement nor niche selection, so no code may depend
+on byte-level correspondence between the two types.  No capacity
+mismatch exists, `keys()` materializes heap-shared keys by
+refcount bump, hash entry pairs are 32 bytes (two per cache
+line), and one capacity ladder serves both contexts.  The raw key
+window (14-22 bytes, previously inline) falls under the same
+corpus tripwire, softened for keys because keys repeat: the heap
+cost is per-distinct-key-per-hash, not per-operation.
+
+**Packed-decimal numeric caches.**  The digits are the expensive
+product of numeric stringification; rendering cached digits is
+nibble unpacking.  `Float` carries a cache of up to 10-11
+significant digits plus decimal exponent, sign, and count; `Int`
+carries up to 12 digits plus sign and count (no exponent).  The
+cached digits are always perl's `%.15g` output digits — never
+shortest-round-trip — so the cache cannot leak a formatting
+divergence.  Coverage is the point: `%.15g` trims trailing zeros,
+making the digit-count distribution bimodal (container-measured:
+parse-born and money-shaped values at 1-8 digits, arithmetic
+artifacts at 14-15, nothing between), so the cache covers the
+short mode completely and the long mode recomputes — **all or
+sentinel**.  Partial-digit resumption is unsound to build on:
+correctly-rounded completion requires the high-precision remainder
+state the digits were extracted from, which dwarfs the digits;
+there is no cheap verify-or-resume mode.  Cached digits do
+accelerate every *narrower* format for free (rounding a cached
+sequence down is next-digit inspection plus carry).  Values are
+copied and assigned whole, so the cache travels with copies and
+can never go stale — no invalidation logic exists.  Fill
+protocol, stated with the memory model rather than against it:
+concurrent *plain* writes are a Rust data race even when every
+writer stores identical bytes — undefined behavior regardless of
+value — so the shared-reference fill makes every concurrently
+written cache byte atomic: digit bytes are `AtomicU8` fields
+stored Relaxed, then the count byte is Release-published; readers
+Acquire the count and Relaxed-load digits.  Racing fillers store
+identical values *through atomics*, which is defined.  All of this
+lives inside the ordinary enum variant — the discriminant stays
+compiler-owned; a hand-tagged `repr(C)` value representation to
+host an atomic metadata word would re-open the manually-tagged
+union §2.3.6 rejects (the SV-flag-discipline architecture this
+design exists to eliminate) to optimize a seven-byte cache.  An
+`EMPTY → FILLING → READY` tri-state (losing fillers recompute
+locally instead of double-writing) is the recorded optimization if
+redundant fills ever measure.  Parse-born values fill free at construction
+when the literal has ≤ 15 significant digits (such literals
+round-trip through `f64` to their own text; longer literals defer
+to stringify-time fill).  Open sub-decision, surfaced: universal
+fill through shared references (atomic cache bytes; `Value`
+implements `Clone` manually, copying relaxed) versus best-effort
+fill only where the ops layer holds `&mut` (no atomics; misses
+shared-container reads).
+
+One recorded casualty: the 16-byte inline `SharedSlice` capture
+view exceeds the envelope beside a discriminant; capture views box
+behind a thin pointer (§2.2.3) — buffer bytes still shared
+zero-copy, and the zero-copy sanctioned-untaint dividend is
+unaffected.
+
+**Corpus tripwire** (ledgered, runs during implementation, does
+not gate the ruling): measure over representative Perl corpora
+(a) the share of strings in the 14-22-byte window, (b) the
+packable share of that window, (c) separator conventions in
+datetime-shaped data (the 17th-symbol trade), (d) the
+significant-digit histogram of numeric output.  If the raw window
+share comes back large, the mitigations are in-envelope (heap-form
+prefix cache in the spare bytes, interning tier), not a return
+to 24.
+
+Knock-on layout targets, measured at implementation: `ScalarCell`
+folds to 16 (the `Plain` payload's spare discriminant encodings
+absorb the cell's own tag, as `Option<Value>` does); the §2.3.6
+assertion battery rebases to 16 wholesale.
 
 ### 2.3 Promoted Scalars
 
@@ -844,7 +1029,7 @@ enum ScalarRef {
 
 ```rust
 enum ScalarCell {
-    Plain(ScalarPayload),      // the common promoted case: 24 bytes
+    Plain(ScalarPayload),      // the common promoted case: 16 bytes
     Full(Box<FullScalar>),     // rare state; payload moves into the box
 }
 
@@ -861,7 +1046,7 @@ struct FullScalar {
 }
 ```
 
-`ScalarCell` is 24 bytes: the `Full` variant is a single pointer that
+`ScalarCell` is 16 bytes (§2.2.9): the `Full` variant is a single pointer that
 threads through the payload's spare niche encodings (measured;
 §2.3.6).  Upgrade from `Plain` to `Full` happens **in place under the
 write lock** — the `Arc` address never changes, preserving every
@@ -873,9 +1058,9 @@ guarantee is identical.
 Cost ledger for a promoted scalar (64-bit, parking_lot):
 
 ```text
-Plain:  Arc header 16 + RwLock 8 + cell 24  =  48 heap bytes,
+Plain:  slot control 8 + RwLock 8 + cell 16  =  32 slab bytes,
         one allocation, payload inline, hot access = lock + match.
-Full:   48 + one extension allocation; payload and rare state
+Full:   32 + one extension allocation; payload and rare state
         colocated in one box (better locality for magic ops than a
         split layout); full-cell payload reads pay one indirection —
         acceptable because full cells are rare: mainstream OO blesses
@@ -1054,29 +1239,32 @@ All sizes below are measured (probe programs preserved in the repo)
 and enforced at compile time:
 
 ```rust
-const _: () = assert!(size_of::<Value>() == 24);
-const _: () = assert!(size_of::<Option<Value>>() == 24);
-const _: () = assert!(size_of::<ScalarPayload>() == 24);
-const _: () = assert!(size_of::<ScalarCell>() == 24);
-const _: () = assert!(size_of::<Option<ScalarCell>>() == 24);
-const _: () = assert!(size_of::<PerlString>() == 24);
+const _: () = assert!(size_of::<Value>() == 16);
+const _: () = assert!(size_of::<Option<Value>>() == 16);
+const _: () = assert!(size_of::<ScalarPayload>() == 16);
+const _: () = assert!(size_of::<ScalarCell>() == 16);
+const _: () = assert!(size_of::<Option<ScalarCell>>() == 16);
+const _: () = assert!(size_of::<PerlString>() == 16);  // layout-compatible with Value's string region
 ```
 
 The load-bearing layout facts:
 
-- **The envelope is 24 bytes** (ruled): full inline `i64` and `f64`,
-  22 inline string bytes covering all numeric stringifications, thin
-  heap pointers, `Option` at no cost.  The denser 16-byte layout was
-  measured reachable (14 inline bytes, taint as parallel variants)
-  and rejected: it taxes numeric<->string conversion — Perl's
-  characteristic hot path — to optimize storage density, and packed
-  containers are the better remedy if dense numeric arrays ever
-  dominate profiles.
+- **The envelope is 16 bytes** (ruled at §2.2.9): full inline
+  `i64` and `f64` with taint as discriminant twins, the 13-byte
+  raw plus 28-character nibble-packed string tiers, thin heap
+  pointers, `Option` at no cost, and per-value packed-decimal
+  numeric caches.  A 24-byte envelope (22 raw-inline bytes, no
+  packed tier) would buy back the 14-22-byte raw-string window at
+  eight bytes on every slot; the packed tier keeps every numeric
+  stringification inline without that tax, and the residual raw
+  window is monitored by the §2.2.9 corpus tripwire with
+  in-envelope mitigations recorded.
 - **Padding placement follows variant size.**  Sub-maximal variants
   may carry redundant or flag fields in their padding for free,
   provided every mutation path that invalidates the redundancy
-  passes through `&mut` on the same handle (the taint bools on
-  `Int`/`Float`/`Ref`, the mirrored length in the string handle);
+  passes through `&mut` on the same handle (the mirrored length in
+  the string handle; formerly the taint bools, now discriminant
+  twins per §2.2.9);
   maximal variants (strings) must fold flags into the *inner*
   type's discriminant —
   adding outer `Value` variants that carry `PerlString` defeats the
@@ -1121,9 +1309,9 @@ Considered and rejected (recorded so the questions stay settled):
   stable allocation instead.
 - **`bytes::Bytes` as the heap string payload.**  Sound (the
   original design used it, and its COW model is carried forward in
-  mechanism), but its 32-byte fat handle repeals the 24-byte
-  envelope wholesale — `Value` returns to 40 and every downstream
-  layout reverts.  Storing it *behind* a pointer is dominated both
+  mechanism), but its 32-byte fat handle repeals the envelope
+  wholesale — `Value` would be 40 bytes and every downstream
+  layout follows.  Storing it *behind* a pointer is dominated both
   ways: `Box<Bytes>` allocates per clone (recreating the copy-cost
   regression); `Arc<Bytes>` stacks two refcounts, double-derefs
   every access, and churns allocations at the COW break.
@@ -1144,19 +1332,17 @@ Considered and rejected (recorded so the questions stay settled):
   top plus a boundary-migration path where bugs live.  Its
   sub-tendril slicing is the one feature worth reproducing natively
   (the `SharedSlice` note in §2.2.3).
-- **Parallel tainted variants** (`TaintedInt(i64)` etc.) instead of
-  padding fields.  Measured layout-equivalent at 24 bytes (and
-  *required* at 16, where payload bools break the niche).  The
-  genuine argument for them — exhaustiveness forces every match to
-  confront taint — points at the wrong discipline: taint handling
-  belongs in one centralized ops-layer propagation function, not
-  scattered per-match arms, and under that structure a uniform
-  field is the right shape while variants double every exhaustive
-  match forever for a mode most programs never enable.  Also
-  violates the padding-placement rule without layout forcing it.
-  The anti-laundering concern is answered by the `Tainted` API
-  contract instead.  Recorded as the required fallback shape should
-  the envelope ever drop to 16.
+- **Taint as padding-resident payload fields** (`Int(i64,
+  Tainted)` etc.) instead of twin discriminants — layout-free only
+  where variant padding can absorb the bool; at the 16-byte
+  envelope the payload bools break the niche budget, so twin
+  discriminants are the ruled shape (§2.2.9).  The discipline
+  question is independent of the shape: taint handling is
+  centralized in one ops-layer propagation function, matches bind
+  through taint-erasing accessors — the twins are a layout
+  encoding, not an invitation to per-match taint arms — and the
+  anti-laundering concern is answered by the `Tainted` API
+  contract.
 - **Taint as magic** (perl's own mechanism).  Correct but
   architecture-mismatched: perl amortizes the one-time `PVMG`
   upgrade over a persistent SV's lifetime, while our compact values
@@ -1214,7 +1400,7 @@ behavior is matched, vocabulary is not.  The type roster:
 PerlString    a Perl string: bytes + utf8/warned/tainted in its tag
 CowBuffer     custom COW byte buffer: (ptr, len) handle;
               {refcount, len, capacity, scan} header
-Value         the universal 24-byte slot value
+Value         the universal 16-byte slot value
 ScalarPayload the authoritative datum of one scalar
 ArraySlot     Option<Value>: None = hole, Some(Undef) = undef element
 ScalarRef     shared identity of a promoted scalar (Mut | Const)
@@ -1298,7 +1484,7 @@ Graph-bearing nodes are allocated from **typed slab arenas** through
 pointer derived from `portable_atomic_util::Arc` (dual-licensed
 MIT/Apache-2.0; itself derived from `std::sync::Arc`), with all
 allocation paths replaced by typed slab slots.  The handle is one
-`NonNull` pointer (`repr(transparent)`), so every niche and 24-byte
+`NonNull` pointer (`repr(transparent)`), so every niche and envelope
 assertion from §2.3.6 is preserved; this is measured by the
 assertions, not assumed.  The fork retains only the API surface the
 runtime uses (roughly: new_in, clone, drop, downgrade, upgrade,
@@ -1335,84 +1521,142 @@ After demolition clears every edge, internal cycles' counts fall
 and their slots free normally — only genuinely escaped handles keep
 slots alive.  Perl-parity behavior, Rust-sound storage.
 
+**Normative geometry.**  Logical pages are 4 KiB; extents are
+2 MiB-aligned 2 MiB reservations obtained through a narrow
+`VirtualMemory` abstraction (Unix: anonymous `mmap` with
+overallocate-and-trim alignment; Windows: reserve then commit),
+never through the global allocator.  The leading pages of each
+extent hold its descriptor region — the extent header and the
+`PageMeta` array — so every lookup is address arithmetic: page
+base = `addr & !0xFFF`, extent base = `addr & !(2 MiB − 1)`,
+descriptor = extent base + page index; no global table sits on the
+hot path.  The slot ordinal is `offset / stride` with the stride
+from the descriptor (a division, not a bitfield — strides vary by
+node class; `ScalarCell` at 32-byte slots yields 128 per page).
+Startup asserts the platform geometry (system page size a multiple
+of 4 KiB); commitment follows demand; reclamation is tiered with
+hysteresis — slot → page free-bitmap → extent free-page set →
+OS decommit/unmap for whole empty ranges, retaining a small
+empty-extent reserve — and per-thread active-page caches keep
+system calls off the allocation path entirely.  Huge-page backing
+is a measured option, not a correctness dependency.
+
 Destruction levels: **level 0** runs outstanding `DESTROY`
 (remaining strong cycles may persist until process end); **level 1**
 additionally demolishes every graph edge in the domain and releases
 nodes iteratively; **level 2+** adds invariant diagnostics.
 External handles never dangle at any level.
 
-#### 2.4.3 The slot: identity-level metadata
+#### 2.4.3 The slot: one word
 
-Each typed slab slot holds allocator-owned metadata *around* the
-Arc control block:
+The per-slot control block is **exactly eight bytes**:
 
-```text
-Slot<T>
-├── SlotMeta            lives for the slot's whole lifetime
-│     slot_state: AtomicU8       (physical allocator state ONLY:
-│                                 Free / Constructing / Occupied /
-│                                 PayloadDropped — "may these bytes
-│                                 be enumerated or reused?")
-│     identity_flags: AtomicU32  (READONLY, ...)
-│     class_id: AtomicUsize      (0 = unblessed; stash identity)
-│     finalizer_next: AtomicPtr  (intrusive pending-finalization link)
-│     page: NonNull<PageHeader>  (initial impl; masking is the
-│                                 measured alternative)
-│     allocation_serial          (debug builds)
-└── ArcInner<T>         reserved until weak count reaches zero
-      rc_state: AtomicUsize      (count bits + ALL logical state,
-                                  §2.4.4 — "is this node live,
-                                  pending, destroying, forced,
-                                  committed dead, immortal?")
-      weak: AtomicUsize
-      data: ManuallyDrop<T>      (alive while real refs or hold exist)
+```rust
+#[repr(C)]
+struct Slot<T> {
+    rc_state: AtomicU64,       // strong count + ALL state (§2.4.4)
+    data: ManuallyDrop<T>,     // alive while real refs or hold exist
+}
+const _: () = assert!(size_of::<AtomicU64>() == 8);
 ```
 
-Logical lifecycle state lives *only* in `rc_state`.  A separate
-logical atomic in the slot would recreate the exact two-word
-coherence race the combined word exists to eliminate; `slot_state`
-answers only the allocator's physical question, and no logical
-transition writes both words.
+`rc_state`'s bit budget: a 48-bit strong-unit count and 16 bits of
+state and flags.  A 48-bit count cannot be reached by *live*
+handles (10^14 references would need petabytes to store), but a
+`clone`-then-`forget` loop increments without retaining anything
+and reaches 2^48 in days — so the increment path is bounds-checked:
+every clone CAS aborts at a threshold well below wrap (the
+`std::sync::Arc` posture; the check rides the state-validating CAS
+loop the clone table already requires, costing nothing extra).
+Silent wrap is never permitted.  The flag space holds the logical
+states of §2.4.4, `HOLD`, the enumeration-pin field (§2.4.6),
+`READONLY`, and the **physical slot phases** (`Free` /
+`Constructing` / `Occupied` / `PayloadDropped`) — folded into the
+same word — one word holds the entire lifecycle, so no second
+atomic exists for a logical transition to race.
 
-**The placement criterion.**  Semantic identity determines what
-*may* move out of the payload; lifetime, synchronization, size, and
-access frequency determine what *does*.  Identity-level state
-survives payload assignment (container-verified: blessing and
-readonly both do) and belongs to the slot: lifecycle, readonly,
-class identity, finalization state.  Value-level state travels with
-copies and stays in the locked payload: taint, the coercion caches
-and their validity, `numify_warned`, boolean-ness.  Magic is
-identity-level but *structured* (variable-sized, traversed under
-semantic synchronization, potentially executable) — it stays in the
-locked `Full` region, not in slot atomics.
+Nothing else is per-slot; every other concern is page-level or
+sparse, under one principle: **a feature costs
+memory only where it is used, and typed pages make the sparsity
+structural**:
 
-Hot/cold layout note: the count word is the hot line; slot-state,
-flags, and class transitions are rare and should not share it.
-Parallel per-page metadata arrays and aligned-masking page
-identification are recorded as measured alternatives.
+- **`class_id`** — a **lazily allocated per-page parallel array**
+  of `AtomicU32`, indexed by slot ordinal.  A page allocates its
+  class array on the first `bless` landing in it: the installer
+  allocates a zeroed array and publishes it with a CAS on the
+  page-descriptor pointer (a racing loser frees its copy);
+  thereafter the §2.4.4 publication order is unchanged — install
+  the hold, then Release-store the array element; an Acquire load
+  of a nonzero element implies a visible hold, and a null array
+  pointer *is* the unblessed answer.  `ScalarCell` pages in
+  object-oriented code essentially never see `bless`; blessed-hash
+  pages pay four bytes per slot — exactly the nodes doing method
+  dispatch.  Semantics are unchanged from the inline word: stash
+  *object* identity in the domain-local tombstoning table, zero
+  means unblessed, delete-and-recreate yields a new identity,
+  dispatch on tombstoned entries stays defined.  The cost, stated:
+  dispatch's class load gains one dependent indirection (mask →
+  descriptor → element) — a ledgered measurement (§2.4.11), with
+  the mitigation that this is precisely the cold identity line the
+  false-sharing guidance wanted off the count word.
+- **The weak count** — the same lazy per-page `AtomicU32` array
+  shape, allocated on the page's first `weaken`.  `Weak` clone and
+  drop touch the array; **`upgrade` never does** — it is a pure
+  `rc_state` CAS, so the hot weak path is untouched.  Slot reuse
+  gates on the array element (§2.4.10).
+- **Readonly** — an `rc_state` flag.  Protocol unchanged: mutations
+  may load relaxed as a fast rejection, must recheck under the
+  write lock; the check under the lock is authoritative.  Uniform
+  across node kinds; a `Plain` cell never promotes to carry it.
+  The bless-on-readonly facts stand as verified: croak on a
+  readonly referent (`sv_bless`), `Can't bless non-reference
+  value`, and the `class`-feature `SVt_PVOBJ` restrictions
+  ledgered for the stash design.
+- **Finalization state** — no per-slot link exists; finalization
+  queues *pages* through per-page pending bitmaps (§2.4.5).
+- **Page identification** — no backpointer exists; pages are
+  recovered by address masking against the normative geometry
+  (§2.4.2).
+- **The allocation serial** — debug builds only, in an
+  out-of-line per-page array.
 
-**`class_id`** is one atomic word naming a *stash object identity*
-in a domain-local stable table — not a package-name slot.  Zero
-means unblessed; bless, rebless, and sweep discovery are single-word
-transitions with no pointee-liveness coupling (an `AtomicPtr` would
-race package deletion).  Table entries tombstone rather than
-recycle: `Symbol::delete_package` detaches the stash but preserves
-the identity; a recreated package is a new identity; dispatch on
-tombstoned entries stays defined.  (Perl's mechanism differs — the
-object holds a refcount on the stash HV, per `sv_bless` — but the
-observable behavior is what fidelity binds.)  The table's lookup
-structure is an implementation-stage item.
+**The placement criterion** survives with new homes.  Semantic
+identity determines what *may* leave the payload; lifetime,
+synchronization, size, and access frequency determine what *does*.
+Identity-level state (survives payload assignment —
+container-verified for blessing and readonly): lifecycle and
+readonly in `rc_state`, class identity in the sparse array,
+finalization state in `rc_state` plus the page bitmap.
+Value-level state travels with copies and stays in the locked
+payload: taint, the coercion caches and their validity,
+`numify_warned`, boolean-ness.  Magic is identity-level but
+*structured* — it stays in the locked `Full` region, not in
+control-word flags.
 
-**Readonly** is a slot flag, uniform across every node kind (no
-more per-container fields; a `Plain` cell no longer promotes to
-`Full` to carry one bit).  Protocol: mutations may load the flag
-relaxed as a fast rejection, must then acquire the write lock and
-recheck; the check under the lock is authoritative.  Verified
-against source and container: `bless` on a readonly *referent*
-croaks the standard modification error (`sv_bless`); `Can't bless
-non-reference value` and the 5.38 `class`-feature restrictions
-(`SVt_PVOBJ` can be neither bless target nor re-blessed) are
-ledgered for the stash design.
+**Size budget** (release, 64-bit; enforced by assertions at
+implementation, compared against perl 5.42 fixed structures):
+
+```text
+node               slot control  lock  payload  total   perl
+ScalarCell                    8     8       16     32   PVMG 72
+PerlArray                     8     8       24     40   AV   64
+PerlHash                      8     8     ~48+   ~64+   HV   56
+```
+
+The hash header is the one concession, repaid within a few entries
+(32-byte key+value pairs against perl's 24-byte `HE` + key + a
+24-byte value SV).  Amortized page metadata — bitmaps, queue state, lease, ops,
+stride, lazy-array headers, descriptors — targets **at most one
+byte per slot**, with half a byte the aspirational bound after
+field packing (per-class sharing of the ops/stride words, a
+compact lease); the claim is settled by the mandatory per-class
+table — stride, slots/page, measured `size_of::<PageMeta>()`,
+descriptor-region loss, bytes/slot — not asserted in prose.  The measured endgame, ledgered:
+folding the lock into `rc_state` flag bits (`parking_lot_core`
+parking keyed on the slot address) reaches a 24-byte total
+`ScalarCell` node — perl's bodyless SV head, payload included —
+at the price of a hand-rolled lock model and count/lock contention
+coupling on one word.
 
 #### 2.4.4 `rc_state` and the finalizer hold
 
@@ -1429,8 +1673,10 @@ only.  Consequences fall out exactly:
   until global destruction.  That *is* perl's cycle behavior.
 
 **The combined word is mandatory.**  Count and logical state live
-in one `AtomicUsize` (`rc_state`: count bits plus HOLD, PENDING,
-DESTROYING, IMMORTAL flags), because separate atomics race: with
+in one `AtomicU64` (`rc_state`: a 48-bit strong-unit count plus the
+state and flag bits — §2.4.3 gives the bit budget and the
+bounds-checked clone that aborts before overflow), because separate
+atomics race: with
 `strong: 2→1` and `lifecycle: Live→Pending` as two steps, a weak
 upgrade between them succeeds *after* the last real reference died.
 The last real release is a single CAS —
@@ -1439,13 +1685,13 @@ and a weak upgrade either linearizes before it (legitimately
 reviving the object) or observes the pending state and fails.
 
 The winning CAS creates the **exclusive finalization
-obligation**; intrusive-list membership (§2.4.5) is its
-*published* representation.  Between the pending CAS and the
-Treiber push the obligation exists unpublished — the producer
-critical section (§2.4.6) guarantees a shutdown phase transition
-cannot pass it by.  Exactly one owner exists at every instant:
-the producer (unpublished), the published domain list, or a
-stolen private batch.  Double-enqueue and
+obligation**; the pending bit on the page's queued bitmap
+(§2.4.5) is its *published* representation.  Between the pending
+CAS and the bit publication the obligation exists unpublished —
+the producer critical section (§2.4.6) guarantees a shutdown
+phase transition cannot pass it by.  Exactly one owner exists at
+every instant: the producer (unpublished), the published page
+bitmap, or a drainer's extracted words.  Double-enqueue and
 dropped-without-consuming obligations are impossible because
 only the pending-CAS winner ever publishes and only the claiming
 drainer ever consumes.
@@ -1624,7 +1870,7 @@ specification.  `DESTROY` never runs from Rust `Drop`; the destructor
 receives interpreter context, with the current-interpreter
 threading mechanism a §13 decision.
 
-#### 2.4.5 Finalization routing: choke points and the intrusive list
+#### 2.4.5 Finalization routing: choke points and the page-bitmap queue
 
 Perl fires `DESTROY` synchronously, mid-expression, inside the
 releasing operation (container-verified).  The timing rule, stated
@@ -1639,80 +1885,107 @@ and only then dropped.
 A context-free release — host Rust code dropping the last real
 handle on a thread with no interpreter — is an event perl cannot
 express (`SvREFCNT_dec` takes `pTHX`), so its semantics are ours to
-define, not a divergence.  The path is **allocation-free**: the
-winning CAS pushes the node's own slot onto the domain's intrusive
-pending list through `finalizer_next` (Treiber push: load, store
-next, CAS head).  No allocation, no locks, no Perl, nothing that
-can panic — fully conformant with the no-panic policy inside
-`Drop`.  The drain side steals the whole batch with one
-`swap(null)`; push order is LIFO and the drainer reverses it for
-stable batch-local processing — FIFO *within the stolen batch*
-only, since concurrent producers, multiple steals, and
-owner-recursive drains make no domain-wide order claim
-(ordering here is defined-by-us).  The correct ABA claim is the
-narrow one: address reuse and re-enqueue create no *harmful* ABA
-under the queue's membership and lifetime invariants — a queued
-node's hold keeps its slot occupied, a slot is never reused while
-it sits in a published or stolen batch, only the pending-state CAS
-winner publishes, and the drainer clears membership before
-resurrection can re-arm it.  The queue invariant, stated
-precisely: **the finalization-list machinery exclusively owns a
-slot's `finalizer_next` from publication until the drainer
-individually detaches the node; ownership resides either in the
-published domain list or in a stolen private batch.**  Pending
-states are `FinalizationPending`, `CleanObjsPending`, and
-`GlobalForcedPending` (§2.4.4).  Drainer order, per node: read the
-next pointer; clear this node's `finalizer_next`; CAS the pending
-state to the matching `Destroying` mode; invoke the callback only
-after a successful claim.  No callback or resurrection transition
-may occur while the link still belongs to a published or stolen
-list.  **Ticket exclusivity**: once a node is published, no arena scan
-or phase transition independently claims its finalizer hold —
-scanners skip every pending, destroying, and committed state, and
-only the drainer owning the published or stolen ticket may
-transition the node to its destroying mode.  A failed
-pending→destroying claim is therefore *not* an expected race: it
-is an invariant violation — diagnostic abort in checked builds,
-invariant-failure termination in production.  (Ticket
-cancellation/handoff is deliberately unmodeled initially; adding
-it later requires an explicit ownership-transfer protocol.)
+define, not a divergence.  The path is **allocation-free** and
+queues *pages*, not slots: a rare finalization event must not
+impose a pointer-sized permanent tax on every allocation.
 
-The memory-ordering contract is part of the list's safety proof,
-not an implementation detail: the node's pending-state CAS occurs
-*before* the list publication; the producer stores
-`finalizer_next = observed_head` Relaxed, then publishes with a
-Release CAS on the head (retrying against the newly observed head
-on failure); the drainer steals with `swap(null)` at Acquire (or
-stronger where the surrounding phase transition requires it) — The Acquire steal observes the producer's pending-state
-transition and the producer-local link initialization — and
-nothing more: independently published identity metadata is read
-through its own contract.  The synchronization proof is
+Producer, after winning the pending CAS in `rc_state` (the sole
+ticket creator, unchanged):
+
+1. `fetch_or` the slot's bit into the page's pending bitmap
+   (Release).
+2. Ensure the page is queued: load the page's queue state —
+   `Idle` → CAS `Idle → Queued` and Treiber-push the *page* onto
+   the domain's pending-page list (Release CAS on the head,
+   retrying against the observed head); `Queued` or `Draining` →
+   done (the drainer's recheck guarantees pickup).
+3. Wake (advisory).
+
+No allocation, no locks, no Perl, nothing that can panic — fully
+conformant with the no-panic policy inside `Drop`.
+
+Drainer, holding the drain-owner token: steal the whole page batch
+with one `swap(null)` at Acquire; per page, CAS `Queued →
+Draining`, then loop: atomically extract the pending words
+(`swap(0)`, Acquire), and for each set ordinal compute the slot
+address (`page_base + ordinal × stride`, the stride from the page
+descriptor — the sanctioned form of slot arithmetic), CAS that
+node's pending state to the matching `Destroying` mode, invoke the
+callback only after a successful claim, and drain all nested
+finalization it generates before continuing.  When an extraction
+returns empty: CAS `Draining → Idle`, then load the bitmap **once
+more** — if bits appeared, re-queue the page (`Idle → Queued`,
+push) and continue.  A producer that sets its bit after that final
+load observes `Idle` at its ensure-queued step and queues the page
+itself.  **The handoff's four operations are
+`SeqCst`** — the bit publication, the producer's state
+observation, the `Draining → Idle` transition, and the final
+recheck: with Release/Acquire on two *different* atomics, the
+store-buffer interleaving is legal in which the producer observes
+`Draining` (declining to queue) while the drainer's final load
+misses the independently published bit — both threads reading
+stale.  `SeqCst` restores the single total order that excludes it;
+finalization is rare enough that the fence cost is immaterial, and
+a dirty/generation RMW handshake on the state word (a producer
+observing `Draining` still RMWs; the drainer idles only if no
+generation moved) is the recorded faster alternative.  **The
+no-lost-work obligation** — every set bit is eventually extracted
+by exactly one drainer, under every interleaving including
+specifically the producer-sees-`Draining` race — is a named Loom
+proof obligation (§2.4.10), not prose.
+
+Mode is preserved by the ticket, not the queue: the pending states
+are `FinalizationPending`, `CleanObjsPending`, and
+`GlobalForcedPending` (§2.4.4), carried in `rc_state`; the bitmap
+is mode-blind and the per-node claim CAS lands in the matching
+`Destroying` mode.
+
+**Ticket ownership, three stages, exactly one owner at every
+instant**: *producer-unpublished* (between the pending CAS and the
+bit set — bracketed by the producer critical section, §2.4.6, so a
+phase transition cannot pass it by); *published* (bit set on a
+page that is `Queued`, held by a drainer, or about to be queued by
+its bracketed setter); *claimed* (bit extracted into a drainer's
+private words, through the pending→destroying CAS).  **Ticket
+exclusivity** is unchanged: no arena scan or phase transition
+independently claims a published hold — scanners skip every
+pending, destroying, and committed state — and a failed
+pending→destroying claim is an invariant violation (diagnostic
+abort in checked builds, invariant-failure termination in
+production; cancellation/handoff deliberately unmodeled).  Page
+reuse creates no harmful ABA: page descriptors live for the
+extent's lifetime, a page is never released to the pool while any
+slot is occupied, and re-queueing an already-seen page is the
+protocol working as designed.
+
+The memory-ordering contract is part of the queue's safety proof,
 compositional per field: `rc_state` through the combined-word CAS
-ordering; `finalizer_next` and the list head through Release
-publication and Acquire steal; `class_id` through Release store
-on bless/rebless/unbless and Acquire load by dispatch and the
-sweep; `identity_flags` through field-specific ordering plus the
-authoritative under-lock recheck.  The custom `HeapArc` inherits
-the remainder wholesale: the ordinary strong/weak ordering proof
-is retained from the upstream implementation, every modified
-operation is enumerated in the state-machine document with its
-additional `rc_state` transitions preserving or strengthening the
-upstream synchronization, and payload destruction performs the
-same release/acquire synchronization as the upstream last-strong
-path.  Because this is unsafe ownership infrastructure, the Loom
-model checks the written contract; it is not a substitute for
-one.
+ordering; the pending bitmap through Release `fetch_or` and
+Acquire extraction/recheck; the page queue through Release push,
+Acquire steal, and AcqRel state CASes; the class array through
+Release store on bless/rebless/unbless, Acquire load by dispatch
+and the sweep, and Acquire load of the lazy array pointer.  The
+custom `HeapArc` inherits the remainder wholesale: the ordinary
+strong/weak ordering proof is retained from the upstream
+implementation, every modified operation is enumerated in the
+state-machine document with its additional `rc_state` transitions
+preserving or strengthening the upstream synchronization, and
+payload destruction performs the same release/acquire
+synchronization as the upstream last-strong path.  Because this is
+unsafe ownership infrastructure, the Loom model checks the written
+contract; it is not a substitute for one.
 
-**Cross-type dispatch.**  One domain queue holds slots from
-different typed slabs (scalar, array, hash, and later code, glob,
-IO nodes), so the drainer must recover the type-specific
-finalization entry from a `SlotMeta` pointer.  The chosen design
-is a **type-specific operations table in the slab page header**,
-reached through the page identification the slot already carries —
-no per-slot type tag:
+Processing order is bitmap order within a page and steal order
+across pages — batch-local only; concurrent producers, multiple
+steals, and owner-recursive drains make no domain-wide order claim
+(ordering here is defined-by-us and unspecified).
+
+**Cross-type dispatch and domain routing** live in the page
+descriptor (§2.4.2: extent-resident, address-derived — no in-page
+header, no per-slot type tag):
 
 ```text
-PageHeader
+PageMeta (in the extent descriptor region)
     domain: DomainLease        (valid until every slot is free)
     ops: &'static NodeOps
         visit_strong_slots     (every strong Value field — §2.4.6)
@@ -1722,6 +1995,8 @@ PageHeader
         drop_payload_shallow   (destroys a T that provably owns
                                 no strong Perl edge)
         demolish_edges         (drains into the ReleaseContext)
+    stride, alloc bitmap, pending bitmap, queue state + link,
+    lazy class/weak array pointers, debug serials
 ```
 
 Edge extraction and payload destruction are separate operations
@@ -1738,33 +2013,27 @@ split; the slab backend keeps it as typed operations.)
 Pages are domain-dedicated (one logical domain per page until
 every slot frees), and the lease targets the `DomainCore` — which
 physically outlives every slot on the page, tombstoned or not —
-so a context-free drop can always reach its queue head, phase,
-and stash table.  The ownership direction is one-way: the
-process-global pool owns pages, each page owns its `DomainLease`,
-and `DomainCore` holds only non-owning page references — a
-domain that strongly owned pages holding strong leases back on
-it could never physically die.  Pointer recovery from
-`*mut SlotMeta` to the containing typed slot is by construction,
-not arithmetic: `SlotMeta` is the first field of `#[repr(C)]
-Slot<T>`, making the addresses identical (the alternative —
-computing slot boundaries from the page and index — is recorded;
-unchecked container-of arithmetic without a provenance argument
-is prohibited).  When a page's last slot goes physically free:
-remove the page from the domain's non-owning index, release the
-`DomainLease`, reset routing and type state — only then may the
-pool assign the page to another domain.  Per-class queue heads drained to a fixed point are
-the recorded alternative if the ops table proves awkward.
+so a context-free drop can always reach its queue head, phase, and
+stash table.  The ownership direction is one-way: the
+process-global pool owns extents and pages, each page owns its
+`DomainLease`, and `DomainCore` holds only non-owning page
+references — a domain that strongly owned pages holding strong
+leases back on it could never physically die.  When a page's last
+slot goes physically free (allocation bitmap empty, every weak
+array element zero): remove the page from the domain's non-owning
+index, release the `DomainLease`, reset stride/type/routing state
+and the lazy arrays — only then may the pool reassign the page.
 
 The two timing rules are distinct and both binding — boundary
 polling never substitutes for the synchronous rule:
 
 - **Interpreter-context last release**: the releasing operation
   itself drains before yielding its result (perl-exact timing).
-- **Context-free last release**: enqueue and wake; an eligible
+- **Context-free last release**: publish and wake; an eligible
   interpreter boundary polls and drains.
 
 **Draining is single-consumer per domain, and the consumer is
-owner-recursive**: any thread may push and wake, but one
+owner-recursive**: any thread may publish and wake, but one
 drain-owner token (owner thread plus depth) executes finalizers
 at a time.  Owner-recursion is a fidelity requirement, not a
 convenience — container-verified: when one `DESTROY` releases
@@ -1794,12 +2063,13 @@ cycles may remain intact indefinitely; at level 1+ the graph
 edges are already cleared (the race-free protocol is the domain
 phase machine, §2.4.6).
 
-Wake signaling is advisory; the list is authoritative.  The
-empty→nonempty push notifies, a parked drainer re-checks the head
-under the scheduler's synchronization (wake-generation counter or
-equivalent) so the check-push-notify-sleep interleaving cannot
-lose the only notification, and every operation boundary polls
-regardless — lost or redundant wakes are harmless.
+Wake signaling is advisory; the queue is authoritative.  The
+empty→nonempty publication notifies, a parked drainer re-checks
+the pending-page list under the scheduler's synchronization
+(wake-generation counter or equivalent) so the
+check-publish-notify-sleep interleaving cannot lose the only
+notification, and every operation boundary polls regardless —
+lost or redundant wakes are harmless.
 
 #### 2.4.6 Global destruction: the arena sweep
 
@@ -1867,7 +2137,8 @@ The passes mirror `sv_clean_objs` (source-verified structure):
    goes through the **internal enumeration pin**: a small
    internal-pin field in `rc_state`, claimed by CAS against a
    live state before the payload is touched and released after
-   the visit.  The pin blocks physical payload drop (a last real
+   the visit (candidates come from the page allocation bitmaps;
+   `rc_state` under the pin is authoritative).  The pin blocks physical payload drop (a last real
    release under pin defers the mechanical drop to pin release),
    is invisible to resurrection arithmetic and to
    `strong_count`, and never counts as a Perl reference.  This
@@ -1961,7 +2232,7 @@ The passes mirror `sv_clean_objs` (source-verified structure):
    (Acquire/Release); (2) load the phase; (3) validate that the
    phase permits the intended transition — on mismatch decrement
    and retry; (4) CAS `rc_state` into the corresponding pending
-   or mechanical state; (5) publish the intrusive entry if a
+   or mechanical state; (5) publish the pending bit and ensure the page is queued, if a
    ticket was created; (6) decrement `active_producers`
    (Release).
 
@@ -2037,7 +2308,7 @@ an explicit list.  So do we: graph-bearing teardown drains
 **extracted child `Value`s** through a runtime-owned, reusable,
 thread-local worklist (`Vec<Value>`), iteratively, never executing
 Perl.  This worklist is deliberately *not* the intrusive
-finalization list: its items are 24-byte values, not slots (they
+finalization list: its items are envelope-sized values, not slots (they
 have no link word to chain through), it needs no interpreter
 context, and its exception and reentrancy rules differ.  One
 mechanism per queue; a mechanical drain triggered while finalizers
@@ -2082,19 +2353,23 @@ resurrection with repeated count changes; forced unblessing
 racing weak upgrade; `class_id` clearing before hold-free `Live`;
 a pending CAS racing a domain phase transition; an unpublished
 obligation protected by an active producer (producers starting
-immediately before and after each phase publication); Treiber
-push racing batch steal; steal, detach, resurrection, and
-same-address re-enqueue; the exclusivity assertion that no
-interleaving produces a failed pending→destroying claim; the
-incremental forced sweep racing another object's last drop; slot
-enumeration racing an unblessed payload's context-free drop (the
-most important addition); final weak release racing page
-enumeration; slot reuse after final weak release; page
-reassignment after the final domain lease; fatal checked
-resurrection retaining its ownership obligations; owner-recursive
-nested finalization; drain-owner acquisition by competing
-threads; wake notification racing park; `slot_state` publication
-and reuse; and reduced-width refcount overflow; plus
+immediately before and after each phase publication);
+pending-bit publication racing page steal; the page queue's
+`Idle`/`Queued`/`Draining` no-lost-work obligation (a bit set
+racing the final recheck and the re-queue); bit extraction,
+claim, resurrection, and same-slot re-publication; the
+exclusivity assertion that no interleaving produces a failed
+pending→destroying claim; lazy class/weak array installation
+racing concurrent `bless`/`weaken`; the incremental forced sweep
+racing another object's last drop; slot enumeration racing an
+unblessed payload's context-free drop (the most important
+addition); final weak-array release racing page enumeration; slot
+reuse after final weak release; page reassignment after the final
+domain lease; fatal checked resurrection retaining its ownership
+obligations; owner-recursive nested finalization; drain-owner
+acquisition by competing threads; wake notification racing park;
+physical-phase publication and reuse; and reduced-width count
+boundary tests; plus
 differential tests against `std::sync::Arc` — scoped to the
 ordinary unblessed core (clone, downgrade, upgrade, releases,
 `ptr_eq`, payload dropped exactly once, control block released
@@ -2111,16 +2386,17 @@ upstream; `Clone` cannot return `Err`); finalizer publication from
 a reusable worklist that may grow — allocation-free release needs
 a separately specified preallocation strategy if ever required.
 
-`slot_state` has its own machine: `Free → Constructing`
-(initialize `SlotMeta`, the `ArcInner` counters, and `T`) `→
-Occupied` (Release-published — an enumerator's Acquire load of
-`Occupied` observes complete initialization) `→ PayloadDropped`
-(only after `T` is mechanically dropped) `→ Free` (only after
-final weak ownership disappears).  Enumeration inspects only
-`Occupied` slots and still takes the payload pin (§2.4.6).
-Before returning to `Free`, the slot clears `finalizer_next`,
-`class_id`, identity flags, stale routing metadata, and bumps the
-debug serial — reuse begins from a provably clean slate.
+The physical phases live in `rc_state` (§2.4.3): `Free →
+Constructing` (initialize the control word and `T`) `→ Occupied`
+(Release-published — an enumerator's Acquire load of `Occupied`
+observes complete initialization) `→ PayloadDropped` (only after
+`T` is mechanically dropped) `→ Free` (only after the slot's weak
+array element reaches zero).  Enumeration candidates come from the
+page allocation bitmap; the pin plus an `Occupied` check is
+authoritative (§2.4.6).  Before returning to `Free`, the slot
+clears its pending bit, its class and weak array elements, and
+bumps the debug serial — reuse begins from a provably clean
+slate.
 
 The first slab migration is `PerlArray` (the simplest graph-bearing
 node), validating layout, pinning, reuse, finalization queueing,
@@ -2144,13 +2420,17 @@ collect — the `Devel::Cycle` analog) as ordinary tooling under
 strict fidelity.
 
 Open items, marked here: the stash-table lookup structure and
-tombstone dispatch rules; page identification (backpointer vs
-aligned masking) and false-sharing layout — both measured
-decisions; process-continuation semantics after the
+tombstone dispatch rules; residual false-sharing layout questions (page identification
+itself is resolved: masking and extent-derived descriptors are
+normative, §2.4.2); process-continuation semantics after the
 `DESTROY created new reference` croak; which pure-Perl shapes
 reach the forced sweep rather than the checked pass, and whether
 perl's finite pass sequence achieves fixed-point coverage for
-recursively created objects (probe matrix); the `DESTROY`
+recursively created objects (probe matrix); the measured cost of
+the class-array dispatch indirection against an inline word; the
+wordless-lock endgame (lock bits in `rc_state` with address-keyed
+parking — count/lock contention coupling is the risk); weak-array
+teardown ordering against page reassignment; the `DESTROY`
 exception-reporting matrix (`G_KEEPERR` interaction with active
 exceptions, by phase); the dynamic environment
 (`$_`, `$@`, caller) installed for channel-drained `DESTROY` and
@@ -2180,7 +2460,9 @@ a stable Perl identity); the release-context
 posture during Rust TLS teardown (leaked per-thread context,
 domain fallback worklist, or a handle-holding restriction); the
 per-page
-blessed bitmap as a measured sweep optimization; exit-status
+blessed bitmap as a measured sweep optimization (the lazy class
+arrays already bound the sweep's scan to pages that ever
+blessed); exit-status
 semantics of a fatal sweep resurrection.
 
 ### 2.5 Magic (Tied Variables and Friends)
@@ -10308,30 +10590,39 @@ internal ordering follows the dependency structure of §2:
 8. `HeapArc`/`HeapWeak` façades (§2.4.10) — `repr(transparent)`
    wrappers over `std::sync::Arc`/`Weak`; every graph-bearing
    variant migrates; raw `Arc` construction becomes private to the
-   heap module; niche and 24-byte assertions re-verified.
+   heap module; niche and envelope assertions re-verified.
 
-9. Perl weak-reference semantics on the façade (§2.4.8) — the weak
-   variants, `weaken`/`isweak`, dead-weak-as-undef coercions,
-   `copy_for_assignment`, and the finalization-state interaction
-   points stubbed for step 10.
+9. The 16-byte envelope (§2.2.9) — `Value`/`ScalarPayload` shrink
+   to 16: taint becomes discriminant twins, the string tier splits
+   raw/packed/heap with fused variants, `Typed` boxes thin, the
+   packed-decimal numeric caches land, and the assertion battery
+   and capacity-boundary tests rebase.  Sequenced before the weak
+   variants deliberately: every later step adds variants and
+   payload-shape dependencies that make a re-envelope more
+   expensive.
 
-10. The typed slab and restricted custom `HeapArc` (§2.4.2-§2.4.5)
+10. Perl weak-reference semantics on the façade (§2.4.8) — the
+    weak variants, `weaken`/`isweak`, dead-weak-as-undef
+    coercions, `copy_for_assignment`, and the finalization-state
+    interaction points stubbed for step 11.
+
+11. The typed slab and restricted custom `HeapArc` (§2.4.2-§2.4.5)
     as a self-contained component — gated on the Loom model of the
-    `rc_state` state machine, intrusive push/steal, sweep-claim
+    `rc_state` state machine, page-bitmap publish/steal, sweep-claim
     races, and drain-owner token; differential, reuse, and
     destructor-accounting test layers.
 
-11. `PerlArray` slab migration — the first node class through the
+12. `PerlArray` slab migration — the first node class through the
     new backend, validating layout, pinning, reuse, finalization
     queueing, and cross-thread races.
 
-12. Remaining node classes (`PerlHash`, `ScalarCell`,
-    `ConstScalar`) once step 11's matrix passes.
+13. Remaining node classes (`PerlHash`, `ScalarCell`,
+    `ConstScalar`) once step 12's matrix passes.
 
-13. Mortal stack — `Vec<Value>` per interpreter, scope-entry marks,
+14. Mortal stack — `Vec<Value>` per interpreter, scope-entry marks,
     scope-exit drops.
 
-14. Task-local `local` mechanism — `Option<Box<LocalStack>>` with
+15. Task-local `local` mechanism — `Option<Box<LocalStack>>` with
     `WasInactive`/`WasActive` save stack.  Test with simulated
     scope entry/exit.
 
