@@ -886,19 +886,40 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
 - **Raw inline, ≤ 13 bytes**: the §2.2.4 scan machinery intact,
   eagerly scanned at construction.
 - **Nibble-packed, ≤ 28 characters**, for digit-dense text — two
-  characters per byte over a 16-symbol alphabet.  Two alphabets,
-  selected by format bits: *numeric* {pad, 0-9, `-`, `.`, `e`,
-  `+`} and *datetime* {pad, 0-9, `-`, `.`, `:`, `T`, `Z`}.
-  Nibble values are assigned in ASCII order with pad below all
-  symbols, so same-alphabet packed comparison is `memcmp`;
-  cross-alphabet comparison decodes (table lookups).  Packing is
+  characters per byte over 16-symbol alphabets.  Three alphabets,
+  selected by two format bits (which with the 5-bit length still
+  leave the byte intact): *numeric* {space, `+`, `-`, `.`, 0-9,
+  `E`, `e`}, *datetime-Z* {space, `-`, `.`, 0-9, `:`, `T`, `Z`}, and
+  *datetime-plus* {space, `+`, `-`, `.`, 0-9, `:`, `T`}.
+  **The space is nibble 0, shared with the padding and
+  disambiguated by position**: trailing zero nibbles are padding,
+  interior zero nibbles are spaces, and a string ending in a
+  space is therefore not packable — its final space could not be
+  told from padding.  The space costs nothing (nibble 0 was
+  already reserved) and it is ASCII 0x20, below every other
+  symbol, so it does not disturb ordering.  Splitting the
+  date-time spellings across two alphabets covers the whole ISO
+  grammar without a seventeenth symbol: a valid timestamp never
+  needs `Z` and `+` together, since Zulu *is* the zero offset —
+  so both offset forms, both date-time separators, and fractional
+  seconds are all encodable; the numeric alphabet likewise carries
+  both exponent spellings, since perl emits uppercase through `%E`
+  and `%G` and accepts either on numification (Zulu leaves room for seven
+  fractional digits, a numeric offset for two).  Nibble values
+  are assigned in ASCII order, so same-alphabet packed comparison
+  is `memcmp` — prefix ordering survives the shared zero because
+  a padded slot ties against an interior space and the longer
+  string, having no trailing space, must still reach a nonzero
+  nibble.  Cross-alphabet *ordering* decodes (table lookups);
+  cross-alphabet *equality* is decided by the alphabets alone,
+  since deterministic classification maps each byte string to
+  exactly one alphabet (fixed priority: numeric, datetime-Z,
+  datetime-plus).  Packing is
   an **encoding, never a canonicalization**: exact byte
   round-trip is the invariant, and a packed string is
   observationally identical to its raw form in every operation —
   length, index, substr, regex, numification and its warnings —
-  a stated test-battery obligation.  The datetime alphabet is
-  T-form ISO; space-separated timestamps take the raw or heap
-  tier (the 17th-symbol trade, recorded).  Every `%.15g` output
+  a stated test-battery obligation.  Every `%.15g` output
   and every `i64` stringification fits the numeric alphabet.
 - **Heap, thin pointer** to the string node; the §2.2.3-§2.2.6
   buffer architecture (single-fetch, scan header, COW) carries
@@ -975,7 +996,7 @@ unaffected.
 not gate the ruling): measure over representative Perl corpora
 (a) the share of strings in the 14-22-byte window, (b) the
 packable share of that window, (c) separator conventions in
-datetime-shaped data (the 17th-symbol trade), (d) the
+datetime-shaped data, (d) the
 significant-digit histogram of numeric output.  If the raw window
 share comes back large, the mitigations are in-envelope (heap-form
 prefix cache in the spare bytes, interning tier), not a return
