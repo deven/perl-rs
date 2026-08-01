@@ -1043,12 +1043,14 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   both exponent spellings, since perl emits uppercase through
   `%E` and `%G` and accepts either on numification.
 
-  **The priority order is chosen for the append path.**  Numeric
-  is a subset of datetime-plus on nibbles 0-13, so content that
-  starts numeric and meets a `:` or `T` widens with no rewriting
-  at all — and lands on the canonical alphabet, because
-  datetime-plus is where timestamps belong unless a `Z` forces
-  otherwise.  `Z` is the one symbol no other alphabet holds, so
+  **The priority order is chosen for the append path.**  All three
+  alphabets hold sixteen symbols, so none is wider than another;
+  they differ in which sixteen.  Numeric and datetime-plus agree on
+  nibbles 0-13, so content that starts numeric and meets a `:` or
+  `T` is reclassified with no rewriting at all — and lands on the
+  canonical alphabet, because datetime-plus is where timestamps
+  belong unless a `Z` forces otherwise.  `Z` is the one symbol no
+  other alphabet holds, so
   datetime-Zulu is reached only through it, which makes the
   variant itself a proof that the timestamp's offset is `+00:00`.
   Content migrating between alphabets transcodes: into

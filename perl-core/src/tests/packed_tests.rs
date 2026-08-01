@@ -243,9 +243,9 @@ fn nibble_assignment_is_ascii_monotone() {
 // ── Transcoding between alphabets ─────────────────────────────────
 
 #[test]
-fn numeric_widens_into_datetime_plus_without_rewriting() {
-    // The two lists agree on nibbles 0-13, so widening is a pure reclassification whenever no exponent symbol is
-    // present — the nibble array comes out identical.
+fn numeric_reclassifies_as_datetime_plus_without_rewriting() {
+    // The two lists agree on nibbles 0-13, so this is a pure reclassification whenever no exponent symbol is present —
+    // the nibble array comes out identical.
     for s in [&b"2026-07-28 2026-07-29"[..], b"192.168.100.200 1.2", b"1234567890123456", b"1234567890123456 "] {
         let numeric = pack(s).unwrap();
         assert_eq!(numeric.alphabet, PackedAlphabet::Numeric);
@@ -280,11 +280,11 @@ fn timestamps_transcode_into_zulu_by_decrement() {
     assert_eq!(offset.alphabet, PackedAlphabet::DateTimePlus);
     assert_eq!(offset.transcode(PackedAlphabet::DateTimeZulu), None, "'+' has no counterpart in DateTimeZulu");
 
-    // Widening from Numeric is free: the two agree on nibbles 0-13, so nothing is rewritten.
+    // Moving from Numeric is free: the two agree on nibbles 0-13, so nothing is rewritten.
     let numeric = pack(b"2026-07-28 2026-07-29").unwrap();
     assert_eq!(numeric.alphabet, PackedAlphabet::Numeric);
     let widened = numeric.transcode(PackedAlphabet::DateTimePlus).unwrap();
-    assert_eq!(widened.nibbles, numeric.nibbles, "widening rewrites no nibble");
+    assert_eq!(widened.nibbles, numeric.nibbles, "reclassification rewrites no nibble");
 }
 
 /// The transition specification, written out rather than re-derived from the symbol lists, so the test fails if the
@@ -305,7 +305,7 @@ fn expected_mapping(from: PackedAlphabet, to: PackedAlphabet, nibble: u8) -> Opt
             0x02..=0x0F => Some(nibble - 1),
             _ => None, // '+' at 0x01.
         },
-        _ => unreachable!("the append path only ever widens along these three transitions"),
+        _ => unreachable!("the append path only ever moves along these three transitions"),
     }
 }
 

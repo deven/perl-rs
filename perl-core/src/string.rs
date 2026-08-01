@@ -645,12 +645,11 @@ fn inline_eligible(bytes: &[u8]) -> bool {
     bytes.len() <= INLINE_MAX && !bytes.contains(&0)
 }
 
-/// Concatenate and re-pack, or `None` when the result leaves the packed tier — too long, or not encodable in any
-/// alphabet.
+/// Pack content that is entering the tier for the first time: inline bytes plus what is being appended to them.
 ///
-/// Re-classifying the whole result rather than widening the existing nibbles in place costs a decode the incremental
-/// path would avoid, and buys canonicity for free: `pack` picks the alphabet by the priority order, so a string built
-/// by appending is byte-identical to the same content constructed whole.
+/// Classification runs over the whole result because there are no nibbles to carry forward yet — that is
+/// [`Packed::push`]'s job, for content already packed.
+///
 fn pack_grown(head: &[u8], tail: &[u8]) -> Option<Packed> {
     let new_len = head.len() + tail.len();
     if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&new_len) {
@@ -1016,14 +1015,15 @@ impl PerlString {
                 }
             }
             RawOwned::Packed(p) => {
-                let (decoded, len) = p.unpack();
-                let old_bytes = &decoded[..len];
-
-                if let Some(packed) = pack_grown(old_bytes, bytes) {
+                if let Some(packed) = p.push(bytes) {
+                    // In place: the existing nibbles are kept, rather than the whole result being decoded and
+                    // re-encoded on every append.
                     PerlString::build_packed(packed, u, w, t)
                 } else {
-                    // Past the band, or no longer alphabet-conformant.  Packed content is ASCII, so the heap state
-                    // starts from there.
+                    // Past the band, or no longer alphabet-conformant: decode once, on the way out of the tier.  Packed
+                    // content is ASCII, so the heap state starts from there.
+                    let (decoded, len) = p.unpack();
+                    let old_bytes = &decoded[..len];
                     let new_len = len + bytes.len();
                     let mut cb = CowBuffer::with_capacity(new_len + (new_len >> 2))?;
                     cb.extend_from_slice(old_bytes)?;

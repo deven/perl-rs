@@ -15,9 +15,10 @@
 //! ([`Packed::transcode`]).
 //!
 //! The order above is the classification priority, and it is chosen for the append path.  `Numeric` is a subset of
-//! `DateTimePlus` on nibbles 0-13, so a string that starts numeric and meets a `:` or `T` widens with no rewriting at
-//! all — and lands on the canonical alphabet, because `DateTimePlus` is where timestamps belong unless a `Z` forces
-//! otherwise.  `Z` is the one symbol no other alphabet holds, so `DateTimeZulu` is reached only through it, which makes
+//! `DateTimePlus` on nibbles 0-13, so a string that starts numeric and meets a `:` or `T` is *reclassified* with no
+//! rewriting at all — and lands on the canonical alphabet, because `DateTimePlus` is where timestamps belong unless a
+//! `Z` forces otherwise.  All three alphabets hold sixteen symbols, so none is wider than another; they differ in which
+//! sixteen.  `Z` is the one symbol no other alphabet holds, so `DateTimeZulu` is reached only through it, which makes
 //! the variant itself a proof that the timestamp's offset is `+00:00`.
 //!
 //! # The length lives in the last nibble
@@ -51,10 +52,9 @@
 //!   DateTimeZulu, so equal byte contents always take equal representations — the prerequisite for representation-level
 //!   equality.
 
-// Four methods still await their consumers: `transcode` belongs to the incremental append path, which currently
-// re-packs the whole result instead of widening in place, and `cmp_same_alphabet`, `eq_bytes`, and `cmp_bytes` are the
-// comparison fast paths that `PerlString` has yet to route through — it decodes and compares bytes for now.  The expect
-// self-reports when either arrives.
+// Three comparison fast paths still await their consumer: `cmp_same_alphabet`, `eq_bytes`, and `cmp_bytes` are what
+// `PerlString` will route equality and ordering through, where it decodes and compares bytes for now.  The expect
+// self-reports when that arrives.
 #![cfg_attr(not(test), expect(dead_code))]
 
 use std::cmp::Ordering;
@@ -82,7 +82,7 @@ pub(crate) enum PackedAlphabet {
     Numeric,
 
     /// space `+` `-` `.` `0`-`9` `:` `T` — ISO timestamps in every form but Zulu.  The canonical alphabet for
-    /// timestamps, and a superset of `Numeric` on nibbles 0-13, so widening into it rewrites nothing.
+    /// timestamps, and it agrees with `Numeric` on nibbles 0-13, so moving into it rewrites nothing.
     DateTimePlus,
 
     /// space `-` `.` `0`-`9` `:` `T` `Z` — Zulu-form ISO timestamps.  Reached only by a `Z`, since that is the one
@@ -220,12 +220,12 @@ pub(crate) fn pack(bytes: &[u8]) -> Option<Packed> {
 /// Encode into a **named** alphabet, or `None` if a byte has no symbol there.
 ///
 /// [`pack`] is this under the canonical priority order.  Incremental building needs the forced form instead, because it
-/// must choose an alphabet before seeing the whole string: it starts in `Numeric` and widens to `DateTimePlus` on the
-/// first `:` or `T`, since those two agree on nibbles 0-13 and the widening rewrites nothing.
+/// must choose an alphabet before seeing the whole string: it starts in `Numeric` and moves to `DateTimePlus` on the
+/// first `:` or `T`, which rewrites no nibble at all, those two agreeing on 0-13.
 ///
 /// The eager choice *is* the canonical one, which is why the priority order runs Numeric, DateTimePlus, DateTimeZulu:
-/// timestamps belong to `DateTimePlus` unless a `Z` forces otherwise, so a string widened on its first `:` or `T` needs
-/// no correction at the end.  Only a `Z` arriving later moves it again, through [`Packed::transcode`].
+/// timestamps belong to `DateTimePlus` unless a `Z` forces otherwise, so a string reclassified on its first `:` or `T`
+/// needs no correction at the end.  Only a `Z` arriving later moves it again, through [`Packed::transcode`].
 pub(crate) fn pack_in(bytes: &[u8], alphabet: PackedAlphabet) -> Option<Packed> {
     debug_assert!((MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()), "the tier selector must route content outside 16-30 characters elsewhere");
 
@@ -319,6 +319,46 @@ impl Packed {
         debug_assert!(packed.padding_is_canonical(), "transcode must preserve zero padding");
 
         Some(packed)
+    }
+
+    /// Append bytes without leaving the nibbles, or `None` when the result leaves the tier — past the capacity, or
+    /// encodable in no alphabet that also holds the existing content.
+    ///
+    /// This is the incremental path: the existing nibbles are kept and the new characters written past them.  Moving
+    /// between `Numeric` and `DateTimePlus` rewrites nothing, those two agreeing on nibbles 0-13; only a move into
+    /// `DateTimeZulu` rewrites, and then by a single decrement pass, that alphabet being the same list shifted down
+    /// past the absent `+`.  Re-classifying the whole result instead would decode and re-encode everything on every
+    /// append, which turns building a string into quadratic work.
+    ///
+    /// The alphabet is chosen by the same priority order `pack` uses, so the result is the representation the content
+    /// would have taken had it been packed whole — appending cannot produce a non-canonical string.
+    pub(crate) fn push(&self, tail: &[u8]) -> Option<Packed> {
+        let len = self.len();
+        let new_len = len + tail.len();
+        if new_len > MAX_PACKED_LEN {
+            return None;
+        }
+
+        // The first alphabet that both holds the new bytes and accepts the existing content.  Priority order is what
+        // makes this the canonical choice.
+        let target = [PackedAlphabet::Numeric, PackedAlphabet::DateTimePlus, PackedAlphabet::DateTimeZulu]
+            .into_iter()
+            .find(|&a| tail.iter().all(|&b| a.encode_table()[b as usize] != INVALID) && self.transcode(a).is_some())?;
+
+        let mut moved = self.transcode(target)?;
+        let table = target.encode_table();
+        for (i, &b) in tail.iter().enumerate() {
+            set_nibble(&mut moved.nibbles, len + i, table[b as usize]);
+        }
+
+        moved.full = new_len == MAX_PACKED_LEN;
+        if !moved.full {
+            set_nibble(&mut moved.nibbles, LENGTH_NIBBLE, (new_len & 0x0F) as u8);
+        }
+
+        debug_assert_eq!(moved.len(), new_len, "the stored length must follow the content");
+        debug_assert!(moved.padding_is_canonical(), "append must leave unused nibbles zero");
+        Some(moved)
     }
 
     /// Ordering against another packed string of the **same alphabet**.

@@ -1259,3 +1259,65 @@ fn the_constructors_accept_every_asref_shape() {
     // FromStr forwards to new, so parse() and new() agree exactly.
     assert_eq!(PerlString::new("2026-07-28T14:33:07Z").unwrap(), "2026-07-28T14:33:07Z".parse().unwrap());
 }
+
+#[test]
+fn appending_yields_what_constructing_whole_would() {
+    // The canonicity obligation for the incremental path: appending into the nibbles must land on the same
+    // representation `pack` would have chosen for the finished content, or equal strings would differ by how they were
+    // built.
+    let cases: &[(&str, &str)] = &[
+        ("2026-07-28T14:33", ":07"),            // stays DateTimePlus
+        ("2026-07-28T14:33:07", "Z"),           // DateTimePlus transcodes into Zulu
+        ("1234567890123456", "7890"),           // stays Numeric
+        ("2026-07-28 202607", "28"),            // Numeric throughout
+        ("192.168.100.200 1", ".2.3"),          // Numeric
+        ("14:33+01:00 14:33", "+02"),           // '+' keeps it out of Zulu
+        ("2026-07-29T17:23:45.1234567", "89Z"), // reaches the full family
+    ];
+
+    for (head, tail) in cases {
+        let mut built: PerlString = head.parse().unwrap();
+        assert_eq!(built.storage_kind(), StorageKind::Packed, "{head} should start packed");
+        built.push_str(tail).unwrap();
+
+        let whole: PerlString = format!("{head}{tail}").parse().unwrap();
+        assert_eq!(built.storage_kind(), whole.storage_kind(), "{head}+{tail}: same tier");
+        assert_eq!(built.as_bytes(&mut [0u8; DECODE_MAX]), whole.as_bytes(&mut [0u8; DECODE_MAX]), "{head}+{tail}: same content");
+        assert_eq!(built, whole, "{head}+{tail}: equal strings");
+    }
+}
+
+#[test]
+fn appending_leaves_the_tier_when_it_must() {
+    // A character in no alphabet, and content past the capacity: both go to the heap, carrying their bytes intact.
+    let mut lettered: PerlString = "2026-07-28T14:33".parse().unwrap();
+    lettered.push_str("x").unwrap();
+    assert_eq!(lettered.storage_kind(), StorageKind::Heap);
+    assert_eq!(lettered.as_bytes(&mut [0u8; DECODE_MAX]), b"2026-07-28T14:33x");
+
+    let mut overflowing: PerlString = "123456789012345678901234567890".parse().unwrap();
+    assert_eq!(overflowing.storage_kind(), StorageKind::Packed, "thirty characters is the capacity");
+    overflowing.push_str("1").unwrap();
+    assert_eq!(overflowing.storage_kind(), StorageKind::Heap);
+    assert_eq!(overflowing.len(), 31);
+
+    // A '+' offset meeting a 'Z': the two spellings are mutually exclusive, so this leaves the tier too.
+    let mut offset: PerlString = "14:33+01:00 14:33".parse().unwrap();
+    offset.push_str("Z").unwrap();
+    assert_eq!(offset.storage_kind(), StorageKind::Heap);
+}
+
+#[test]
+fn incremental_building_reaches_the_packed_tier() {
+    // The case the length families exist for: a string that passes through a trailing space on its way to something
+    // longer, built one piece at a time through fmt::Write.
+    use std::fmt::Write;
+    let mut s = PerlString::empty();
+    write!(s, "2026-07-28").unwrap();
+    write!(s, " ").unwrap();
+    assert_eq!(s.len(), 11, "a trailing space mid-build");
+    write!(s, "14:33:07").unwrap();
+    assert_eq!(s.storage_kind(), StorageKind::Packed);
+    assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"2026-07-28 14:33:07");
+    assert_eq!(s, "2026-07-28 14:33:07".parse().unwrap());
+}
