@@ -1136,6 +1136,37 @@ window (16-22 bytes) falls under the same
 corpus tripwire, softened for keys because keys repeat: the heap
 cost is per-distinct-key-per-hash, not per-operation.
 
+**Where the cache bytes live, and why the obvious placements
+fail.**  The discriminant is not a byte the layout sets aside: it
+occupies the niche in `PerlString`'s own tag, which uses 96 of its
+256 values.  Rust's niche-filling requires every other variant's
+data to avoid that byte, and it lays a variant out as a
+self-contained struct *before* placing it — so a field wanting
+eight-byte alignment lands at offset 8 and fills the payload,
+leaving nowhere for a cache.  Adding one cache byte beside a bare
+`i64` therefore costs eight, for the same reason a taint byte did
+before taint became a discriminant twin.  Measured:
+
+| arrangement | size |
+|---|---|
+| `Integer(i64)` — datum alone | 16 |
+| `Integer(i64, [u8; 1])` — one cache byte | 24 |
+| `Integer([u8; 7], i64)` — cache first | 24 |
+| the pair as a `repr(C)` struct | 24 |
+| `repr(align(8))` on the enclosing enum | 24 |
+| **packed payload, aligned `PerlString`** | **16** |
+
+The arrangement that works gives the payload struct alignment 1, so
+it sits at envelope offset 1 — clear of the discriminant — with the
+datum at offset 8 and seven bytes ahead of it for the cache.  The
+alignment making offset 8 a real boundary comes from `PerlString`
+carrying `repr(align(8))`, which is free there because that type is
+already sixteen bytes; the enclosing enums inherit alignment from
+their largest variant.  Applying the attribute to `Value` instead
+defeats niche-filling and costs eight bytes.  So `repr(packed)`
+buys the layout, not unaligned reads: every datum access is an
+ordinary aligned load.
+
 **Packed-decimal numeric caches.**  The digits are the expensive
 product of default numeric stringification; rendering cached
 digits is nibble unpacking.  `Float` carries a cache of up to 10-11

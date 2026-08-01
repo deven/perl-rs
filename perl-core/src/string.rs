@@ -404,6 +404,7 @@ macro_rules! define_perl_string {
     ) => {
         /// A Perl string.  See the module documentation; the variant set is the folded tag (§2.2.3) and is an
         /// implementation detail — construct and inspect through the methods, never by matching variants directly.
+        #[repr(align(8))]
         pub enum PerlString {
             $( #[doc(hidden)] $iv { buf: [u8; INLINE_MAX] }, )*
             $( #[doc(hidden)] $pv { nibbles: [u8; PACKED_BYTES] }, )*

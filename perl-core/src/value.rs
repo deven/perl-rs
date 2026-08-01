@@ -39,6 +39,7 @@ use std::str;
 use crate::containers::{ArrayRef, HashRef};
 use crate::cow_buffer::AllocError;
 use crate::heap::HeapArc;
+use crate::numeric::{FloatPayload, IntegerPayload, UnsignedPayload};
 use crate::scalar::{ConstScalar, FALSE_SCALAR, ScalarCell, ScalarRef, TRUE_SCALAR};
 use crate::string::{DECODE_MAX, PerlString};
 
@@ -91,26 +92,26 @@ pub enum ScalarPayload {
     UndefTainted,
 
     /// Clean: a signed integer.
-    Integer(i64),
+    Integer(IntegerPayload),
 
     /// Tainted (§2.6): a signed integer.  The taint dimension is a discriminant twin rather than a field, because a
     /// taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
-    IntegerTainted(i64),
+    IntegerTainted(IntegerPayload),
 
     /// Clean: an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
-    Unsigned(u64),
+    Unsigned(UnsignedPayload),
 
     /// Tainted (§2.6): an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).  The taint dimension
     /// is a discriminant twin rather than a field, because a taint byte beside an eight-byte datum cannot fit the
     /// envelope's niche-supplied tag (measured).
-    UnsignedTainted(u64),
+    UnsignedTainted(UnsignedPayload),
 
     /// Clean: a float.
-    Float(f64),
+    Float(FloatPayload),
 
     /// Tainted (§2.6): a float.  The taint dimension is a discriminant twin rather than a field, because a taint byte
     /// beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
-    FloatTainted(f64),
+    FloatTainted(FloatPayload),
 
     /// Clean: a reference to a mutable scalar (§2.2.1, flattened per mutability).
     ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
@@ -162,26 +163,26 @@ pub enum Value {
     UndefTainted,
 
     /// Clean: a signed integer.
-    Integer(i64),
+    Integer(IntegerPayload),
 
     /// Tainted (§2.6): a signed integer.  The taint dimension is a discriminant twin rather than a field, because a
     /// taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
-    IntegerTainted(i64),
+    IntegerTainted(IntegerPayload),
 
     /// Clean: an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
-    Unsigned(u64),
+    Unsigned(UnsignedPayload),
 
     /// Tainted (§2.6): an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).  The taint dimension
     /// is a discriminant twin rather than a field, because a taint byte beside an eight-byte datum cannot fit the
     /// envelope's niche-supplied tag (measured).
-    UnsignedTainted(u64),
+    UnsignedTainted(UnsignedPayload),
 
     /// Clean: a float.
-    Float(f64),
+    Float(FloatPayload),
 
     /// Tainted (§2.6): a float.  The taint dimension is a discriminant twin rather than a field, because a taint byte
     /// beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
-    FloatTainted(f64),
+    FloatTainted(FloatPayload),
 
     /// Clean: a reference to a mutable scalar (§2.2.1, flattened per mutability).
     ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
@@ -242,17 +243,20 @@ impl ScalarPayload {
 
     /// A `Integer`, clean or tainted as `taint` says.
     pub fn integer(value: i64, taint: Tainted) -> ScalarPayload {
-        if taint.is_tainted() { ScalarPayload::IntegerTainted(value) } else { ScalarPayload::Integer(value) }
+        let p = IntegerPayload::new(value);
+        if taint.is_tainted() { ScalarPayload::IntegerTainted(p) } else { ScalarPayload::Integer(p) }
     }
 
     /// A `Unsigned`, clean or tainted as `taint` says.
     pub fn unsigned(value: u64, taint: Tainted) -> ScalarPayload {
-        if taint.is_tainted() { ScalarPayload::UnsignedTainted(value) } else { ScalarPayload::Unsigned(value) }
+        let p = UnsignedPayload::new(value);
+        if taint.is_tainted() { ScalarPayload::UnsignedTainted(p) } else { ScalarPayload::Unsigned(p) }
     }
 
     /// A `Float`, clean or tainted as `taint` says.
     pub fn float(value: f64, taint: Tainted) -> ScalarPayload {
-        if taint.is_tainted() { ScalarPayload::FloatTainted(value) } else { ScalarPayload::Float(value) }
+        let p = FloatPayload::new(value);
+        if taint.is_tainted() { ScalarPayload::FloatTainted(p) } else { ScalarPayload::Float(p) }
     }
 
     /// A `ScalarRefMut`, clean or tainted as `taint` says.
@@ -290,17 +294,20 @@ impl Value {
 
     /// A `Integer`, clean or tainted as `taint` says.
     pub fn integer(value: i64, taint: Tainted) -> Value {
-        if taint.is_tainted() { Value::IntegerTainted(value) } else { Value::Integer(value) }
+        let p = IntegerPayload::new(value);
+        if taint.is_tainted() { Value::IntegerTainted(p) } else { Value::Integer(p) }
     }
 
     /// A `Unsigned`, clean or tainted as `taint` says.
     pub fn unsigned(value: u64, taint: Tainted) -> Value {
-        if taint.is_tainted() { Value::UnsignedTainted(value) } else { Value::Unsigned(value) }
+        let p = UnsignedPayload::new(value);
+        if taint.is_tainted() { Value::UnsignedTainted(p) } else { Value::Unsigned(p) }
     }
 
     /// A `Float`, clean or tainted as `taint` says.
     pub fn float(value: f64, taint: Tainted) -> Value {
-        if taint.is_tainted() { Value::FloatTainted(value) } else { Value::Float(value) }
+        let p = FloatPayload::new(value);
+        if taint.is_tainted() { Value::FloatTainted(p) } else { Value::Float(p) }
     }
 
     /// A `ScalarRefMut`, clean or tainted as `taint` says.
@@ -359,9 +366,9 @@ macro_rules! impl_coercions {
             pub fn to_bool(&self) -> bool {
                 match self {
                     $ty::Undef | $ty::UndefTainted => false,
-                    $ty::Integer(n) | $ty::IntegerTainted(n) => *n != 0,
-                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => *u != 0,
-                    $ty::Float(f) | $ty::FloatTainted(f) => *f != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => n.value() != 0,
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.value() != 0,
+                    $ty::Float(f) | $ty::FloatTainted(f) => f.value() != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
                     $ty::String(s) => s.to_bool(),
                     $ty::True => true,
                     $ty::False => false,
@@ -389,9 +396,9 @@ macro_rules! impl_coercions {
             pub fn to_int(&self) -> i64 {
                 match self {
                     $ty::Undef | $ty::UndefTainted => 0,
-                    $ty::Integer(n) | $ty::IntegerTainted(n) => *n,
-                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => *u as i64, // The same 64 bits read signed — perl's IV view of a UV.
-                    $ty::Float(f) | $ty::FloatTainted(f) => float_to_int_i64_visible(*f),
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => n.value(),
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.value() as i64, // The same 64 bits read signed — perl's IV view of a UV.
+                    $ty::Float(f) | $ty::FloatTainted(f) => float_to_int_i64_visible(f.value()),
                     $ty::String(s) => s.to_int(),
                     $ty::True => 1,
                     $ty::False => 0,
@@ -408,9 +415,9 @@ macro_rules! impl_coercions {
             pub fn to_float(&self) -> f64 {
                 match self {
                     $ty::Undef | $ty::UndefTainted => 0.0,
-                    $ty::Integer(n) | $ty::IntegerTainted(n) => *n as f64,
-                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => *u as f64,
-                    $ty::Float(f) | $ty::FloatTainted(f) => *f,
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => n.value() as f64,
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.value() as f64,
+                    $ty::Float(f) | $ty::FloatTainted(f) => f.value(),
                     $ty::String(s) => s.to_float(),
                     $ty::True => 1.0,
                     $ty::False => 0.0,
@@ -428,9 +435,9 @@ macro_rules! impl_coercions {
             pub fn numify(&self) -> Numeric {
                 match self {
                     $ty::Undef | $ty::UndefTainted => Numeric::Integer(0),
-                    $ty::Integer(n) | $ty::IntegerTainted(n) => Numeric::Integer(*n),
-                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => Numeric::Unsigned(*u),
-                    $ty::Float(f) | $ty::FloatTainted(f) => Numeric::Float(*f),
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => Numeric::Integer(n.value()),
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => Numeric::Unsigned(u.value()),
+                    $ty::Float(f) | $ty::FloatTainted(f) => Numeric::Float(f.value()),
                     $ty::String(s) => s.numify(),
                     $ty::True => Numeric::Integer(1),
                     $ty::False => Numeric::Integer(0),
@@ -454,18 +461,18 @@ macro_rules! impl_coercions {
                     $ty::Undef | $ty::UndefTainted => (PerlString::empty(), self.taint()),
                     $ty::Integer(n) | $ty::IntegerTainted(n) => {
                         let mut rendered = PerlString::empty();
-                        format_int_into(*n, &mut rendered)?;
+                        format_int_into(n.value(), &mut rendered)?;
                         (rendered, self.taint())
                     }
                     $ty::Unsigned(u) | $ty::UnsignedTainted(u) => {
                         // Exact digits: at most twenty characters, so the packed numeric alphabet holds them.
                         let mut rendered = PerlString::empty();
-                        rendered.push_fmt(format_args!("{u}"))?;
+                        rendered.push_fmt(format_args!("{}", u.value()))?;
                         (rendered, self.taint())
                     }
                     $ty::Float(f) | $ty::FloatTainted(f) => {
                         let mut rendered = PerlString::empty();
-                        format_float_into(*f, &mut rendered)?;
+                        format_float_into(f.value(), &mut rendered)?;
                         (rendered, self.taint())
                     }
                     $ty::String(s) => return Ok(s.clone()),
