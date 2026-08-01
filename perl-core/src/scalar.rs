@@ -119,7 +119,7 @@ impl Drop for ScalarCell {
             ScalarCell::Full(f) => std::mem::replace(&mut f.payload, ScalarPayload::Undef(Tainted::CLEAN)),
         };
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
-            crate::release::release_payload(payload);
+            crate::heap::release_payload(payload);
         }
     }
 }
@@ -315,7 +315,7 @@ impl Drop for ConstScalar {
     fn drop(&mut self) {
         let payload = std::mem::replace(&mut self.payload, ScalarPayload::Undef(Tainted::CLEAN));
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
-            crate::release::release_payload(payload);
+            crate::heap::release_payload(payload);
         }
     }
 }

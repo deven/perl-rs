@@ -10,8 +10,7 @@
 //! - [`heap`] — `HeapArc`/`HeapWeak`, the façade over shared ownership that the slab backend will replace.
 //!
 //! Two private modules hold representations that never allocate: `inline` for content of fifteen payload bytes or
-//! fewer, `packed` for the nibble encoding that carries sixteen to thirty characters of digit-dense text.  A third,
-//! `release`, performs iterative teardown so that deep structures cannot overflow the stack when they die.
+//! fewer, `packed` for the nibble encoding that carries sixteen to thirty characters of digit-dense text.
 //!
 //! # Design principles
 //!
@@ -31,7 +30,6 @@
 
 mod inline;
 mod packed;
-mod release;
 
 pub mod containers;
 pub mod cow_buffer;

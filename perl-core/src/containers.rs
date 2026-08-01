@@ -41,7 +41,7 @@ impl Drop for PerlArray {
     /// `Vec`'s drop glue.  Destruction is not perl-visible mutation, so the readonly flag is deliberately not consulted.
     fn drop(&mut self) {
         for v in self.slots.drain(..).flatten() {
-            crate::release::release_value(v);
+            crate::heap::release_value(v);
         }
     }
 }
@@ -190,7 +190,7 @@ impl Drop for PerlHash {
     /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
     fn drop(&mut self) {
         for (_key, v) in self.map.drain(..) {
-            crate::release::release_value(v);
+            crate::heap::release_value(v);
         }
     }
 }
