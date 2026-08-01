@@ -29,7 +29,7 @@ use std::mem;
 use std::str;
 
 /// Maximum inline payload: chosen so every numeric stringification stays allocation-free (§2.2.3).
-pub const INLINE_MAX: usize = 22;
+pub const INLINE_MAX: usize = 15;
 
 /// Heap scan-cache states, stored in the `CowBuffer` header byte (§2.2.4).  Zero is `UNKNOWN`, the lattice top — the
 /// natural zero-initialized state can never assert a validity claim (§2.2.6).
@@ -384,7 +384,7 @@ macro_rules! define_perl_string {
         /// A Perl string.  See the module documentation; the variant set is the folded tag (§2.2.3) and is an
         /// implementation detail — construct and inspect through the methods, never by matching variants directly.
         pub enum PerlString {
-            $( #[doc(hidden)] $iv { len: u8, buf: [u8; INLINE_MAX] }, )*
+            $( #[doc(hidden)] $iv { buf: [u8; INLINE_MAX] }, )*
             $( #[doc(hidden)] $hv(CowBuffer), )*
         }
 
@@ -431,9 +431,9 @@ macro_rules! define_perl_string {
 
             /// Rebuild an inline value with the given tag dimensions (payload preserved).  Internal: tag transitions go
             /// through the public monotone/setter methods.
-            fn build_inline(scan: InlineScan, utf8: bool, warned: bool, tainted: bool, len: u8, buf: [u8; INLINE_MAX]) -> PerlString {
+            fn build_inline(scan: InlineScan, utf8: bool, warned: bool, tainted: bool, buf: [u8; INLINE_MAX]) -> PerlString {
                 match (scan, utf8, warned, tainted) {
-                    $( (InlineScan::$iscan, $iu, $iw, $it) => PerlString::$iv { len, buf }, )*
+                    $( (InlineScan::$iscan, $iu, $iw, $it) => PerlString::$iv { buf }, )*
                 }
             }
 
@@ -503,8 +503,8 @@ define_perl_string! {
 }
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
-const _: () = assert!(size_of::<PerlString>() == 24);
-const _: () = assert!(size_of::<Option<PerlString>>() == 24);
+const _: () = assert!(size_of::<PerlString>() == 16);
+const _: () = assert!(size_of::<Option<PerlString>>() == 16);
 
 // ── Construction ──────────────────────────────────────────────────
 /// Eager full scan of a short byte slice: terminal state (§2.2.3).
@@ -518,11 +518,25 @@ fn eager_scan(bytes: &[u8]) -> InlineScan {
     }
 }
 
-fn inline_payload(bytes: &[u8]) -> (u8, [u8; INLINE_MAX]) {
-    debug_assert!(bytes.len() <= INLINE_MAX);
+/// The stored length of a NUL-terminated payload: the first NUL, or the whole payload when there is none.
+///
+/// The terminator is what buys the fifteenth byte — a length field would have spent it — and it is why content
+/// containing NUL cannot be stored inline at all (§2.2.9): its own bytes would end it early.  Such content takes the
+/// heap, which is the ruled placement.
+fn inline_len(buf: &[u8; INLINE_MAX]) -> usize {
+    buf.iter().position(|&b| b == 0).unwrap_or(INLINE_MAX)
+}
+
+/// Whether content can be stored inline: short enough, and free of the terminator.
+fn inline_eligible(bytes: &[u8]) -> bool {
+    bytes.len() <= INLINE_MAX && !bytes.contains(&0)
+}
+
+fn inline_payload(bytes: &[u8]) -> [u8; INLINE_MAX] {
+    debug_assert!(inline_eligible(bytes));
     let mut buf = [0u8; INLINE_MAX];
     buf[..bytes.len()].copy_from_slice(bytes);
-    (bytes.len() as u8, buf)
+    buf
 }
 
 impl PerlString {
@@ -541,7 +555,7 @@ impl PerlString {
     /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
     /// payload needs no allocation — which is also what lets `Default` exist.
     pub fn empty() -> PerlString {
-        PerlString::build_inline(InlineScan::Ascii, false, false, false, 0, [0u8; INLINE_MAX])
+        PerlString::build_inline(InlineScan::Ascii, false, false, false, [0u8; INLINE_MAX])
     }
 
     /// Construct from a Rust `&str` **without allocating**, or `None` if the content cannot be stored in the value
@@ -559,8 +573,7 @@ impl PerlString {
         }
 
         let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Malformed/Extended impossible from &str.
-        let (len, buf) = inline_payload(bytes);
-        Some(PerlString::build_inline(state, state != InlineScan::Ascii, false, false, len, buf))
+        Some(PerlString::build_inline(state, state != InlineScan::Ascii, false, false, inline_payload(bytes)))
     }
 
     /// Construct from raw bytes **without allocating**, or `None` if the content cannot be stored in the value itself.
@@ -571,15 +584,14 @@ impl PerlString {
             return None;
         }
 
-        let (len, buf) = inline_payload(bytes);
-        Some(PerlString::build_inline(eager_scan(bytes), false, false, false, len, buf))
+        Some(PerlString::build_inline(eager_scan(bytes), false, false, false, inline_payload(bytes)))
     }
 
     // ── Accessors ─────────────────────────────────────────────────
     /// Length in bytes.  No dereference for inline; handle mirror for heap.
     pub fn len(&self) -> usize {
         match self.raw_parts() {
-            RawParts::Inline { len, .. } => len as usize,
+            RawParts::Inline { buf } => inline_len(buf),
             RawParts::Heap(cb) => cb.len(),
         }
     }
@@ -592,7 +604,7 @@ impl PerlString {
     /// The raw bytes.
     pub fn as_bytes(&self) -> &[u8] {
         match self.raw_parts() {
-            RawParts::Inline { len, buf } => &buf[..len as usize],
+            RawParts::Inline { buf } => &buf[..inline_len(buf)],
             RawParts::Heap(cb) => cb.as_slice(),
         }
     }
@@ -601,8 +613,8 @@ impl PerlString {
     /// heap scan lattice as a side effect (§2.2.5); sound through `&self`.
     pub fn as_str(&self) -> Option<&str> {
         match self.raw_parts() {
-            RawParts::Inline { len, buf } => {
-                let bytes = &buf[..len as usize];
+            RawParts::Inline { buf } => {
+                let bytes = &buf[..inline_len(buf)];
                 match self.inline_scan() {
                     // SAFETY: terminal scan states were established by a full validity scan at construction and inline
                     // mutation re-scans; Ascii, Latin1, and NonLatin1 all certify Rust-valid UTF-8.
@@ -710,10 +722,11 @@ impl PerlString {
     /// one is the flagged-side answer.  O(1) after first classification; cached per-buffer, shared across COW sharers.
     pub fn char_len(&self) -> Option<usize> {
         match self.raw_parts() {
-            RawParts::Inline { len, buf } => {
-                let bytes = &buf[..len as usize];
+            RawParts::Inline { buf } => {
+                let len = inline_len(buf);
+                let bytes = &buf[..len];
                 match self.inline_scan() {
-                    Some(InlineScan::Ascii) => Some(len as usize),
+                    Some(InlineScan::Ascii) => Some(len),
                     Some(InlineScan::Malformed) | None => None,
                     _ => {
                         let (_, chars) = classify_full(bytes); // ≤ 22 bytes: recount is trivial
@@ -772,7 +785,7 @@ impl PerlString {
         let old = mem::take(self);
 
         *self = match old.into_raw() {
-            RawOwned::Inline { scan, len, buf } => PerlString::build_inline(scan, u2, w2, t2, len, buf),
+            RawOwned::Inline { scan, buf } => PerlString::build_inline(scan, u2, w2, t2, buf),
             RawOwned::Heap(cb) => PerlString::build_heap(u2, w2, t2, cb),
         };
     }
@@ -807,15 +820,18 @@ impl PerlString {
         let old = mem::take(self);
 
         *self = match old.into_raw() {
-            RawOwned::Inline { scan, len, buf } => {
-                let old_bytes = &buf[..len as usize];
-                let new_len = len as usize + bytes.len();
+            RawOwned::Inline { scan, buf } => {
+                let len = inline_len(&buf);
+                let old_bytes = &buf[..len];
+                let new_len = len + bytes.len();
 
-                if new_len <= INLINE_MAX {
+                // A NUL among the appended bytes would terminate the payload early, so such content leaves the inline
+                // forms even when it would otherwise fit (§2.2.9).
+                if new_len <= INLINE_MAX && !bytes.contains(&0) {
                     let mut nbuf = buf;
-                    nbuf[len as usize..new_len].copy_from_slice(bytes);
+                    nbuf[len..new_len].copy_from_slice(bytes);
                     let nscan = append_transition_inline(scan, kind, &nbuf[..new_len]);
-                    PerlString::build_inline(nscan, u, w, t, new_len as u8, nbuf)
+                    PerlString::build_inline(nscan, u, w, t, nbuf)
                 } else {
                     // Promote to heap (one-way).  Fold the append into the promoting allocation.
                     let mut cb = CowBuffer::with_capacity(new_len + (new_len >> 2))?;
@@ -861,46 +877,46 @@ impl PerlString {
         {
             use PerlString::*;
             match self {
-                InlineAscii { len, buf }
-                | InlineAsciiFlagged { len, buf }
-                | InlineAsciiWarned { len, buf }
-                | InlineAsciiFlaggedWarned { len, buf }
-                | InlineAsciiTainted { len, buf }
-                | InlineAsciiFlaggedTainted { len, buf }
-                | InlineAsciiWarnedTainted { len, buf }
-                | InlineAsciiFlaggedWarnedTainted { len, buf }
-                | InlineLatin1 { len, buf }
-                | InlineLatin1Flagged { len, buf }
-                | InlineLatin1Warned { len, buf }
-                | InlineLatin1FlaggedWarned { len, buf }
-                | InlineLatin1Tainted { len, buf }
-                | InlineLatin1FlaggedTainted { len, buf }
-                | InlineLatin1WarnedTainted { len, buf }
-                | InlineLatin1FlaggedWarnedTainted { len, buf }
-                | InlineNonLatin1 { len, buf }
-                | InlineNonLatin1Flagged { len, buf }
-                | InlineNonLatin1Warned { len, buf }
-                | InlineNonLatin1FlaggedWarned { len, buf }
-                | InlineNonLatin1Tainted { len, buf }
-                | InlineNonLatin1FlaggedTainted { len, buf }
-                | InlineNonLatin1WarnedTainted { len, buf }
-                | InlineNonLatin1FlaggedWarnedTainted { len, buf }
-                | InlineExtended { len, buf }
-                | InlineExtendedFlagged { len, buf }
-                | InlineExtendedWarned { len, buf }
-                | InlineExtendedFlaggedWarned { len, buf }
-                | InlineExtendedTainted { len, buf }
-                | InlineExtendedFlaggedTainted { len, buf }
-                | InlineExtendedWarnedTainted { len, buf }
-                | InlineExtendedFlaggedWarnedTainted { len, buf }
-                | InlineMalformed { len, buf }
-                | InlineMalformedFlagged { len, buf }
-                | InlineMalformedWarned { len, buf }
-                | InlineMalformedFlaggedWarned { len, buf }
-                | InlineMalformedTainted { len, buf }
-                | InlineMalformedFlaggedTainted { len, buf }
-                | InlineMalformedWarnedTainted { len, buf }
-                | InlineMalformedFlaggedWarnedTainted { len, buf } => RawParts::Inline { len: *len, buf },
+                InlineAscii { buf }
+                | InlineAsciiFlagged { buf }
+                | InlineAsciiWarned { buf }
+                | InlineAsciiFlaggedWarned { buf }
+                | InlineAsciiTainted { buf }
+                | InlineAsciiFlaggedTainted { buf }
+                | InlineAsciiWarnedTainted { buf }
+                | InlineAsciiFlaggedWarnedTainted { buf }
+                | InlineLatin1 { buf }
+                | InlineLatin1Flagged { buf }
+                | InlineLatin1Warned { buf }
+                | InlineLatin1FlaggedWarned { buf }
+                | InlineLatin1Tainted { buf }
+                | InlineLatin1FlaggedTainted { buf }
+                | InlineLatin1WarnedTainted { buf }
+                | InlineLatin1FlaggedWarnedTainted { buf }
+                | InlineNonLatin1 { buf }
+                | InlineNonLatin1Flagged { buf }
+                | InlineNonLatin1Warned { buf }
+                | InlineNonLatin1FlaggedWarned { buf }
+                | InlineNonLatin1Tainted { buf }
+                | InlineNonLatin1FlaggedTainted { buf }
+                | InlineNonLatin1WarnedTainted { buf }
+                | InlineNonLatin1FlaggedWarnedTainted { buf }
+                | InlineExtended { buf }
+                | InlineExtendedFlagged { buf }
+                | InlineExtendedWarned { buf }
+                | InlineExtendedFlaggedWarned { buf }
+                | InlineExtendedTainted { buf }
+                | InlineExtendedFlaggedTainted { buf }
+                | InlineExtendedWarnedTainted { buf }
+                | InlineExtendedFlaggedWarnedTainted { buf }
+                | InlineMalformed { buf }
+                | InlineMalformedFlagged { buf }
+                | InlineMalformedWarned { buf }
+                | InlineMalformedFlaggedWarned { buf }
+                | InlineMalformedTainted { buf }
+                | InlineMalformedFlaggedTainted { buf }
+                | InlineMalformedWarnedTainted { buf }
+                | InlineMalformedFlaggedWarnedTainted { buf } => RawParts::Inline { buf },
 
                 Heap(cb)
                 | HeapFlagged(cb)
@@ -921,49 +937,49 @@ impl PerlString {
         {
             use PerlString::*;
             match self {
-                InlineAscii { len, buf }
-                | InlineAsciiFlagged { len, buf }
-                | InlineAsciiWarned { len, buf }
-                | InlineAsciiFlaggedWarned { len, buf }
-                | InlineAsciiTainted { len, buf }
-                | InlineAsciiFlaggedTainted { len, buf }
-                | InlineAsciiWarnedTainted { len, buf }
-                | InlineAsciiFlaggedWarnedTainted { len, buf }
-                | InlineLatin1 { len, buf }
-                | InlineLatin1Flagged { len, buf }
-                | InlineLatin1Warned { len, buf }
-                | InlineLatin1FlaggedWarned { len, buf }
-                | InlineLatin1Tainted { len, buf }
-                | InlineLatin1FlaggedTainted { len, buf }
-                | InlineLatin1WarnedTainted { len, buf }
-                | InlineLatin1FlaggedWarnedTainted { len, buf }
-                | InlineNonLatin1 { len, buf }
-                | InlineNonLatin1Flagged { len, buf }
-                | InlineNonLatin1Warned { len, buf }
-                | InlineNonLatin1FlaggedWarned { len, buf }
-                | InlineNonLatin1Tainted { len, buf }
-                | InlineNonLatin1FlaggedTainted { len, buf }
-                | InlineNonLatin1WarnedTainted { len, buf }
-                | InlineNonLatin1FlaggedWarnedTainted { len, buf }
-                | InlineExtended { len, buf }
-                | InlineExtendedFlagged { len, buf }
-                | InlineExtendedWarned { len, buf }
-                | InlineExtendedFlaggedWarned { len, buf }
-                | InlineExtendedTainted { len, buf }
-                | InlineExtendedFlaggedTainted { len, buf }
-                | InlineExtendedWarnedTainted { len, buf }
-                | InlineExtendedFlaggedWarnedTainted { len, buf }
-                | InlineMalformed { len, buf }
-                | InlineMalformedFlagged { len, buf }
-                | InlineMalformedWarned { len, buf }
-                | InlineMalformedFlaggedWarned { len, buf }
-                | InlineMalformedTainted { len, buf }
-                | InlineMalformedFlaggedTainted { len, buf }
-                | InlineMalformedWarnedTainted { len, buf }
-                | InlineMalformedFlaggedWarnedTainted { len, buf } => {
+                InlineAscii { buf }
+                | InlineAsciiFlagged { buf }
+                | InlineAsciiWarned { buf }
+                | InlineAsciiFlaggedWarned { buf }
+                | InlineAsciiTainted { buf }
+                | InlineAsciiFlaggedTainted { buf }
+                | InlineAsciiWarnedTainted { buf }
+                | InlineAsciiFlaggedWarnedTainted { buf }
+                | InlineLatin1 { buf }
+                | InlineLatin1Flagged { buf }
+                | InlineLatin1Warned { buf }
+                | InlineLatin1FlaggedWarned { buf }
+                | InlineLatin1Tainted { buf }
+                | InlineLatin1FlaggedTainted { buf }
+                | InlineLatin1WarnedTainted { buf }
+                | InlineLatin1FlaggedWarnedTainted { buf }
+                | InlineNonLatin1 { buf }
+                | InlineNonLatin1Flagged { buf }
+                | InlineNonLatin1Warned { buf }
+                | InlineNonLatin1FlaggedWarned { buf }
+                | InlineNonLatin1Tainted { buf }
+                | InlineNonLatin1FlaggedTainted { buf }
+                | InlineNonLatin1WarnedTainted { buf }
+                | InlineNonLatin1FlaggedWarnedTainted { buf }
+                | InlineExtended { buf }
+                | InlineExtendedFlagged { buf }
+                | InlineExtendedWarned { buf }
+                | InlineExtendedFlaggedWarned { buf }
+                | InlineExtendedTainted { buf }
+                | InlineExtendedFlaggedTainted { buf }
+                | InlineExtendedWarnedTainted { buf }
+                | InlineExtendedFlaggedWarnedTainted { buf }
+                | InlineMalformed { buf }
+                | InlineMalformedFlagged { buf }
+                | InlineMalformedWarned { buf }
+                | InlineMalformedFlaggedWarned { buf }
+                | InlineMalformedTainted { buf }
+                | InlineMalformedFlaggedTainted { buf }
+                | InlineMalformedWarnedTainted { buf }
+                | InlineMalformedFlaggedWarnedTainted { buf } => {
                     // inline_scan() is Some for every inline variant by construction of the macro table.
                     let scan = scan.unwrap_or(InlineScan::Malformed);
-                    RawOwned::Inline { scan, len, buf }
+                    RawOwned::Inline { scan, buf }
                 }
 
                 Heap(cb)
@@ -980,12 +996,12 @@ impl PerlString {
 }
 
 enum RawParts<'a> {
-    Inline { len: u8, buf: &'a [u8; INLINE_MAX] },
+    Inline { buf: &'a [u8; INLINE_MAX] },
     Heap(&'a CowBuffer),
 }
 
 enum RawOwned {
-    Inline { scan: InlineScan, len: u8, buf: [u8; INLINE_MAX] },
+    Inline { scan: InlineScan, buf: [u8; INLINE_MAX] },
     Heap(CowBuffer),
 }
 
@@ -1494,12 +1510,12 @@ impl Clone for PerlString {
     fn clone(&self) -> PerlString {
         let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
         match self.raw_parts() {
-            RawParts::Inline { len, buf } => {
+            RawParts::Inline { buf } => {
                 let scan = match self.inline_scan() {
                     Some(s) => s,
                     None => InlineScan::Malformed, // unreachable by construction; safe fallback
                 };
-                PerlString::build_inline(scan, u, w, t, len, *buf)
+                PerlString::build_inline(scan, u, w, t, *buf)
             }
             RawParts::Heap(cb) => PerlString::build_heap(u, w, t, cb.clone()),
         }
