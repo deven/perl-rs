@@ -2158,3 +2158,36 @@ fn ordering_matches_perl_for_every_flag_combination() {
         assert_eq!(a == b, *want == 0, "eq disagrees with cmp for {ah:?}/{af} against {bh:?}/{bf}");
     }
 }
+
+#[test]
+fn ord_is_the_ordering_that_agrees_with_equality() {
+    // `Ord` carries perl's cmp, so sorting and lookups agree.  Byte-mode ordering cannot be the trait: these two share
+    // their internal bytes — c3 a9 — but one is two Latin-1 characters and the other is U+00E9, so raw octets would
+    // call them equal where equality calls them unequal.
+    let plain = from_hex("c3a9", false);
+    let flagged = from_hex("c3a9", true);
+    assert_ne!(plain, flagged);
+    assert_eq!(plain.cmp(&flagged), Ordering::Less, "Ord agrees with perl and with equality");
+    assert_eq!(plain.cmp_bytes_mode(&flagged), Ordering::Equal, "byte mode sees identical octets");
+
+    // Sorting works, and matches perl's order for a mixed corpus.
+    let mut v = [
+        from_hex("ff", false),  // one octet, U+00FF
+        from_hex("c480", true), // U+0100
+        from_hex("61", false),  // "a"
+        from_hex("e9", false),  // U+00E9
+    ];
+
+    v.sort();
+    let order: Vec<usize> = v.iter().map(|s| s.len()).collect();
+    assert_eq!(v[0], from_hex("61", false), "\"a\" first");
+    assert_eq!(v[3], from_hex("c480", true), "U+0100 last");
+    assert!(order.len() == 4);
+
+    // And the trait's own consistency obligation, over the container-verified corpus.
+    for (a, b) in [("616263", "616264"), ("e9", "c480"), ("", "61")] {
+        let (x, y) = (from_hex(a, false), from_hex(b, false));
+        assert_eq!(x < y, x.cmp(&y) == Ordering::Less);
+        assert_eq!(x == y, x.cmp(&y) == Ordering::Equal);
+    }
+}

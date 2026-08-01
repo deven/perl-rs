@@ -1686,6 +1686,24 @@ impl PartialEq for PerlString {
 }
 impl Eq for PerlString {}
 
+impl Ord for PerlString {
+    /// Perl's `cmp`, which is the only ordering consistent with [`PartialEq`] and so the only one this trait can carry.
+    ///
+    /// [`PerlString::cmp_bytes_mode`] is deliberately *not* this: two strings can share their internal bytes and still
+    /// differ — an unflagged `"\xC3\xA9"` is two Latin-1 characters where a flagged one is `U+00E9` — so raw octet
+    /// ordering reports them equal where equality reports them unequal.  `Ord` requires agreement, and `use bytes` is a
+    /// lexical pragma the caller applies rather than a property of the strings.
+    fn cmp(&self, other: &PerlString) -> Ordering {
+        self.cmp_perl(other)
+    }
+}
+
+impl PartialOrd for PerlString {
+    fn partial_cmp(&self, other: &PerlString) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl Hash for PerlString {
     /// Canonical downgraded-when-possible form (§2.3.5), routed through an internal 64-bit content digest: the `Hasher`
     /// API cannot fork mid-stream, and the single-fetch dual calculation (below) must run two candidate hashers and
