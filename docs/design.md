@@ -367,16 +367,22 @@ incidental.**  Perl's `%.15g` float stringification maxes out at
 exactly 22 characters (`-2.22507385850720e-308`: sign + digit +
 point + 14 mantissa digits + 5-character exponent); `i64::MIN`
 stringifies to 20.  The longer of those outputs exceed the
-15-byte inline tier
-but draw entirely from the numeric alphabet of the nibble-packed
-tier (≤ 30 characters, §2.2.9), so **every numeric stringification
-the interpreter can produce stays inline** — encoded by table
-lookup, allocation-free — and numeric stringification is constant
-traffic (every printed number, every number used as a hash key,
-every interpolation).  This invariant is
-load-bearing for the envelope: the packed tier is what preserves
-it at 16 bytes (§2.2.9), and every alternative string design is
-measured against it.
+15-byte inline tier but draw entirely from the numeric alphabet of
+the nibble-packed tier (≤ 30 characters, §2.2.9), so **every
+*default* numeric stringification stays inline** — encoded by table
+lookup, allocation-free — and default numeric stringification is
+constant traffic (every printed number, every number used as a
+hash key, every interpolation).  The scope is exactly the implicit
+string conversion, perl's `SvPV` path: `sprintf` and `printf` with
+an explicit precision produce arbitrary-length output
+(`%.53g` of `sqrt(2)` is 54 characters, container-verified) and
+allocate like any other long string, as does any format whose
+width or literal text carries it past the tier.  That is not a
+weakness of the bound — those are formatting operations that
+already build a buffer — but the invariant must not be read as
+covering them.  It is load-bearing for the envelope: the packed
+tier is what preserves it at 16 bytes (§2.2.9), and every
+alternative string design is measured against it.
 
 **Per-value state vs. per-buffer facts.**  String state splits into
 two locations by one criterion: copies duplicate the tag and share
@@ -853,7 +859,7 @@ is deliberately deferred (§2.3.6).
 
 **The envelope is 16 bytes** — `Value`, `ScalarPayload`, and
 `Option` of each.  The load-bearing invariant a wider envelope
-would buy — numeric stringifications inline (§2.2.3) — is
+would buy — default numeric stringifications inline (§2.2.3) — is
 delivered instead by the packed string tier below, so the choice
 reduces to density, where 16 wins outright.
 
@@ -1047,8 +1053,8 @@ corpus tripwire, softened for keys because keys repeat: the heap
 cost is per-distinct-key-per-hash, not per-operation.
 
 **Packed-decimal numeric caches.**  The digits are the expensive
-product of numeric stringification; rendering cached digits is
-nibble unpacking.  `Float` carries a cache of up to 10-11
+product of default numeric stringification; rendering cached
+digits is nibble unpacking.  `Float` carries a cache of up to 10-11
 significant digits plus decimal exponent, sign, and count; `Int`
 carries up to 12 digits plus sign and count (no exponent).  The
 cached digits are always perl's `%.15g` output digits — never
