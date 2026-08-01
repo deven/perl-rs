@@ -23,6 +23,18 @@
 //! optimization a string simply doesn't get.
 
 // The production consumers arrive with the PerlString fusion; the expect self-reports for removal the moment they land.
+//! # The obligation this format carries into comparison
+//!
+//! `Latin1` stores code points where perl's buffer holds their UTF-8 encoding.  That is a compression of the buffer,
+//! not a claim about the value.  With the utf8 flag *off* those bytes **are** the string: fifteen stored code points in
+//! `U+0080`-`U+00FF` are a thirty-character value, each byte its own character, and it is only a coincidence of
+//! encoding that they fit in fifteen.
+//!
+//! So every length, comparison, and hash must answer over the virtual expansion rather than the stored payload — §2.2.9
+//! and §2.3.5.  Reaching for the payload directly would give a flagged and an unflagged Latin-1-stored string the same
+//! characters, which is the one thing they do not share.  `PerlString`'s comparison paths are written against raw
+//! inline bytes today and will need revisiting here, not merely extending.
+
 #![cfg_attr(not(test), expect(dead_code))]
 
 /// The inline payload width in bytes.

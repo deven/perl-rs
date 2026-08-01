@@ -1542,6 +1542,24 @@ a flagged one — the same octets, read as Latin-1 characters.  The
 operands are projected and then compared by the one ordering these
 values have.
 
+**Comparison reads the value, never the storage.**  The Latin-1
+inline format (§2.2.9) stores code points where perl's buffer holds
+their UTF-8 encoding, which is a compression of the buffer and not
+a claim about the value.  With the flag *off* those bytes are the
+string: fifteen stored code points in `U+0080`-`U+00FF` are a
+**thirty-character** value, each byte its own character, and it is
+only a coincidence of encoding that they can be held as fifteen.
+Equality, ordering, and hashing must therefore answer over the
+virtual expansion — the same discipline §2.2.9 requires of
+`length`, which reports 30 there, and of `ord`, which returns the
+lead byte `C3` rather than the code point.
+
+A comparison path that reached for the stored payload would give a
+flagged and an unflagged Latin-1-stored string the same characters,
+which is the one thing they do not share.  Nothing does so today,
+the format not yet being live — the inline tier still stores raw
+bytes — and this is the obligation it must satisfy when it lands.
+
 **For seven-bit content the flag is semantically null.**  ASCII
 encodes identically as octets and as UTF-8, so the value is the
 same either way and the projection is the identity there too — it
