@@ -2168,7 +2168,7 @@ fn ord_is_the_ordering_that_agrees_with_equality() {
     let flagged = from_hex("c3a9", true);
     assert_ne!(plain, flagged);
     assert_eq!(plain.cmp(&flagged), Ordering::Less, "Ord agrees with perl and with equality");
-    assert_eq!(plain.cmp_bytes_mode(&flagged), Ordering::Equal, "byte mode sees identical octets");
+    assert_eq!(plain.cmp_raw_bytes(&flagged), Ordering::Equal, "byte mode sees identical octets");
 
     // Sorting works, and matches perl's order for a mixed corpus.
     let mut v = [
@@ -2190,4 +2190,80 @@ fn ord_is_the_ordering_that_agrees_with_equality() {
         assert_eq!(x < y, x.cmp(&y) == Ordering::Less);
         assert_eq!(x == y, x.cmp(&y) == Ordering::Equal);
     }
+}
+
+#[test]
+fn the_flag_is_semantically_null_for_ascii() {
+    // Seven-bit content encodes identically as octets and as UTF-8, so the flag changes nothing about the value: it
+    // takes a code point of U+0080 or above for the flag to mean anything.  Equality, ordering, and hashing must
+    // therefore ignore it here — while `is_utf8` still reports it, perl exposing the flag through `utf8::is_utf8`
+    // even where it is semantically null.
+    //
+    // Perl does not canonicalize the flag for ASCII — it may be set or clear arbitrarily — so all four combinations
+    // over identical seven-bit bytes must agree.  Our scan state records ASCII as its own value, which perl has no
+    // equivalent of, and that extra distinction must not leak into comparison.
+    for hex in ["", "61", "616263", "7f", "004161", "30313233343536373839616263"] {
+        for (lf, rf) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (a, b) = (from_hex(hex, lf), from_hex(hex, rf));
+            assert_eq!(a, b, "{hex:?} with flags {lf}/{rf}");
+            assert_eq!(a.cmp_perl(&b), Ordering::Equal, "{hex:?} with flags {lf}/{rf}");
+            assert_eq!(hash_of(&a), hash_of(&b), "{hex:?} with flags {lf}/{rf}: equal values must hash alike");
+        }
+    }
+
+    // And ASCII strings that differ in content still differ, whatever the flags.
+    for (lf, rf) in [(false, false), (false, true), (true, false), (true, true)] {
+        assert_ne!(from_hex("616263", lf), from_hex("616264", rf), "flags {lf}/{rf}");
+        assert_eq!(from_hex("616263", lf).cmp_perl(&from_hex("616264", rf)), Ordering::Less);
+    }
+
+    let plain = from_hex("616263", false);
+    let flagged = from_hex("616263", true);
+    assert_ne!(plain.is_utf8(), flagged.is_utf8(), "the flag is still observable");
+
+    // At U+0080 and above the flag becomes load-bearing: the same octets are two Latin-1 characters unflagged and
+    // one character flagged.
+    let two_octets = from_hex("c3a9", false);
+    let one_char = from_hex("c3a9", true);
+    assert_ne!(two_octets, one_char, "here the flag decides the value");
+    assert_eq!(two_octets.len(), 2);
+    assert_eq!(one_char.char_len(), Some(1));
+}
+
+#[test]
+fn identical_ascii_bytes_are_one_value_across_every_flag_and_tier() {
+    // The property, exhaustively rather than by sample: if the bytes are seven-bit and identical, the strings are
+    // the same value whatever the flags say.  Swept across all three storage tiers, because each has its own
+    // comparison path — inline runs the scan-state grid, packed has a nibble fast path, heap compares buffers — and
+    // a shortcut in any of them could let the flag leak into the answer.
+    //
+    // Packed content is always ASCII by construction, so the flagged packed forms exist precisely to be equal to
+    // their unflagged twins.
+    let mut contents: Vec<Vec<u8>> = Vec::new();
+    for len in 0..=40 {
+        contents.push((0..len).map(|i| b'a' + (i % 26) as u8).collect()); // inline, then heap
+        contents.push((0..len).map(|i| b'0' + (i % 10) as u8).collect()); // packs, in the numeric alphabet
+    }
+    contents.push(b"2026-07-28T14:33:07Z".to_vec()); // packs, date-time alphabet
+    contents.push(b"2026-07-29T17:23:45.123456789Z".to_vec()); // packs, full family
+    contents.push(b"\x00\x01\x7f".to_vec()); // the seven-bit extremes, including NUL
+    contents.push(vec![0u8; 20]); // all NUL, packed band length
+
+    let mut tiers = std::collections::BTreeSet::new();
+    for bytes in &contents {
+        assert!(bytes.iter().all(|&b| b < 0x80), "fixture must be seven-bit");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        for (lf, rf) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (a, b) = (from_hex(&hex, lf), from_hex(&hex, rf));
+            tiers.insert(format!("{:?}", a.storage_kind()));
+
+            assert_eq!(a, b, "len {} flags {lf}/{rf}", bytes.len());
+            assert_eq!(a.cmp_perl(&b), Ordering::Equal, "len {} flags {lf}/{rf}", bytes.len());
+            assert_eq!(b.cmp_perl(&a), Ordering::Equal, "len {} flags {rf}/{lf}", bytes.len());
+            assert_eq!(hash_of(&a), hash_of(&b), "len {} flags {lf}/{rf}: equal values must hash alike", bytes.len());
+        }
+    }
+
+    assert_eq!(tiers.len(), 3, "the sweep must reach every tier, saw {tiers:?}");
 }

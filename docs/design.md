@@ -1533,9 +1533,41 @@ Unlike equality, ordering gets no shortcuts from the scan-state
 grid: knowing two strings differ says nothing about which is
 greater, so the cross-flag path always walks.
 
- Under `use bytes` the ops layer selects a third comparison mode —
-raw bytes, flags ignored — by compile-time hint (§2.2.3, §8); it is
-not a property of the strings.  The warned and tainted tag bits are
+ Under `use bytes` the ops layer ignores the utf8 flag, by
+compile-time hint (§2.2.3, §8) rather than by any property of the
+strings.  That is not a third comparison: **the flag is part of a
+string's value, not an annotation on it**, so ignoring it is the
+identity on an unflagged string and yields a *different value* for
+a flagged one — the same octets, read as Latin-1 characters.  The
+operands are projected and then compared by the one ordering these
+values have.
+
+**For seven-bit content the flag is semantically null.**  ASCII
+encodes identically as octets and as UTF-8, so the value is the
+same either way and the projection is the identity there too — it
+takes a code point of `U+0080` or above for the flag to mean
+anything.
+
+Perl does not canonicalize the flag for ASCII — it may be set or
+clear on the same bytes — so all four flag combinations over
+identical seven-bit content must agree: both set, both clear, or
+one of each.  The flag remains *observable*, perl exposing it
+through `utf8::is_utf8`, so both representations exist and are not
+interchangeable at that level; but equality, ordering, and hashing
+must ignore it, which is what makes the canonical downgraded form
+sound as the hash input.  Our scan state records ASCII as a value
+of its own, which perl has no equivalent of, and that extra
+distinction must not reach comparison either.
+
+Above that boundary the flag decides the value, and the projection
+is not injective: a flagged `U+00E9` and an unflagged `"\xC3\xA9"`
+both collapse onto the same two-octet value.  Comparing projected
+operands is therefore sound, and
+comparing a projected one against an unprojected one is not —
+which is also why a raw byte comparison cannot serve as the
+ordering on unprojected values, and so cannot be the `Ord` impl.
+
+The warned and tainted tag bits are
 ignored by equality and hashing.  This section supersedes any notion
 of "internal representation equality" — string equality in perl-core
 *is* Perl-level string equality.

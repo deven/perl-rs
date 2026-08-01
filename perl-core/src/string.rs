@@ -1454,11 +1454,13 @@ impl PerlString {
     /// because its first octet reads as `U+00C3`.  Equal content compares equal across flags, agreeing with
     /// [`PartialEq`].
     ///
-    /// This is the default mode.  `use bytes` selects raw-octet ordering instead, which is a lexical pragma and so the
-    /// caller's to apply (§2.2.9); against these strings that is [`PerlString::cmp_bytes_mode`].
+    /// `use bytes` selects no second comparison.  The utf8 flag is part of a string's value rather than an
+    /// annotation on it, so ignoring the flag is the identity on an unflagged string and yields a *different value*
+    /// for a flagged one — the same octets, read as Latin-1 characters.  The operands are projected and then
+    /// compared by this ordering, like against like.
     pub fn cmp_perl(&self, other: &PerlString) -> Ordering {
         if self.is_utf8() == other.is_utf8() {
-            return self.cmp_bytes_mode(other);
+            return self.cmp_raw_bytes(other);
         }
 
         let (flagged, plain) = if self.is_utf8() { (self, other) } else { (other, self) };
@@ -1467,12 +1469,17 @@ impl PerlString {
         if self.is_utf8() { ordering } else { ordering.reverse() }
     }
 
-    /// Raw-octet ordering: what `use bytes` selects, and what `cmp_perl` reduces to when both sides read their bytes
-    /// the same way.
+    /// Compare the raw bytes, which is what [`PerlString::cmp_perl`] reduces to when both sides read theirs the same
+    /// way — unflagged octets being their own code points, and UTF-8 being order-preserving.
     ///
-    /// Two packed strings of one alphabet compare as their nibbles do — the values are assigned in ASCII order, so
-    /// nibble order is byte order — without decoding either side.
-    pub fn cmp_bytes_mode(&self, other: &PerlString) -> Ordering {
+    /// Two packed strings of one alphabet compare as their nibbles do, the values being assigned in ASCII order, so
+    /// neither side decodes.
+    ///
+    /// Private, and an optimization rather than a second ordering: there is one ordering on these values, and this
+    /// is how it computes when neither side needs decoding.  It is *not* the `use bytes` comparison — that pragma
+    /// changes which value is being compared, not how — and applied to operands whose flags differ it would report
+    /// unlike things equal, which is why it cannot be the `Ord` impl.
+    fn cmp_raw_bytes(&self, other: &PerlString) -> Ordering {
         match (self.raw_parts(), other.raw_parts()) {
             (RawParts::Packed(a), RawParts::Packed(b)) if a.alphabet == b.alphabet => a.cmp_same_alphabet(&b),
             (RawParts::Packed(a), _) => a.cmp_bytes(other.as_bytes(&mut [0u8; DECODE_MAX])),
@@ -1689,10 +1696,9 @@ impl Eq for PerlString {}
 impl Ord for PerlString {
     /// Perl's `cmp`, which is the only ordering consistent with [`PartialEq`] and so the only one this trait can carry.
     ///
-    /// [`PerlString::cmp_bytes_mode`] is deliberately *not* this: two strings can share their internal bytes and still
-    /// differ — an unflagged `"\xC3\xA9"` is two Latin-1 characters where a flagged one is `U+00E9` — so raw octet
-    /// ordering reports them equal where equality reports them unequal.  `Ord` requires agreement, and `use bytes` is a
-    /// lexical pragma the caller applies rather than a property of the strings.
+    /// A raw byte comparison is deliberately *not* this: two strings can share their internal bytes and still
+    /// differ — an unflagged `"\xC3\xA9"` is two Latin-1 characters where a flagged one is `U+00E9` — so it would
+    /// report them equal where equality reports them unequal, and `Ord` requires the two to agree.
     fn cmp(&self, other: &PerlString) -> Ordering {
         self.cmp_perl(other)
     }
