@@ -281,11 +281,13 @@ fn would_warn_boundary_table() {
     ];
 
     for form in warns {
-        assert!(string_would_warn(form.as_bytes()), "{form:?} must warn (container-verified)");
+        let s: PerlString = form.parse().unwrap();
+        assert!(s.would_warn(), "{form:?} must warn (container-verified)");
     }
 
     for form in silent {
-        assert!(!string_would_warn(form.as_bytes()), "{form:?} must be silent (container-verified)");
+        let s: PerlString = form.parse().unwrap();
+        assert!(!s.would_warn(), "{form:?} must be silent (container-verified)");
     }
 }
 

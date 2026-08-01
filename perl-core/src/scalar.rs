@@ -8,7 +8,7 @@
 
 use crate::cow_buffer::AllocError;
 use crate::string::PerlString;
-use crate::value::{Numeric, ScalarPayload, Tainted, string_would_warn};
+use crate::value::{Numeric, ScalarPayload, Tainted};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::mem;
@@ -287,7 +287,7 @@ impl ScalarCell {
         };
 
         let emit = match payload {
-            ScalarPayload::String(s) if string_would_warn(s.as_bytes()) && !s.is_warned() => {
+            ScalarPayload::String(s) if s.would_warn() && !s.is_warned() => {
                 s.mark_warned();
                 true
             }
@@ -335,7 +335,7 @@ impl ConstScalar {
         let float = payload.to_float();
         let string = payload.stringify()?;
 
-        let can_warn = matches!(&payload, ScalarPayload::String(s) if string_would_warn(s.as_bytes()));
+        let can_warn = matches!(&payload, ScalarPayload::String(s) if s.would_warn());
         let numify_warned = can_warn.then(|| AtomicBool::new(false));
 
         Ok(ConstScalar { payload, int, float, string, numify_warned })

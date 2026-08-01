@@ -1162,3 +1162,38 @@ fn formatting_into_a_string_grows_it_across_tiers() {
     assert_eq!(s.as_bytes(), b"0000000100020003000400050006000700080009");
     assert_eq!(s.len(), 40);
 }
+
+// ── Interpreting the content (§2.2.2, §2.3.3, §2.3.4) ─────────────
+
+#[test]
+fn interpretation_methods_answer_from_the_string() {
+    // The operations that used to reach for the bytes at the call site.  Asking the string means the caller neither
+    // sees nor decides which storage form holds the content.
+    let s: PerlString = "42abc".parse().unwrap();
+    assert_eq!(s.to_int(), 42, "leading numeric prefix");
+    assert!(s.to_bool());
+    assert!(s.would_warn(), "a trailing non-numeric tail warns");
+
+    let f: PerlString = "3.75".parse().unwrap();
+    assert_eq!(f.to_float(), 3.75);
+    assert_eq!(f.to_int(), 3, "truncating toward zero");
+    assert!(!f.would_warn());
+
+    // Perl truthiness: only "" and "0" are false, so "0.0" and "00" are true.
+    for (text, truth) in [("", false), ("0", false), ("0.0", true), ("00", true), (" ", true), ("0E0", true)] {
+        let v: PerlString = text.parse().unwrap();
+        assert_eq!(v.to_bool(), truth, "truthiness of {text:?}");
+    }
+}
+
+#[test]
+fn interpretation_agrees_across_storage_forms() {
+    // The same content held inline and on the heap must answer identically — the property that lets storage forms
+    // multiply without consumers noticing.
+    let short: PerlString = "17".parse().unwrap();
+    let padded: PerlString = "17                                        ".parse().unwrap();
+    assert_ne!(short.storage_kind(), padded.storage_kind(), "the two must actually differ in storage");
+    assert_eq!(short.to_int(), 17);
+    assert_eq!(padded.to_int(), 17, "trailing space does not change the numeric prefix");
+    assert!(short.to_bool() && padded.to_bool());
+}

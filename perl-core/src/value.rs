@@ -159,7 +159,7 @@ macro_rules! impl_coercions {
                     $ty::Undef(_) => false,
                     $ty::Int(n, _) => *n != 0,
                     $ty::Float(f, _) => *f != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
-                    $ty::String(s) => !matches!(s.as_bytes(), b"" | b"0"),
+                    $ty::String(s) => s.to_bool(),
                     $ty::True => true,
                     $ty::False => false,
                     $ty::ScalarRefMut(..) | $ty::ScalarRefConst(..) | $ty::ArrayRef(..) | $ty::HashRef(..) => true, // refs are always true (verified)
@@ -174,7 +174,7 @@ macro_rules! impl_coercions {
                     $ty::Undef(_) => 0,
                     $ty::Int(n, _) => *n,
                     $ty::Float(f, _) => float_to_int_i64_visible(*f),
-                    $ty::String(s) => parse_int_i64_visible(s.as_bytes()),
+                    $ty::String(s) => s.to_int(),
                     $ty::True => 1,
                     $ty::False => 0,
                     $ty::ScalarRefMut(c, _) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
@@ -192,7 +192,7 @@ macro_rules! impl_coercions {
                     $ty::Undef(_) => 0.0,
                     $ty::Int(n, _) => *n as f64,
                     $ty::Float(f, _) => *f,
-                    $ty::String(s) => parse_float(s.as_bytes()),
+                    $ty::String(s) => s.to_float(),
                     $ty::True => 1.0,
                     $ty::False => 0.0,
                     $ty::ScalarRefMut(c, _) => HeapArc::as_ptr(c) as usize as f64,
@@ -211,7 +211,7 @@ macro_rules! impl_coercions {
                     $ty::Undef(_) => Numeric::Int(0),
                     $ty::Int(n, _) => Numeric::Int(*n),
                     $ty::Float(f, _) => Numeric::Float(*f),
-                    $ty::String(s) => classify_numeric(s.as_bytes()),
+                    $ty::String(s) => s.numify(),
                     $ty::True => Numeric::Int(1),
                     $ty::False => Numeric::Int(0),
                     $ty::ScalarRefMut(c, _) => Numeric::Int(HeapArc::as_ptr(c) as usize as i64),
@@ -846,7 +846,7 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
 
 /// String numification classification: an exactly-integral token within i64 range numifies as an integer; everything
 /// else (fractions, exponents, overflow, Inf/NaN forms, garbage) as a float.
-fn classify_numeric(bytes: &[u8]) -> Numeric {
+pub(crate) fn classify_numeric(bytes: &[u8]) -> Numeric {
     let (negative, rest) = split_sign(bytes);
 
     let mut digit_end = 0;

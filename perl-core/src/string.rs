@@ -1111,6 +1111,42 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     Chars { rest: bytes, raw_fallback: false }
 }
 
+impl PerlString {
+    // ── Numeric and boolean interpretation (§2.2.2, §2.3.4) ───────
+    //
+    // These live here rather than at the call site because they are questions about a string's *content*, and the
+    // representation that holds that content is this type's business.  A caller asking `s.to_int()` needs no view of
+    // the bytes, so no scratch buffer and no decision about which storage form it is looking at — which is what lets
+    // the storage forms multiply without every consumer learning about them.
+
+    /// Perl truthiness: every string is true but `""` and `"0"` (§2.3.3).
+    pub fn to_bool(&self) -> bool {
+        !matches!(self.as_bytes(), b"" | b"0")
+    }
+
+    /// Perl's integer numification, as `int` and integer context see it — the visible i64, wrapping past the range
+    /// exactly as perl's cast does (§2.2.2).
+    pub fn to_int(&self) -> i64 {
+        crate::value::parse_int_i64_visible(self.as_bytes())
+    }
+
+    /// Perl's float numification: leading-numeric prefix, `Inf`/`NaN` forms, zero for a non-numeric string.
+    pub fn to_float(&self) -> f64 {
+        crate::value::parse_float(self.as_bytes())
+    }
+
+    /// How this string numifies — integer or float — under the deferred-UV rule (§2.2.2).
+    pub fn numify(&self) -> crate::value::Numeric {
+        crate::value::classify_numeric(self.as_bytes())
+    }
+
+    /// Whether numifying this string would emit perl's `Argument isn't numeric` warning (§2.3.4).  A question about the
+    /// content; whether the warning has *already* fired is [`PerlString::is_warned`].
+    pub fn would_warn(&self) -> bool {
+        crate::value::string_would_warn(self.as_bytes())
+    }
+}
+
 impl fmt::Write for PerlString {
     /// Append formatted text.  The only failure this can encounter is allocation, which `fmt::Error` cannot carry — use
     /// [`PerlString::push_fmt`] where the distinction matters; this impl exists so that `write!` works.
