@@ -12,20 +12,21 @@
 //! the 24-byte envelope (§2.3.6).  The module name is temporary in the same sense as `string.rs`: the final names
 //! arrive when the superseded flag-matrix modules are deleted.
 //!
-//! Numeric contracts are container-verified against perl 5.38 and pin the **i64-visible** behavior only; UV semantics
-//! are a deferred design section (§2.2.2).  Verified facts encoded below:
+//! Numeric contracts are container-verified against perl 5.38 and pin the **i64-visible** behavior only — the value
+//! this crate exposes as an `i64`, which is what perl's own integer context yields for everything in range.  Unsigned
+//! semantics are a deferred design section (§2.2.2).  Verified facts encoded below:
 //!
 //! - String numification: leading ASCII whitespace skipped; optional sign; decimal digits (radix prefixes are never
 //!   interpreted: `"0xff"` is 0-and-stop); a dangling exponent marker is not part of the number (`"1e"` is 1).
 //!   Case-insensitive `inf`/`nan` *prefixes* are recognized after the sign (`"infx"` is Inf, `"nanx"` is NaN, `"in"`
 //!   is 0).
-//! - Integer strings beyond `i64::MAX` are UV-exact in perl; the i64-visible value is the wrapping cast
-//!   (`"9223372036854775808"` is `i64::MIN`); beyond `u64::MAX` the value saturates UV_MAX-visible (`-1`); negative
-//!   overflow clamps to `i64::MIN`.
+//! - Integer strings beyond `i64::MAX` are exact as unsigned 64-bit values in perl; the i64-visible value is the
+//!   wrapping cast (`"9223372036854775808"` is `i64::MIN`); beyond `u64::MAX` the value reads as `-1` (perl saturates
+//!   its cached unsigned integer at `UV_MAX`); negative overflow clamps to `i64::MIN`.
 //! - Float→int truncates toward zero; NaN gives 0; values in `[2^63, 2^64)` wrap through the u64 cast (9.3e18 is
-//!   -9146744073709551616); at or above `2^64` (including `+Inf`) the value is UV_MAX-visible (`-1`); below `-2^63`
-//!   (including `-Inf`) it clamps to `i64::MIN`.  (`printf %d` renders non-finite NVs as `Inf`/`NaN` without consulting
-//!   the cached integer — a formatting rule for the ops layer, separate from these coercion values.)
+//!   -9146744073709551616); at or above `2^64` (including `+Inf`) the value reads as `-1`; below `-2^63` (including
+//!   `-Inf`) it clamps to `i64::MIN`.  (`printf %d` renders non-finite NVs as `Inf`/`NaN` without consulting the cached
+//!   integer — a formatting rule for the ops layer, separate from these coercion values.)
 //! - Truthiness: NaN is true; `-0.0` is false; the strings `""` and `"0"` are false, everything else (including
 //!   `"0.0"`, `"00"`, `" "`) is true.
 
@@ -141,8 +142,8 @@ const _: () = assert!(size_of::<Option<Value>>() == 24);
 
 // ── Coercions: one match each, written once (§2.2.2) ──────────────
 /// The result of numification: perl's numeric context yields an integer or a float per the value's nature.  i64-visible
-/// only (§2.2.2): integer strings that are UV-exact but beyond `i64::MAX` classify as `Float` here, with `to_int`
-/// supplying the pinned wrapped value through the exact-digits path independently.
+/// only (§2.2.2): integer strings exact as unsigned 64-bit values but beyond `i64::MAX` classify as `Float` here, with
+/// `to_int` supplying the pinned wrapped value through the exact-digits path independently.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Numeric {
     Int(i64),
@@ -676,9 +677,9 @@ pub fn parse_int_i64_visible(bytes: &[u8]) -> i64 {
             i64::MIN // -(2^63) exactly, and every larger magnitude clamps here (container-verified)
         }
     } else if value <= u128::from(u64::MAX) {
-        value as u64 as i64 // exact within i64; the wrapping cast above it (UV-exact in perl, i64-visible wrap)
+        value as u64 as i64 // Exact within i64, the wrapping cast above it — perl holds these exactly, unsigned.
     } else {
-        -1 // beyond UV_MAX: UV_MAX-visible
+        -1 // Reads as -1: perl saturates its cached unsigned integer at UV_MAX.
     }
 }
 
@@ -692,7 +693,7 @@ pub fn float_to_int_i64_visible(f: f64) -> i64 {
     }
 
     if f >= TWO_64 {
-        return -1; // UV_MAX-visible (includes +Inf)
+        return -1; // Reads as -1, +Inf included: perl saturates at UV_MAX.
     }
 
     if f >= TWO_63 {
@@ -872,7 +873,7 @@ pub(crate) fn classify_numeric(bytes: &[u8]) -> Numeric {
             return Numeric::Int(n);
         }
 
-        // UV-exact-but-beyond-i64 (and larger): Float under the deferred-UV rule (§2.2.2).
+        // Exact as an unsigned 64-bit value but beyond i64, and larger: Float under the deferred-UV rule (§2.2.2).
     }
 
     Numeric::Float(parse_float(bytes))

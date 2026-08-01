@@ -56,11 +56,12 @@ fn numify_classification() {
     assert_eq!(s("42").numify(), Numeric::Int(42));
     assert_eq!(s("  +42  junk").numify(), Numeric::Int(42));
     assert_eq!(s("-9223372036854775808").numify(), Numeric::Int(i64::MIN));
-    assert_eq!(s("9223372036854775807").numify(), Numeric::Int(i64::MAX), "IV_MAX string is exact (verified)");
+    assert_eq!(s("9223372036854775807").numify(), Numeric::Int(i64::MAX), "a string at perl's IV_MAX is exact (verified)");
     assert_eq!(s("3.5").numify(), Numeric::Float(3.5));
     assert_eq!(s("1e2").numify(), Numeric::Float(100.0));
 
-    // UV-exact-but-beyond-i64: Float under the deferred-UV rule; to_int supplies the pinned wrap.
+    // Exact as an unsigned 64-bit value but beyond i64: Float under the deferred-UV rule; to_int supplies the
+    // pinned wrap.
     assert_eq!(s("9223372036854775808").numify(), Numeric::Float(9.223372036854776e18));
     assert_eq!(Value::True.numify(), Numeric::Int(1));
     assert_eq!(Value::False.numify(), Numeric::Int(0));
@@ -85,8 +86,8 @@ fn parse_int_basics() {
 fn parse_int_beyond_i64_is_the_wrapping_cast() {
     // The resolution of the old "never 0" red: container-verified printf %d gives the wrapped cast.
     assert_eq!(parse_int_i64_visible(b"9223372036854775808"), i64::MIN, "2^63 wraps (verified -9223372036854775808)");
-    assert_eq!(parse_int_i64_visible(b"18446744073709551615"), -1, "UV_MAX wraps to -1");
-    assert_eq!(parse_int_i64_visible(b"18446744073709551616"), -1, "beyond UV_MAX is UV_MAX-visible (verified)");
+    assert_eq!(parse_int_i64_visible(b"18446744073709551615"), -1, "perl's UV_MAX wraps to -1");
+    assert_eq!(parse_int_i64_visible(b"18446744073709551616"), -1, "beyond it, perl saturates and reads -1 (verified)");
     assert_eq!(parse_int_i64_visible(b"99999999999999999999999999"), -1);
     assert_eq!(parse_int_i64_visible(b"-9223372036854775808"), i64::MIN);
     assert_eq!(parse_int_i64_visible(b"-9223372036854775809"), i64::MIN, "negative overflow clamps (verified)");
@@ -98,11 +99,11 @@ fn float_to_int_contracts() {
     assert_eq!(float_to_int_i64_visible(3.7), 3);
     assert_eq!(float_to_int_i64_visible(-3.7), -3, "truncation toward zero (verified)");
     assert_eq!(float_to_int_i64_visible(f64::NAN), 0, "NaN caches 0 (Devel::Peek-verified)");
-    assert_eq!(float_to_int_i64_visible(f64::INFINITY), -1, "Inf caches UV_MAX (Devel::Peek-verified)");
-    assert_eq!(float_to_int_i64_visible(f64::NEG_INFINITY), i64::MIN, "-Inf caches IV_MIN");
-    assert_eq!(float_to_int_i64_visible(1e30), -1, "finite beyond UV_MAX (verified printf %d)");
+    assert_eq!(float_to_int_i64_visible(f64::INFINITY), -1, "Inf caches perl's UV_MAX, reading -1 (Devel::Peek-verified)");
+    assert_eq!(float_to_int_i64_visible(f64::NEG_INFINITY), i64::MIN, "-Inf caches perl's IV_MIN");
+    assert_eq!(float_to_int_i64_visible(1e30), -1, "finite but beyond perl's UV_MAX (verified printf %d)");
     assert_eq!(float_to_int_i64_visible(-1e30), i64::MIN);
-    assert_eq!(float_to_int_i64_visible(9.3e18), -9146744073709551616, "the UV range wraps (verified)");
+    assert_eq!(float_to_int_i64_visible(9.3e18), -9146744073709551616, "the unsigned range wraps (verified)");
     assert_eq!(float_to_int_i64_visible(9223372036854775808.0), i64::MIN, "exactly 2^63 (verified)");
 }
 

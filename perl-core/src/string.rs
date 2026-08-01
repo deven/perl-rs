@@ -186,8 +186,8 @@ fn block_end(pos: usize, len: usize) -> usize {
 /// One traversal (in the fetch sense) determines perl-validity, Rust-validity, both range facts, and the character
 /// count.  Perl's extended validity, container-verified: surrogates, supra-Unicode, and the FE (7-byte) / FF (13-byte)
 /// forms decode; overlongs (minimal-length rule at every width), bare continuations, and truncations are malformed;
-/// values cap at IV_MAX.  Rust additionally rejects surrogates, values above U+10FFFF, and any sequence longer than
-/// 4 bytes — decidable per-sequence during the same decode.
+/// values cap at perl's `IV_MAX`, 2^63-1.  Rust additionally rejects surrogates, values above U+10FFFF, and any
+/// sequence longer than 4 bytes — decidable per-sequence during the same decode.
 fn classify_full(bytes: &[u8]) -> (u8, usize) {
     count_full_scan();
 
