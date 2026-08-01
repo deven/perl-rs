@@ -27,6 +27,8 @@
 //! - **State that survives assignment lives outside the payload.**  Blessing and readonly are properties of the
 //!   container; taint, caches, and the warning bit travel with the value.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 mod inline;
 mod packed;
 mod release;
