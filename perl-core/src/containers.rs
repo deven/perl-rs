@@ -21,7 +21,7 @@ use indexmap::IndexMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 
-use crate::heap::HeapArc;
+use crate::heap::{HeapArc, release_value};
 use crate::scalar::ScalarError;
 use crate::string::PerlString;
 use crate::value::{ArraySlot, Value};
@@ -42,7 +42,7 @@ impl Drop for PerlArray {
     /// `Vec`'s drop glue.  Destruction is not perl-visible mutation, so the readonly flag is deliberately not consulted.
     fn drop(&mut self) {
         for v in self.slots.drain(..).flatten() {
-            crate::heap::release_value(v);
+            release_value(v);
         }
     }
 }
@@ -191,7 +191,7 @@ impl Drop for PerlHash {
     /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
     fn drop(&mut self) {
         for (_key, v) in self.map.drain(..) {
-            crate::heap::release_value(v);
+            release_value(v);
         }
     }
 }

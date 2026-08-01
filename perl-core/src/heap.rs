@@ -28,6 +28,7 @@
 //! rule is what keeps it deadlock-free.
 
 use std::fmt;
+use std::ops::Deref;
 use std::sync::{Arc, Weak};
 
 /// A strong reference to a heap-domain node.
@@ -66,7 +67,7 @@ impl<T> Clone for HeapArc<T> {
     }
 }
 
-impl<T> std::ops::Deref for HeapArc<T> {
+impl<T> Deref for HeapArc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {

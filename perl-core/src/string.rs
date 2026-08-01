@@ -24,11 +24,12 @@
 
 use crate::cow_buffer::{AllocError, CowBuffer};
 use crate::packed::{MAX_PACKED_LEN, MIN_PACKED_LEN, PACKED_BYTES, Packed, PackedAlphabet, pack};
+use crate::value::{Numeric, classify_numeric, parse_float, parse_int_i64_visible, string_would_warn};
 use std::fmt;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::mem;
-use std::str;
+use std::str::{self, FromStr};
 
 /// Maximum inline payload: chosen so every numeric stringification stays allocation-free (§2.2.3).
 pub const INLINE_MAX: usize = 15;
@@ -691,7 +692,7 @@ impl PerlString {
     }
 
     /// Construct from a Rust `&str` **without allocating**, or `None` if the content cannot be stored in the value
-    /// itself.  Flagging follows [`FromStr`](std::str::FromStr): ASCII stores unflagged, non-ASCII flagged.
+    /// itself.  Flagging follows [`FromStr`]: ASCII stores unflagged, non-ASCII flagged.
     ///
     /// The contract is the guarantee, not a byte count: `Some` means no heap allocation occurred, so the set of
     /// accepted content widens whenever the non-allocating storage forms do.  Callers who merely prefer inline storage
@@ -1204,26 +1205,26 @@ impl PerlString {
     /// exactly as perl's cast does (§2.2.2).
     pub fn to_int(&self) -> i64 {
         let mut scratch = [0u8; DECODE_MAX];
-        crate::value::parse_int_i64_visible(self.as_bytes(&mut scratch))
+        parse_int_i64_visible(self.as_bytes(&mut scratch))
     }
 
     /// Perl's float numification: leading-numeric prefix, `Inf`/`NaN` forms, zero for a non-numeric string.
     pub fn to_float(&self) -> f64 {
         let mut scratch = [0u8; DECODE_MAX];
-        crate::value::parse_float(self.as_bytes(&mut scratch))
+        parse_float(self.as_bytes(&mut scratch))
     }
 
-    /// How this string numifies — integer or float — under the deferred-UV rule (§2.2.2).
-    pub fn numify(&self) -> crate::value::Numeric {
+    /// How this string numifies: integer, unsigned, or float, per §2.2.2's classification.
+    pub fn numify(&self) -> Numeric {
         let mut scratch = [0u8; DECODE_MAX];
-        crate::value::classify_numeric(self.as_bytes(&mut scratch))
+        classify_numeric(self.as_bytes(&mut scratch))
     }
 
     /// Whether numifying this string would emit perl's `Argument isn't numeric` warning (§2.3.4).  A question about the
     /// content; whether the warning has *already* fired is [`PerlString::is_warned`].
     pub fn would_warn(&self) -> bool {
         let mut scratch = [0u8; DECODE_MAX];
-        crate::value::string_would_warn(self.as_bytes(&mut scratch))
+        string_would_warn(self.as_bytes(&mut scratch))
     }
 }
 
@@ -1275,7 +1276,7 @@ impl Default for PerlString {
     }
 }
 
-impl std::str::FromStr for PerlString {
+impl FromStr for PerlString {
     type Err = AllocError;
 
     /// Construct from a Rust `&str`.  ASCII content is stored unflagged (the canonical downgraded form, §2.3.5);

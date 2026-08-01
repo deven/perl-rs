@@ -12,10 +12,11 @@ use crate::value::{Numeric, ScalarPayload, Tainted};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
-use crate::heap::HeapArc;
+use crate::heap::{HeapArc, release_payload};
 
 // ── Carried-over stubs (§2.3.7: "carried over") ───────────────────
 /// A chain of magic (tie, overload, ...) attached to a scalar.  Shape is a later design section.
@@ -121,7 +122,7 @@ impl Drop for ScalarCell {
             ScalarCell::Full(f) => mem::replace(&mut f.payload, ScalarPayload::Undef(Tainted::CLEAN)),
         };
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
-            crate::heap::release_payload(payload);
+            release_payload(payload);
         }
     }
 }
@@ -317,7 +318,7 @@ impl Drop for ConstScalar {
     fn drop(&mut self) {
         let payload = mem::replace(&mut self.payload, ScalarPayload::Undef(Tainted::CLEAN));
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
-            crate::heap::release_payload(payload);
+            release_payload(payload);
         }
     }
 }
@@ -493,7 +494,7 @@ impl ScalarReadGuard<'_> {
 /// at guard acquisition — acquiring a write guard to *toggle* readonly must remain possible.
 pub struct ScalarWriteGuard<'a>(RwLockWriteGuard<'a, ScalarCell>);
 
-impl std::ops::Deref for ScalarWriteGuard<'_> {
+impl Deref for ScalarWriteGuard<'_> {
     type Target = ScalarCell;
 
     fn deref(&self) -> &ScalarCell {
@@ -501,7 +502,7 @@ impl std::ops::Deref for ScalarWriteGuard<'_> {
     }
 }
 
-impl std::ops::DerefMut for ScalarWriteGuard<'_> {
+impl DerefMut for ScalarWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut ScalarCell {
         &mut self.0
     }

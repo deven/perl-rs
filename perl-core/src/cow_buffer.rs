@@ -34,7 +34,8 @@
 
 use std::alloc::{self, Layout};
 use std::fmt;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
+use std::slice;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering, fence};
 
 /// Allocation failure (or capacity arithmetic overflow, which is the same condition seen earlier).  Surfaces as a
@@ -92,7 +93,7 @@ impl CowBuffer {
 
         // SAFETY: freshly allocated, refcount 1, capacity >= bytes.len().
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.ptr.as_ptr(), bytes.len());
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buf.ptr.as_ptr(), bytes.len());
             buf.set_len(bytes.len());
         }
 
@@ -165,7 +166,7 @@ impl CowBuffer {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: invariants 1 and 2 — `len` bytes are initialized at `ptr`.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.header().len) }
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.header().len) }
     }
 
     /// Whether this handle is the only one (refcount == 1).  Acquire ordering so a `true` result synchronizes with any
@@ -215,7 +216,7 @@ impl CowBuffer {
 
         // SAFETY: fresh is unique with sufficient capacity; source bytes are valid for self.header().len.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.header().len);
+            ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.header().len);
             fresh.set_len(self.header().len);
         }
 
@@ -242,7 +243,7 @@ impl CowBuffer {
 
         // SAFETY: fresh is unique with capacity >= len; source valid for self.header().len.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.header().len);
+            ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.header().len);
             fresh.set_len(self.header().len);
         }
 
@@ -262,7 +263,7 @@ impl CowBuffer {
         // SAFETY: unique (reserve guarantees), capacity checked; regions cannot overlap (a &[u8] argument cannot alias
         // our uniquely-owned data region while &mut self is held).
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(self.header().len), bytes.len());
+            ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(self.header().len), bytes.len());
             let new_len = self.header().len + bytes.len();
             self.set_len(new_len);
         }
@@ -297,7 +298,7 @@ impl CowBuffer {
         self.make_unique(0)?;
 
         // SAFETY: unique (just ensured); len bytes initialized.
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.header().len) })
+        Ok(unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.header().len) })
     }
 
     /// Set both lengths (handle mirror and header).

@@ -39,8 +39,8 @@ use std::str;
 use crate::containers::{ArrayRef, HashRef};
 use crate::cow_buffer::AllocError;
 use crate::heap::HeapArc;
-use crate::scalar::{ConstScalar, ScalarCell, ScalarRef};
-use crate::string::PerlString;
+use crate::scalar::{ConstScalar, FALSE_SCALAR, ScalarCell, ScalarRef, TRUE_SCALAR};
+use crate::string::{DECODE_MAX, PerlString};
 
 // ── Tainted (§2.6.1, §2.6.3) ──────────────────────────────────────
 /// The per-value taint bit: a monotone bool newtype.  Constructors are explicit (`CLEAN` / `TAINTED` — sources that
@@ -329,8 +329,8 @@ impl Value {
     /// reach references through the ops layer's temp materialization.
     pub fn upgrade_to_scalar(&self) -> Option<ScalarRef> {
         match self {
-            Value::True => Some(crate::scalar::TRUE_SCALAR.clone()),
-            Value::False => Some(crate::scalar::FALSE_SCALAR.clone()),
+            Value::True => Some(TRUE_SCALAR.clone()),
+            Value::False => Some(FALSE_SCALAR.clone()),
             _ => None,
         }
     }
@@ -647,7 +647,7 @@ pub fn format_float(n: f64) -> String {
     let mut out = PerlString::empty();
     match format_float_into(n, &mut out) {
         // Every rendering fits without allocating (§2.2.3), so the error arm is unreachable in practice.
-        Ok(()) => String::from_utf8_lossy(out.as_bytes(&mut [0u8; crate::string::DECODE_MAX])).into_owned(),
+        Ok(()) => String::from_utf8_lossy(out.as_bytes(&mut [0u8; DECODE_MAX])).into_owned(),
         Err(_) => String::new(),
     }
 }
