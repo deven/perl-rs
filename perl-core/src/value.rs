@@ -85,6 +85,9 @@ impl Tainted {
 pub enum ScalarPayload {
     Undef(Tainted),
     Integer(i64, Tainted),
+
+    /// An integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
+    Unsigned(u64, Tainted),
     Float(f64, Tainted),
     String(PerlString),
     True,
@@ -110,6 +113,9 @@ pub enum ScalarPayload {
 pub enum Value {
     Undef(Tainted),
     Integer(i64, Tainted),
+
+    /// An integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
+    Unsigned(u64, Tainted),
     Float(f64, Tainted),
     String(PerlString),
     True,
@@ -147,6 +153,11 @@ const _: () = assert!(size_of::<Option<Value>>() == 24);
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Numeric {
     Integer(i64),
+
+    /// Values in `[2^63, 2^64)`, which perl holds exactly and an `i64` cannot.  Canonical only in that range: perl uses
+    /// its unsigned slot strictly when the signed one will not fit (container-verified — subtracting two unsigned
+    /// values down to 5 comes back signed), so a value has one representation, not two.
+    Unsigned(u64),
     Float(f64),
 }
 
@@ -159,6 +170,7 @@ macro_rules! impl_coercions {
                 match self {
                     $ty::Undef(_) => false,
                     $ty::Integer(n, _) => *n != 0,
+                    $ty::Unsigned(u, _) => *u != 0,
                     $ty::Float(f, _) => *f != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
                     $ty::String(s) => s.to_bool(),
                     $ty::True => true,
@@ -169,11 +181,19 @@ macro_rules! impl_coercions {
                 }
             }
 
+            /// The u64-visible integer coercion: the same 64 bits `to_int` yields, read unsigned — which is what perl's
+            /// `%u` renders (container-verified across the range, including the wrapping and clamping cases).  Exact
+            /// arithmetic on `Unsigned` values needs this reading; nothing else about it differs.
+            pub fn to_unsigned(&self) -> u64 {
+                self.to_int() as u64
+            }
+
             /// The i64-visible integer coercion, one match on the payload (contracts in the module header).
             pub fn to_int(&self) -> i64 {
                 match self {
                     $ty::Undef(_) => 0,
                     $ty::Integer(n, _) => *n,
+                    $ty::Unsigned(u, _) => *u as i64, // The same 64 bits read signed — perl's IV view of a UV.
                     $ty::Float(f, _) => float_to_int_i64_visible(*f),
                     $ty::String(s) => s.to_int(),
                     $ty::True => 1,
@@ -192,6 +212,7 @@ macro_rules! impl_coercions {
                 match self {
                     $ty::Undef(_) => 0.0,
                     $ty::Integer(n, _) => *n as f64,
+                    $ty::Unsigned(u, _) => *u as f64,
                     $ty::Float(f, _) => *f,
                     $ty::String(s) => s.to_float(),
                     $ty::True => 1.0,
@@ -211,6 +232,7 @@ macro_rules! impl_coercions {
                 match self {
                     $ty::Undef(_) => Numeric::Integer(0),
                     $ty::Integer(n, _) => Numeric::Integer(*n),
+                    $ty::Unsigned(u, _) => Numeric::Unsigned(*u),
                     $ty::Float(f, _) => Numeric::Float(*f),
                     $ty::String(s) => s.numify(),
                     $ty::True => Numeric::Integer(1),
@@ -236,6 +258,12 @@ macro_rules! impl_coercions {
                     $ty::Integer(n, t) => {
                         let mut rendered = PerlString::empty();
                         format_int_into(*n, &mut rendered)?;
+                        (rendered, *t)
+                    }
+                    $ty::Unsigned(u, t) => {
+                        // Exact digits: at most twenty characters, so the packed numeric alphabet holds them.
+                        let mut rendered = PerlString::empty();
+                        rendered.push_fmt(format_args!("{u}"))?;
                         (rendered, *t)
                     }
                     $ty::Float(f, t) => {
@@ -270,6 +298,7 @@ macro_rules! impl_coercions {
                 match self {
                     $ty::Undef(t)
                     | $ty::Integer(_, t)
+                    | $ty::Unsigned(_, t)
                     | $ty::Float(_, t)
                     | $ty::ScalarRefMut(_, t)
                     | $ty::ScalarRefConst(_, t)
@@ -319,6 +348,7 @@ impl Value {
         let payload = match mem::take(slot) {
             Value::Undef(t) => ScalarPayload::Undef(t),
             Value::Integer(n, t) => ScalarPayload::Integer(n, t),
+            Value::Unsigned(u, t) => ScalarPayload::Unsigned(u, t),
             Value::Float(f, t) => ScalarPayload::Float(f, t),
             Value::String(s) => ScalarPayload::String(s),
             Value::True => ScalarPayload::True,
@@ -359,6 +389,7 @@ impl Value {
         match p {
             ScalarPayload::Undef(t) => Value::Undef(t),
             ScalarPayload::Integer(n, t) => Value::Integer(n, t),
+            ScalarPayload::Unsigned(u, t) => Value::Unsigned(u, t),
             ScalarPayload::Float(f, t) => Value::Float(f, t),
             ScalarPayload::String(s) => Value::String(s),
             ScalarPayload::True => Value::True,
@@ -532,6 +563,7 @@ fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), AllocError> {
     let Some(e) = rendered.iter().position(|&b| b == b'e') else {
         return out.push_bytes(rendered); // Unreachable: exponent form always contains 'e'.
     };
+
     let (mantissa, exponent) = (&rendered[..e], &rendered[e + 1..]);
     let Ok(exp) = str::from_utf8(exponent).unwrap_or("").parse::<i32>() else {
         return out.push_bytes(rendered); // Unreachable likewise.
@@ -873,7 +905,12 @@ pub(crate) fn classify_numeric(bytes: &[u8]) -> Numeric {
             return Numeric::Integer(n);
         }
 
-        // Exact as an unsigned 64-bit value but beyond i64, and larger: Float under the deferred-UV rule (§2.2.2).
+        // Beyond i64 but within u64: exact as an unsigned value, which is where perl reaches for its unsigned slot.
+        if !negative && value <= u128::from(u64::MAX) {
+            return Numeric::Unsigned(value as u64);
+        }
+
+        // Larger still (or negative past i64::MIN): only a float can hold it, inexactly.
     }
 
     Numeric::Float(parse_float(bytes))

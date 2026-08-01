@@ -141,6 +141,7 @@ enum Value {
     // tainted undef is real — see below.
     Undef,
     Integer(i64),              // + packed-decimal digit cache (§2.2.9)
+    Unsigned(u64),             // [2^63, 2^64): beyond Integer
     Float(f64),                // + packed-decimal digit cache (§2.2.9)
     StrBytes(..),              // internal octets <= 15, NUL-terminated
     StrUtf8(..),               // encoded bytes <= 15, beyond Latin-1
@@ -268,6 +269,21 @@ against container perl 5.38 via `Devel::Peek`:
 - `Inf`, `-Inf`, and `NaN` in integer context cache `UV_MAX`,
   `IV_MIN`, and `0` respectively — always with only the private flag.
   The NV stays authoritative; stringification still gives `Inf`.
+
+Integer strings in `[2^63, 2^64)` are held by the `Unsigned`
+payload rather than losing exactness to a float: perl holds them
+exactly, and reaches for its unsigned slot strictly when the
+signed one will not fit — subtracting two unsigned values down to
+5 comes back signed (`Devel::Peek`-verified).  `Unsigned` is
+therefore canonical only in that range, so a value has one
+representation and not two.  Its readings are one 64-bit quantity
+seen two ways: `to_int` is the signed view and `to_unsigned` the
+unsigned one, matching perl's `%d` and `%u` across the whole range
+including the wrapping and clamping cases (container-verified).
+What remains genuinely unwritten is *promotion* — which operand
+types an operator's result takes, and when an exact result falls
+out to a float — because this crate has no arithmetic yet, for
+signed values either.
 
 The uniform rule beneath all three: every NV-to-IV coercion may cache;
 the result is authoritative iff the round-trip is exact.  In the

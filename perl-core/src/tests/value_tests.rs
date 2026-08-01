@@ -7,8 +7,8 @@ fn s(text: &str) -> Value {
 // ── The payload principle (§2.2.2): the retired flag-matrix bug class ─────
 #[test]
 fn payload_stays_authoritative_through_coercion() {
-    // Verified perl 5.38: my $x = 3.7 used as an integer still stringifies as "3.7" (FLAGS = NOK,pIOK — private
-    // cache only).
+    // Verified perl 5.38: my $x = 3.7 used as an integer still stringifies as "3.7" (FLAGS = NOK,pIOK — private cache
+    // only).
     let x = Value::Float(3.7, Tainted::CLEAN);
     assert_eq!(x.to_int(), 3); // truncating coercion
     assert_eq!(x.stringify().unwrap().as_bytes(), b"3.7"); // payload answers
@@ -16,8 +16,8 @@ fn payload_stays_authoritative_through_coercion() {
 
 #[test]
 fn truthiness_survives_numeric_use() {
-    // The three container-verified cases the flag-matrix model failed: "0.0", "abc", "0.5" remain true through
-    // numeric use, because truthiness is a payload question and coercion cannot replace the payload.
+    // The three container-verified cases the flag-matrix model failed: "0.0", "abc", "0.5" remain true through numeric
+    // use, because truthiness is a payload question and coercion cannot replace the payload.
     for text in ["0.0", "abc", "0.5", "00", " "] {
         let v = s(text);
         let _ = v.to_int();
@@ -60,9 +60,12 @@ fn numify_classification() {
     assert_eq!(s("3.5").numify(), Numeric::Float(3.5));
     assert_eq!(s("1e2").numify(), Numeric::Float(100.0));
 
-    // Exact as an unsigned 64-bit value but beyond i64: Float under the deferred-UV rule; to_int supplies the
-    // pinned wrap.
-    assert_eq!(s("9223372036854775808").numify(), Numeric::Float(9.223372036854776e18));
+    // Beyond i64 but within u64: exact, where perl reaches for its unsigned slot (container-verified: printing
+    // "18446744073709551615" + 0 gives the digits back, not 1.84467440737096e+19).
+    assert_eq!(s("9223372036854775808").numify(), Numeric::Unsigned(9223372036854775808));
+    assert_eq!(s("18446744073709551615").numify(), Numeric::Unsigned(u64::MAX));
+    assert_eq!(s("18446744073709551616").numify(), Numeric::Float(1.8446744073709552e19), "past u64, only a float");
+    assert_eq!(s("-9223372036854775809").numify(), Numeric::Float(-9.223372036854776e18), "negative past i64::MIN");
     assert_eq!(Value::True.numify(), Numeric::Integer(1));
     assert_eq!(Value::False.numify(), Numeric::Integer(0));
 }
@@ -117,6 +120,7 @@ fn parse_float_basics() {
     assert_eq!(parse_float(b".5"), 0.5);
     assert_eq!(parse_float(b""), 0.0);
     assert_eq!(parse_float(b"abc"), 0.0);
+
     let nv = parse_float(b"9223372036854775808");
     assert!((nv - 9.223372036854776e18).abs() < 1e4);
 }
@@ -249,8 +253,7 @@ fn aliasing_transparency_and_write_through() {
 
 #[test]
 fn boolean_slots_promote_to_their_own_cells() {
-    // Container-verified: \$x and \$y for two boolean variables are distinct, and distinct from the immortal
-    // (\(1==1)).
+    // Container-verified: \$x and \$y for two boolean variables are distinct, and distinct from the immortal (\(1==1)).
     let mut x = Value::True;
     let mut y = Value::True;
     let rx = Value::take_ref(&mut x);
@@ -271,10 +274,12 @@ fn reference_coercions_are_the_address() {
     let r = Value::take_ref(&mut slot);
 
     assert!(r.to_bool(), "references are unconditionally true (container-verified)");
+
     let addr = r.to_int();
     assert!(addr != 0);
     assert_eq!(r.to_float(), addr as f64);
     assert_eq!(r.numify(), Numeric::Integer(addr));
+
     let rendered = r.stringify().unwrap();
     let expected = format!("SCALAR(0x{:x})", addr as usize);
     assert_eq!(rendered.as_bytes(), expected.as_bytes(), "SCALAR(0x...) lowercase hex (verified)");
@@ -339,9 +344,9 @@ fn envelope_sizes() {
 // ── format_float against perl's default NV stringification ────────
 //
 // Every expectation below is container perl 5.38.2's own output for the same literal, captured by differential run:
-// `print 1e15` and friends.  Note that these are NV *literals* — perl's arithmetic returns an IV whenever the result
-// is integral and fits, so `1e15 + 0.0` prints as 1000000000000000 rather than 1e+15, which is integer
-// stringification and a different path.
+// `print 1e15` and friends.  Note that these are NV *literals* — perl's arithmetic returns an IV whenever the result is
+// integral and fits, so `1e15 + 0.0` prints as 1000000000000000 rather than 1e+15, which is integer stringification and
+// a different path.
 #[test]
 fn format_float_matches_container_perl() {
     let cases: &[(f64, &str)] = &[
@@ -390,6 +395,7 @@ fn format_float_matches_container_perl() {
         (0.9999999999999999_f64, "1"),
         (1.0000000000000002_f64, "1"),
     ];
+
     for (value, expected) in cases {
         assert_eq!(&format_float(*value), expected, "rendering {value:?}");
     }
@@ -410,7 +416,70 @@ fn numeric_stringification_does_not_allocate() {
         let rendered = format_float(value);
         assert!(PerlString::inline(&rendered).is_some(), "{rendered} should need no allocation");
     }
+
     for value in [0_i64, -1, i64::MAX, i64::MIN] {
         assert!(PerlString::inline(value.to_string()).is_some(), "{value} should need no allocation");
+    }
+}
+
+// ── The unsigned payload (§2.2.2) ─────────────────────────────
+
+#[test]
+fn unsigned_round_trips_exactly_where_a_float_would_not() {
+    // The divergence this variant closes: perl prints "18446744073709551615" + 0 as its digits.
+    let big = Value::Unsigned(u64::MAX, Tainted::CLEAN);
+    assert_eq!(big.stringify().unwrap().as_bytes(), b"18446744073709551615");
+    assert_eq!(Value::Unsigned(9223372036854775808, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"9223372036854775808");
+
+    // Round-tripping through a string preserves it, where classifying as a float would not.
+    let text = s("18446744073709551615");
+    assert_eq!(text.numify(), Numeric::Unsigned(u64::MAX));
+    assert_eq!(Value::Unsigned(u64::MAX, Tainted::CLEAN).stringify().unwrap(), text.stringify().unwrap());
+}
+
+#[test]
+fn unsigned_coercions() {
+    let m = Value::Unsigned(u64::MAX, Tainted::CLEAN);
+    assert_eq!(m.to_int(), -1, "the same 64 bits read signed (perl's IV view of a UV)");
+    assert_eq!(m.to_unsigned(), u64::MAX);
+    assert_eq!(m.to_float(), 1.8446744073709552e19);
+    assert!(m.to_bool());
+    assert!(!Value::Unsigned(0, Tainted::CLEAN).to_bool());
+    assert_eq!(m.numify(), Numeric::Unsigned(u64::MAX));
+}
+
+#[test]
+fn to_unsigned_is_the_signed_value_reread() {
+    // Container-verified against printf "%u": every case is the i64-visible value reinterpreted, so the unsigned
+    // reading needs no contract of its own.
+    let cases: &[(Value, u64)] = &[
+        (Value::Integer(-1, Tainted::CLEAN), u64::MAX),
+        (Value::Integer(0, Tainted::CLEAN), 0),
+        (Value::Integer(5, Tainted::CLEAN), 5),
+        (Value::Float(-3.7, Tainted::CLEAN), 18446744073709551613),
+        (Value::Float(3.7, Tainted::CLEAN), 3),
+        (Value::Float(1e30, Tainted::CLEAN), u64::MAX),
+        (Value::Float(-1e30, Tainted::CLEAN), 9223372036854775808),
+        (Value::Float(9.3e18, Tainted::CLEAN), 9300000000000000000),
+        (Value::Unsigned(u64::MAX, Tainted::CLEAN), u64::MAX),
+    ];
+
+    for (value, expected) in cases {
+        assert_eq!(value.to_unsigned(), *expected, "%u of {value:?}");
+        assert_eq!(value.to_unsigned(), value.to_int() as u64, "the two readings are one value");
+    }
+}
+
+#[test]
+fn unsigned_is_canonical_only_above_i64() {
+    // Perl uses its unsigned slot strictly when the signed one will not fit — subtracting two unsigned values down to 5
+    // comes back signed (Devel::Peek-verified).  Classification must not produce Unsigned in i64's range, or a value
+    // would have two representations.
+    for text in ["0", "5", "9223372036854775807"] {
+        assert!(matches!(s(text).numify(), Numeric::Integer(_)), "{text} belongs to Integer");
+    }
+
+    for text in ["9223372036854775808", "18446744073709551615"] {
+        assert!(matches!(s(text).numify(), Numeric::Unsigned(_)), "{text} belongs to Unsigned");
     }
 }
