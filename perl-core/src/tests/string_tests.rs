@@ -6,6 +6,7 @@ fn hash_of(s: &PerlString) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
+
     h.finish()
 }
 
@@ -515,8 +516,8 @@ fn design_decides_false(a: &PerlString, sa: u8, b: &PerlString, sb: u8) -> bool 
         || sf == scan::MALFORMED_UTF8
 }
 
-/// Build every reachable (state, storage) witness configuration, with several byte contents behind the
-/// indeterminate states.  Each witness's state is asserted at construction.
+/// Build every reachable (state, storage) witness configuration, with several byte contents behind the indeterminate
+/// states.  Each witness's state is asserted at construction.
 fn grid_witnesses() -> Vec<(String, PerlString)> {
     let mut out: Vec<(String, PerlString)> = Vec::new();
 
@@ -567,6 +568,7 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
     let na_raw_valid = PerlString::from_bytes(&[0xC3, 0xA9].repeat(12)).unwrap();
     assert!(!na_raw_valid.is_ascii());
     push("heap-nonascii-valid-bytes", na_raw_valid, scan::NON_ASCII);
+
     out
 }
 
@@ -645,8 +647,8 @@ fn eq_short_circuits_at_first_mismatch_depth() {
 
 #[test]
 fn eq_grid_decided_pairs_perform_no_scan() {
-    // Observable-state companion: a grid-decided comparison must leave an indeterminate operand's state untouched
-    // (no scan happened on it).
+    // Observable-state companion: a grid-decided comparison must leave an indeterminate operand's state untouched (no
+    // scan happened on it).
     let wide = PerlString::from_str("字").unwrap(); // inline NL1, flagged
     assert!(wide.is_utf8()); // from_str of non-ASCII is flagged already
     let unknown = PerlString::from_bytes(&[0x90u8; 24]).unwrap(); // heap UNKNOWN
@@ -692,18 +694,20 @@ fn eq_grid_exhaustive_over_all_state_flag_combinations() {
                     assert_eq!(full_scans, 0, "eq performed a full scan on {na} vs {nb} — the walk is its only byte access");
                     let want = reference_eq(&a, &b);
                     assert_eq!(got, want, "eq vs oracle for {na} vs {nb} (states {sa}/{sb})");
+
                     if design_decides_false(&a, sa, &b, sb) {
                         decided += 1;
                         assert!(!want, "design table unsound for {na} vs {nb} (states {sa}/{sb})");
 
-                        // The mechanism assertion: a decided pair must be decided BY THE GRID — same-flag decided
-                        // pairs may resolve in the pre-memcmp rows or memcmp's length check; cross-flag decided
-                        // pairs must hit a grid row and must never enter the streaming walk.
+                        // The mechanism assertion: a decided pair must be decided BY THE GRID — same-flag decided pairs
+                        // may resolve in the pre-memcmp rows or memcmp's length check; cross-flag decided pairs must
+                        // hit a grid row and must never enter the streaming walk.
                         if a.is_utf8() != b.is_utf8() {
                             assert!(grid_hits >= 1, "grid row failed to fire for {na} vs {nb} (states {sa}/{sb})");
                             assert_eq!(walk_entries, 0, "walk entered on decided pair {na} vs {nb} (states {sa}/{sb})");
                         }
                     }
+
                     pairs += 1;
                 }
             }
@@ -814,8 +818,8 @@ fn hash_dual_calculation_wide_and_malformed_outcomes() {
 
 #[test]
 fn hash_dual_calculation_across_block_boundary() {
-    // A Latin-1 character straddling the grid boundary during the dual pass: the downgraded digest must still match
-    // the unflagged twin byte-for-byte.
+    // A Latin-1 character straddling the grid boundary during the dual pass: the downgraded digest must still match the
+    // unflagged twin byte-for-byte.
     let mut flagged_src = String::with_capacity(CLASSIFY_BLOCK + 8);
     for _ in 0..CLASSIFY_BLOCK - 1 {
         flagged_src.push('a');
@@ -836,8 +840,8 @@ fn hash_dual_calculation_across_block_boundary() {
 }
 
 // ── Blocked hybrid classifier boundaries (§2.2.5) ─────────────
-/// Test-only reference: the scalar single-byte-scan classifier, transcribed as the oracle for the blocked hybrid
-/// (same decode rules, no blocking).
+/// Test-only reference: the scalar single-byte-scan classifier, transcribed as the oracle for the blocked hybrid (same
+/// decode rules, no blocking).
 fn reference_classify(bytes: &[u8]) -> (u8, usize) {
     let mut facts = ScanFacts::default();
     match scalar_decode_span(bytes, 0, bytes.len(), &mut facts, |_| {}) {
@@ -866,6 +870,7 @@ fn block_boundary_straddles_every_sequence_length() {
         *slot = 0x80 | (v2 & 0x3F) as u8;
         v2 >>= 6;
     }
+
     fe_min.extend_from_slice(&c2);
 
     let cases: [(&[u8], u8); 5] = [
@@ -892,8 +897,8 @@ fn block_boundary_straddles_every_sequence_length() {
 
 #[test]
 fn block_boundaries_realign_to_the_grid_after_straddles() {
-    // Sequences straddling TWO consecutive fixed grid boundaries: correctness here requires the second block to end
-    // at the absolute grid multiple, not at a drifted offset.
+    // Sequences straddling TWO consecutive fixed grid boundaries: correctness here requires the second block to end at
+    // the absolute grid multiple, not at a drifted offset.
     let mut bytes = vec![b'a'; CLASSIFY_BLOCK - 1];
     bytes.extend_from_slice("字".as_bytes()); // straddles boundary 1 (cut after 1 of 3 bytes)
     while bytes.len() < 2 * CLASSIFY_BLOCK - 1 {
@@ -945,8 +950,8 @@ fn blocked_hybrid_matches_reference_on_corpus() {
         rng
     };
 
-    // Several compositions, each ~3 blocks long; the last snippet index drawn caps which classes appear so the
-    // corpus covers pure-ASCII, valid-only, extended, and malformed mixes.
+    // Several compositions, each ~3 blocks long; the last snippet index drawn caps which classes appear so the corpus
+    // covers pure-ASCII, valid-only, extended, and malformed mixes.
     for cap in [1usize, 3, 4, 6, 7] {
         let mut bytes = Vec::with_capacity(3 * CLASSIFY_BLOCK + 64);
         while bytes.len() < 3 * CLASSIFY_BLOCK {
@@ -1010,8 +1015,8 @@ fn char_len_semantics_and_caching() {
     assert_eq!(e.char_len(), Some(6));
 
     // Surrogates count one character per encoded sequence; perl never merges pairs.  Container-verified:
-    // length(chr 0xD800) == 1; a CESU-style pair decodes to TWO characters (D800, DC00), length 2, distinct from
-    // the one-character astral U+10000.
+    // length(chr 0xD800) == 1; a CESU-style pair decodes to TWO characters (D800, DC00), length 2, distinct from the
+    // one-character astral U+10000.
     let lone = PerlString::from_bytes(&[0xED, 0xA0, 0x80]).unwrap();
     assert_eq!(lone.inline_scan(), Some(InlineScan::Extended));
     assert_eq!(lone.char_len(), Some(1));
@@ -1099,6 +1104,7 @@ fn inline_flags_follow_the_source_type() {
     // From &str: ASCII unflagged (canonical downgraded form), non-ASCII flagged.
     assert!(!PerlString::inline("hello").unwrap().is_utf8());
     assert!(PerlString::inline("héllo").unwrap().is_utf8());
+
     // From bytes: never flagged, even when the content happens to be valid UTF-8.
     assert!(!PerlString::inline_bytes(b"h\xC3\xA9llo").unwrap().is_utf8());
 }
@@ -1116,8 +1122,43 @@ fn inline_accepts_every_asref_shape() {
     assert!(PerlString::inline(&owned).is_some());
     assert!(PerlString::inline(owned.clone()).is_some());
     assert!(PerlString::inline(owned.as_str()).is_some());
+
     let bytes = vec![1u8, 2, 3];
     assert!(PerlString::inline_bytes(&bytes).is_some());
     assert!(PerlString::inline_bytes(bytes.clone()).is_some());
     assert!(PerlString::inline_bytes(&bytes[..]).is_some());
+}
+
+// ── Formatting into the string ────────────────────────────────────
+
+#[test]
+fn write_macro_appends_through_fmt_write() {
+    use std::fmt::Write;
+    let mut s = PerlString::empty();
+    write!(s, "{}-tail", 42).unwrap();
+    write!(s, " {:.2}", 1.5).unwrap();
+    assert_eq!(s.as_bytes(), b"42-tail 1.50");
+}
+
+#[test]
+fn push_fmt_reports_allocation_precisely() {
+    // The trait impl flattens failure into fmt::Error, which carries nothing; push_fmt keeps the real error.
+    let mut s = PerlString::empty();
+    s.push_fmt(format_args!("{}", 12345)).unwrap();
+    s.push_fmt(format_args!("{:>8}", "x")).unwrap();
+    assert_eq!(s.as_bytes(), b"12345       x");
+}
+
+#[test]
+fn formatting_into_a_string_grows_it_across_tiers() {
+    use std::fmt::Write;
+
+    // Crossing the inline capacity mid-format must promote and keep every byte.
+    let mut s = PerlString::empty();
+    for i in 0..10 {
+        write!(s, "{i:04}").unwrap();
+    }
+
+    assert_eq!(s.as_bytes(), b"0000000100020003000400050006000700080009");
+    assert_eq!(s.len(), 40);
 }

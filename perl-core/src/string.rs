@@ -620,9 +620,11 @@ impl PerlString {
                     _ => {
                         let (st, chars) = classify_full(bytes); // one pass: validity (both tiers) + range + count
                         cb.narrow_scan(st);
+
                         if chars > 0 {
                             cb.set_char_count(chars);
                         }
+
                         if scan::is_rust_valid(st) {
                             // SAFETY: classify_full certifies Rust-valid states only for byte content that decoded
                             // cleanly within Rust's accepted range.
@@ -649,7 +651,9 @@ impl PerlString {
                         count_probe_byte();
                         b.is_ascii()
                     });
+
                     cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_NON_ASCII });
+
                     ascii
                 }
                 _ => {
@@ -657,7 +661,9 @@ impl PerlString {
                         count_probe_byte();
                         b.is_ascii()
                     });
+
                     cb.narrow_scan(if ascii { scan::ASCII } else { scan::NON_ASCII });
+
                     ascii
                 }
             },
@@ -687,9 +693,11 @@ impl PerlString {
                 _ => {
                     let (st, chars) = classify_full(cb.as_slice()); // the single pass
                     cb.narrow_scan(st);
+
                     if chars > 0 {
                         cb.set_char_count(chars);
                     }
+
                     scan::is_perl_decodable(st)
                 }
             },
@@ -721,8 +729,10 @@ impl PerlString {
                     if cached > 0 {
                         return Some(cached);
                     }
+
                     let (st, chars) = classify_full(cb.as_slice()); // one pass classifies AND counts
                     cb.narrow_scan(st);
+
                     if st == scan::MALFORMED_UTF8 {
                         None
                     } else {
@@ -800,6 +810,7 @@ impl PerlString {
             RawOwned::Inline { scan, len, buf } => {
                 let old_bytes = &buf[..len as usize];
                 let new_len = len as usize + bytes.len();
+
                 if new_len <= INLINE_MAX {
                     let mut nbuf = buf;
                     nbuf[len as usize..new_len].copy_from_slice(bytes);
@@ -1100,6 +1111,47 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     Chars { rest: bytes, raw_fallback: false }
 }
 
+impl fmt::Write for PerlString {
+    /// Append formatted text.  The only failure this can encounter is allocation, which `fmt::Error` cannot carry — use
+    /// [`PerlString::push_fmt`] where the distinction matters; this impl exists so that `write!` works.
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.push_str(s).map_err(|_| fmt::Error)
+    }
+}
+
+impl PerlString {
+    /// Append formatted text, reporting allocation failure precisely: `write!(s, ...)` through the [`fmt::Write`] impl
+    /// flattens that into `fmt::Error`, which carries nothing.
+    ///
+    /// Formatting straight into the string is the point — rendering into a scratch buffer and copying the result in
+    /// would allocate a second time for content the string can usually hold itself.
+    pub fn push_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<(), AllocError> {
+        // `fmt::Error` carries nothing, so the real error is captured on the way past.
+        struct Sink<'a> {
+            target: &'a mut PerlString,
+            failure: Option<AllocError>,
+        }
+
+        impl fmt::Write for Sink<'_> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.target.push_str(s).map_err(|e| {
+                    self.failure = Some(e);
+                    fmt::Error
+                })
+            }
+        }
+
+        let mut sink = Sink { target: self, failure: None };
+        match fmt::write(&mut sink, args) {
+            Ok(()) => Ok(()),
+
+            // A failure with nothing captured means a `Display` impl among the arguments failed on its own account —
+            // exotic, and reported here as a zero-size allocation failure rather than growing a second error type.
+            Err(_) => Err(sink.failure.unwrap_or(AllocError { requested: 0 })),
+        }
+    }
+}
+
 impl Default for PerlString {
     /// The empty string, per [`PerlString::empty`].
     fn default() -> PerlString {
@@ -1222,6 +1274,7 @@ impl PartialEq for PerlString {
             // Non-ASCII block: scalar dual-cursor over the cached bytes.
             while i < end {
                 let win_end = (i + 4).min(fb.len());
+
                 let (c, len) = match str::from_utf8(&fb[i..win_end]) {
                     Ok(w) => match w.chars().next() {
                         Some(ch) => (ch as u32, ch.len_utf8()),

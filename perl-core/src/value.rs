@@ -228,18 +228,19 @@ macro_rules! impl_coercions {
             /// immortal-boolean rule).  Numeric renderings are at most 24 ASCII bytes, hence inline; the `Result` is
             /// the honest allocation contract, not an expected path.
             pub fn stringify(&self) -> Result<PerlString, AllocError> {
-                // Each arm produces the `PerlString` directly: routing through Rust `String` would allocate a buffer
-                // per rendering only to copy its bytes into the value and drop it again.
-                let mut rendered = NumericBuf::new();
+                // Each arm renders into the `PerlString` itself: a scratch buffer would only be copied from and
+                // dropped, and the value can usually hold the result without allocating at all.
                 let (out, taint): (PerlString, Tainted) = match self {
                     $ty::Undef(t) => (PerlString::empty(), *t),
                     $ty::Int(n, t) => {
-                        format_int_into(*n, &mut rendered);
-                        (PerlString::from_bytes(rendered.as_bytes())?, *t)
+                        let mut rendered = PerlString::empty();
+                        format_int_into(*n, &mut rendered)?;
+                        (rendered, *t)
                     }
                     $ty::Float(f, t) => {
-                        format_float_into(*f, &mut rendered);
-                        (PerlString::from_bytes(rendered.as_bytes())?, *t)
+                        let mut rendered = PerlString::empty();
+                        format_float_into(*f, &mut rendered)?;
+                        (rendered, *t)
                     }
                     $ty::String(s) => return Ok(s.clone()),
                     $ty::True => (PerlString::from_bytes(b"1")?, Tainted::CLEAN),
@@ -457,36 +458,31 @@ pub fn array_delete(slots: &mut Vec<ArraySlot>, index: usize) -> Value {
 /// Perl's `%g`-at-15-digits float stringification.  Rust has no `%g` formatter, so build it: render at 15 significant
 /// digits in exponent form, then choose fixed or exponent presentation by the `%g` rule and strip trailing fraction
 /// zeros.  All shapes verified against perl 5.38.2 print output: `0.1+0.2` is `"0.3"`, `1e15` is `"1e+15"`, `1e-5` is
-/// `"1e-05"`.
-/// The widest rendering any of these formatters produces: `%.15g` tops out at 22 characters
-/// (`-2.22507385850720e-308`) and `i64::MIN` at 20, so 32 bytes is comfortable headroom.
-const NUMERIC_FORMAT_MAX: usize = 32;
+/// `"1e-05"`.  The widest rendering the float formatter's intermediate step produces: `{:.14e}` of an `f64` is at most
+/// 22 characters, so 32 bytes is comfortable headroom.
+const SCIENTIFIC_MAX: usize = 32;
 
-/// A fixed-capacity formatting buffer.  Numeric rendering is constant traffic — every printed number, every number
-/// used as a hash key, every interpolation — and its output is bounded, so it has no business allocating.  Writes past
-/// the capacity are dropped rather than panicking; `NUMERIC_FORMAT_MAX` is proved sufficient by the bounds above, and
-/// a debug assertion catches any future format that outgrows it.
-struct NumericBuf {
-    buf: [u8; NUMERIC_FORMAT_MAX],
+/// A fixed-capacity buffer for the float formatter's intermediate scientific form, which must be produced before it can
+/// be parsed into `%g`'s presentation.  Genuine scratch: the *result* goes straight into the destination string, since
+/// numeric rendering is constant traffic and has no business allocating a buffer to copy from.  Writes past the
+/// capacity are dropped rather than panicking; the bound above proves that cannot happen, and a debug assertion catches
+/// any future format that outgrows it.
+struct ScientificBuf {
+    buf: [u8; SCIENTIFIC_MAX],
     len: usize,
 }
 
-impl NumericBuf {
-    fn new() -> NumericBuf {
-        NumericBuf { buf: [0; NUMERIC_FORMAT_MAX], len: 0 }
+impl ScientificBuf {
+    fn new() -> ScientificBuf {
+        ScientificBuf { buf: [0; SCIENTIFIC_MAX], len: 0 }
     }
 
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
 
-    /// The rendered text.  Always ASCII: every byte written here comes from a numeric format.
-    fn as_str(&self) -> &str {
-        str::from_utf8(self.as_bytes()).unwrap_or("")
-    }
-
     fn push(&mut self, byte: u8) {
-        if self.len < NUMERIC_FORMAT_MAX {
+        if self.len < SCIENTIFIC_MAX {
             self.buf[self.len] = byte;
             self.len += 1;
         }
@@ -497,19 +493,13 @@ impl NumericBuf {
             self.push(b);
         }
     }
-
-    fn push_zeros(&mut self, count: usize) {
-        for _ in 0..count {
-            self.push(b'0');
-        }
-    }
 }
 
-impl fmt::Write for NumericBuf {
+impl fmt::Write for ScientificBuf {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let before = self.len;
         self.push_bytes(s.as_bytes());
-        debug_assert_eq!(self.len - before, s.len(), "NUMERIC_FORMAT_MAX is too small for this format");
+        debug_assert_eq!(self.len - before, s.len(), "SCIENTIFIC_MAX is too small for this format");
         Ok(())
     }
 }
@@ -520,38 +510,34 @@ impl fmt::Write for NumericBuf {
 ///
 /// Explicit `sprintf`/`printf` with a precision is a different operation with unbounded output (§2.2.3); this covers
 /// only the implicit conversion.
-fn format_float_into(n: f64, out: &mut NumericBuf) {
+fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), AllocError> {
     if n.is_nan() {
-        out.push_bytes(b"NaN");
-        return;
+        return out.push_str("NaN");
     }
 
     if n.is_infinite() {
-        out.push_bytes(if n < 0.0 { b"-Inf" } else { b"Inf" });
-        return;
+        return out.push_str(if n < 0.0 { "-Inf" } else { "Inf" });
     }
 
     if n == 0.0 {
-        out.push(b'0'); // Covers -0.0, which perl also prints as "0".
-        return;
+        return out.push_str("0"); // Covers -0.0, which perl also prints as "0".
     }
 
     // "{:.14e}" is the normalized d.dddddddddddddd form: 15 significant digits, correctly rounded.
-    let mut scientific = NumericBuf::new();
+    let mut scientific = ScientificBuf::new();
     let _ = write!(scientific, "{n:.14e}");
     let rendered = scientific.as_bytes();
 
     let Some(e) = rendered.iter().position(|&b| b == b'e') else {
-        out.push_bytes(rendered); // Unreachable: exponent form always contains 'e'.
-        return;
+        return out.push_bytes(rendered); // Unreachable: exponent form always contains 'e'.
     };
     let (mantissa, exponent) = (&rendered[..e], &rendered[e + 1..]);
     let Ok(exp) = str::from_utf8(exponent).unwrap_or("").parse::<i32>() else {
-        out.push_bytes(rendered); // Unreachable likewise.
-        return;
+        return out.push_bytes(rendered); // Unreachable likewise.
     };
 
     let negative = mantissa.first() == Some(&b'-');
+
     // The significant digits, trailing zeros trimmed — %g drops them.
     let mut digits = [0u8; 16];
     let mut count = 0;
@@ -561,66 +547,87 @@ fn format_float_into(n: f64, out: &mut NumericBuf) {
             count += 1;
         }
     }
+
     while count > 1 && digits[count - 1] == b'0' {
         count -= 1;
     }
+
     let digits = &digits[..count];
 
     if negative {
-        out.push(b'-');
+        out.push_str("-")?;
     }
 
     // %g takes exponent form when the decimal exponent is below -4 or at/above the precision (15).
     if !(-4..15).contains(&exp) {
-        out.push(digits[0]);
+        out.push_bytes(&digits[..1])?;
+
         if count > 1 {
-            out.push(b'.');
-            out.push_bytes(&digits[1..]);
+            out.push_str(".")?;
+            out.push_bytes(&digits[1..])?;
         }
-        out.push(b'e');
-        out.push(if exp < 0 { b'-' } else { b'+' });
+
         let magnitude = exp.unsigned_abs();
-        if magnitude < 10 {
-            out.push(b'0'); // Perl pads the exponent to two digits: 1e-05, not 1e-5.
-        }
-        let _ = write!(out, "{magnitude}");
-        return;
+        let sign = if exp < 0 { '-' } else { '+' };
+
+        // Perl pads the exponent to two digits: 1e-05, not 1e-5.
+        return out.push_fmt(format_args!("e{sign}{magnitude:02}"));
     }
 
     if exp >= 0 {
         let int_len = exp as usize + 1;
+
         if count <= int_len {
-            out.push_bytes(digits);
-            out.push_zeros(int_len - count);
+            out.push_bytes(digits)?;
+            push_zeros(out, int_len - count)?;
         } else {
-            out.push_bytes(&digits[..int_len]);
-            out.push(b'.');
-            out.push_bytes(&digits[int_len..]);
+            out.push_bytes(&digits[..int_len])?;
+            out.push_str(".")?;
+            out.push_bytes(&digits[int_len..])?;
         }
     } else {
-        out.push_bytes(b"0.");
-        out.push_zeros((-exp - 1) as usize);
-        out.push_bytes(digits);
+        out.push_str("0.")?;
+        push_zeros(out, (-exp - 1) as usize)?;
+        out.push_bytes(digits)?;
     }
+
+    Ok(())
+}
+
+/// Append a run of `'0'`, the one repetition `%g`'s presentation needs.
+fn push_zeros(out: &mut PerlString, count: usize) -> Result<(), AllocError> {
+    const ZEROS: &[u8; 24] = b"000000000000000000000000";
+
+    let mut left = count;
+    while left > 0 {
+        let take = left.min(ZEROS.len());
+        out.push_bytes(&ZEROS[..take])?;
+        left -= take;
+    }
+
+    Ok(())
 }
 
 /// Perl's default float stringification as an owned `String`, for callers that want Rust text.  Paths that build a
 /// `PerlString` render into the stack buffer instead and never allocate.
 pub fn format_float(n: f64) -> String {
-    let mut out = NumericBuf::new();
-    format_float_into(n, &mut out);
-    out.as_str().to_string()
+    let mut out = PerlString::empty();
+    match format_float_into(n, &mut out) {
+        // Every rendering fits without allocating (§2.2.3), so the error arm is unreachable in practice.
+        Ok(()) => String::from_utf8_lossy(out.as_bytes()).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 /// Perl's integer stringification, rendered without allocating.
-fn format_int_into(n: i64, out: &mut NumericBuf) {
-    let _ = write!(out, "{n}");
+fn format_int_into(n: i64, out: &mut PerlString) -> Result<(), AllocError> {
+    out.push_fmt(format_args!("{n}"))
 }
 
 /// A reference's stringification: `PREFIX(0xADDR)` with lowercase hex, perl's container-verified form.  Rendered
 /// through the stack buffer like the numeric forms; the result exceeds the inline capacity, so this one does allocate.
 fn ref_repr(prefix: &str, addr: usize) -> Result<PerlString, AllocError> {
-    let mut out = NumericBuf::new();
+    let mut out = ScientificBuf::new();
     let _ = write!(out, "{prefix}(0x{addr:x})");
     PerlString::from_bytes(out.as_bytes())
 }
@@ -650,7 +657,9 @@ pub fn parse_int_i64_visible(bytes: &[u8]) -> i64 {
         if !b.is_ascii_digit() {
             break;
         }
+
         digits += 1;
+
         if value <= u128::from(u64::MAX) {
             value = value * 10 + u128::from(b - b'0');
         }
@@ -704,9 +713,11 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
     // Case-insensitive inf/nan *prefixes* after the sign ("infx" is Inf, "in" is not).
     if rest.len() >= 3 {
         let p = [rest[0].to_ascii_lowercase(), rest[1].to_ascii_lowercase(), rest[2].to_ascii_lowercase()];
+
         if p == *b"inf" {
             return if negative { f64::NEG_INFINITY } else { f64::INFINITY };
         }
+
         if p == *b"nan" {
             return f64::NAN;
         }
@@ -721,6 +732,7 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
 
     if end < rest.len() && rest[end] == b'.' {
         end += 1;
+
         while end < rest.len() && rest[end].is_ascii_digit() {
             end += 1;
         }
@@ -728,13 +740,17 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
 
     if end < rest.len() && (rest[end] == b'e' || rest[end] == b'E') {
         let mut exp_end = end + 1;
+
         if exp_end < rest.len() && (rest[exp_end] == b'+' || rest[exp_end] == b'-') {
             exp_end += 1;
         }
+
         let exp_digits_start = exp_end;
+
         while exp_end < rest.len() && rest[exp_end].is_ascii_digit() {
             exp_end += 1;
         }
+
         if exp_end > exp_digits_start {
             end = exp_end;
         }
@@ -796,6 +812,7 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
 
     if i < body.len() && body[i] == b'.' {
         i += 1;
+
         while i < body.len() && body[i].is_ascii_digit() {
             i += 1;
             mantissa_digits += 1;
@@ -811,13 +828,16 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
         if j < body.len() && (body[j] == b'+' || body[j] == b'-') {
             j += 1;
         }
+
         let digits_start = j;
         while j < body.len() && body[j].is_ascii_digit() {
             j += 1;
         }
+
         if j == digits_start {
             return true; // dangling exponent marker: "1e", "1e+"
         }
+
         i = j;
     }
 
@@ -845,6 +865,7 @@ fn classify_numeric(bytes: &[u8]) -> Numeric {
                 break;
             }
         }
+
         let in_range = if negative { value <= i64::MAX as u128 + 1 } else { value <= i64::MAX as u128 };
         if in_range {
             let n = if negative { if value == i64::MAX as u128 + 1 { i64::MIN } else { -(value as i64) } } else { value as i64 };

@@ -344,7 +344,7 @@ fn transition_table_matches_the_specification() {
 fn transcoding_preserves_content_and_leaves_the_length_alone() {
     for s in [&b"2026-07-28 14:33:07"[..], b"2026-07-28 14:33:0 ", b"192.168.100.200 1.2"] {
         let original = pack(s).unwrap();
-        for target in [PackedAlphabet::Numeric, PackedAlphabet::DateTimeZulu, PackedAlphabet::DateTimePlus] {
+        for target in [PackedAlphabet::Numeric, PackedAlphabet::DateTimePlus, PackedAlphabet::DateTimeZulu] {
             let Some(moved) = original.transcode(target) else { continue };
             assert_eq!(moved.len(), original.len(), "the length nibble is not a symbol and must not be remapped");
             assert_eq!(moved.full, original.full);
