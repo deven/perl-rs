@@ -1061,7 +1061,15 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   an optimization a string simply doesn't get.  Reversible:
   explicit-length NUL-capable inline variants are the recorded
   fallback if the corpus tripwire ever shows short NUL-bearing
-  strings mattering.  Packing is
+  strings mattering, and the packed tier's length families are
+  their template: a full-capacity family carrying its length
+  implicitly beside a shorter family storing the length in the
+  space the last character would have used.  The cost is priced —
+  the three inline formats double to six, taking the string
+  encodings from 104 to 152 — which is why the trade waits on
+  evidence.  Trailing spaces got the same treatment without
+  waiting because incremental building forced them: a string need
+  not *end* in a space to *pass through* one.  Packing is
   an **encoding, never a canonicalization**: exact byte
   round-trip is the invariant, and a packed string is
   observationally identical to its raw form in every operation —
