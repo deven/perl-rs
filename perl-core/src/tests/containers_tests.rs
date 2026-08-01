@@ -2,7 +2,7 @@ use super::*;
 use crate::value::{ScalarPayload, Tainted};
 
 fn int(n: i64) -> Value {
-    Value::Int(n, Tainted::CLEAN)
+    Value::Integer(n, Tainted::CLEAN)
 }
 
 fn key(text: &str) -> PerlString {
@@ -35,7 +35,7 @@ fn array_ensure_element_vivifies_undef() {
 
     // Write-through: take a ref of the vivified slot, assign, observe (the \$a[3] round trip).
     let r = Value::take_ref(a.ensure_element(3).unwrap());
-    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::Int(5, Tainted::CLEAN)).unwrap();
+    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::Integer(5, Tainted::CLEAN)).unwrap();
     assert_eq!(a.get(3).unwrap().to_int(), 5, "$$r = 5 lands in the array");
 }
 
@@ -139,7 +139,7 @@ fn hash_entry_or_undef_vivifies() {
     assert!(h.exists(&key("k")));
 
     let r = Value::take_ref(h.entry_or_undef(key("k")).unwrap());
-    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::Int(7, Tainted::CLEAN)).unwrap();
+    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::Integer(7, Tainted::CLEAN)).unwrap();
     assert_eq!(h.get(&key("k")).unwrap().to_int(), 7);
 }
 

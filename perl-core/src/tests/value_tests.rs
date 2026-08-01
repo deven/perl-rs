@@ -30,8 +30,8 @@ fn truthiness_survives_numeric_use() {
 #[test]
 fn truthiness_matrix() {
     assert!(!Value::default().to_bool());
-    assert!(!Value::Int(0, Tainted::CLEAN).to_bool());
-    assert!(Value::Int(-1, Tainted::CLEAN).to_bool());
+    assert!(!Value::Integer(0, Tainted::CLEAN).to_bool());
+    assert!(Value::Integer(-1, Tainted::CLEAN).to_bool());
     assert!(!Value::Float(0.0, Tainted::CLEAN).to_bool());
     assert!(!Value::Float(-0.0, Tainted::CLEAN).to_bool(), "-0.0 is false (container-verified)");
     assert!(Value::Float(f64::NAN, Tainted::CLEAN).to_bool(), "NaN is true (container-verified)");
@@ -45,7 +45,7 @@ fn truthiness_matrix() {
 #[test]
 fn stringification_matrix() {
     assert_eq!(Value::default().stringify().unwrap().as_bytes(), b"");
-    assert_eq!(Value::Int(-42, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"-42");
+    assert_eq!(Value::Integer(-42, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"-42");
     assert_eq!(Value::Float(1e15, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"1e+15");
     assert_eq!(Value::True.stringify().unwrap().as_bytes(), b"1");
     assert_eq!(Value::False.stringify().unwrap().as_bytes(), b"");
@@ -53,18 +53,18 @@ fn stringification_matrix() {
 
 #[test]
 fn numify_classification() {
-    assert_eq!(s("42").numify(), Numeric::Int(42));
-    assert_eq!(s("  +42  junk").numify(), Numeric::Int(42));
-    assert_eq!(s("-9223372036854775808").numify(), Numeric::Int(i64::MIN));
-    assert_eq!(s("9223372036854775807").numify(), Numeric::Int(i64::MAX), "a string at perl's IV_MAX is exact (verified)");
+    assert_eq!(s("42").numify(), Numeric::Integer(42));
+    assert_eq!(s("  +42  junk").numify(), Numeric::Integer(42));
+    assert_eq!(s("-9223372036854775808").numify(), Numeric::Integer(i64::MIN));
+    assert_eq!(s("9223372036854775807").numify(), Numeric::Integer(i64::MAX), "a string at perl's IV_MAX is exact (verified)");
     assert_eq!(s("3.5").numify(), Numeric::Float(3.5));
     assert_eq!(s("1e2").numify(), Numeric::Float(100.0));
 
     // Exact as an unsigned 64-bit value but beyond i64: Float under the deferred-UV rule; to_int supplies the
     // pinned wrap.
     assert_eq!(s("9223372036854775808").numify(), Numeric::Float(9.223372036854776e18));
-    assert_eq!(Value::True.numify(), Numeric::Int(1));
-    assert_eq!(Value::False.numify(), Numeric::Int(0));
+    assert_eq!(Value::True.numify(), Numeric::Integer(1));
+    assert_eq!(Value::False.numify(), Numeric::Integer(0));
 }
 
 // ── Integer coercions (all container-verified) ────────────────
@@ -179,15 +179,15 @@ fn taint_is_monotone_and_placed_per_variant() {
     assert!(v.stringify().unwrap().is_tainted());
 
     // Numeric stringification propagates the operand's taint into the tag.
-    let ti = Value::Int(7, Tainted::TAINTED);
+    let ti = Value::Integer(7, Tainted::TAINTED);
     assert!(ti.stringify().unwrap().is_tainted());
-    assert!(!Value::Int(7, Tainted::CLEAN).stringify().unwrap().is_tainted());
+    assert!(!Value::Integer(7, Tainted::CLEAN).stringify().unwrap().is_tainted());
 }
 
 // ── ArraySlot semantics (§2.2.1, container-verified) ──────────
 #[test]
 fn array_slot_hole_and_truncation_rules() {
-    let mk = || vec![Some(Value::Int(1, Tainted::CLEAN)), Some(Value::Int(2, Tainted::CLEAN)), Some(Value::Int(3, Tainted::CLEAN))];
+    let mk = || vec![Some(Value::Integer(1, Tainted::CLEAN)), Some(Value::Integer(2, Tainted::CLEAN)), Some(Value::Integer(3, Tainted::CLEAN))];
 
     // delete-mid: hole, length unchanged, value returned, exists false.
     let mut a = mk();
@@ -232,7 +232,7 @@ fn take_ref_identity_is_idempotent_and_distinct_per_slot() {
 
 #[test]
 fn aliasing_transparency_and_write_through() {
-    let mut slot = Value::Int(5, Tainted::CLEAN);
+    let mut slot = Value::Integer(5, Tainted::CLEAN);
     let r = Value::take_ref(&mut slot);
 
     // The promoted slot still answers as the payload: aliasing transparency.
@@ -243,7 +243,7 @@ fn aliasing_transparency_and_write_through() {
 
     // Writes through the dereferenced identity are visible through the slot.
     let view = r.deref_scalar().unwrap();
-    view.write().unwrap().assign(ScalarPayload::Int(9, Tainted::CLEAN)).unwrap();
+    view.write().unwrap().assign(ScalarPayload::Integer(9, Tainted::CLEAN)).unwrap();
     assert_eq!(slot.to_int(), 9, "$$r = 9 observed via $x");
 }
 
@@ -274,7 +274,7 @@ fn reference_coercions_are_the_address() {
     let addr = r.to_int();
     assert!(addr != 0);
     assert_eq!(r.to_float(), addr as f64);
-    assert_eq!(r.numify(), Numeric::Int(addr));
+    assert_eq!(r.numify(), Numeric::Integer(addr));
     let rendered = r.stringify().unwrap();
     let expected = format!("SCALAR(0x{:x})", addr as usize);
     assert_eq!(rendered.as_bytes(), expected.as_bytes(), "SCALAR(0x...) lowercase hex (verified)");
@@ -296,7 +296,7 @@ fn ref_of_ref_chains() {
     assert_eq!(base_view.read().stringify().unwrap().as_bytes(), b"x");
 
     // And writing through the chain is visible via the original slot.
-    base_view.write().unwrap().assign(ScalarPayload::Int(7, Tainted::CLEAN)).unwrap();
+    base_view.write().unwrap().assign(ScalarPayload::Integer(7, Tainted::CLEAN)).unwrap();
     assert_eq!(base.to_int(), 7);
 }
 

@@ -84,7 +84,7 @@ impl Tainted {
 #[derive(Clone, Debug)]
 pub enum ScalarPayload {
     Undef(Tainted),
-    Int(i64, Tainted),
+    Integer(i64, Tainted),
     Float(f64, Tainted),
     String(PerlString),
     True,
@@ -109,7 +109,7 @@ pub enum ScalarPayload {
 #[derive(Clone, Debug)]
 pub enum Value {
     Undef(Tainted),
-    Int(i64, Tainted),
+    Integer(i64, Tainted),
     Float(f64, Tainted),
     String(PerlString),
     True,
@@ -146,7 +146,7 @@ const _: () = assert!(size_of::<Option<Value>>() == 24);
 /// `to_int` supplying the pinned wrapped value through the exact-digits path independently.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Numeric {
-    Int(i64),
+    Integer(i64),
     Float(f64),
 }
 
@@ -158,7 +158,7 @@ macro_rules! impl_coercions {
             pub fn to_bool(&self) -> bool {
                 match self {
                     $ty::Undef(_) => false,
-                    $ty::Int(n, _) => *n != 0,
+                    $ty::Integer(n, _) => *n != 0,
                     $ty::Float(f, _) => *f != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
                     $ty::String(s) => s.to_bool(),
                     $ty::True => true,
@@ -173,7 +173,7 @@ macro_rules! impl_coercions {
             pub fn to_int(&self) -> i64 {
                 match self {
                     $ty::Undef(_) => 0,
-                    $ty::Int(n, _) => *n,
+                    $ty::Integer(n, _) => *n,
                     $ty::Float(f, _) => float_to_int_i64_visible(*f),
                     $ty::String(s) => s.to_int(),
                     $ty::True => 1,
@@ -191,7 +191,7 @@ macro_rules! impl_coercions {
             pub fn to_float(&self) -> f64 {
                 match self {
                     $ty::Undef(_) => 0.0,
-                    $ty::Int(n, _) => *n as f64,
+                    $ty::Integer(n, _) => *n as f64,
                     $ty::Float(f, _) => *f,
                     $ty::String(s) => s.to_float(),
                     $ty::True => 1.0,
@@ -209,16 +209,16 @@ macro_rules! impl_coercions {
             /// tokens in i64 range numify as integers; everything else as floats.
             pub fn numify(&self) -> Numeric {
                 match self {
-                    $ty::Undef(_) => Numeric::Int(0),
-                    $ty::Int(n, _) => Numeric::Int(*n),
+                    $ty::Undef(_) => Numeric::Integer(0),
+                    $ty::Integer(n, _) => Numeric::Integer(*n),
                     $ty::Float(f, _) => Numeric::Float(*f),
                     $ty::String(s) => s.numify(),
-                    $ty::True => Numeric::Int(1),
-                    $ty::False => Numeric::Int(0),
-                    $ty::ScalarRefMut(c, _) => Numeric::Int(HeapArc::as_ptr(c) as usize as i64),
-                    $ty::ScalarRefConst(c, _) => Numeric::Int(HeapArc::as_ptr(c) as usize as i64),
-                    $ty::ArrayRef(r, _) => Numeric::Int(r.addr() as i64),
-                    $ty::HashRef(r, _) => Numeric::Int(r.addr() as i64),
+                    $ty::True => Numeric::Integer(1),
+                    $ty::False => Numeric::Integer(0),
+                    $ty::ScalarRefMut(c, _) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
+                    $ty::ScalarRefConst(c, _) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
+                    $ty::ArrayRef(r, _) => Numeric::Integer(r.addr() as i64),
+                    $ty::HashRef(r, _) => Numeric::Integer(r.addr() as i64),
                     $($ty::$smut(c) => c.read().payload().numify(),)?
                     $($ty::$sconst(c) => c.payload().numify(),)?
                 }
@@ -233,7 +233,7 @@ macro_rules! impl_coercions {
                 // dropped, and the value can usually hold the result without allocating at all.
                 let (out, taint): (PerlString, Tainted) = match self {
                     $ty::Undef(t) => (PerlString::empty(), *t),
-                    $ty::Int(n, t) => {
+                    $ty::Integer(n, t) => {
                         let mut rendered = PerlString::empty();
                         format_int_into(*n, &mut rendered)?;
                         (rendered, *t)
@@ -269,7 +269,7 @@ macro_rules! impl_coercions {
             pub fn is_tainted(&self) -> bool {
                 match self {
                     $ty::Undef(t)
-                    | $ty::Int(_, t)
+                    | $ty::Integer(_, t)
                     | $ty::Float(_, t)
                     | $ty::ScalarRefMut(_, t)
                     | $ty::ScalarRefConst(_, t)
@@ -318,7 +318,7 @@ impl Value {
 
         let payload = match mem::take(slot) {
             Value::Undef(t) => ScalarPayload::Undef(t),
-            Value::Int(n, t) => ScalarPayload::Int(n, t),
+            Value::Integer(n, t) => ScalarPayload::Integer(n, t),
             Value::Float(f, t) => ScalarPayload::Float(f, t),
             Value::String(s) => ScalarPayload::String(s),
             Value::True => ScalarPayload::True,
@@ -358,7 +358,7 @@ impl Value {
     pub(crate) fn from_payload(p: ScalarPayload) -> Value {
         match p {
             ScalarPayload::Undef(t) => Value::Undef(t),
-            ScalarPayload::Int(n, t) => Value::Int(n, t),
+            ScalarPayload::Integer(n, t) => Value::Integer(n, t),
             ScalarPayload::Float(f, t) => Value::Float(f, t),
             ScalarPayload::String(s) => Value::String(s),
             ScalarPayload::True => Value::True,
@@ -870,7 +870,7 @@ pub(crate) fn classify_numeric(bytes: &[u8]) -> Numeric {
         let in_range = if negative { value <= i64::MAX as u128 + 1 } else { value <= i64::MAX as u128 };
         if in_range {
             let n = if negative { if value == i64::MAX as u128 + 1 { i64::MIN } else { -(value as i64) } } else { value as i64 };
-            return Numeric::Int(n);
+            return Numeric::Integer(n);
         }
 
         // Exact as an unsigned 64-bit value but beyond i64, and larger: Float under the deferred-UV rule (§2.2.2).

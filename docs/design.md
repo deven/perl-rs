@@ -140,7 +140,7 @@ enum Value {
     // (§2.2.9); the twins are elided here for readability, and
     // tainted undef is real — see below.
     Undef,
-    Int(i64),                  // + packed-decimal digit cache (§2.2.9)
+    Integer(i64),              // + packed-decimal digit cache (§2.2.9)
     Float(f64),                // + packed-decimal digit cache (§2.2.9)
     StrBytes(..),              // internal octets <= 15, NUL-terminated
     StrUtf8(..),               // encoded bytes <= 15, beyond Latin-1
@@ -1100,7 +1100,7 @@ cost is per-distinct-key-per-hash, not per-operation.
 **Packed-decimal numeric caches.**  The digits are the expensive
 product of default numeric stringification; rendering cached
 digits is nibble unpacking.  `Float` carries a cache of up to 10-11
-significant digits plus decimal exponent, sign, and count; `Int`
+significant digits plus decimal exponent, sign, and count; `Integer`
 carries up to 12 digits plus sign and count (no exponent).  The
 cached digits are always perl's `%.15g` output digits — never
 shortest-round-trip — so the cache cannot leak a formatting

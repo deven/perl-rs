@@ -68,7 +68,7 @@ fn deep_hash_chain_releases_iteratively() {
 #[test]
 fn deep_mixed_chain_releases_iteratively() {
     // Alternating array → hash → promoted-scalar links: every Drop interception point in one chain.
-    let mut link = Value::Int(0, Tainted::CLEAN);
+    let mut link = Value::Integer(0, Tainted::CLEAN);
     for i in 0..50_000 {
         link = match i % 3 {
             0 => {
@@ -102,7 +102,7 @@ fn assignment_over_a_deep_chain_releases_iteratively() {
 
     let r = Value::take_ref(&mut slot);
     let view = r.deref_scalar().unwrap();
-    view.write().unwrap().assign(ScalarPayload::Int(1, Tainted::CLEAN)).unwrap();
+    view.write().unwrap().assign(ScalarPayload::Integer(1, Tainted::CLEAN)).unwrap();
     assert_eq!(slot.to_int(), 1, "the chain died; the slot lives on with the new payload");
 }
 
