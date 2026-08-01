@@ -1068,3 +1068,56 @@ impl PerlString {
         self.rebuild_tag(|_u, w, t| (true, w, t));
     }
 }
+
+// ── The non-allocating constructors ───────────────────────────────
+
+#[test]
+fn inline_accepts_up_to_the_capacity_and_refuses_beyond() {
+    assert!(PerlString::inline("a".repeat(INLINE_MAX)).is_some());
+    assert_eq!(PerlString::inline("a".repeat(INLINE_MAX + 1)), None);
+    assert!(PerlString::inline_bytes(vec![0xFFu8; INLINE_MAX]).is_some());
+    assert_eq!(PerlString::inline_bytes(vec![0xFFu8; INLINE_MAX + 1]), None);
+}
+
+#[test]
+fn inline_agrees_with_the_fallible_constructors() {
+    // Same content, same result: the fallible paths delegate here, so the representations must match exactly.
+    for text in ["", "hello", "héllo", "0", "a longer ascii string"] {
+        if let Some(inline) = PerlString::inline(text) {
+            assert_eq!(inline, text.parse::<PerlString>().unwrap(), "{text:?}");
+        }
+    }
+    for bytes in [&b""[..], b"hello", b"\xFF\xFE", b"\xC3\xA9"] {
+        if let Some(inline) = PerlString::inline_bytes(bytes) {
+            assert_eq!(inline, PerlString::from_bytes(bytes).unwrap(), "{bytes:?}");
+        }
+    }
+}
+
+#[test]
+fn inline_flags_follow_the_source_type() {
+    // From &str: ASCII unflagged (canonical downgraded form), non-ASCII flagged.
+    assert!(!PerlString::inline("hello").unwrap().is_utf8());
+    assert!(PerlString::inline("héllo").unwrap().is_utf8());
+    // From bytes: never flagged, even when the content happens to be valid UTF-8.
+    assert!(!PerlString::inline_bytes(b"h\xC3\xA9llo").unwrap().is_utf8());
+}
+
+#[test]
+fn inline_composes_with_unwrap_or_default() {
+    // The discard-the-detail path: callers who merely prefer inline storage need one combinator.
+    assert_eq!(PerlString::inline("hi").unwrap_or_default().as_bytes(), b"hi");
+    assert_eq!(PerlString::inline("a".repeat(INLINE_MAX + 1)).unwrap_or_default(), PerlString::empty());
+}
+
+#[test]
+fn inline_accepts_every_asref_shape() {
+    let owned = String::from("owned");
+    assert!(PerlString::inline(&owned).is_some());
+    assert!(PerlString::inline(owned.clone()).is_some());
+    assert!(PerlString::inline(owned.as_str()).is_some());
+    let bytes = vec![1u8, 2, 3];
+    assert!(PerlString::inline_bytes(&bytes).is_some());
+    assert!(PerlString::inline_bytes(bytes.clone()).is_some());
+    assert!(PerlString::inline_bytes(&bytes[..]).is_some());
+}

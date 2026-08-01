@@ -526,12 +526,12 @@ impl PerlString {
     /// Construct from raw bytes (I/O, `Encode`, lexer literals).  Unflagged; inline content gets its eager terminal
     /// scan, heap content defers all scanning (`UNKNOWN`), per §2.2.7.
     pub fn from_bytes(bytes: &[u8]) -> Result<PerlString, AllocError> {
-        if bytes.len() <= INLINE_MAX {
-            let (len, buf) = inline_payload(bytes);
-            Ok(PerlString::build_inline(eager_scan(bytes), false, false, false, len, buf))
-        } else {
-            let cb = CowBuffer::from_slice(bytes)?; // scan byte born UNKNOWN
-            Ok(PerlString::build_heap(false, false, false, cb))
+        match PerlString::inline_bytes(bytes) {
+            Some(inline) => Ok(inline),
+            None => {
+                let cb = CowBuffer::from_slice(bytes)?; // scan byte born UNKNOWN
+                Ok(PerlString::build_heap(false, false, false, cb))
+            }
         }
     }
 
@@ -539,6 +539,37 @@ impl PerlString {
     /// payload needs no allocation — which is also what lets `Default` exist.
     pub fn empty() -> PerlString {
         PerlString::build_inline(InlineScan::Ascii, false, false, false, 0, [0u8; INLINE_MAX])
+    }
+
+    /// Construct from a Rust `&str` **without allocating**, or `None` if the content cannot be stored in the value
+    /// itself.  Flagging follows [`FromStr`](std::str::FromStr): ASCII stores unflagged, non-ASCII flagged.
+    ///
+    /// The contract is the guarantee, not a byte count: `Some` means no heap allocation occurred, so the set of
+    /// accepted content widens whenever the non-allocating storage forms do.  Callers who merely prefer inline storage
+    /// can write `PerlString::inline(s).unwrap_or_default()`; callers who need the content stored either way should use
+    /// the fallible constructors instead.
+    pub fn inline(s: impl AsRef<str>) -> Option<PerlString> {
+        let s = s.as_ref();
+        let bytes = s.as_bytes();
+        if bytes.len() > INLINE_MAX {
+            return None;
+        }
+
+        let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Malformed/Extended impossible from &str.
+        let (len, buf) = inline_payload(bytes);
+        Some(PerlString::build_inline(state, state != InlineScan::Ascii, false, false, len, buf))
+    }
+
+    /// Construct from raw bytes **without allocating**, or `None` if the content cannot be stored in the value itself.
+    /// Unflagged, like [`PerlString::from_bytes`]; the same guarantee-not-a-count contract as [`PerlString::inline`].
+    pub fn inline_bytes(bytes: impl AsRef<[u8]>) -> Option<PerlString> {
+        let bytes = bytes.as_ref();
+        if bytes.len() > INLINE_MAX {
+            return None;
+        }
+
+        let (len, buf) = inline_payload(bytes);
+        Some(PerlString::build_inline(eager_scan(bytes), false, false, false, len, buf))
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -1080,14 +1111,10 @@ impl std::str::FromStr for PerlString {
     /// non-ASCII content is stored with the utf8 flag, its validity known from the type.  Allocation failure is the
     /// only error.
     fn from_str(s: &str) -> Result<PerlString, AllocError> {
-        let bytes = s.as_bytes();
-
-        if bytes.len() <= INLINE_MAX {
-            let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Malformed/Extended impossible from &str
-            let (len, buf) = inline_payload(bytes);
-            let utf8 = state != InlineScan::Ascii;
-            Ok(PerlString::build_inline(state, utf8, false, false, len, buf))
+        if let Some(inline) = PerlString::inline(s) {
+            Ok(inline)
         } else {
+            let bytes = s.as_bytes();
             let cb = CowBuffer::from_slice(bytes)?;
             let ascii = bytes.iter().all(|b| b.is_ascii());
             cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE });
