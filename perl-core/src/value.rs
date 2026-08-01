@@ -83,68 +83,258 @@ impl Tainted {
 /// never-tainted immortal booleans (§2.6.1).
 #[derive(Clone, Debug)]
 pub enum ScalarPayload {
-    Undef(Tainted),
-    Integer(i64, Tainted),
+    /// Clean: the absence of a value.
+    Undef,
 
-    /// An integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
-    Unsigned(u64, Tainted),
-    Float(f64, Tainted),
+    /// Tainted (§2.6): the absence of a value.  The taint dimension is a discriminant twin rather than a field, because
+    /// a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    UndefTainted,
+
+    /// Clean: a signed integer.
+    Integer(i64),
+
+    /// Tainted (§2.6): a signed integer.  The taint dimension is a discriminant twin rather than a field, because a
+    /// taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    IntegerTainted(i64),
+
+    /// Clean: an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
+    Unsigned(u64),
+
+    /// Tainted (§2.6): an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).  The taint dimension
+    /// is a discriminant twin rather than a field, because a taint byte beside an eight-byte datum cannot fit the
+    /// envelope's niche-supplied tag (measured).
+    UnsignedTainted(u64),
+
+    /// Clean: a float.
+    Float(f64),
+
+    /// Tainted (§2.6): a float.  The taint dimension is a discriminant twin rather than a field, because a taint byte
+    /// beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    FloatTainted(f64),
+
+    /// Clean: a reference to a mutable scalar (§2.2.1, flattened per mutability).
+    ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
+
+    /// Tainted (§2.6): a reference to a mutable scalar (§2.2.1, flattened per mutability).  The taint dimension is a
+    /// discriminant twin rather than a field, because a taint byte beside an eight-byte datum cannot fit the envelope's
+    /// niche-supplied tag (measured).
+    ScalarRefMutTainted(HeapArc<RwLock<ScalarCell>>),
+
+    /// Clean: a reference to a frozen scalar (§2.3.1 `Const`).
+    ScalarRefConst(HeapArc<ConstScalar>),
+
+    /// Tainted (§2.6): a reference to a frozen scalar (§2.3.1 `Const`).  The taint dimension is a discriminant twin
+    /// rather than a field, because a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied
+    /// tag (measured).
+    ScalarRefConstTainted(HeapArc<ConstScalar>),
+
+    /// Clean: a reference to an array.
+    ArrayRef(ArrayRef),
+
+    /// Tainted (§2.6): a reference to an array.  The taint dimension is a discriminant twin rather than a field,
+    /// because a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    ArrayRefTainted(ArrayRef),
+
+    /// Clean: a reference to a hash.
+    HashRef(HashRef),
+
+    /// Tainted (§2.6): a reference to a hash.  The taint dimension is a discriminant twin rather than a field, because
+    /// a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    HashRefTainted(HashRef),
+
+    /// A string, whose taint rides its own tag (§2.2.3).
     String(PerlString),
+
+    /// The immortal booleans, always clean.
     True,
     False,
-
-    /// A reference to a mutable scalar (§2.2.1, flattened per mutability — measured: the nested identity enum defeats
-    /// niche-folding).  The referent carries its own taint; this is the reference value's.
-    ScalarRefMut(HeapArc<RwLock<ScalarCell>>, Tainted),
-
-    /// A reference to a frozen scalar (§2.3.1 `Const`: immortals, `use constant`, folded literals).
-    ScalarRefConst(HeapArc<ConstScalar>, Tainted),
-
-    /// A reference to an array (§2.2.1).  The handle is a tagless newtype, so nesting preserves the niche.
-    ArrayRef(ArrayRef, Tainted),
-
-    /// A reference to a hash (§2.2.1).
-    HashRef(HashRef, Tainted),
 }
 
 /// The universal slot value (§2.2.1): the compact scalar payloads, plus (in later §21.1 steps) the reference variants,
 /// the promoted-scalar aliasing variant, and `Typed`.
 #[derive(Clone, Debug)]
 pub enum Value {
-    Undef(Tainted),
-    Integer(i64, Tainted),
+    /// Clean: the absence of a value.
+    Undef,
 
-    /// An integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
-    Unsigned(u64, Tainted),
-    Float(f64, Tainted),
+    /// Tainted (§2.6): the absence of a value.  The taint dimension is a discriminant twin rather than a field, because
+    /// a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    UndefTainted,
+
+    /// Clean: a signed integer.
+    Integer(i64),
+
+    /// Tainted (§2.6): a signed integer.  The taint dimension is a discriminant twin rather than a field, because a
+    /// taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    IntegerTainted(i64),
+
+    /// Clean: an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).
+    Unsigned(u64),
+
+    /// Tainted (§2.6): an integer in `[2^63, 2^64)`, which `Integer` cannot hold exactly (§2.2.2).  The taint dimension
+    /// is a discriminant twin rather than a field, because a taint byte beside an eight-byte datum cannot fit the
+    /// envelope's niche-supplied tag (measured).
+    UnsignedTainted(u64),
+
+    /// Clean: a float.
+    Float(f64),
+
+    /// Tainted (§2.6): a float.  The taint dimension is a discriminant twin rather than a field, because a taint byte
+    /// beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    FloatTainted(f64),
+
+    /// Clean: a reference to a mutable scalar (§2.2.1, flattened per mutability).
+    ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
+
+    /// Tainted (§2.6): a reference to a mutable scalar (§2.2.1, flattened per mutability).  The taint dimension is a
+    /// discriminant twin rather than a field, because a taint byte beside an eight-byte datum cannot fit the envelope's
+    /// niche-supplied tag (measured).
+    ScalarRefMutTainted(HeapArc<RwLock<ScalarCell>>),
+
+    /// Clean: a reference to a frozen scalar (§2.3.1 `Const`).
+    ScalarRefConst(HeapArc<ConstScalar>),
+
+    /// Tainted (§2.6): a reference to a frozen scalar (§2.3.1 `Const`).  The taint dimension is a discriminant twin
+    /// rather than a field, because a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied
+    /// tag (measured).
+    ScalarRefConstTainted(HeapArc<ConstScalar>),
+
+    /// Clean: a reference to an array.
+    ArrayRef(ArrayRef),
+
+    /// Tainted (§2.6): a reference to an array.  The taint dimension is a discriminant twin rather than a field,
+    /// because a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    ArrayRefTainted(ArrayRef),
+
+    /// Clean: a reference to a hash.
+    HashRef(HashRef),
+
+    /// Tainted (§2.6): a reference to a hash.  The taint dimension is a discriminant twin rather than a field, because
+    /// a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
+    HashRefTainted(HashRef),
+
+    /// A string, whose taint rides its own tag (§2.2.3).
     String(PerlString),
+
+    /// The immortal booleans, always clean.
     True,
     False,
-    ScalarRefMut(HeapArc<RwLock<ScalarCell>>, Tainted),
-    ScalarRefConst(HeapArc<ConstScalar>, Tainted),
-    ArrayRef(ArrayRef, Tainted),
-    HashRef(HashRef, Tainted),
 
-    /// A promoted mutable scalar occupying this slot — the slot aliases it (§2.2.1).  Coercions read through the cell:
-    /// aliasing transparency.
+    /// An aliasing slot naming a promoted mutable scalar; taint belongs to the referent, not the alias.
     ScalarMut(HeapArc<RwLock<ScalarCell>>),
 
-    /// A promoted frozen scalar occupying this slot (e.g. `foreach` aliasing over literal list elements).
+    /// An aliasing slot naming a frozen scalar.
     ScalarConst(HeapArc<ConstScalar>),
 }
 
 /// A fielded variant cannot be a derived default (§2.6.1): the manual impl names the clean undef.
+impl ScalarPayload {
+    // ── Constructors (§2.6: taint is a discriminant twin) ─────────
+    //
+    // The taint dimension is carried by the variant rather than a field, so these exist to keep callers writing
+    // `(datum, taint)` instead of choosing a variant by hand — the pairing that would otherwise be restated at every
+    // construction site.
+
+    /// A `Undef`, clean or tainted as `taint` says.
+    pub fn undef(taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::UndefTainted } else { ScalarPayload::Undef }
+    }
+
+    /// A `Integer`, clean or tainted as `taint` says.
+    pub fn integer(value: i64, taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::IntegerTainted(value) } else { ScalarPayload::Integer(value) }
+    }
+
+    /// A `Unsigned`, clean or tainted as `taint` says.
+    pub fn unsigned(value: u64, taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::UnsignedTainted(value) } else { ScalarPayload::Unsigned(value) }
+    }
+
+    /// A `Float`, clean or tainted as `taint` says.
+    pub fn float(value: f64, taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::FloatTainted(value) } else { ScalarPayload::Float(value) }
+    }
+
+    /// A `ScalarRefMut`, clean or tainted as `taint` says.
+    pub fn scalar_ref_mut(value: HeapArc<RwLock<ScalarCell>>, taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::ScalarRefMutTainted(value) } else { ScalarPayload::ScalarRefMut(value) }
+    }
+
+    /// A `ScalarRefConst`, clean or tainted as `taint` says.
+    pub fn scalar_ref_const(value: HeapArc<ConstScalar>, taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::ScalarRefConstTainted(value) } else { ScalarPayload::ScalarRefConst(value) }
+    }
+
+    /// A `ArrayRef`, clean or tainted as `taint` says.
+    pub fn array_ref(value: ArrayRef, taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::ArrayRefTainted(value) } else { ScalarPayload::ArrayRef(value) }
+    }
+
+    /// A `HashRef`, clean or tainted as `taint` says.
+    pub fn hash_ref(value: HashRef, taint: Tainted) -> ScalarPayload {
+        if taint.is_tainted() { ScalarPayload::HashRefTainted(value) } else { ScalarPayload::HashRef(value) }
+    }
+}
+
+impl Value {
+    // ── Constructors (§2.6: taint is a discriminant twin) ─────────
+    //
+    // The taint dimension is carried by the variant rather than a field, so these exist to keep callers writing
+    // `(datum, taint)` instead of choosing a variant by hand — the pairing that would otherwise be restated at every
+    // construction site.
+
+    /// A `Undef`, clean or tainted as `taint` says.
+    pub fn undef(taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::UndefTainted } else { Value::Undef }
+    }
+
+    /// A `Integer`, clean or tainted as `taint` says.
+    pub fn integer(value: i64, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::IntegerTainted(value) } else { Value::Integer(value) }
+    }
+
+    /// A `Unsigned`, clean or tainted as `taint` says.
+    pub fn unsigned(value: u64, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::UnsignedTainted(value) } else { Value::Unsigned(value) }
+    }
+
+    /// A `Float`, clean or tainted as `taint` says.
+    pub fn float(value: f64, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::FloatTainted(value) } else { Value::Float(value) }
+    }
+
+    /// A `ScalarRefMut`, clean or tainted as `taint` says.
+    pub fn scalar_ref_mut(value: HeapArc<RwLock<ScalarCell>>, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::ScalarRefMutTainted(value) } else { Value::ScalarRefMut(value) }
+    }
+
+    /// A `ScalarRefConst`, clean or tainted as `taint` says.
+    pub fn scalar_ref_const(value: HeapArc<ConstScalar>, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::ScalarRefConstTainted(value) } else { Value::ScalarRefConst(value) }
+    }
+
+    /// A `ArrayRef`, clean or tainted as `taint` says.
+    pub fn array_ref(value: ArrayRef, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::ArrayRefTainted(value) } else { Value::ArrayRef(value) }
+    }
+
+    /// A `HashRef`, clean or tainted as `taint` says.
+    pub fn hash_ref(value: HashRef, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::HashRefTainted(value) } else { Value::HashRef(value) }
+    }
+}
+
 impl Default for Value {
     fn default() -> Value {
-        Value::Undef(Tainted::CLEAN)
+        Value::undef(Tainted::CLEAN)
     }
 }
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
 const _: () = assert!(size_of::<Tainted>() == 1);
-const _: () = assert!(size_of::<ScalarPayload>() == 24);
-const _: () = assert!(size_of::<Value>() == 24);
-const _: () = assert!(size_of::<Option<Value>>() == 24);
+const _: () = assert!(size_of::<ScalarPayload>() == 16);
+const _: () = assert!(size_of::<Value>() == 16);
+const _: () = assert!(size_of::<Option<Value>>() == 16);
 
 // ── Coercions: one match each, written once (§2.2.2) ──────────────
 /// The result of numification: perl's numeric context yields an integer or a float per the value's nature.  i64-visible
@@ -168,14 +358,21 @@ macro_rules! impl_coercions {
             /// `"0"` are the only false strings.
             pub fn to_bool(&self) -> bool {
                 match self {
-                    $ty::Undef(_) => false,
-                    $ty::Integer(n, _) => *n != 0,
-                    $ty::Unsigned(u, _) => *u != 0,
-                    $ty::Float(f, _) => *f != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
+                    $ty::Undef | $ty::UndefTainted => false,
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => *n != 0,
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => *u != 0,
+                    $ty::Float(f) | $ty::FloatTainted(f) => *f != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
                     $ty::String(s) => s.to_bool(),
                     $ty::True => true,
                     $ty::False => false,
-                    $ty::ScalarRefMut(..) | $ty::ScalarRefConst(..) | $ty::ArrayRef(..) | $ty::HashRef(..) => true, // refs are always true (verified)
+                    $ty::ScalarRefMut(..)
+                    | $ty::ScalarRefMutTainted(..)
+                    | $ty::ScalarRefConst(..)
+                    | $ty::ScalarRefConstTainted(..)
+                    | $ty::ArrayRef(..)
+                    | $ty::ArrayRefTainted(..)
+                    | $ty::HashRef(..)
+                    | $ty::HashRefTainted(..) => true, // References are always true (verified).
                     $($ty::$smut(c) => c.read().to_bool(),)?
                     $($ty::$sconst(c) => c.to_bool(),)?
                 }
@@ -191,17 +388,17 @@ macro_rules! impl_coercions {
             /// The i64-visible integer coercion, one match on the payload (contracts in the module header).
             pub fn to_int(&self) -> i64 {
                 match self {
-                    $ty::Undef(_) => 0,
-                    $ty::Integer(n, _) => *n,
-                    $ty::Unsigned(u, _) => *u as i64, // The same 64 bits read signed — perl's IV view of a UV.
-                    $ty::Float(f, _) => float_to_int_i64_visible(*f),
+                    $ty::Undef | $ty::UndefTainted => 0,
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => *n,
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => *u as i64, // The same 64 bits read signed — perl's IV view of a UV.
+                    $ty::Float(f) | $ty::FloatTainted(f) => float_to_int_i64_visible(*f),
                     $ty::String(s) => s.to_int(),
                     $ty::True => 1,
                     $ty::False => 0,
-                    $ty::ScalarRefMut(c, _) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
-                    $ty::ScalarRefConst(c, _) => HeapArc::as_ptr(c) as usize as i64,
-                    $ty::ArrayRef(r, _) => r.addr() as i64,
-                    $ty::HashRef(r, _) => r.addr() as i64,
+                    $ty::ScalarRefMut(c) | $ty::ScalarRefMutTainted(c) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
+                    $ty::ScalarRefConst(c) | $ty::ScalarRefConstTainted(c) => HeapArc::as_ptr(c) as usize as i64,
+                    $ty::ArrayRef(r) | $ty::ArrayRefTainted(r) => r.addr() as i64,
+                    $ty::HashRef(r) | $ty::HashRefTainted(r) => r.addr() as i64,
                     $($ty::$smut(c) => c.read().to_int(),)?
                     $($ty::$sconst(c) => c.to_int(),)?
                 }
@@ -210,17 +407,17 @@ macro_rules! impl_coercions {
             /// The float coercion, one match on the payload.
             pub fn to_float(&self) -> f64 {
                 match self {
-                    $ty::Undef(_) => 0.0,
-                    $ty::Integer(n, _) => *n as f64,
-                    $ty::Unsigned(u, _) => *u as f64,
-                    $ty::Float(f, _) => *f,
+                    $ty::Undef | $ty::UndefTainted => 0.0,
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => *n as f64,
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => *u as f64,
+                    $ty::Float(f) | $ty::FloatTainted(f) => *f,
                     $ty::String(s) => s.to_float(),
                     $ty::True => 1.0,
                     $ty::False => 0.0,
-                    $ty::ScalarRefMut(c, _) => HeapArc::as_ptr(c) as usize as f64,
-                    $ty::ScalarRefConst(c, _) => HeapArc::as_ptr(c) as usize as f64,
-                    $ty::ArrayRef(r, _) => r.addr() as f64,
-                    $ty::HashRef(r, _) => r.addr() as f64,
+                    $ty::ScalarRefMut(c) | $ty::ScalarRefMutTainted(c) => HeapArc::as_ptr(c) as usize as f64,
+                    $ty::ScalarRefConst(c) | $ty::ScalarRefConstTainted(c) => HeapArc::as_ptr(c) as usize as f64,
+                    $ty::ArrayRef(r) | $ty::ArrayRefTainted(r) => r.addr() as f64,
+                    $ty::HashRef(r) | $ty::HashRefTainted(r) => r.addr() as f64,
                     $($ty::$smut(c) => c.read().to_float(),)?
                     $($ty::$sconst(c) => c.to_float(),)?
                 }
@@ -230,17 +427,17 @@ macro_rules! impl_coercions {
             /// tokens in i64 range numify as integers; everything else as floats.
             pub fn numify(&self) -> Numeric {
                 match self {
-                    $ty::Undef(_) => Numeric::Integer(0),
-                    $ty::Integer(n, _) => Numeric::Integer(*n),
-                    $ty::Unsigned(u, _) => Numeric::Unsigned(*u),
-                    $ty::Float(f, _) => Numeric::Float(*f),
+                    $ty::Undef | $ty::UndefTainted => Numeric::Integer(0),
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => Numeric::Integer(*n),
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => Numeric::Unsigned(*u),
+                    $ty::Float(f) | $ty::FloatTainted(f) => Numeric::Float(*f),
                     $ty::String(s) => s.numify(),
                     $ty::True => Numeric::Integer(1),
                     $ty::False => Numeric::Integer(0),
-                    $ty::ScalarRefMut(c, _) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
-                    $ty::ScalarRefConst(c, _) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
-                    $ty::ArrayRef(r, _) => Numeric::Integer(r.addr() as i64),
-                    $ty::HashRef(r, _) => Numeric::Integer(r.addr() as i64),
+                    $ty::ScalarRefMut(c) | $ty::ScalarRefMutTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
+                    $ty::ScalarRefConst(c) | $ty::ScalarRefConstTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
+                    $ty::ArrayRef(r) | $ty::ArrayRefTainted(r) => Numeric::Integer(r.addr() as i64),
+                    $ty::HashRef(r) | $ty::HashRefTainted(r) => Numeric::Integer(r.addr() as i64),
                     $($ty::$smut(c) => c.read().payload().numify(),)?
                     $($ty::$sconst(c) => c.payload().numify(),)?
                 }
@@ -254,32 +451,32 @@ macro_rules! impl_coercions {
                 // Each arm renders into the `PerlString` itself: a scratch buffer would only be copied from and
                 // dropped, and the value can usually hold the result without allocating at all.
                 let (out, taint): (PerlString, Tainted) = match self {
-                    $ty::Undef(t) => (PerlString::empty(), *t),
-                    $ty::Integer(n, t) => {
+                    $ty::Undef | $ty::UndefTainted => (PerlString::empty(), self.taint()),
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => {
                         let mut rendered = PerlString::empty();
                         format_int_into(*n, &mut rendered)?;
-                        (rendered, *t)
+                        (rendered, self.taint())
                     }
-                    $ty::Unsigned(u, t) => {
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => {
                         // Exact digits: at most twenty characters, so the packed numeric alphabet holds them.
                         let mut rendered = PerlString::empty();
                         rendered.push_fmt(format_args!("{u}"))?;
-                        (rendered, *t)
+                        (rendered, self.taint())
                     }
-                    $ty::Float(f, t) => {
+                    $ty::Float(f) | $ty::FloatTainted(f) => {
                         let mut rendered = PerlString::empty();
                         format_float_into(*f, &mut rendered)?;
-                        (rendered, *t)
+                        (rendered, self.taint())
                     }
                     $ty::String(s) => return Ok(s.clone()),
                     $ty::True => (PerlString::from_bytes(b"1")?, Tainted::CLEAN),
                     $ty::False => (PerlString::empty(), Tainted::CLEAN),
 
                     // Container-verified form: SCALAR(0x...) with lowercase hex.
-                    $ty::ScalarRefMut(c, t) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, *t),
-                    $ty::ScalarRefConst(c, t) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, *t),
-                    $ty::ArrayRef(r, t) => (ref_repr("ARRAY", r.addr())?, *t),
-                    $ty::HashRef(r, t) => (ref_repr("HASH", r.addr())?, *t),
+                    $ty::ScalarRefMut(c) | $ty::ScalarRefMutTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
+                    $ty::ScalarRefConst(c) | $ty::ScalarRefConstTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
+                    $ty::ArrayRef(r) | $ty::ArrayRefTainted(r) => (ref_repr("ARRAY", r.addr())?, self.taint()),
+                    $ty::HashRef(r) | $ty::HashRefTainted(r) => (ref_repr("HASH", r.addr())?, self.taint()),
                     $($ty::$smut(c) => return c.read().stringify(),)?
                     $($ty::$sconst(c) => return Ok(c.stringify().clone()),)?
                 };
@@ -295,20 +492,38 @@ macro_rules! impl_coercions {
             /// Whether the value is tainted, read through the payload (string payloads carry it in the tag).  Named
             /// parallel to `PerlString::is_tainted`; `PerlString::taint` is the tag *setter*.
             pub fn is_tainted(&self) -> bool {
+                // Exhaustive rather than a catch-all: the aliasing slots answer through their referent, and a wildcard
+                // would silently claim any future variant is clean.
                 match self {
-                    $ty::Undef(t)
-                    | $ty::Integer(_, t)
-                    | $ty::Unsigned(_, t)
-                    | $ty::Float(_, t)
-                    | $ty::ScalarRefMut(_, t)
-                    | $ty::ScalarRefConst(_, t)
-                    | $ty::ArrayRef(_, t)
-                    | $ty::HashRef(_, t) => t.is_tainted(),
+                    $ty::UndefTainted
+                    | $ty::IntegerTainted(_)
+                    | $ty::UnsignedTainted(_)
+                    | $ty::FloatTainted(_)
+                    | $ty::ScalarRefMutTainted(_)
+                    | $ty::ScalarRefConstTainted(_)
+                    | $ty::ArrayRefTainted(_)
+                    | $ty::HashRefTainted(_) => true,
+
+                    $ty::Undef
+                    | $ty::Integer(_)
+                    | $ty::Unsigned(_)
+                    | $ty::Float(_)
+                    | $ty::ScalarRefMut(_)
+                    | $ty::ScalarRefConst(_)
+                    | $ty::ArrayRef(_)
+                    | $ty::HashRef(_)
+                    | $ty::True
+                    | $ty::False => false,
+
                     $ty::String(s) => s.is_tainted(),
-                    $ty::True | $ty::False => false,
                     $($ty::$smut(c) => c.read().is_tainted(),)?
                     $($ty::$sconst(c) => c.is_tainted(),)?
                 }
+            }
+
+            /// The taint dimension as a value, for handing to a constructor.
+            pub fn taint(&self) -> Tainted {
+                if self.is_tainted() { Tainted::TAINTED } else { Tainted::CLEAN }
             }
         }
     };
@@ -340,38 +555,46 @@ impl Value {
     /// yields `ptr_eq` references.  The reference value itself is clean — taint belongs to the referent.
     pub fn take_ref(slot: &mut Value) -> Value {
         match slot {
-            Value::ScalarMut(c) => return Value::ScalarRefMut(c.clone(), Tainted::CLEAN),
-            Value::ScalarConst(c) => return Value::ScalarRefConst(c.clone(), Tainted::CLEAN),
+            Value::ScalarMut(c) => return Value::scalar_ref_mut(c.clone(), Tainted::CLEAN),
+            Value::ScalarConst(c) => return Value::scalar_ref_const(c.clone(), Tainted::CLEAN),
             _ => {}
         }
 
         let payload = match mem::take(slot) {
-            Value::Undef(t) => ScalarPayload::Undef(t),
-            Value::Integer(n, t) => ScalarPayload::Integer(n, t),
-            Value::Unsigned(u, t) => ScalarPayload::Unsigned(u, t),
-            Value::Float(f, t) => ScalarPayload::Float(f, t),
+            Value::Undef => ScalarPayload::Undef,
+            Value::UndefTainted => ScalarPayload::UndefTainted,
+            Value::Integer(n) => ScalarPayload::Integer(n),
+            Value::IntegerTainted(n) => ScalarPayload::IntegerTainted(n),
+            Value::Unsigned(u) => ScalarPayload::Unsigned(u),
+            Value::UnsignedTainted(u) => ScalarPayload::UnsignedTainted(u),
+            Value::Float(f) => ScalarPayload::Float(f),
+            Value::FloatTainted(f) => ScalarPayload::FloatTainted(f),
+            Value::ScalarRefMut(c) => ScalarPayload::ScalarRefMut(c),
+            Value::ScalarRefMutTainted(c) => ScalarPayload::ScalarRefMutTainted(c),
+            Value::ScalarRefConst(c) => ScalarPayload::ScalarRefConst(c),
+            Value::ScalarRefConstTainted(c) => ScalarPayload::ScalarRefConstTainted(c),
+            Value::ArrayRef(r) => ScalarPayload::ArrayRef(r),
+            Value::ArrayRefTainted(r) => ScalarPayload::ArrayRefTainted(r),
+            Value::HashRef(r) => ScalarPayload::HashRef(r),
+            Value::HashRefTainted(r) => ScalarPayload::HashRefTainted(r),
             Value::String(s) => ScalarPayload::String(s),
             Value::True => ScalarPayload::True,
             Value::False => ScalarPayload::False,
-            Value::ScalarRefMut(c, t) => ScalarPayload::ScalarRefMut(c, t),
-            Value::ScalarRefConst(c, t) => ScalarPayload::ScalarRefConst(c, t),
-            Value::ArrayRef(r, t) => ScalarPayload::ArrayRef(r, t),
-            Value::HashRef(r, t) => ScalarPayload::HashRef(r, t),
             Value::ScalarMut(c) => {
                 // Unreachable (handled above); restore and share rather than panic.
                 *slot = Value::ScalarMut(c.clone());
-                return Value::ScalarRefMut(c, Tainted::CLEAN);
+                return Value::scalar_ref_mut(c, Tainted::CLEAN);
             }
             Value::ScalarConst(c) => {
                 *slot = Value::ScalarConst(c.clone());
-                return Value::ScalarRefConst(c, Tainted::CLEAN);
+                return Value::scalar_ref_const(c, Tainted::CLEAN);
             }
         };
 
         let cell = HeapArc::new(RwLock::new(ScalarCell::Plain(payload)));
         *slot = Value::ScalarMut(cell.clone());
 
-        Value::ScalarRefMut(cell, Tainted::CLEAN)
+        Value::scalar_ref_mut(cell, Tainted::CLEAN)
     }
 
     /// Whether this value holds a strong graph edge (§2.4.9): the reference and aliasing variants.  Non-edge values
@@ -387,17 +610,25 @@ impl Value {
     /// worklist as a value) and, eventually, the ops layer's slot writes.
     pub(crate) fn from_payload(p: ScalarPayload) -> Value {
         match p {
-            ScalarPayload::Undef(t) => Value::Undef(t),
-            ScalarPayload::Integer(n, t) => Value::Integer(n, t),
-            ScalarPayload::Unsigned(u, t) => Value::Unsigned(u, t),
-            ScalarPayload::Float(f, t) => Value::Float(f, t),
+            ScalarPayload::Undef => Value::Undef,
+            ScalarPayload::UndefTainted => Value::UndefTainted,
+            ScalarPayload::Integer(n) => Value::Integer(n),
+            ScalarPayload::IntegerTainted(n) => Value::IntegerTainted(n),
+            ScalarPayload::Unsigned(u) => Value::Unsigned(u),
+            ScalarPayload::UnsignedTainted(u) => Value::UnsignedTainted(u),
+            ScalarPayload::Float(f) => Value::Float(f),
+            ScalarPayload::FloatTainted(f) => Value::FloatTainted(f),
+            ScalarPayload::ScalarRefMut(c) => Value::ScalarRefMut(c),
+            ScalarPayload::ScalarRefMutTainted(c) => Value::ScalarRefMutTainted(c),
+            ScalarPayload::ScalarRefConst(c) => Value::ScalarRefConst(c),
+            ScalarPayload::ScalarRefConstTainted(c) => Value::ScalarRefConstTainted(c),
+            ScalarPayload::ArrayRef(r) => Value::ArrayRef(r),
+            ScalarPayload::ArrayRefTainted(r) => Value::ArrayRefTainted(r),
+            ScalarPayload::HashRef(r) => Value::HashRef(r),
+            ScalarPayload::HashRefTainted(r) => Value::HashRefTainted(r),
             ScalarPayload::String(s) => Value::String(s),
             ScalarPayload::True => Value::True,
             ScalarPayload::False => Value::False,
-            ScalarPayload::ScalarRefMut(c, t) => Value::ScalarRefMut(c, t),
-            ScalarPayload::ScalarRefConst(c, t) => Value::ScalarRefConst(c, t),
-            ScalarPayload::ArrayRef(r, t) => Value::ArrayRef(r, t),
-            ScalarPayload::HashRef(r, t) => Value::HashRef(r, t),
         }
     }
 
@@ -408,13 +639,13 @@ impl Value {
     pub fn deref_array(&self) -> Option<ArrayRef> {
         fn from_payload(p: &ScalarPayload) -> Option<ArrayRef> {
             match p {
-                ScalarPayload::ArrayRef(r, _) => Some(r.clone()),
+                ScalarPayload::ArrayRef(r) | ScalarPayload::ArrayRefTainted(r) => Some(r.clone()),
                 _ => None,
             }
         }
 
         match self {
-            Value::ArrayRef(r, _) => Some(r.clone()),
+            Value::ArrayRef(r) | Value::ArrayRefTainted(r) => Some(r.clone()),
             Value::ScalarMut(cell) => from_payload(cell.read().payload()),
             Value::ScalarConst(cs) => from_payload(cs.payload()),
             _ => None,
@@ -425,13 +656,13 @@ impl Value {
     pub fn deref_hash(&self) -> Option<HashRef> {
         fn from_payload(p: &ScalarPayload) -> Option<HashRef> {
             match p {
-                ScalarPayload::HashRef(r, _) => Some(r.clone()),
+                ScalarPayload::HashRef(r) | ScalarPayload::HashRefTainted(r) => Some(r.clone()),
                 _ => None,
             }
         }
 
         match self {
-            Value::HashRef(r, _) => Some(r.clone()),
+            Value::HashRef(r) | Value::HashRefTainted(r) => Some(r.clone()),
             Value::ScalarMut(cell) => from_payload(cell.read().payload()),
             Value::ScalarConst(cs) => from_payload(cs.payload()),
             _ => None,
@@ -441,15 +672,15 @@ impl Value {
     pub fn deref_scalar(&self) -> Option<ScalarRef> {
         fn from_payload(p: &ScalarPayload) -> Option<ScalarRef> {
             match p {
-                ScalarPayload::ScalarRefMut(c, _) => Some(ScalarRef::Mut(c.clone())),
-                ScalarPayload::ScalarRefConst(c, _) => Some(ScalarRef::Const(c.clone())),
+                ScalarPayload::ScalarRefMut(c) | ScalarPayload::ScalarRefMutTainted(c) => Some(ScalarRef::Mut(c.clone())),
+                ScalarPayload::ScalarRefConst(c) | ScalarPayload::ScalarRefConstTainted(c) => Some(ScalarRef::Const(c.clone())),
                 _ => None,
             }
         }
 
         match self {
-            Value::ScalarRefMut(c, _) => Some(ScalarRef::Mut(c.clone())),
-            Value::ScalarRefConst(c, _) => Some(ScalarRef::Const(c.clone())),
+            Value::ScalarRefMut(c) | Value::ScalarRefMutTainted(c) => Some(ScalarRef::Mut(c.clone())),
+            Value::ScalarRefConst(c) | Value::ScalarRefConstTainted(c) => Some(ScalarRef::Const(c.clone())),
             Value::ScalarMut(cell) => from_payload(cell.read().payload()),
             Value::ScalarConst(cs) => from_payload(cs.payload()),
             _ => None,

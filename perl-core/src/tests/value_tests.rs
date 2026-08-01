@@ -10,7 +10,7 @@ fn s(text: &str) -> Value {
 fn payload_stays_authoritative_through_coercion() {
     // Verified perl 5.38: my $x = 3.7 used as an integer still stringifies as "3.7" (FLAGS = NOK,pIOK — private cache
     // only).
-    let x = Value::Float(3.7, Tainted::CLEAN);
+    let x = Value::float(3.7, Tainted::CLEAN);
     assert_eq!(x.to_int(), 3); // truncating coercion
     assert_eq!(x.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"3.7"); // payload answers
 }
@@ -31,11 +31,11 @@ fn truthiness_survives_numeric_use() {
 #[test]
 fn truthiness_matrix() {
     assert!(!Value::default().to_bool());
-    assert!(!Value::Integer(0, Tainted::CLEAN).to_bool());
-    assert!(Value::Integer(-1, Tainted::CLEAN).to_bool());
-    assert!(!Value::Float(0.0, Tainted::CLEAN).to_bool());
-    assert!(!Value::Float(-0.0, Tainted::CLEAN).to_bool(), "-0.0 is false (container-verified)");
-    assert!(Value::Float(f64::NAN, Tainted::CLEAN).to_bool(), "NaN is true (container-verified)");
+    assert!(!Value::integer(0, Tainted::CLEAN).to_bool());
+    assert!(Value::integer(-1, Tainted::CLEAN).to_bool());
+    assert!(!Value::float(0.0, Tainted::CLEAN).to_bool());
+    assert!(!Value::float(-0.0, Tainted::CLEAN).to_bool(), "-0.0 is false (container-verified)");
+    assert!(Value::float(f64::NAN, Tainted::CLEAN).to_bool(), "NaN is true (container-verified)");
     assert!(!s("").to_bool());
     assert!(!s("0").to_bool());
     assert!(s("0.0").to_bool());
@@ -46,8 +46,8 @@ fn truthiness_matrix() {
 #[test]
 fn stringification_matrix() {
     assert_eq!(Value::default().stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"");
-    assert_eq!(Value::Integer(-42, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"-42");
-    assert_eq!(Value::Float(1e15, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"1e+15");
+    assert_eq!(Value::integer(-42, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"-42");
+    assert_eq!(Value::float(1e15, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"1e+15");
     assert_eq!(Value::True.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"1");
     assert_eq!(Value::False.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"");
 }
@@ -169,7 +169,7 @@ fn taint_is_monotone_and_placed_per_variant() {
     assert!(!Tainted::laundered().is_tainted());
 
     // Tainted undef is real (§2.6.1: readline at EOF).
-    let tu = Value::Undef(Tainted::TAINTED);
+    let tu = Value::undef(Tainted::TAINTED);
     assert!(tu.is_tainted());
     assert!(!tu.to_bool());
 
@@ -184,15 +184,15 @@ fn taint_is_monotone_and_placed_per_variant() {
     assert!(v.stringify().unwrap().is_tainted());
 
     // Numeric stringification propagates the operand's taint into the tag.
-    let ti = Value::Integer(7, Tainted::TAINTED);
+    let ti = Value::integer(7, Tainted::TAINTED);
     assert!(ti.stringify().unwrap().is_tainted());
-    assert!(!Value::Integer(7, Tainted::CLEAN).stringify().unwrap().is_tainted());
+    assert!(!Value::integer(7, Tainted::CLEAN).stringify().unwrap().is_tainted());
 }
 
 // ── ArraySlot semantics (§2.2.1, container-verified) ──────────
 #[test]
 fn array_slot_hole_and_truncation_rules() {
-    let mk = || vec![Some(Value::Integer(1, Tainted::CLEAN)), Some(Value::Integer(2, Tainted::CLEAN)), Some(Value::Integer(3, Tainted::CLEAN))];
+    let mk = || vec![Some(Value::integer(1, Tainted::CLEAN)), Some(Value::integer(2, Tainted::CLEAN)), Some(Value::integer(3, Tainted::CLEAN))];
 
     // delete-mid: hole, length unchanged, value returned, exists false.
     let mut a = mk();
@@ -211,7 +211,7 @@ fn array_slot_hole_and_truncation_rules() {
     let mut b = mk();
     let d3 = array_delete(&mut b, 9);
     assert!(!d3.to_bool());
-    assert!(matches!(d3, Value::Undef(_)));
+    assert!(matches!(d3, Value::Undef | Value::UndefTainted));
     assert_eq!(b.len(), 3);
 
     // A hole is not an undef element: Some(Undef) exists.
@@ -237,7 +237,7 @@ fn take_ref_identity_is_idempotent_and_distinct_per_slot() {
 
 #[test]
 fn aliasing_transparency_and_write_through() {
-    let mut slot = Value::Integer(5, Tainted::CLEAN);
+    let mut slot = Value::integer(5, Tainted::CLEAN);
     let r = Value::take_ref(&mut slot);
 
     // The promoted slot still answers as the payload: aliasing transparency.
@@ -248,7 +248,7 @@ fn aliasing_transparency_and_write_through() {
 
     // Writes through the dereferenced identity are visible through the slot.
     let view = r.deref_scalar().unwrap();
-    view.write().unwrap().assign(ScalarPayload::Integer(9, Tainted::CLEAN)).unwrap();
+    view.write().unwrap().assign(ScalarPayload::integer(9, Tainted::CLEAN)).unwrap();
     assert_eq!(slot.to_int(), 9, "$$r = 9 observed via $x");
 }
 
@@ -302,7 +302,7 @@ fn ref_of_ref_chains() {
     assert_eq!(base_view.read().stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"x");
 
     // And writing through the chain is visible via the original slot.
-    base_view.write().unwrap().assign(ScalarPayload::Integer(7, Tainted::CLEAN)).unwrap();
+    base_view.write().unwrap().assign(ScalarPayload::integer(7, Tainted::CLEAN)).unwrap();
     assert_eq!(base.to_int(), 7);
 }
 
@@ -320,7 +320,7 @@ fn reference_taint_belongs_to_the_referent() {
 
 #[test]
 fn const_slots_alias_frozen_cells() {
-    let cs = crate::scalar::ConstScalar::materialize(ScalarPayload::Float(3.7, Tainted::CLEAN)).unwrap();
+    let cs = crate::scalar::ConstScalar::materialize(ScalarPayload::float(3.7, Tainted::CLEAN)).unwrap();
     let mut slot = Value::ScalarConst(HeapArc::new(cs));
 
     assert_eq!(slot.to_int(), 3);
@@ -335,10 +335,10 @@ fn const_slots_alias_frozen_cells() {
 // ── Layout (§2.3.6) ───────────────────────────────────────────
 #[test]
 fn envelope_sizes() {
-    assert_eq!(size_of::<ScalarPayload>(), 24);
-    assert_eq!(size_of::<Value>(), 24);
-    assert_eq!(size_of::<Option<Value>>(), 24);
-    assert_eq!(size_of::<ArraySlot>(), 24);
+    assert_eq!(size_of::<ScalarPayload>(), 16);
+    assert_eq!(size_of::<Value>(), 16);
+    assert_eq!(size_of::<Option<Value>>(), 16);
+    assert_eq!(size_of::<ArraySlot>(), 16);
     assert_eq!(size_of::<Numeric>(), 16);
 }
 
@@ -428,24 +428,24 @@ fn numeric_stringification_does_not_allocate() {
 #[test]
 fn unsigned_round_trips_exactly_where_a_float_would_not() {
     // The divergence this variant closes: perl prints "18446744073709551615" + 0 as its digits.
-    let big = Value::Unsigned(u64::MAX, Tainted::CLEAN);
+    let big = Value::unsigned(u64::MAX, Tainted::CLEAN);
     assert_eq!(big.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"18446744073709551615");
-    assert_eq!(Value::Unsigned(9223372036854775808, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"9223372036854775808");
+    assert_eq!(Value::unsigned(9223372036854775808, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"9223372036854775808");
 
     // Round-tripping through a string preserves it, where classifying as a float would not.
     let text = s("18446744073709551615");
     assert_eq!(text.numify(), Numeric::Unsigned(u64::MAX));
-    assert_eq!(Value::Unsigned(u64::MAX, Tainted::CLEAN).stringify().unwrap(), text.stringify().unwrap());
+    assert_eq!(Value::unsigned(u64::MAX, Tainted::CLEAN).stringify().unwrap(), text.stringify().unwrap());
 }
 
 #[test]
 fn unsigned_coercions() {
-    let m = Value::Unsigned(u64::MAX, Tainted::CLEAN);
+    let m = Value::unsigned(u64::MAX, Tainted::CLEAN);
     assert_eq!(m.to_int(), -1, "the same 64 bits read signed (perl's IV view of a UV)");
     assert_eq!(m.to_unsigned(), u64::MAX);
     assert_eq!(m.to_float(), 1.8446744073709552e19);
     assert!(m.to_bool());
-    assert!(!Value::Unsigned(0, Tainted::CLEAN).to_bool());
+    assert!(!Value::unsigned(0, Tainted::CLEAN).to_bool());
     assert_eq!(m.numify(), Numeric::Unsigned(u64::MAX));
 }
 
@@ -454,15 +454,15 @@ fn to_unsigned_is_the_signed_value_reread() {
     // Container-verified against printf "%u": every case is the i64-visible value reinterpreted, so the unsigned
     // reading needs no contract of its own.
     let cases: &[(Value, u64)] = &[
-        (Value::Integer(-1, Tainted::CLEAN), u64::MAX),
-        (Value::Integer(0, Tainted::CLEAN), 0),
-        (Value::Integer(5, Tainted::CLEAN), 5),
-        (Value::Float(-3.7, Tainted::CLEAN), 18446744073709551613),
-        (Value::Float(3.7, Tainted::CLEAN), 3),
-        (Value::Float(1e30, Tainted::CLEAN), u64::MAX),
-        (Value::Float(-1e30, Tainted::CLEAN), 9223372036854775808),
-        (Value::Float(9.3e18, Tainted::CLEAN), 9300000000000000000),
-        (Value::Unsigned(u64::MAX, Tainted::CLEAN), u64::MAX),
+        (Value::integer(-1, Tainted::CLEAN), u64::MAX),
+        (Value::integer(0, Tainted::CLEAN), 0),
+        (Value::integer(5, Tainted::CLEAN), 5),
+        (Value::float(-3.7, Tainted::CLEAN), 18446744073709551613),
+        (Value::float(3.7, Tainted::CLEAN), 3),
+        (Value::float(1e30, Tainted::CLEAN), u64::MAX),
+        (Value::float(-1e30, Tainted::CLEAN), 9223372036854775808),
+        (Value::float(9.3e18, Tainted::CLEAN), 9300000000000000000),
+        (Value::unsigned(u64::MAX, Tainted::CLEAN), u64::MAX),
     ];
 
     for (value, expected) in cases {

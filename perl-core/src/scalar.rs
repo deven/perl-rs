@@ -118,8 +118,8 @@ impl Drop for ScalarCell {
     /// recurse through a chain of referents.
     fn drop(&mut self) {
         let payload = match self {
-            ScalarCell::Plain(p) => mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN)),
-            ScalarCell::Full(f) => mem::replace(&mut f.payload, ScalarPayload::Undef(Tainted::CLEAN)),
+            ScalarCell::Plain(p) => mem::replace(p, ScalarPayload::undef(Tainted::CLEAN)),
+            ScalarCell::Full(f) => mem::replace(&mut f.payload, ScalarPayload::undef(Tainted::CLEAN)),
         };
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
             release_payload(payload);
@@ -241,7 +241,7 @@ impl ScalarCell {
     /// identity — never changes.
     pub fn upgrade_to_full(&mut self) -> &mut FullScalar {
         if let ScalarCell::Plain(p) = self {
-            let payload = mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN));
+            let payload = mem::replace(p, ScalarPayload::undef(Tainted::CLEAN));
             *self = ScalarCell::Full(FullScalar::new(payload));
         }
 
@@ -299,7 +299,7 @@ impl ScalarCell {
     }
 }
 
-const _: () = assert!(size_of::<ScalarCell>() == 24);
+const _: () = assert!(size_of::<ScalarCell>() == 16);
 
 // ── ConstScalar — frozen at birth (§2.3.3) ────────────────────────
 /// The lockless immutable cell: every coercion materialized at construction, reads are plain field access, trivially
@@ -316,7 +316,7 @@ pub struct ConstScalar {
 impl Drop for ConstScalar {
     /// Iterative teardown (§2.4.9): frozen payloads can carry graph edges too (§2.4.10).
     fn drop(&mut self) {
-        let payload = mem::replace(&mut self.payload, ScalarPayload::Undef(Tainted::CLEAN));
+        let payload = mem::replace(&mut self.payload, ScalarPayload::undef(Tainted::CLEAN));
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
             release_payload(payload);
         }

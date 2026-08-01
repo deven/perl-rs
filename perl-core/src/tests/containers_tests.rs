@@ -3,7 +3,7 @@ use crate::string::DECODE_MAX;
 use crate::value::{ScalarPayload, Tainted};
 
 fn int(n: i64) -> Value {
-    Value::Integer(n, Tainted::CLEAN)
+    Value::integer(n, Tainted::CLEAN)
 }
 
 fn key(text: &str) -> PerlString {
@@ -29,14 +29,14 @@ fn array_ensure_element_vivifies_undef() {
     // Container-verified: \$a[3] on empty — length 4, element exists, undef.
     let mut a = PerlArray::new();
     let slot = a.ensure_element(3).unwrap();
-    assert!(matches!(slot, Value::Undef(_)));
+    assert!(matches!(slot, Value::Undef | Value::UndefTainted));
     assert_eq!(a.len(), 4);
     assert!(a.exists(3));
     assert!(!a.exists(0), "the get/ensure split: indices below stay holes");
 
     // Write-through: take a ref of the vivified slot, assign, observe (the \$a[3] round trip).
     let r = Value::take_ref(a.ensure_element(3).unwrap());
-    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::Integer(5, Tainted::CLEAN)).unwrap();
+    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::integer(5, Tainted::CLEAN)).unwrap();
     assert_eq!(a.get(3).unwrap().to_int(), 5, "$$r = 5 lands in the array");
 }
 
@@ -53,7 +53,7 @@ fn array_delete_rules() {
     assert!(!a.exists(1));
     assert_eq!(a.delete(2).unwrap().to_int(), 3);
     assert_eq!(a.len(), 1, "delete-last truncates through trailing holes");
-    assert!(matches!(a.delete(9).unwrap(), Value::Undef(_)));
+    assert!(matches!(a.delete(9).unwrap(), Value::Undef | Value::UndefTainted));
     assert_eq!(a.len(), 1, "delete beyond the end touches nothing");
 }
 
@@ -67,7 +67,7 @@ fn array_push_pop_shift_unshift() {
     assert_eq!(a.shift_value().unwrap().to_int(), 0);
     assert_eq!(a.pop_value().unwrap().to_int(), 2);
     assert_eq!(a.pop_value().unwrap().to_int(), 1);
-    assert!(matches!(a.pop_value().unwrap(), Value::Undef(_)), "pop on empty is undef");
+    assert!(matches!(a.pop_value().unwrap(), Value::Undef | Value::UndefTainted), "pop on empty is undef");
 
     // Pop after a sparse set: the value comes off; the holes remain (length 5, all holes).
     let mut sparse = PerlArray::new();
@@ -75,7 +75,7 @@ fn array_push_pop_shift_unshift() {
     assert_eq!(sparse.pop_value().unwrap().to_int(), 9);
     assert_eq!(sparse.len(), 5);
     assert!(!sparse.exists(0));
-    assert!(matches!(sparse.pop_value().unwrap(), Value::Undef(_)), "popping a hole is undef");
+    assert!(matches!(sparse.pop_value().unwrap(), Value::Undef | Value::UndefTainted), "popping a hole is undef");
     assert_eq!(sparse.len(), 4);
 }
 
@@ -106,7 +106,7 @@ fn hash_store_get_exists_delete() {
     assert_eq!(h.get(&key("b")).unwrap().to_int(), 2);
     assert_eq!(h.delete(&key("b")).unwrap().to_int(), 2, "delete returns the value (verified)");
     assert!(!h.exists(&key("b")));
-    assert!(matches!(h.delete(&key("z")).unwrap(), Value::Undef(_)));
+    assert!(matches!(h.delete(&key("z")).unwrap(), Value::Undef | Value::UndefTainted));
     h.store(key("a"), int(9)).unwrap();
     assert_eq!(h.get(&key("a")).unwrap().to_int(), 9, "re-store replaces the value");
     assert_eq!(h.len(), 1);
@@ -136,11 +136,11 @@ fn hash_entry_or_undef_vivifies() {
     // Container-verified: \$h{k} — the entry exists, undef.
     let mut h = PerlHash::new();
     let slot = h.entry_or_undef(key("k")).unwrap();
-    assert!(matches!(slot, Value::Undef(_)));
+    assert!(matches!(slot, Value::Undef | Value::UndefTainted));
     assert!(h.exists(&key("k")));
 
     let r = Value::take_ref(h.entry_or_undef(key("k")).unwrap());
-    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::Integer(7, Tainted::CLEAN)).unwrap();
+    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::integer(7, Tainted::CLEAN)).unwrap();
     assert_eq!(h.get(&key("k")).unwrap().to_int(), 7);
 }
 

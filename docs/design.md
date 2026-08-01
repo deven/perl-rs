@@ -142,6 +142,15 @@ enum Value {
     Undef,
     Integer(i64),              // + packed-decimal digit cache (§2.2.9)
     Unsigned(u64),             // [2^63, 2^64): beyond Integer
+
+    // ... each taintable variant above appears twice, clean and
+    // tainted: the taint dimension is a discriminant twin, not a
+    // field.  A taint byte beside an eight-byte datum cannot fit
+    // beneath the niche-supplied tag (measured: 24 with a field,
+    // 16 with twins, and no field ordering recovers it), and the
+    // niche is PerlString's — 96 of its 256 tag values are used,
+    // so Value's discriminant lives in the other 160.
+
     Float(f64),                // + packed-decimal digit cache (§2.2.9)
     StrBytes(..),              // internal octets <= 15, NUL-terminated
     StrUtf8(..),               // encoded bytes <= 15, beyond Latin-1
