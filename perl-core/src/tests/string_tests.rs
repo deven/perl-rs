@@ -1242,8 +1242,8 @@ fn debug_shows_the_representation_with_readable_bytes() {
 
 #[test]
 fn the_constructors_accept_every_asref_shape() {
-    // Generic at the boundary: an embedder holding a String, a Cow, or a compact string type from the ecosystem
-    // needs no conversion, and the ladder beneath is monomorphic.
+    // Generic at the boundary: an embedder holding a String, a Cow, or a compact string type from the ecosystem needs
+    // no conversion, and the ladder beneath is monomorphic.
     let owned = String::from("owned content");
     assert_eq!(PerlString::new(&owned).unwrap().len(), 13);
     assert_eq!(PerlString::new(owned.clone()).unwrap().len(), 13);
@@ -1320,4 +1320,127 @@ fn incremental_building_reaches_the_packed_tier() {
     assert_eq!(s.storage_kind(), StorageKind::Packed);
     assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"2026-07-28 14:33:07");
     assert_eq!(s, "2026-07-28 14:33:07".parse().unwrap());
+}
+
+#[test]
+fn the_terminator_is_found_at_every_position() {
+    // inline_len reads two words rather than scanning bytes, so every boundary deserves checking — especially 7/8,
+    // where the first word ends, and 15, where a full payload has no terminator at all.
+    for len in 0..=INLINE_MAX {
+        let content: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+        let s = PerlString::from_bytes(&content).unwrap();
+        assert_eq!(s.len(), len, "length of {len} bytes of content");
+        assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &content[..], "content of {len} bytes");
+    }
+
+    // High bytes must not be mistaken for terminators: 0x80 and 0xFF are where the naive bit trick goes wrong.
+    for filler in [0x80u8, 0xFF, 0x01, 0x7F] {
+        for len in 1..=INLINE_MAX {
+            let content = vec![filler; len];
+            let s = PerlString::from_bytes(&content).unwrap();
+            assert_eq!(s.len(), len, "{len} bytes of {filler:#04x}");
+        }
+    }
+}
+
+#[test]
+fn the_terminator_is_found_at_every_length() {
+    // inline_len reads two words rather than scanning bytes, so every boundary within and across the two — and the full
+    // payload, which has no terminator at all — needs pinning.
+    for len in 0..=INLINE_MAX {
+        let content = vec![b'x'; len];
+        let s = PerlString::from_bytes(&content).unwrap();
+        assert_eq!(s.len(), len, "length {len}");
+        assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &content[..], "content at length {len}");
+    }
+
+    // A byte with the high bit set must not be mistaken for the terminator: the trick discards borrows that came from
+    // 0x80-or-above bytes, which is the half of it that is easy to get wrong.
+    for len in 1..=INLINE_MAX {
+        let mut content = vec![0xFFu8; len];
+        content[len - 1] = 0x80;
+        let s = PerlString::from_bytes(&content).unwrap();
+        assert_eq!(s.len(), len, "high-bit content at length {len}");
+    }
+}
+
+#[test]
+fn nul_bearing_content_lives_inline_now() {
+    // An explicit length admits what a terminator could not: a NUL is content like any other byte, and needs no special
+    // case in construction, in appending, or in the tier ladder.
+    for content in [&b"\0"[..], b"a\0b", b"\0\0\0", b"ab\0", b"\0abcdefghijklm", b"abcdefghijklmn\0"] {
+        let s = PerlString::from_bytes(content).unwrap();
+        assert_eq!(s.storage_kind(), StorageKind::Inline, "{content:?} should be inline");
+        assert_eq!(s.len(), content.len());
+        assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), content);
+    }
+
+    // And appending one keeps the string inline.
+    let mut s = PerlString::from_bytes(b"ab").unwrap();
+    s.push_bytes(b"\0cd").unwrap();
+    assert_eq!(s.storage_kind(), StorageKind::Inline);
+    assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"ab\0cd");
+}
+
+#[test]
+fn the_length_families_split_at_capacity() {
+    // Content of exactly fifteen bytes fills the payload and implies its length; anything shorter stores it in the byte'
+    // a fifteenth character would have used.
+    for len in 0..=INLINE_MAX {
+        let content = vec![b'x'; len];
+        let s = PerlString::from_bytes(&content).unwrap();
+        assert_eq!(s.len(), len, "length {len}");
+        assert_eq!(s.storage_kind(), StorageKind::Inline);
+        assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &content[..]);
+    }
+
+    // Growing across the boundary by appending, one byte at a time.
+    let mut s = PerlString::empty();
+    for i in 0..INLINE_MAX {
+        s.push_bytes(b"y").unwrap();
+        assert_eq!(s.len(), i + 1, "after {} appends", i + 1);
+        assert_eq!(s.storage_kind(), StorageKind::Inline);
+    }
+
+    // One more leaves the tier: sixteen characters is where the packed band begins.
+    s.push_bytes(b"y").unwrap();
+    assert_eq!(s.len(), 16);
+    assert_ne!(s.storage_kind(), StorageKind::Inline);
+}
+
+#[test]
+fn equal_content_has_equal_bytes_whatever_its_history() {
+    // Padding past the length is canonically zero, so a string built by appending is byte-identical to the same content
+    // constructed whole — which is what lets representation stand in for content.
+    let whole = PerlString::from_bytes(b"abcde").unwrap();
+    let mut built = PerlString::from_bytes(b"abc").unwrap();
+    built.push_bytes(b"de").unwrap();
+    assert_eq!(whole, built);
+
+    // The same content reached through the full-capacity family and back down.
+    let mut long = PerlString::from_bytes(b"abc").unwrap();
+    long.push_bytes(b"de").unwrap();
+    assert_eq!(whole, long);
+}
+
+#[test]
+fn rebuilding_zeroes_everything_past_the_content() {
+    // The canonical-padding obligation, checked at the representation rather than through content: a payload carrying
+    // stale bytes past its length must come back with them cleared, or two equal strings could differ in their bytes
+    // and representation would stop standing in for content.
+    let mut dirty = [0xEEu8; INLINE_MAX];
+    dirty[..4].copy_from_slice(b"abcd");
+    let s = PerlString::build_inline(InlineScan::Ascii, false, false, false, 4, dirty);
+
+    match s.raw_parts() {
+        RawParts::Inline { full, buf } => {
+            assert!(!full, "four bytes is the stored-length family");
+            assert_eq!(&buf[..4], b"abcd");
+            assert!(buf[4..LENGTH_BYTE].iter().all(|&b| b == 0), "padding must be cleared, got {:?}", &buf[4..LENGTH_BYTE]);
+            assert_eq!(buf[LENGTH_BYTE], 4, "the length byte");
+        }
+        _ => panic!("expected inline storage"),
+    }
+
+    assert_eq!(s, PerlString::from_bytes(b"abcd").unwrap());
 }

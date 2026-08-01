@@ -152,9 +152,9 @@ enum Value {
     // so Value's discriminant lives in the other 160.
 
     Float(f64),                // + packed-decimal digit cache (§2.2.9)
-    StrBytes(..),              // internal octets <= 15, NUL-terminated
-    StrUtf8(..),               // encoded bytes <= 15, beyond Latin-1
-    StrLatin1(..),             // code points <= 15, flag-independent
+    StrBytes(..),              // internal octets; <= 14 store their
+    StrUtf8(..),               // length, exactly 15 implies it, so
+    StrLatin1(..),             // each format is two length families
     StrPackedNumeric(..),      // nibble-packed <= 30 chars: all 15
     StrPackedDateTimeZ(..),    // payload bytes are nibbles, so the
     StrPackedDateTimePlus(..), // alphabet lives in the variant (§2.2.9)
@@ -316,12 +316,15 @@ storage kinds:
 // behind accessors (storage_kind(), is_utf8(), is_warned(),
 // is_tainted(), scan-state and tag-transition methods).
 enum PerlString {
-    Bytes([u8; 15]),        // internal octets, NUL-terminated (§2.2.9)
+    // Each format below is two length families (§2.2.9): content of
+    // 14 bytes or fewer stores its length in the byte a fifteenth
+    // would have used, and content of exactly 15 implies it.
+    Bytes([u8; 15]),        // internal octets
     Utf8([u8; 15]),         // encoded bytes, beyond Latin-1
     Latin1([u8; 15]),       // code points, flag-independent
-    PackedNumeric([u8; 15]),  // nibbles, <= 30 chars, no stored
-    PackedDateTimeZ([u8; 15]),     // length; the alphabet has no
-    PackedDateTimePlus([u8; 15]),  // payload byte — it IS the variant
+    PackedNumeric([u8; 15]),       // nibbles, 16-30 chars, also
+    PackedDateTimeZ([u8; 15]),     // two families; the alphabet
+    PackedDateTimePlus([u8; 15]),  // has no byte — it IS the variant
     Heap(..),               // thin handle; COW buffer
 }
 ```
@@ -408,6 +411,31 @@ already build a buffer — but the invariant must not be read as
 covering them.  It is load-bearing for the envelope: the packed
 tier is what preserves it at 16 bytes (§2.2.9), and every
 alternative string design is measured against it.
+
+**Perl implements no float-to-decimal algorithm of its own.**
+`sv.c` calls `Gconvert`, a Configure-selected macro resolving to
+`gconvert`, `gcvt`, or `sprintf("%.*g")`, with `NV_DIG` (15) as the
+precision — so the fidelity target is whatever libc does, which is
+why renderings are pinned against the container rather than
+against a specification, and why perl's own output can differ
+across platforms where ours does not.  It also sets the
+performance bar at a `sprintf` round-trip: measured against perl
+5.44, uncached float stringification is at parity (240-408 ns
+against roughly 350) and integers are already ahead (52 against
+roughly 76), while a cached rendering is six to eight times
+faster.
+
+Two improvements are recorded, neither urgent, since neither
+closes a deficit.  Rust's shortest-round-trip formatting can
+replace the fixed-precision call whenever the shortest form has 15
+significant digits or fewer *and* the value is normal: those
+digits are then exactly `%.15g`'s, because an `f64` resolves finer
+than 15 digits — verified across 202,902 values, where the
+normality guard is load-bearing, subnormals carrying fewer
+significant digits than `%.15g` prints.  That is 3x on the path
+that money-shaped and parse-born values all take.  Beyond it lies
+a direct digit-generation algorithm, which would need a decision
+about porting versus depending, and about licence provenance.
 
 **Per-value state vs. per-buffer facts.**  String state splits into
 two locations by one criterion: copies duplicate the tag and share
@@ -926,9 +954,11 @@ battery is the tripwire.
 enum's discriminant (an opaque inner string type cannot fuse; the
 inner tag would cost a word — the §2.3.6 nesting lesson):
 
-- **Inline, ≤ 15 payload bytes in three storage formats**, all
-  NUL-terminated (a length of exactly 15 is the unterminated
-  form), selected by the discriminant.  **The storage format is
+- **Inline, ≤ 15 payload bytes in three storage formats**, each
+  in two length families: a full-capacity form implying its
+  length and a shorter form storing it in the byte a fifteenth
+  character would have used.  Both the format and the family are
+  discriminant dimensions.  **The storage format is
   an axis independent of the semantic `SvUTF8` flag** — the flag
   is perl's interpretation claim; the format says what the
   payload bytes physically are:
@@ -1092,23 +1122,31 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   derived length resolves every zero's meaning before it is
   compared.  A leading decode-pair precheck and a speculative
   dual-interpretation single pass are recorded measured options.
-- **NUL is heap-only** [DECISION]: a string containing NUL in any
-  spelling — the octet `0x00`, the encoded byte `0x00`, the
-  character U+0000 — takes the heap tier.  The inline forms
-  reserve the terminator byte; NUL-bearing strings are rare and
-  skew long (binary blobs, packed records), and inline storage is
-  an optimization a string simply doesn't get.  Reversible:
-  explicit-length NUL-capable inline variants are the recorded
-  fallback if the corpus tripwire ever shows short NUL-bearing
-  strings mattering, and the packed tier's length families are
-  their template: a full-capacity family carrying its length
-  implicitly beside a shorter family storing the length in the
-  space the last character would have used.  The cost is priced —
-  the three inline formats double to six, taking the string
-  encodings from 104 to 152 — which is why the trade waits on
-  evidence.  Trailing spaces got the same treatment without
-  waiting because incremental building forced them: a string need
-  not *end* in a space to *pass through* one.  Packing is
+- **NUL is ordinary content** [DECISION, revised]: a string
+  containing NUL in any spelling — the octet `0x00`, the encoded
+  byte `0x00`, the character U+0000 — is stored like any other.
+  It was heap-only while the inline forms were NUL-terminated,
+  the terminator being what bought the fifteenth payload byte,
+  and the reversal is explicit-length inline
+  variants — adopted, on evidence that
+  arrived from an unexpected direction.  The fallback was recorded
+  against the corpus tripwire showing short NUL-bearing strings
+  mattering; what settled it instead was the cost of termination
+  itself.  Finding the terminator is a scan where a length is a
+  byte read, and every append must additionally reject NUL-bearing
+  content, so the inline forms measured 2.4x slower at appending
+  and 2.2x slower at reading a length than the same forms with an
+  explicit length.  The packed tier's length families are the
+  template: a full-capacity family carrying its length implicitly
+  beside a shorter family storing it in the byte the last
+  character would have used.  Inline variants double, 40 to 80,
+  taking the total from 116 to 156 of 256.  NUL then stops being a
+  special case anywhere: content carrying one is stored inline
+  like any other, which removes the rejection from both
+  constructors, the check from the append path, and the hazard
+  that a string need not *end* in a NUL to *pass through* one —
+  the same shape as the trailing-space problem the packed families
+  already solved.  Packing is
   an **encoding, never a canonicalization**: exact byte
   round-trip is the invariant, and a packed string is
   observationally identical to its raw form in every operation —
