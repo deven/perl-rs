@@ -74,8 +74,8 @@ pub(crate) const PACKED_BYTES: usize = MAX_PACKED_LEN / 2;
 /// The nibble index holding the stored length, for content shorter than the capacity.
 const LENGTH_NIBBLE: usize = MAX_PACKED_LEN - 1;
 
-/// Which 16-symbol alphabet a packed string uses.  In the fused forms this is carried by the enclosing enum's
-/// discriminant — the packed payload is 15 nibble bytes with no metadata byte.
+/// Which 16-symbol alphabet a packed string uses.  In `PerlString` this is not stored: it is folded into the tag, so
+/// each alphabet has its own variants and the payload is fifteen nibble bytes with nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PackedAlphabet {
     /// space `+` `-` `.` `0`-`9` `E` `e` — every numeric stringification, in either exponent spelling.
@@ -90,8 +90,11 @@ pub(crate) enum PackedAlphabet {
     DateTimeZulu,
 }
 
-/// A packed string: the alphabet, the length family, and the nibble array.  The first two are discriminant bits in the
-/// fused forms; the fields stand in for them here.
+/// A packed string: the alphabet, the length family, and the nibble array.
+///
+/// This is the working form, used while encoding and decoding.  In `PerlString` the first two fields do not exist —
+/// they are folded into the tag, one variant per alphabet and length family — so a stored packed string is fifteen
+/// bytes of nibbles and nothing else.  The fields here stand in for that tag while the value is in hand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Packed {
     pub(crate) alphabet: PackedAlphabet,

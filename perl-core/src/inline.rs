@@ -32,9 +32,9 @@ pub(crate) const INLINE_BYTES: usize = 15;
 /// points expands to thirty octets.
 pub(crate) const INLINE_MAX_OCTETS: usize = 30;
 
-/// An inline string with its full semantic identity.  Illegal flag/format combinations are unrepresentable: `Bytes` is
-/// flag-off by construction, `Utf8` flag-on, and only `Latin1` carries the flag — in the fused enums these become
-/// discriminant dimensions.
+/// An inline string with its full semantic identity.  Illegal flag/format combinations are unrepresentable: `Bytes`
+/// is flag-off by construction, `Utf8` flag-on, and only `Latin1` carries the flag.  In `PerlString` these are not
+/// fields at all — each combination is its own variant, folded into the tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InlineStr {
     /// Internal octets verbatim; semantic flag off.
