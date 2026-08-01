@@ -33,10 +33,17 @@ use std::str;
 pub const INLINE_MAX: usize = 15;
 
 /// The widest byte sequence any non-heap form decodes to, and so the size of the scratch buffer the borrowed-view
-/// accessors take.  Thirty covers every case at once: the packed capacity is thirty ASCII characters, and fifteen
-/// Latin-1 code points expand to thirty octets of UTF-8 — the raw forms of fifteen bytes or fewer are trivially under
-/// it.
-pub const DECODE_MAX: usize = 30;
+/// accessors take.
+///
+/// It is `INLINE_MAX * 2`, and not by coincidence: **every non-heap form is a 2:1 compression of its decoded bytes**.
+/// The packed forms reach that ratio by storing two symbols per byte, four bits each; the Latin-1 form reaches it by
+/// declining to spend two bytes on a code point, since `U+0080`-`U+00FF` sits inside UTF-8's two-byte range.  The same
+/// factor, arrived at from opposite directions — one packing two units into a byte, the other refusing to let one unit
+/// take two.  Raw forms compress not at all and are trivially under the bound.
+///
+/// So this is correct by construction rather than by measuring the cases, and it is a constraint on what may be added
+/// later: a non-heap encoding compressing more than 2:1 would overflow every scratch buffer in the crate.
+pub const DECODE_MAX: usize = INLINE_MAX * 2;
 
 /// Heap scan-cache states, stored in the `CowBuffer` header byte (§2.2.4).  Zero is `UNKNOWN`, the lattice top — the
 /// natural zero-initialized state can never assert a validity claim (§2.2.6).

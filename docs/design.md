@@ -934,6 +934,18 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
     U+0100, a perl-extended code point, or malformed content.
     Scan states are the three that can occur
     (`UTF8_NON_LATIN1`, `EXTENDED_UTF8`, `MALFORMED_UTF8`).
+  Every non-heap form is a **2:1 compression of its decoded
+  bytes**, which is why one scratch buffer of thirty serves all of
+  them: the packed forms store two symbols per byte at four bits
+  each, and the Latin-1 form declines to spend two bytes on a code
+  point, `U+0080`-`U+00FF` sitting inside UTF-8's two-byte range.
+  The same factor from opposite directions — one packing two units
+  into a byte, the other refusing to let one unit take two — so the
+  bound is `15 x 2` by construction rather than the larger of two
+  measured cases.  It is also a constraint on later additions: a
+  non-heap encoding compressing more than 2:1 would overflow every
+  borrowed-view buffer.
+
   - *Latin-1*: content that is valid UTF-8 with every code point
     in U+0001-U+00FF, stored **one code point per byte,
     regardless of the flag**.  Flag on: the payload is the
