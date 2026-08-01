@@ -1444,3 +1444,47 @@ fn rebuilding_zeroes_everything_past_the_content() {
 
     assert_eq!(s, PerlString::from_bytes(b"abcd").unwrap());
 }
+
+#[test]
+fn packed_equality_compares_nibbles_directly() {
+    // Equal content in one alphabet has equal nibbles, so no decoding is needed — the encoding is injective and the
+    // padding canonical.  These pin the answers rather than the mechanism, but a wrong fast path would break them.
+    let a: PerlString = "2026-07-28T14:33:07Z".parse().unwrap();
+    let b: PerlString = "2026-07-28T14:33:07Z".parse().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a.storage_kind(), StorageKind::Packed);
+
+    // Differing in the last character, and in the first.
+    assert_ne!(a, "2026-07-28T14:33:08Z".parse().unwrap());
+    assert_ne!(a, "3026-07-28T14:33:07Z".parse().unwrap());
+
+    // Different lengths within the same alphabet, including the two length families.
+    assert_ne!(a, "2026-07-28T14:33:07.5Z".parse::<PerlString>().unwrap());
+    let full: PerlString = "2026-07-29T17:23:45.123456789Z".parse().unwrap();
+    assert_eq!(full, "2026-07-29T17:23:45.123456789Z".parse().unwrap());
+    assert_ne!(full, "2026-07-29T17:23:45.12345678Z".parse().unwrap());
+
+    // Different alphabets cannot hold equal content, so the mismatch is decisive.
+    let numeric: PerlString = "192.168.100.200 1.2".parse().unwrap();
+    assert_ne!(a, numeric);
+
+    // Packed against the other tiers, both directions.
+    let heaped: PerlString = "2026-07-28T14:33:07Z and then some more".parse().unwrap();
+    assert_ne!(a, heaped);
+    assert_ne!(heaped, a);
+    let short: PerlString = "2026-07-28".parse().unwrap();
+    assert_ne!(a, short);
+    assert_ne!(short, a);
+
+    // A packed string equals the same content held on the heap, which is the case the one-sided path serves.
+    let long_numeric: PerlString = "1234567890123456789012345".parse().unwrap();
+    assert_eq!(long_numeric.storage_kind(), StorageKind::Packed);
+
+    let same_on_heap = {
+        let mut s: PerlString = "1234567890123456789012345 tail".parse().unwrap();
+        assert_eq!(s.storage_kind(), StorageKind::Heap);
+        s = PerlString::from_bytes(&s.as_bytes(&mut [0u8; DECODE_MAX])[..25]).unwrap();
+        s
+    };
+    assert_eq!(long_numeric, same_on_heap, "same content, different tiers");
+}

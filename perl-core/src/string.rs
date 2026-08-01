@@ -1463,6 +1463,26 @@ impl PartialEq for PerlString {
             }
 
             // Same interpretation: byte equality is character equality (length check is memcmp's first move).
+            //
+            // Two packed strings of one alphabet compare as their nibbles do, with no decoding at all: the encoding is
+            // injective and the padding canonical, so equal content is equal bytes.  Different alphabets cannot hold
+            // equal content — classification is deterministic, so content picks exactly one — which makes the mismatch
+            // a decisive answer rather than a reason to decode.
+            if let (RawParts::Packed(a), RawParts::Packed(b)) = (self.raw_parts(), other.raw_parts()) {
+                return a.alphabet == b.alphabet && a.full == b.full && a.nibbles == b.nibbles;
+            }
+
+            // One side packed: compare against the other's bytes without materialising this side's.
+            if let RawParts::Packed(p) = self.raw_parts() {
+                let mut rs = [0u8; DECODE_MAX];
+                return p.eq_bytes(other.as_bytes(&mut rs));
+            }
+
+            if let RawParts::Packed(p) = other.raw_parts() {
+                let mut ls = [0u8; DECODE_MAX];
+                return p.eq_bytes(self.as_bytes(&mut ls));
+            }
+
             let (mut ls, mut rs) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
             return self.as_bytes(&mut ls) == other.as_bytes(&mut rs);
         }
