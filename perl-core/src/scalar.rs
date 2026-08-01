@@ -10,6 +10,8 @@ use crate::cow_buffer::AllocError;
 use crate::string::PerlString;
 use crate::value::{Numeric, ScalarPayload, Tainted, string_would_warn};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::fmt;
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
@@ -43,8 +45,8 @@ impl From<AllocError> for ScalarError {
     }
 }
 
-impl std::fmt::Display for ScalarError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ScalarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ScalarError::ReadOnly => f.write_str("Modification of a read-only value attempted"),
             ScalarError::Alloc(_) => f.write_str("Out of memory!"),
@@ -115,8 +117,8 @@ impl Drop for ScalarCell {
     /// recurse through a chain of referents.
     fn drop(&mut self) {
         let payload = match self {
-            ScalarCell::Plain(p) => std::mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN)),
-            ScalarCell::Full(f) => std::mem::replace(&mut f.payload, ScalarPayload::Undef(Tainted::CLEAN)),
+            ScalarCell::Plain(p) => mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN)),
+            ScalarCell::Full(f) => mem::replace(&mut f.payload, ScalarPayload::Undef(Tainted::CLEAN)),
         };
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
             crate::heap::release_payload(payload);
@@ -124,8 +126,8 @@ impl Drop for ScalarCell {
     }
 }
 
-impl std::fmt::Debug for ScalarCell {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ScalarCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ScalarCell::Plain(p) => f.debug_tuple("Plain").field(p).finish(),
             ScalarCell::Full(full) => f.debug_struct("Full").field("payload", &full.payload).finish_non_exhaustive(),
@@ -238,7 +240,7 @@ impl ScalarCell {
     /// identity — never changes.
     pub fn upgrade_to_full(&mut self) -> &mut FullScalar {
         if let ScalarCell::Plain(p) = self {
-            let payload = std::mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN));
+            let payload = mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN));
             *self = ScalarCell::Full(FullScalar::new(payload));
         }
 
@@ -313,15 +315,15 @@ pub struct ConstScalar {
 impl Drop for ConstScalar {
     /// Iterative teardown (§2.4.9): frozen payloads can carry graph edges too (§2.4.10).
     fn drop(&mut self) {
-        let payload = std::mem::replace(&mut self.payload, ScalarPayload::Undef(Tainted::CLEAN));
+        let payload = mem::replace(&mut self.payload, ScalarPayload::Undef(Tainted::CLEAN));
         if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
             crate::heap::release_payload(payload);
         }
     }
 }
 
-impl std::fmt::Debug for ConstScalar {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ConstScalar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConstScalar").field("payload", &self.payload).finish_non_exhaustive()
     }
 }
@@ -382,8 +384,8 @@ pub enum ScalarRef {
     Const(HeapArc<ConstScalar>),
 }
 
-impl std::fmt::Debug for ScalarRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ScalarRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
             ScalarRef::Mut(_) => "Mut",
             ScalarRef::Const(_) => "Const",

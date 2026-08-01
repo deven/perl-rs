@@ -42,6 +42,8 @@
 // moment they land.
 #![cfg_attr(not(test), expect(dead_code))]
 
+use std::cmp::Ordering;
+
 /// The packed-tier capacity in characters: 15 nibble bytes, two characters each.  No length is stored — the byte a
 /// length would occupy is two characters of capacity, and 29-30 characters is exactly where millisecond-offset and
 /// nanosecond-Zulu timestamps live.  Because trailing spaces are unpackable, the logical length is uniquely the
@@ -286,14 +288,14 @@ impl Packed {
     /// packed "2026" against raw "2026\n" must be Less (the packed string ended), but a naive decoder reading the zero
     /// nibble as a space would answer Greater (space > newline).  Deriving the length first makes every zero's meaning
     /// known before it is compared.
-    pub(crate) fn cmp_bytes(&self, other: &[u8]) -> std::cmp::Ordering {
+    pub(crate) fn cmp_bytes(&self, other: &[u8]) -> Ordering {
         let len = self.len();
         let table = self.alphabet.decode_table();
         for (i, &o) in other.iter().enumerate().take(len) {
             let byte = self.nibbles[i / 2];
             let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
             match table[n as usize].cmp(&o) {
-                std::cmp::Ordering::Equal => {}
+                Ordering::Equal => {}
                 ordering => return ordering,
             }
         }
@@ -306,7 +308,7 @@ impl Packed {
     /// and the comparison continues, while against any other symbol the pad is lower — prefix-first, exactly as byte
     /// comparison orders a prefix before its extension.  Callers must decode for cross-alphabet ordering; asserting
     /// here keeps that contract loud.
-    pub(crate) fn cmp_same_alphabet(&self, other: &Packed) -> std::cmp::Ordering {
+    pub(crate) fn cmp_same_alphabet(&self, other: &Packed) -> Ordering {
         debug_assert_eq!(self.alphabet, other.alphabet, "cross-alphabet packed ordering must decode");
         self.nibbles.cmp(&other.nibbles)
     }

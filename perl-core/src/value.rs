@@ -30,6 +30,9 @@
 //!   `"0.0"`, `"00"`, `" "`) is true.
 
 use parking_lot::RwLock;
+use std::borrow::Cow;
+use std::mem;
+use std::str;
 
 use crate::containers::{ArrayRef, HashRef};
 use crate::cow_buffer::AllocError;
@@ -224,19 +227,19 @@ macro_rules! impl_coercions {
             /// immortal-boolean rule).  Numeric renderings are at most 24 ASCII bytes, hence inline; the `Result` is
             /// the honest allocation contract, not an expected path.
             pub fn to_string_repr(&self) -> Result<PerlString, AllocError> {
-                let (text, taint): (std::borrow::Cow<'_, str>, Tainted) = match self {
-                    $ty::Undef(t) => (std::borrow::Cow::Borrowed(""), *t),
-                    $ty::Int(n, t) => (std::borrow::Cow::Owned(n.to_string()), *t),
-                    $ty::Float(f, t) => (std::borrow::Cow::Owned(format_nv(*f)), *t),
+                let (text, taint): (Cow<'_, str>, Tainted) = match self {
+                    $ty::Undef(t) => (Cow::Borrowed(""), *t),
+                    $ty::Int(n, t) => (Cow::Owned(n.to_string()), *t),
+                    $ty::Float(f, t) => (Cow::Owned(format_nv(*f)), *t),
                     $ty::String(s) => return Ok(s.clone()),
-                    $ty::True => (std::borrow::Cow::Borrowed("1"), Tainted::CLEAN),
-                    $ty::False => (std::borrow::Cow::Borrowed(""), Tainted::CLEAN),
+                    $ty::True => (Cow::Borrowed("1"), Tainted::CLEAN),
+                    $ty::False => (Cow::Borrowed(""), Tainted::CLEAN),
 
                     // Container-verified form: SCALAR(0x...) with lowercase hex.
-                    $ty::ScalarRefMut(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
-                    $ty::ScalarRefConst(c, t) => (std::borrow::Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
-                    $ty::ArrayRef(r, t) => (std::borrow::Cow::Owned(format!("ARRAY(0x{:x})", r.addr())), *t),
-                    $ty::HashRef(r, t) => (std::borrow::Cow::Owned(format!("HASH(0x{:x})", r.addr())), *t),
+                    $ty::ScalarRefMut(c, t) => (Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
+                    $ty::ScalarRefConst(c, t) => (Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
+                    $ty::ArrayRef(r, t) => (Cow::Owned(format!("ARRAY(0x{:x})", r.addr())), *t),
+                    $ty::HashRef(r, t) => (Cow::Owned(format!("HASH(0x{:x})", r.addr())), *t),
                     $($ty::$smut(c) => return c.read().to_string_repr(),)?
                     $($ty::$sconst(c) => return Ok(c.to_string_repr().clone()),)?
                 };
@@ -301,7 +304,7 @@ impl Value {
             _ => {}
         }
 
-        let payload = match std::mem::take(slot) {
+        let payload = match mem::take(slot) {
             Value::Undef(t) => ScalarPayload::Undef(t),
             Value::Int(n, t) => ScalarPayload::Int(n, t),
             Value::Float(f, t) => ScalarPayload::Float(f, t),
@@ -612,7 +615,7 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
     }
 
     // The scanned span is ASCII digits/'.'/'e'/sign by construction.
-    let magnitude = std::str::from_utf8(&rest[..end]).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let magnitude = str::from_utf8(&rest[..end]).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 
     if negative { -magnitude } else { magnitude }
 }

@@ -33,6 +33,7 @@
 //! obligation for an environment that has it.)
 
 use std::alloc::{self, Layout};
+use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering, fence};
 
@@ -341,8 +342,8 @@ impl Drop for CowBuffer {
     }
 }
 
-impl std::fmt::Debug for CowBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CowBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CowBuffer")
             .field("len", &self.len)
             .field("capacity", &self.capacity())

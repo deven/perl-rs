@@ -19,6 +19,7 @@
 
 use indexmap::IndexMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::fmt;
 
 use crate::heap::HeapArc;
 use crate::scalar::ScalarError;
@@ -346,8 +347,8 @@ macro_rules! container_handle {
             }
         }
 
-        impl std::fmt::Debug for $handle {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl fmt::Debug for $handle {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, concat!(stringify!($handle), "(0x{:x})"), self.addr())
             }
         }

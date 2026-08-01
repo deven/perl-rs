@@ -23,7 +23,10 @@
 //! and tainted are ignored by `Eq`/`Hash`.
 
 use crate::cow_buffer::{AllocError, CowBuffer};
+use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::mem;
+use std::str;
 
 /// Maximum inline payload: chosen so every numeric stringification stays allocation-free (§2.2.3).
 pub const INLINE_MAX: usize = 22;
@@ -603,7 +606,7 @@ impl PerlString {
                 match self.inline_scan() {
                     // SAFETY: terminal scan states were established by a full validity scan at construction and inline
                     // mutation re-scans; Ascii, Latin1, and NonLatin1 all certify Rust-valid UTF-8.
-                    Some(InlineScan::Ascii) | Some(InlineScan::Latin1) | Some(InlineScan::NonLatin1) => Some(unsafe { std::str::from_utf8_unchecked(bytes) }),
+                    Some(InlineScan::Ascii) | Some(InlineScan::Latin1) | Some(InlineScan::NonLatin1) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
                     _ => None,
                 }
             }
@@ -612,7 +615,7 @@ impl PerlString {
                 match cb.scan() {
                     // SAFETY: these lattice states certify prior successful validation of these exact bytes (states
                     // only narrow; mutation resets to UNKNOWN).
-                    st if scan::is_rust_valid(st) => Some(unsafe { std::str::from_utf8_unchecked(bytes) }),
+                    st if scan::is_rust_valid(st) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
                     scan::MALFORMED_UTF8 | scan::EXTENDED_UTF8 => None,
                     _ => {
                         let (st, chars) = classify_full(bytes); // one pass: validity (both tiers) + range + count
@@ -623,7 +626,7 @@ impl PerlString {
                         if scan::is_rust_valid(st) {
                             // SAFETY: classify_full certifies Rust-valid states only for byte content that decoded
                             // cleanly within Rust's accepted range.
-                            Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+                            Some(unsafe { str::from_utf8_unchecked(bytes) })
                         } else {
                             None
                         }
@@ -756,7 +759,7 @@ impl PerlString {
             return;
         }
 
-        let old = std::mem::take(self);
+        let old = mem::take(self);
 
         *self = match old.into_raw() {
             RawOwned::Inline { scan, len, buf } => PerlString::build_inline(scan, u2, w2, t2, len, buf),
@@ -791,7 +794,7 @@ impl PerlString {
         }
 
         let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
-        let old = std::mem::take(self);
+        let old = mem::take(self);
 
         *self = match old.into_raw() {
             RawOwned::Inline { scan, len, buf } => {
@@ -1073,7 +1076,7 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
                 return Some(0x8000_0000 | b as u32);
             }
 
-            match std::str::from_utf8(&self.rest[..self.rest.len().min(4)]) {
+            match str::from_utf8(&self.rest[..self.rest.len().min(4)]) {
                 Ok(s) => {
                     let c = s.chars().next()?;
                     self.rest = &self.rest[c.len_utf8()..];
@@ -1081,7 +1084,7 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
                 }
                 Err(e) if e.valid_up_to() > 0 => {
                     // SAFETY: valid_up_to bytes are certified valid UTF-8.
-                    let s = unsafe { std::str::from_utf8_unchecked(&self.rest[..e.valid_up_to()]) };
+                    let s = unsafe { str::from_utf8_unchecked(&self.rest[..e.valid_up_to()]) };
                     let c = s.chars().next()?;
                     self.rest = &self.rest[c.len_utf8()..];
                     Some(c as u32)
@@ -1219,14 +1222,14 @@ impl PartialEq for PerlString {
             // Non-ASCII block: scalar dual-cursor over the cached bytes.
             while i < end {
                 let win_end = (i + 4).min(fb.len());
-                let (c, len) = match std::str::from_utf8(&fb[i..win_end]) {
+                let (c, len) = match str::from_utf8(&fb[i..win_end]) {
                     Ok(w) => match w.chars().next() {
                         Some(ch) => (ch as u32, ch.len_utf8()),
                         None => return false,
                     },
                     Err(e) if e.valid_up_to() > 0 => {
                         // SAFETY: the error reports a valid prefix of this exact window.
-                        let w = unsafe { std::str::from_utf8_unchecked(&fb[i..i + e.valid_up_to()]) };
+                        let w = unsafe { str::from_utf8_unchecked(&fb[i..i + e.valid_up_to()]) };
                         match w.chars().next() {
                             Some(ch) => (ch as u32, ch.len_utf8()),
                             None => return false,
@@ -1414,8 +1417,8 @@ impl Clone for PerlString {
     }
 }
 
-impl std::fmt::Debug for PerlString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PerlString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PerlString")
             .field("storage", &self.storage_kind())
             .field("len", &self.len())

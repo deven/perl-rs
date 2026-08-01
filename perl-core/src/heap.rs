@@ -27,6 +27,7 @@
 //! `parking_lot::Mutex` is uncontended and avoids `RefCell`'s panic-on-reentrant-borrow hazard; the no-lock-during-drop
 //! rule is what keeps it deadlock-free.
 
+use std::fmt;
 use std::sync::{Arc, Weak};
 
 /// A strong reference to a heap-domain node.
@@ -73,8 +74,8 @@ impl<T> std::ops::Deref for HeapArc<T> {
     }
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for HeapArc<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T: fmt::Debug> fmt::Debug for HeapArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
