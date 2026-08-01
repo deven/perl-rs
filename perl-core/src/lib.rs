@@ -1,52 +1,38 @@
-//! Perl core types.
+//! Perl core types: the value representation and the heap that owns it.
 //!
-//! This crate provides the fundamental value representation:
+//! - [`value`] — `Value`, the universal slot value, and `ScalarPayload`, the payload of a promoted scalar.  Both carry
+//!   compact scalar cases inline and hold references to shared nodes.
+//! - [`scalar`] — `ScalarCell`, a promoted scalar: the payload plus the identity-level state that survives assignment.
+//! - [`containers`] — `PerlArray` and `PerlHash`.
+//! - [`string`] — `PerlString`, an octet sequence with its per-string state: the utf8 flag as a semantic claim, the
+//!   numification-warning bit, taint, and the scan cache recording what is known about Rust-level validity.
+//! - [`cow_buffer`] — the reference-counted copy-on-write buffer behind heap strings.
+//! - [`heap`] — `HeapArc`/`HeapWeak`, the façade over shared ownership that the slab backend will replace.
 //!
-//! - [`Value`] — the top-level enum with compact variants for common cases (integers, floats, small strings) and
-//!   `Arc`-wrapped variants for shared values (full scalars, arrays, hashes, code, regex).
+//! Two private modules hold representations that never allocate: `inline` for content of fifteen payload bytes or
+//! fewer, `packed` for the nibble encoding that carries sixteen to thirty characters of digit-dense text.  A third,
+//! `release`, performs iterative teardown so that deep structures cannot overflow the stack when they die.
 //!
-//! - [`Scalar`] — the full Perl SV: parallel int/num/string caches with flag-driven validity, magic chain, stash for
-//!   blessed objects.
+//! # Design principles
 //!
-//! - [`ScalarFlags`] — bitflags for cache validity (INT_VALID, NUM_VALID, STR_VALID, REF_VALID) and metadata (READONLY,
-//!   UTF8, TAINT, MAGICAL, WEAK).
+//! - **Compact by default.**  A value occupies its slot directly — array element, hash value, pad entry — and only
+//!   values needing shared identity, per-identity state, or magic are promoted to a cell behind a shared reference.
 //!
-//! - Type aliases: `Sv`, `Av`, `Hv` for `Arc<RwLock<T>>` wrapped types.
+//! - **Upgrade, never downgrade.**  Once a value is promoted, it stays promoted: its address is its identity.
 //!
-//! # Design Principles
+//! - **Representation is canonical.**  Content determines its representation uniquely, so equal Perl strings are equal
+//!   representations — which is what lets equality and hashing work on the representation rather than by decoding
+//!   first.
 //!
-//! - **Compact by default.**  `Value::Int(42)` is 8 bytes, no heap allocation.  Only values that need shared identity,
-//!   multi-representation caching, or magic are upgraded to a full `Scalar` behind `Arc<RwLock<>>`.
-//!
-//! - **Upgrade, never downgrade.**  Once a value becomes `Value::Scalar(Sv)`, it stays that way.  Identity via `Arc`
-//!   address must be preserved.
-//!
-//! - **Flag-driven coercion.**  The `Scalar` struct uses `ScalarFlags` to track which representation slots are valid.
-//!   The coercion engine checks flags for the fast path and caches new representations lazily.
+//! - **State that survives assignment lives outside the payload.**  Blessing and readonly are properties of the
+//!   container; taint, caches, and the warning bit travel with the value.
 
 mod packed;
 mod release;
 
-pub mod cell;
 pub mod containers;
 pub mod cow_buffer;
-pub mod flags;
 pub mod heap;
-pub mod payload;
-pub mod perl_string;
 pub mod scalar;
-pub mod small_string;
 pub mod string;
-pub mod string_slot;
 pub mod value;
-
-pub use flags::ScalarFlags;
-pub use perl_string::PerlString;
-pub use scalar::Scalar;
-pub use small_string::{SMALL_STRING_MAX, SmallString};
-pub use string_slot::{PerlStringSlot, SLOT_INLINE_MAX};
-pub use value::{Av, Hv, Sv, Value};
-
-// Re-export `Bytes` so downstream crates can use the type returned by `PerlString::into_bytes()` and
-// `PerlString::bytes()` without adding a separate `bytes` dependency.
-pub use bytes::Bytes;

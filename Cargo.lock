@@ -107,7 +107,6 @@ dependencies = [
 name = "perl-core"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "indexmap",
  "parking_lot",
 ]

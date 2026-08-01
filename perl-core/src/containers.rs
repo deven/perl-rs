@@ -20,10 +20,10 @@
 use indexmap::IndexMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::cell::ScalarError;
 use crate::heap::HeapArc;
-use crate::payload::{ArraySlot, Value};
+use crate::scalar::ScalarError;
 use crate::string::PerlString;
+use crate::value::{ArraySlot, Value};
 
 // ── PerlArray (§2.2.1) ────────────────────────────────────────────
 /// `Vec<ArraySlot>` plus array-level state.  `None` = a hole (nonexistent element); `Some(Undef)` = an existing element
@@ -361,7 +361,7 @@ container_handle!(HashRef, PerlHash, "The Arc-backed shared hash identity (§2.2
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::{ScalarPayload, Tainted};
+    use crate::value::{ScalarPayload, Tainted};
 
     fn int(n: i64) -> Value {
         Value::Int(n, Tainted::CLEAN)

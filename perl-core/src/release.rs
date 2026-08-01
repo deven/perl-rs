@@ -16,7 +16,7 @@
 
 use parking_lot::Mutex;
 
-use crate::payload::{ScalarPayload, Value};
+use crate::value::{ScalarPayload, Value};
 
 struct ReleaseState {
     /// True while this thread's drain loop is running: nested releases append and return.
@@ -77,7 +77,7 @@ pub(crate) fn release_payload(payload: ScalarPayload) {
 #[cfg(test)]
 mod tests {
     use crate::containers::{ArrayRef, HashRef, PerlArray, PerlHash};
-    use crate::payload::{ScalarPayload, Tainted, Value};
+    use crate::value::{ScalarPayload, Tainted, Value};
 
     // Depths chosen well past the measured failure points: the scalar-ref chain overflowed at 20k in debug builds and
     // the array chain at 200k in release builds before §2.4.9.

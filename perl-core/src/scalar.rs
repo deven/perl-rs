@@ -1,947 +1,830 @@
-//! Full Perl scalar — multi-representation caching with flag-driven validity.
+//! The promoted-scalar layer (§2.3.1–§2.3.4): `ScalarRef` shared identity over the Mut/Const split, `ScalarCell` with
+//! in-place `Plain`→`Full` upgrade, `ConstScalar` with coercions materialized at birth, the boolean immortal
+//! singletons, the structural readonly error path, and numification-warning state.
 //!
-//! A `Scalar` is the "heavy" representation used when a value needs:
-//! - Multiple cached representations (string + integer + float)
-//! - Magic (tied variables, overloaded objects)
-//! - Blessing into a package (objects)
-//! - Readonly / taint flags
-//!
-//! Most values start as compact `Value` variants and are upgraded to `Scalar` only when needed (see
-//! `Value::upgrade_to_scalar`).
+//! The module name is temporary in the same sense as `string.rs` and `payload.rs`: final names arrive when the
+//! superseded flag-matrix modules are deleted.  `MagicChain` and `Stash` are carried over at their current stub
+//! fidelity; their real shapes are later design sections.
 
-use std::fmt;
-use std::sync::Arc;
+use crate::cow_buffer::AllocError;
+use crate::string::PerlString;
+use crate::value::{Numeric, ScalarPayload, Tainted, string_would_warn};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{LazyLock, OnceLock};
 
-use crate::flags::ScalarFlags;
-use crate::value::Value;
-use crate::{PerlString, PerlStringSlot};
+use crate::heap::HeapArc;
 
-// Placeholder types — will be fleshed out as the runtime develops.  Using empty structs for now so the code compiles
-// and the shape is right.
-
-/// A chain of magic (tie, overload, etc.) attached to a scalar.  Will be a linked list of trait objects implementing
-/// the Magic trait.
+// ── Carried-over stubs (§2.3.7: "carried over") ───────────────────
+/// A chain of magic (tie, overload, ...) attached to a scalar.  Shape is a later design section.
 pub struct MagicChain {
-    // TODO: Vec<Box<dyn Magic>> or linked list
     _private: (),
 }
 
-/// A package stash — the symbol table for a package.  Will be a HashMap<PerlString, Glob> or similar.
+/// A package stash — the symbol table for a package.  Shape is a later design section.
 pub struct Stash {
-    // TODO: name, symbol table, ISA, method cache
     _private: (),
 }
 
-/// The full Perl scalar.
-///
-/// Parallel representation slots with flag-driven validity, following Perl 5's SV model.  `$x = "42"` sets STR_VALID;
-/// `$x + 0` sets INT_VALID and caches 42 in `int` without clearing the string.
-///
-/// # Flag Discipline
-///
-/// - `int` is meaningful only when `flags.contains(ScalarFlags::INT_VALID)`.
-/// - `num` is meaningful only when `flags.contains(ScalarFlags::NUM_VALID)`.
-/// - `bytes` content is meaningful only when `flags.contains(ScalarFlags::STR_VALID)`.
-/// - `reference` is meaningful only when `flags.contains(ScalarFlags::REF_VALID)`.
-///
-/// Writing a new representation typically invalidates the others:
-/// - Setting a string: set STR_VALID, clear INT_VALID and NUM_VALID.
-/// - Setting an integer: set INT_VALID, clear STR_VALID and NUM_VALID (unless caching).
-///
-/// Reading a missing representation triggers lazy coercion:
-/// - Reading int when only STR_VALID is set: parse the string, cache in int, set INT_VALID.
-pub struct Scalar {
-    /// Which representations are valid + metadata.
-    pub(crate) flags: ScalarFlags,
-
-    /// Integer representation.  Valid when INT_VALID is set.
-    pub(crate) int: i64,
-
-    /// Float representation.  Valid when NUM_VALID is set.
-    pub(crate) num: f64,
-
-    /// String representation.  Valid when STR_VALID is set.  Uses small-string optimization internally.
-    pub(crate) bytes: PerlStringSlot,
-
-    /// Reference target.  Valid when REF_VALID is set.  When set, this scalar IS a reference (like Perl's RV).
-    pub(crate) reference: Option<Value>,
-
-    /// Magic chain (tie, overload, special variable magic).
-    pub(crate) magic: Option<Box<MagicChain>>,
-
-    /// Blessed package stash (for objects).
-    pub(crate) stash: Option<Arc<Stash>>,
+// ── The fallible-operation error (§2.3.7 roster) ──────────────────
+/// Errors from fallible scalar operations.  `ReadOnly` is the structural mutation failure the runtime maps to perl's
+/// message; allocation failures thread through from the string layer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScalarError {
+    /// Modification of a read-only value attempted (§2.3.1): structural for `Const` cells, the dynamic readonly flag
+    /// for `Mut` cells.
+    ReadOnly,
+    Alloc(AllocError),
 }
 
-impl Scalar {
-    // ── Constructors ──────────────────────────────────────────────
-    /// Create an undef scalar (no flags set, no valid representations).
-    pub fn new_undef() -> Self {
-        Scalar { flags: ScalarFlags::EMPTY, int: 0, num: 0.0, bytes: PerlStringSlot::None, reference: None, magic: None, stash: None }
+impl From<AllocError> for ScalarError {
+    fn from(e: AllocError) -> ScalarError {
+        ScalarError::Alloc(e)
+    }
+}
+
+impl std::fmt::Display for ScalarError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalarError::ReadOnly => f.write_str("Modification of a read-only value attempted"),
+            ScalarError::Alloc(_) => f.write_str("Out of memory!"),
+        }
+    }
+}
+
+// ── FullScalar — boxed rare state (§2.3.2) ────────────────────────
+/// The rare-state extension: payload plus lazy caches plus identity state, colocated in one box.
+///
+/// **Cache mechanism (ruled §2.3.2):** the numeric slots are plain atomics — while any reader holds the read lock the
+/// payload is frozen (writes require the write lock and clear the caches under it), so racing fillers compute the
+/// identical value and the race is benign; value stores are `Relaxed` paired with a `Release` validity store and
+/// `Acquire` validity load.  The string slot is `OnceLock<PerlString>` (a `PerlString` cannot be an atomic): the value
+/// sits inline in the slot, and invalidation is `take()` through the write guard's `&mut`.
+pub struct FullScalar {
+    payload: ScalarPayload,
+
+    // Derived caches (lazy; §2.2.2: derived state, never consulted for anything the payload answers).
+    cached_int: AtomicI64,
+    cached_int_valid: AtomicBool,
+    cached_float_bits: AtomicU64,
+    cached_float_valid: AtomicBool,
+    cached_string: OnceLock<PerlString>,
+
+    // Rare identity state.
+    magic: Option<Box<MagicChain>>,
+    stash: Option<HeapArc<Stash>>,
+
+    /// The dynamic readonly flag (`Internals::SvREADONLY`, toggleable) — `Mut`-cell readonly, distinct from the
+    /// structural `Const` kind (§2.3.1).  Mutated under the write lock only.
+    readonly: bool,
+}
+
+impl FullScalar {
+    fn new(payload: ScalarPayload) -> Box<FullScalar> {
+        Box::new(FullScalar {
+            payload,
+            cached_int: AtomicI64::new(0),
+            cached_int_valid: AtomicBool::new(false),
+            cached_float_bits: AtomicU64::new(0),
+            cached_float_valid: AtomicBool::new(false),
+            cached_string: OnceLock::new(),
+            magic: None,
+            stash: None,
+            readonly: false,
+        })
     }
 
-    /// Create a scalar from an integer.  INT_VALID is set.
-    pub fn from_int(n: i64) -> Self {
-        Scalar { flags: ScalarFlags::INT_VALID, int: n, num: 0.0, bytes: PerlStringSlot::None, reference: None, magic: None, stash: None }
+    fn invalidate_caches(&mut self) {
+        *self.cached_int_valid.get_mut() = false;
+        *self.cached_float_valid.get_mut() = false;
+        let _ = self.cached_string.take();
+    }
+}
+
+// ── ScalarCell — the mutable interior (§2.3.2) ────────────────────
+/// `Plain` is the common promoted case; `Full` is a single pointer threading the payload's spare niche encodings,
+/// keeping the cell at 24 bytes (§2.3.6).  Upgrade happens in place under the write lock: the `Arc` address never
+/// changes, preserving every outstanding reference — perl's `sv_upgrade` identity guarantee with a different mechanism.
+pub enum ScalarCell {
+    Plain(ScalarPayload),
+    Full(Box<FullScalar>),
+}
+
+impl Drop for ScalarCell {
+    /// Iterative teardown (§2.4.9): a dying cell hands its payload to the release worklist instead of letting drop glue
+    /// recurse through a chain of referents.
+    fn drop(&mut self) {
+        let payload = match self {
+            ScalarCell::Plain(p) => std::mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN)),
+            ScalarCell::Full(f) => std::mem::replace(&mut f.payload, ScalarPayload::Undef(Tainted::CLEAN)),
+        };
+        if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
+            crate::release::release_payload(payload);
+        }
+    }
+}
+
+impl std::fmt::Debug for ScalarCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalarCell::Plain(p) => f.debug_tuple("Plain").field(p).finish(),
+            ScalarCell::Full(full) => f.debug_struct("Full").field("payload", &full.payload).finish_non_exhaustive(),
+        }
+    }
+}
+
+impl ScalarCell {
+    /// The authoritative payload (§2.2.2).
+    pub fn payload(&self) -> &ScalarPayload {
+        match self {
+            ScalarCell::Plain(p) => p,
+            ScalarCell::Full(f) => &f.payload,
+        }
     }
 
-    /// Create a scalar from a float.  NUM_VALID is set.
-    pub fn from_num(n: f64) -> Self {
-        Scalar { flags: ScalarFlags::NUM_VALID, int: 0, num: n, bytes: PerlStringSlot::None, reference: None, magic: None, stash: None }
+    pub fn to_bool(&self) -> bool {
+        self.payload().to_bool()
     }
 
-    /// Create a scalar from a string.  STR_VALID is set.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        let mut bytes = PerlStringSlot::None;
-        bytes.set_str(s);
+    /// The integer coercion; `Full` cells memoize through the atomic pair (mechanism in [`FullScalar`]).
+    pub fn to_int(&self) -> i64 {
+        match self {
+            ScalarCell::Plain(p) => p.to_int(),
+            ScalarCell::Full(f) => {
+                if f.cached_int_valid.load(Ordering::Acquire) {
+                    return f.cached_int.load(Ordering::Relaxed);
+                }
 
-        Scalar { flags: ScalarFlags::STR_VALID | ScalarFlags::UTF8, int: 0, num: 0.0, bytes, reference: None, magic: None, stash: None }
+                let v = f.payload.to_int();
+                f.cached_int.store(v, Ordering::Relaxed);
+                f.cached_int_valid.store(true, Ordering::Release);
+
+                v
+            }
+        }
     }
 
-    /// Create a scalar from a `PerlString`.  STR_VALID is set.
-    pub fn from_perl_string(ps: PerlString) -> Self {
-        let flags = if ps.is_utf8() { ScalarFlags::STR_VALID | ScalarFlags::UTF8 } else { ScalarFlags::STR_VALID };
+    /// The float coercion; `Full` cells memoize as bits through the atomic pair.
+    pub fn to_float(&self) -> f64 {
+        match self {
+            ScalarCell::Plain(p) => p.to_float(),
+            ScalarCell::Full(f) => {
+                if f.cached_float_valid.load(Ordering::Acquire) {
+                    return f64::from_bits(f.cached_float_bits.load(Ordering::Relaxed));
+                }
 
-        Scalar { flags, int: 0, num: 0.0, bytes: PerlStringSlot::Heap(ps), reference: None, magic: None, stash: None }
+                let v = f.payload.to_float();
+                f.cached_float_bits.store(v.to_bits(), Ordering::Relaxed);
+                f.cached_float_valid.store(true, Ordering::Release);
+
+                v
+            }
+        }
     }
 
-    /// Create a reference scalar.  REF_VALID is set.
-    pub fn from_ref(target: Value) -> Self {
-        Scalar { flags: ScalarFlags::REF_VALID, int: 0, num: 0.0, bytes: PerlStringSlot::None, reference: Some(target), magic: None, stash: None }
+    pub fn numify(&self) -> Numeric {
+        self.payload().numify()
     }
 
-    // ── Flag accessors ────────────────────────────────────────────
-    /// The current flags.
-    pub fn flags(&self) -> ScalarFlags {
-        self.flags
+    /// Stringification; `Full` cells memoize in the `OnceLock` slot.  The set-then-get shape (rather than
+    /// `get_or_init`) threads the allocation `Result` out; a racing loser's identical value is dropped.
+    pub fn to_string_repr(&self) -> Result<PerlString, AllocError> {
+        match self {
+            ScalarCell::Plain(p) => p.to_string_repr(),
+            ScalarCell::Full(f) => {
+                if let Some(s) = f.cached_string.get() {
+                    return Ok(s.clone());
+                }
+
+                let v = f.payload.to_string_repr()?;
+                let _ = f.cached_string.set(v.clone());
+
+                Ok(v)
+            }
+        }
     }
 
-    /// Whether this scalar is a reference.
-    pub fn is_ref(&self) -> bool {
-        self.flags.contains(ScalarFlags::REF_VALID)
+    pub fn is_tainted(&self) -> bool {
+        self.payload().is_tainted()
     }
 
-    /// Whether this scalar is read-only.
+    /// Whether the dynamic readonly flag is set (`Plain` cells never carry it).
     pub fn is_readonly(&self) -> bool {
-        self.flags.contains(ScalarFlags::READONLY)
+        matches!(self, ScalarCell::Full(f) if f.readonly)
     }
 
-    /// Whether magic is attached.
-    pub fn is_magical(&self) -> bool {
-        self.flags.contains(ScalarFlags::MAGICAL)
-    }
-
-    /// Whether this scalar is blessed into a package.
-    pub fn is_blessed(&self) -> bool {
-        self.stash.is_some()
-    }
-
-    /// Whether any value representation is valid (not undef).
-    pub fn is_defined(&self) -> bool {
-        self.flags.intersects(ScalarFlags::ANY_VAL | ScalarFlags::REF_VALID)
-    }
-
-    /// Perl truthiness.
-    ///
-    /// A scalar is false if it is:
-    /// - undef (no valid representations)
-    /// - integer zero (`int == 0` when INT_VALID)
-    /// - float zero (`num == 0.0` when NUM_VALID)
-    /// - empty string (`""` when STR_VALID)
-    /// - the string `"0"` (when STR_VALID)
-    ///
-    /// References are always true.  Everything else is true.
-    ///
-    /// When multiple representations are valid, numeric is checked first (faster than string comparison).
-    pub fn is_true(&self) -> bool {
-        // References are always true.
-        if self.flags.contains(ScalarFlags::REF_VALID) {
-            return true;
-        }
-
-        // Integer representation — check for zero.
-        if self.flags.contains(ScalarFlags::INT_VALID) {
-            return self.int != 0;
-        }
-
-        // Float representation — check for zero.
-        if self.flags.contains(ScalarFlags::NUM_VALID) {
-            return self.num != 0.0;
-        }
-
-        // String representation — check for "" and "0".
-        if self.flags.contains(ScalarFlags::STR_VALID) {
-            return !string_is_false(&self.bytes);
-        }
-
-        // No valid representation → undef → false.
-        false
-    }
-
-    // ── Integer access (with lazy coercion) ───────────────────────
-    /// Get the integer value, coercing from other representations if needed.  Caches the result by setting INT_VALID.
-    pub fn get_int(&mut self) -> i64 {
-        if self.flags.contains(ScalarFlags::REF_VALID) {
-            // A reference numifies to its referent's address (perl's PTR2IV).  Not cached: setting INT_VALID would
-            // claim an authoritative integer representation the reference does not have.
-            return self.ref_parts().1 as i64;
-        }
-
-        if self.flags.contains(ScalarFlags::INT_VALID) {
-            return self.int;
-        }
-
-        // Try to coerce from float
-        if self.flags.contains(ScalarFlags::NUM_VALID) {
-            self.int = self.num as i64;
-            self.flags.insert(ScalarFlags::INT_VALID);
-            return self.int;
-        }
-
-        // Try to coerce from string
-        if self.flags.contains(ScalarFlags::STR_VALID) {
-            if let Some(ps) = self.bytes.to_perl_string() {
-                self.int = ps.parse_iv();
-            } else {
-                self.int = 0;
+    /// Replace the payload — the single choke point (§2.2.2): derived state drops here.  Fails structurally on the
+    /// dynamic readonly flag.
+    pub fn assign(&mut self, payload: ScalarPayload) -> Result<(), ScalarError> {
+        match self {
+            ScalarCell::Plain(p) => {
+                *p = payload;
+                Ok(())
             }
-            self.flags.insert(ScalarFlags::INT_VALID);
-            return self.int;
-        }
+            ScalarCell::Full(f) => {
+                if f.readonly {
+                    return Err(ScalarError::ReadOnly);
+                }
 
-        // Undef → 0
-        0
-    }
+                f.payload = payload;
+                f.invalidate_caches();
 
-    /// Set the integer value.  Sets INT_VALID, clears NUM_VALID and STR_VALID.
-    pub fn set_int(&mut self, n: i64) {
-        self.int = n;
-        self.flags.insert(ScalarFlags::INT_VALID);
-        self.flags.remove(ScalarFlags::NUM_VALID | ScalarFlags::STR_VALID | ScalarFlags::UTF8);
-        self.bytes.clear();
-    }
-
-    // ── Float access (with lazy coercion) ─────────────────────────
-    /// Get the float value, coercing from other representations if needed.  Caches the result by setting NUM_VALID.
-    pub fn get_num(&mut self) -> f64 {
-        if self.flags.contains(ScalarFlags::REF_VALID) {
-            // Same address rule as get_int.
-            return self.ref_parts().1 as f64;
-        }
-
-        if self.flags.contains(ScalarFlags::NUM_VALID) {
-            return self.num;
-        }
-
-        if self.flags.contains(ScalarFlags::INT_VALID) {
-            self.num = self.int as f64;
-            self.flags.insert(ScalarFlags::NUM_VALID);
-            return self.num;
-        }
-
-        if self.flags.contains(ScalarFlags::STR_VALID) {
-            if let Some(ps) = self.bytes.to_perl_string() {
-                self.num = ps.parse_nv();
-            } else {
-                self.num = 0.0;
+                Ok(())
             }
-
-            self.flags.insert(ScalarFlags::NUM_VALID);
-            return self.num;
-        }
-
-        0.0
-    }
-
-    /// Set the float value.  Sets NUM_VALID, clears INT_VALID and STR_VALID.
-    pub fn set_num(&mut self, n: f64) {
-        self.num = n;
-        self.flags.insert(ScalarFlags::NUM_VALID);
-        self.flags.remove(ScalarFlags::INT_VALID | ScalarFlags::STR_VALID | ScalarFlags::UTF8);
-        self.bytes.clear();
-    }
-
-    // ── String access (with lazy coercion) ────────────────────────
-    /// Get a string view, coercing from other representations if needed.  Caches the result by setting STR_VALID.
-    /// Returns `None` only for undef.
-    pub fn get_bytes(&mut self) -> Option<&[u8]> {
-        if self.flags.contains(ScalarFlags::REF_VALID) {
-            // A reference stringifies as PREFIX(0xADDR), like the compact Value::Ref path.  The rendering goes into the
-            // byte slot so it can be borrowed, but STR_VALID stays clear — it is a per-read rendering, not a string
-            // representation the scalar owns.
-            let (prefix, addr) = self.ref_parts();
-            let rendered = format!("{}(0x{:x})", prefix, addr);
-            self.bytes.set_str(&rendered);
-            return self.bytes.as_bytes();
-        }
-
-        if self.flags.contains(ScalarFlags::STR_VALID) {
-            return self.bytes.as_bytes();
-        }
-
-        if self.flags.contains(ScalarFlags::INT_VALID) {
-            let s = self.int.to_string();
-            self.bytes.set_str(&s);
-            self.flags.insert(ScalarFlags::STR_VALID | ScalarFlags::UTF8);
-            return self.bytes.as_bytes();
-        }
-
-        if self.flags.contains(ScalarFlags::NUM_VALID) {
-            let s = format_nv(self.num);
-            self.bytes.set_str(&s);
-            self.flags.insert(ScalarFlags::STR_VALID | ScalarFlags::UTF8);
-            return self.bytes.as_bytes();
-        }
-
-        // Undef
-        None
-    }
-
-    /// Get a `&str` view if the string representation is UTF-8.  Coerces if needed (numeric → string is always UTF-8).
-    pub fn get_str(&mut self) -> Option<&str> {
-        // Ensure string is populated
-        self.get_bytes()?;
-        self.bytes.as_str()
-    }
-
-    /// Set the string value from a `&str`.  Sets STR_VALID + UTF8, clears INT_VALID and NUM_VALID.
-    pub fn set_str(&mut self, s: &str) {
-        self.bytes.set_str(s);
-        self.flags.insert(ScalarFlags::STR_VALID | ScalarFlags::UTF8);
-        self.flags.remove(ScalarFlags::INT_VALID | ScalarFlags::NUM_VALID);
-    }
-
-    /// Set the string value from raw bytes.  Sets STR_VALID, clears UTF8 + INT_VALID + NUM_VALID.
-    pub fn set_bytes(&mut self, bytes: impl AsRef<[u8]>) {
-        self.bytes.set_bytes(bytes);
-        self.flags.insert(ScalarFlags::STR_VALID);
-        self.flags.remove(ScalarFlags::INT_VALID | ScalarFlags::NUM_VALID | ScalarFlags::UTF8);
-    }
-
-    /// Get the string representation as an owned `PerlString`.  Coerces if needed (populates the string cache as a side
-    /// effect).  Returns an empty string for undef.
-    pub fn stringify(&mut self) -> PerlString {
-        // Ensure string cache is populated (may coerce from int/num).
-        if self.get_bytes().is_none() {
-            return PerlString::new(); // undef → empty string
-        }
-
-        // Now bytes is guaranteed to be populated.  Read it.
-        let is_utf8 = self.flags.contains(ScalarFlags::UTF8);
-
-        if let Some(bytes) = self.bytes.as_bytes() {
-            // SAFETY: if UTF8 flag is set, get_bytes ensured valid UTF-8.
-            unsafe { PerlString::from_bytes_utf8_unchecked(bytes.to_vec(), is_utf8) }
-        } else {
-            PerlString::new()
         }
     }
 
-    // ── Reference access ──────────────────────────────────────────
-    /// The stringification prefix and address for a reference scalar, matching perl's SCALAR(0x...)/ARRAY(0x...) forms
-    /// and PTR2IV numification.  Arc-backed targets use the Arc's address; compact targets (immediate values as
-    /// constructed by tests) use the address of the stored Value slot, which is stable for this Scalar's life.
-    fn ref_parts(&self) -> (&'static str, usize) {
-        match self.reference.as_ref() {
-            Some(Value::Array(av)) => ("ARRAY", Arc::as_ptr(av) as usize),
-            Some(Value::Hash(hv)) => ("HASH", Arc::as_ptr(hv) as usize),
-            Some(Value::Code(cv)) => ("CODE", Arc::as_ptr(cv) as usize),
-            Some(Value::Regex(re)) => ("Regexp", Arc::as_ptr(re) as usize),
-            Some(Value::Scalar(sv)) => ("SCALAR", Arc::as_ptr(sv) as usize),
-            Some(Value::Ref(sv)) => ("REF", Arc::as_ptr(sv) as usize),
-            Some(other) => ("SCALAR", other as *const Value as usize),
-            None => ("SCALAR", 0),
+    /// In-place `Plain`→`Full` upgrade (§2.3.2); idempotent.  Callers hold the write lock, so the `Arc` address — the
+    /// identity — never changes.
+    pub fn upgrade_to_full(&mut self) -> &mut FullScalar {
+        if let ScalarCell::Plain(p) = self {
+            let payload = std::mem::replace(p, ScalarPayload::Undef(Tainted::CLEAN));
+            *self = ScalarCell::Full(FullScalar::new(payload));
+        }
+
+        match self {
+            ScalarCell::Full(f) => f,
+            ScalarCell::Plain(_) => unreachable!("upgraded above"),
         }
     }
 
-    /// Get the reference target, if this is a reference.
-    pub fn get_rv(&self) -> Option<&Value> {
-        if self.flags.contains(ScalarFlags::REF_VALID) { self.reference.as_ref() } else { None }
+    /// Set or clear the dynamic readonly flag (`Internals::SvREADONLY` semantics: toggleable).  Setting upgrades to
+    /// `Full`; clearing on a `Plain` cell is a no-op.
+    pub fn set_readonly(&mut self, readonly: bool) {
+        match self {
+            ScalarCell::Plain(_) if !readonly => {}
+            _ => self.upgrade_to_full().readonly = readonly,
+        }
     }
 
-    /// Set this scalar to be a reference to the given value.  Clears all other representations.
-    pub fn set_rv(&mut self, target: Value) {
-        self.reference = Some(target);
-        self.flags = ScalarFlags::REF_VALID;
-        self.int = 0;
-        self.num = 0.0;
-        self.bytes.clear();
-    }
-
-    // ── Magic ─────────────────────────────────────────────────────
-    /// Attach a magic chain.  Sets MAGICAL flag.
+    /// Attach magic (upgrades to `Full`).  Magic *dispatch* is a later design section; step 4 pins only that attachment
+    /// preserves identity and payload.
     pub fn set_magic(&mut self, magic: MagicChain) {
-        self.magic = Some(Box::new(magic));
-        self.flags.insert(ScalarFlags::MAGICAL);
+        self.upgrade_to_full().magic = Some(Box::new(magic));
     }
 
-    // ── Blessing ──────────────────────────────────────────────────
-    /// Bless this scalar into a package.
-    pub fn bless(&mut self, stash: Arc<Stash>) {
-        self.stash = Some(stash);
+    pub fn has_magic(&self) -> bool {
+        matches!(self, ScalarCell::Full(f) if f.magic.is_some())
     }
 
-    /// The blessed stash, if any.
-    pub fn blessed_stash(&self) -> Option<&Arc<Stash>> {
-        self.stash.as_ref()
+    /// Bless into a stash (upgrades to `Full`).
+    pub fn bless(&mut self, stash: HeapArc<Stash>) {
+        self.upgrade_to_full().stash = Some(stash);
     }
 
-    // ── Read-only ─────────────────────────────────────────────────
-    /// Mark this scalar as read-only.
-    pub fn set_readonly(&mut self) {
-        self.flags.insert(ScalarFlags::READONLY);
-    }
-}
+    /// Numify, noting the once-only warning state (§2.3.4).  Returns the numeric result and whether the ops layer
+    /// should emit the warning *now*: true exactly when the payload would warn and this is the first such numification.
+    /// The once-bit rides the `PerlString` tag, so slot-to-slot copies carry it (the verified copy semantics); requires
+    /// the write lock because first-warn is a tag transition.
+    pub fn numify_noting_warning(&mut self) -> (Numeric, bool) {
+        let n = self.numify();
 
-// ── Helpers ──────────────────────────────────────────────────────
-/// Format a float the way perl does: `sprintf("%.15g", n)` (Gconvert at NV_DIG significant digits), with perl's
-/// "Inf"/"-Inf"/"NaN" capitalizations.  Note %.15g is a fixed significant-digit count, not shortest-round-trip — which
-/// is exactly why perl prints 0.1+0.2 as "0.3".
-pub(crate) fn format_nv(n: f64) -> String {
-    // Rust has no %g formatter, so build it: render at 15 significant digits in exponent form, then choose fixed or
-    // exponent presentation by the %g rule and strip trailing fraction zeros.  All shapes verified against perl 5.38.2
-    // print output: 0.1+0.2 is "0.3", 1e15 is "1e+15", 1e-5 is "1e-05".
-    if n.is_nan() {
-        return "NaN".to_string();
-    }
+        let payload = match self {
+            ScalarCell::Plain(p) => p,
+            ScalarCell::Full(f) => &mut f.payload,
+        };
 
-    if n.is_infinite() {
-        return if n < 0.0 { "-Inf".to_string() } else { "Inf".to_string() };
-    }
+        let emit = match payload {
+            ScalarPayload::String(s) if string_would_warn(s.as_bytes()) && !s.is_warned() => {
+                s.mark_warned();
+                true
+            }
+            _ => false,
+        };
 
-    if n == 0.0 {
-        return "0".to_string();
-    }
-
-    // "{:.14e}" gives a normalized d.dddddddddddddd form — 15 significant digits, correctly rounded.
-    let rendered = format!("{:.14e}", n);
-    let (mantissa, exp) = rendered.split_once('e').expect("exponent form always contains 'e'");
-    let exp: i32 = exp.parse().expect("exponent is a decimal integer");
-    let sign = if mantissa.starts_with('-') { "-" } else { "" };
-    let all_digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
-    let digits = all_digits.trim_end_matches('0');
-    let digits = if digits.is_empty() { "0" } else { digits };
-
-    // %g uses exponent form when the decimal exponent is below -4 or at/above the precision (15).
-    if !(-4..15).contains(&exp) {
-        let frac = &digits[1..];
-        let point = if frac.is_empty() { String::new() } else { format!(".{frac}") };
-        let exp_sign = if exp < 0 { '-' } else { '+' };
-        return format!("{sign}{}{point}e{exp_sign}{:02}", &digits[..1], exp.abs());
-    }
-
-    if exp >= 0 {
-        let int_len = exp as usize + 1;
-
-        if digits.len() <= int_len {
-            format!("{sign}{digits}{}", "0".repeat(int_len - digits.len()))
-        } else {
-            format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
-        }
-    } else {
-        format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        (n, emit)
     }
 }
 
-/// Perl string falseness: `""` (empty) and `"0"` are false.  Everything else is true.
-fn string_is_false(slot: &PerlStringSlot) -> bool {
-    match slot.as_bytes() {
-        None => true,       // no string → false (shouldn't happen if STR_VALID is set)
-        Some(b"") => true,  // empty string
-        Some(b"0") => true, // the string "0"
-        Some(_) => false,   // anything else
+const _: () = assert!(size_of::<ScalarCell>() == 24);
+
+// ── ConstScalar — frozen at birth (§2.3.3) ────────────────────────
+/// The lockless immutable cell: every coercion materialized at construction, reads are plain field access, trivially
+/// `Sync`.  The single mutable exception is the numification-warning once-bit, present only when the payload can warn
+/// (`None` makes "cannot warn" structural — eager knowledge, lazy surfacing, §2.3.4).
+pub struct ConstScalar {
+    payload: ScalarPayload,
+    int: i64,
+    float: f64,
+    string: PerlString,
+    numify_warned: Option<AtomicBool>,
+}
+
+impl Drop for ConstScalar {
+    /// Iterative teardown (§2.4.9): frozen payloads can carry graph edges too (§2.4.10).
+    fn drop(&mut self) {
+        let payload = std::mem::replace(&mut self.payload, ScalarPayload::Undef(Tainted::CLEAN));
+        if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
+            crate::release::release_payload(payload);
+        }
     }
 }
 
-// ── Trait impls ──────────────────────────────────────────────────
-impl fmt::Debug for Scalar {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut d = f.debug_struct("Scalar");
-        d.field("flags", &self.flags);
-        if self.flags.contains(ScalarFlags::INT_VALID) {
-            d.field("int", &self.int);
-        }
-        if self.flags.contains(ScalarFlags::NUM_VALID) {
-            d.field("num", &self.num);
-        }
-        if self.flags.contains(ScalarFlags::STR_VALID) {
-            d.field("bytes", &self.bytes);
-        }
-        if self.flags.contains(ScalarFlags::REF_VALID) {
-            d.field("reference", &self.reference);
-        }
-        if self.magic.is_some() {
-            d.field("magic", &"<attached>");
-        }
-        if self.stash.is_some() {
-            d.field("stash", &"<blessed>");
-        }
-        d.finish()
+impl std::fmt::Debug for ConstScalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstScalar").field("payload", &self.payload).finish_non_exhaustive()
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────
+impl ConstScalar {
+    /// Materialize a payload into a frozen cell (at most two short strings and two numbers, §2.3.3).
+    pub fn materialize(payload: ScalarPayload) -> Result<ConstScalar, AllocError> {
+        let int = payload.to_int();
+        let float = payload.to_float();
+        let string = payload.to_string_repr()?;
+
+        let can_warn = matches!(&payload, ScalarPayload::String(s) if string_would_warn(s.as_bytes()));
+        let numify_warned = can_warn.then(|| AtomicBool::new(false));
+
+        Ok(ConstScalar { payload, int, float, string, numify_warned })
+    }
+
+    pub fn payload(&self) -> &ScalarPayload {
+        &self.payload
+    }
+
+    pub fn to_bool(&self) -> bool {
+        self.payload.to_bool()
+    }
+
+    pub fn to_int(&self) -> i64 {
+        self.int
+    }
+
+    pub fn to_float(&self) -> f64 {
+        self.float
+    }
+
+    pub fn to_string_repr(&self) -> &PerlString {
+        &self.string
+    }
+
+    pub fn is_tainted(&self) -> bool {
+        self.payload.is_tainted()
+    }
+
+    /// Note a numification against the once-only warning state; returns whether the ops layer should emit the warning
+    /// now.  Statically-unwarnable payloads (`None`) answer false with no atomic traffic.
+    pub fn note_numify_warning(&self) -> bool {
+        match &self.numify_warned {
+            Some(flag) => !flag.swap(true, Ordering::AcqRel),
+            None => false,
+        }
+    }
+}
+
+// ── ScalarRef — shared identity (§2.3.1) ──────────────────────────
+/// The Mut/Const split.  Reference identity is `Arc::ptr_eq`; `Const` reads take no lock; `write()` on a `Const` has no
+/// lock to hand out — the mutation failure is structural.
+#[derive(Clone)]
+pub enum ScalarRef {
+    Mut(HeapArc<RwLock<ScalarCell>>),
+    Const(HeapArc<ConstScalar>),
+}
+
+impl std::fmt::Debug for ScalarRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            ScalarRef::Mut(_) => "Mut",
+            ScalarRef::Const(_) => "Const",
+        };
+        write!(f, "ScalarRef::{kind}(0x{:x})", self.addr())
+    }
+}
+
+impl ScalarRef {
+    pub fn new_mut(payload: ScalarPayload) -> ScalarRef {
+        ScalarRef::Mut(HeapArc::new(RwLock::new(ScalarCell::Plain(payload))))
+    }
+
+    pub fn new_const(cell: ConstScalar) -> ScalarRef {
+        ScalarRef::Const(HeapArc::new(cell))
+    }
+
+    /// The cell address — the value perl exposes when a reference is numified or stringified (`SCALAR(0x...)`); stable
+    /// for the identity's lifetime, shared by clones.
+    pub fn addr(&self) -> usize {
+        match self {
+            ScalarRef::Mut(c) => HeapArc::as_ptr(c) as usize,
+            ScalarRef::Const(c) => HeapArc::as_ptr(c) as usize,
+        }
+    }
+
+    /// Reference identity (§2.3.1): what `==` on Perl references compares.
+    pub fn ptr_eq(a: &ScalarRef, b: &ScalarRef) -> bool {
+        match (a, b) {
+            (ScalarRef::Mut(x), ScalarRef::Mut(y)) => HeapArc::ptr_eq(x, y),
+            (ScalarRef::Const(x), ScalarRef::Const(y)) => HeapArc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+
+    /// The unified read accessor (§2.3.1): a guard viewing the cell either way.  `Const` reads take no lock.
+    pub fn read(&self) -> ScalarReadGuard<'_> {
+        match self {
+            ScalarRef::Mut(cell) => ScalarReadGuard::Mut(cell.read()),
+            ScalarRef::Const(cell) => ScalarReadGuard::Const(cell),
+        }
+    }
+
+    /// The write accessor: `Const` has no lock to hand out — `ReadOnly` is structural, before any lock talk.
+    pub fn write(&self) -> Result<ScalarWriteGuard<'_>, ScalarError> {
+        match self {
+            ScalarRef::Mut(cell) => Ok(ScalarWriteGuard(cell.write())),
+            ScalarRef::Const(_) => Err(ScalarError::ReadOnly),
+        }
+    }
+}
+
+/// The read view over either cell kind.  Coercion reads on `Mut` go through the cell's caches; on `Const` they are the
+/// materialized fields.
+pub enum ScalarReadGuard<'a> {
+    Mut(RwLockReadGuard<'a, ScalarCell>),
+    Const(&'a ConstScalar),
+}
+
+impl ScalarReadGuard<'_> {
+    pub fn payload(&self) -> &ScalarPayload {
+        match self {
+            ScalarReadGuard::Mut(g) => g.payload(),
+            ScalarReadGuard::Const(c) => c.payload(),
+        }
+    }
+
+    pub fn to_bool(&self) -> bool {
+        match self {
+            ScalarReadGuard::Mut(g) => g.to_bool(),
+            ScalarReadGuard::Const(c) => c.to_bool(),
+        }
+    }
+
+    pub fn to_int(&self) -> i64 {
+        match self {
+            ScalarReadGuard::Mut(g) => g.to_int(),
+            ScalarReadGuard::Const(c) => c.to_int(),
+        }
+    }
+
+    pub fn to_float(&self) -> f64 {
+        match self {
+            ScalarReadGuard::Mut(g) => g.to_float(),
+            ScalarReadGuard::Const(c) => c.to_float(),
+        }
+    }
+
+    pub fn to_string_repr(&self) -> Result<PerlString, AllocError> {
+        match self {
+            ScalarReadGuard::Mut(g) => g.to_string_repr(),
+            ScalarReadGuard::Const(c) => Ok(c.to_string_repr().clone()),
+        }
+    }
+
+    pub fn is_tainted(&self) -> bool {
+        match self {
+            ScalarReadGuard::Mut(g) => g.is_tainted(),
+            ScalarReadGuard::Const(c) => c.is_tainted(),
+        }
+    }
+}
+
+/// The write view (only `Mut` cells reach here).  The dynamic readonly flag is checked at the mutation (`assign`), not
+/// at guard acquisition — acquiring a write guard to *toggle* readonly must remain possible.
+pub struct ScalarWriteGuard<'a>(RwLockWriteGuard<'a, ScalarCell>);
+
+impl std::ops::Deref for ScalarWriteGuard<'_> {
+    type Target = ScalarCell;
+
+    fn deref(&self) -> &ScalarCell {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ScalarWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ScalarCell {
+        &mut self.0
+    }
+}
+
+// ── The boolean immortals (§2.3.3) ────────────────────────────────
+/// Fallback-free materialization for the immortals: the payloads' renderings are tiny ASCII, so the inline path cannot
+/// allocate; the unreachable error arm degrades to an unmaterialized-string cell rather than panicking (no-panic
+/// policy).
+fn immortal(payload: ScalarPayload) -> ScalarRef {
+    let cell = ConstScalar::materialize(payload.clone()).unwrap_or_else(|_| ConstScalar {
+        payload,
+        int: 0,
+        float: 0.0,
+        string: PerlString::empty(),
+        numify_warned: None,
+    });
+
+    ScalarRef::Const(HeapArc::new(cell))
+}
+
+/// The true immortal: `ScalarPayload::True`, materialized as 1 / 1.0 / `"1"` (§2.3.3, as amended).
+pub static TRUE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(ScalarPayload::True));
+
+/// The false immortal: `ScalarPayload::False`, the dualvar — numerically 0, string `""` (§2.3.3).
+pub static FALSE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(ScalarPayload::False));
+
+// ── Tests ─────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::Value;
 
+    fn plain(payload: ScalarPayload) -> ScalarRef {
+        ScalarRef::new_mut(payload)
+    }
+
+    fn str_payload(text: &str) -> ScalarPayload {
+        ScalarPayload::String(text.parse().unwrap())
+    }
+
+    // ── The §2.3.3 singleton contract, pinned ─────────────────────
     #[test]
-    fn undef_scalar() {
-        let sv = Scalar::new_undef();
-        assert!(!sv.is_defined());
-        assert!(sv.flags().is_empty());
+    fn boolean_immortals_share_identity() {
+        // Verified perl 5.38: \(1==1) yields the same address twice.
+        let a = Value::True.upgrade_to_scalar().unwrap();
+        let b = Value::True.upgrade_to_scalar().unwrap();
+        assert!(ScalarRef::ptr_eq(&a, &b));
+        assert!(matches!(a, ScalarRef::Const(_)));
+
+        let f1 = Value::False.upgrade_to_scalar().unwrap();
+        let f2 = Value::False.upgrade_to_scalar().unwrap();
+        assert!(ScalarRef::ptr_eq(&f1, &f2));
+        assert!(!ScalarRef::ptr_eq(&a, &f1), "the two singletons are distinct");
     }
 
     #[test]
-    fn from_int() {
-        let mut sv = Scalar::from_int(42);
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
-        assert_eq!(sv.get_int(), 42);
-        assert!(sv.is_defined());
+    fn immortals_prematerialized_values() {
+        let t = TRUE_SCALAR.read();
+        assert!(matches!(t.payload(), ScalarPayload::True));
+        assert_eq!(t.to_int(), 1);
+        assert_eq!(t.to_float(), 1.0);
+        assert_eq!(t.to_string_repr().unwrap().as_bytes(), b"1");
+        assert!(t.to_bool());
+
+        // The dualvar: numerically 0, string "" (not "0") — verified: (1==0)."" has length 0.
+        let f = FALSE_SCALAR.read();
+        assert!(matches!(f.payload(), ScalarPayload::False));
+        assert_eq!(f.to_int(), 0);
+        assert_eq!(f.to_float(), 0.0);
+        assert_eq!(f.to_string_repr().unwrap().as_bytes(), b"");
+        assert!(!f.to_bool());
     }
 
     #[test]
-    fn from_num() {
-        let mut sv = Scalar::from_num(3.125);
-        assert!(sv.flags().contains(ScalarFlags::NUM_VALID));
-        assert!((sv.get_num() - 3.125).abs() < 1e-10);
+    fn immortal_mutation_is_the_readonly_error_never_a_panic() {
+        match TRUE_SCALAR.write() {
+            Err(ScalarError::ReadOnly) => {}
+            _ => panic!("Const write must fail structurally"),
+        }
+
+        assert_eq!(ScalarError::ReadOnly.to_string(), "Modification of a read-only value attempted");
     }
 
     #[test]
-    fn from_str() {
-        let mut sv = Scalar::from_str("hello");
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(sv.flags().contains(ScalarFlags::UTF8));
-        assert_eq!(sv.get_str(), Some("hello"));
+    fn cross_thread_upgrades_still_ptr_eq() {
+        // Guards LazyLock initialization races: a fresh thread's upgrade is the same singleton.
+        let here = Value::True.upgrade_to_scalar().unwrap();
+        let there = std::thread::spawn(|| Value::True.upgrade_to_scalar().unwrap());
+        let there = there.join().unwrap_or_else(|_| Value::True.upgrade_to_scalar().unwrap());
+        assert!(ScalarRef::ptr_eq(&here, &there));
     }
 
     #[test]
-    fn iv_to_nv_coercion() {
-        let mut sv = Scalar::from_int(42);
-        assert!(!sv.flags().contains(ScalarFlags::NUM_VALID));
-        let n = sv.get_num();
-        assert!((n - 42.0).abs() < 1e-10);
-        assert!(sv.flags().contains(ScalarFlags::NUM_VALID)); // now cached
+    fn is_bool_answers_from_the_variant() {
+        assert!(Value::True.is_bool());
+        assert!(Value::False.is_bool());
+        assert!(!Value::Int(1, Tainted::CLEAN).is_bool());
+        assert!(!Value::String("".parse().unwrap()).is_bool());
+    }
+
+    // ── ScalarRef / guards ────────────────────────────────────────
+    #[test]
+    fn reference_identity_and_clone_share() {
+        let r1 = plain(ScalarPayload::Int(42, Tainted::CLEAN));
+        let r2 = r1.clone();
+        assert!(ScalarRef::ptr_eq(&r1, &r2));
+        let r3 = plain(ScalarPayload::Int(42, Tainted::CLEAN));
+        assert!(!ScalarRef::ptr_eq(&r1, &r3), "equal payloads, distinct identities");
+
+        // Writes through one handle are visible through the other: shared identity.
+        r1.write().unwrap().assign(ScalarPayload::Int(7, Tainted::CLEAN)).unwrap();
+        assert_eq!(r2.read().to_int(), 7);
     }
 
     #[test]
-    fn iv_to_str_coercion() {
-        let mut sv = Scalar::from_int(42);
-        assert!(!sv.flags().contains(ScalarFlags::STR_VALID));
-        let s = sv.get_str();
-        assert_eq!(s, Some("42"));
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID)); // now cached
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID)); // still valid
+    fn concurrent_const_reads_take_no_lock() {
+        // Trivially concurrent: many threads reading the same Const cell simultaneously.
+        let cell = ConstScalar::materialize(str_payload("3.7")).unwrap();
+        let r = ScalarRef::new_const(cell);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let r = &r;
+                s.spawn(move || {
+                    for _ in 0..1000 {
+                        assert_eq!(r.read().to_int(), 3);
+                        assert_eq!(r.read().to_float(), 3.7);
+                    }
+                });
+            }
+        });
+    }
+
+    // ── ScalarCell: payload authority, caches, upgrade ────────────
+    #[test]
+    fn payload_stays_authoritative_through_coercion() {
+        // The §21.1 illustrative test: 3.7 used as an integer still stringifies as "3.7".
+        let r = plain(ScalarPayload::Float(3.7, Tainted::CLEAN));
+        assert_eq!(r.read().to_int(), 3);
+        assert_eq!(r.read().to_string_repr().unwrap().as_bytes(), b"3.7");
     }
 
     #[test]
-    fn str_to_iv_coercion() {
-        let mut sv = Scalar::from_str("42abc");
-        assert!(!sv.flags().contains(ScalarFlags::INT_VALID));
-        let n = sv.get_int();
-        assert_eq!(n, 42); // Perl-style: parse leading digits
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID)); // now cached
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID)); // still valid
+    fn full_cell_caches_and_invalidation() {
+        let r = plain(ScalarPayload::Float(3.7, Tainted::CLEAN));
+        r.write().unwrap().upgrade_to_full();
+
+        // Repeated coercions agree through the caches (fill under concurrent read guards).
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let r = &r;
+                s.spawn(move || {
+                    for _ in 0..500 {
+                        let g = r.read();
+                        assert_eq!(g.to_int(), 3);
+                        assert_eq!(g.to_float(), 3.7);
+                        assert_eq!(g.to_string_repr().unwrap().as_bytes(), b"3.7");
+                    }
+                });
+            }
+        });
+
+        // Assignment is the single choke point: caches drop with the payload.
+        r.write().unwrap().assign(ScalarPayload::Int(9, Tainted::CLEAN)).unwrap();
+        let g = r.read();
+        assert_eq!(g.to_int(), 9);
+        assert_eq!(g.to_float(), 9.0);
+        assert_eq!(g.to_string_repr().unwrap().as_bytes(), b"9");
     }
 
     #[test]
-    fn set_int_clears_string() {
-        let mut sv = Scalar::from_str("hello");
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        sv.set_int(99);
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::STR_VALID));
+    fn upgrade_preserves_identity_and_payload() {
+        let r = plain(str_payload("hello"));
+        let alias = r.clone();
+
+        {
+            let mut g = r.write().unwrap();
+            assert!(matches!(&*g, ScalarCell::Plain(_)));
+            g.upgrade_to_full();
+            g.upgrade_to_full(); // idempotent
+            assert!(matches!(&*g, ScalarCell::Full(_)));
+        }
+
+        // The Arc address never changed: the outstanding alias still reaches the upgraded cell.
+        assert!(ScalarRef::ptr_eq(&r, &alias));
+        assert_eq!(alias.read().to_string_repr().unwrap().as_bytes(), b"hello");
     }
 
     #[test]
-    fn set_str_clears_numeric() {
-        let mut sv = Scalar::from_int(42);
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
-        sv.set_str("hello");
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::INT_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::NUM_VALID));
+    fn magic_and_bless_attach_in_place() {
+        let r = plain(ScalarPayload::Int(1, Tainted::CLEAN));
+
+        {
+            let mut g = r.write().unwrap();
+            assert!(!g.has_magic());
+            g.set_magic(MagicChain { _private: () });
+            g.bless(HeapArc::new(Stash { _private: () }));
+            assert!(g.has_magic());
+        }
+
+        assert_eq!(r.read().to_int(), 1, "payload survives the attachments");
+    }
+
+    // ── The readonly error path ───────────────────────────────────
+    #[test]
+    fn dynamic_readonly_is_toggleable() {
+        let r = plain(ScalarPayload::Int(5, Tainted::CLEAN));
+
+        r.write().unwrap().set_readonly(true);
+        assert!(r.write().unwrap().is_readonly(), "the flag is set; acquiring the guard stays legal");
+        assert_eq!(r.write().unwrap().assign(ScalarPayload::Int(6, Tainted::CLEAN)), Err(ScalarError::ReadOnly));
+        assert_eq!(r.read().to_int(), 5, "the failed assignment changed nothing");
+
+        // Internals::SvREADONLY is toggleable: clear and assign.
+        r.write().unwrap().set_readonly(false);
+        r.write().unwrap().assign(ScalarPayload::Int(6, Tainted::CLEAN)).unwrap();
+        assert_eq!(r.read().to_int(), 6);
+
+        // Clearing readonly on a Plain cell is a no-op that must not upgrade.
+        let p = plain(ScalarPayload::Int(1, Tainted::CLEAN));
+        p.write().unwrap().set_readonly(false);
+        assert!(matches!(&*p.write().unwrap(), ScalarCell::Plain(_)));
+    }
+
+    // ── Numification-warning state (§2.3.4, container-verified) ───
+    #[test]
+    fn numify_warns_once_and_copies_carry_the_state() {
+        // "abc" + 1 twice warns once.
+        let r = plain(str_payload("abc"));
+        let (n1, emit1) = r.write().unwrap().numify_noting_warning();
+        assert_eq!(n1, Numeric::Float(0.0));
+        assert!(emit1, "first numification warns");
+        let (_, emit2) = r.write().unwrap().numify_noting_warning();
+        assert!(!emit2, "second is silent — the once-bit");
+
+        // Copy AFTER first numification: the copy is silent (the bit rides the PerlString tag).
+        let copied = r.read().payload().clone();
+        let r2 = plain(copied);
+        let (_, emit3) = r2.write().unwrap().numify_noting_warning();
+        assert!(!emit3, "copy after first numification is silent (verified)");
+
+        // Copy BEFORE: both warn.
+        let a = plain(str_payload("12abc"));
+        let b = plain(a.read().payload().clone());
+        assert!(a.write().unwrap().numify_noting_warning().1);
+        assert!(b.write().unwrap().numify_noting_warning().1, "copy before numification warns independently");
+
+        // Clean numerics never emit.
+        let c = plain(str_payload("  12  "));
+        assert!(!c.write().unwrap().numify_noting_warning().1);
     }
 
     #[test]
-    fn multi_rep_caching() {
-        // Simulate: $x = "42"; $x + 0;
-        // After the addition, both STR_VALID and INT_VALID should be set.
-        let mut sv = Scalar::from_str("42");
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::INT_VALID));
+    fn const_cell_warning_state() {
+        let warns = ConstScalar::materialize(str_payload("abc")).unwrap();
+        assert!(warns.note_numify_warning(), "first note emits");
+        assert!(!warns.note_numify_warning(), "second is silent");
 
-        // Reading as integer triggers coercion and caching
-        let n = sv.get_int();
-        assert_eq!(n, 42);
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID)); // cached
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID)); // still valid
+        // Statically-unwarnable payloads carry nothing (§2.3.4).
+        let silent = ConstScalar::materialize(ScalarPayload::Int(5, Tainted::CLEAN)).unwrap();
+        assert!(silent.numify_warned.is_none());
+        assert!(!silent.note_numify_warning());
+        let clean_str = ConstScalar::materialize(str_payload("42")).unwrap();
+        assert!(clean_str.numify_warned.is_none());
     }
 
+    // ── The §2.3.4 would-warn boundary table, pinned in full ──────
     #[test]
-    fn reference_scalar() {
-        let target = Value::Int(42);
-        let sv = Scalar::from_ref(target);
-        assert!(sv.is_ref());
-        assert!(sv.is_defined());
-        match sv.get_rv() {
-            Some(Value::Int(42)) => {}
-            other => panic!("Expected Value::Int(42), got {:?}", other),
+    fn would_warn_boundary_table() {
+        let warns = [
+            "abc",
+            "12abc",
+            "1e",
+            "1e+",
+            "0x10",
+            "",
+            "12.5abc",
+            ".",
+            "+",
+            "-",
+            "0.5.3",
+            "1_000",
+            "infx",
+            "nanx",
+            "  ",
+            "0 But True",
+            "0 but true ",
+            " 0 but true",
+            "0 but false",
+        ];
+        let silent = [
+            "12",
+            " 12",
+            "12 ",
+            "  12  ",
+            "\t12\n",
+            "3.5",
+            "1e5",
+            "0 but true",
+            "inf",
+            "Inf",
+            "+5",
+            "5.",
+            ".5",
+            "nan",
+            "infinity",
+            "INFINITY",
+            "0E0",
+            "-inf",
+            "+nan",
+        ];
+
+        for form in warns {
+            assert!(string_would_warn(form.as_bytes()), "{form:?} must warn (container-verified)");
+        }
+
+        for form in silent {
+            assert!(!string_would_warn(form.as_bytes()), "{form:?} must be silent (container-verified)");
         }
     }
 
+    // ── Layout (§2.3.6) ───────────────────────────────────────────
     #[test]
-    fn readonly() {
-        let mut sv = Scalar::from_int(42);
-        assert!(!sv.is_readonly());
-        sv.set_readonly();
-        assert!(sv.is_readonly());
-    }
-
-    #[test]
-    fn undef_coerces_to_zero() {
-        let mut sv = Scalar::new_undef();
-        assert_eq!(sv.get_int(), 0);
-        assert!((sv.get_num()).abs() < 1e-10);
-    }
-
-    #[test]
-    fn undef_coerces_to_no_string() {
-        let mut sv = Scalar::new_undef();
-        assert_eq!(sv.get_bytes(), None);
-        assert_eq!(sv.get_str(), None);
-    }
-
-    // ── Truthiness tests ──────────────────────────────────────
-    #[test]
-    fn undef_is_false() {
-        let sv = Scalar::new_undef();
-        assert!(!sv.is_true());
-    }
-
-    #[test]
-    fn zero_int_is_false() {
-        let sv = Scalar::from_int(0);
-        assert!(!sv.is_true());
-    }
-
-    #[test]
-    fn nonzero_int_is_true() {
-        let sv = Scalar::from_int(42);
-        assert!(sv.is_true());
-
-        let sv = Scalar::from_int(-1);
-        assert!(sv.is_true());
-    }
-
-    #[test]
-    fn zero_float_is_false() {
-        let sv = Scalar::from_num(0.0);
-        assert!(!sv.is_true());
-    }
-
-    #[test]
-    fn nonzero_float_is_true() {
-        let sv = Scalar::from_num(3.125);
-        assert!(sv.is_true());
-
-        let sv = Scalar::from_num(-0.001);
-        assert!(sv.is_true());
-    }
-
-    #[test]
-    fn nan_is_true() {
-        // In Perl, NaN is true (it's not zero).
-        let sv = Scalar::from_num(f64::NAN);
-        assert!(sv.is_true());
-    }
-
-    #[test]
-    fn empty_string_is_false() {
-        let sv = Scalar::from_str("");
-        assert!(!sv.is_true());
-    }
-
-    #[test]
-    fn string_zero_is_false() {
-        let sv = Scalar::from_str("0");
-        assert!(!sv.is_true());
-    }
-
-    #[test]
-    fn nonempty_string_is_true() {
-        let sv = Scalar::from_str("hello");
-        assert!(sv.is_true());
-
-        // "00" is true — only exactly "0" is false
-        let sv = Scalar::from_str("00");
-        assert!(sv.is_true());
-
-        // "0.0" is true — only exactly "0" is false
-        let sv = Scalar::from_str("0.0");
-        assert!(sv.is_true());
-
-        // " " (space) is true
-        let sv = Scalar::from_str(" ");
-        assert!(sv.is_true());
-
-        // "0E0" is true — Perl's "zero but true"
-        let sv = Scalar::from_str("0E0");
-        assert!(sv.is_true());
-    }
-
-    #[test]
-    fn reference_is_true() {
-        let sv = Scalar::from_ref(Value::Int(0));
-        assert!(sv.is_true());
-
-        // Even a reference to undef is true
-        let sv = Scalar::from_ref(Value::Undef);
-        assert!(sv.is_true());
-    }
-
-    // ── Stringification tests ─────────────────────────────────
-    #[test]
-    fn stringify_undef() {
-        let mut sv = Scalar::new_undef();
-        let ps = sv.stringify();
-        assert!(ps.is_empty());
-    }
-
-    #[test]
-    fn stringify_iv() {
-        let mut sv = Scalar::from_int(42);
-        let ps = sv.stringify();
-        assert_eq!(ps.as_str(), Some("42"));
-        assert!(ps.is_utf8());
-
-        // Should have cached the string (STR_VALID now set)
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID)); // still valid
-    }
-
-    #[test]
-    fn stringify_nv() {
-        let mut sv = Scalar::from_num(3.125);
-        let ps = sv.stringify();
-        assert_eq!(ps.as_str(), Some("3.125"));
-    }
-
-    #[test]
-    fn stringify_str_passthrough() {
-        let mut sv = Scalar::from_str("hello");
-        let ps = sv.stringify();
-        assert_eq!(ps.as_str(), Some("hello"));
-    }
-
-    #[test]
-    fn stringify_caches_string() {
-        // Start with integer, stringify, check both INT_VALID and STR_VALID are set.
-        let mut sv = Scalar::from_int(99);
-        assert!(!sv.flags().contains(ScalarFlags::STR_VALID));
-        let _ = sv.stringify();
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
-    }
-
-    // ── Truthiness vs cached numeric coercions (verified against perl 5.38.2) ─────
-    //
-    // Perl's SvTRUE consults the string representation first when one exists.  A numeric coercion caches a *lossy*
-    // value (perl marks it IOKp/NOKp — private — precisely so truth and stringification never consult it), so using a
-    // string as a number must never change its truth value or how it prints.
-
-    #[test]
-    fn truthiness_of_str_zero_zero_survives_numeric_use() {
-        // Verified: perl keeps "0.0" true after ("0.0" + 0).
-        let mut sv = Scalar::from_str("0.0");
-        assert!(sv.is_true(), "\"0.0\" is a true string");
-        let _ = sv.get_num();
-        assert!(sv.is_true(), "\"0.0\" must stay true after numeric coercion caches 0.0");
-    }
-
-    #[test]
-    fn truthiness_of_str_abc_survives_numeric_use() {
-        // Verified: perl keeps "abc" true after ("abc" + 0) numifies it to 0.
-        let mut sv = Scalar::from_str("abc");
-        let _ = sv.get_num();
-        assert!(sv.is_true(), "\"abc\" must stay true after numeric coercion caches 0.0");
-    }
-
-    #[test]
-    fn truthiness_of_str_zero_point_five_survives_int_use() {
-        // get_int on "0.5" caches int 0; perl keeps the scalar true.
-        let mut sv = Scalar::from_str("0.5");
-        let _ = sv.get_int();
-        assert!(sv.is_true(), "\"0.5\" must stay true after integer coercion caches 0");
-    }
-
-    #[test]
-    fn lossy_int_cache_does_not_poison_stringify_of_str() {
-        let mut sv = Scalar::from_str("0.5");
-        assert_eq!(sv.get_int(), 0);
-        assert_eq!(sv.stringify().as_str(), Some("0.5"), "string representation is authoritative over a lossy int cache");
-    }
-
-    #[test]
-    fn lossy_int_cache_does_not_poison_stringify_of_num() {
-        // Verified: perl prints 0.5 after int(0.5) has been taken of the same scalar.
-        let mut sv = Scalar::from_num(0.5);
-        assert_eq!(sv.get_int(), 0);
-        assert_eq!(sv.get_str(), Some("0.5"), "float representation is authoritative over a lossy int cache");
-    }
-
-    #[test]
-    fn pure_string_truthiness_regressions() {
-        // No coercion involved — the string rules themselves.
-        assert!(!Scalar::from_str("").is_true());
-        assert!(!Scalar::from_str("0").is_true());
-        assert!(Scalar::from_str("0.0").is_true());
-        assert!(Scalar::from_str("00").is_true());
-        assert!(Scalar::from_str(" ").is_true());
-    }
-
-    // ── References held in a full Scalar (consistency with the compact Value::Ref path) ─────
-
-    #[test]
-    fn ref_scalar_numifies_to_address() {
-        // Perl numifies a reference to its address — never 0.
-        let mut sv = Scalar::from_ref(Value::Int(7));
-        assert_ne!(sv.get_int(), 0, "a reference numifies to its address, not 0");
-        assert!(sv.get_num() != 0.0);
-    }
-
-    #[test]
-    fn ref_scalar_stringifies_like_value_ref() {
-        // Value::Ref stringifies as "SCALAR(0xADDR)"; the same reference held in a full Scalar must not stringify as
-        // the empty string.
-        let mut sv = Scalar::from_ref(Value::Int(7));
-        let ps = sv.stringify();
-        let bytes = ps.as_bytes();
-        assert!(bytes.starts_with(b"SCALAR(0x"), "expected SCALAR(0x...) form, got {:?}", String::from_utf8_lossy(bytes));
-    }
-
-    #[test]
-    fn ref_scalar_is_true() {
-        assert!(Scalar::from_ref(Value::Int(0)).is_true(), "references are always true");
-    }
-
-    // ── format_nv vs perl's %.15g (all values verified against perl 5.38.2 print output) ─────
-
-    #[test]
-    fn format_nv_matches_perl_g15_rounding() {
-        // print 0.1+0.2 gives "0.3" in perl (%.15g rounds away the representation noise); Rust's shortest round-trip
-        // Display gives "0.30000000000000004".
-        assert_eq!(format_nv(0.1 + 0.2), "0.3");
-    }
-
-    #[test]
-    fn format_nv_switches_to_exponent_at_16_digits() {
-        // %.15g uses exponent form once the exponent reaches the precision: perl prints 1e15 as "1e+15" and 1e21 as
-        // "1e+21".
-        assert_eq!(format_nv(1e15), "1e+15");
-        assert_eq!(format_nv(1e21), "1e+21");
-        assert_eq!(format_nv(999999999999999.0), "999999999999999");
-    }
-
-    #[test]
-    fn format_nv_small_magnitude_exponent_form() {
-        // perl prints 1e-5 as "1e-05" (two-digit exponent).
-        assert_eq!(format_nv(1e-5), "1e-05");
-    }
-
-    #[test]
-    fn format_nv_specials_capitalization() {
-        // perl prints Inf / -Inf / NaN.
-        assert_eq!(format_nv(f64::INFINITY), "Inf");
-        assert_eq!(format_nv(f64::NEG_INFINITY), "-Inf");
-        assert_eq!(format_nv(f64::NAN), "NaN");
-    }
-
-    #[test]
-    fn format_nv_plain_values_regressions() {
-        assert_eq!(format_nv(0.5), "0.5");
-        assert_eq!(format_nv(3.125), "3.125");
-        assert_eq!(format_nv(100.0), "100");
-        assert_eq!(format_nv(0.0), "0");
-        assert_eq!(format_nv(-2.5), "-2.5");
-    }
-
-    // ── Coercion and flag-discipline edge cases ───────────────────────
-
-    #[test]
-    fn from_int_negative_round_trip() {
-        let mut sv = Scalar::from_int(-42);
-        assert_eq!(sv.get_int(), -42);
-        assert_eq!(sv.get_str(), Some("-42"));
-
-        // Reading the string didn't disturb the cached int.
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
-        assert_eq!(sv.get_int(), -42);
-    }
-
-    #[test]
-    fn float_to_int_truncates_toward_zero() {
-        // Rust's `as i64` truncates toward zero, matching Perl's int() behavior on floats within i64 range.
-        let mut a = Scalar::from_num(3.7);
-        assert_eq!(a.get_int(), 3);
-        let mut b = Scalar::from_num(-3.7);
-        assert_eq!(b.get_int(), -3);
-    }
-
-    #[test]
-    fn float_nan_coerces_to_zero() {
-        // Rust f64::NAN `as i64` is 0 (saturating-cast rules).  Perl's int(0+"nan") is also 0.  Match.
-        let mut sv = Scalar::from_num(f64::NAN);
-        assert_eq!(sv.get_int(), 0);
-    }
-
-    #[test]
-    fn set_ref_clears_all_other_flags() {
-        // After set_rv, only REF_VALID should be set among the validity flags.
-        let mut sv = Scalar::from_str("hello");
-        sv.set_int(42); // STR_VALID cleared, INT_VALID set
-        let _ = sv.get_num(); // NUM_VALID now also set (cached from INT_VALID)
-        assert!(sv.flags().contains(ScalarFlags::INT_VALID));
-        assert!(sv.flags().contains(ScalarFlags::NUM_VALID));
-        sv.set_rv(Value::Int(99));
-        assert!(sv.flags().contains(ScalarFlags::REF_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::INT_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::NUM_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::UTF8));
-    }
-
-    #[test]
-    fn from_perl_string_utf8_flag_propagates() {
-        let ps_utf8 = PerlString::from_str("hello");
-        let sv = Scalar::from_perl_string(ps_utf8);
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(sv.flags().contains(ScalarFlags::UTF8));
-
-        let ps_bytes = PerlString::from_bytes(vec![0xff, 0xfe]);
-        let sv2 = Scalar::from_perl_string(ps_bytes);
-        assert!(sv2.flags().contains(ScalarFlags::STR_VALID));
-        assert!(!sv2.flags().contains(ScalarFlags::UTF8));
-    }
-
-    #[test]
-    fn set_bytes_clears_utf8_flag() {
-        let mut sv = Scalar::from_str("hello");
-        assert!(sv.flags().contains(ScalarFlags::UTF8));
-        sv.set_bytes([0xff, 0xfe]);
-        assert!(sv.flags().contains(ScalarFlags::STR_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::UTF8));
-        assert!(!sv.flags().contains(ScalarFlags::INT_VALID));
-        assert!(!sv.flags().contains(ScalarFlags::NUM_VALID));
-    }
-
-    #[test]
-    fn double_coercion_then_read_back() {
-        // $x = 42, read as string, read as int again: should still be 42 throughout.
-        let mut sv = Scalar::from_int(42);
-        assert_eq!(sv.get_str(), Some("42"));
-        assert_eq!(sv.get_int(), 42);
-        assert_eq!(sv.get_str(), Some("42"));
+    fn envelope_sizes() {
+        assert_eq!(size_of::<ScalarCell>(), 24, "Full threads the payload's niche (measured, §2.3.2)");
+        assert_eq!(size_of::<ScalarRef>(), 16);
     }
 }
