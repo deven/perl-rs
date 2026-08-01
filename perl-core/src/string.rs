@@ -815,13 +815,33 @@ impl PerlString {
         self.len() == 0
     }
 
-    /// The raw bytes.
+    /// The string's bytes — perl's buffer contents, whatever form this value stores them in.
     ///
     /// Borrowed from the string where the bytes exist in that form, and from `scratch` where they do not — packed
     /// content is nibbles, so its bytes have to be decoded somewhere, and a buffer built inside this call could not
     /// outlive it.  The caller supplies one stack array and never learns which case it got, which is what lets the
     /// storage forms multiply without every consumer following along.
+    ///
+    /// **Every compressing storage form must expand here.**  This is the one place the expansion happens, and it is why
+    /// length, comparison, and hashing are correct without knowing which form they were handed: they read the value's
+    /// bytes, never a payload.  An arm returning a compressed payload would silently give every consumer the wrong
+    /// string — most damagingly the Latin-1 inline form (§2.2.9), whose stored code points are *half* the characters of
+    /// an unflagged value, so returning them unexpanded would make a thirty-character string look like fifteen and
+    /// compare equal to a string it differs from.  `DECODE_MAX` is `INLINE_MAX * 2` for this reason: it is sized for
+    /// the widest expansion any form may need.
     pub fn as_bytes<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> &'a [u8] {
+        // `len` derives the byte count per storage form, independently of this decode, so the two disagreeing means an
+        // arm forgot to expand.  Its own scratch, the caller's being borrowed for the return.
+        #[cfg(debug_assertions)]
+        {
+            let mut probe = [0u8; DECODE_MAX];
+            debug_assert_eq!(self.as_bytes_inner(&mut probe).len(), self.len(), "as_bytes must yield the value's bytes, not a compressed payload");
+        }
+
+        self.as_bytes_inner(scratch)
+    }
+
+    fn as_bytes_inner<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> &'a [u8] {
         match self.raw_parts() {
             RawParts::Inline { full, buf } => &buf[..inline_len(full, buf)],
             RawParts::Packed(p) => {
