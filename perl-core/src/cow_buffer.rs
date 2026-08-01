@@ -22,7 +22,7 @@
 //!
 //! 1. `ptr` is non-null, points at the data region of a live allocation laid out as `[Header][data]`, with the `Header`
 //!    at `ptr - HEADER_SIZE` and at least `capacity` addressable data bytes.
-//! 2. `self.len == header.len <= header.capacity` at all times outside a mutation in progress.
+//! 2. `self.header().len == header.len <= header.capacity` at all times outside a mutation in progress.
 //! 3. The refcount counts live handles; the allocation is freed exactly when the count falls from 1 to 0
 //!    (release/acquire protocol, as `Arc`).
 //! 4. Data bytes are never written through a handle unless the refcount is exactly 1 (checked with acquire ordering).
@@ -73,11 +73,10 @@ const fn grow_headroom(needed: usize) -> usize {
 
 /// The copy-on-write byte buffer.  16-byte handle: data pointer + mirrored length.
 pub struct CowBuffer {
-    /// Points at the data region (offset `HEADER_SIZE` into the allocation).
+    /// Points at the data region (offset `HEADER_SIZE` into the allocation).  The whole handle: the length is read
+    /// from the header rather than mirrored here, because a two-word handle cannot fit the 16-byte envelope beside a
+    /// discriminant (§2.2.9).  The envelope reinstates a mirror in its own spare bytes, where it costs nothing.
     ptr: NonNull<u8>,
-
-    /// Mirrored from the header (coherent by COW; see module docs).
-    len: usize,
 }
 
 // SAFETY: the buffer is shared only through the atomic refcount protocol; data bytes are immutable while shared
@@ -117,7 +116,7 @@ impl CowBuffer {
         // SAFETY: HEADER_SIZE is within the allocation.
         let ptr = unsafe { NonNull::new_unchecked(base.as_ptr().add(HEADER_SIZE)) };
 
-        Ok(CowBuffer { ptr, len: 0 })
+        Ok(CowBuffer { ptr })
     }
 
     /// Allocation layout for a buffer with `capacity` data bytes.  Capacity arithmetic overflow is reported as the same
@@ -147,13 +146,13 @@ impl CowBuffer {
     /// Length in bytes.  Reads the handle mirror — no dereference.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.header().len
     }
 
     /// Whether the buffer is empty.  No dereference.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.header().len == 0
     }
 
     /// Allocated data capacity in bytes.
@@ -166,7 +165,7 @@ impl CowBuffer {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: invariants 1 and 2 — `len` bytes are initialized at `ptr`.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.header().len) }
     }
 
     /// Whether this handle is the only one (refcount == 1).  Acquire ordering so a `true` result synchronizes with any
@@ -211,13 +210,13 @@ impl CowBuffer {
             return Ok(());
         }
 
-        let needed = self.len.checked_add(extra).ok_or(AllocError { requested: usize::MAX })?;
+        let needed = self.header().len.checked_add(extra).ok_or(AllocError { requested: usize::MAX })?;
         let mut fresh = CowBuffer::with_capacity(grow_headroom(needed))?;
 
-        // SAFETY: fresh is unique with sufficient capacity; source bytes are valid for self.len.
+        // SAFETY: fresh is unique with sufficient capacity; source bytes are valid for self.header().len.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.len);
-            fresh.set_len(self.len);
+            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.header().len);
+            fresh.set_len(self.header().len);
         }
 
         // The scan and count knowledge describe the bytes, which we copied verbatim — carry them.
@@ -232,7 +231,7 @@ impl CowBuffer {
     /// buffer is unique with `capacity >= len + additional`.
     pub fn reserve(&mut self, additional: usize) -> Result<(), AllocError> {
         self.make_unique(additional)?;
-        let needed = self.len.checked_add(additional).ok_or(AllocError { requested: usize::MAX })?;
+        let needed = self.header().len.checked_add(additional).ok_or(AllocError { requested: usize::MAX })?;
 
         if needed <= self.capacity() {
             return Ok(());
@@ -241,10 +240,10 @@ impl CowBuffer {
         let new_cap = grow_headroom(needed);
         let mut fresh = CowBuffer::with_capacity(new_cap)?;
 
-        // SAFETY: fresh is unique with capacity >= len; source valid for self.len.
+        // SAFETY: fresh is unique with capacity >= len; source valid for self.header().len.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.len);
-            fresh.set_len(self.len);
+            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), fresh.ptr.as_ptr(), self.header().len);
+            fresh.set_len(self.header().len);
         }
 
         fresh.narrow_scan(self.scan());
@@ -263,8 +262,8 @@ impl CowBuffer {
         // SAFETY: unique (reserve guarantees), capacity checked; regions cannot overlap (a &[u8] argument cannot alias
         // our uniquely-owned data region while &mut self is held).
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(self.len), bytes.len());
-            let new_len = self.len + bytes.len();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(self.header().len), bytes.len());
+            let new_len = self.header().len + bytes.len();
             self.set_len(new_len);
         }
 
@@ -278,7 +277,7 @@ impl CowBuffer {
     /// value, and other sharers must keep their full contents.  Scan state resets to `UNKNOWN`; the caller may
     /// re-narrow per the removal rules (§2.2.5).
     pub fn truncate(&mut self, new_len: usize) -> Result<(), AllocError> {
-        if new_len >= self.len {
+        if new_len >= self.header().len {
             return Ok(());
         }
 
@@ -298,7 +297,7 @@ impl CowBuffer {
         self.make_unique(0)?;
 
         // SAFETY: unique (just ensured); len bytes initialized.
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) })
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.header().len) })
     }
 
     /// Set both lengths (handle mirror and header).
@@ -309,7 +308,7 @@ impl CowBuffer {
     unsafe fn set_len(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.capacity());
         self.header_mut().len = new_len;
-        self.len = new_len;
+        self.header_mut().len = new_len;
     }
 }
 
@@ -319,7 +318,7 @@ impl Clone for CowBuffer {
         // Relaxed suffices for increment: creating a new handle from an existing one cannot race with destruction of
         // the last handle (we hold one).  Same protocol as `Arc::clone`.
         self.header().refcount.fetch_add(1, Ordering::Relaxed);
-        CowBuffer { ptr: self.ptr, len: self.len }
+        CowBuffer { ptr: self.ptr }
     }
 }
 
@@ -345,7 +344,7 @@ impl Drop for CowBuffer {
 impl fmt::Debug for CowBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CowBuffer")
-            .field("len", &self.len)
+            .field("len", &self.header().len)
             .field("capacity", &self.capacity())
             .field("unique", &self.is_unique())
             .field("scan", &self.scan())
@@ -363,8 +362,11 @@ impl PartialEq for CowBuffer {
 impl Eq for CowBuffer {}
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
-const _: () = assert!(size_of::<CowBuffer>() == 16);
-const _: () = assert!(size_of::<Option<CowBuffer>>() == 16);
+//
+// One word: the handle must fit the 16-byte envelope beside a discriminant and the inline payload alternative, which a
+// mirrored length would prevent.  `NonNull` supplies the niche, so `Option` is free.
+const _: () = assert!(size_of::<CowBuffer>() == 8);
+const _: () = assert!(size_of::<Option<CowBuffer>>() == 8);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
