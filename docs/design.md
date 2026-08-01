@@ -142,8 +142,12 @@ enum Value {
     Undef,
     Int(i64),                  // + packed-decimal digit cache (§2.2.9)
     Float(f64),                // + packed-decimal digit cache (§2.2.9)
-    StrInline(..),             // raw bytes <= 13, eagerly scanned
-    StrPacked(..),             // nibble-packed <= 28 chars (§2.2.9)
+    StrBytes(..),              // internal octets <= 15, NUL-terminated
+    StrUtf8(..),               // encoded bytes <= 15, beyond Latin-1
+    StrLatin1(..),             // code points <= 15, flag-independent
+    StrPackedNumeric(..),      // nibble-packed <= 30 chars: all 15
+    StrPackedDateTimeZ(..),    // payload bytes are nibbles, so the
+    StrPackedDateTimePlus(..), // alphabet lives in the variant (§2.2.9)
     StrHeap(..),               // thin pointer; §2.2.3 buffer model
     True,                      // canonical boolean true  (see 2.3.3)
     False,                     // canonical boolean false (see 2.3.3)
@@ -287,9 +291,13 @@ storage kinds:
 // behind accessors (storage_kind(), is_utf8(), is_warned(),
 // is_tainted(), scan-state and tag-transition methods).
 enum PerlString {
-    Raw { len: u8, buf: [u8; 13] },      // no heap allocation
-    Packed { fmt_len: u8, nib: [u8; 14] }, // <= 28 chars (§2.2.9)
-    Heap(..),                            // thin handle; COW buffer
+    Bytes([u8; 15]),        // internal octets, NUL-terminated (§2.2.9)
+    Utf8([u8; 15]),         // encoded bytes, beyond Latin-1
+    Latin1([u8; 15]),       // code points, flag-independent
+    PackedNumeric([u8; 15]),  // nibbles, <= 30 chars, no stored
+    PackedDateTimeZ([u8; 15]),     // length; the alphabet has no
+    PackedDateTimePlus([u8; 15]),  // payload byte — it IS the variant
+    Heap(..),               // thin handle; COW buffer
 }
 ```
 
@@ -358,7 +366,8 @@ unique-check mutation, nothing else.  Details:
 incidental.**  Perl's `%.15g` float stringification maxes out at
 exactly 22 characters (`-2.22507385850720e-308`: sign + digit +
 point + 14 mantissa digits + 5-character exponent); `i64::MIN`
-stringifies to 20.  Those outputs exceed the 13-byte raw-inline tier
+stringifies to 20.  The longer of those outputs exceed the
+15-byte inline tier
 but draw entirely from the numeric alphabet of the nibble-packed
 tier (≤ 28 characters, §2.2.9), so **every numeric stringification
 the interpreter can produce stays inline** — encoded by table
@@ -399,14 +408,17 @@ In the buffer header (per-buffer, `Heap` only):
 tag — and needs only the five *terminal* states (`ASCII`,
 `UTF8_LATIN1`, `UTF8_NON_LATIN1`, `EXTENDED_UTF8`,
 `MALFORMED_UTF8`), because inline strings are scanned eagerly and
-completely at construction (§2.2.7): checking at most 13 bytes is
+completely at construction (§2.2.7): checking at most 15 bytes is
 nearly free.  Discriminant-state arithmetic under the fused
-variants (§2.2.9): raw-inline 5 (scan) × 2 (utf8) × 2 (warned) ×
-2 (tainted) = 40; packed 2 (alphabet) × 2 (utf8) × 2 (warned) ×
-2 (tainted) = 16 (the scan state is fixed — packed alphabets are
-ASCII by construction); heap 2 × 2 × 2 = 8.  64 string encodings
-plus the non-string twins still leave ample niche encodings for
-the enclosing `Value`/`ScalarCell` layouts (§2.3.6).
+variants (§2.2.9): inline-Bytes 5 (scan) × 2 (warned) ×
+2 (tainted) = 20 (the flag is off by definition); inline-Utf8
+3 (scan) × 2 × 2 = 12 (the flag is on by definition);
+inline-Latin-1 2 (flag) × 2 (ascii) × 2 × 2 = 16; packed
+3 (alphabet) × 2 (utf8) × 2 (warned) × 2 (tainted) = 24 (the
+scan state is fixed — packed alphabets are ASCII by
+construction); heap 2 × 2 × 2 = 8.  80 string encodings plus the
+non-string twins still leave ample niche encodings for the
+enclosing `Value`/`ScalarCell` layouts (§2.3.6).
 
 **The Perl flag and the scan cache must never be conflated.**
 Verified against container perl 5.38: `chr(0x110000)` is legal core
@@ -631,7 +643,7 @@ decode walks right past, so under the single-pass fusion law it is
 counted then and cached in the buffer header (`char_count`,
 sentinel `MAX` = unknown — a zero sentinel is unsound because heap
 strings never demote and can truncate to empty; inline strings
-recount their ≤ 13 bytes trivially).  Relaxed atomic stores
+recount their ≤ 15 payload bytes trivially).  Relaxed atomic stores
 suffice here, unlike the scan byte: the character count of fixed
 bytes is unique, so racing writers store the *same* value through
 an atomic — benign by identity, where scan discoveries need the
@@ -803,7 +815,7 @@ testing against zero.
 #### 2.2.7 Construction policy:
 
 - `Inline`: always scan *fully* at construction — ASCII plus
-  validity including the extended forms (checking ≤13 bytes is
+  validity including the extended forms (checking ≤15 bytes is
   nearly free) — yielding one of the five terminal states.  From
   Rust `&str`/`String` the validity half is known from the type.
   This is the only eager scan; inline scan states are therefore
@@ -864,7 +876,7 @@ Why 16, against 24 and wider:
   with the discriminant outside it.  Everything below 16 is
   NaN-boxing (rejected, §2.3.6).
 - **The regret is asymmetric**: 16's known weakness (the
-  14-22-byte raw-string window) is patchable afterward inside the
+  16-22-byte raw-string window) is patchable afterward inside the
   envelope — the packed tier below, prefix caches, interning;
   24's weakness (8 bytes on every slot) is permanent.
 
@@ -883,8 +895,68 @@ battery is the tripwire.
 enum's discriminant (an opaque inner string type cannot fuse; the
 inner tag would cost a word — the §2.3.6 nesting lesson):
 
-- **Raw inline, ≤ 13 bytes**: the §2.2.4 scan machinery intact,
-  eagerly scanned at construction.
+- **Inline, ≤ 15 payload bytes in three storage formats**, all
+  NUL-terminated (a length of exactly 15 is the unterminated
+  form), selected by the discriminant.  **The storage format is
+  an axis independent of the semantic `SvUTF8` flag** — the flag
+  is perl's interpretation claim; the format says what the
+  payload bytes physically are:
+
+  - *Bytes*: perl's internal octets verbatim — flag-off strings
+    whose octets are not valid Latin-1-range UTF-8 (canonical
+    selection sends those to *Latin-1*).  Characters are the
+    octets; the §2.2.4 five-state scan lattice applies, eagerly
+    at construction.
+  - *Utf8*: encoded bytes verbatim — flag-on strings that cannot
+    decode into the Latin-1 range: a code point at or above
+    U+0100, a perl-extended code point, or malformed content.
+    Scan states are the three that can occur
+    (`UTF8_NON_LATIN1`, `EXTENDED_UTF8`, `MALFORMED_UTF8`).
+  - *Latin-1*: content that is valid UTF-8 with every code point
+    in U+0001-U+00FF, stored **one code point per byte,
+    regardless of the flag**.  Flag on: the payload is the
+    string's characters (fifteen high-Latin-1 characters inline
+    where their encoding spans thirty bytes), and
+    `utf8::upgrade`/`downgrade` are pure flag flips with zero
+    byte work — where perl itself re-encodes the buffer.  Flag
+    off: the string *is* the UTF-8 octet sequence — semantically
+    raw bytes, as when byte-oriented reads ingest UTF-8 data —
+    stored compressed: **up to thirty semantic octets inline**.
+    Every operation answers over the virtual expansion, the
+    packed tier's dual-view discipline, and `length` is the
+    expansion sum — one or two per payload byte — never the
+    payload count: fifteen stored high-Latin-1 code points report
+    length **30** (container-verified, with `ord` returning the
+    lead byte `C3`, not the code point).  The cached ASCII bit
+    short-circuits the sum: all-ASCII content expands to itself.
+    Byte-level *mutation* can split an encoded character —
+    container-verified: `chop` removes one byte, leaving a
+    dangling lead byte that is no longer valid UTF-8 — so
+    mutation re-runs canonical selection on the result, and a
+    split lands in *Bytes* form; decoded storage is a read
+    optimization the string can fall out of, never a constraint
+    on what the bytes may become.
+
+  The independence is load-bearing, with a pinned monster:
+  payload `E9` flag-off means the one-octet string `é` under
+  *Bytes* and the two-octet string `C3 A9` under *Latin-1* —
+  different strings (container-verified: flag-off they compare
+  unequal at lengths one and two; decode the second and they
+  compare equal) — distinguished by the format axis alone.
+  Canonical selection is a determinism obligation, since equal
+  perl strings must take equal representations for
+  representation-level equality and hashing to be sound: a
+  flag-off octet sequence that is valid Latin-1-range UTF-8
+  always takes *Latin-1*, never *Bytes*; *Bytes* holds exactly
+  the octet strings failing that test; the full tier-selection
+  priority (Latin-1, Bytes, Utf8, packed, heap, by content and
+  fitted capacity) is a normative table at implementation.  The
+  reinterpretation APIs are representation transforms, total
+  because decoded storage re-expands through the unique canonical
+  encoding: `Encode::_utf8_off` on compressed flag-on content
+  re-expands (container-verified: an upgraded `é` becomes the
+  flag-off two-character `C3.A9`), and `_utf8_on` on raw octets
+  reclassifies (a lone `E9` becomes flagged malformed content).
 - **Nibble-packed, ≤ 30 characters**, for digit-dense text — two
   characters per byte over 16-symbol alphabets, in 15 payload
   bytes with **no stored length**: a length byte is two characters
@@ -941,9 +1013,9 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
 
 The standalone `PerlString` is 16 bytes too — the tag budget
 closes in one byte (kind 2 bits, scan 3, utf8/warned/tainted 3),
-leaving 15 payload bytes: raw ≤ 13 and packed ≤ 28, identical to
-the fused tiers, with the heap kind a thin pointer plus a u48
-mirrored length in the spare bytes.  Its tiers and capacities are identical to the fused variants, and
+leaving 15 payload bytes: the three inline formats and the packed
+tier at the fused variants' capacities, with the heap kind a thin
+pointer plus a u48 mirrored length in the spare bytes.  Its tiers and capacities are identical to the fused variants, and
 the `Value`↔key boundary is an exhaustive-match reconstruction —
 which the optimizer reduces to a copy plus tag write in practice,
 but is **never a transmute**: the size assertions pin neither
@@ -952,7 +1024,7 @@ on byte-level correspondence between the two types.  No capacity
 mismatch exists, `keys()` materializes heap-shared keys by
 refcount bump, hash entry pairs are 32 bytes (two per cache
 line), and one capacity ladder serves both contexts.  The raw key
-window (14-22 bytes, previously inline) falls under the same
+window (16-22 bytes) falls under the same
 corpus tripwire, softened for keys because keys repeat: the heap
 cost is per-distinct-key-per-hash, not per-operation.
 
@@ -1008,7 +1080,8 @@ unaffected.
 
 **Corpus tripwire** (ledgered, runs during implementation, does
 not gate the ruling): measure over representative Perl corpora
-(a) the share of strings in the 14-22-byte window, (b) the
+(a) the share of strings in the 16-22-byte window — those
+neither packable nor valid Latin-1-range UTF-8 — (b) the
 packable share of that window, (c) separator conventions in
 datetime-shaped data, (d) the
 significant-digit histogram of numeric output.  If the raw window
@@ -1285,11 +1358,13 @@ const _: () = assert!(size_of::<PerlString>() == 16);  // layout-compatible with
 The load-bearing layout facts:
 
 - **The envelope is 16 bytes** (ruled at §2.2.9): full inline
-  `i64` and `f64` with taint as discriminant twins, the 13-byte
-  raw plus 28-character nibble-packed string tiers, thin heap
+  `i64` and `f64` with taint as discriminant twins, the
+  three-format 15-byte inline plus 30-character nibble-packed
+  string tiers, thin heap
   pointers, `Option` at no cost, and per-value packed-decimal
   numeric caches.  A 24-byte envelope (22 raw-inline bytes, no
-  packed tier) would buy back the 14-22-byte raw-string window at
+  packed tier) would buy back part of the 16-22-byte raw-string
+  window at
   eight bytes on every slot; the packed tier keeps every numeric
   stringification inline without that tax, and the residual raw
   window is monitored by the §2.2.9 corpus tripwire with
