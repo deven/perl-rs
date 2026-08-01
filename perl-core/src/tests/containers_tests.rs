@@ -1,4 +1,5 @@
 use super::*;
+use crate::string::DECODE_MAX;
 use crate::value::{ScalarPayload, Tainted};
 
 fn int(n: i64) -> Value {
@@ -153,7 +154,7 @@ fn each_visits_all_when_deleting_current() {
 
     let mut visited = Vec::new();
     while let Some((k, _)) = h.each() {
-        let is_b = k.as_bytes() == b"b";
+        let is_b = k.as_bytes(&mut [0u8; DECODE_MAX]) == b"b";
         visited.push(k.clone());
         if is_b {
             h.delete(&k).unwrap();
@@ -183,6 +184,7 @@ fn each_exhausts_restarts_and_keys_resets() {
     let _ = g.each();
     let _ = g.keys();
     let mut count = 0;
+
     while g.each().is_some() {
         count += 1;
     }
@@ -200,7 +202,11 @@ fn keys_values_stable_and_corresponding() {
 
     let k1 = h.keys();
     let k2 = h.keys();
-    assert_eq!(k1.iter().map(|k| k.as_bytes().to_vec()).collect::<Vec<_>>(), k2.iter().map(|k| k.as_bytes().to_vec()).collect::<Vec<_>>());
+    assert_eq!(
+        k1.iter().map(|k| k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()).collect::<Vec<_>>(),
+        k2.iter().map(|k| k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()).collect::<Vec<_>>()
+    );
+
     let vals = h.values();
     for (k, v) in k1.iter().zip(vals.iter()) {
         assert_eq!(h.get(k).unwrap().to_int(), v.to_int());

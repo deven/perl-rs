@@ -23,6 +23,7 @@
 //! and tainted are ignored by `Eq`/`Hash`.
 
 use crate::cow_buffer::{AllocError, CowBuffer};
+use crate::packed::{MAX_PACKED_LEN, MIN_PACKED_LEN, PACKED_BYTES, Packed, PackedAlphabet, pack};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem;
@@ -30,6 +31,12 @@ use std::str;
 
 /// Maximum inline payload: chosen so every numeric stringification stays allocation-free (§2.2.3).
 pub const INLINE_MAX: usize = 15;
+
+/// The widest byte sequence any non-heap form decodes to, and so the size of the scratch buffer the borrowed-view
+/// accessors take.  Thirty covers every case at once: the packed capacity is thirty ASCII characters, and fifteen
+/// Latin-1 code points expand to thirty octets of UTF-8 — the raw forms of fifteen bytes or fewer are trivially under
+/// it.
+pub const DECODE_MAX: usize = 30;
 
 /// Heap scan-cache states, stored in the `CowBuffer` header byte (§2.2.4).  Zero is `UNKNOWN`, the lattice top — the
 /// natural zero-initialized state can never assert a validity claim (§2.2.6).
@@ -370,6 +377,10 @@ pub enum StorageKind {
     /// Inline: ≤ [`INLINE_MAX`] bytes in the enum payload, no allocation.
     Inline,
 
+    /// Nibble-packed: 16-30 characters of digit-dense text in the enum payload, no allocation (§2.2.9).  The bytes do
+    /// not exist in that form, so a borrowed view of them must be decoded into a caller-held buffer.
+    Packed,
+
     /// Heap: a shared [`CowBuffer`].
     Heap,
 }
@@ -379,12 +390,14 @@ pub enum StorageKind {
 macro_rules! define_perl_string {
     (
         inline: [ $( $iv:ident = ($iscan:ident, $iu:literal, $iw:literal, $it:literal) ),* $(,)? ],
+        packed: [ $( $pv:ident = ($palpha:ident, $pfull:literal, $pu:literal, $pw:literal, $pt:literal) ),* $(,)? ],
         heap:   [ $( $hv:ident = ($hu:literal, $hw:literal, $ht:literal) ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation; the variant set is the folded tag (§2.2.3) and is an
         /// implementation detail — construct and inspect through the methods, never by matching variants directly.
         pub enum PerlString {
             $( #[doc(hidden)] $iv { buf: [u8; INLINE_MAX] }, )*
+            $( #[doc(hidden)] $pv { nibbles: [u8; PACKED_BYTES] }, )*
             $( #[doc(hidden)] $hv(CowBuffer), )*
         }
 
@@ -393,6 +406,7 @@ macro_rules! define_perl_string {
             pub fn storage_kind(&self) -> StorageKind {
                 match self {
                     $( PerlString::$iv { .. } => StorageKind::Inline, )*
+                    $( PerlString::$pv { .. } => StorageKind::Packed, )*
                     $( PerlString::$hv(_) => StorageKind::Heap, )*
                 }
             }
@@ -401,6 +415,7 @@ macro_rules! define_perl_string {
             pub fn is_utf8(&self) -> bool {
                 match self {
                     $( PerlString::$iv { .. } => $iu, )*
+                    $( PerlString::$pv { .. } => $pu, )*
                     $( PerlString::$hv(_) => $hu, )*
                 }
             }
@@ -409,6 +424,7 @@ macro_rules! define_perl_string {
             pub fn is_warned(&self) -> bool {
                 match self {
                     $( PerlString::$iv { .. } => $iw, )*
+                    $( PerlString::$pv { .. } => $pw, )*
                     $( PerlString::$hv(_) => $hw, )*
                 }
             }
@@ -417,6 +433,7 @@ macro_rules! define_perl_string {
             pub fn is_tainted(&self) -> bool {
                 match self {
                     $( PerlString::$iv { .. } => $it, )*
+                    $( PerlString::$pv { .. } => $pt, )*
                     $( PerlString::$hv(_) => $ht, )*
                 }
             }
@@ -425,6 +442,8 @@ macro_rules! define_perl_string {
             pub fn inline_scan(&self) -> Option<InlineScan> {
                 match self {
                     $( PerlString::$iv { .. } => Some(InlineScan::$iscan), )*
+                    // Packed alphabets are ASCII by construction, so the scan state is fixed.
+                    $( PerlString::$pv { .. } => Some(InlineScan::Ascii), )*
                     $( PerlString::$hv(_) => None, )*
                 }
             }
@@ -437,7 +456,42 @@ macro_rules! define_perl_string {
                 }
             }
 
-            /// Rebuild a heap value with the given tag dimensions (buffer preserved).
+            /// Rebuild a heap value with the given tag dimensions (buffer preserved).  Build a packed value with the
+            /// given alphabet, length family, and tag dimensions.
+            fn build_packed(packed: Packed, utf8: bool, warned: bool, tainted: bool) -> PerlString {
+                match (packed.alphabet, packed.full, utf8, warned, tainted) {
+                    $( (PackedAlphabet::$palpha, $pfull, $pu, $pw, $pt) => PerlString::$pv { nibbles: packed.nibbles }, )*
+                }
+            }
+
+
+            /// The payload behind the tag, borrowed.  Generated rather than hand-written: with three storage kinds the
+            /// explicit variant lists ran past a hundred names, and the per-section repetition expresses it exactly.
+            fn raw_parts(&self) -> RawParts<'_> {
+                match self {
+                    $( PerlString::$iv { buf } => RawParts::Inline { buf }, )*
+                    $( PerlString::$pv { nibbles } => RawParts::Packed(Packed {
+                        alphabet: PackedAlphabet::$palpha,
+                        full: $pfull,
+                        nibbles: *nibbles,
+                    }), )*
+                    $( PerlString::$hv(cb) => RawParts::Heap(cb), )*
+                }
+            }
+
+            /// The payload behind the tag, owned — the shape mutation needs, since it rebuilds the tag afterward.
+            fn into_raw(self) -> RawOwned {
+                match self {
+                    $( PerlString::$iv { buf } => RawOwned::Inline { scan: InlineScan::$iscan, buf }, )*
+                    $( PerlString::$pv { nibbles } => RawOwned::Packed(Packed {
+                        alphabet: PackedAlphabet::$palpha,
+                        full: $pfull,
+                        nibbles,
+                    }), )*
+                    $( PerlString::$hv(cb) => RawOwned::Heap(cb), )*
+                }
+            }
+
             fn build_heap(utf8: bool, warned: bool, tainted: bool, cb: CowBuffer) -> PerlString {
                 match (utf8, warned, tainted) {
                     $( ($hu, $hw, $ht) => PerlString::$hv(cb), )*
@@ -490,6 +544,56 @@ define_perl_string! {
         InlineMalformedWarnedTainted        = (Malformed, false, true,  true),
         InlineMalformedFlaggedWarnedTainted = (Malformed, true,  true,  true),
     ],
+    packed: [
+        PackedNum                                    = (Numeric     , false, false, false, false),
+        PackedNumFlagged                             = (Numeric     , false, true , false, false),
+        PackedNumWarned                              = (Numeric     , false, false, true , false),
+        PackedNumFlaggedWarned                       = (Numeric     , false, true , true , false),
+        PackedNumTainted                             = (Numeric     , false, false, false, true),
+        PackedNumFlaggedTainted                      = (Numeric     , false, true , false, true),
+        PackedNumWarnedTainted                       = (Numeric     , false, false, true , true),
+        PackedNumFlaggedWarnedTainted                = (Numeric     , false, true , true , true),
+        PackedNumFull                                = (Numeric     , true , false, false, false),
+        PackedNumFullFlagged                         = (Numeric     , true , true , false, false),
+        PackedNumFullWarned                          = (Numeric     , true , false, true , false),
+        PackedNumFullFlaggedWarned                   = (Numeric     , true , true , true , false),
+        PackedNumFullTainted                         = (Numeric     , true , false, false, true),
+        PackedNumFullFlaggedTainted                  = (Numeric     , true , true , false, true),
+        PackedNumFullWarnedTainted                   = (Numeric     , true , false, true , true),
+        PackedNumFullFlaggedWarnedTainted            = (Numeric     , true , true , true , true),
+        PackedPlus                                   = (DateTimePlus, false, false, false, false),
+        PackedPlusFlagged                            = (DateTimePlus, false, true , false, false),
+        PackedPlusWarned                             = (DateTimePlus, false, false, true , false),
+        PackedPlusFlaggedWarned                      = (DateTimePlus, false, true , true , false),
+        PackedPlusTainted                            = (DateTimePlus, false, false, false, true),
+        PackedPlusFlaggedTainted                     = (DateTimePlus, false, true , false, true),
+        PackedPlusWarnedTainted                      = (DateTimePlus, false, false, true , true),
+        PackedPlusFlaggedWarnedTainted               = (DateTimePlus, false, true , true , true),
+        PackedPlusFull                               = (DateTimePlus, true , false, false, false),
+        PackedPlusFullFlagged                        = (DateTimePlus, true , true , false, false),
+        PackedPlusFullWarned                         = (DateTimePlus, true , false, true , false),
+        PackedPlusFullFlaggedWarned                  = (DateTimePlus, true , true , true , false),
+        PackedPlusFullTainted                        = (DateTimePlus, true , false, false, true),
+        PackedPlusFullFlaggedTainted                 = (DateTimePlus, true , true , false, true),
+        PackedPlusFullWarnedTainted                  = (DateTimePlus, true , false, true , true),
+        PackedPlusFullFlaggedWarnedTainted           = (DateTimePlus, true , true , true , true),
+        PackedZulu                                   = (DateTimeZulu, false, false, false, false),
+        PackedZuluFlagged                            = (DateTimeZulu, false, true , false, false),
+        PackedZuluWarned                             = (DateTimeZulu, false, false, true , false),
+        PackedZuluFlaggedWarned                      = (DateTimeZulu, false, true , true , false),
+        PackedZuluTainted                            = (DateTimeZulu, false, false, false, true),
+        PackedZuluFlaggedTainted                     = (DateTimeZulu, false, true , false, true),
+        PackedZuluWarnedTainted                      = (DateTimeZulu, false, false, true , true),
+        PackedZuluFlaggedWarnedTainted               = (DateTimeZulu, false, true , true , true),
+        PackedZuluFull                               = (DateTimeZulu, true , false, false, false),
+        PackedZuluFullFlagged                        = (DateTimeZulu, true , true , false, false),
+        PackedZuluFullWarned                         = (DateTimeZulu, true , false, true , false),
+        PackedZuluFullFlaggedWarned                  = (DateTimeZulu, true , true , true , false),
+        PackedZuluFullTainted                        = (DateTimeZulu, true , false, false, true),
+        PackedZuluFullFlaggedTainted                 = (DateTimeZulu, true , true , false, true),
+        PackedZuluFullWarnedTainted                  = (DateTimeZulu, true , false, true , true),
+        PackedZuluFullFlaggedWarnedTainted           = (DateTimeZulu, true , true , true , true),
+    ],
     heap: [
         Heap                     = (false, false, false),
         HeapFlagged              = (true,  false, false),
@@ -532,10 +636,30 @@ fn inline_eligible(bytes: &[u8]) -> bool {
     bytes.len() <= INLINE_MAX && !bytes.contains(&0)
 }
 
+/// Concatenate and re-pack, or `None` when the result leaves the packed tier — too long, or not encodable in any
+/// alphabet.
+///
+/// Re-classifying the whole result rather than widening the existing nibbles in place costs a decode the incremental
+/// path would avoid, and buys canonicity for free: `pack` picks the alphabet by the priority order, so a string built
+/// by appending is byte-identical to the same content constructed whole.
+fn pack_grown(head: &[u8], tail: &[u8]) -> Option<Packed> {
+    let new_len = head.len() + tail.len();
+    if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&new_len) {
+        return None;
+    }
+
+    let mut combined = [0u8; MAX_PACKED_LEN];
+    combined[..head.len()].copy_from_slice(head);
+    combined[head.len()..new_len].copy_from_slice(tail);
+
+    pack(&combined[..new_len])
+}
+
 fn inline_payload(bytes: &[u8]) -> [u8; INLINE_MAX] {
     debug_assert!(inline_eligible(bytes));
     let mut buf = [0u8; INLINE_MAX];
     buf[..bytes.len()].copy_from_slice(bytes);
+
     buf
 }
 
@@ -568,11 +692,18 @@ impl PerlString {
     pub fn inline(s: impl AsRef<str>) -> Option<PerlString> {
         let s = s.as_ref();
         let bytes = s.as_bytes();
-        if bytes.len() > INLINE_MAX {
-            return None;
+        if bytes.len() > INLINE_MAX || bytes.contains(&0) {
+            // The packed tier's band begins exactly where the inline payload ends, and it allocates nothing either.
+            // Past the band there is no non-allocating form, so this is where `None` starts meaning "the heap".
+            if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
+                return None;
+            }
+
+            return pack(bytes).map(|p| PerlString::build_packed(p, false, false, false));
         }
 
         let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Malformed/Extended impossible from &str.
+
         Some(PerlString::build_inline(state, state != InlineScan::Ascii, false, false, inline_payload(bytes)))
     }
 
@@ -580,8 +711,12 @@ impl PerlString {
     /// Unflagged, like [`PerlString::from_bytes`]; the same guarantee-not-a-count contract as [`PerlString::inline`].
     pub fn inline_bytes(bytes: impl AsRef<[u8]>) -> Option<PerlString> {
         let bytes = bytes.as_ref();
-        if bytes.len() > INLINE_MAX {
-            return None;
+        if bytes.len() > INLINE_MAX || bytes.contains(&0) {
+            if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
+                return None;
+            }
+
+            return pack(bytes).map(|p| PerlString::build_packed(p, false, false, false));
         }
 
         Some(PerlString::build_inline(eager_scan(bytes), false, false, false, inline_payload(bytes)))
@@ -592,6 +727,7 @@ impl PerlString {
     pub fn len(&self) -> usize {
         match self.raw_parts() {
             RawParts::Inline { buf } => inline_len(buf),
+            RawParts::Packed(p) => p.len(),
             RawParts::Heap(cb) => cb.len(),
         }
     }
@@ -602,17 +738,33 @@ impl PerlString {
     }
 
     /// The raw bytes.
-    pub fn as_bytes(&self) -> &[u8] {
+    ///
+    /// Borrowed from the string where the bytes exist in that form, and from `scratch` where they do not — packed
+    /// content is nibbles, so its bytes have to be decoded somewhere, and a buffer built inside this call could not
+    /// outlive it.  The caller supplies one stack array and never learns which case it got, which is what lets the
+    /// storage forms multiply without every consumer following along.
+    pub fn as_bytes<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> &'a [u8] {
         match self.raw_parts() {
             RawParts::Inline { buf } => &buf[..inline_len(buf)],
+            RawParts::Packed(p) => {
+                let (decoded, len) = p.unpack();
+                scratch[..len].copy_from_slice(&decoded[..len]);
+                &scratch[..len]
+            }
             RawParts::Heap(cb) => cb.as_slice(),
         }
     }
 
     /// View as a Rust `&str` if the bytes are valid UTF-8 (a fact question, independent of the Perl flag).  Narrows the
     /// heap scan lattice as a side effect (§2.2.5); sound through `&self`.
-    pub fn as_str(&self) -> Option<&str> {
+    pub fn as_str<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> Option<&'a str> {
         match self.raw_parts() {
+            RawParts::Packed(p) => {
+                // Every packed alphabet is ASCII, so the decoded bytes are always valid.
+                let (decoded, len) = p.unpack();
+                scratch[..len].copy_from_slice(&decoded[..len]);
+                str::from_utf8(&scratch[..len]).ok()
+            }
             RawParts::Inline { buf } => {
                 let bytes = &buf[..inline_len(buf)];
                 match self.inline_scan() {
@@ -654,6 +806,9 @@ impl PerlString {
     pub fn is_ascii(&self) -> bool {
         match self.raw_parts() {
             RawParts::Inline { .. } => self.inline_scan() == Some(InlineScan::Ascii),
+            // Every symbol of every packed alphabet is ASCII, so this is a constant rather than a question about
+            // content — unlike the inline forms, whose bytes are whatever they are.
+            RawParts::Packed(_) => true,
             RawParts::Heap(cb) => match cb.scan() {
                 scan::ASCII => true,
                 scan::UTF8_LATIN1 | scan::UTF8_NON_LATIN1 | scan::UTF8_NON_ASCII | scan::MALFORMED_UTF8 | scan::NON_ASCII | scan::EXTENDED_UTF8 => false,
@@ -690,6 +845,7 @@ impl PerlString {
                 Some(st) => inline_scan_to_heap(st),
                 None => scan::UNKNOWN, // unreachable by construction
             },
+            RawParts::Packed(_) => scan::ASCII,
             RawParts::Heap(cb) => cb.scan(),
         }
     }
@@ -699,6 +855,7 @@ impl PerlString {
     pub fn is_perl_utf8_valid(&self) -> bool {
         match self.raw_parts() {
             RawParts::Inline { .. } => !matches!(self.inline_scan(), Some(InlineScan::Malformed)),
+            RawParts::Packed(_) => true, // ASCII is valid under every reading.
             RawParts::Heap(cb) => match cb.scan() {
                 st if scan::is_perl_decodable(st) => true,
                 scan::MALFORMED_UTF8 => false,
@@ -722,6 +879,8 @@ impl PerlString {
     /// one is the flagged-side answer.  O(1) after first classification; cached per-buffer, shared across COW sharers.
     pub fn char_len(&self) -> Option<usize> {
         match self.raw_parts() {
+            // Packed alphabets are ASCII, so every character is one byte.
+            RawParts::Packed(p) => Some(p.len()),
             RawParts::Inline { buf } => {
                 let len = inline_len(buf);
                 let bytes = &buf[..len];
@@ -729,7 +888,7 @@ impl PerlString {
                     Some(InlineScan::Ascii) => Some(len),
                     Some(InlineScan::Malformed) | None => None,
                     _ => {
-                        let (_, chars) = classify_full(bytes); // ≤ 22 bytes: recount is trivial
+                        let (_, chars) = classify_full(bytes); // at most fifteen bytes: recount is trivial
                         Some(chars)
                     }
                 }
@@ -786,6 +945,7 @@ impl PerlString {
 
         *self = match old.into_raw() {
             RawOwned::Inline { scan, buf } => PerlString::build_inline(scan, u2, w2, t2, buf),
+            RawOwned::Packed(p) => PerlString::build_packed(p, u2, w2, t2),
             RawOwned::Heap(cb) => PerlString::build_heap(u2, w2, t2, cb),
         };
     }
@@ -832,12 +992,33 @@ impl PerlString {
                     nbuf[len..new_len].copy_from_slice(bytes);
                     let nscan = append_transition_inline(scan, kind, &nbuf[..new_len]);
                     PerlString::build_inline(nscan, u, w, t, nbuf)
+                } else if let Some(packed) = pack_grown(old_bytes, bytes) {
+                    // Outgrowing the inline payload does not mean the heap: the packed tier's band starts exactly where
+                    // the inline one ends.
+                    PerlString::build_packed(packed, u, w, t)
                 } else {
                     // Promote to heap (one-way).  Fold the append into the promoting allocation.
                     let mut cb = CowBuffer::with_capacity(new_len + (new_len >> 2))?;
                     cb.extend_from_slice(old_bytes)?;
                     cb.extend_from_slice(bytes)?;
                     cb.narrow_scan(append_transition_heap(inline_scan_to_heap(scan), kind));
+                    PerlString::build_heap(u, w, t, cb)
+                }
+            }
+            RawOwned::Packed(p) => {
+                let (decoded, len) = p.unpack();
+                let old_bytes = &decoded[..len];
+
+                if let Some(packed) = pack_grown(old_bytes, bytes) {
+                    PerlString::build_packed(packed, u, w, t)
+                } else {
+                    // Past the band, or no longer alphabet-conformant.  Packed content is ASCII, so the heap state
+                    // starts from there.
+                    let new_len = len + bytes.len();
+                    let mut cb = CowBuffer::with_capacity(new_len + (new_len >> 2))?;
+                    cb.extend_from_slice(old_bytes)?;
+                    cb.extend_from_slice(bytes)?;
+                    cb.narrow_scan(append_transition_heap(scan::ASCII, kind));
                     PerlString::build_heap(u, w, t, cb)
                 }
             }
@@ -862,146 +1043,17 @@ impl PerlString {
 
         Ok(())
     }
-
-    // ── Internal raw views ────────────────────────────────────────
-    fn raw_parts(&self) -> RawParts<'_> {
-        // The macro cannot express payload access generically across two shapes without another dimension of rules;
-        // this single exhaustive match is the one hand-written traversal, kept private.
-        macro_rules! arms {
-            () => {};
-        }
-
-        arms!();
-
-        #[allow(clippy::enum_glob_use)]
-        {
-            use PerlString::*;
-            match self {
-                InlineAscii { buf }
-                | InlineAsciiFlagged { buf }
-                | InlineAsciiWarned { buf }
-                | InlineAsciiFlaggedWarned { buf }
-                | InlineAsciiTainted { buf }
-                | InlineAsciiFlaggedTainted { buf }
-                | InlineAsciiWarnedTainted { buf }
-                | InlineAsciiFlaggedWarnedTainted { buf }
-                | InlineLatin1 { buf }
-                | InlineLatin1Flagged { buf }
-                | InlineLatin1Warned { buf }
-                | InlineLatin1FlaggedWarned { buf }
-                | InlineLatin1Tainted { buf }
-                | InlineLatin1FlaggedTainted { buf }
-                | InlineLatin1WarnedTainted { buf }
-                | InlineLatin1FlaggedWarnedTainted { buf }
-                | InlineNonLatin1 { buf }
-                | InlineNonLatin1Flagged { buf }
-                | InlineNonLatin1Warned { buf }
-                | InlineNonLatin1FlaggedWarned { buf }
-                | InlineNonLatin1Tainted { buf }
-                | InlineNonLatin1FlaggedTainted { buf }
-                | InlineNonLatin1WarnedTainted { buf }
-                | InlineNonLatin1FlaggedWarnedTainted { buf }
-                | InlineExtended { buf }
-                | InlineExtendedFlagged { buf }
-                | InlineExtendedWarned { buf }
-                | InlineExtendedFlaggedWarned { buf }
-                | InlineExtendedTainted { buf }
-                | InlineExtendedFlaggedTainted { buf }
-                | InlineExtendedWarnedTainted { buf }
-                | InlineExtendedFlaggedWarnedTainted { buf }
-                | InlineMalformed { buf }
-                | InlineMalformedFlagged { buf }
-                | InlineMalformedWarned { buf }
-                | InlineMalformedFlaggedWarned { buf }
-                | InlineMalformedTainted { buf }
-                | InlineMalformedFlaggedTainted { buf }
-                | InlineMalformedWarnedTainted { buf }
-                | InlineMalformedFlaggedWarnedTainted { buf } => RawParts::Inline { buf },
-
-                Heap(cb)
-                | HeapFlagged(cb)
-                | HeapWarned(cb)
-                | HeapFlaggedWarned(cb)
-                | HeapTainted(cb)
-                | HeapFlaggedTainted(cb)
-                | HeapWarnedTainted(cb)
-                | HeapFlaggedWarnedTainted(cb) => RawParts::Heap(cb),
-            }
-        }
-    }
-
-    fn into_raw(self) -> RawOwned {
-        let scan = self.inline_scan();
-
-        #[allow(clippy::enum_glob_use)]
-        {
-            use PerlString::*;
-            match self {
-                InlineAscii { buf }
-                | InlineAsciiFlagged { buf }
-                | InlineAsciiWarned { buf }
-                | InlineAsciiFlaggedWarned { buf }
-                | InlineAsciiTainted { buf }
-                | InlineAsciiFlaggedTainted { buf }
-                | InlineAsciiWarnedTainted { buf }
-                | InlineAsciiFlaggedWarnedTainted { buf }
-                | InlineLatin1 { buf }
-                | InlineLatin1Flagged { buf }
-                | InlineLatin1Warned { buf }
-                | InlineLatin1FlaggedWarned { buf }
-                | InlineLatin1Tainted { buf }
-                | InlineLatin1FlaggedTainted { buf }
-                | InlineLatin1WarnedTainted { buf }
-                | InlineLatin1FlaggedWarnedTainted { buf }
-                | InlineNonLatin1 { buf }
-                | InlineNonLatin1Flagged { buf }
-                | InlineNonLatin1Warned { buf }
-                | InlineNonLatin1FlaggedWarned { buf }
-                | InlineNonLatin1Tainted { buf }
-                | InlineNonLatin1FlaggedTainted { buf }
-                | InlineNonLatin1WarnedTainted { buf }
-                | InlineNonLatin1FlaggedWarnedTainted { buf }
-                | InlineExtended { buf }
-                | InlineExtendedFlagged { buf }
-                | InlineExtendedWarned { buf }
-                | InlineExtendedFlaggedWarned { buf }
-                | InlineExtendedTainted { buf }
-                | InlineExtendedFlaggedTainted { buf }
-                | InlineExtendedWarnedTainted { buf }
-                | InlineExtendedFlaggedWarnedTainted { buf }
-                | InlineMalformed { buf }
-                | InlineMalformedFlagged { buf }
-                | InlineMalformedWarned { buf }
-                | InlineMalformedFlaggedWarned { buf }
-                | InlineMalformedTainted { buf }
-                | InlineMalformedFlaggedTainted { buf }
-                | InlineMalformedWarnedTainted { buf }
-                | InlineMalformedFlaggedWarnedTainted { buf } => {
-                    // inline_scan() is Some for every inline variant by construction of the macro table.
-                    let scan = scan.unwrap_or(InlineScan::Malformed);
-                    RawOwned::Inline { scan, buf }
-                }
-
-                Heap(cb)
-                | HeapFlagged(cb)
-                | HeapWarned(cb)
-                | HeapFlaggedWarned(cb)
-                | HeapTainted(cb)
-                | HeapFlaggedTainted(cb)
-                | HeapWarnedTainted(cb)
-                | HeapFlaggedWarnedTainted(cb) => RawOwned::Heap(cb),
-            }
-        }
-    }
 }
 
 enum RawParts<'a> {
     Inline { buf: &'a [u8; INLINE_MAX] },
+    Packed(Packed),
     Heap(&'a CowBuffer),
 }
 
 enum RawOwned {
     Inline { scan: InlineScan, buf: [u8; INLINE_MAX] },
+    Packed(Packed),
     Heap(CowBuffer),
 }
 
@@ -1129,7 +1181,6 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
 
 impl PerlString {
     // ── Numeric and boolean interpretation (§2.2.2, §2.3.4) ───────
-    //
     // These live here rather than at the call site because they are questions about a string's *content*, and the
     // representation that holds that content is this type's business.  A caller asking `s.to_int()` needs no view of
     // the bytes, so no scratch buffer and no decision about which storage form it is looking at — which is what lets
@@ -1137,29 +1188,34 @@ impl PerlString {
 
     /// Perl truthiness: every string is true but `""` and `"0"` (§2.3.3).
     pub fn to_bool(&self) -> bool {
-        !matches!(self.as_bytes(), b"" | b"0")
+        let mut scratch = [0u8; DECODE_MAX];
+        !matches!(self.as_bytes(&mut scratch), b"" | b"0")
     }
 
     /// Perl's integer numification, as `int` and integer context see it — the visible i64, wrapping past the range
     /// exactly as perl's cast does (§2.2.2).
     pub fn to_int(&self) -> i64 {
-        crate::value::parse_int_i64_visible(self.as_bytes())
+        let mut scratch = [0u8; DECODE_MAX];
+        crate::value::parse_int_i64_visible(self.as_bytes(&mut scratch))
     }
 
     /// Perl's float numification: leading-numeric prefix, `Inf`/`NaN` forms, zero for a non-numeric string.
     pub fn to_float(&self) -> f64 {
-        crate::value::parse_float(self.as_bytes())
+        let mut scratch = [0u8; DECODE_MAX];
+        crate::value::parse_float(self.as_bytes(&mut scratch))
     }
 
     /// How this string numifies — integer or float — under the deferred-UV rule (§2.2.2).
     pub fn numify(&self) -> crate::value::Numeric {
-        crate::value::classify_numeric(self.as_bytes())
+        let mut scratch = [0u8; DECODE_MAX];
+        crate::value::classify_numeric(self.as_bytes(&mut scratch))
     }
 
     /// Whether numifying this string would emit perl's `Argument isn't numeric` warning (§2.3.4).  A question about the
     /// content; whether the warning has *already* fired is [`PerlString::is_warned`].
     pub fn would_warn(&self) -> bool {
-        crate::value::string_would_warn(self.as_bytes())
+        let mut scratch = [0u8; DECODE_MAX];
+        crate::value::string_would_warn(self.as_bytes(&mut scratch))
     }
 }
 
@@ -1259,7 +1315,8 @@ impl PartialEq for PerlString {
             }
 
             // Same interpretation: byte equality is character equality (length check is memcmp's first move).
-            return self.as_bytes() == other.as_bytes();
+            let (mut ls, mut rs) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
+            return self.as_bytes(&mut ls) == other.as_bytes(&mut rs);
         }
 
         let (flagged, plain) = if self.is_utf8() { (self, other) } else { (other, self) };
@@ -1298,8 +1355,9 @@ impl PartialEq for PerlString {
         #[cfg(test)]
         eq_probe::WALK_ENTRIES.with(|c| c.set(c.get() + 1));
 
-        let fb = flagged.as_bytes();
-        let pb = plain.as_bytes();
+        let (mut fs, mut ps) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
+        let fb = flagged.as_bytes(&mut fs);
+        let pb = plain.as_bytes(&mut ps);
         let mut saw_non_ascii = false;
         let (mut i, mut j) = (0usize, 0usize);
 
@@ -1411,7 +1469,8 @@ impl PerlString {
             DIGEST_KEY.get_or_init(RandomState::new).build_hasher()
         }
 
-        let bytes = self.as_bytes();
+        let mut scratch = [0u8; DECODE_MAX];
+        let bytes = self.as_bytes(&mut scratch);
 
         // Unflagged, or flagged with known-ASCII content: the raw bytes ARE the canonical downgraded form.
         if !self.is_utf8() || self.scan_state() == scan::ASCII {
@@ -1510,6 +1569,7 @@ impl Clone for PerlString {
     fn clone(&self) -> PerlString {
         let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
         match self.raw_parts() {
+            RawParts::Packed(p) => PerlString::build_packed(p, u, w, t),
             RawParts::Inline { buf } => {
                 let scan = match self.inline_scan() {
                     Some(s) => s,
@@ -1530,7 +1590,7 @@ impl fmt::Debug for PerlString {
             .field("utf8", &self.is_utf8())
             .field("warned", &self.is_warned())
             .field("tainted", &self.is_tainted())
-            .field("bytes", &self.as_bytes())
+            .field("bytes", &self.as_bytes(&mut [0u8; DECODE_MAX]))
             .finish()
     }
 }

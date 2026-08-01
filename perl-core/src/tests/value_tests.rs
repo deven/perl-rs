@@ -1,4 +1,5 @@
 use super::*;
+use crate::string::DECODE_MAX;
 
 fn s(text: &str) -> Value {
     Value::String(text.parse().unwrap())
@@ -11,7 +12,7 @@ fn payload_stays_authoritative_through_coercion() {
     // only).
     let x = Value::Float(3.7, Tainted::CLEAN);
     assert_eq!(x.to_int(), 3); // truncating coercion
-    assert_eq!(x.stringify().unwrap().as_bytes(), b"3.7"); // payload answers
+    assert_eq!(x.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"3.7"); // payload answers
 }
 
 #[test]
@@ -23,7 +24,7 @@ fn truthiness_survives_numeric_use() {
         let _ = v.to_int();
         let _ = v.to_float();
         assert!(v.to_bool(), "{text:?} must stay true through numeric use");
-        assert_eq!(v.stringify().unwrap().as_bytes(), text.as_bytes());
+        assert_eq!(v.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), text.as_bytes());
     }
 }
 
@@ -44,11 +45,11 @@ fn truthiness_matrix() {
 
 #[test]
 fn stringification_matrix() {
-    assert_eq!(Value::default().stringify().unwrap().as_bytes(), b"");
-    assert_eq!(Value::Integer(-42, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"-42");
-    assert_eq!(Value::Float(1e15, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"1e+15");
-    assert_eq!(Value::True.stringify().unwrap().as_bytes(), b"1");
-    assert_eq!(Value::False.stringify().unwrap().as_bytes(), b"");
+    assert_eq!(Value::default().stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"");
+    assert_eq!(Value::Integer(-42, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"-42");
+    assert_eq!(Value::Float(1e15, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"1e+15");
+    assert_eq!(Value::True.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"1");
+    assert_eq!(Value::False.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"");
 }
 
 #[test]
@@ -243,7 +244,7 @@ fn aliasing_transparency_and_write_through() {
     assert!(matches!(slot, Value::ScalarMut(_)));
     assert_eq!(slot.to_int(), 5);
     assert!(slot.to_bool());
-    assert_eq!(slot.stringify().unwrap().as_bytes(), b"5");
+    assert_eq!(slot.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"5");
 
     // Writes through the dereferenced identity are visible through the slot.
     let view = r.deref_scalar().unwrap();
@@ -282,7 +283,7 @@ fn reference_coercions_are_the_address() {
 
     let rendered = r.stringify().unwrap();
     let expected = format!("SCALAR(0x{:x})", addr as usize);
-    assert_eq!(rendered.as_bytes(), expected.as_bytes(), "SCALAR(0x...) lowercase hex (verified)");
+    assert_eq!(rendered.as_bytes(&mut [0u8; DECODE_MAX]), expected.as_bytes(), "SCALAR(0x...) lowercase hex (verified)");
 }
 
 #[test]
@@ -298,7 +299,7 @@ fn ref_of_ref_chains() {
     let inner = mid.read().payload().clone();
     let inner = Value::from_payload(inner);
     let base_view = inner.deref_scalar().unwrap();
-    assert_eq!(base_view.read().stringify().unwrap().as_bytes(), b"x");
+    assert_eq!(base_view.read().stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"x");
 
     // And writing through the chain is visible via the original slot.
     base_view.write().unwrap().assign(ScalarPayload::Integer(7, Tainted::CLEAN)).unwrap();
@@ -323,7 +324,7 @@ fn const_slots_alias_frozen_cells() {
     let mut slot = Value::ScalarConst(HeapArc::new(cs));
 
     assert_eq!(slot.to_int(), 3);
-    assert_eq!(slot.stringify().unwrap().as_bytes(), b"3.7");
+    assert_eq!(slot.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"3.7");
 
     let r = Value::take_ref(&mut slot);
     assert!(matches!(r, Value::ScalarRefConst(..)));
@@ -428,8 +429,8 @@ fn numeric_stringification_does_not_allocate() {
 fn unsigned_round_trips_exactly_where_a_float_would_not() {
     // The divergence this variant closes: perl prints "18446744073709551615" + 0 as its digits.
     let big = Value::Unsigned(u64::MAX, Tainted::CLEAN);
-    assert_eq!(big.stringify().unwrap().as_bytes(), b"18446744073709551615");
-    assert_eq!(Value::Unsigned(9223372036854775808, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"9223372036854775808");
+    assert_eq!(big.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"18446744073709551615");
+    assert_eq!(Value::Unsigned(9223372036854775808, Tainted::CLEAN).stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"9223372036854775808");
 
     // Round-tripping through a string preserves it, where classifying as a float would not.
     let text = s("18446744073709551615");

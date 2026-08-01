@@ -647,7 +647,7 @@ pub fn format_float(n: f64) -> String {
     let mut out = PerlString::empty();
     match format_float_into(n, &mut out) {
         // Every rendering fits without allocating (§2.2.3), so the error arm is unreachable in practice.
-        Ok(()) => String::from_utf8_lossy(out.as_bytes()).into_owned(),
+        Ok(()) => String::from_utf8_lossy(out.as_bytes(&mut [0u8; crate::string::DECODE_MAX])).into_owned(),
         Err(_) => String::new(),
     }
 }

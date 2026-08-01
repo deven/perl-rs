@@ -34,10 +34,10 @@
 //! passes through a trailing space on its way to something longer.
 //!
 //! Nibble values are assigned in ASCII order, so for two packed strings **of the same alphabet and the same length
-//! family**, comparing the nibble arrays as plain bytes gives exactly the raw strings' byte order: content differences
-//! decide before nibble 29 is reached, and where one string ends the other has a symbol above the zero padding.
-//! Comparing across length families compares the twenty-nine shared nibbles and then the lengths, since the last nibble
-//! means different things on the two sides.  Comparing across alphabets decodes.
+//! **family**, comparing the nibble arrays as plain bytes gives exactly the raw strings' byte order: content
+//! differences decide before nibble 29 is reached, and where one string ends the other has a symbol above the zero
+//! padding.  Comparing across length families compares the twenty-nine shared nibbles and then the lengths, since the
+//! last nibble means different things on the two sides.  Comparing across alphabets decodes.
 //!
 //! # Invariants
 //!
@@ -51,8 +51,10 @@
 //!   DateTimeZulu, so equal byte contents always take equal representations — the prerequisite for representation-level
 //!   equality.
 
-// The production consumers arrive with the PerlString and Value rework; the expect self-reports for removal the moment
-// they land.
+// Four methods still await their consumers: `transcode` belongs to the incremental append path, which currently
+// re-packs the whole result instead of widening in place, and `cmp_same_alphabet`, `eq_bytes`, and `cmp_bytes` are the
+// comparison fast paths that `PerlString` has yet to route through — it decodes and compares bytes for now.  The expect
+// self-reports when either arrives.
 #![cfg_attr(not(test), expect(dead_code))]
 
 use std::cmp::Ordering;
@@ -270,9 +272,11 @@ impl Packed {
         let table = self.alphabet.decode_table();
         let mut out = [0u8; MAX_PACKED_LEN];
         let len = self.len();
+
         for (i, slot) in out.iter_mut().enumerate().take(len) {
             *slot = table[nibble_at(&self.nibbles, i) as usize];
         }
+
         (out, len)
     }
 
@@ -313,6 +317,7 @@ impl Packed {
 
         let packed = Packed { alphabet: to, full: self.full, nibbles };
         debug_assert!(packed.padding_is_canonical(), "transcode must preserve zero padding");
+
         Some(packed)
     }
 
@@ -331,6 +336,7 @@ impl Packed {
 
         let shared = self.nibbles[..PACKED_BYTES - 1].cmp(&other.nibbles[..PACKED_BYTES - 1]);
         let last_shared = MAX_PACKED_LEN - 2;
+
         shared.then_with(|| nibble_at(&self.nibbles, last_shared).cmp(&nibble_at(&other.nibbles, last_shared))).then_with(|| self.len().cmp(&other.len()))
     }
 
@@ -342,6 +348,7 @@ impl Packed {
         }
 
         let table = self.alphabet.decode_table();
+
         other.iter().enumerate().all(|(i, &o)| table[nibble_at(&self.nibbles, i) as usize] == o)
     }
 
