@@ -523,25 +523,6 @@ fn inline_payload(bytes: &[u8]) -> (u8, [u8; INLINE_MAX]) {
 }
 
 impl PerlString {
-    /// Construct from a Rust `&str`.  ASCII content is stored unflagged (the canonical downgraded form, §2.3.5);
-    /// non-ASCII content is stored with the utf8 flag (validity known from the type).  Public surface: the `FromStr`
-    /// impl below.
-    fn from_str_impl(s: &str) -> Result<PerlString, AllocError> {
-        let bytes = s.as_bytes();
-
-        if bytes.len() <= INLINE_MAX {
-            let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Malformed/Extended impossible from &str
-            let (len, buf) = inline_payload(bytes);
-            let utf8 = state != InlineScan::Ascii;
-            Ok(PerlString::build_inline(state, utf8, false, false, len, buf))
-        } else {
-            let cb = CowBuffer::from_slice(bytes)?;
-            let ascii = bytes.iter().all(|b| b.is_ascii());
-            cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE });
-            Ok(PerlString::build_heap(!ascii, false, false, cb))
-        }
-    }
-
     /// Construct from raw bytes (I/O, `Encode`, lexer literals).  Unflagged; inline content gets its eager terminal
     /// scan, heap content defers all scanning (`UNKNOWN`), per §2.2.7.
     pub fn from_bytes(bytes: &[u8]) -> Result<PerlString, AllocError> {
@@ -1087,11 +1068,23 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
 impl std::str::FromStr for PerlString {
     type Err = AllocError;
 
-    /// Construct from a Rust `&str` (the same rules as documented on the private constructor: ASCII stores in the
-    /// canonical downgraded unflagged form; non-ASCII stores flagged).  `"..." .parse::<PerlString>()` therefore works,
-    /// with allocation failure as the error.
+    /// Construct from a Rust `&str`.  ASCII content is stored unflagged (the canonical downgraded form, §2.3.5);
+    /// non-ASCII content is stored with the utf8 flag, its validity known from the type.  Allocation failure is the
+    /// only error.
     fn from_str(s: &str) -> Result<PerlString, AllocError> {
-        PerlString::from_str_impl(s)
+        let bytes = s.as_bytes();
+
+        if bytes.len() <= INLINE_MAX {
+            let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Malformed/Extended impossible from &str
+            let (len, buf) = inline_payload(bytes);
+            let utf8 = state != InlineScan::Ascii;
+            Ok(PerlString::build_inline(state, utf8, false, false, len, buf))
+        } else {
+            let cb = CowBuffer::from_slice(bytes)?;
+            let ascii = bytes.iter().all(|b| b.is_ascii());
+            cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE });
+            Ok(PerlString::build_heap(!ascii, false, false, cb))
+        }
     }
 }
 
