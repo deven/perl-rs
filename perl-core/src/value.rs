@@ -460,19 +460,20 @@ macro_rules! impl_coercions {
                 let (out, taint): (PerlString, Tainted) = match self {
                     $ty::Undef | $ty::UndefTainted => (PerlString::empty(), self.taint()),
                     $ty::Integer(n) | $ty::IntegerTainted(n) => {
+                        // Through the payload, so cached digits are used when present.
                         let mut rendered = PerlString::empty();
-                        format_int_into(n.value(), &mut rendered)?;
+                        n.render(&mut rendered)?;
                         (rendered, self.taint())
                     }
                     $ty::Unsigned(u) | $ty::UnsignedTainted(u) => {
                         // Exact digits: at most twenty characters, so the packed numeric alphabet holds them.
                         let mut rendered = PerlString::empty();
-                        rendered.push_fmt(format_args!("{}", u.value()))?;
+                        u.render(&mut rendered)?;
                         (rendered, self.taint())
                     }
                     $ty::Float(f) | $ty::FloatTainted(f) => {
                         let mut rendered = PerlString::empty();
-                        format_float_into(f.value(), &mut rendered)?;
+                        f.render(&mut rendered)?;
                         (rendered, self.taint())
                     }
                     $ty::String(s) => return Ok(s.clone()),
@@ -525,6 +526,40 @@ macro_rules! impl_coercions {
                     $ty::String(s) => s.is_tainted(),
                     $($ty::$smut(c) => c.read().is_tainted(),)?
                     $($ty::$sconst(c) => c.is_tainted(),)?
+                }
+            }
+
+            /// A copy whose numeric rendering is cached, when its digits fit the seven bytes beside the datum.
+            ///
+            /// Rendering a number is the expensive part of stringifying one, and the digits are the same every time,
+            /// so a value that will be printed, interpolated, or used as a hash key more than once should carry them.
+            /// Non-numeric values are returned unchanged: they have no digits.
+            ///
+            /// Who calls this is not yet settled (§2.2.9): filling through a shared reference needs atomic cache bytes,
+            /// while filling only where a caller holds the value mutably — as here — misses values read through shared
+            /// containers.  This is the mutable path; the shared one awaits that ruling.
+            pub fn with_cached_digits(self) -> $ty {
+                match self {
+                    $ty::Integer(n) => $ty::Integer(n.filled()),
+                    $ty::IntegerTainted(n) => $ty::IntegerTainted(n.filled()),
+                    $ty::Unsigned(u) => $ty::Unsigned(u.filled()),
+                    $ty::UnsignedTainted(u) => $ty::UnsignedTainted(u.filled()),
+                    $ty::Float(f) => $ty::Float(f.filled()),
+                    $ty::FloatTainted(f) => $ty::FloatTainted(f.filled()),
+
+                    // Nothing else renders from digits.  A later numeric kind would want an arm here; missing one
+                    // costs the optimization, never correctness.
+                    other => other,
+                }
+            }
+
+            /// Whether this value's rendering is already cached.
+            pub fn has_cached_digits(&self) -> bool {
+                match self {
+                    $ty::Integer(n) | $ty::IntegerTainted(n) => n.is_cached(),
+                    $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.is_cached(),
+                    $ty::Float(f) | $ty::FloatTainted(f) => f.is_cached(),
+                    _ => false,
                 }
             }
 
@@ -779,18 +814,14 @@ impl fmt::Write for ScientificBuf {
 /// specials.  Renders into `out`, allocating nothing.
 ///
 /// Explicit `sprintf`/`printf` with a precision is a different operation with unbounded output (§2.2.3); this covers
-/// only the implicit conversion.
-fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), AllocError> {
-    if n.is_nan() {
-        return out.push_str("NaN");
-    }
-
-    if n.is_infinite() {
-        return out.push_str(if n < 0.0 { "-Inf" } else { "Inf" });
-    }
-
-    if n == 0.0 {
-        return out.push_str("0"); // Covers -0.0, which perl also prints as "0".
+/// only the implicit conversion.  The significant digits and decimal exponent of a float's `%.15g` rendering, or `None`
+/// when the value renders as a special (`NaN`, `Inf`, `-Inf`) or as plain `0`, which have no digits to extract.
+///
+/// This is the expensive half — a formatted render followed by a parse — and the half a digit cache exists to skip.
+/// Its counterpart [`present_float`] turns the result back into text.
+pub(crate) fn float_digits(n: f64) -> Option<([u8; FLOAT_DIGIT_MAX], usize, i32)> {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return None;
     }
 
     // "{:.14e}" is the normalized d.dddddddddddddd form: 15 significant digits, correctly rounded.
@@ -798,44 +829,53 @@ fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), AllocError> {
     let _ = write!(scientific, "{n:.14e}");
     let rendered = scientific.as_bytes();
 
-    let Some(e) = rendered.iter().position(|&b| b == b'e') else {
-        return out.push_bytes(rendered); // Unreachable: exponent form always contains 'e'.
-    };
-
+    let e = rendered.iter().position(|&b| b == b'e')?;
     let (mantissa, exponent) = (&rendered[..e], &rendered[e + 1..]);
-    let Ok(exp) = str::from_utf8(exponent).unwrap_or("").parse::<i32>() else {
-        return out.push_bytes(rendered); // Unreachable likewise.
-    };
-
-    let negative = mantissa.first() == Some(&b'-');
+    let exp = str::from_utf8(exponent).ok()?.parse::<i32>().ok()?;
 
     // The significant digits, trailing zeros trimmed — %g drops them.
-    let mut digits = [0u8; 16];
+    let mut digits = [0u8; FLOAT_DIGIT_MAX];
     let mut count = 0;
     for &b in mantissa {
         if b.is_ascii_digit() && count < digits.len() {
-            digits[count] = b;
+            digits[count] = b - b'0';
             count += 1;
         }
     }
 
-    while count > 1 && digits[count - 1] == b'0' {
+    while count > 1 && digits[count - 1] == 0 {
         count -= 1;
     }
 
-    let digits = &digits[..count];
+    Some((digits, count, exp))
+}
 
+/// The widest digit sequence `%.15g` produces, plus room for the rounding position.
+pub(crate) const FLOAT_DIGIT_MAX: usize = 16;
+
+/// Render digits and a decimal exponent as `%g` presents them: fixed notation within its range, exponent notation
+/// outside it.  The cheap half, and the one a cached rendering reuses.
+pub(crate) fn present_float(digits: &[u8], exp: i32, negative: bool, out: &mut PerlString) -> Result<(), AllocError> {
     if negative {
         out.push_str("-")?;
     }
 
+    let count = digits.len();
+    let mut buf = [0u8; FLOAT_DIGIT_MAX];
+
+    for (i, &d) in digits.iter().enumerate() {
+        buf[i] = b'0' + d;
+    }
+
+    let ascii = &buf[..count];
+
     // %g takes exponent form when the decimal exponent is below -4 or at/above the precision (15).
     if !(-4..15).contains(&exp) {
-        out.push_bytes(&digits[..1])?;
+        out.push_bytes(&ascii[..1])?;
 
         if count > 1 {
             out.push_str(".")?;
-            out.push_bytes(&digits[1..])?;
+            out.push_bytes(&ascii[1..])?;
         }
 
         let magnitude = exp.unsigned_abs();
@@ -849,20 +889,45 @@ fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), AllocError> {
         let int_len = exp as usize + 1;
 
         if count <= int_len {
-            out.push_bytes(digits)?;
+            out.push_bytes(ascii)?;
             push_zeros(out, int_len - count)?;
         } else {
-            out.push_bytes(&digits[..int_len])?;
+            out.push_bytes(&ascii[..int_len])?;
             out.push_str(".")?;
-            out.push_bytes(&digits[int_len..])?;
+            out.push_bytes(&ascii[int_len..])?;
         }
     } else {
         out.push_str("0.")?;
         push_zeros(out, (-exp - 1) as usize)?;
-        out.push_bytes(digits)?;
+        out.push_bytes(ascii)?;
     }
 
     Ok(())
+}
+
+/// Perl's default float stringification: `sprintf("%.15g")`, the `SvPV` path — a fixed significant-digit count rather
+/// than shortest-round-trip, which is why perl prints `0.1 + 0.2` as `0.3`.  Perl's own capitalizations for the
+/// specials.  Renders into `out`, allocating nothing.
+///
+/// Explicit `sprintf`/`printf` with a precision is a different operation with unbounded output (§2.2.3); this covers
+/// only the implicit conversion.
+pub(crate) fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), AllocError> {
+    if n.is_nan() {
+        return out.push_str("NaN");
+    }
+
+    if n.is_infinite() {
+        return out.push_str(if n < 0.0 { "-Inf" } else { "Inf" });
+    }
+
+    if n == 0.0 {
+        return out.push_str("0"); // Covers -0.0, which perl also prints as "0".
+    }
+
+    match float_digits(n) {
+        Some((digits, count, exp)) => present_float(&digits[..count], exp, n.is_sign_negative(), out),
+        None => out.push_str("0"), // Unreachable: the specials returned above.
+    }
 }
 
 /// Append a run of `'0'`, the one repetition `%g`'s presentation needs.
@@ -891,7 +956,7 @@ pub fn format_float(n: f64) -> String {
 }
 
 /// Perl's integer stringification, rendered without allocating.
-fn format_int_into(n: i64, out: &mut PerlString) -> Result<(), AllocError> {
+pub(crate) fn format_int_into(n: i64, out: &mut PerlString) -> Result<(), AllocError> {
     out.push_fmt(format_args!("{n}"))
 }
 

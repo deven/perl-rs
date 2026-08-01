@@ -1169,9 +1169,11 @@ ordinary aligned load.
 
 **Packed-decimal numeric caches.**  The digits are the expensive
 product of default numeric stringification; rendering cached
-digits is nibble unpacking.  `Float` carries a cache of up to 10-11
-significant digits plus decimal exponent, sign, and count; `Integer`
-carries up to 12 digits plus sign and count (no exponent).  The
+digits is nibble unpacking.  `Float` carries 10 significant
+digits plus a decimal exponent and a count; `Integer` carries 12,
+spending no byte on an exponent and so holding two more in the same
+seven.  Neither stores a sign — the datum carries it, which buys a
+digit.  The
 cached digits are always perl's `%.15g` output digits — never
 shortest-round-trip — so the cache cannot leak a formatting
 divergence.  Coverage is the point: `%.15g` trims trailing zeros,

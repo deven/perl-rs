@@ -484,3 +484,37 @@ fn unsigned_is_canonical_only_above_i64() {
         assert!(matches!(s(text).numify(), Numeric::Unsigned(_)), "{text} belongs to Unsigned");
     }
 }
+
+#[test]
+fn caching_a_value_does_not_change_what_it_prints() {
+    // The cache rides inside the value, so a cached copy must stringify identically to an uncached one — across the
+    // short renderings that fit and the long ones that do not.
+    for v in [
+        Value::integer(42, Tainted::CLEAN),
+        Value::integer(-7_000_000, Tainted::CLEAN),
+        Value::integer(i64::MIN, Tainted::CLEAN),
+        Value::unsigned(u64::MAX, Tainted::CLEAN),
+        Value::float(3.7, Tainted::CLEAN),
+        Value::float(0.1 + 0.2, Tainted::CLEAN),
+        Value::float(1.0 / 3.0, Tainted::CLEAN),
+        Value::float(1e-5, Tainted::CLEAN),
+        Value::float(f64::NAN, Tainted::CLEAN),
+        Value::float(f64::INFINITY, Tainted::CLEAN),
+    ] {
+        let cached = v.clone().with_cached_digits();
+        assert_eq!(v.stringify().unwrap(), cached.stringify().unwrap(), "cached rendering of {v:?} must match");
+    }
+}
+
+#[test]
+fn caching_preserves_taint_and_value() {
+    let tainted = Value::integer(99, Tainted::TAINTED).with_cached_digits();
+    assert!(tainted.is_tainted(), "the cache rides inside the variant, so the twin must survive");
+    assert_eq!(tainted.to_int(), 99);
+    assert!(tainted.has_cached_digits());
+
+    // A rendering past the capacity caches nothing, and says so.
+    let long = Value::float(1.0 / 3.0, Tainted::CLEAN).with_cached_digits();
+    assert!(!long.has_cached_digits(), "fifteen digits exceed the capacity");
+    assert_eq!(long.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"0.333333333333333");
+}
