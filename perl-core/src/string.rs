@@ -535,7 +535,8 @@ impl PerlString {
         }
     }
 
-    /// The empty string (inline, unflagged, trivially ASCII).
+    /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
+    /// payload needs no allocation — which is also what lets `Default` exist.
     pub fn empty() -> PerlString {
         PerlString::build_inline(InlineScan::Ascii, false, false, false, 0, [0u8; INLINE_MAX])
     }
@@ -724,7 +725,7 @@ impl PerlString {
             return;
         }
 
-        let old = std::mem::replace(self, PerlString::empty());
+        let old = std::mem::take(self);
 
         *self = match old.into_raw() {
             RawOwned::Inline { scan, len, buf } => PerlString::build_inline(scan, u2, w2, t2, len, buf),
@@ -759,7 +760,7 @@ impl PerlString {
         }
 
         let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
-        let old = std::mem::replace(self, PerlString::empty());
+        let old = std::mem::take(self);
 
         *self = match old.into_raw() {
             RawOwned::Inline { scan, len, buf } => {
@@ -1063,6 +1064,13 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     }
 
     Chars { rest: bytes, raw_fallback: false }
+}
+
+impl Default for PerlString {
+    /// The empty string, per [`PerlString::empty`].
+    fn default() -> PerlString {
+        PerlString::empty()
+    }
 }
 
 impl std::str::FromStr for PerlString {
