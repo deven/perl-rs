@@ -369,7 +369,7 @@ point + 14 mantissa digits + 5-character exponent); `i64::MIN`
 stringifies to 20.  The longer of those outputs exceed the
 15-byte inline tier
 but draw entirely from the numeric alphabet of the nibble-packed
-tier (≤ 28 characters, §2.2.9), so **every numeric stringification
+tier (≤ 30 characters, §2.2.9), so **every numeric stringification
 the interpreter can produce stays inline** — encoded by table
 lookup, allocation-free — and numeric stringification is constant
 traffic (every printed number, every number used as a hash key,
@@ -962,10 +962,19 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   bytes with **no stored length**: a length byte is two characters
   of capacity, and 29-30 characters is exactly where
   millisecond-offset and nanosecond-Zulu timestamps live.  The
-  logical length is one past the last nonzero nibble — unique
-  because trailing-space strings are unpackable — recovered by a
-  bounded reverse scan; unused nibbles are canonically zero at
-  construction.  Three alphabets, carried entirely by the
+  tier's band is **16-30 characters** and is a property of the
+  representation, not a convention: shorter content takes an
+  inline form, so the packed forms never hold it — which keeps
+  canonical selection single-valued and puts the terminating
+  nibble always within the last eight payload bytes.  The logical
+  length is therefore the capacity minus the count of trailing
+  pad nibbles, read from one word: a big-endian load maps nibble
+  k onto bits 4*(29-k), so the word's trailing zeros are the
+  string's trailing pads and `trailing_zeros() >> 2` counts them.
+  Unused nibbles are canonically zero at construction, and
+  trailing-space strings are unpackable — which is what makes the
+  terminating nibble nonzero and the count exact.  Three
+  alphabets, carried entirely by the
   enclosing discriminant: *numeric* {space, `+`, `-`, `.`, 0-9,
   `E`, `e`}, *datetime-Z* {space, `-`, `.`, 0-9, `:`, `T`, `Z`},
   and *datetime-plus* {space, `+`, `-`, `.`, 0-9, `:`, `T`}.
@@ -1000,7 +1009,16 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   naive space-decoding of the zero answers Greater), and the
   derived length resolves every zero's meaning before it is
   compared.  A leading decode-pair precheck and a speculative
-  dual-interpretation single pass are recorded measured options.  Packing is
+  dual-interpretation single pass are recorded measured options.
+- **NUL is heap-only** [DECISION]: a string containing NUL in any
+  spelling — the octet `0x00`, the encoded byte `0x00`, the
+  character U+0000 — takes the heap tier.  The inline forms
+  reserve the terminator byte; NUL-bearing strings are rare and
+  skew long (binary blobs, packed records), and inline storage is
+  an optimization a string simply doesn't get.  Reversible:
+  explicit-length NUL-capable inline variants are the recorded
+  fallback if the corpus tripwire ever shows short NUL-bearing
+  strings mattering.  Packing is
   an **encoding, never a canonicalization**: exact byte
   round-trip is the invariant, and a packed string is
   observationally identical to its raw form in every operation —
@@ -1015,8 +1033,8 @@ The standalone `PerlString` is 16 bytes too — the tag budget
 closes in one byte (kind 2 bits, scan 3, utf8/warned/tainted 3),
 leaving 15 payload bytes: the three inline formats and the packed
 tier at the fused variants' capacities, with the heap kind a thin
-pointer plus a u48 mirrored length in the spare bytes.  Its tiers and capacities are identical to the fused variants, and
-the `Value`↔key boundary is an exhaustive-match reconstruction —
+pointer plus a u48 mirrored length in the spare bytes.  The
+`Value`↔key boundary is an exhaustive-match reconstruction —
 which the optimizer reduces to a copy plus tag write in practice,
 but is **never a transmute**: the size assertions pin neither
 discriminant placement nor niche selection, so no code may depend
