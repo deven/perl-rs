@@ -11,7 +11,7 @@ fn payload_stays_authoritative_through_coercion() {
     // cache only).
     let x = Value::Float(3.7, Tainted::CLEAN);
     assert_eq!(x.to_int(), 3); // truncating coercion
-    assert_eq!(x.to_string_repr().unwrap().as_bytes(), b"3.7"); // payload answers
+    assert_eq!(x.stringify().unwrap().as_bytes(), b"3.7"); // payload answers
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn truthiness_survives_numeric_use() {
         let _ = v.to_int();
         let _ = v.to_float();
         assert!(v.to_bool(), "{text:?} must stay true through numeric use");
-        assert_eq!(v.to_string_repr().unwrap().as_bytes(), text.as_bytes());
+        assert_eq!(v.stringify().unwrap().as_bytes(), text.as_bytes());
     }
 }
 
@@ -44,11 +44,11 @@ fn truthiness_matrix() {
 
 #[test]
 fn stringification_matrix() {
-    assert_eq!(Value::default().to_string_repr().unwrap().as_bytes(), b"");
-    assert_eq!(Value::Int(-42, Tainted::CLEAN).to_string_repr().unwrap().as_bytes(), b"-42");
-    assert_eq!(Value::Float(1e15, Tainted::CLEAN).to_string_repr().unwrap().as_bytes(), b"1e+15");
-    assert_eq!(Value::True.to_string_repr().unwrap().as_bytes(), b"1");
-    assert_eq!(Value::False.to_string_repr().unwrap().as_bytes(), b"");
+    assert_eq!(Value::default().stringify().unwrap().as_bytes(), b"");
+    assert_eq!(Value::Int(-42, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"-42");
+    assert_eq!(Value::Float(1e15, Tainted::CLEAN).stringify().unwrap().as_bytes(), b"1e+15");
+    assert_eq!(Value::True.stringify().unwrap().as_bytes(), b"1");
+    assert_eq!(Value::False.stringify().unwrap().as_bytes(), b"");
 }
 
 #[test]
@@ -175,12 +175,12 @@ fn taint_is_monotone_and_placed_per_variant() {
     ps.taint();
     let v = Value::String(ps);
     assert!(v.is_tainted());
-    assert!(v.to_string_repr().unwrap().is_tainted());
+    assert!(v.stringify().unwrap().is_tainted());
 
     // Numeric stringification propagates the operand's taint into the tag.
     let ti = Value::Int(7, Tainted::TAINTED);
-    assert!(ti.to_string_repr().unwrap().is_tainted());
-    assert!(!Value::Int(7, Tainted::CLEAN).to_string_repr().unwrap().is_tainted());
+    assert!(ti.stringify().unwrap().is_tainted());
+    assert!(!Value::Int(7, Tainted::CLEAN).stringify().unwrap().is_tainted());
 }
 
 // ── ArraySlot semantics (§2.2.1, container-verified) ──────────
@@ -238,7 +238,7 @@ fn aliasing_transparency_and_write_through() {
     assert!(matches!(slot, Value::ScalarMut(_)));
     assert_eq!(slot.to_int(), 5);
     assert!(slot.to_bool());
-    assert_eq!(slot.to_string_repr().unwrap().as_bytes(), b"5");
+    assert_eq!(slot.stringify().unwrap().as_bytes(), b"5");
 
     // Writes through the dereferenced identity are visible through the slot.
     let view = r.deref_scalar().unwrap();
@@ -274,7 +274,7 @@ fn reference_coercions_are_the_address() {
     assert!(addr != 0);
     assert_eq!(r.to_float(), addr as f64);
     assert_eq!(r.numify(), Numeric::Int(addr));
-    let rendered = r.to_string_repr().unwrap();
+    let rendered = r.stringify().unwrap();
     let expected = format!("SCALAR(0x{:x})", addr as usize);
     assert_eq!(rendered.as_bytes(), expected.as_bytes(), "SCALAR(0x...) lowercase hex (verified)");
 }
@@ -292,7 +292,7 @@ fn ref_of_ref_chains() {
     let inner = mid.read().payload().clone();
     let inner = Value::from_payload(inner);
     let base_view = inner.deref_scalar().unwrap();
-    assert_eq!(base_view.read().to_string_repr().unwrap().as_bytes(), b"x");
+    assert_eq!(base_view.read().stringify().unwrap().as_bytes(), b"x");
 
     // And writing through the chain is visible via the original slot.
     base_view.write().unwrap().assign(ScalarPayload::Int(7, Tainted::CLEAN)).unwrap();
@@ -317,7 +317,7 @@ fn const_slots_alias_frozen_cells() {
     let mut slot = Value::ScalarConst(HeapArc::new(cs));
 
     assert_eq!(slot.to_int(), 3);
-    assert_eq!(slot.to_string_repr().unwrap().as_bytes(), b"3.7");
+    assert_eq!(slot.stringify().unwrap().as_bytes(), b"3.7");
 
     let r = Value::take_ref(&mut slot);
     assert!(matches!(r, Value::ScalarRefConst(..)));

@@ -10773,7 +10773,7 @@ fn payload_stays_authoritative_through_coercion() {
     // stringifies as "3.7" (FLAGS = NOK,pIOK — private cache only).
     let mut cell = ScalarCell::from_float(3.7);
     assert_eq!(cell.to_int(), 3);          // truncating coercion
-    assert_eq!(cell.to_string_repr(), "3.7");  // payload answers
+    assert_eq!(cell.stringify(), "3.7");       // payload answers
 }
 
 #[test]

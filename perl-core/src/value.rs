@@ -226,7 +226,7 @@ macro_rules! impl_coercions {
             /// (string payloads carry theirs in the tag already; `True` is `"1"`, `False` is `""`, both clean — the
             /// immortal-boolean rule).  Numeric renderings are at most 24 ASCII bytes, hence inline; the `Result` is
             /// the honest allocation contract, not an expected path.
-            pub fn to_string_repr(&self) -> Result<PerlString, AllocError> {
+            pub fn stringify(&self) -> Result<PerlString, AllocError> {
                 let (text, taint): (Cow<'_, str>, Tainted) = match self {
                     $ty::Undef(t) => (Cow::Borrowed(""), *t),
                     $ty::Int(n, t) => (Cow::Owned(n.to_string()), *t),
@@ -240,8 +240,8 @@ macro_rules! impl_coercions {
                     $ty::ScalarRefConst(c, t) => (Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
                     $ty::ArrayRef(r, t) => (Cow::Owned(format!("ARRAY(0x{:x})", r.addr())), *t),
                     $ty::HashRef(r, t) => (Cow::Owned(format!("HASH(0x{:x})", r.addr())), *t),
-                    $($ty::$smut(c) => return c.read().to_string_repr(),)?
-                    $($ty::$sconst(c) => return Ok(c.to_string_repr().clone()),)?
+                    $($ty::$smut(c) => return c.read().stringify(),)?
+                    $($ty::$sconst(c) => return Ok(c.stringify().clone()),)?
                 };
 
                 let mut out: PerlString = text.parse()?;

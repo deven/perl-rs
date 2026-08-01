@@ -190,15 +190,15 @@ impl ScalarCell {
 
     /// Stringification; `Full` cells memoize in the `OnceLock` slot.  The set-then-get shape (rather than
     /// `get_or_init`) threads the allocation `Result` out; a racing loser's identical value is dropped.
-    pub fn to_string_repr(&self) -> Result<PerlString, AllocError> {
+    pub fn stringify(&self) -> Result<PerlString, AllocError> {
         match self {
-            ScalarCell::Plain(p) => p.to_string_repr(),
+            ScalarCell::Plain(p) => p.stringify(),
             ScalarCell::Full(f) => {
                 if let Some(s) = f.cached_string.get() {
                     return Ok(s.clone());
                 }
 
-                let v = f.payload.to_string_repr()?;
+                let v = f.payload.stringify()?;
                 let _ = f.cached_string.set(v.clone());
 
                 Ok(v)
@@ -333,7 +333,7 @@ impl ConstScalar {
     pub fn materialize(payload: ScalarPayload) -> Result<ConstScalar, AllocError> {
         let int = payload.to_int();
         let float = payload.to_float();
-        let string = payload.to_string_repr()?;
+        let string = payload.stringify()?;
 
         let can_warn = matches!(&payload, ScalarPayload::String(s) if string_would_warn(s.as_bytes()));
         let numify_warned = can_warn.then(|| AtomicBool::new(false));
@@ -357,7 +357,7 @@ impl ConstScalar {
         self.float
     }
 
-    pub fn to_string_repr(&self) -> &PerlString {
+    pub fn stringify(&self) -> &PerlString {
         &self.string
     }
 
@@ -474,10 +474,10 @@ impl ScalarReadGuard<'_> {
         }
     }
 
-    pub fn to_string_repr(&self) -> Result<PerlString, AllocError> {
+    pub fn stringify(&self) -> Result<PerlString, AllocError> {
         match self {
-            ScalarReadGuard::Mut(g) => g.to_string_repr(),
-            ScalarReadGuard::Const(c) => Ok(c.to_string_repr().clone()),
+            ScalarReadGuard::Mut(g) => g.stringify(),
+            ScalarReadGuard::Const(c) => Ok(c.stringify().clone()),
         }
     }
 

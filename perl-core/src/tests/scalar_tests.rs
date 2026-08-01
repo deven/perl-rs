@@ -30,7 +30,7 @@ fn immortals_prematerialized_values() {
     assert!(matches!(t.payload(), ScalarPayload::True));
     assert_eq!(t.to_int(), 1);
     assert_eq!(t.to_float(), 1.0);
-    assert_eq!(t.to_string_repr().unwrap().as_bytes(), b"1");
+    assert_eq!(t.stringify().unwrap().as_bytes(), b"1");
     assert!(t.to_bool());
 
     // The dualvar: numerically 0, string "" (not "0") — verified: (1==0)."" has length 0.
@@ -38,7 +38,7 @@ fn immortals_prematerialized_values() {
     assert!(matches!(f.payload(), ScalarPayload::False));
     assert_eq!(f.to_int(), 0);
     assert_eq!(f.to_float(), 0.0);
-    assert_eq!(f.to_string_repr().unwrap().as_bytes(), b"");
+    assert_eq!(f.stringify().unwrap().as_bytes(), b"");
     assert!(!f.to_bool());
 }
 
@@ -107,7 +107,7 @@ fn payload_stays_authoritative_through_coercion() {
     // The §21.1 illustrative test: 3.7 used as an integer still stringifies as "3.7".
     let r = plain(ScalarPayload::Float(3.7, Tainted::CLEAN));
     assert_eq!(r.read().to_int(), 3);
-    assert_eq!(r.read().to_string_repr().unwrap().as_bytes(), b"3.7");
+    assert_eq!(r.read().stringify().unwrap().as_bytes(), b"3.7");
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn full_cell_caches_and_invalidation() {
                     let g = r.read();
                     assert_eq!(g.to_int(), 3);
                     assert_eq!(g.to_float(), 3.7);
-                    assert_eq!(g.to_string_repr().unwrap().as_bytes(), b"3.7");
+                    assert_eq!(g.stringify().unwrap().as_bytes(), b"3.7");
                 }
             });
         }
@@ -135,7 +135,7 @@ fn full_cell_caches_and_invalidation() {
     let g = r.read();
     assert_eq!(g.to_int(), 9);
     assert_eq!(g.to_float(), 9.0);
-    assert_eq!(g.to_string_repr().unwrap().as_bytes(), b"9");
+    assert_eq!(g.stringify().unwrap().as_bytes(), b"9");
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn upgrade_preserves_identity_and_payload() {
 
     // The Arc address never changed: the outstanding alias still reaches the upgraded cell.
     assert!(ScalarRef::ptr_eq(&r, &alias));
-    assert_eq!(alias.read().to_string_repr().unwrap().as_bytes(), b"hello");
+    assert_eq!(alias.read().stringify().unwrap().as_bytes(), b"hello");
 }
 
 #[test]
