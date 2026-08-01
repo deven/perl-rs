@@ -55,7 +55,7 @@ fn non_ascii_from_str_is_flagged() {
 
 #[test]
 fn invalid_bytes_inline_scan_terminal() {
-    let s = PerlString::from_bytes(&[0xFF, 0xFE]).unwrap();
+    let s = PerlString::from_bytes([0xFF, 0xFE]).unwrap();
     assert_eq!(s.inline_scan(), Some(InlineScan::Malformed));
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), None);
     assert!(!s.is_ascii());
@@ -84,18 +84,18 @@ fn eq_same_flags_is_byte_equality() {
 #[test]
 fn eq_cross_flag_same_bytes_can_differ() {
     // Verified perl 5.38: unflagged C3 A9 is the two characters "\xc3\xa9"; flagged it is "é" — not eq.
-    let mut flagged = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let unflagged = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let unflagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     assert_ne!(flagged, unflagged);
 }
 
 #[test]
 fn eq_cross_flag_different_bytes_can_match() {
     // Verified perl 5.38: unflagged E9 (latin-1 é) eq flagged C3 A9 (UTF-8 é).
-    let mut flagged = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let latin1 = PerlString::from_bytes(&[0xE9]).unwrap();
+    let latin1 = PerlString::from_bytes([0xE9]).unwrap();
     assert_eq!(flagged, latin1);
     assert_eq!(latin1, flagged);
 }
@@ -114,9 +114,9 @@ fn eq_ignores_warned_and_tainted() {
 #[test]
 fn hash_key_flag_insensitive() {
     // Verified perl 5.38: utf8::upgrade/downgrade variants of a key are ONE key.
-    let mut flagged = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let latin1 = PerlString::from_bytes(&[0xE9]).unwrap();
+    let latin1 = PerlString::from_bytes([0xE9]).unwrap();
     assert_eq!(hash_of(&flagged), hash_of(&latin1), "equal strings must hash equal");
     let mut h: HashMap<PerlString, i32> = HashMap::new();
     h.insert(flagged, 1);
@@ -191,7 +191,7 @@ fn heap_append_transitions() {
 
     // ASCII + valid-non-ascii → UTF8_NON_ASCII, without rescanning.
     assert!(!s.is_ascii());
-    let mut raw = PerlString::from_bytes(&[0x80u8; 30]).unwrap(); // Heap, UNKNOWN
+    let mut raw = PerlString::from_bytes([0x80u8; 30]).unwrap(); // Heap, UNKNOWN
     raw.push_bytes(&[0x81]).unwrap();
     assert_eq!(raw.as_str(&mut [0u8; DECODE_MAX]), None); // lazy scan resolves to invalid
 }
@@ -278,7 +278,7 @@ fn ff_form_boundary() {
 
 #[test]
 fn extended_append_transitions() {
-    let mut s = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let mut s = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     s.push_str("abc").unwrap();
     assert_eq!(s.inline_scan(), Some(InlineScan::Extended), "valid append preserves extended");
     assert!(s.is_perl_utf8_valid());
@@ -287,13 +287,13 @@ fn extended_append_transitions() {
 #[test]
 fn extended_eq_and_hash_behavior() {
     // A flagged extended string equals no unflagged string (chars above 0xFF) and byte-identical flagged self.
-    let mut a = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let mut a = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     a.set_utf8_for_test();
-    let mut b = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let mut b = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     b.set_utf8_for_test();
     assert_eq!(a, b);
     assert_eq!(hash_of(&a), hash_of(&b));
-    let plain = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let plain = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     assert_ne!(a, plain, "flag changes the character sequence");
 }
 
@@ -316,7 +316,7 @@ fn unknown_range_classifies_on_ascii_probe() {
 
     // The classification left terminal Latin-1 knowledge behind: cross-flag equality against the downgraded form
     // succeeds (and would fast-negative if the state had wrongly become NON_LATIN1).
-    let plain = PerlString::from_bytes(&[0xE9u8; 20]).unwrap();
+    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(s, plain);
 }
 
@@ -326,9 +326,9 @@ fn eq_grid_same_flag_length_mismatch() {
     let a = PerlString::from_bytes(b"abc").unwrap();
     let b = PerlString::from_bytes(b"abcd").unwrap();
     assert_ne!(a, b);
-    let mut fa = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut fa = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     fa.set_utf8_for_test();
-    let mut fb = PerlString::from_bytes(&[0xC3, 0xA9, 0x41]).unwrap();
+    let mut fb = PerlString::from_bytes([0xC3, 0xA9, 0x41]).unwrap();
     fb.set_utf8_for_test();
     assert_ne!(fa, fb);
 }
@@ -336,20 +336,20 @@ fn eq_grid_same_flag_length_mismatch() {
 #[test]
 fn eq_cross_flag_flagged_longer_positive_and_negative() {
     // Flagged longer CAN match (char count < byte count): é as C3 A9 vs E9 — the positive case.
-    let mut f = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut f = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     f.set_utf8_for_test();
-    assert_eq!(f, PerlString::from_bytes(&[0xE9]).unwrap());
+    assert_eq!(f, PerlString::from_bytes([0xE9]).unwrap());
 
     // Flagged longer, mismatch mid-walk.
-    assert_ne!(f, PerlString::from_bytes(&[0xEA]).unwrap());
+    assert_ne!(f, PerlString::from_bytes([0xEA]).unwrap());
 
     // Flagged longer, plain exhausted with flagged characters remaining: "é" + "a" vs just é.
-    let mut f2 = PerlString::from_bytes(&[0xC3, 0xA9, b'a']).unwrap();
+    let mut f2 = PerlString::from_bytes([0xC3, 0xA9, b'a']).unwrap();
     f2.set_utf8_for_test();
-    assert_ne!(f2, PerlString::from_bytes(&[0xE9]).unwrap());
+    assert_ne!(f2, PerlString::from_bytes([0xE9]).unwrap());
 
     // And the fully-matching longer-flagged multi-char case.
-    assert_eq!(f2, PerlString::from_bytes(&[0xE9, b'a']).unwrap());
+    assert_eq!(f2, PerlString::from_bytes([0xE9, b'a']).unwrap());
 }
 
 #[test]
@@ -364,9 +364,9 @@ fn eq_cross_flag_equal_length_ascii_can_match() {
 #[test]
 fn eq_grid_both_flagged_terminal_mismatch() {
     // The flagged twin of the exclusivity row.
-    let mut latin1 = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut latin1 = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     latin1.set_utf8_for_test();
-    let mut mal = PerlString::from_bytes(&[0xC0, 0x80]).unwrap();
+    let mut mal = PerlString::from_bytes([0xC0, 0x80]).unwrap();
     mal.set_utf8_for_test();
     assert_ne!(latin1, mal);
 }
@@ -376,7 +376,7 @@ fn eq_grid_valid_vs_invalid_same_flag() {
     // Flagged terminal Rust-invalid vs flagged known-Rust-valid nonterminal (heap UTF8_UNKNOWN_RANGE): valid bytes
     // never equal invalid bytes.
     let flagged_valid = PerlString::from_str(&"é".repeat(20)).unwrap(); // heap, flagged, UNKNOWN_RANGE
-    let mut ext = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let mut ext = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     ext.set_utf8_for_test();
     assert_ne!(flagged_valid, ext);
     assert_ne!(ext, flagged_valid);
@@ -387,10 +387,10 @@ fn eq_grid_ascii_vs_non_ascii_both_orientations() {
     // Flagged-ASCII vs unflagged known-non-ASCII.
     let mut fa = PerlString::from_bytes(b"abc").unwrap();
     fa.set_utf8_for_test();
-    assert_ne!(fa, PerlString::from_bytes(&[0x80, 0x81, 0x82]).unwrap());
+    assert_ne!(fa, PerlString::from_bytes([0x80, 0x81, 0x82]).unwrap());
 
     // Unflagged-ASCII vs flagged known-non-ASCII (Latin-1).
-    let mut fl = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut fl = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     fl.set_utf8_for_test();
     assert_ne!(PerlString::from_bytes(b"ab").unwrap(), fl);
 }
@@ -398,8 +398,8 @@ fn eq_grid_ascii_vs_non_ascii_both_orientations() {
 #[test]
 fn eq_grid_same_flag_terminal_mismatch() {
     // Differing terminals, both unflagged: decided without memcmp (exclusivity law).
-    let latin1 = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap(); // valid, Latin-1-range... as bytes: classified
-    let malformed = PerlString::from_bytes(&[0xC0, 0x80]).unwrap();
+    let latin1 = PerlString::from_bytes([0xC3, 0xA9]).unwrap(); // valid, Latin-1-range... as bytes: classified
+    let malformed = PerlString::from_bytes([0xC0, 0x80]).unwrap();
     assert_ne!(latin1, malformed);
     let ascii = PerlString::from_bytes(b"ab").unwrap();
     assert_ne!(ascii, latin1);
@@ -407,18 +407,18 @@ fn eq_grid_same_flag_terminal_mismatch() {
 
 #[test]
 fn eq_grid_flagged_malformed_vs_unflagged_is_false() {
-    let mut mal = PerlString::from_bytes(&[0x80]).unwrap();
+    let mut mal = PerlString::from_bytes([0x80]).unwrap();
     mal.set_utf8_for_test(); // flagged malformed
-    let plain = PerlString::from_bytes(&[0x80]).unwrap();
+    let plain = PerlString::from_bytes([0x80]).unwrap();
     assert_ne!(mal, plain, "upgrade of unflagged is valid; never matches malformed bytes");
 }
 
 #[test]
 fn eq_reverse_malformed_orientation_can_match() {
     // Unflagged MALFORMED-classified bytes are just bytes: \x80 as a character equals flagged C2 80.
-    let plain = PerlString::from_bytes(&[0x80]).unwrap();
+    let plain = PerlString::from_bytes([0x80]).unwrap();
     assert_eq!(plain.inline_scan(), Some(InlineScan::Malformed));
-    let mut flagged = PerlString::from_bytes(&[0xC2, 0x80]).unwrap();
+    let mut flagged = PerlString::from_bytes([0xC2, 0x80]).unwrap();
     flagged.set_utf8_for_test();
     assert_eq!(flagged, plain, "the grid must not shortcut this orientation");
 }
@@ -426,13 +426,13 @@ fn eq_reverse_malformed_orientation_can_match() {
 #[test]
 fn eq_grid_length_rows() {
     // plain longer than flagged: impossible.
-    let mut flagged = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let plain3 = PerlString::from_bytes(&[0xE9, 0xE9, 0xE9]).unwrap();
+    let plain3 = PerlString::from_bytes([0xE9, 0xE9, 0xE9]).unwrap();
     assert_ne!(flagged, plain3);
 
     // flagged known Latin-1 (has a 2-byte char) with equal byte lengths: impossible.
-    let plain2 = PerlString::from_bytes(&[0xC3, 0xA9]).unwrap();
+    let plain2 = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
     assert_ne!(flagged, plain2);
 }
 
@@ -441,7 +441,7 @@ fn streaming_compare_narrows_on_completed_walk() {
     // Heap flagged UTF8_UNKNOWN_RANGE vs matching latin1 bytes: undecided by the grid, resolved by the single walk,
     // which narrows both sides.
     let flagged = PerlString::from_str(&"é".repeat(20)).unwrap(); // heap, flagged, UNKNOWN_RANGE
-    let plain = PerlString::from_bytes(&[0xE9u8; 20]).unwrap();
+    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(flagged, plain);
 
     // The completed walk narrowed the flagged side to UTF8_LATIN1: is_ascii is now a state read.
@@ -455,7 +455,7 @@ fn cheap_probe_defers_range() {
     assert!(!s.is_ascii()); // cheap probe: narrows to UTF8_NON_ASCII, range still deferred
 
     // Equality resolves range on demand and still matches the downgraded form.
-    let plain = PerlString::from_bytes(&[0xE9u8; 20]).unwrap();
+    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(s, plain);
 
     // And a wide heap string resolved through the same path fast-negatives.
@@ -475,7 +475,7 @@ fn eq_fast_negative_for_beyond_latin1() {
 
     // And the é (Latin-1) case still compares by character as before.
     let e_flagged = PerlString::from_str("é").unwrap();
-    let e_latin1 = PerlString::from_bytes(&[0xE9]).unwrap();
+    let e_latin1 = PerlString::from_bytes([0xE9]).unwrap();
     assert_eq!(e_flagged, e_latin1);
 }
 
@@ -496,7 +496,7 @@ fn append_range_join_semantics() {
 
 #[test]
 fn heap_append_range_join() {
-    let mut s = PerlString::from_bytes(&b"a".repeat(30)).unwrap();
+    let mut s = PerlString::from_bytes(b"a".repeat(30)).unwrap();
     assert!(s.is_ascii()); // narrows heap state to ASCII
     s.push_str("é").unwrap(); // ASCII join Latin-1 = Latin-1, no rescan
     let latin1_equiv: Vec<u8> = b"a".repeat(30).iter().copied().chain([0xE9u8]).collect();
@@ -553,13 +553,13 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
 
     // Inline terminals.
     push("inl-ascii", PerlString::from_bytes(b"ab").unwrap(), scan::ASCII);
-    push("inl-latin1", PerlString::from_bytes(&[0xC3, 0xA9]).unwrap(), scan::UTF8_LATIN1);
+    push("inl-latin1", PerlString::from_bytes([0xC3, 0xA9]).unwrap(), scan::UTF8_LATIN1);
     push("inl-nonlatin1", PerlString::from_str("字").unwrap(), scan::UTF8_NON_LATIN1);
-    push("inl-extended", PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80]).unwrap(), scan::EXTENDED_UTF8);
-    push("inl-malformed", PerlString::from_bytes(&[0x80]).unwrap(), scan::MALFORMED_UTF8);
+    push("inl-extended", PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap(), scan::EXTENDED_UTF8);
+    push("inl-malformed", PerlString::from_bytes([0x80]).unwrap(), scan::MALFORMED_UTF8);
 
     // Heap terminals (narrowed via probes).
-    let h_ascii = PerlString::from_bytes(&b"a".repeat(24)).unwrap();
+    let h_ascii = PerlString::from_bytes(b"a".repeat(24)).unwrap();
     assert!(h_ascii.is_ascii());
     push("heap-ascii", h_ascii, scan::ASCII);
     let h_l1 = PerlString::from_str(&"é".repeat(12)).unwrap();
@@ -568,17 +568,17 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
     let h_nl1 = PerlString::from_str(&"字".repeat(8)).unwrap();
     let _ = h_nl1.char_len();
     push("heap-nonlatin1", h_nl1, scan::UTF8_NON_LATIN1);
-    let h_ext = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
+    let h_ext = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
     assert!(h_ext.is_perl_utf8_valid());
     push("heap-extended", h_ext, scan::EXTENDED_UTF8);
-    let h_mal = PerlString::from_bytes(&[0x80; 24]).unwrap();
+    let h_mal = PerlString::from_bytes([0x80; 24]).unwrap();
     assert!(!h_mal.is_perl_utf8_valid());
     push("heap-malformed", h_mal, scan::MALFORMED_UTF8);
 
     // Indeterminate states, several contents each.
-    push("heap-unknown-ascii", PerlString::from_bytes(&b"x".repeat(24)).unwrap(), scan::UNKNOWN);
-    push("heap-unknown-latin1", PerlString::from_bytes(&[0xC3, 0xA9].repeat(12)).unwrap(), scan::UNKNOWN);
-    push("heap-unknown-malformed", PerlString::from_bytes(&[0x81; 23]).unwrap(), scan::UNKNOWN);
+    push("heap-unknown-ascii", PerlString::from_bytes(b"x".repeat(24)).unwrap(), scan::UNKNOWN);
+    push("heap-unknown-latin1", PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap(), scan::UNKNOWN);
+    push("heap-unknown-malformed", PerlString::from_bytes([0x81; 23]).unwrap(), scan::UNKNOWN);
     push("heap-ur-latin1", PerlString::from_str(&"é".repeat(12)).unwrap(), scan::UTF8_UNKNOWN_RANGE);
     push("heap-ur-wide", PerlString::from_str(&"字".repeat(8)).unwrap(), scan::UTF8_UNKNOWN_RANGE);
     let na8_l1 = PerlString::from_str(&"é".repeat(12)).unwrap();
@@ -587,10 +587,10 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
     let na8_wide = PerlString::from_str(&"字".repeat(8)).unwrap();
     assert!(!na8_wide.is_ascii());
     push("heap-na8-wide", na8_wide, scan::UTF8_NON_ASCII);
-    let na_raw = PerlString::from_bytes(&[0x82; 24]).unwrap();
+    let na_raw = PerlString::from_bytes([0x82; 24]).unwrap();
     assert!(!na_raw.is_ascii());
     push("heap-nonascii-raw", na_raw, scan::NON_ASCII);
-    let na_raw_valid = PerlString::from_bytes(&[0xC3, 0xA9].repeat(12)).unwrap();
+    let na_raw_valid = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
     assert!(!na_raw_valid.is_ascii());
     push("heap-nonascii-valid-bytes", na_raw_valid, scan::NON_ASCII);
 
@@ -601,7 +601,7 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
 fn full_scan_runs_once_then_state_answers() {
     // A heap string's first as_str pays one validation pass (+ one classification); afterwards every question is a
     // state read — the never-scan-twice law, mechanically.
-    let s = PerlString::from_bytes(&[0xC3, 0xA9].repeat(12)).unwrap(); // heap UNKNOWN
+    let s = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap(); // heap UNKNOWN
     eq_probe::reset();
     assert!(s.as_str(&mut [0u8; DECODE_MAX]).is_some());
     let (scans_first, _) = eq_probe::scans();
@@ -663,7 +663,7 @@ fn eq_short_circuits_at_first_mismatch_depth() {
 
     // Full equality consumes everything exactly once.
     let flagged3 = PerlString::from_str(&"é".repeat(big)).unwrap();
-    let plain3 = PerlString::from_bytes(&vec![0xE9u8; big]).unwrap();
+    let plain3 = PerlString::from_bytes(vec![0xE9u8; big]).unwrap();
     eq_probe::reset();
     assert_eq!(flagged3, plain3);
     let (_, _, chars3) = eq_probe::snapshot();
@@ -676,7 +676,7 @@ fn eq_grid_decided_pairs_perform_no_scan() {
     // scan happened on it).
     let wide = PerlString::from_str("字").unwrap(); // inline NL1, flagged
     assert!(wide.is_utf8()); // from_str of non-ASCII is flagged already
-    let unknown = PerlString::from_bytes(&[0x90u8; 24]).unwrap(); // heap UNKNOWN
+    let unknown = PerlString::from_bytes([0x90u8; 24]).unwrap(); // heap UNKNOWN
     assert_eq!(unknown.scan_state(), scan::UNKNOWN);
     eq_probe::reset();
     assert_ne!(wide, unknown); // cross-flag, flagged NL1: grid row 4
@@ -763,7 +763,7 @@ fn blocked_walk_gated_spans_and_ladder_straddle() {
     assert_eq!(f, p);
 
     // Long pure-ASCII cross-flag pair: decided entirely by gated memcmp spans, late mismatch caught.
-    let mut fa = PerlString::from_bytes(&b"a".repeat(9000)).unwrap();
+    let mut fa = PerlString::from_bytes(b"a".repeat(9000)).unwrap();
     fa.set_utf8_for_test();
     let _ = fa.is_ascii(); // ASCII state on the flagged side would grid-decide vs known-non-ASCII only
     let mut good = b"a".repeat(9000);
@@ -804,7 +804,7 @@ fn hash_dual_calculation_is_single_fetch_and_keeps_knowledge() {
     assert_eq!(eq_probe::scans(), (0, 0));
 
     // The downgraded digest matches the unflagged equal (the HashMap-key requirement).
-    let plain = PerlString::from_bytes(&[0xE9u8; 20]).unwrap();
+    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(d, digest_of(&plain));
 
     // A repeat hash uses the known-Latin-1 single-emission path: still exactly one fetch.
@@ -1019,14 +1019,14 @@ fn blocked_known_valid_boundaries() {
 #[test]
 fn char_len_semantics_and_caching() {
     // ASCII: chars == bytes, no scan at all when state is known.
-    let a = PerlString::from_bytes(&b"ab".repeat(15)).unwrap();
+    let a = PerlString::from_bytes(b"ab".repeat(15)).unwrap();
     assert!(a.is_ascii());
     eq_probe::reset();
     assert_eq!(a.char_len(), Some(30));
     assert_eq!(eq_probe::scans().0, 0, "ASCII char_len is a length read");
 
     // Latin-1 heap: first call pays ONE fused pass; second call is a cache read.
-    let l = PerlString::from_bytes(&[0xC3, 0xA9].repeat(12)).unwrap();
+    let l = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
     eq_probe::reset();
     assert_eq!(l.char_len(), Some(12));
     assert_eq!(eq_probe::scans().0, 1, "exactly one fused pass classifies and counts");
@@ -1036,33 +1036,33 @@ fn char_len_semantics_and_caching() {
     assert_eq!(eq_probe::scans().0, 0, "count and state both cached from the one pass");
 
     // Extended: counted (a 4-byte and a 13-byte character are one character each).
-    let e = PerlString::from_bytes(&[0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
+    let e = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
     assert_eq!(e.char_len(), Some(6));
 
     // Surrogates count one character per encoded sequence; perl never merges pairs.  Container-verified:
     // length(chr 0xD800) == 1; a CESU-style pair decodes to TWO characters (D800, DC00), length 2, distinct from the
     // one-character astral U+10000.
-    let lone = PerlString::from_bytes(&[0xED, 0xA0, 0x80]).unwrap();
+    let lone = PerlString::from_bytes([0xED, 0xA0, 0x80]).unwrap();
     assert_eq!(lone.inline_scan(), Some(InlineScan::Extended));
     assert_eq!(lone.char_len(), Some(1));
-    let cesu_pair = PerlString::from_bytes(&[0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80]).unwrap();
+    let cesu_pair = PerlString::from_bytes([0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80]).unwrap();
     assert_eq!(cesu_pair.char_len(), Some(2), "pairs are two characters, never merged");
     let astral = PerlString::from_str("\u{10000}").unwrap();
     assert_eq!(astral.char_len(), Some(1));
 
     // Malformed: None (ops layer owns perl's warning behavior).
-    let m = PerlString::from_bytes(&[0x80; 24]).unwrap();
+    let m = PerlString::from_bytes([0x80; 24]).unwrap();
     assert_eq!(m.char_len(), None);
 
     // Inline recount, all classes.
     assert_eq!(PerlString::from_str("héllo").unwrap().char_len(), Some(5));
     assert_eq!(PerlString::from_str("字").unwrap().char_len(), Some(1));
-    assert_eq!(PerlString::from_bytes(&[0x80]).unwrap().char_len(), None);
+    assert_eq!(PerlString::from_bytes([0x80]).unwrap().char_len(), None);
 }
 
 #[test]
 fn char_len_maintained_through_append() {
-    let mut s = PerlString::from_bytes(&[0xC3, 0xA9].repeat(12)).unwrap(); // heap
+    let mut s = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap(); // heap
     assert_eq!(s.char_len(), Some(12)); // classify + count: one pass
     eq_probe::reset();
     s.push_str("abc").unwrap(); // classification of the ADDED bytes only
@@ -1073,7 +1073,7 @@ fn char_len_maintained_through_append() {
 
 #[test]
 fn char_count_shared_across_cow_sharers() {
-    let a = PerlString::from_bytes(&[0xC3, 0xA9].repeat(12)).unwrap();
+    let a = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
     let b = a.clone(); // shares the buffer
     assert_eq!(a.char_len(), Some(12)); // pays the pass
     eq_probe::reset();
@@ -1232,10 +1232,30 @@ fn debug_shows_the_representation_with_readable_bytes() {
     assert!(shown.contains(r#"bytes: b"2026-07-28T14:33:07Z""#), "byte-string syntax, not integers: {shown}");
 
     // Bytes that are not text render escaped rather than lossily, since a perl string's content need not be UTF-8.
-    let raw = PerlString::from_bytes(&[0xFF, 0xFE, b'h', b'i']).unwrap();
+    let raw = PerlString::from_bytes([0xFF, 0xFE, b'h', b'i']).unwrap();
     assert!(format!("{raw:?}").contains(r#"b"\xFF\xFEhi""#));
 
     // The usual escapes, so a newline does not break the line.
     let escaped: PerlString = "a\tb\nc".parse().unwrap();
     assert!(format!("{escaped:?}").contains(r#"b"a\tb\nc""#));
+}
+
+#[test]
+fn the_constructors_accept_every_asref_shape() {
+    // Generic at the boundary: an embedder holding a String, a Cow, or a compact string type from the ecosystem
+    // needs no conversion, and the ladder beneath is monomorphic.
+    let owned = String::from("owned content");
+    assert_eq!(PerlString::new(&owned).unwrap().len(), 13);
+    assert_eq!(PerlString::new(owned.clone()).unwrap().len(), 13);
+    assert_eq!(PerlString::new(owned.as_str()).unwrap().len(), 13);
+    assert_eq!(PerlString::new(std::borrow::Cow::Borrowed("borrowed")).unwrap().len(), 8);
+
+    let bytes = vec![1u8, 2, 3];
+    assert_eq!(PerlString::from_bytes(&bytes).unwrap().len(), 3);
+    assert_eq!(PerlString::from_bytes(bytes.clone()).unwrap().len(), 3);
+    assert_eq!(PerlString::from_bytes(&bytes[..]).unwrap().len(), 3);
+    assert_eq!(PerlString::from_bytes([7u8; 4]).unwrap().len(), 4);
+
+    // FromStr forwards to new, so parse() and new() agree exactly.
+    assert_eq!(PerlString::new("2026-07-28T14:33:07Z").unwrap(), "2026-07-28T14:33:07Z".parse().unwrap());
 }

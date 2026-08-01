@@ -675,7 +675,8 @@ fn inline_payload(bytes: &[u8]) -> [u8; INLINE_MAX] {
 impl PerlString {
     /// Construct from raw bytes (I/O, `Encode`, lexer literals).  Unflagged; inline content gets its eager terminal
     /// scan, heap content defers all scanning (`UNKNOWN`), per §2.2.7.
-    pub fn from_bytes(bytes: &[u8]) -> Result<PerlString, AllocError> {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<PerlString, AllocError> {
+        let bytes = bytes.as_ref();
         match PerlString::inline_bytes(bytes) {
             Some(inline) => Ok(inline),
             None => {
@@ -1279,10 +1280,22 @@ impl Default for PerlString {
 impl FromStr for PerlString {
     type Err = AllocError;
 
+    /// The same construction as [`PerlString::new`], for generic contexts and `"...".parse()`.
+    fn from_str(s: &str) -> Result<PerlString, AllocError> {
+        PerlString::new(s)
+    }
+}
+
+impl PerlString {
     /// Construct from a Rust `&str`.  ASCII content is stored unflagged (the canonical downgraded form, §2.3.5);
     /// non-ASCII content is stored with the utf8 flag, its validity known from the type.  Allocation failure is the
     /// only error.
-    fn from_str(s: &str) -> Result<PerlString, AllocError> {
+    ///
+    /// Generic at the boundary so that embedders holding a `String`, a `Cow`, or one of the compact string types from
+    /// the ecosystem need no conversion; the ladder beneath is monomorphic and instantiated once.
+    pub fn new(s: impl AsRef<str>) -> Result<PerlString, AllocError> {
+        let s = s.as_ref();
+
         if let Some(inline) = PerlString::inline(s) {
             Ok(inline)
         } else {
