@@ -255,8 +255,9 @@ impl ScalarCell {
     /// `Full`; clearing on a `Plain` cell is a no-op.
     pub fn set_readonly(&mut self, readonly: bool) {
         match self {
+            // Clearing a flag a `Plain` cell cannot carry: nothing to do, and no reason to promote it.
             ScalarCell::Plain(_) if !readonly => {}
-            _ => self.upgrade_to_full().readonly = readonly,
+            ScalarCell::Plain(_) | ScalarCell::Full(_) => self.upgrade_to_full().readonly = readonly,
         }
     }
 
@@ -415,10 +416,12 @@ impl ScalarRef {
 
     /// Reference identity (§2.3.1): what `==` on Perl references compares.
     pub fn ptr_eq(a: &ScalarRef, b: &ScalarRef) -> bool {
+        // Exhaustive over the pairs: a wildcard here would report that a reference of some future kind is not equal to
+        // itself, which is the one answer this function must never give.
         match (a, b) {
             (ScalarRef::Mut(x), ScalarRef::Mut(y)) => HeapArc::ptr_eq(x, y),
             (ScalarRef::Const(x), ScalarRef::Const(y)) => HeapArc::ptr_eq(x, y),
-            _ => false,
+            (ScalarRef::Mut(_), ScalarRef::Const(_)) | (ScalarRef::Const(_), ScalarRef::Mut(_)) => false,
         }
     }
 
