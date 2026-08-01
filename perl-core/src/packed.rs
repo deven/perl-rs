@@ -1,95 +1,108 @@
 //! Nibble-packed digit-dense strings (§2.2.9): two characters per byte over 16-symbol alphabets.
 //!
 //! Strings drawn from a 16-symbol alphabet pack two characters per byte, raising the inline capacity for the
-//! digit-dense class — timestamps, IPs, numeric IDs, and every numeric stringification the interpreter can produce — to
-//! `MAX_PACKED_LEN` (30) characters inside the 16-byte envelope, with no stored length: the logical length is one past
-//! the last nonzero nibble, unique because trailing spaces are unpackable.  Three alphabets are defined, selected by
-//! format bits in the enclosing discriminant:
+//! digit-dense class — timestamps, IPs, numeric IDs, and every default numeric stringification — to `MAX_PACKED_LEN`
+//! (30) characters inside the 16-byte envelope.  Three alphabets are defined, selected by the enclosing discriminant:
 //!
-//! - **Numeric**: space, `+`, `-`, `.`, `0`-`9`, `E`, `e` — covers every `%.15g` float output and every `i64`
-//!   stringification (§2.2.3's 22-character bound), and both exponent spellings: perl emits lowercase by default but
-//!   uppercase through `%E` and `%G`, and accepts either on numification.
-//! - **DateTimeZ**: space, `-`, `.`, `0`-`9`, `:`, `T`, `Z` — ISO timestamps in Zulu form, and those carrying a
-//!   `-hh:mm` offset (the minus sign is shared with the date separators).
-//! - **DateTimePlus**: space, `+`, `-`, `.`, `0`-`9`, `:`, `T` — ISO timestamps carrying a `+hh:mm` offset.  A valid
-//!   timestamp never needs `Z` and `+` together (Zulu *is* the zero offset), so splitting the two spellings across two
-//!   alphabets covers the whole grammar without a 17th symbol.
+//! - **Numeric**: space, `+`, `-`, `.`, `0`-`9`, `E`, `e` — every `%.15g` output and every `i64` stringification, in
+//!   either exponent spelling.
+//! - **DateTimePlus**: space, `+`, `-`, `.`, `0`-`9`, `:`, `T` — ISO timestamps in every form but Zulu.
+//! - **DateTimeZulu**: space, `-`, `.`, `0`-`9`, `:`, `T`, `Z` — Zulu-form ISO timestamps.
 //!
-//! All three alphabets are exactly full at sixteen symbols: the `T`/space date-time separator, both offset spellings,
-//! and both exponent spellings are therefore all encodable, with no nibble left over.
+//! A valid timestamp never needs `Z` and `+` together — Zulu *is* the zero offset — so splitting the two spellings
+//! covers the whole ISO grammar without a seventeenth symbol.  The union of all three is nineteen symbols against
+//! sixteen nibble values, so three alphabets are forced, and content that migrates between them transcodes
+//! ([`Packed::transcode`]).
 //!
-//! **The space is nibble 0, shared with the padding, disambiguated by position**: trailing zero nibbles are padding,
-//! interior zero nibbles are spaces.  A string with a *trailing* space is consequently not packable at all — its final
-//! space would be indistinguishable from padding — and `pack` rejects it.  This costs nothing that was previously
-//! available (such strings were unpackable when the space was outside the alphabets), and it buys the space for free
-//! because nibble 0 was already reserved.  ASCII space is 0x20, below every other symbol in every alphabet, so nibble 0
-//! remains the least code and comparison is unaffected.
+//! The order above is the classification priority, and it is chosen for the append path.  `Numeric` is a subset of
+//! `DateTimePlus` on nibbles 0-13, so a string that starts numeric and meets a `:` or `T` widens with no rewriting at
+//! all — and lands on the canonical alphabet, because `DateTimePlus` is where timestamps belong unless a `Z` forces
+//! otherwise.  `Z` is the one symbol no other alphabet holds, so `DateTimeZulu` is reached only through it, which makes
+//! the variant itself a proof that the timestamp's offset is `+00:00`.
 //!
-//! Nibble values are assigned in ASCII order, packed high-nibble first, and the tail pad-filled — so for two packed
-//! strings of the *same* alphabet, comparing the nibble arrays as plain bytes gives exactly the raw strings' byte order
-//! (verified exhaustively by the order property test).  Prefix ordering survives the shared zero: where the shorter
-//! string has padding and the longer has a space, both nibbles are 0 and the comparison simply continues, and because
-//! trailing spaces are excluded the longer string must reach a non-space — hence a nonzero nibble — before it ends.
-//! Cross-alphabet *ordering* decodes; cross-alphabet *equality* is decided by the alphabets alone, since deterministic
-//! classification maps each byte string to exactly one alphabet.
+//! # The length lives in the last nibble
 //!
-//! Packing is an **encoding, never a canonicalization**: `unpack(pack(s)) == s` exactly, byte for byte, for every
-//! accepted input — the §2.2.9 observational-identity obligation starts here.  Classification is deterministic so that
-//! equal byte contents always take equal representations (a prerequisite for packed `eq` via `memcmp`): the alphabets
-//! are tried in the fixed priority order Numeric, DateTimeZ, DateTimePlus, and the first feasible one wins.
+//! Each alphabet has **two length families**, again carried by the discriminant.  Content of exactly `MAX_PACKED_LEN`
+//! characters fills all thirty nibbles and needs no stored length — the family says so.  Content of `MIN_PACKED_LEN`-29
+//! characters stores the low four bits of its length in nibble 29, the one a thirtieth character would have used, and
+//! recovers it as `0x10 | nibble` because the band's floor is sixteen.  Reading a length is one byte load, an `AND`,
+//! and an `OR` — no scan, and no dependence on content.
+//!
+//! Storing the length explicitly is what makes **trailing spaces representable**.  With the length implied by the last
+//! nonzero nibble, a string ending in a space could not be told from one padded with zeros, so such strings were
+//! unpackable — a restriction that looked harmless for whole strings but blocks incremental building, where a string
+//! passes through a trailing space on its way to something longer.
+//!
+//! Nibble values are assigned in ASCII order, so for two packed strings **of the same alphabet and the same length
+//! family**, comparing the nibble arrays as plain bytes gives exactly the raw strings' byte order: content differences
+//! decide before nibble 29 is reached, and where one string ends the other has a symbol above the zero padding.
+//! Comparing across length families compares the twenty-nine shared nibbles and then the lengths, since the last nibble
+//! means different things on the two sides.  Comparing across alphabets decodes.
+//!
+//! # Invariants
+//!
+//! - **Padding is zero.**  Nibbles from the content end through nibble 28 are zero.  Nothing reads them to derive a
+//!   length any more, so a violation no longer announces itself — it silently corrupts ordering, equality, and hashing,
+//!   all of which read the whole payload.  Every construction path zeroes by building from a zeroed array; any future
+//!   mutation that shortens content must re-zero what it vacates.  [`Packed::padding_is_canonical`] states the property
+//!   and the debug assertions check it.
+//! - **Packing is an encoding, never a canonicalization.**  `unpack(pack(s)) == s` exactly, for every accepted input.
+//! - **Classification is deterministic**: the alphabets are tried in the fixed priority order Numeric, DateTimePlus,
+//!   DateTimeZulu, so equal byte contents always take equal representations — the prerequisite for representation-level
+//!   equality.
 
-// The production consumers arrive with the step-9 PerlString and Value rework; the expect self-reports for removal the
-// moment they land.
+// The production consumers arrive with the PerlString and Value rework; the expect self-reports for removal the moment
+// they land.
 #![cfg_attr(not(test), expect(dead_code))]
 
 use std::cmp::Ordering;
 
-/// The packed-tier capacity in characters: 15 nibble bytes, two characters each.  No length is stored — the byte a
-/// length would occupy is two characters of capacity, and 29-30 characters is exactly where millisecond-offset and
-/// nanosecond-Zulu timestamps live.  Because trailing spaces are unpackable, the logical length is uniquely the
-/// position one past the last nonzero nibble.
+/// The packed-tier capacity in characters: 15 nibble bytes, two characters each.
 pub(crate) const MAX_PACKED_LEN: usize = 30;
 
 /// The shortest content this tier holds.  Content of 15 characters or fewer takes an inline form instead (§2.2.9), so
-/// the packed forms hold exactly 16-30 characters — which is what lets `len` read a single word: the terminating nibble
-/// is always at nibble index 15-29, inside the last eight payload bytes.  The band is established by the tier selector,
-/// the only path that constructs strings; `pack` states it as a precondition rather than checking it.
+/// the packed forms hold exactly 16-30 characters.  The band is established by the tier selector, the only path that
+/// constructs strings; `pack` states it as a precondition rather than checking it.  It is also what lets the stored
+/// length occupy four bits: only the low nibble varies across 16-29.
 pub(crate) const MIN_PACKED_LEN: usize = 16;
 
 /// The nibble-array width in bytes.
 pub(crate) const PACKED_BYTES: usize = MAX_PACKED_LEN / 2;
 
-/// Which 16-symbol alphabet a packed string uses.  In the fused forms this is carried entirely by the enclosing enum's
+/// The nibble index holding the stored length, for content shorter than the capacity.
+const LENGTH_NIBBLE: usize = MAX_PACKED_LEN - 1;
+
+/// Which 16-symbol alphabet a packed string uses.  In the fused forms this is carried by the enclosing enum's
 /// discriminant — the packed payload is 15 nibble bytes with no metadata byte.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PackedAlphabet {
-    /// space `+` `-` `.` `0`-`9` `E` `e` — every numeric stringification fits here, in either exponent spelling.
-    Numeric = 0,
+    /// space `+` `-` `.` `0`-`9` `E` `e` — every numeric stringification, in either exponent spelling.
+    Numeric,
 
-    /// space `-` `.` `0`-`9` `:` `T` `Z` — Zulu-form and `-hh:mm`-offset ISO timestamps.
-    DateTimeZ = 1,
+    /// space `+` `-` `.` `0`-`9` `:` `T` — ISO timestamps in every form but Zulu.  The canonical alphabet for
+    /// timestamps, and a superset of `Numeric` on nibbles 0-13, so widening into it rewrites nothing.
+    DateTimePlus,
 
-    /// space `+` `-` `.` `0`-`9` `:` `T` — `+hh:mm`-offset ISO timestamps.
-    DateTimePlus = 2,
+    /// space `-` `.` `0`-`9` `:` `T` `Z` — Zulu-form ISO timestamps.  Reached only by a `Z`, since that is the one
+    /// symbol the other alphabets lack: **this variant proves the offset is `+00:00`**.
+    DateTimeZulu,
 }
 
-/// A packed string: the alphabet and the pad-filled nibble array — no stored length.  In the fused `PerlString`/`Value`
-/// forms the alphabet lives in the enclosing discriminant and the payload is the 15 nibble bytes alone; the field here
-/// stands in for that discriminant.
-///
-/// Unused nibbles are canonically zero at construction: equality, ordering, and length recovery all read the full
-/// array, so stale bits would be semantic corruption.
+/// A packed string: the alphabet, the length family, and the nibble array.  The first two are discriminant bits in the
+/// fused forms; the fields stand in for them here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Packed {
     pub(crate) alphabet: PackedAlphabet,
+
+    /// The `MAX_PACKED_LEN`-character family: every nibble is content and the length is implied.
+    pub(crate) full: bool,
     pub(crate) nibbles: [u8; PACKED_BYTES],
 }
 
-/// Sentinel in the byte→nibble tables: this byte is outside the alphabet.
+/// Sentinel in the byte-to-nibble tables: this byte is outside the alphabet.
 const INVALID: u8 = 0xFF;
 
-/// Build a byte→nibble table from an ASCII-ordered symbol list.  The list *starts* with the space, so the space takes
-/// nibble 0 — the same value the unwritten tail carries as padding.
+/// Build a byte-to-nibble table from an ASCII-ordered symbol list, space first.
 const fn encode_table(symbols: &[u8]) -> [u8; 256] {
     let mut table = [INVALID; 256];
     let mut i = 0;
@@ -101,8 +114,7 @@ const fn encode_table(symbols: &[u8]) -> [u8; 256] {
     table
 }
 
-/// Build the nibble→byte table.  Index 0 decodes to the space; positions past the alphabet are never reached, because
-/// decoding is bounded by the stored length and packing only ever emits in-alphabet nibbles.
+/// Build the nibble-to-byte table.
 const fn decode_table(symbols: &[u8]) -> [u8; 16] {
     let mut table = [0u8; 16];
     let mut i = 0;
@@ -117,64 +129,76 @@ const fn decode_table(symbols: &[u8]) -> [u8; 16] {
 // ASCII-ordered symbol lists, space first.  Order is load-bearing: monotone nibble assignment is what makes
 // same-alphabet packed comparison agree with raw byte comparison.
 const NUMERIC_SYMBOLS: &[u8] = b" +-.0123456789Ee";
-const DATETIME_Z_SYMBOLS: &[u8] = b" -.0123456789:TZ";
 const DATETIME_PLUS_SYMBOLS: &[u8] = b" +-.0123456789:T";
+const DATETIME_ZULU_SYMBOLS: &[u8] = b" -.0123456789:TZ";
 
 const NUMERIC_ENCODE: [u8; 256] = encode_table(NUMERIC_SYMBOLS);
 const NUMERIC_DECODE: [u8; 16] = decode_table(NUMERIC_SYMBOLS);
-const DATETIME_Z_ENCODE: [u8; 256] = encode_table(DATETIME_Z_SYMBOLS);
-const DATETIME_Z_DECODE: [u8; 16] = decode_table(DATETIME_Z_SYMBOLS);
 const DATETIME_PLUS_ENCODE: [u8; 256] = encode_table(DATETIME_PLUS_SYMBOLS);
 const DATETIME_PLUS_DECODE: [u8; 16] = decode_table(DATETIME_PLUS_SYMBOLS);
+const DATETIME_ZULU_ENCODE: [u8; 256] = encode_table(DATETIME_ZULU_SYMBOLS);
+const DATETIME_ZULU_DECODE: [u8; 16] = decode_table(DATETIME_ZULU_SYMBOLS);
 
-// Each alphabet is exactly full, with 16 symbols defined.
 const _: () = assert!(NUMERIC_SYMBOLS.len() == 16);
-const _: () = assert!(DATETIME_Z_SYMBOLS.len() == 16);
 const _: () = assert!(DATETIME_PLUS_SYMBOLS.len() == 16);
+const _: () = assert!(DATETIME_ZULU_SYMBOLS.len() == 16);
 
 impl PackedAlphabet {
     fn encode_table(self) -> &'static [u8; 256] {
         match self {
             PackedAlphabet::Numeric => &NUMERIC_ENCODE,
-            PackedAlphabet::DateTimeZ => &DATETIME_Z_ENCODE,
             PackedAlphabet::DateTimePlus => &DATETIME_PLUS_ENCODE,
+            PackedAlphabet::DateTimeZulu => &DATETIME_ZULU_ENCODE,
         }
     }
 
     fn decode_table(self) -> &'static [u8; 16] {
         match self {
             PackedAlphabet::Numeric => &NUMERIC_DECODE,
-            PackedAlphabet::DateTimeZ => &DATETIME_Z_DECODE,
             PackedAlphabet::DateTimePlus => &DATETIME_PLUS_DECODE,
+            PackedAlphabet::DateTimeZulu => &DATETIME_ZULU_DECODE,
         }
     }
 }
 
-/// Classify and pack, or report that the bytes are not packable: ending in a space, or containing a byte outside every
-/// alphabet.  Deterministic — the alphabets are tried in a fixed priority order.
+/// Read one nibble, high nibble first so that byte order over the array mirrors character order.
+fn nibble_at(nibbles: &[u8; PACKED_BYTES], index: usize) -> u8 {
+    let byte = nibbles[index / 2];
+
+    if index.is_multiple_of(2) { byte >> 4 } else { byte & 0x0F }
+}
+
+/// Write one nibble, leaving the other half of the byte untouched.
+fn set_nibble(nibbles: &mut [u8; PACKED_BYTES], index: usize, value: u8) {
+    let byte = &mut nibbles[index / 2];
+
+    if index.is_multiple_of(2) {
+        *byte = (*byte & 0x0F) | (value << 4);
+    } else {
+        *byte = (*byte & 0xF0) | value;
+    }
+}
+
+/// Classify and pack, or report that the content is not encodable in any alphabet.  Deterministic — the alphabets are
+/// tried in a fixed priority order.
 ///
 /// **Precondition: the input is 16-30 bytes** (`MIN_PACKED_LEN..=MAX_PACKED_LEN`).  The tier selector is the only
 /// constructor of strings and dispatches on length before reaching here, so out-of-band content cannot arrive; the
-/// bound is asserted in debug builds and not checked in release.  `None` therefore means exactly one thing — the
-/// content is not encodable in any alphabet — which is the classification result the selector needs, not a bounds
-/// rejection it already ruled out.
+/// bound is asserted in debug builds and not checked in release.
 pub(crate) fn pack(bytes: &[u8]) -> Option<Packed> {
     debug_assert!((MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()), "the tier selector must route content outside 16-30 characters elsewhere");
-    if bytes.last() == Some(&b' ') {
-        return None; // A trailing space cannot be distinguished from padding.
-    }
 
     // One pass tracking feasibility in every alphabet; fail fast when none survives.  All must be tracked for every
-    // byte: 'e' passes only Numeric and 'Z' only DateTimeZ, so a later byte must not select an alphabet an earlier byte
-    // already ruled out.
+    // byte: 'e' passes only Numeric and 'Z' only DateTimeZulu, so a later byte must not select an alphabet an earlier
+    // byte already ruled out.
     let mut numeric = true;
-    let mut datetime_z = true;
     let mut datetime_plus = true;
+    let mut datetime_zulu = true;
     for &b in bytes {
         numeric &= NUMERIC_ENCODE[b as usize] != INVALID;
-        datetime_z &= DATETIME_Z_ENCODE[b as usize] != INVALID;
         datetime_plus &= DATETIME_PLUS_ENCODE[b as usize] != INVALID;
-        if !numeric && !datetime_z && !datetime_plus {
+        datetime_zulu &= DATETIME_ZULU_ENCODE[b as usize] != INVALID;
+        if !numeric && !datetime_plus && !datetime_zulu {
             return None;
         }
     }
@@ -182,135 +206,157 @@ pub(crate) fn pack(bytes: &[u8]) -> Option<Packed> {
     // The priority order is the determinism rule: equal byte contents must always take equal representations.
     let alphabet = if numeric {
         PackedAlphabet::Numeric
-    } else if datetime_z {
-        PackedAlphabet::DateTimeZ
-    } else {
+    } else if datetime_plus {
         PackedAlphabet::DateTimePlus
+    } else {
+        PackedAlphabet::DateTimeZulu
     };
+
+    pack_in(bytes, alphabet)
+}
+
+/// Encode into a **named** alphabet, or `None` if a byte has no symbol there.
+///
+/// [`pack`] is this under the canonical priority order.  Incremental building needs the forced form instead, because it
+/// must choose an alphabet before seeing the whole string: it starts in `Numeric` and widens to `DateTimePlus` on the
+/// first `:` or `T`, since those two agree on nibbles 0-13 and the widening rewrites nothing.
+///
+/// The eager choice *is* the canonical one, which is why the priority order runs Numeric, DateTimePlus, DateTimeZulu:
+/// timestamps belong to `DateTimePlus` unless a `Z` forces otherwise, so a string widened on its first `:` or `T` needs
+/// no correction at the end.  Only a `Z` arriving later moves it again, through [`Packed::transcode`].
+pub(crate) fn pack_in(bytes: &[u8], alphabet: PackedAlphabet) -> Option<Packed> {
+    debug_assert!((MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()), "the tier selector must route content outside 16-30 characters elsewhere");
 
     let table = alphabet.encode_table();
-    let encode = |b: &u8| {
-        let n = table[*b as usize];
-        debug_assert_ne!(n, INVALID, "feasibility pass admitted an out-of-alphabet byte");
-        n
-    };
-
-    // Walking the destination rather than the source bounds the write by the array itself, so nothing stands between
-    // the precondition and memory safety.  High nibble first: byte order mirrors character order.
-    let mut nibbles = [0u8; PACKED_BYTES];
-    for (slot, pair) in nibbles.iter_mut().zip(bytes.chunks(2)) {
-        *slot = (pair.first().map_or(0, &encode) << 4) | pair.get(1).map_or(0, &encode);
+    let mut nibbles = [0u8; PACKED_BYTES]; // Padding is zero by construction.
+    for (i, &b) in bytes.iter().enumerate() {
+        let n = table[b as usize];
+        if n == INVALID {
+            return None;
+        }
+        set_nibble(&mut nibbles, i, n);
     }
 
-    Some(Packed { alphabet, nibbles })
+    let full = bytes.len() == MAX_PACKED_LEN;
+    if !full {
+        set_nibble(&mut nibbles, LENGTH_NIBBLE, (bytes.len() & 0x0F) as u8);
+    }
+
+    let packed = Packed { alphabet, full, nibbles };
+    debug_assert!(packed.padding_is_canonical(), "packing must leave unused nibbles zero");
+    Some(packed)
 }
 
 impl Packed {
-    /// The logical character count: one past the last nonzero nibble.  Unique because trailing spaces are unpackable —
-    /// the final character's nibble is always nonzero.
-    ///
-    /// The derivation counts trailing zero *nibbles*: a big-endian load of the word makes string position map
-    /// monotonically onto bit position (nibble k occupies bits 4*(29-k)), so the trailing zeros of the word are the
-    /// trailing pad nibbles of the string and `trailing_zeros() >> 2` is their count.  The length is the capacity minus
-    /// that count — five instructions, one load, no branches.  The big-endian load is load-bearing, not incidental:
-    /// little-endian with `leading_zeros` inverts nibble order within each byte and breaks the mapping.
-    ///
-    /// The word to load is chosen by the tier guarantee: content of 16-30 characters has its last nonzero nibble at
-    /// nibble index 15-29, which is byte index 7-14 — exactly the last eight bytes.  Both words are fetched whole; an
-    /// eight-byte copy compiles to one load plus a byte swap, where a byte-wise array literal compiles to eight loads
-    /// and a shift chain and measured 1.7x slower.  Neither load has an alignment precondition — the copy is a `memcpy`
-    /// into a value, where a raw-pointer cast would be the unsound formulation — but the hot one is aligned anyway: in
-    /// the fused envelope the discriminant occupies byte 0, placing the payload at offset 1, so this word's first byte
-    /// sits at struct offset 8 and inherits the envelope's 8-byte alignment (measured).  An 8-aligned eight-byte word
-    /// cannot cross a cache line either, so the hot path is free of both costs.  The fallback word, at offset 1, is the
-    /// unaligned one — and it is the branch that never runs in population.
-    ///
-    /// Measured against a byte-at-a-time reverse scan, medians of 15 interleaved runs over 4096-entry corpora: this
-    /// form is data-independent at ~1.01 ns, while the scan ranges from ~2.09 ns at 16 characters to ~0.82 at 30,
-    /// exiting sooner the longer the string is.  It therefore wins across the whole tier band, and by 1.85x on mixed
-    /// content where the scan additionally pays branch mispredictions.  Splitting the packed variants by length band to
-    /// dispatch between the two algorithms was measured and rejected: it costs 1.2-1.3x on every distribution tested,
-    /// because duplicating the 65-instruction unrolled scan into a second arm inflates the dispatch function from 79 to
-    /// 144 instructions, and that cost is paid on every call — including calls on values holding no string at all.
+    /// The character count.  The full family implies it; otherwise nibble 29 carries its low four bits and the band's
+    /// floor supplies the high one.  One byte load, an `AND`, an `OR` — no scan, no dependence on content.
     pub(crate) fn len(&self) -> usize {
-        // The last eight payload bytes, loaded as one word.  `pack` guarantees 16-30 characters, so the terminating
-        // nibble is always inside this word and it is never zero.
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&self.nibbles[7..15]);
-        let terminator = u64::from_be_bytes(word);
-        debug_assert_ne!(terminator, 0, "a packed string always holds at least MIN_PACKED_LEN characters");
-        MAX_PACKED_LEN - (terminator.trailing_zeros() as usize >> 2)
+        if self.full { MAX_PACKED_LEN } else { MIN_PACKED_LEN | nibble_at(&self.nibbles, LENGTH_NIBBLE) as usize }
     }
 
-    /// Decode to raw bytes: the exact original, by the round-trip invariant.  Interior zero nibbles decode to spaces;
-    /// the padding is never reached because the walk is bounded by the length.
+    /// Whether the nibbles between the content end and the length field are zero.  Nothing derives a length from them
+    /// any more, so a violation would not announce itself: ordering, equality, and hashing all read the whole payload,
+    /// and equal content must have equal representation.
+    pub(crate) fn padding_is_canonical(&self) -> bool {
+        if self.full {
+            return true; // Every nibble is content.
+        }
+
+        (self.len()..LENGTH_NIBBLE).all(|i| nibble_at(&self.nibbles, i) == 0)
+    }
+
+    /// Decode to raw bytes: the exact original, by the round-trip invariant.
     pub(crate) fn unpack(&self) -> ([u8; MAX_PACKED_LEN], usize) {
         let table = self.alphabet.decode_table();
         let mut out = [0u8; MAX_PACKED_LEN];
         let len = self.len();
         for (i, slot) in out.iter_mut().enumerate().take(len) {
-            let byte = self.nibbles[i / 2];
-            let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
-            *slot = table[n as usize];
+            *slot = table[nibble_at(&self.nibbles, i) as usize];
         }
-
         (out, len)
     }
 
-    /// Equality against a raw byte string, length-first: derive the length, reject on mismatch, then compare decoded
-    /// characters.  Length-first is normative because a zero nibble is ambiguous against a raw space or a raw
-    /// end-of-string (interior space versus padding), and the length resolves every such case up front with predictable
-    /// control flow.  A first-bytes decode-pair precheck and the speculative dual-interpretation comparator are
-    /// recorded measured options.
-    pub(crate) fn eq_bytes(&self, other: &[u8]) -> bool {
-        if other.len() > MAX_PACKED_LEN {
-            return false;
+    /// Re-encode into another alphabet, or `None` when a symbol has no counterpart there — the operation incremental
+    /// building needs when a character arrives that the current alphabet cannot hold.
+    ///
+    /// Only content nibbles are remapped: nibble 29 holds a length, not a symbol, and must survive untouched.
+    ///
+    /// The table lookups make this correct by construction — a symbol absent from the target has no encoding, so the
+    /// conversion fails — and the resulting transitions, which the append path uses, are:
+    ///
+    /// |            transition            |  `0x00`   |  `0x01`   | `0x02`-`0x0D` | `0x0E`-`0x0F` |
+    /// |----------------------------------|-----------|-----------|---------------|---------------|
+    /// |      `Numeric` to `DateTimePlus` | unchanged | unchanged |   unchanged   |   **fail**    |
+    /// |      `Numeric` to `DateTimeZulu` | unchanged | **fail**  |   decrement   |   **fail**    |
+    /// | `DateTimePlus` to `DateTimeZulu` | unchanged | **fail**  |   decrement   |   decrement   |
+    ///
+    /// Widening into `DateTimePlus` rewrites nothing, since it and `Numeric` agree on nibbles 0-13 — only `E` and `e`
+    /// have no counterpart, and they exist in no other alphabet.  Converting into `DateTimeZulu` is the same decrement
+    /// from either source, `DateTimeZulu` being the same list shifted down past the absent `+`; `0x01` is that `+` and
+    /// always fails, and the two sources differ only in that `0x0E`-`0x0F` are `E`/`e` under `Numeric` and `:`/`T`
+    /// under `DateTimePlus`.  A failure means the content leaves the packed tier for the heap.
+    pub(crate) fn transcode(&self, to: PackedAlphabet) -> Option<Packed> {
+        if to == self.alphabet {
+            return Some(*self);
         }
 
-        let len = self.len();
-        if len != other.len() {
+        let (from_table, to_table) = (self.alphabet.decode_table(), to.encode_table());
+        let mut nibbles = self.nibbles;
+        for i in 0..self.len() {
+            let symbol = from_table[nibble_at(&self.nibbles, i) as usize];
+            let mapped = to_table[symbol as usize];
+            if mapped == INVALID {
+                return None;
+            }
+            set_nibble(&mut nibbles, i, mapped);
+        }
+
+        let packed = Packed { alphabet: to, full: self.full, nibbles };
+        debug_assert!(packed.padding_is_canonical(), "transcode must preserve zero padding");
+        Some(packed)
+    }
+
+    /// Ordering against another packed string of the **same alphabet**.
+    ///
+    /// Within one length family this is plain byte comparison: a content difference decides before the length field is
+    /// reached, and where one string ends the other holds a symbol above the zero padding.  Across families the last
+    /// nibble means different things on the two sides, so the twenty-nine shared nibbles decide first and the lengths
+    /// break the tie — which is prefix ordering, since the full family is the longer one.
+    pub(crate) fn cmp_same_alphabet(&self, other: &Packed) -> Ordering {
+        debug_assert_eq!(self.alphabet, other.alphabet, "cross-alphabet packed ordering must decode");
+
+        if self.full == other.full {
+            return self.nibbles.cmp(&other.nibbles);
+        }
+
+        let shared = self.nibbles[..PACKED_BYTES - 1].cmp(&other.nibbles[..PACKED_BYTES - 1]);
+        let last_shared = MAX_PACKED_LEN - 2;
+        shared.then_with(|| nibble_at(&self.nibbles, last_shared).cmp(&nibble_at(&other.nibbles, last_shared))).then_with(|| self.len().cmp(&other.len()))
+    }
+
+    /// Equality against a raw byte string, length-first: the stored length is free, so a mismatch rejects before any
+    /// decoding.
+    pub(crate) fn eq_bytes(&self, other: &[u8]) -> bool {
+        if self.len() != other.len() {
             return false;
         }
 
         let table = self.alphabet.decode_table();
-        for (i, &o) in other.iter().enumerate() {
-            let byte = self.nibbles[i / 2];
-            let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
-            if table[n as usize] != o {
-                return false;
-            }
-        }
-
-        true
+        other.iter().enumerate().all(|(i, &o)| table[nibble_at(&self.nibbles, i) as usize] == o)
     }
 
-    /// Ordering against a raw byte string, length-first for the same ambiguity reason — the pinned counterexample:
-    /// packed "2026" against raw "2026\n" must be Less (the packed string ended), but a naive decoder reading the zero
-    /// nibble as a space would answer Greater (space > newline).  Deriving the length first makes every zero's meaning
-    /// known before it is compared.
+    /// Ordering against a raw byte string: decoded characters decide, then length breaks a prefix tie.
     pub(crate) fn cmp_bytes(&self, other: &[u8]) -> Ordering {
         let len = self.len();
         let table = self.alphabet.decode_table();
         for (i, &o) in other.iter().enumerate().take(len) {
-            let byte = self.nibbles[i / 2];
-            let n = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
-            match table[n as usize].cmp(&o) {
+            match table[nibble_at(&self.nibbles, i) as usize].cmp(&o) {
                 Ordering::Equal => {}
                 ordering => return ordering,
             }
         }
 
         len.cmp(&other.len())
-    }
-
-    /// Same-alphabet comparison on the packed representation: equals raw byte order.  The ASCII-order nibble assignment
-    /// handles symbol-versus-symbol, and the shared zero handles length: a padded slot ties against an interior space
-    /// and the comparison continues, while against any other symbol the pad is lower — prefix-first, exactly as byte
-    /// comparison orders a prefix before its extension.  Callers must decode for cross-alphabet ordering; asserting
-    /// here keeps that contract loud.
-    pub(crate) fn cmp_same_alphabet(&self, other: &Packed) -> Ordering {
-        debug_assert_eq!(self.alphabet, other.alphabet, "cross-alphabet packed ordering must decode");
-        self.nibbles.cmp(&other.nibbles)
     }
 }
 

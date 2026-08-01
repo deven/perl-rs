@@ -965,50 +965,87 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   reclassifies (a lone `E9` becomes flagged malformed content).
 - **Nibble-packed, ≤ 30 characters**, for digit-dense text — two
   characters per byte over 16-symbol alphabets, in 15 payload
-  bytes with **no stored length**: a length byte is two characters
-  of capacity, and 29-30 characters is exactly where
-  millisecond-offset and nanosecond-Zulu timestamps live.  The
-  tier's band is **16-30 characters** and is a property of the
-  representation, not a convention: shorter content takes an
-  inline form, so the packed forms never hold it — which keeps
-  canonical selection single-valued and puts the terminating
-  nibble always within the last eight payload bytes.  The logical
-  length is therefore the capacity minus the count of trailing
-  pad nibbles, read from one word: a big-endian load maps nibble
-  k onto bits 4*(29-k), so the word's trailing zeros are the
-  string's trailing pads and `trailing_zeros() >> 2` counts them.
-  Unused nibbles are canonically zero at construction, and
-  trailing-space strings are unpackable — which is what makes the
-  terminating nibble nonzero and the count exact.  Three
-  alphabets, carried entirely by the
-  enclosing discriminant: *numeric* {space, `+`, `-`, `.`, 0-9,
-  `E`, `e`}, *datetime-Z* {space, `-`, `.`, 0-9, `:`, `T`, `Z`},
-  and *datetime-plus* {space, `+`, `-`, `.`, 0-9, `:`, `T`}.
-  **The space is nibble 0, shared with the padding and
-  disambiguated by position**: trailing zero nibbles are padding,
-  interior zero nibbles are spaces, and a string ending in a
-  space is therefore not packable — its final space could not be
-  told from padding.  The space costs nothing (nibble 0 was
-  already reserved) and it is ASCII 0x20, below every other
-  symbol, so it does not disturb ordering.  Splitting the
-  date-time spellings across two alphabets covers the whole ISO
-  grammar without a seventeenth symbol: a valid timestamp never
-  needs `Z` and `+` together, since Zulu *is* the zero offset —
-  so both offset forms, both date-time separators, and fractional
-  seconds are all encodable — Zulu through full nanoseconds, a
-  numeric offset through milliseconds; the numeric alphabet
-  likewise carries both exponent spellings, since perl emits
-  uppercase through `%E` and `%G` and accepts either on
-  numification.  Nibble values
-  are assigned in ASCII order, so same-alphabet packed comparison
-  is `memcmp` — prefix ordering survives the shared zero because
-  a padded slot ties against an interior space and the longer
-  string, having no trailing space, must still reach a nonzero
-  nibble.  Cross-alphabet *ordering* decodes (table lookups);
-  cross-alphabet *equality* is decided by the alphabets alone,
-  since deterministic classification maps each byte string to
-  exactly one alphabet (fixed priority: numeric, datetime-Z,
-  datetime-plus).  Comparison against an *unpacked*
+  bytes.  The tier's band is **16-30 characters** and is a
+  property of the representation, not a convention: shorter
+  content takes an inline form, so the packed forms never hold
+  it, which keeps canonical selection single-valued.
+
+  **The length lives in the last nibble.**  Each alphabet has two
+  length families, carried by the discriminant alongside it.
+  Content of exactly 30 characters fills every nibble and needs
+  no stored length — the family says so.  Content of 16-29
+  characters puts the low four bits of its length in nibble 29,
+  the one a thirtieth character would have used, and recovers it
+  as `0x10 | nibble` because the band's floor is sixteen.
+  Reading a length is one byte load, an `AND`, and an `OR`: no
+  scan, and no dependence on content.  The length costs a nibble
+  rather than a byte, and only for strings short of capacity,
+  which is why the 30-character forms lose nothing.
+
+  Storing the length explicitly is what makes **trailing spaces
+  representable**.  Deriving it from the last nonzero nibble
+  instead would leave a string ending in a space
+  indistinguishable from one padded with zeros — a restriction
+  that looks harmless for whole strings but blocks incremental
+  building, where a string passes through a trailing space on its
+  way to something longer.  All-space content likewise becomes
+  packable, where before every nibble would have read as padding.
+
+  Three alphabets, carried entirely by the enclosing
+  discriminant, in classification priority order: *numeric*
+  {space, `+`, `-`, `.`, 0-9, `E`, `e`}, *datetime-plus* {space,
+  `+`, `-`, `.`, 0-9, `:`, `T`}, and *datetime-Zulu* {space, `-`,
+  `.`, 0-9, `:`, `T`, `Z`}.  The union is nineteen symbols
+  against sixteen nibble values, so three alphabets are forced; a
+  valid timestamp never needs `Z` and `+` together, since Zulu
+  *is* the zero offset, which is what lets two of them cover the
+  whole ISO grammar without a seventeenth symbol.  Both offset
+  forms, both date-time separators, and fractional seconds are
+  therefore encodable — Zulu through full nanoseconds, a numeric
+  offset through milliseconds — and the numeric alphabet carries
+  both exponent spellings, since perl emits uppercase through
+  `%E` and `%G` and accepts either on numification.
+
+  **The priority order is chosen for the append path.**  Numeric
+  is a subset of datetime-plus on nibbles 0-13, so content that
+  starts numeric and meets a `:` or `T` widens with no rewriting
+  at all — and lands on the canonical alphabet, because
+  datetime-plus is where timestamps belong unless a `Z` forces
+  otherwise.  `Z` is the one symbol no other alphabet holds, so
+  datetime-Zulu is reached only through it, which makes the
+  variant itself a proof that the timestamp's offset is `+00:00`.
+  Content migrating between alphabets transcodes: into
+  datetime-plus nibbles are unchanged and `E`/`e` fail, having no
+  counterpart anywhere; into datetime-Zulu every nibble from
+  `0x02` up decrements, since that alphabet is the same list
+  shifted down past the absent `+`, and `0x01` — the `+` itself —
+  fails.  A failed transcode sends the content to the heap.
+
+  The space is nibble 0, shared with the padding, and costs
+  nothing because nibble 0 was already reserved; at ASCII 0x20 it
+  is below every other symbol, so it does not disturb ordering.
+  Nibble values are assigned in ASCII order, so packed comparison
+  within one alphabet *and one length family* is `memcmp`: a
+  content difference decides before the length field is reached,
+  and where one string ends the other holds a symbol above the
+  zero padding.  Across length families the last nibble means
+  different things on the two sides, so the twenty-nine shared
+  nibbles decide and the lengths break the tie — prefix ordering,
+  since the full family is the longer one.  Cross-alphabet
+  *ordering* decodes (table lookups); cross-alphabet *equality*
+  is decided by the alphabets alone, since deterministic
+  classification maps each byte string to exactly one alphabet.
+
+  **Unused nibbles between the content end and the length field
+  are zero** — an invariant with no natural enforcement now that
+  nothing derives a length from them.  A violation no longer
+  announces itself as a wrong length; it silently corrupts
+  ordering, equality, and hashing, all of which read the whole
+  payload, and equal content must have equal representation.
+  Construction zeroes by building from a zeroed array; any
+  mutation that shortens content must re-zero what it vacates.
+
+  Comparison against an *unpacked*
   representation derives the length first, normatively: a zero
   nibble is ambiguous against a raw space or a raw end-of-string
   (packed "2026" versus raw "2026\n" must order Less, where a
