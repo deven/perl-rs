@@ -1147,10 +1147,12 @@ divergence.  Coverage is the point: `%.15g` trims trailing zeros,
 making the digit-count distribution bimodal (container-measured:
 parse-born and money-shaped values at 1-8 digits, arithmetic
 artifacts at 14-15, nothing between), so the cache covers the
-short mode completely and the long mode recomputes — **all or
-sentinel**.  Partial-digit resumption is unsound to build on:
+short mode completely and the long mode recomputes.  It is an
+all-or-nothing cache: a rendering that does not fit the available
+space is not cached at all.  Keeping the part that fits would buy
+nothing, because partial-digit resumption is unsound —
 correctly-rounded completion requires the high-precision remainder
-state the digits were extracted from, which dwarfs the digits;
+state the digits were extracted from, which dwarfs the digits, and
 there is no cheap verify-or-resume mode.  Cached digits do
 accelerate every *narrower* format for free (rounding a cached
 sequence down is next-digit inspection plus carry).  Values are
