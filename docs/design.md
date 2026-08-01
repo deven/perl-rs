@@ -1515,6 +1515,24 @@ stored key: keys returned by `keys`/`each` are clean *structurally*,
 implementing the documented hash-key untaint contract (§2.6.2) rather
 than scrubbing on read.  Equality already ignores those bits, so
 tainted-key lookup against clean stored keys needs no special case.
+**Ordering is code-point ordering**, and the utf8 flag is what
+selects between the two readings.  When both sides carry the same
+flag, byte order *is* code-point order — unflagged octets are
+their own code points, and UTF-8 is order-preserving — so a byte
+comparison answers, and two packed strings of one alphabet compare
+as their nibbles do, the values being assigned in ASCII order.
+When the flags differ, the flagged side's bytes decode to code
+points while the plain side's are code points, and the two are
+walked together.  Container-verified across 625 pairs spanning the
+four flag combinations: an unflagged `0xE9` sorts before a flagged
+`U+0100`, and `"\xC3\xA9"` before `U+00E9`, its first octet reading
+as `U+00C3`.  Ordering and equality agree on every pair, which they
+must, or a sort and a lookup can disagree about the same strings.
+
+Unlike equality, ordering gets no shortcuts from the scan-state
+grid: knowing two strings differ says nothing about which is
+greater, so the cross-flag path always walks.
+
  Under `use bytes` the ops layer selects a third comparison mode —
 raw bytes, flags ignored — by compile-time hint (§2.2.3, §8); it is
 not a property of the strings.  The warned and tainted tag bits are

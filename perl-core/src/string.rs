@@ -25,6 +25,7 @@
 use crate::cow_buffer::{AllocError, CowBuffer};
 use crate::packed::{MAX_PACKED_LEN, MIN_PACKED_LEN, PACKED_BYTES, Packed, PackedAlphabet, pack};
 use crate::value::{Numeric, classify_numeric, parse_float, parse_int_i64_visible, string_would_warn};
+use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
@@ -1439,6 +1440,89 @@ macro_rules! grid_hit {
         #[cfg(test)]
         eq_probe::GRID_HITS.with(|c| c.set(c.get() + 1));
     };
+}
+
+impl PerlString {
+    /// Perl's `cmp`: **code-point ordering**, which is what the utf8 flag selects between.
+    ///
+    /// The flag says how to read the bytes, so it decides the comparison shape.  When both sides agree, byte order *is*
+    /// code-point order — unflagged octets are their own code points, and UTF-8 is order-preserving, so a straight byte
+    /// comparison answers.  When they disagree, the flagged side's bytes decode to code points while the plain side's
+    /// are code points, and the two are walked together.
+    ///
+    /// Container-verified: an unflagged `0xE9` sorts before a flagged `U+0100`, and `"\xC3\xA9"` sorts before `U+00E9`
+    /// because its first octet reads as `U+00C3`.  Equal content compares equal across flags, agreeing with
+    /// [`PartialEq`].
+    ///
+    /// This is the default mode.  `use bytes` selects raw-octet ordering instead, which is a lexical pragma and so the
+    /// caller's to apply (§2.2.9); against these strings that is [`PerlString::cmp_bytes_mode`].
+    pub fn cmp_perl(&self, other: &PerlString) -> Ordering {
+        if self.is_utf8() == other.is_utf8() {
+            return self.cmp_bytes_mode(other);
+        }
+
+        let (flagged, plain) = if self.is_utf8() { (self, other) } else { (other, self) };
+        let ordering = cmp_cross_flag(flagged, plain);
+
+        if self.is_utf8() { ordering } else { ordering.reverse() }
+    }
+
+    /// Raw-octet ordering: what `use bytes` selects, and what `cmp_perl` reduces to when both sides read their bytes
+    /// the same way.
+    ///
+    /// Two packed strings of one alphabet compare as their nibbles do — the values are assigned in ASCII order, so
+    /// nibble order is byte order — without decoding either side.
+    pub fn cmp_bytes_mode(&self, other: &PerlString) -> Ordering {
+        match (self.raw_parts(), other.raw_parts()) {
+            (RawParts::Packed(a), RawParts::Packed(b)) if a.alphabet == b.alphabet => a.cmp_same_alphabet(&b),
+            (RawParts::Packed(a), _) => a.cmp_bytes(other.as_bytes(&mut [0u8; DECODE_MAX])),
+            (_, RawParts::Packed(b)) => b.cmp_bytes(self.as_bytes(&mut [0u8; DECODE_MAX])).reverse(),
+            _ => {
+                let (mut ls, mut rs) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
+                self.as_bytes(&mut ls).cmp(other.as_bytes(&mut rs))
+            }
+        }
+    }
+}
+
+/// Compare a flagged string's code points against an unflagged string's octets, which are themselves code points.
+///
+/// Malformed flagged content has no code points to compare, so it falls back to octets — the same bytes either way, and
+/// the only answer available.
+fn cmp_cross_flag(flagged: &PerlString, plain: &PerlString) -> Ordering {
+    let (mut fs, mut ps) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
+    let fb = flagged.as_bytes(&mut fs);
+    let pb = plain.as_bytes(&mut ps);
+
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < fb.len() && j < pb.len() {
+        let window = &fb[i..(i + 4).min(fb.len())];
+        let (point, width) = match str::from_utf8(window) {
+            Ok(w) => match w.chars().next() {
+                Some(c) => (c as u32, c.len_utf8()),
+                None => return Ordering::Equal, // Unreachable: the window is non-empty.
+            },
+            Err(e) if e.valid_up_to() > 0 => {
+                let valid = &window[..e.valid_up_to()];
+                match str::from_utf8(valid).ok().and_then(|w| w.chars().next()) {
+                    Some(c) => (c as u32, c.len_utf8()),
+                    None => (fb[i] as u32, 1),
+                }
+            }
+            Err(_) => (fb[i] as u32, 1), // Malformed: the octet stands for itself.
+        };
+
+        match point.cmp(&(pb[j] as u32)) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+
+        i += width;
+        j += 1;
+    }
+
+    // Whichever still has content is the longer, hence the greater.
+    (i < fb.len()).cmp(&(j < pb.len()))
 }
 
 impl PartialEq for PerlString {

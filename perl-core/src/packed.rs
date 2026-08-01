@@ -52,12 +52,6 @@
 //!   DateTimeZulu, so equal byte contents always take equal representations — the prerequisite for representation-level
 //!   equality.
 
-// `cmp_same_alphabet` and `cmp_bytes` await string ordering, which `PerlString` does not yet have: perl orders by code
-// point (container-verified — an unflagged 0xE9 sorts before a flagged U+0100, and `use bytes` switches to raw octets),
-// so it needs the same scan-state grid and cross-flag walk that equality has, plus that mode selection.  The expect
-// self-reports when it arrives.
-#![cfg_attr(not(test), expect(dead_code))]
-
 use std::cmp::Ordering;
 
 /// The packed-tier capacity in characters: 15 nibble bytes, two characters each.
