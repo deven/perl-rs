@@ -30,7 +30,8 @@
 //!   `"0.0"`, `"00"`, `" "`) is true.
 
 use parking_lot::RwLock;
-use std::borrow::Cow;
+use std::fmt;
+use std::fmt::Write as _;
 use std::mem;
 use std::str;
 
@@ -227,24 +228,33 @@ macro_rules! impl_coercions {
             /// immortal-boolean rule).  Numeric renderings are at most 24 ASCII bytes, hence inline; the `Result` is
             /// the honest allocation contract, not an expected path.
             pub fn stringify(&self) -> Result<PerlString, AllocError> {
-                let (text, taint): (Cow<'_, str>, Tainted) = match self {
-                    $ty::Undef(t) => (Cow::Borrowed(""), *t),
-                    $ty::Int(n, t) => (Cow::Owned(n.to_string()), *t),
-                    $ty::Float(f, t) => (Cow::Owned(format_nv(*f)), *t),
+                // Each arm produces the `PerlString` directly: routing through Rust `String` would allocate a buffer
+                // per rendering only to copy its bytes into the value and drop it again.
+                let mut rendered = NumericBuf::new();
+                let (out, taint): (PerlString, Tainted) = match self {
+                    $ty::Undef(t) => (PerlString::empty(), *t),
+                    $ty::Int(n, t) => {
+                        format_int_into(*n, &mut rendered);
+                        (PerlString::from_bytes(rendered.as_bytes())?, *t)
+                    }
+                    $ty::Float(f, t) => {
+                        format_float_into(*f, &mut rendered);
+                        (PerlString::from_bytes(rendered.as_bytes())?, *t)
+                    }
                     $ty::String(s) => return Ok(s.clone()),
-                    $ty::True => (Cow::Borrowed("1"), Tainted::CLEAN),
-                    $ty::False => (Cow::Borrowed(""), Tainted::CLEAN),
+                    $ty::True => (PerlString::from_bytes(b"1")?, Tainted::CLEAN),
+                    $ty::False => (PerlString::empty(), Tainted::CLEAN),
 
                     // Container-verified form: SCALAR(0x...) with lowercase hex.
-                    $ty::ScalarRefMut(c, t) => (Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
-                    $ty::ScalarRefConst(c, t) => (Cow::Owned(format!("SCALAR(0x{:x})", HeapArc::as_ptr(c) as usize)), *t),
-                    $ty::ArrayRef(r, t) => (Cow::Owned(format!("ARRAY(0x{:x})", r.addr())), *t),
-                    $ty::HashRef(r, t) => (Cow::Owned(format!("HASH(0x{:x})", r.addr())), *t),
+                    $ty::ScalarRefMut(c, t) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, *t),
+                    $ty::ScalarRefConst(c, t) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, *t),
+                    $ty::ArrayRef(r, t) => (ref_repr("ARRAY", r.addr())?, *t),
+                    $ty::HashRef(r, t) => (ref_repr("HASH", r.addr())?, *t),
                     $($ty::$smut(c) => return c.read().stringify(),)?
                     $($ty::$sconst(c) => return Ok(c.stringify().clone()),)?
                 };
 
-                let mut out: PerlString = text.parse()?;
+                let mut out = out;
                 if taint.is_tainted() {
                     out.taint();
                 }
@@ -448,51 +458,171 @@ pub fn array_delete(slots: &mut Vec<ArraySlot>, index: usize) -> Value {
 /// digits in exponent form, then choose fixed or exponent presentation by the `%g` rule and strip trailing fraction
 /// zeros.  All shapes verified against perl 5.38.2 print output: `0.1+0.2` is `"0.3"`, `1e15` is `"1e+15"`, `1e-5` is
 /// `"1e-05"`.
-pub fn format_nv(n: f64) -> String {
+/// The widest rendering any of these formatters produces: `%.15g` tops out at 22 characters
+/// (`-2.22507385850720e-308`) and `i64::MIN` at 20, so 32 bytes is comfortable headroom.
+const NUMERIC_FORMAT_MAX: usize = 32;
+
+/// A fixed-capacity formatting buffer.  Numeric rendering is constant traffic — every printed number, every number
+/// used as a hash key, every interpolation — and its output is bounded, so it has no business allocating.  Writes past
+/// the capacity are dropped rather than panicking; `NUMERIC_FORMAT_MAX` is proved sufficient by the bounds above, and
+/// a debug assertion catches any future format that outgrows it.
+struct NumericBuf {
+    buf: [u8; NUMERIC_FORMAT_MAX],
+    len: usize,
+}
+
+impl NumericBuf {
+    fn new() -> NumericBuf {
+        NumericBuf { buf: [0; NUMERIC_FORMAT_MAX], len: 0 }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// The rendered text.  Always ASCII: every byte written here comes from a numeric format.
+    fn as_str(&self) -> &str {
+        str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.len < NUMERIC_FORMAT_MAX {
+            self.buf[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.push(b);
+        }
+    }
+
+    fn push_zeros(&mut self, count: usize) {
+        for _ in 0..count {
+            self.push(b'0');
+        }
+    }
+}
+
+impl fmt::Write for NumericBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let before = self.len;
+        self.push_bytes(s.as_bytes());
+        debug_assert_eq!(self.len - before, s.len(), "NUMERIC_FORMAT_MAX is too small for this format");
+        Ok(())
+    }
+}
+
+/// Perl's default float stringification: `sprintf("%.15g")`, the `SvPV` path — a fixed significant-digit count rather
+/// than shortest-round-trip, which is why perl prints `0.1 + 0.2` as `0.3`.  Perl's own capitalizations for the
+/// specials.  Renders into `out`, allocating nothing.
+///
+/// Explicit `sprintf`/`printf` with a precision is a different operation with unbounded output (§2.2.3); this covers
+/// only the implicit conversion.
+fn format_float_into(n: f64, out: &mut NumericBuf) {
     if n.is_nan() {
-        return "NaN".to_string();
+        out.push_bytes(b"NaN");
+        return;
     }
 
     if n.is_infinite() {
-        return if n < 0.0 { "-Inf".to_string() } else { "Inf".to_string() };
+        out.push_bytes(if n < 0.0 { b"-Inf" } else { b"Inf" });
+        return;
     }
 
     if n == 0.0 {
-        return "0".to_string();
+        out.push(b'0'); // Covers -0.0, which perl also prints as "0".
+        return;
     }
 
-    // "{:.14e}" gives a normalized d.dddddddddddddd form — 15 significant digits, correctly rounded.
-    let rendered = format!("{:.14e}", n);
-    let Some((mantissa, exp)) = rendered.split_once('e') else {
-        return rendered; // unreachable: exponent form always contains 'e'; returning it is the no-panic path
+    // "{:.14e}" is the normalized d.dddddddddddddd form: 15 significant digits, correctly rounded.
+    let mut scientific = NumericBuf::new();
+    let _ = write!(scientific, "{n:.14e}");
+    let rendered = scientific.as_bytes();
+
+    let Some(e) = rendered.iter().position(|&b| b == b'e') else {
+        out.push_bytes(rendered); // Unreachable: exponent form always contains 'e'.
+        return;
     };
-    let Ok(exp) = exp.parse::<i32>() else {
-        return rendered; // unreachable likewise
+    let (mantissa, exponent) = (&rendered[..e], &rendered[e + 1..]);
+    let Ok(exp) = str::from_utf8(exponent).unwrap_or("").parse::<i32>() else {
+        out.push_bytes(rendered); // Unreachable likewise.
+        return;
     };
 
-    let sign = if mantissa.starts_with('-') { "-" } else { "" };
-    let all_digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
-    let digits = all_digits.trim_end_matches('0');
-    let digits = if digits.is_empty() { "0" } else { digits };
+    let negative = mantissa.first() == Some(&b'-');
+    // The significant digits, trailing zeros trimmed — %g drops them.
+    let mut digits = [0u8; 16];
+    let mut count = 0;
+    for &b in mantissa {
+        if b.is_ascii_digit() && count < digits.len() {
+            digits[count] = b;
+            count += 1;
+        }
+    }
+    while count > 1 && digits[count - 1] == b'0' {
+        count -= 1;
+    }
+    let digits = &digits[..count];
 
-    // %g uses exponent form when the decimal exponent is below -4 or at/above the precision (15).
+    if negative {
+        out.push(b'-');
+    }
+
+    // %g takes exponent form when the decimal exponent is below -4 or at/above the precision (15).
     if !(-4..15).contains(&exp) {
-        let frac = &digits[1..];
-        let point = if frac.is_empty() { String::new() } else { format!(".{frac}") };
-        let exp_sign = if exp < 0 { '-' } else { '+' };
-        return format!("{sign}{}{point}e{exp_sign}{:02}", &digits[..1], exp.abs());
+        out.push(digits[0]);
+        if count > 1 {
+            out.push(b'.');
+            out.push_bytes(&digits[1..]);
+        }
+        out.push(b'e');
+        out.push(if exp < 0 { b'-' } else { b'+' });
+        let magnitude = exp.unsigned_abs();
+        if magnitude < 10 {
+            out.push(b'0'); // Perl pads the exponent to two digits: 1e-05, not 1e-5.
+        }
+        let _ = write!(out, "{magnitude}");
+        return;
     }
 
     if exp >= 0 {
         let int_len = exp as usize + 1;
-        if digits.len() <= int_len {
-            format!("{sign}{digits}{}", "0".repeat(int_len - digits.len()))
+        if count <= int_len {
+            out.push_bytes(digits);
+            out.push_zeros(int_len - count);
         } else {
-            format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
+            out.push_bytes(&digits[..int_len]);
+            out.push(b'.');
+            out.push_bytes(&digits[int_len..]);
         }
     } else {
-        format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        out.push_bytes(b"0.");
+        out.push_zeros((-exp - 1) as usize);
+        out.push_bytes(digits);
     }
+}
+
+/// Perl's default float stringification as an owned `String`, for callers that want Rust text.  Paths that build a
+/// `PerlString` render into the stack buffer instead and never allocate.
+pub fn format_float(n: f64) -> String {
+    let mut out = NumericBuf::new();
+    format_float_into(n, &mut out);
+    out.as_str().to_string()
+}
+
+/// Perl's integer stringification, rendered without allocating.
+fn format_int_into(n: i64, out: &mut NumericBuf) {
+    let _ = write!(out, "{n}");
+}
+
+/// A reference's stringification: `PREFIX(0xADDR)` with lowercase hex, perl's container-verified form.  Rendered
+/// through the stack buffer like the numeric forms; the result exceeds the inline capacity, so this one does allocate.
+fn ref_repr(prefix: &str, addr: usize) -> Result<PerlString, AllocError> {
+    let mut out = NumericBuf::new();
+    let _ = write!(out, "{prefix}(0x{addr:x})");
+    PerlString::from_bytes(out.as_bytes())
 }
 
 /// Leading ASCII whitespace and optional sign; returns (negative, rest).

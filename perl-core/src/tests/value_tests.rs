@@ -135,22 +135,22 @@ fn parse_float_inf_nan_prefix_forms() {
     assert!(parse_float(b"NaN").is_nan());
 }
 
-// ── format_nv (ported; all values verified against perl 5.38.2 print output) ──
+// ── format_float (ported; all values verified against perl 5.38.2 print output) ──
 #[test]
-fn format_nv_matches_perl_g15() {
-    assert_eq!(format_nv(0.1 + 0.2), "0.3");
-    assert_eq!(format_nv(0.0), "0");
-    assert_eq!(format_nv(-0.0), "0");
-    assert_eq!(format_nv(42.0), "42");
-    assert_eq!(format_nv(3.7), "3.7");
-    assert_eq!(format_nv(1e15), "1e+15");
-    assert_eq!(format_nv(999999999999999.0), "999999999999999");
-    assert_eq!(format_nv(1e-5), "1e-05");
-    assert_eq!(format_nv(0.0001), "0.0001");
-    assert_eq!(format_nv(f64::NAN), "NaN");
-    assert_eq!(format_nv(f64::INFINITY), "Inf");
-    assert_eq!(format_nv(f64::NEG_INFINITY), "-Inf");
-    assert_eq!(format_nv(-2.5), "-2.5");
+fn format_float_matches_perl_g15() {
+    assert_eq!(format_float(0.1 + 0.2), "0.3");
+    assert_eq!(format_float(0.0), "0");
+    assert_eq!(format_float(-0.0), "0");
+    assert_eq!(format_float(42.0), "42");
+    assert_eq!(format_float(3.7), "3.7");
+    assert_eq!(format_float(1e15), "1e+15");
+    assert_eq!(format_float(999999999999999.0), "999999999999999");
+    assert_eq!(format_float(1e-5), "1e-05");
+    assert_eq!(format_float(0.0001), "0.0001");
+    assert_eq!(format_float(f64::NAN), "NaN");
+    assert_eq!(format_float(f64::INFINITY), "Inf");
+    assert_eq!(format_float(f64::NEG_INFINITY), "-Inf");
+    assert_eq!(format_float(-2.5), "-2.5");
 }
 
 // ── Taint (§2.6.1/§2.6.3) ─────────────────────────────────────
@@ -333,4 +333,83 @@ fn envelope_sizes() {
     assert_eq!(size_of::<Option<Value>>(), 24);
     assert_eq!(size_of::<ArraySlot>(), 24);
     assert_eq!(size_of::<Numeric>(), 16);
+}
+
+// ── format_float against perl's default NV stringification ────────
+//
+// Every expectation below is container perl 5.38.2's own output for the same literal, captured by differential run:
+// `print 1e15` and friends.  Note that these are NV *literals* — perl's arithmetic returns an IV whenever the result
+// is integral and fits, so `1e15 + 0.0` prints as 1000000000000000 rather than 1e+15, which is integer
+// stringification and a different path.
+#[test]
+fn format_float_matches_container_perl() {
+    let cases: &[(f64, &str)] = &[
+        (0.1_f64, "0.1"),
+        (0.30000000000000004_f64, "0.3"),
+        (0.0_f64, "0"),
+        (-0.0_f64, "0"),
+        (1.0_f64, "1"),
+        (-1.0_f64, "-1"),
+        (42.0_f64, "42"),
+        (3.7_f64, "3.7"),
+        (-2.5_f64, "-2.5"),
+        (1.25_f64, "1.25"),
+        (0.5_f64, "0.5"),
+        (100.0_f64, "100"),
+        (1e14_f64, "100000000000000"),
+        (1e15_f64, "1e+15"),
+        (1e16_f64, "1e+16"),
+        (1e21_f64, "1e+21"),
+        (1e100_f64, "1e+100"),
+        (1e308_f64, "1e+308"),
+        (999999999999999.0_f64, "999999999999999"),
+        (1000000000000000.0_f64, "1e+15"),
+        (1234567890123456.0_f64, "1.23456789012346e+15"),
+        (123456789012345.0_f64, "123456789012345"),
+        (1.5e15_f64, "1.5e+15"),
+        (-1e15_f64, "-1e+15"),
+        (0.0001_f64, "0.0001"),
+        (0.00001_f64, "1e-05"),
+        (0.00012345_f64, "0.00012345"),
+        (0.000123456789012345_f64, "0.000123456789012345"),
+        (0.3333333333333333_f64, "0.333333333333333"),
+        (-0.3333333333333333_f64, "-0.333333333333333"),
+        (2.220446049250313e-16_f64, "2.22044604925031e-16"),
+        (1.7976931348623157e308_f64, "1.79769313486232e+308"),
+        (2.2250738585072014e-308_f64, "2.2250738585072e-308"),
+        (-2.2250738585072014e-308_f64, "-2.2250738585072e-308"),
+        (5e-324_f64, "4.94065645841247e-324"),
+        (9.88131291682493e-324_f64, "9.88131291682493e-324"),
+        (1e-300_f64, "1e-300"),
+        (123.456_f64, "123.456"),
+        (0.007_f64, "0.007"),
+        (7.0_f64, "7"),
+        (1e5_f64, "100000"),
+        (1e-1_f64, "0.1"),
+        (0.9999999999999999_f64, "1"),
+        (1.0000000000000002_f64, "1"),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(&format_float(*value), expected, "rendering {value:?}");
+    }
+}
+
+#[test]
+fn format_float_specials_use_perls_capitalization() {
+    assert_eq!(format_float(f64::NAN), "NaN");
+    assert_eq!(format_float(f64::INFINITY), "Inf");
+    assert_eq!(format_float(f64::NEG_INFINITY), "-Inf");
+}
+
+#[test]
+fn numeric_stringification_does_not_allocate() {
+    // The keystone invariant (§2.2.3): default numeric renderings stay in the value itself.  If a rendering ever
+    // exceeds the non-allocating capacity this fails rather than silently allocating on constant-traffic paths.
+    for value in [0.0_f64, 3.7, -2.5, 1e15, 1e-5, f64::MIN_POSITIVE, f64::MAX, -f64::MAX, f64::NAN] {
+        let rendered = format_float(value);
+        assert!(PerlString::inline(&rendered).is_some(), "{rendered} should need no allocation");
+    }
+    for value in [0_i64, -1, i64::MAX, i64::MIN] {
+        assert!(PerlString::inline(value.to_string()).is_some(), "{value} should need no allocation");
+    }
 }
