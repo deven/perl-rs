@@ -25,6 +25,7 @@
 use crate::cow_buffer::{AllocError, CowBuffer};
 use crate::packed::{MAX_PACKED_LEN, MIN_PACKED_LEN, PACKED_BYTES, Packed, PackedAlphabet, pack};
 use std::fmt;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::mem;
 use std::str;
@@ -1589,7 +1590,35 @@ impl Clone for PerlString {
     }
 }
 
+/// Byte-string syntax for the content: printable ASCII as itself, everything else escaped.  `Debug` for a byte slice
+/// renders integers, which makes a timestamp thirty numbers; a perl string's bytes are frequently not UTF-8, so lossy
+/// text would misrepresent them instead.
+struct ByteLiteral<'a>(&'a [u8]);
+
+impl fmt::Debug for ByteLiteral<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("b\"")?;
+        for &b in self.0 {
+            match b {
+                b'"' => f.write_str("\\\"")?,
+                b'\\' => f.write_str("\\\\")?,
+                b'\n' => f.write_str("\\n")?,
+                b'\r' => f.write_str("\\r")?,
+                b'\t' => f.write_str("\\t")?,
+                0x20..=0x7E => f.write_char(b as char)?,
+                _ => write!(f, "\\x{b:02X}")?,
+            }
+        }
+
+        f.write_str("\"")
+    }
+}
+
 impl fmt::Debug for PerlString {
+    /// The representation, not the value: which tier holds the content, its length, the three per-value tag bits, and
+    /// the bytes.  A developer printing one of these is nearly always asking where it landed, and this type's identity
+    /// *is* its representation — how the content should render as text is a question for whatever layer knows the
+    /// output encoding.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PerlString")
             .field("storage", &self.storage_kind())
@@ -1597,7 +1626,7 @@ impl fmt::Debug for PerlString {
             .field("utf8", &self.is_utf8())
             .field("warned", &self.is_warned())
             .field("tainted", &self.is_tainted())
-            .field("bytes", &self.as_bytes(&mut [0u8; DECODE_MAX]))
+            .field("bytes", &ByteLiteral(self.as_bytes(&mut [0u8; DECODE_MAX])))
             .finish()
     }
 }

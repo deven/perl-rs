@@ -1223,3 +1223,19 @@ fn interpretation_agrees_across_storage_forms() {
     assert_eq!(padded.to_int(), 17, "trailing space does not change the numeric prefix");
     assert!(short.to_bool() && padded.to_bool());
 }
+
+#[test]
+fn debug_shows_the_representation_with_readable_bytes() {
+    let packed: PerlString = "2026-07-28T14:33:07Z".parse().unwrap();
+    let shown = format!("{packed:?}");
+    assert!(shown.contains("storage: Packed"), "the tier is the first thing a developer wants: {shown}");
+    assert!(shown.contains(r#"bytes: b"2026-07-28T14:33:07Z""#), "byte-string syntax, not integers: {shown}");
+
+    // Bytes that are not text render escaped rather than lossily, since a perl string's content need not be UTF-8.
+    let raw = PerlString::from_bytes(&[0xFF, 0xFE, b'h', b'i']).unwrap();
+    assert!(format!("{raw:?}").contains(r#"b"\xFF\xFEhi""#));
+
+    // The usual escapes, so a newline does not break the line.
+    let escaped: PerlString = "a\tb\nc".parse().unwrap();
+    assert!(format!("{escaped:?}").contains(r#"b"a\tb\nc""#));
+}
