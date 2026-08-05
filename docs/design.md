@@ -156,7 +156,7 @@ enum Value {
     StrLatin1(..),             // (§2.2.9): the class selects the
     StrNonLatin1(..),          // payload representation — compressed
     StrExtended(..),           // code points or verbatim octets;
-    StrMalformed(..),          // <= 14 split s/h nibbles, 15 implied
+    StrBytes(..),              // <= 14 split s/h nibbles, 15 implied
     StrPackedNumeric(..),      // nibble-packed <= 30 chars: all 15
     StrPackedDateTimeZ(..),    // payload bytes are nibbles, so the
     StrPackedDateTimePlus(..), // alphabet lives in the variant (§2.2.9)
@@ -471,7 +471,7 @@ tag — and needs only the five *terminal* states (`ASCII`,
 `MALFORMED_UTF8`), because inline strings are scanned eagerly and
 completely at construction (§2.2.7): checking at most 15 bytes is
 nearly free.  Discriminant-state arithmetic under the fused
-variants (§2.2.9): inline-Bytes 5 (scan) × 2 (warned) ×
+variants (§2.2.9): inline-bytes 5 (scan) × 2 (warned) ×
 2 (tainted) = 20 (the flag is off by definition); inline-Utf8
 3 (scan) × 2 × 2 = 12 (the flag is on by definition);
 inline-Latin-1 2 (flag) × 2 (ascii) × 2 × 2 = 16; packed
@@ -961,7 +961,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   form keeping it in the byte a fifteenth character would have
   used.  The discriminant carries the **content class** — the
   five terminal states of the §2.2.4 scan lattice (ASCII,
-  Latin-1-range, non-Latin-1, extended, malformed), established
+  Latin-1-range, non-Latin-1, extended, bytes), established
   eagerly at construction — and the class, the family, the flag,
   and the §2.6/§2.3.4 bits are all tag dimensions, so every
   content fact a reader wants is a tag inspection, never a
@@ -988,12 +988,13 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
     payload count: fifteen stored high-Latin-1 code points report
     length **30** (container-verified, with `ord` returning the
     lead byte `C3`, not the code point).
-  - *Non-Latin-1, extended, and malformed content* stores the
+  - *Non-Latin-1, extended, and bytes-class content* stores the
     internal octets **verbatim**: 0-15 original bytes that are
     Rust-valid UTF-8 beyond the Latin-1 range, perl-decodable but
-    Rust-invalid (§2.2.4), or malformed under both readings —
-    the last by default, the tag having ruled out every other
-    class.  Only the compressed classes have a 0-28 internal
+    Rust-invalid (§2.2.4), or the bytes class — selected by
+    default when the tag rules out every other, and not opaque:
+    unflagged, perl reads the octets as Latin-1, every byte a
+    character.  Only the compressed classes have a 0-28 internal
     byte range; verbatim storage holds what it holds.
 
   **The length byte is two nibbles.**  For content of 14 payload
@@ -1005,15 +1006,17 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   character length is `s` with the flag on and `s + h` with it
   off: every length answer a nibble read and at most one add.
   For the two verbatim valid classes it holds the decoded
-  character count, and for malformed it is canonically zero.
+  character count; for the bytes class it is canonically zero.
   The assignment is forced per class rather than chosen: for the
   compressed classes a character count would duplicate `s` — the
   flag-on count is `s` itself — while `h` derives every length in
   one add; for the verbatim classes `h` cannot recover the
   character count, which is `s` minus the continuation bytes
   where a high-bit count merges leads with continuations, so the
-  count is stored directly; and malformed content has no
-  character count to record.  The unreachable values are
+  count is stored directly; and the bytes class splits by flag —
+  unflagged, the count is `s` itself, perl reading the octets as
+  Latin-1, with nothing left to store; flagged, no count exists,
+  perl's one genuinely malformed reading.  The unreachable values are
   debug-assertion territory: `h` is never zero for the
   Latin-1-range class — that content is the ASCII class by
   canonical selection — and never 15, and a verbatim character
@@ -1043,7 +1046,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
 
   The class/flag independence is load-bearing, with a pinned
   monster: payload `E9` flag-off means the one-octet string `é`
-  stored verbatim under the *malformed* class and the two-octet
+  stored verbatim under the *bytes* class and the two-octet
   string `C3 A9` stored compressed under the *Latin-1* class —
   different strings (container-verified: flag-off they compare
   unequal at lengths one and two; decode the second and they
@@ -1055,13 +1058,12 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   octet sequence that is valid Latin-1-range UTF-8 always takes
   the compressed representation, never verbatim storage, and the
   verbatim classes hold exactly the content failing that test;
-  the full tier-selection priority (compressed inline, verbatim
-  inline, packed, heap, by content and fitted capacity) is a
-  normative table at implementation.  Byte-level *mutation* can
-  split an encoded character — container-verified: `chop`
-  removes one byte, leaving a dangling lead byte that is no
-  longer valid UTF-8 — so mutation re-runs canonical selection
-  on the result, and a split lands in a verbatim class; decoded
+  the full tier selection is normative, tabled below.
+  Byte-level *mutation* can split an encoded character —
+  container-verified: `chop` removes one byte, leaving a
+  dangling lead byte that is no longer valid UTF-8 — so mutation
+  re-runs canonical selection on the result, and a split lands in
+  a verbatim class; decoded
   storage is a read optimization the string can fall out of,
   never a constraint on what the bytes may become.  The
   reinterpretation APIs are representation transforms, total
@@ -1069,7 +1071,38 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   encoding: `Encode::_utf8_off` on compressed flag-on content
   re-expands (container-verified: an upgraded `é` becomes the
   flag-off two-character `C3.A9`), and `_utf8_on` on raw octets
-  reclassifies (a lone `E9` stays malformed-class, now flagged).
+  reclassifies (a lone `E9` stays bytes-class, now flagged).
+
+  **The storage types are the normative vocabulary.**  The
+  seventeen base variants — `InlineAscii`, `InlineLatin1`,
+  `InlineNonLatin1`, `InlineExtended`, and `InlineBytes`, each
+  beside its `Full` family twin; the `PackedNumeric`,
+  `PackedDateTimePlus`, and `PackedDateTimeZulu` pairs; and
+  `Heap` — are reified as `StorageType`, and the discriminant is
+  `type x 8 + flags` with the utf8, warned, and tainted bits as
+  the low three, so `storage_type()` is a shift once explicit
+  discriminants land, class is `type >> 1` and family `type & 1`
+  over the inline range, and every coarse question is a
+  projection on it.  `StorageKind`, `InlineScan`, and the model
+  `InlineStr` retire into it.  The inline bytes class and the
+  §2.2.4 lattice terminal `MALFORMED_UTF8` are the same
+  classification of the same content — one eager, in the tag;
+  one lazy, in the buffer header; the constant keeps its name
+  because it states a relation to UTF-8, not the content's
+  nature.  Tier selection is deterministic because the content
+  categories are disjoint and length decides within each:
+  all-ASCII content takes `InlineAscii` at 0-15 characters,
+  packed at 16-30 where it fits an alphabet — tried in the fixed
+  order `Numeric`, `DateTimePlus`, `DateTimeZulu`, digits
+  fitting more than one — and heap otherwise; Latin-1-range
+  content with a high code point takes `InlineLatin1` at 0-15
+  code points (up to 30 encoded bytes) and heap past that, the
+  packed rungs unreachable for it since the alphabets are
+  ASCII-only; non-Latin-1, extended, and bytes content takes its
+  inline type at 0-15 octets and heap past that.  The growth
+  consequence: only alphabet-compatible ASCII leaves inline
+  capacity without spilling to heap.  The ladder consults bytes
+  alone, never the flag (class/flag independence above).
 - **Nibble-packed, ≤ 30 characters**, for digit-dense text — two
   characters per byte over 16-symbol alphabets, in 15 payload
   bytes.  The tier's band is **16-30 characters** and is a
