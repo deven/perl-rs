@@ -905,6 +905,26 @@ fn inline_payload(bytes: &[u8]) -> [u8; INLINE_MAX] {
 }
 
 impl PerlString {
+    /// Construct from a Rust `&str`.  ASCII content is stored unflagged (the canonical downgraded form, §2.3.5);
+    /// non-ASCII content is stored with the utf8 flag, its validity known from the type.  Allocation failure is the
+    /// only error.
+    ///
+    /// Generic at the boundary so that embedders holding a `String`, a `Cow`, or one of the compact string types from
+    /// the ecosystem need no conversion; the ladder beneath is monomorphic and instantiated once.
+    pub fn new(s: impl AsRef<str>) -> Result<PerlString, AllocError> {
+        let s = s.as_ref();
+
+        if let Some(inline) = PerlString::inline(s) {
+            Ok(inline)
+        } else {
+            let bytes = s.as_bytes();
+            let cb = CowBuffer::from_slice(bytes)?;
+            let ascii = bytes.iter().all(|b| b.is_ascii());
+            cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE });
+            Ok(PerlString::build_heap(!ascii, false, false, cb))
+        }
+    }
+
     /// Construct from raw bytes (I/O, `Encode`, lexer literals).  Unflagged; inline content gets its eager terminal
     /// scan, heap content defers all scanning (`UNKNOWN`), per §2.2.7.
     pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<PerlString, AllocError> {
@@ -916,6 +936,20 @@ impl PerlString {
                 Ok(PerlString::build_heap(false, false, false, cb))
             }
         }
+    }
+
+    /// The full tier ladder with every tag dimension supplied — the transforms' constructor, and `from_bytes` in
+    /// spirit: compressed inline, verbatim inline, packed, heap, in the ruled order (§2.2.9).  Internal: public
+    /// construction fixes the flags.
+    fn tiered(bytes: &[u8], utf8: bool, warned: bool, tainted: bool) -> Result<PerlString, AllocError> {
+        if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
+            return Ok(PerlString::build_inline(class, utf8, warned, tainted, stored, aux, buf));
+        }
+        if let Some(p) = pack(bytes) {
+            return Ok(PerlString::build_packed(p, utf8, warned, tainted));
+        }
+        let cb = CowBuffer::from_slice(bytes)?;
+        Ok(PerlString::build_heap(utf8, warned, tainted, cb))
     }
 
     /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
@@ -1209,6 +1243,124 @@ impl PerlString {
     /// Mark the numification warning as fired.  Monotone: there is no clearing method (§2.3.4).
     pub fn mark_warned(&mut self) {
         self.rebuild_tag(|_u, _w, _t| (_u, true, _t));
+    }
+
+    // ── Representation transforms (§2.2.9) ────────────────────────
+    // Private until the ops layer calls them — no public surface without a caller — with the tests pinning the
+    // container-verified facts the design records.
+
+    /// `Encode::_utf8_on`/`_utf8_off`: reinterpretation is a pure flag flip.  The class is a fact about the bytes, so
+    /// the representation is already right, verbatim and compressed classes alike (§2.2.9): an upgraded `é` becomes the
+    /// flag-off two-character `C3.A9` with the payload untouched.
+    fn reinterpret_utf8(&mut self, utf8: bool) {
+        self.rebuild_tag(|_, w, t| (utf8, w, t));
+    }
+
+    /// `utf8::upgrade`: the same characters, flagged.  Flagged content is untouched.  An unflagged string's characters
+    /// are its internal bytes, so the result stores exactly those bytes as its compressed payload — zero byte work for
+    /// the Ascii and verbatim classes, whose payload already is the internal bytes (the monster: flag-off `E9` re-tags
+    /// Bytes to flagged Latin-1, payload identical), and one expansion copy for the Latin-1 class, whose stored bytes
+    /// are not (upgrading flag-off `C3 A9` yields the two-character `Ã©`, not `é` — that reinterpretation is
+    /// `_utf8_on`'s).  Past fifteen characters the result is heap: sixteen to thirty characters have no flagged
+    /// non-heap form unless ASCII, and ASCII took the flip.
+    #[cfg_attr(not(test), expect(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
+    fn upgraded(&self) -> Result<PerlString, AllocError> {
+        if self.is_utf8() {
+            return Ok(self.clone());
+        }
+
+        if self.is_ascii() {
+            // Characters, bytes, and encoding all coincide: the representation is already right in every tier.
+            let mut s = self.clone();
+            s.reinterpret_utf8(true);
+            return Ok(s);
+        }
+
+        let (w, t) = (self.is_warned(), self.is_tainted());
+        let mut scratch = [0u8; DECODE_MAX];
+        let internal = self.as_bytes(&mut scratch);
+
+        if internal.len() <= INLINE_MAX {
+            let mut buf = [0u8; INLINE_MAX];
+            buf[..internal.len()].copy_from_slice(internal);
+            let h = high_count(internal);
+            debug_assert!(h > 0, "all-ASCII content took the flip above");
+            return Ok(PerlString::build_inline(InlineClass::Latin1, true, w, t, internal.len(), h, buf));
+        }
+
+        // Sixteen or more non-ASCII characters: heap, each byte expanding to its encoding.
+        let mut cb = CowBuffer::with_capacity(internal.len() + high_count(internal))?;
+        let mut pair = [0u8; 2];
+        for &b in internal {
+            let n = expand_latin1(b, &mut pair);
+            cb.extend_from_slice(&pair[..n])?;
+        }
+        cb.narrow_scan(scan::UTF8_LATIN1);
+
+        Ok(PerlString::build_heap(true, w, t, cb))
+    }
+
+    /// `utf8::downgrade`: the same characters, unflagged — `None` where a character exceeds U+00FF, which is where
+    /// perl's downgrade dies.  Unflagged content is untouched.  The compressed classes' characters are their stored
+    /// bytes, so the result is those bytes reclassified as octets — zero byte work for the monster (`é` re-tags Latin-1
+    /// to Bytes, payload `E9` identical), re-compression where the octets happen to be valid Latin-1-range UTF-8.  The
+    /// flagged verbatim classes cannot downgrade: NonLatin1 and Extended hold a character at or above U+0100 by their
+    /// class, and the Bytes class flagged has no characters at all.
+    #[cfg_attr(not(test), expect(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
+    fn downgraded(&self) -> Result<Option<PerlString>, AllocError> {
+        if !self.is_utf8() {
+            return Ok(Some(self.clone()));
+        }
+
+        if self.is_ascii() {
+            let mut s = self.clone();
+            s.reinterpret_utf8(false);
+            return Ok(Some(s));
+        }
+
+        let (w, t) = (self.is_warned(), self.is_tainted());
+        match self.raw_parts() {
+            RawParts::Inline { class: InlineClass::Latin1, full, buf } => {
+                let stored = inline_stored(full, buf);
+
+                Ok(Some(PerlString::tiered(&buf[..stored], false, w, t)?))
+            }
+            RawParts::Inline { .. } => Ok(None),
+            RawParts::Packed(_) => {
+                // Packed content is ASCII by construction, so the flip above took it; answering the same way keeps the
+                // arm total without a panic.
+                let mut s = self.clone();
+                s.reinterpret_utf8(false);
+
+                Ok(Some(s))
+            }
+            RawParts::Heap(cb) => {
+                // Walk the encoding: every character must sit in U+0000-U+00FF, emitted as its single byte.  The result
+                // re-runs the ladder — sixteen to thirty emitted octets can compress right back inline.
+                let bytes = cb.as_slice();
+                let mut out = CowBuffer::with_capacity(bytes.len())?;
+                let mut i = 0;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b @ 0x00..=0x7F => {
+                            out.extend_from_slice(&[b])?;
+                            i += 1;
+                        }
+                        lead @ (0xC2 | 0xC3) if i + 1 < bytes.len() && bytes[i + 1] & 0xC0 == 0x80 => {
+                            out.extend_from_slice(&[((lead & 0x03) << 6) | (bytes[i + 1] & 0x3F)])?;
+                            i += 2;
+                        }
+                        _ => return Ok(None), // A character past U+00FF, or no character at all.
+                    }
+                }
+
+                if out.len() <= MAX_PACKED_LEN {
+                    return Ok(Some(PerlString::tiered(out.as_slice(), false, w, t)?));
+                }
+
+                Ok(Some(PerlString::build_heap(false, w, t, out)))
+            }
+        }
     }
 
     /// Set or propagate the taint bit.  Monotone raise; clearing is the laundering capability's alone (§2.6.2).
@@ -1594,28 +1746,6 @@ impl FromStr for PerlString {
     /// The same construction as [`PerlString::new`], for generic contexts and `"...".parse()`.
     fn from_str(s: &str) -> Result<PerlString, AllocError> {
         PerlString::new(s)
-    }
-}
-
-impl PerlString {
-    /// Construct from a Rust `&str`.  ASCII content is stored unflagged (the canonical downgraded form, §2.3.5);
-    /// non-ASCII content is stored with the utf8 flag, its validity known from the type.  Allocation failure is the
-    /// only error.
-    ///
-    /// Generic at the boundary so that embedders holding a `String`, a `Cow`, or one of the compact string types from
-    /// the ecosystem need no conversion; the ladder beneath is monomorphic and instantiated once.
-    pub fn new(s: impl AsRef<str>) -> Result<PerlString, AllocError> {
-        let s = s.as_ref();
-
-        if let Some(inline) = PerlString::inline(s) {
-            Ok(inline)
-        } else {
-            let bytes = s.as_bytes();
-            let cb = CowBuffer::from_slice(bytes)?;
-            let ascii = bytes.iter().all(|b| b.is_ascii());
-            cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE });
-            Ok(PerlString::build_heap(!ascii, false, false, cb))
-        }
     }
 }
 

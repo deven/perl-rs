@@ -47,7 +47,6 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-mod inline;
 mod numeric;
 
 pub mod containers;

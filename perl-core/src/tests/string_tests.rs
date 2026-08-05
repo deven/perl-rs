@@ -3734,3 +3734,122 @@ fn nonzero_padding_is_detected() {
     assert!(!p.padding_is_canonical(), "a nonzero padding nibble must be detected");
     assert_eq!(p.len(), 16, "the length is unaffected, which is exactly why this is dangerous");
 }
+
+// ── Representation transforms and canonical selection (§2.2.9) ───────────────────────────────────────────────────────
+
+#[test]
+fn upgrade_and_downgrade_preserve_characters() {
+    // The monster's transforms: flag-off E9 upgrades with zero byte work — Bytes re-tags to flagged Latin-1, the
+    // payload identical — and flagged é downgrades back the same way.
+    let raw = from_hex("e9", false);
+    let up = raw.upgraded().unwrap();
+    assert_eq!(up, from_hex("c3a9", true), "the character survives: é stays é");
+    assert_eq!(up.storage_type(), StorageType::InlineLatin1);
+    assert_eq!(up, raw, "sv_eq upgrades the byte side: still equal");
+    assert_eq!(up.downgraded().unwrap().unwrap(), raw);
+
+    // Upgrading flag-off C3 A9 yields the two-character Ã©, not é — upgrade is not reinterpretation.
+    let octets = from_hex("c3a9", false);
+    let up2 = octets.upgraded().unwrap();
+    assert_ne!(up2, from_hex("c3a9", true), "Ã© is not é");
+    assert_eq!(up2.char_len(), Some(2));
+    assert_eq!(up2.len(), 4, "two characters, C3 and A9, each encoding to two bytes");
+    assert_eq!(up2.downgraded().unwrap().unwrap(), octets, "downgrade returns exactly the octets");
+
+    // Beyond Latin-1 cannot downgrade, and flagged Bytes-class content has no characters to downgrade.
+    assert_eq!(from_hex("e282ac", true).downgraded().unwrap(), None);
+    assert_eq!(from_hex("e9", true).downgraded().unwrap(), None);
+
+    // ASCII upgrades and downgrades as pure flips in every tier: inline, packed, and heap.
+    for hex in ["616263", &"31".repeat(20), &"61".repeat(40)] {
+        let s = from_hex(hex, false);
+        let up = s.upgraded().unwrap();
+        assert!(up.is_utf8());
+        assert_eq!(up.storage_type(), s.storage_type(), "the representation is already right");
+        assert_eq!(up.downgraded().unwrap().unwrap(), s);
+    }
+
+    // Sixteen non-ASCII characters exceed every flagged non-heap form: the upgrade heaps, stays character-exact, and
+    // downgrades back through the ladder to exactly where the content fits.
+    let wide = from_hex(&"e9".repeat(16), false);
+    let up = wide.upgraded().unwrap();
+    assert!(up.storage_type().is_heap());
+    assert_eq!(up.char_len(), Some(16));
+    assert_eq!(up.downgraded().unwrap().unwrap(), wide);
+}
+
+#[test]
+fn reinterpretation_is_a_pure_flag_flip() {
+    // Container-probed: _utf8_off on an upgraded é yields the flag-off two-character C3.A9 with the payload untouched —
+    // and the class axis never moves, being a fact about the bytes (§2.2.9).
+    let wide = "c3a9".repeat(10);
+    for (hex, flagged) in [("c3a9", true), ("e9", false), ("e282ac", true), (wide.as_str(), false)] {
+        let s = from_hex(hex, flagged);
+        let mut flipped = s.clone();
+        flipped.reinterpret_utf8(!flagged);
+        assert_eq!(flipped, from_hex(hex, !flagged), "the value is the same bytes under the other flag");
+        assert_eq!(flipped.storage_type(), s.storage_type(), "the class is a fact about the bytes");
+
+        let mut back = flipped.clone();
+        back.reinterpret_utf8(flagged);
+        assert_eq!(back, s);
+    }
+
+    let e_acute = from_hex("c3a9", true);
+    let mut off = e_acute.clone();
+    off.reinterpret_utf8(false);
+    assert_eq!(off.len(), 2, "flag-off C3.A9 is the two-octet string");
+    assert_ne!(off, e_acute, "the octet string is not the character é");
+}
+
+#[test]
+fn byte_mutation_reruns_canonical_selection() {
+    // chop's split, as a constructor fact (container-verified): removing the trailing octet of A.C3.A9 leaves a
+    // dangling lead that no longer reads as UTF-8 — the Bytes residual.
+    assert_eq!(from_hex("41c3", false).storage_type(), StorageType::InlineBytes);
+
+    // And live mutation through append — the pass-through hazard: a Bytes-class dangling lead completed by its
+    // continuation becomes valid Latin-1-range UTF-8 again, and canonical selection re-compresses it.
+    let mut s = from_hex("616263c3", false);
+    assert_eq!(s.storage_type(), StorageType::InlineBytes);
+
+    s.push_bytes(b"\xA9").unwrap();
+    assert_eq!(s.storage_type(), StorageType::InlineLatin1, "abc + é: valid again, so it compresses");
+    assert_eq!(s, from_hex("616263c3a9", false));
+    assert_eq!(s.char_len(), Some(4));
+}
+
+#[test]
+fn nul_compresses_in_every_spelling() {
+    // The revised ruling (§2.2.9): the octet, the encoded byte, and the character U+0000 are ordinary content — the
+    // explicit length is what admits them, a terminator having no way to.
+    assert_eq!(from_hex("00", false).storage_type(), StorageType::InlineAscii);
+    assert_eq!(from_hex("00", false).len(), 1);
+
+    let s = from_hex("c3a900", true); // é then U+0000, flagged: two characters, one of them NUL.
+    assert_eq!(s.storage_type(), StorageType::InlineLatin1);
+    assert_eq!(s.char_len(), Some(2));
+    assert_eq!(s.len(), 3);
+
+    assert_eq!(from_hex("e900", false).storage_type(), StorageType::InlineBytes, "beside an invalid octet: verbatim");
+    assert_ne!(from_hex("610062", false), from_hex("610063", false), "equality sees past a NUL");
+}
+
+#[test]
+fn equal_content_takes_equal_representations_across_routes() {
+    // Canonical selection means routes group by which string they produce — downgrade preserves characters where
+    // reinterpretation preserves bytes, the E9 monster in transform clothing.
+    let direct = from_hex("e9e9", false);
+    let via_downgrade = from_hex("c3a9c3a9", true).downgraded().unwrap().unwrap();
+    let via_round_trip = direct.upgraded().unwrap().downgraded().unwrap().unwrap();
+    assert_eq!(direct, via_downgrade);
+    assert_eq!(direct.storage_type(), via_downgrade.storage_type());
+    assert_eq!(direct, via_round_trip);
+
+    let data = from_hex("c3a9c3a9", false);
+    let mut via_flip = from_hex("c3a9c3a9", true);
+    via_flip.reinterpret_utf8(false);
+    assert_eq!(data, via_flip);
+    assert_eq!(data.storage_type(), via_flip.storage_type());
+    assert_ne!(direct, data, "and the two groups are different strings");
+}
