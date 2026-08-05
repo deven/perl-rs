@@ -148,13 +148,15 @@ enum Value {
     // field.  A taint byte beside an eight-byte datum cannot fit
     // beneath the niche-supplied tag (measured: 24 with a field,
     // 16 with twins, and no field ordering recovers it), and the
-    // niche is PerlString's — 96 of its 256 tag values are used,
-    // so Value's discriminant lives in the other 160.
+    // niche is PerlString's — 136 of its 256 tag values are used,
+    // so Value's discriminant lives in the other 120.
 
     Float(f64),                // + packed-decimal digit cache (§2.2.9)
-    StrBytes(..),              // internal octets; <= 14 store their
-    StrUtf8(..),               // length, exactly 15 implies it, so
-    StrLatin1(..),             // each format is two length families
+    StrAscii(..),              // inline content class in the tag
+    StrLatin1(..),             // (§2.2.9): the class selects the
+    StrNonLatin1(..),          // payload representation — compressed
+    StrExtended(..),           // code points or verbatim octets;
+    StrMalformed(..),          // <= 14 split s/h nibbles, 15 implied
     StrPackedNumeric(..),      // nibble-packed <= 30 chars: all 15
     StrPackedDateTimeZ(..),    // payload bytes are nibbles, so the
     StrPackedDateTimePlus(..), // alphabet lives in the variant (§2.2.9)
@@ -954,45 +956,27 @@ battery is the tripwire.
 enum's discriminant (an opaque inner string type cannot fuse; the
 inner tag would cost a word — the §2.3.6 nesting lesson):
 
-- **Inline, ≤ 15 payload bytes in three storage formats**, each
-  in two length families: a full-capacity form implying its
-  length and a shorter form storing it in the byte a fifteenth
-  character would have used.  Both the format and the family are
-  discriminant dimensions.  **The storage format is
-  an axis independent of the semantic `SvUTF8` flag** — the flag
-  is perl's interpretation claim; the format says what the
-  payload bytes physically are:
+- **Inline, ≤ 15 payload bytes**, in two length families: a
+  full-capacity form implying its stored length and a shorter
+  form keeping it in the byte a fifteenth character would have
+  used.  The discriminant carries the **content class** — the
+  five terminal states of the §2.2.4 scan lattice (ASCII,
+  Latin-1-range, non-Latin-1, extended, malformed), established
+  eagerly at construction — and the class, the family, the flag,
+  and the §2.6/§2.3.4 bits are all tag dimensions, so every
+  content fact a reader wants is a tag inspection, never a
+  payload scan.  **The class is an axis independent of the
+  semantic `SvUTF8` flag**: the flag is perl's interpretation
+  claim; the class is a fact about the bytes.  The class selects
+  the payload representation:
 
-  - *Bytes*: perl's internal octets verbatim — flag-off strings
-    whose octets are not valid Latin-1-range UTF-8 (canonical
-    selection sends those to *Latin-1*).  Characters are the
-    octets; the §2.2.4 five-state scan lattice applies, eagerly
-    at construction.
-  - *Utf8*: encoded bytes verbatim — flag-on strings that cannot
-    decode into the Latin-1 range: a code point at or above
-    U+0100, a perl-extended code point, or malformed content.
-    Scan states are the three that can occur
-    (`UTF8_NON_LATIN1`, `EXTENDED_UTF8`, `MALFORMED_UTF8`).
-  Every non-heap form is a **2:1 compression of its decoded
-  bytes**, which is why one scratch buffer of thirty serves all of
-  them: the packed forms store two symbols per byte at four bits
-  each, and the Latin-1 form declines to spend two bytes on a code
-  point, `U+0080`-`U+00FF` sitting inside UTF-8's two-byte range.
-  The same factor from opposite directions — one packing two units
-  into a byte, the other refusing to let one unit take two — so the
-  bound is `15 x 2` by construction rather than the larger of two
-  measured cases.  It is also a constraint on later additions: a
-  non-heap encoding compressing more than 2:1 would overflow every
-  borrowed-view buffer.
-
-  - *Latin-1*: content that is valid UTF-8 with every code point
-    in U+0000-U+00FF (U+0000 included: NUL is ordinary content,
-    and its canonical encoding is the single byte 00 — the
-    overlong C0 80 stays invalid), stored **one code point per
-    byte,
-    regardless of the flag**.  Flag on: the payload is the
-    string's characters (fifteen high-Latin-1 characters inline
-    where their encoding spans thirty bytes), and
+  - *ASCII and Latin-1-range content* — valid UTF-8 with every
+    code point in U+0000-U+00FF (U+0000 included: NUL is ordinary
+    content, and its canonical encoding is the single byte 00 —
+    the overlong C0 80 stays invalid) — stores **one code point
+    per byte, regardless of the flag**.  Flag on: the payload is
+    the string's characters (fifteen high-Latin-1 characters
+    inline where their encoding spans thirty bytes), and
     `utf8::upgrade`/`downgrade` are pure flag flips with zero
     byte work — where perl itself re-encodes the buffer.  Flag
     off: the string *is* the UTF-8 octet sequence — semantically
@@ -1003,36 +987,89 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
     expansion sum — one or two per payload byte — never the
     payload count: fifteen stored high-Latin-1 code points report
     length **30** (container-verified, with `ord` returning the
-    lead byte `C3`, not the code point).  The cached ASCII bit
-    short-circuits the sum: all-ASCII content expands to itself.
-    Byte-level *mutation* can split an encoded character —
-    container-verified: `chop` removes one byte, leaving a
-    dangling lead byte that is no longer valid UTF-8 — so
-    mutation re-runs canonical selection on the result, and a
-    split lands in *Bytes* form; decoded storage is a read
-    optimization the string can fall out of, never a constraint
-    on what the bytes may become.
+    lead byte `C3`, not the code point).
+  - *Non-Latin-1, extended, and malformed content* stores the
+    internal octets **verbatim**: 0-15 original bytes that are
+    Rust-valid UTF-8 beyond the Latin-1 range, perl-decodable but
+    Rust-invalid (§2.2.4), or malformed under both readings —
+    the last by default, the tag having ruled out every other
+    class.  Only the compressed classes have a 0-28 internal
+    byte range; verbatim storage holds what it holds.
 
-  The independence is load-bearing, with a pinned monster:
-  payload `E9` flag-off means the one-octet string `é` under
-  *Bytes* and the two-octet string `C3 A9` under *Latin-1* —
+  **The length byte is two nibbles.**  For content of 14 payload
+  bytes or fewer, the low nibble holds `s`, the count of payload
+  bytes stored, and the high nibble is per-class.  For the
+  compressed classes it holds `h`, the count of stored code
+  points at or above U+0080 — zero for the ASCII class by its
+  tag — so the internal byte length is `s + h` (0-28) and the
+  character length is `s` with the flag on and `s + h` with it
+  off: every length answer a nibble read and at most one add.
+  For the two verbatim valid classes it holds the decoded
+  character count, and for malformed it is canonically zero.
+  The assignment is forced per class rather than chosen: for the
+  compressed classes a character count would duplicate `s` — the
+  flag-on count is `s` itself — while `h` derives every length in
+  one add; for the verbatim classes `h` cannot recover the
+  character count, which is `s` minus the continuation bytes
+  where a high-bit count merges leads with continuations, so the
+  count is stored directly; and malformed content has no
+  character count to record.  The unreachable values are
+  debug-assertion territory: `h` is never zero for the
+  Latin-1-range class — that content is the ASCII class by
+  canonical selection — and never 15, and a verbatim character
+  count is always strictly below `s`.  Because the class is a
+  fact about the bytes, the reinterpretation flips are pure flag
+  flips on verbatim content too, and the stored count is what
+  keeps `char_len` O(1) across them.
+  Full capacity implies `s = 15` and derives the rest by short
+  word-parallel counts over the payload: the compressed classes'
+  internal length is 15 plus the high-code-point count, the
+  verbatim valid classes' character count is 15 minus the
+  continuation-byte count, and flag-on full-capacity compressed
+  content is fifteen characters by implication, paying no count
+  at all.
+
+  Every non-heap form is a **2:1 compression of its decoded
+  bytes**, which is why one scratch buffer of thirty serves all
+  of them: the packed forms store two symbols per byte at four
+  bits each, and the compressed classes decline to spend two
+  bytes on a code point, `U+0080`-`U+00FF` sitting inside UTF-8's
+  two-byte range.  The same factor from opposite directions — one
+  packing two units into a byte, the other refusing to let one
+  unit take two — so the bound is `15 x 2` by construction rather
+  than the larger of two measured cases.  It is also a constraint
+  on later additions: a non-heap encoding compressing more than
+  2:1 would overflow every borrowed-view buffer.
+
+  The class/flag independence is load-bearing, with a pinned
+  monster: payload `E9` flag-off means the one-octet string `é`
+  stored verbatim under the *malformed* class and the two-octet
+  string `C3 A9` stored compressed under the *Latin-1* class —
   different strings (container-verified: flag-off they compare
   unequal at lengths one and two; decode the second and they
-  compare equal) — distinguished by the format axis alone.
+  compare equal) — distinguished by the class axis alone.
   Canonical selection is a determinism obligation, since equal
   perl strings must take equal representations for
-  representation-level equality and hashing to be sound: a
-  flag-off octet sequence that is valid Latin-1-range UTF-8
-  always takes *Latin-1*, never *Bytes*; *Bytes* holds exactly
-  the octet strings failing that test; the full tier-selection
-  priority (Latin-1, Bytes, Utf8, packed, heap, by content and
-  fitted capacity) is a normative table at implementation.  The
+  representation-level equality and hashing to be sound: content
+  is classified by its bytes deterministically, so a flag-off
+  octet sequence that is valid Latin-1-range UTF-8 always takes
+  the compressed representation, never verbatim storage, and the
+  verbatim classes hold exactly the content failing that test;
+  the full tier-selection priority (compressed inline, verbatim
+  inline, packed, heap, by content and fitted capacity) is a
+  normative table at implementation.  Byte-level *mutation* can
+  split an encoded character — container-verified: `chop`
+  removes one byte, leaving a dangling lead byte that is no
+  longer valid UTF-8 — so mutation re-runs canonical selection
+  on the result, and a split lands in a verbatim class; decoded
+  storage is a read optimization the string can fall out of,
+  never a constraint on what the bytes may become.  The
   reinterpretation APIs are representation transforms, total
   because decoded storage re-expands through the unique canonical
   encoding: `Encode::_utf8_off` on compressed flag-on content
   re-expands (container-verified: an upgraded `é` becomes the
   flag-off two-character `C3.A9`), and `_utf8_on` on raw octets
-  reclassifies (a lone `E9` becomes flagged malformed content).
+  reclassifies (a lone `E9` stays malformed-class, now flagged).
 - **Nibble-packed, ≤ 30 characters**, for digit-dense text — two
   characters per byte over 16-symbol alphabets, in 15 payload
   bytes.  The tier's band is **16-30 characters** and is a
@@ -1626,12 +1663,12 @@ date-time punctuation — but the rule is available wherever the
 other side is known all-ASCII, which the scan cache already records
 for the inline and heap forms.
 
-**Against the `Utf8` form it does not**, and that is the boundary
-the implementation has to be built to respect rather than merely
-documented against.
+**Against a flagged verbatim payload it does not**, and that is
+the boundary the implementation has to be built to respect rather
+than merely documented against.
 There both sides hold high bytes, one storing code points and the
 other their encoding, so a naive byte comparison is wrong in both
-directions: a Latin-1 `E9` and a `Utf8` `C3 A9` are the same
+directions: a compressed `E9` and a verbatim `C3 A9` are the same
 character and compare unequal, and `U+00E9` against `U+0100` — a
 genuine `Less` — inverts to `Greater`, because `E9` exceeds `C4`.
 An inverted order is worse than a wrong equality: it corrupts a
@@ -1661,8 +1698,9 @@ payload unflagged is `Less` against `U+00E9` while equalling
 excluding the bad pairing.**  The condition to test is *this
 operand is known all-ASCII* — which the scan cache answers for
 inline and heap content, and which the packed forms satisfy by
-construction.  Testing instead that the other side *is not* the
-`Utf8` form would be the same rule spelled as an exclusion, and
+construction.  Testing instead that the other side *is not* a
+flagged verbatim form would be the same rule spelled as an
+exclusion, and
 exclusions fail open: a storage form added later, or an operand
 whose classification is merely unknown, would slip into the fast
 path and be compared wrongly.  Stated positively the same cases
