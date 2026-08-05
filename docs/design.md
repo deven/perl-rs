@@ -986,7 +986,10 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   borrowed-view buffer.
 
   - *Latin-1*: content that is valid UTF-8 with every code point
-    in U+0001-U+00FF, stored **one code point per byte,
+    in U+0000-U+00FF (U+0000 included: NUL is ordinary content,
+    and its canonical encoding is the single byte 00 — the
+    overlong C0 80 stays invalid), stored **one code point per
+    byte,
     regardless of the flag**.  Flag on: the payload is the
     string's characters (fifteen high-Latin-1 characters inline
     where their encoding spans thirty bytes), and
