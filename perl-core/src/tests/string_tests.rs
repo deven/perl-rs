@@ -2301,6 +2301,27 @@ fn exact_round_trip_across_the_class() {
 }
 
 #[test]
+fn every_alphabet_symbol_round_trips() {
+    // Built from the tables themselves so a table edit cannot outrun it.  Each alphabet's full sixteen-symbol sweep
+    // packs, selects its own alphabet — every sweep contains a symbol the other two lack — and decodes back exactly,
+    // which covers all sixteen nibble values in both directions where the representative citizens only cover the
+    // symbols they happen to use.  Symbol order must equal nibble value: that is the ASCII-order property the no-decode
+    // comparisons rest on, and the ascending check pins it against table edits.
+    for (symbols, alphabet) in [
+        (NUMERIC_SYMBOLS, PackedAlphabet::Numeric),
+        (DATETIME_PLUS_SYMBOLS, PackedAlphabet::DateTimePlus),
+        (DATETIME_ZULU_SYMBOLS, PackedAlphabet::DateTimeZulu),
+    ] {
+        assert!(symbols.windows(2).all(|w| w[0] < w[1]), "symbols must ascend in ASCII order");
+        let p = roundtrip(symbols);
+        assert_eq!(p.alphabet, alphabet, "each sweep must select its own alphabet");
+        for (i, &sym) in symbols.iter().enumerate() {
+            assert_eq!(alphabet.encode_table()[sym as usize] as usize, i, "symbol order must equal nibble value");
+        }
+    }
+}
+
+#[test]
 fn trailing_spaces_are_representable() {
     // The restriction the explicit length removes.  Incremental building passes through these on its way to longer
     // content, so they must round-trip like anything else.
