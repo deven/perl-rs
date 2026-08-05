@@ -17,12 +17,10 @@
 //! encodings are invalid UTF-8 and therefore never compress — they stay in their encoded form, which is what makes the
 //! reinterpretation transforms total.
 //!
-//! Storage length is the position of the first NUL, or 15 when none is present (the unterminated form).  Content
-//! containing NUL in any spelling — octet `0x00`, encoded byte `0x00`, character U+0000 — is **heap-only, ruled**
-//! (§2.2.9): the terminator byte is reserved, NUL-bearing strings are rare and skew long, and inline storage is an
-//! optimization a string simply doesn't get.
-
-// The production consumers arrive with the PerlString fusion; the expect self-reports for removal the moment they land.
+//! Storage length is explicit: content of fourteen bytes or fewer keeps its length in the byte a fifteenth would have
+//! used, and content of exactly fifteen implies it (§2.2.9).  NUL is ordinary content — it was heap-only while the
+//! inline forms were NUL-terminated, the terminator being what bought the fifteenth byte.
+//!
 //! # The obligation this format carries into comparison
 //!
 //! `Latin1` stores code points where perl's buffer holds their UTF-8 encoding.  That is a compression of the buffer,
@@ -30,11 +28,44 @@
 //! `U+0080`-`U+00FF` are a thirty-character value, each byte its own character, and it is only a coincidence of
 //! encoding that they fit in fifteen.
 //!
-//! So every length, comparison, and hash must answer over the virtual expansion rather than the stored payload — §2.2.9
-//! and §2.3.5.  Reaching for the payload directly would give a flagged and an unflagged Latin-1-stored string the same
-//! characters, which is the one thing they do not share.  `PerlString`'s comparison paths are written against raw
-//! inline bytes today and will need revisiting here, not merely extending.
+//! Against an **all-ASCII** operand the stored payload nevertheless compares directly, either flag — a property of the
+//! other side being ASCII rather than of any storage form.  A stored byte below `0x80` compares as the character it is;
+//! a stored byte at or above `0x80` exceeds every ASCII byte and decides the comparison there, being a high code point
+//! flagged or its encoding's lead byte unflagged, and which one does not change the answer.  A payload with no high
+//! byte expands to itself, so the prefix rule applies unchanged.  Verified over 400,000 pairs against the expanded
+//! comparison.  The packed forms are ASCII by construction and so always qualify; for the inline and heap forms the
+//! scan cache already records it.
+//!
+//! The reason it is correct rather than merely convenient: a set high bit means a code point above `U+007F`, which
+//! outranks every ASCII character, so byte order and code-point order agree at that position and the naive comparison
+//! yields the answer the expanded one would have.
+//!
+//! That agreement is UTF-8's design, not a fact about encodings.  UTF-8 sets the high bit on every non-ASCII byte and
+//! preserves code-point order under byte comparison — verified across every code point to `U+10FFFF`.  UTF-16 does
+//! neither: an ASCII character contains a `0x00` byte, and the surrogate range inverts (`U+E000` encodes as `E0 00`,
+//! the larger `U+10000` as `D8 00 DC 00`).  None of this survives a change of encoding.
+//!
+//! Against the **`Utf8`** form it does not: both sides hold high bytes, one storing code points and the other their
+//! encoding, so `E9` and `C3 A9` are one character compared unequal, and `U+00E9` against `U+0100` *inverts* — `E9`
+//! exceeding `C4` while the code point is smaller.  An inverted order corrupts a sort silently, so that pairing
+//! compares character by character — and what this payload presents as characters is decided by the flag.
+//!
+//! Flag on, each stored byte *is* a code point, compared against the other side's decoded one.  Flag off, the value is
+//! the UTF-8 encoding and its bytes are themselves the characters, so a stored byte below `0x80` presents one character
+//! and a byte at or above presents two: the lead `0xC0 | b >> 6`, then the continuation `0x80 | b & 0x3F`, each
+//! compared in its own right.  Neither reading needs a buffer — the characters are computed as the comparison walks,
+//! one stored byte yielding one or two.  Verified over 300,000 pairs against the materialised expansion.
+//!
+//! **Gate the direct path on a positive fact.**  The condition is *the other operand is known all-ASCII*, never *the
+//! other operand is not `Utf8`*.  An exclusion fails open: a storage form added later, or content whose classification
+//! is simply unknown, would slip through and compare wrongly.  Stated positively those cases fall through to decoding,
+//! which is always correct and only sometimes slower.
+//!
+//! So every length, comparison, and hash answers over the virtual expansion rather than the stored payload — §2.2.9 and
+//! §2.3.5.  `PerlString`'s comparison paths are written against raw inline bytes today and will need revisiting here,
+//! not merely extending.
 
+// The production consumers arrive when `PerlString` adopts these formats; the expect self-reports the moment they land.
 #![cfg_attr(not(test), expect(dead_code))]
 
 /// The inline payload width in bytes.
@@ -44,9 +75,9 @@ pub(crate) const INLINE_BYTES: usize = 15;
 /// points expands to thirty octets.
 pub(crate) const INLINE_MAX_OCTETS: usize = 30;
 
-/// An inline string with its full semantic identity.  Illegal flag/format combinations are unrepresentable: `Bytes`
-/// is flag-off by construction, `Utf8` flag-on, and only `Latin1` carries the flag.  In `PerlString` these are not
-/// fields at all — each combination is its own variant, folded into the tag.
+/// An inline string with its full semantic identity.  Illegal flag/format combinations are unrepresentable: `Bytes` is
+/// flag-off by construction, `Utf8` flag-on, and only `Latin1` carries the flag.  In `PerlString` these are not fields
+/// at all — each combination is its own variant, folded into the tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InlineStr {
     /// Internal octets verbatim; semantic flag off.

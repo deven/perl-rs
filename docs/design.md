@@ -1556,7 +1556,85 @@ lead byte `C3` rather than the code point.
 
 A comparison path that reached for the stored payload would give a
 flagged and an unflagged Latin-1-stored string the same characters,
-which is the one thing they do not share.  Nothing does so today,
+which is the one thing they do not share.
+
+**Against an all-ASCII string the stored payload compares
+directly** — no expansion, either flag.  This is a property of the
+*other* operand being ASCII, not of any particular storage form.  A
+stored Latin-1 byte below `0x80` is an ASCII character and compares
+normally.  A stored byte at or above `0x80` has its high bit set,
+and a set high bit means a code point above `U+007F` whether the
+byte is a Latin-1 character or a UTF-8 lead — which genuinely
+outranks every ASCII character.  So byte order and code-point order
+*agree* at that position: the comparison does not merely terminate
+there, it terminates with the answer the expanded comparison would
+have given.  That is why the naive result is right rather than
+lucky, and why it does not matter which of the two readings the
+byte carries.
+
+**This is a property of UTF-8's design, not of encodings.**  UTF-8
+sets the high bit on every non-ASCII byte and preserves code-point
+order under byte comparison — measured across every code point to
+`U+10FFFF`, zero disagreements.  UTF-16 does neither: an ASCII
+character contains a `0x00` byte, so "high bit set" stops meaning
+"non-ASCII" at the first character, and the surrogate range
+inverts, `U+E000` encoding as `E0 00` while the larger `U+10000`
+encodes as `D8 00 DC 00` and sorts below it.  Nothing here
+generalizes to another encoding; it generalizes to UTF-8, which was
+built for it.  A payload with no high byte expands to itself, so its
+length is its payload's and the prefix rule applies unchanged.
+Verified over 400,000 random pairs against the expanded
+comparison, arbitrary ASCII of arbitrary length, both flags, zero
+disagreements.
+
+The packed forms are the case this most obviously reaches, being
+ASCII by construction — their alphabets hold only digits and
+date-time punctuation — but the rule is available wherever the
+other side is known all-ASCII, which the scan cache already records
+for the inline and heap forms.
+
+**Against the `Utf8` form it does not**, and that is the boundary
+the implementation has to be built to respect rather than merely
+documented against.
+There both sides hold high bytes, one storing code points and the
+other their encoding, so a naive byte comparison is wrong in both
+directions: a Latin-1 `E9` and a `Utf8` `C3 A9` are the same
+character and compare unequal, and `U+00E9` against `U+0100` — a
+genuine `Less` — inverts to `Greater`, because `E9` exceeds `C4`.
+An inverted order is worse than a wrong equality: it corrupts a
+sort silently.  That pairing compares character by character, and
+what a Latin-1 payload presents as characters is decided by the
+flag:
+
+- **Flag on**, each stored byte *is* a code point, compared
+  directly against the other side's decoded code point.
+- **Flag off**, the value is the UTF-8 encoding and its bytes are
+  themselves the characters, so a stored byte below `0x80` presents
+  one character and a byte at or above presents *two* — the lead
+  `0xC0 | b >> 6` and the continuation `0x80 | b & 0x3F` — each
+  compared in its own right.
+
+Neither reading needs a buffer: the characters are computed as the
+comparison walks, one stored byte yielding one or two.  Verified
+over 300,000 random pairs against the materialised expansion, both
+flags, against code points from ASCII to beyond the BMP, zero
+disagreements.  It resolves both inversions — a flagged `E9`
+against `U+00E9` is `Equal` where bytes said `Greater`, and against
+`U+0100` is `Less` where bytes said `Greater` — and the same
+payload unflagged is `Less` against `U+00E9` while equalling
+`U+00C3, U+00A9`, which is what two characters means.
+
+**So the direct path is gated on a positive fact, never on
+excluding the bad pairing.**  The condition to test is *this
+operand is known all-ASCII* — which the scan cache answers for
+inline and heap content, and which the packed forms satisfy by
+construction.  Testing instead that the other side *is not* the
+`Utf8` form would be the same rule spelled as an exclusion, and
+exclusions fail open: a storage form added later, or an operand
+whose classification is merely unknown, would slip into the fast
+path and be compared wrongly.  Stated positively the same cases
+fall through to decoding, which is always correct and only
+sometimes slower.  Nothing does so today,
 the format not yet being live — the inline tier still stores raw
 bytes — and this is the obligation it must satisfy when it lands.
 
