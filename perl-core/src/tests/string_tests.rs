@@ -198,13 +198,14 @@ fn heap_append_transitions() {
 
 #[test]
 fn flag_and_bits_survive_promotion() {
-    let mut s = PerlString::from_str(&"é".repeat(11)).unwrap(); // 22 bytes inline, flagged
+    let mut s = PerlString::from_str(&"é".repeat(15)).unwrap(); // Fifteen stored bytes: full-capacity inline, flagged.
     s.taint();
-    s.push_str("x").unwrap(); // promotes
+    assert!(s.storage_type().is_inline(), "thirty encoded bytes compress to a full payload (§2.2.9)");
+    s.push_str("é").unwrap(); // A sixteenth character: past every non-heap form — non-ASCII cannot pack.
     assert!(s.storage_type().is_heap());
     assert!(s.is_utf8());
     assert!(s.is_tainted());
-    assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some(format!("{}x", "é".repeat(11)).as_str()));
+    assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("é".repeat(16).as_str()));
 }
 
 // ── Extended-UTF-8 taxonomy (container-verified, §2.2.4) ──────
@@ -562,7 +563,7 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
     let h_ascii = PerlString::from_bytes(b"a".repeat(24)).unwrap();
     assert!(h_ascii.is_ascii());
     push("heap-ascii", h_ascii, scan::ASCII);
-    let h_l1 = PerlString::from_str(&"é".repeat(12)).unwrap();
+    let h_l1 = PerlString::from_str(&"é".repeat(16)).unwrap();
     let _ = h_l1.char_len(); // classifies via the fused pass
     push("heap-latin1", h_l1, scan::UTF8_LATIN1);
     let h_nl1 = PerlString::from_str(&"字".repeat(8)).unwrap();
@@ -577,11 +578,11 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
 
     // Indeterminate states, several contents each.
     push("heap-unknown-ascii", PerlString::from_bytes(b"x".repeat(24)).unwrap(), scan::UNKNOWN);
-    push("heap-unknown-latin1", PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap(), scan::UNKNOWN);
+    push("heap-unknown-latin1", PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap(), scan::UNKNOWN);
     push("heap-unknown-malformed", PerlString::from_bytes([0x81; 23]).unwrap(), scan::UNKNOWN);
-    push("heap-ur-latin1", PerlString::from_str(&"é".repeat(12)).unwrap(), scan::UTF8_UNKNOWN_RANGE);
+    push("heap-ur-latin1", PerlString::from_str(&"é".repeat(16)).unwrap(), scan::UTF8_UNKNOWN_RANGE);
     push("heap-ur-wide", PerlString::from_str(&"字".repeat(8)).unwrap(), scan::UTF8_UNKNOWN_RANGE);
-    let na8_l1 = PerlString::from_str(&"é".repeat(12)).unwrap();
+    let na8_l1 = PerlString::from_str(&"é".repeat(16)).unwrap();
     assert!(!na8_l1.is_ascii());
     push("heap-na8-latin1", na8_l1, scan::UTF8_NON_ASCII);
     let na8_wide = PerlString::from_str(&"字".repeat(8)).unwrap();
@@ -590,7 +591,7 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
     let na_raw = PerlString::from_bytes([0x82; 24]).unwrap();
     assert!(!na_raw.is_ascii());
     push("heap-nonascii-raw", na_raw, scan::NON_ASCII);
-    let na_raw_valid = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
+    let na_raw_valid = PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap();
     assert!(!na_raw_valid.is_ascii());
     push("heap-nonascii-valid-bytes", na_raw_valid, scan::NON_ASCII);
 
@@ -601,7 +602,7 @@ fn grid_witnesses() -> Vec<(String, PerlString)> {
 fn full_scan_runs_once_then_state_answers() {
     // A heap string's first as_str pays one validation pass (+ one classification); afterwards every question is a
     // state read — the never-scan-twice law, mechanically.
-    let s = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap(); // heap UNKNOWN
+    let s = PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap(); // heap UNKNOWN: 32 bytes exceed the intake
     eq_probe::reset();
     assert!(s.as_str(&mut [0u8; DECODE_MAX]).is_some());
     let (scans_first, _) = eq_probe::scans();
@@ -610,7 +611,7 @@ fn full_scan_runs_once_then_state_answers() {
     assert!(s.as_str(&mut [0u8; DECODE_MAX]).is_some());
     assert!(s.is_perl_utf8_valid());
     assert!(!s.is_ascii());
-    assert_eq!(s.char_len(), Some(12));
+    assert_eq!(s.char_len(), Some(16));
     assert_eq!(eq_probe::scans(), (0, 0), "cached state must answer every subsequent question");
 }
 
@@ -1025,13 +1026,21 @@ fn char_len_semantics_and_caching() {
     assert_eq!(a.char_len(), Some(30));
     assert_eq!(eq_probe::scans().0, 0, "ASCII char_len is a length read");
 
-    // Latin-1 heap: first call pays ONE fused pass; second call is a cache read.
-    let l = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
+    // Latin-1 inline: the transcoded units are the flagged-side characters, so the count is the stored nibble — no scan
+    // at all, where the raw-byte tier paid a recount.
+    let li = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
+    assert!(li.storage_type().is_inline(), "24 compressible bytes live inline now (§2.2.9)");
     eq_probe::reset();
-    assert_eq!(l.char_len(), Some(12));
+    assert_eq!(li.char_len(), Some(12));
+    assert_eq!(eq_probe::scans().0, 0, "the count is the stored nibble: no pass at all");
+
+    // Latin-1 heap: first call pays ONE fused pass; second call is a cache read.
+    let l = PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap();
+    eq_probe::reset();
+    assert_eq!(l.char_len(), Some(16));
     assert_eq!(eq_probe::scans().0, 1, "exactly one fused pass classifies and counts");
     eq_probe::reset();
-    assert_eq!(l.char_len(), Some(12));
+    assert_eq!(l.char_len(), Some(16));
     assert!(l.as_str(&mut [0u8; DECODE_MAX]).is_some());
     assert_eq!(eq_probe::scans().0, 0, "count and state both cached from the one pass");
 
@@ -1424,20 +1433,77 @@ fn equal_content_has_equal_bytes_whatever_its_history() {
 }
 
 #[test]
+fn compressed_payloads_and_the_nibble_scheme() {
+    // The Latin-1 class stores the Latin-1 transcoding of the internal bytes — each one- or two-byte UTF-8 sequence as
+    // its single-byte equivalent — with the length byte split into the two nibbles (§2.2.9): low `s`, high `h`.  The E9
+    // monster's two strings at the representation level.
+    let two_char = PerlString::from_bytes([0xC3, 0xA9]).unwrap(); // The octet string C3.A9.
+    assert_eq!(two_char.storage_type(), StorageType::InlineLatin1);
+    match two_char.raw_parts() {
+        RawParts::Inline { buf, .. } => {
+            assert_eq!(buf[0], 0xE9, "the payload is the Latin-1 equivalent, not the encoding");
+            assert_eq!(buf[LENGTH_BYTE], 0x11, "one stored, one high: nibbles 1/1");
+        }
+        _ => panic!("expected inline storage"),
+    }
+    assert_eq!(two_char.len(), 2, "the internal length is s + h");
+    assert_eq!(two_char.char_len(), Some(1));
+    assert_eq!(two_char.as_bytes(&mut [0u8; DECODE_MAX]), [0xC3, 0xA9], "as_bytes expands the compression");
+
+    let one_char = PerlString::from_bytes([0xE9]).unwrap(); // The one-octet string é: the Bytes residual.
+    assert_eq!(one_char.storage_type(), StorageType::InlineBytes);
+    assert_eq!(one_char.len(), 1);
+    assert_ne!(two_char, one_char, "different strings, distinguished by the class axis alone");
+
+    // Sixteen to thirty compressible bytes are the new inline intake: fifteen stored high bytes span thirty internal
+    // bytes, report length 30 (container-verified: ord returns the lead C3), and fill the payload — the full family.
+    let wide = PerlString::from_bytes([0xC3, 0xA9].repeat(15)).unwrap();
+    assert_eq!(wide.storage_type(), StorageType::InlineLatin1Full);
+    assert_eq!(wide.len(), 30, "length is the expansion sum, never the payload count");
+    assert_eq!(wide.char_len(), Some(15));
+    assert_eq!(wide.as_bytes(&mut [0u8; DECODE_MAX]), [0xC3, 0xA9].repeat(15));
+
+    // The verbatim valid classes carry their character count in the aux nibble: O(1), no decode.
+    let euro = PerlString::from_str("€€").unwrap(); // Six bytes, two characters, beyond Latin-1.
+    assert_eq!(euro.storage_type(), StorageType::InlineNonLatin1);
+    match euro.raw_parts() {
+        RawParts::Inline { buf, .. } => assert_eq!(buf[LENGTH_BYTE], 0x26, "six stored, two characters: nibbles 2/6"),
+        _ => panic!("expected inline storage"),
+    }
+    assert_eq!(euro.char_len(), Some(2));
+
+    // Ascii and Bytes keep a zero aux nibble, making their short-family payloads bit-identical to the raw-byte tier.
+    let plain = PerlString::from_bytes(b"abcd").unwrap();
+    match plain.raw_parts() {
+        RawParts::Inline { buf, .. } => assert_eq!(buf[LENGTH_BYTE], 0x04),
+        _ => panic!("expected inline storage"),
+    }
+
+    // Overlong NUL never compresses; canonical NUL does — in every spelling (§2.2.9).
+    assert_eq!(PerlString::from_bytes([0xC0, 0x80]).unwrap().storage_type(), StorageType::InlineBytes);
+    assert_eq!(PerlString::from_bytes(b"a\0b").unwrap().storage_type(), StorageType::InlineAscii);
+
+    // Deterministic ladder: 16-30-byte ASCII goes packed where an alphabet fits and heap otherwise — never compressed,
+    // sixteen characters not fitting fifteen payload bytes.
+    assert_eq!(PerlString::from_bytes(b"1234567890123456").unwrap().storage_type(), StorageType::PackedNumeric);
+    assert_eq!(PerlString::from_bytes(b"abcdefghabcdefgh").unwrap().storage_type(), StorageType::Heap);
+}
+
+#[test]
 fn rebuilding_zeroes_everything_past_the_content() {
     // The canonical-padding obligation, checked at the representation rather than through content: a payload carrying
     // stale bytes past its length must come back with them cleared, or two equal strings could differ in their bytes
     // and representation would stop standing in for content.
     let mut dirty = [0xEEu8; INLINE_MAX];
     dirty[..4].copy_from_slice(b"abcd");
-    let s = PerlString::build_inline(InlineClass::Ascii, false, false, false, 4, dirty);
+    let s = PerlString::build_inline(InlineClass::Ascii, false, false, false, 4, 0, dirty);
 
     match s.raw_parts() {
-        RawParts::Inline { full, buf } => {
+        RawParts::Inline { full, buf, .. } => {
             assert!(!full, "four bytes is the stored-length family");
             assert_eq!(&buf[..4], b"abcd");
             assert!(buf[4..LENGTH_BYTE].iter().all(|&b| b == 0), "padding must be cleared, got {:?}", &buf[4..LENGTH_BYTE]);
-            assert_eq!(buf[LENGTH_BYTE], 4, "the length byte");
+            assert_eq!(buf[LENGTH_BYTE], 4, "the length byte: aux nibble zero, stored nibble four");
         }
         _ => panic!("expected inline storage"),
     }
@@ -1472,6 +1538,7 @@ fn packed_equality_compares_nibbles_directly() {
     let heaped: PerlString = "2026-07-28T14:33:07Z and then some more".parse().unwrap();
     assert_ne!(a, heaped);
     assert_ne!(heaped, a);
+
     let short: PerlString = "2026-07-28".parse().unwrap();
     assert_ne!(a, short);
     assert_ne!(short, a);
@@ -1497,9 +1564,8 @@ fn from_hex(hex: &str, flagged: bool) -> PerlString {
     let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
 
     if bytes.len() <= INLINE_MAX {
-        let mut buf = [0u8; INLINE_MAX];
-        buf[..bytes.len()].copy_from_slice(&bytes);
-        return PerlString::build_inline(eager_scan(&bytes), flagged, false, false, bytes.len(), buf);
+        let (class, stored, aux, buf) = classify_inline(&bytes).expect("fifteen bytes always classify");
+        return PerlString::build_inline(class, flagged, false, false, stored, aux, buf);
     }
 
     if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
@@ -1517,7 +1583,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
     // Pairs from `cmp` in container perl 5.44 across every storage pairing — inline, packed, and heap operands in every
     // content class, both length families, the four flag combinations, ASCII and high octets, multi-byte sequences,
     // embedded NULs, empty strings — including pairs whose bytes are identical but whose flags make them mean different
-    // things.  37 operands, all 1369 ordered pairs, regenerated whole whenever the operand list changes.
+    // things.  39 operands, all 1521 ordered pairs — two of them the compressed tier's 16-30-byte intake, under both
+    // flags, regenerated whole whenever the operand list changes.
     let cases: &[(&str, bool, &str, bool, i32)] = &[
         ("616263", false, "616263", false, 0),
         ("616263", false, "616264", false, -1),
@@ -1556,6 +1623,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("616263", false, "616161616161616161616161616161", false, 1),
         ("616263", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("616263", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("616263", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("616263", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("616264", false, "616263", false, 1),
         ("616264", false, "616264", false, 0),
         ("616264", false, "6162", false, 1),
@@ -1593,6 +1662,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("616264", false, "616161616161616161616161616161", false, 1),
         ("616264", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("616264", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("616264", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("616264", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("6162", false, "616263", false, -1),
         ("6162", false, "616264", false, -1),
         ("6162", false, "6162", false, 0),
@@ -1630,6 +1701,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("6162", false, "616161616161616161616161616161", false, 1),
         ("6162", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("6162", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("6162", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("6162", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("", false, "616263", false, -1),
         ("", false, "616264", false, -1),
         ("", false, "6162", false, -1),
@@ -1667,6 +1740,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("", false, "616161616161616161616161616161", false, -1),
         ("", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("", false, "313131313131313131313131313131313131313131313131313131313131", false, -1),
+        ("", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("e9", false, "616263", false, 1),
         ("e9", false, "616264", false, 1),
         ("e9", false, "6162", false, 1),
@@ -1704,6 +1779,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("e9", false, "616161616161616161616161616161", false, 1),
         ("e9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("e9", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("e9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("e9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("ff", false, "616263", false, 1),
         ("ff", false, "616264", false, 1),
         ("ff", false, "6162", false, 1),
@@ -1741,6 +1818,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("ff", false, "616161616161616161616161616161", false, 1),
         ("ff", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("ff", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("ff", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("ff", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("c3a9", false, "616263", false, 1),
         ("c3a9", false, "616264", false, 1),
         ("c3a9", false, "6162", false, 1),
@@ -1778,6 +1857,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c3a9", false, "616161616161616161616161616161", false, 1),
         ("c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("c3a9", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("00", false, "616263", false, -1),
         ("00", false, "616264", false, -1),
         ("00", false, "6162", false, -1),
@@ -1815,6 +1896,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("00", false, "616161616161616161616161616161", false, -1),
         ("00", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("00", false, "313131313131313131313131313131313131313131313131313131313131", false, -1),
+        ("00", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("00", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("610062", false, "616263", false, -1),
         ("610062", false, "616264", false, -1),
         ("610062", false, "6162", false, -1),
@@ -1852,6 +1935,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("610062", false, "616161616161616161616161616161", false, -1),
         ("610062", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("610062", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("610062", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("610062", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("616263", true, "616263", false, 0),
         ("616263", true, "616264", false, -1),
         ("616263", true, "6162", false, 1),
@@ -1889,6 +1974,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("616263", true, "616161616161616161616161616161", false, 1),
         ("616263", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("616263", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("616263", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("616263", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("616264", true, "616263", false, 1),
         ("616264", true, "616264", false, 0),
         ("616264", true, "6162", false, 1),
@@ -1926,6 +2013,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("616264", true, "616161616161616161616161616161", false, 1),
         ("616264", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("616264", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("616264", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("616264", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("6162", true, "616263", false, -1),
         ("6162", true, "616264", false, -1),
         ("6162", true, "6162", false, 0),
@@ -1963,6 +2052,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("6162", true, "616161616161616161616161616161", false, 1),
         ("6162", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("6162", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("6162", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("6162", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("", true, "616263", false, -1),
         ("", true, "616264", false, -1),
         ("", true, "6162", false, -1),
@@ -2000,6 +2091,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("", true, "616161616161616161616161616161", false, -1),
         ("", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("", true, "313131313131313131313131313131313131313131313131313131313131", false, -1),
+        ("", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("c3a9", true, "616263", false, 1),
         ("c3a9", true, "616264", false, 1),
         ("c3a9", true, "6162", false, 1),
@@ -2037,6 +2130,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c3a9", true, "616161616161616161616161616161", false, 1),
         ("c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("c3a9", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("c3bf", true, "616263", false, 1),
         ("c3bf", true, "616264", false, 1),
         ("c3bf", true, "6162", false, 1),
@@ -2074,6 +2169,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c3bf", true, "616161616161616161616161616161", false, 1),
         ("c3bf", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("c3bf", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3bf", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c3bf", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("c480", true, "616263", false, 1),
         ("c480", true, "616264", false, 1),
         ("c480", true, "6162", false, 1),
@@ -2111,6 +2208,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c480", true, "616161616161616161616161616161", false, 1),
         ("c480", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("c480", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c480", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c480", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("e282ac", true, "616263", false, 1),
         ("e282ac", true, "616264", false, 1),
         ("e282ac", true, "6162", false, 1),
@@ -2148,6 +2247,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("e282ac", true, "616161616161616161616161616161", false, 1),
         ("e282ac", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("e282ac", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("e282ac", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("e282ac", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("61c3a9", true, "616263", false, 1),
         ("61c3a9", true, "616264", false, 1),
         ("61c3a9", true, "6162", false, 1),
@@ -2185,6 +2286,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("61c3a9", true, "616161616161616161616161616161", false, 1),
         ("61c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("61c3a9", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("61c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("61c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("c3a961", true, "616263", false, 1),
         ("c3a961", true, "616264", false, 1),
         ("c3a961", true, "6162", false, 1),
@@ -2222,6 +2325,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c3a961", true, "616161616161616161616161616161", false, 1),
         ("c3a961", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("c3a961", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a961", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c3a961", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("00", true, "616263", false, -1),
         ("00", true, "616264", false, -1),
         ("00", true, "6162", false, -1),
@@ -2259,6 +2364,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("00", true, "616161616161616161616161616161", false, -1),
         ("00", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("00", true, "313131313131313131313131313131313131313131313131313131313131", false, -1),
+        ("00", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("00", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("323032362d30372d32385431343a33333a30375a", false, "616263", false, -1),
         ("323032362d30372d32385431343a33333a30375a", false, "616264", false, -1),
         ("323032362d30372d32385431343a33333a30375a", false, "6162", false, -1),
@@ -2296,6 +2403,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("323032362d30372d32385431343a33333a30375a", false, "616161616161616161616161616161", false, -1),
         ("323032362d30372d32385431343a33333a30375a", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("323032362d30372d32385431343a33333a30375a", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("323032362d30372d32385431343a33333a30375a", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("323032362d30372d32385431343a33333a30375a", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("323032362d30372d32385431343a33333a30385a", false, "616263", false, -1),
         ("323032362d30372d32385431343a33333a30385a", false, "616264", false, -1),
         ("323032362d30372d32385431343a33333a30385a", false, "6162", false, -1),
@@ -2333,6 +2442,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("323032362d30372d32385431343a33333a30385a", false, "616161616161616161616161616161", false, -1),
         ("323032362d30372d32385431343a33333a30385a", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("323032362d30372d32385431343a33333a30385a", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("323032362d30372d32385431343a33333a30385a", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("323032362d30372d32385431343a33333a30385a", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("3139322e3136382e3130302e32303020312e32", false, "616263", false, -1),
         ("3139322e3136382e3130302e32303020312e32", false, "616264", false, -1),
         ("3139322e3136382e3130302e32303020312e32", false, "6162", false, -1),
@@ -2370,6 +2481,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("3139322e3136382e3130302e32303020312e32", false, "616161616161616161616161616161", false, -1),
         ("3139322e3136382e3130302e32303020312e32", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("3139322e3136382e3130302e32303020312e32", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("3139322e3136382e3130302e32303020312e32", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("3139322e3136382e3130302e32303020312e32", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("31323334353637383930313233343536373839", false, "616263", false, -1),
         ("31323334353637383930313233343536373839", false, "616264", false, -1),
         ("31323334353637383930313233343536373839", false, "6162", false, -1),
@@ -2407,6 +2520,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("31323334353637383930313233343536373839", false, "616161616161616161616161616161", false, -1),
         ("31323334353637383930313233343536373839", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("31323334353637383930313233343536373839", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("31323334353637383930313233343536373839", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("31323334353637383930313233343536373839", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("323032362d30372d32385431343a33333a30375a", true, "616263", false, -1),
         ("323032362d30372d32385431343a33333a30375a", true, "616264", false, -1),
         ("323032362d30372d32385431343a33333a30375a", true, "6162", false, -1),
@@ -2444,6 +2559,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("323032362d30372d32385431343a33333a30375a", true, "616161616161616161616161616161", false, -1),
         ("323032362d30372d32385431343a33333a30375a", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("323032362d30372d32385431343a33333a30375a", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("323032362d30372d32385431343a33333a30375a", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("323032362d30372d32385431343a33333a30375a", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", false, "616263", false, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", false, "616264", false, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", false, "6162", false, -1),
@@ -2487,6 +2604,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("61616161616161616161616161616161616161616161616161616161616161", false, "616161616161616161616161616161", false, 1),
         ("61616161616161616161616161616161616161616161616161616161616161", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("61616161616161616161616161616161616161616161616161616161616161", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("61616161616161616161616161616161616161616161616161616161616161", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", true, "616263", false, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", true, "616264", false, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", true, "6162", false, -1),
@@ -2524,6 +2643,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("61616161616161616161616161616161616161616161616161616161616161", true, "616161616161616161616161616161", false, 1),
         ("61616161616161616161616161616161616161616161616161616161616161", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("61616161616161616161616161616161616161616161616161616161616161", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("61616161616161616161616161616161616161616161616161616161616161", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("61616161616161616161616161616161616161616161616161616161616161", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("6162636465666768696a206b6c6d6e6f70717273", false, "616263", false, 1),
         ("6162636465666768696a206b6c6d6e6f70717273", false, "616264", false, -1),
         ("6162636465666768696a206b6c6d6e6f70717273", false, "6162", false, 1),
@@ -2561,6 +2682,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("6162636465666768696a206b6c6d6e6f70717273", false, "616161616161616161616161616161", false, 1),
         ("6162636465666768696a206b6c6d6e6f70717273", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("6162636465666768696a206b6c6d6e6f70717273", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("6162636465666768696a206b6c6d6e6f70717273", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("6162636465666768696a206b6c6d6e6f70717273", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616263", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616264", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "6162", false, 1),
@@ -2622,6 +2745,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616161616161616161616161616161", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616263", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616264", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "6162", false, 1),
@@ -2671,6 +2796,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616161616161616161616161616161", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "616263", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "616264", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "6162", false, 1),
@@ -2708,6 +2835,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "616161616161616161616161616161", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "616263", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "616264", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "6162", false, 1),
@@ -2745,6 +2874,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "616161616161616161616161616161", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "616263", false, 1),
         ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "616264", false, 1),
         ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "6162", false, 1),
@@ -2788,6 +2919,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "616161616161616161616161616161", false, 1),
         ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
         ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 1),
         ("31313131313131313131313131313131313131313131313131313131313131", false, "616263", false, -1),
         ("31313131313131313131313131313131313131313131313131313131313131", false, "616264", false, -1),
         ("31313131313131313131313131313131313131313131313131313131313131", false, "6162", false, -1),
@@ -2831,6 +2964,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("31313131313131313131313131313131313131313131313131313131313131", false, "616161616161616161616161616161", false, -1),
         ("31313131313131313131313131313131313131313131313131313131313131", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("31313131313131313131313131313131313131313131313131313131313131", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("31313131313131313131313131313131313131313131313131313131313131", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("31313131313131313131313131313131313131313131313131313131313131", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("616161616161616161616161616161", false, "616263", false, -1),
         ("616161616161616161616161616161", false, "616264", false, -1),
         ("616161616161616161616161616161", false, "6162", false, -1),
@@ -2868,6 +3003,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("616161616161616161616161616161", false, "616161616161616161616161616161", false, 0),
         ("616161616161616161616161616161", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("616161616161616161616161616161", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("616161616161616161616161616161", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("616161616161616161616161616161", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "616263", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "616264", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "6162", false, 1),
@@ -2905,6 +3042,8 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "616161616161616161616161616161", false, 1),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 0),
         ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
         ("313131313131313131313131313131313131313131313131313131313131", false, "616263", false, -1),
         ("313131313131313131313131313131313131313131313131313131313131", false, "616264", false, -1),
         ("313131313131313131313131313131313131313131313131313131313131", false, "6162", false, -1),
@@ -2942,6 +3081,86 @@ fn ordering_matches_perl_for_every_flag_combination() {
         ("313131313131313131313131313131313131313131313131313131313131", false, "616161616161616161616161616161", false, -1),
         ("313131313131313131313131313131313131313131313131313131313131", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, -1),
         ("313131313131313131313131313131313131313131313131313131313131", false, "313131313131313131313131313131313131313131313131313131313131", false, 0),
+        ("313131313131313131313131313131313131313131313131313131313131", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("313131313131313131313131313131313131313131313131313131313131", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616263", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616264", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "6162", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "e9", false, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "ff", false, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "00", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "610062", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616263", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616264", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "6162", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3bf", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c480", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "e282ac", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "61c3a9", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a961", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "00", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "323032362d30372d32385431343a33333a30375a", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "323032362d30372d32385431343a33333a30385a", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "3139322e3136382e3130302e32303020312e32", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "31323334353637383930313233343536373839", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "323032362d30372d32385431343a33333a30375a", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "61616161616161616161616161616161616161616161616161616161616161", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "61616161616161616161616161616161616161616161616161616161616161", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "6162636465666768696a206b6c6d6e6f70717273", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "31313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "616161616161616161616161616161", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 0),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616263", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616264", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "6162", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "e9", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "ff", false, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "00", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "610062", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616263", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616264", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "6162", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3bf", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c480", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "e282ac", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "61c3a9", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a961", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "00", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "323032362d30372d32385431343a33333a30375a", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "323032362d30372d32385431343a33333a30385a", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "3139322e3136382e3130302e32303020312e32", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "31323334353637383930313233343536373839", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "323032362d30372d32385431343a33333a30375a", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "61616161616161616161616161616161616161616161616161616161616161", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "61616161616161616161616161616161616161616161616161616161616161", true, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "6162636465666768696a206b6c6d6e6f70717273", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", false, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "f4908080f4908080f4908080f4908080f4908080f4908080f4908080f4908080", true, -1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "31313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "616161616161616161616161616161", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a961", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "313131313131313131313131313131313131313131313131313131313131", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", false, 1),
+        ("c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9", true, 0),
     ];
 
     for (ah, af, bh, bf, want) in cases {

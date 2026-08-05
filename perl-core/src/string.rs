@@ -39,9 +39,9 @@ pub const INLINE_MAX: usize = 15;
 ///
 /// It is `INLINE_MAX * 2`, and not by coincidence: **every non-heap form is a 2:1 compression of its decoded bytes**.
 /// The packed forms reach that ratio by storing two symbols per byte, four bits each; the Latin-1 form reaches it by
-/// declining to spend two bytes on a code point, since `U+0080`-`U+00FF` sits inside UTF-8's two-byte range.  The same
-/// factor, arrived at from opposite directions — one packing two units into a byte, the other refusing to let one unit
-/// take two.  Raw forms compress not at all and are trivially under the bound.
+/// declining to spend two bytes on what Latin-1 writes in one, since `U+0080`-`U+00FF` sits inside UTF-8's two-byte
+/// range.  The same factor, arrived at from opposite directions — one packing two units into a byte, the other refusing
+/// to let one unit take two.  Raw forms compress not at all and are trivially under the bound.
 ///
 /// So this is correct by construction rather than by measuring the cases, and it is a constraint on what may be added
 /// later: a non-heap encoding compressing more than 2:1 would overflow every scratch buffer in the crate.
@@ -394,7 +394,8 @@ pub enum StorageType {
     /// ASCII at full capacity, the stored length implied.
     InlineAsciiFull,
 
-    /// Latin-1-range content: valid UTF-8, every code point in U+0000-U+00FF, at least one at or above U+0080.
+    /// Latin-1-range content: valid UTF-8, every code point in U+0000-U+00FF, at least one at or above U+0080 — stored
+    /// as its Latin-1 transcoding, one byte per one- or two-byte UTF-8 sequence.
     InlineLatin1,
 
     /// Latin-1-range content at full capacity.
@@ -528,20 +529,30 @@ macro_rules! define_perl_string {
                 }
             }
 
-            /// Rebuild an inline value with the given tag dimensions.  `len` selects the length family: the
-            /// full-capacity forms imply their length, the shorter ones store it in the byte a fifteenth character
-            /// would have used.  Internal: tag transitions go through the public monotone/setter methods.
-            fn build_inline(scan: InlineClass, utf8: bool, warned: bool, tainted: bool, len: usize, buf: [u8; INLINE_MAX]) -> PerlString {
-                debug_assert!(len <= INLINE_MAX);
+            /// Rebuild an inline value with the given tag dimensions and payload.  `s` is the payload byte count and
+            /// selects the length family; `aux` is the class's second nibble (§2.2.9) — the high-bit count for the
+            /// compressed classes, the decoded character count for the verbatim valid classes, zero for Ascii and
+            /// Bytes — stored beside `s` in the short family, implied and derived at full capacity.  Internal: tag
+            /// transitions go through the public monotone/setter methods.
+            fn build_inline(class: InlineClass, utf8: bool, warned: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PerlString {
+                debug_assert!(s <= INLINE_MAX);
+                debug_assert!(
+                    match class {
+                        InlineClass::Ascii | InlineClass::Bytes => aux == 0,
+                        InlineClass::Latin1 => (1..=s).contains(&aux),
+                        InlineClass::NonLatin1 | InlineClass::Extended => (1..s).contains(&aux),
+                    },
+                    "the aux nibble is per-class (§2.2.9): {class:?} with s {s}, aux {aux}"
+                );
                 let mut buf = buf;
-                if len < INLINE_MAX {
+                if s < INLINE_MAX {
                     // Everything past the content is zeroed, not just the length byte: equal content must have equal
                     // bytes, or representation stops standing in for content.
-                    buf[len..].fill(0);
-                    buf[LENGTH_BYTE] = len as u8;
+                    buf[s..].fill(0);
+                    buf[LENGTH_BYTE] = ((aux as u8) << 4) | s as u8;
                 }
 
-                match (scan, len == INLINE_MAX, utf8, warned, tainted) {
+                match (class, s == INLINE_MAX, utf8, warned, tainted) {
                     $( (InlineClass::$iscan, $ifull, $iu, $iw, $it) => PerlString::$iv { buf }, )*
                 }
             }
@@ -558,7 +569,7 @@ macro_rules! define_perl_string {
             /// explicit variant lists ran past a hundred names, and the per-section repetition expresses it exactly.
             fn raw_parts(&self) -> RawParts<'_> {
                 match self {
-                    $( PerlString::$iv { buf } => RawParts::Inline { full: $ifull, buf }, )*
+                    $( PerlString::$iv { buf } => RawParts::Inline { class: InlineClass::$iscan, full: $ifull, buf }, )*
                     $( PerlString::$pv { nibbles } => RawParts::Packed(Packed {
                         alphabet: PackedAlphabet::$palpha,
                         full: $pfull,
@@ -581,7 +592,7 @@ macro_rules! define_perl_string {
             /// The payload behind the tag, owned — the shape mutation needs, since it rebuilds the tag afterward.
             fn into_raw(self) -> RawOwned {
                 match self {
-                    $( PerlString::$iv { buf } => RawOwned::Inline { scan: InlineClass::$iscan, full: $ifull, buf }, )*
+                    $( PerlString::$iv { buf } => RawOwned::Inline { class: InlineClass::$iscan, full: $ifull, buf }, )*
                     $( PerlString::$pv { nibbles } => RawOwned::Packed(Packed {
                         alphabet: PackedAlphabet::$palpha,
                         full: $pfull,
@@ -749,52 +760,140 @@ define_perl_string! {
 const _: () = assert!(size_of::<PerlString>() == 16);
 const _: () = assert!(size_of::<Option<PerlString>>() == 16);
 
-// ── Construction ──────────────────────────────────────────────────
-/// Eager full scan of a short byte slice: terminal state (§2.2.3).
-fn eager_scan(bytes: &[u8]) -> InlineClass {
-    match classify_full(bytes).0 {
-        scan::ASCII => InlineClass::Ascii,
-        scan::UTF8_LATIN1 => InlineClass::Latin1,
-        scan::UTF8_NON_LATIN1 => InlineClass::NonLatin1,
-        scan::EXTENDED_UTF8 => InlineClass::Extended,
-        _ => InlineClass::Bytes,
+// ── Classification and construction ───────────────────────────────
+/// Where a short inline string keeps its length byte: the byte a fifteenth character would have occupied.  Two nibbles
+/// (§2.2.9): the low nibble is `s`, the payload bytes stored; the high nibble is the class's aux count — the high-bit
+/// count `h` for the compressed classes, the decoded character count for the verbatim valid classes, canonically zero
+/// for Ascii (whose `h` is zero by tag) and Bytes.  Full capacity implies `s = 15` and derives the aux instead.
+const LENGTH_BYTE: usize = INLINE_MAX - 1;
+
+/// The stored payload byte count `s` of an inline value: implied at full capacity, the length byte's low nibble
+/// otherwise.  An explicit length costs nothing at full capacity and buys a nibble read instead of a scan everywhere
+/// else, and it lets NUL-bearing content live inline, which a terminator cannot.
+#[inline]
+fn inline_stored(full: bool, buf: &[u8; INLINE_MAX]) -> usize {
+    if full { INLINE_MAX } else { (buf[LENGTH_BYTE] & 0x0F) as usize }
+}
+
+/// The stored aux nibble of a short-family inline value; the full family derives its aux instead (§2.2.9).
+#[inline]
+fn inline_aux(buf: &[u8; INLINE_MAX]) -> usize {
+    (buf[LENGTH_BYTE] >> 4) as usize
+}
+
+/// The count of stored bytes with the high bit set in a compressed payload — each the transcoding of a two-byte UTF-8
+/// sequence — the full family's derived `h` (§2.2.9).
+fn high_count(cps: &[u8]) -> usize {
+    cps.iter().filter(|&&c| c >= 0x80).count()
+}
+
+/// The internal byte length of an inline value: `s + h` for the Latin-1 class, whose stored bytes each expand back to
+/// one or two internal bytes, and `s` for everything else — Ascii's `h` is zero by tag, and the verbatim classes store
+/// the internal bytes themselves (§2.2.9).
+fn inline_internal_len(class: InlineClass, full: bool, buf: &[u8; INLINE_MAX]) -> usize {
+    let s = inline_stored(full, buf);
+    match class {
+        InlineClass::Latin1 => s + if full { high_count(buf) } else { inline_aux(buf) },
+        _ => s,
     }
 }
 
-/// Where a short inline string keeps its length: the byte a fifteenth character would have occupied.
-const LENGTH_BYTE: usize = INLINE_MAX - 1;
+/// The aux nibble, stored or derived: the short family reads it; the full family recomputes it (§2.2.9).
+fn inline_derived_aux(class: InlineClass, full: bool, buf: &[u8; INLINE_MAX]) -> usize {
+    if !full {
+        return inline_aux(buf);
+    }
+    match class {
+        InlineClass::Ascii | InlineClass::Bytes => 0,
+        InlineClass::Latin1 => high_count(buf),
+        InlineClass::NonLatin1 | InlineClass::Extended => classify_full(buf).1,
+    }
+}
 
-/// The length of an inline payload.
-///
-/// Full-capacity content implies its length, and everything shorter stores it — the same arrangement the packed tier
-/// uses, and for the same reason: an explicit length costs nothing at full capacity and buys a byte read instead of a
-/// scan everywhere else.  It also lets NUL-bearing content live inline, which a terminator cannot.
-#[inline]
-fn inline_len(full: bool, buf: &[u8; INLINE_MAX]) -> usize {
-    if full { INLINE_MAX } else { buf[LENGTH_BYTE] as usize }
+/// Strict decode of Latin-1-range UTF-8 into its Latin-1 transcoding: every code point in U+0000-U+00FF, canonical
+/// encodings only, each one- or two-byte sequence stored as its single-byte Latin-1 equivalent — flag-blind, since the
+/// class is a fact about the bytes.  Overlong forms (`C0`/`C1` leads — including `C0 80`, the overlong NUL) and every
+/// lead at or above `C4` fail, since noncanonical content must never compress; so does a sixteenth stored byte, which
+/// is why up to thirty input bytes can land inline (§2.2.9).  Returns the transcoded bytes beside the two nibbles: the
+/// stored count `s` and the high-bit count `h`.
+fn decode_latin1_range(bytes: &[u8]) -> Option<([u8; INLINE_MAX], usize, usize)> {
+    if bytes.len() > DECODE_MAX {
+        return None; // More than thirty bytes cannot transcode to fifteen.
+    }
+
+    let mut cp = [0u8; INLINE_MAX];
+    let (mut s, mut h, mut i) = (0usize, 0usize, 0usize);
+    while i < bytes.len() {
+        let decoded = match bytes[i] {
+            b @ 0x00..=0x7F => {
+                i += 1;
+                b
+            }
+            lead @ (0xC2 | 0xC3) => {
+                let &cont = bytes.get(i + 1)?;
+                if cont & 0xC0 != 0x80 {
+                    return None;
+                }
+                i += 2;
+                h += 1;
+                ((lead & 0x03) << 6) | (cont & 0x3F)
+            }
+            _ => return None,
+        };
+
+        if s == INLINE_MAX {
+            return None; // A sixteenth stored byte: past the payload.
+        }
+        cp[s] = decoded;
+        s += 1;
+    }
+
+    Some((cp, s, h))
+}
+
+/// Expand one stored byte back to the UTF-8 sequence it transcoded, returning the width — the compressed classes'
+/// expansion primitive.  Callers guarantee room: every consumer writes into a `DECODE_MAX` scratch sized for the widest
+/// expansion.
+fn expand_latin1(b: u8, out: &mut [u8]) -> usize {
+    if b < 0x80 {
+        out[0] = b;
+        1
+    } else {
+        out[0] = 0xC0 | (b >> 6);
+        out[1] = 0x80 | (b & 0x3F);
+        2
+    }
+}
+
+/// Classify content into its canonical inline form: the class, the two nibbles, and the payload — `None` when no inline
+/// form holds it, packed and heap lying past (§2.2.9's ladder, inline rungs).  Determinism is disjointness: valid
+/// Latin-1-range UTF-8 always compresses — up to thirty input bytes — and the verbatim classes hold exactly the
+/// fifteen-byte-or-shorter content failing that test, the Bytes class by default when the tag rules out every other.
+/// The flag is never consulted: the class is a fact about the bytes.
+fn classify_inline(bytes: &[u8]) -> Option<(InlineClass, usize, usize, [u8; INLINE_MAX])> {
+    if let Some((cp, s, h)) = decode_latin1_range(bytes) {
+        let class = if h == 0 { InlineClass::Ascii } else { InlineClass::Latin1 };
+        return Some((class, s, h, cp));
+    }
+
+    if bytes.len() > INLINE_MAX {
+        return None;
+    }
+
+    let (class, aux) = match classify_full(bytes) {
+        (scan::UTF8_NON_LATIN1, chars) => (InlineClass::NonLatin1, chars),
+        (scan::EXTENDED_UTF8, chars) => (InlineClass::Extended, chars),
+        // ASCII and Latin-1-range content took the compressed branch above; what remains is the Bytes residual.
+        _ => (InlineClass::Bytes, 0),
+    };
+
+    Some((class, bytes.len(), aux, inline_payload(bytes)))
 }
 
 /// Whether content can be stored inline.  Length alone: an explicit length admits NUL-bearing content that a terminator
 /// would have to reject.
 fn inline_eligible(bytes: &[u8]) -> bool {
     bytes.len() <= INLINE_MAX
-}
-
-/// Pack content that is entering the tier for the first time: inline bytes plus what is being appended to them.
-///
-/// Classification runs over the whole result because there are no nibbles to carry forward yet — that is
-/// [`Packed::push`]'s job, for content already packed.
-fn pack_grown(head: &[u8], tail: &[u8]) -> Option<Packed> {
-    let new_len = head.len() + tail.len();
-    if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&new_len) {
-        return None;
-    }
-
-    let mut combined = [0u8; MAX_PACKED_LEN];
-    combined[..head.len()].copy_from_slice(head);
-    combined[head.len()..new_len].copy_from_slice(tail);
-
-    pack(&combined[..new_len])
 }
 
 fn inline_payload(bytes: &[u8]) -> [u8; INLINE_MAX] {
@@ -822,7 +921,7 @@ impl PerlString {
     /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
     /// payload needs no allocation — which is also what lets `Default` exist.
     pub fn empty() -> PerlString {
-        PerlString::build_inline(InlineClass::Ascii, false, false, false, 0, [0u8; INLINE_MAX])
+        PerlString::build_inline(InlineClass::Ascii, false, false, false, 0, 0, [0u8; INLINE_MAX])
     }
 
     /// Construct from a Rust `&str` **without allocating**, or `None` if the content cannot be stored in the value
@@ -833,43 +932,46 @@ impl PerlString {
     /// can write `PerlString::inline(s).unwrap_or_default()`; callers who need the content stored either way should use
     /// the fallible constructors instead.
     pub fn inline(s: impl AsRef<str>) -> Option<PerlString> {
-        let s = s.as_ref();
-        let bytes = s.as_bytes();
-        if bytes.len() > INLINE_MAX {
-            // The packed tier's band begins exactly where the inline payload ends, and it allocates nothing either.
-            // Past the band there is no non-allocating form, so this is where `None` starts meaning "the heap".
-            if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
-                return None;
-            }
+        let bytes = s.as_ref().as_bytes();
 
-            return pack(bytes).map(|p| PerlString::build_packed(p, false, false, false));
+        // The inline rungs come first (§2.2.9's ladder), and they now reach 16-30-byte Latin-1-compressible content:
+        // the accepted set has widened, exactly as the guarantee-not-a-count contract promises.
+        if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
+            // Ascii stores unflagged, non-ASCII flagged, following `FromStr`.  Bytes/Extended are impossible from a
+            // `&str`, whose bytes are Rust-valid.
+            return Some(PerlString::build_inline(class, class != InlineClass::Ascii, false, false, stored, aux, buf));
         }
 
-        let state = eager_scan(bytes); // Ascii or Utf8NonAscii; Bytes/Extended impossible from &str.
+        // The packed band holds 16-30-character alphabet content and allocates nothing either.  Past it, `None` starts
+        // meaning "the heap".
+        if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
+            return None;
+        }
 
-        Some(PerlString::build_inline(state, state != InlineClass::Ascii, false, false, bytes.len(), inline_payload(bytes)))
+        pack(bytes).map(|p| PerlString::build_packed(p, false, false, false))
     }
 
     /// Construct from raw bytes **without allocating**, or `None` if the content cannot be stored in the value itself.
     /// Unflagged, like [`PerlString::from_bytes`]; the same guarantee-not-a-count contract as [`PerlString::inline`].
     pub fn inline_bytes(bytes: impl AsRef<[u8]>) -> Option<PerlString> {
         let bytes = bytes.as_ref();
-        if bytes.len() > INLINE_MAX {
-            if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
-                return None;
-            }
 
-            return pack(bytes).map(|p| PerlString::build_packed(p, false, false, false));
+        if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
+            return Some(PerlString::build_inline(class, false, false, false, stored, aux, buf));
         }
 
-        Some(PerlString::build_inline(eager_scan(bytes), false, false, false, bytes.len(), inline_payload(bytes)))
+        if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
+            return None;
+        }
+
+        pack(bytes).map(|p| PerlString::build_packed(p, false, false, false))
     }
 
     // ── Accessors ─────────────────────────────────────────────────
     /// Length in bytes.  No dereference for inline; handle mirror for heap.
     pub fn len(&self) -> usize {
         match self.raw_parts() {
-            RawParts::Inline { full, buf } => inline_len(full, buf),
+            RawParts::Inline { class, full, buf } => inline_internal_len(class, full, buf),
             RawParts::Packed(p) => p.len(),
             RawParts::Heap(cb) => cb.len(),
         }
@@ -890,10 +992,10 @@ impl PerlString {
     /// **Every compressing storage form must expand here.**  This is the one place the expansion happens, and it is why
     /// length, comparison, and hashing are correct without knowing which form they were handed: they read the value's
     /// bytes, never a payload.  An arm returning a compressed payload would silently give every consumer the wrong
-    /// string — most damagingly the Latin-1 inline form (§2.2.9), whose stored code points are *half* the characters of
-    /// an unflagged value, so returning them unexpanded would make a thirty-character string look like fifteen and
-    /// compare equal to a string it differs from.  `DECODE_MAX` is `INLINE_MAX * 2` for this reason: it is sized for
-    /// the widest expansion any form may need.
+    /// string — most damagingly the Latin-1 inline form (§2.2.9), whose stored bytes are *half* the internal bytes at
+    /// the widest, so returning them unexpanded would make a thirty-byte string look like fifteen and compare equal to
+    /// a string it differs from.  `DECODE_MAX` is `INLINE_MAX * 2` for this reason: it is sized for the widest
+    /// expansion any form may need.
     pub fn as_bytes<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> &'a [u8] {
         // `len` derives the byte count per storage form, independently of this decode, so the two disagreeing means an
         // arm forgot to expand.  Its own scratch, the caller's being borrowed for the return.
@@ -908,7 +1010,19 @@ impl PerlString {
 
     fn as_bytes_inner<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> &'a [u8] {
         match self.raw_parts() {
-            RawParts::Inline { full, buf } => &buf[..inline_len(full, buf)],
+            RawParts::Inline { class, full, buf } => {
+                let stored = inline_stored(full, buf);
+                if class == InlineClass::Latin1 {
+                    // The compressed payload is the Latin-1 transcoding; the value's bytes are its expansion (§2.2.9).
+                    let mut n = 0;
+                    for &c in &buf[..stored] {
+                        n += expand_latin1(c, &mut scratch[n..]);
+                    }
+
+                    return &scratch[..n];
+                }
+                &buf[..stored]
+            }
             RawParts::Packed(p) => {
                 let (decoded, len) = p.unpack();
                 scratch[..len].copy_from_slice(&decoded[..len]);
@@ -928,13 +1042,24 @@ impl PerlString {
                 scratch[..len].copy_from_slice(&decoded[..len]);
                 str::from_utf8(&scratch[..len]).ok()
             }
-            RawParts::Inline { full, buf } => {
-                let bytes = &buf[..inline_len(full, buf)];
-                match self.inline_class() {
-                    // SAFETY: terminal scan states were established by a full validity scan at construction and inline
-                    // mutation re-scans; Ascii, Latin1, and NonLatin1 all certify Rust-valid UTF-8.
-                    Some(InlineClass::Ascii) | Some(InlineClass::Latin1) | Some(InlineClass::NonLatin1) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
-                    _ => None,
+            RawParts::Inline { class, full, buf } => {
+                let stored = inline_stored(full, buf);
+                match class {
+                    InlineClass::Latin1 => {
+                        let mut n = 0;
+                        for &c in &buf[..stored] {
+                            n += expand_latin1(c, &mut scratch[n..]);
+                        }
+
+                        // SAFETY: the expansion emits canonical one- and two-byte encodings only — valid by
+                        // construction.
+                        Some(unsafe { str::from_utf8_unchecked(&scratch[..n]) })
+                    }
+
+                    // SAFETY: the Ascii class certifies seven-bit content and NonLatin1 certifies Rust-valid UTF-8,
+                    // both established by a full scan at construction; inline mutation reclassifies.
+                    InlineClass::Ascii | InlineClass::NonLatin1 => Some(unsafe { str::from_utf8_unchecked(&buf[..stored]) }),
+                    InlineClass::Extended | InlineClass::Bytes => None,
                 }
             }
             RawParts::Heap(cb) => {
@@ -1045,16 +1170,16 @@ impl PerlString {
         match self.raw_parts() {
             // Packed alphabets are ASCII, so every character is one byte.
             RawParts::Packed(p) => Some(p.len()),
-            RawParts::Inline { full, buf } => {
-                let len = inline_len(full, buf);
-                let bytes = &buf[..len];
-                match self.inline_class() {
-                    Some(InlineClass::Ascii) => Some(len),
-                    Some(InlineClass::Bytes) | None => None,
-                    _ => {
-                        let (_, chars) = classify_full(bytes); // at most fifteen bytes: recount is trivial
-                        Some(chars)
-                    }
+            RawParts::Inline { class, full, buf } => {
+                let stored = inline_stored(full, buf);
+                match class {
+                    // Under perl's flagged semantics — this method's question — the transcoded units are the
+                    // characters, so the count is the stored count: O(1) for all Latin-1-range content, where the
+                    // raw-byte tier could only shortcut ASCII.
+                    InlineClass::Ascii | InlineClass::Latin1 => Some(stored),
+                    InlineClass::Bytes => None,
+                    // The verbatim valid classes carry their count in the aux nibble; the full family derives it.
+                    InlineClass::NonLatin1 | InlineClass::Extended => Some(if full { classify_full(&buf[..stored]).1 } else { inline_aux(buf) }),
                 }
             }
             RawParts::Heap(cb) => match cb.scan() {
@@ -1108,7 +1233,10 @@ impl PerlString {
         let old = mem::take(self);
 
         *self = match old.into_raw() {
-            RawOwned::Inline { scan, full, buf } => PerlString::build_inline(scan, u2, w2, t2, inline_len(full, &buf), buf),
+            RawOwned::Inline { class, full, buf } => {
+                let (s, aux) = (inline_stored(full, &buf), inline_derived_aux(class, full, &buf));
+                PerlString::build_inline(class, u2, w2, t2, s, aux, buf)
+            }
             RawOwned::Packed(p) => PerlString::build_packed(p, u2, w2, t2),
             RawOwned::Heap(cb) => PerlString::build_heap(u2, w2, t2, cb),
         };
@@ -1142,55 +1270,72 @@ impl PerlString {
 
         // Inline content never needs `mem::take`: the payload is a fifteen-byte `Copy` array, so it can be read out,
         // extended, and written back.  Taking exists to move a `CowBuffer` out of `&mut self`, which only the heap arm
-        // below actually requires.  Cheapest case first, and touching nothing it does not have to: a short inline
-        // string whose tag the append leaves alone, and which still fits short, is written straight through the
-        // existing variant — the length byte updated in place.  Reaching full capacity changes the family, so it takes
-        // the rebuild below.
-        if let Some(scan) = self.inline_class()
-            && append_transition_known(scan, kind) == Some(scan)
+        // below actually requires.  Cheapest case first, and touching nothing it does not have to: only the Ascii class
+        // writes through — its payload is the raw bytes with a zero aux nibble, so appending ASCII content that still
+        // fits short extends the existing variant bit-identically to the raw-byte tier, the length byte updated in
+        // place.  Every other class, and any append reaching full capacity (which changes the family), rebuilds through
+        // canonical selection below — append is byte mutation (§2.2.9).
+        if self.inline_class() == Some(InlineClass::Ascii)
+            && matches!(kind, AppendKind::Valid { class: scan::ASCII, .. })
             && let Some((full, dst)) = self.inline_buf_mut()
             && !full
         {
-            let len = dst[LENGTH_BYTE] as usize;
+            let len = (dst[LENGTH_BYTE] & 0x0F) as usize;
             let new_len = len + bytes.len();
             if new_len < INLINE_MAX {
                 dst[len..new_len].copy_from_slice(bytes);
-                dst[LENGTH_BYTE] = new_len as u8;
+                dst[LENGTH_BYTE] = new_len as u8; // Aux stays zero: the class is Ascii on both sides.
                 return Ok(());
             }
         }
 
-        // Otherwise the payload has to move.  For inline content that is still only a copy of fifteen bytes and one
-        // rebuild: `mem::take` exists to move a `CowBuffer` out of `&mut self`, which the heap arm alone requires.
+        // Otherwise the payload has to move.  For inline content that is still only a materialisation of at most thirty
+        // bytes and one rebuild: append is byte mutation, so the result re-runs canonical selection (§2.2.9) over the
+        // value's internal bytes — the compressed classes expand first, exactly as `as_bytes` would.
         let inline = match self.raw_parts() {
-            RawParts::Inline { full, buf } => Some((inline_len(full, buf), *buf)),
+            RawParts::Inline { class, full, buf } => Some((class, inline_stored(full, buf), *buf)),
             _ => None,
         };
 
-        if let (Some(scan), Some((len, buf))) = (self.inline_class(), inline) {
-            let new_len = len + bytes.len();
+        if let Some((class, stored, buf)) = inline {
+            let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
 
-            if new_len <= INLINE_MAX {
-                let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
-                let mut nbuf = buf;
-                nbuf[len..new_len].copy_from_slice(bytes);
-                let nscan = append_transition_inline(scan, kind, &nbuf[..new_len]);
-                *self = PerlString::build_inline(nscan, u, w, t, new_len, nbuf);
-                return Ok(());
+            let mut internal = [0u8; DECODE_MAX];
+            let ilen = if class == InlineClass::Latin1 {
+                let mut n = 0;
+                for &c in &buf[..stored] {
+                    n += expand_latin1(c, &mut internal[n..]);
+                }
+                n
+            } else {
+                internal[..stored].copy_from_slice(&buf[..stored]);
+                stored
+            };
+            let total = ilen + bytes.len();
+
+            if total <= MAX_PACKED_LEN {
+                let mut combined = [0u8; MAX_PACKED_LEN];
+                combined[..ilen].copy_from_slice(&internal[..ilen]);
+                combined[ilen..total].copy_from_slice(bytes);
+
+                if let Some((nc, ns, naux, nbuf)) = classify_inline(&combined[..total]) {
+                    *self = PerlString::build_inline(nc, u, w, t, ns, naux, nbuf);
+                    return Ok(());
+                }
+
+                if let Some(packed) = pack(&combined[..total]) {
+                    *self = PerlString::build_packed(packed, u, w, t);
+                    return Ok(());
+                }
+
+                // Sixteen to thirty bytes fitting neither a compressed payload nor an alphabet: the heap, below.
             }
 
-            // Outgrowing the payload: the packed band begins exactly where it ends, and the heap lies past that.
-            let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
-            let old_bytes = &buf[..len];
-            *self = if let Some(packed) = pack_grown(old_bytes, bytes) {
-                PerlString::build_packed(packed, u, w, t)
-            } else {
-                let mut cb = CowBuffer::with_capacity(new_len + (new_len >> 2))?;
-                cb.extend_from_slice(old_bytes)?;
-                cb.extend_from_slice(bytes)?;
-                cb.narrow_scan(append_transition_heap(inline_scan_to_heap(scan), kind));
-                PerlString::build_heap(u, w, t, cb)
-            };
+            let mut cb = CowBuffer::with_capacity(total + (total >> 2))?;
+            cb.extend_from_slice(&internal[..ilen])?;
+            cb.extend_from_slice(bytes)?;
+            cb.narrow_scan(append_transition_heap(inline_scan_to_heap(class), kind));
+            *self = PerlString::build_heap(u, w, t, cb);
 
             return Ok(());
         }
@@ -1242,13 +1387,13 @@ impl PerlString {
 }
 
 enum RawParts<'a> {
-    Inline { full: bool, buf: &'a [u8; INLINE_MAX] },
+    Inline { class: InlineClass, full: bool, buf: &'a [u8; INLINE_MAX] },
     Packed(Packed),
     Heap(&'a CowBuffer),
 }
 
 enum RawOwned {
-    Inline { scan: InlineClass, full: bool, buf: [u8; INLINE_MAX] },
+    Inline { class: InlineClass, full: bool, buf: [u8; INLINE_MAX] },
     Packed(Packed),
     Heap(CowBuffer),
 }
@@ -1272,52 +1417,6 @@ fn inline_scan_to_heap(s: InlineClass) -> u8 {
         InlineClass::NonLatin1 => scan::UTF8_NON_LATIN1,
         InlineClass::Extended => scan::EXTENDED_UTF8,
         InlineClass::Bytes => scan::MALFORMED_UTF8,
-    }
-}
-
-/// §2.2.5 append transitions for an inline result.  Inline states are terminal, and the appended region is small, so
-/// degraded knowledge is recovered by an eager re-scan of the (≤ 22-byte) result rather than tracked lazily.  The
-/// resulting scan state when the transition rules settle it from the prior state and what is being appended alone,
-/// without looking at the content — which is every case but the fallback below.
-///
-/// Separated out because the append fast path needs to know whether the tag changes *before* deciding whether it can
-/// write through the existing variant, and a rescan would cost more than the rebuild it is trying to avoid.
-fn append_transition_known(prior: InlineClass, kind: AppendKind) -> Option<InlineClass> {
-    match (prior, kind) {
-        // Valid + valid: the range join (§2.2.5).
-        (InlineClass::Ascii, AppendKind::Valid { class: scan::ASCII, .. }) => Some(InlineClass::Ascii),
-        (InlineClass::Ascii | InlineClass::Latin1, AppendKind::Valid { class: scan::ASCII | scan::UTF8_LATIN1, .. }) => Some(InlineClass::Latin1),
-        (
-            InlineClass::Ascii | InlineClass::Latin1 | InlineClass::NonLatin1,
-            AppendKind::Valid { class: scan::ASCII | scan::UTF8_LATIN1 | scan::UTF8_NON_LATIN1, .. },
-        ) => Some(InlineClass::NonLatin1),
-
-        // Perl-decodable content of any kind appended to extended: the Rust-rejected code point is still there.
-        (InlineClass::Extended, AppendKind::Valid { .. }) => Some(InlineClass::Extended),
-
-        _ => None,
-    }
-}
-
-fn append_transition_inline(prior: InlineClass, kind: AppendKind, result: &[u8]) -> InlineClass {
-    if let Some(known) = append_transition_known(prior, kind) {
-        return known;
-    }
-
-    match (prior, kind) {
-        // Valid + valid: the range join (§2.2.5).
-        (InlineClass::Ascii, AppendKind::Valid { class: scan::ASCII, .. }) => InlineClass::Ascii,
-        (InlineClass::Ascii | InlineClass::Latin1, AppendKind::Valid { class: scan::ASCII | scan::UTF8_LATIN1, .. }) => InlineClass::Latin1,
-        (
-            InlineClass::Ascii | InlineClass::Latin1 | InlineClass::NonLatin1,
-            AppendKind::Valid { class: scan::ASCII | scan::UTF8_LATIN1 | scan::UTF8_NON_LATIN1, .. },
-        ) => InlineClass::NonLatin1,
-
-        // Perl-decodable content of any kind appended to extended: the Rust-rejected code point is still there.
-        (InlineClass::Extended, AppendKind::Valid { .. }) => InlineClass::Extended,
-
-        // Anything else: inline is small — rescue full knowledge with an eager re-scan.
-        _ => eager_scan(result),
     }
 }
 
@@ -1626,6 +1725,16 @@ impl PartialEq for PerlString {
             {
                 grid_hit!();
                 return false;
+            }
+
+            // Same flag, both inline: representation equality is exact — canonical selection guarantees equal content
+            // takes equal class, family, and payload bytes (§2.2.9), and the padding is canonical.  One discriminant
+            // compare and one fifteen-byte memcmp, where expanding both sides costs decode work.
+            if let (RawParts::Inline { class: ca, full: fa, buf: ba }, RawParts::Inline { class: cb, full: fb, buf: bb }) =
+                (self.raw_parts(), other.raw_parts())
+            {
+                grid_hit!();
+                return ca == cb && fa == fb && ba == bb;
             }
 
             // Same interpretation: byte equality is character equality (length check is memcmp's first move).

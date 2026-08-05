@@ -973,8 +973,10 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   - *ASCII and Latin-1-range content* — valid UTF-8 with every
     code point in U+0000-U+00FF (U+0000 included: NUL is ordinary
     content, and its canonical encoding is the single byte 00 —
-    the overlong C0 80 stays invalid) — stores **one code point
-    per byte, regardless of the flag**.  Flag on: the payload is
+    the overlong C0 80 stays invalid) — stores **the Latin-1
+    transcoding of the internal bytes, regardless of the flag**:
+    each one- or two-byte UTF-8 sequence as its single-byte
+    Latin-1 equivalent.  Flag on: the payload is
     the string's characters (fifteen high-Latin-1 characters
     inline where their encoding spans thirty bytes), and
     `utf8::upgrade`/`downgrade` are pure flag flips with zero
@@ -985,9 +987,9 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
     Every operation answers over the virtual expansion, the
     packed tier's dual-view discipline, and `length` is the
     expansion sum — one or two per payload byte — never the
-    payload count: fifteen stored high-Latin-1 code points report
-    length **30** (container-verified, with `ord` returning the
-    lead byte `C3`, not the code point).
+    payload count: fifteen stored high bytes report length **30**
+    (container-verified, with `ord` returning the lead byte `C3`,
+    not the code point).
   - *Non-Latin-1, extended, and bytes-class content* stores the
     internal octets **verbatim**: 0-15 original bytes that are
     Rust-valid UTF-8 beyond the Latin-1 range, perl-decodable but
@@ -1000,9 +1002,10 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   **The length byte is two nibbles.**  For content of 14 payload
   bytes or fewer, the low nibble holds `s`, the count of payload
   bytes stored, and the high nibble is per-class.  For the
-  compressed classes it holds `h`, the count of stored code
-  points at or above U+0080 — zero for the ASCII class by its
-  tag — so the internal byte length is `s + h` (0-28) and the
+  compressed classes it holds `h`, the count of stored bytes
+  with the high bit set — each the transcoding of a two-byte
+  UTF-8 sequence, zero for the ASCII class by its tag — so the
+  internal byte length is `s + h` (0-28) and the
   character length is `s` with the flag on and `s + h` with it
   off: every length answer a nibble read and at most one add.
   For the two verbatim valid classes it holds the decoded
@@ -1026,7 +1029,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   keeps `char_len` O(1) across them.
   Full capacity implies `s = 15` and derives the rest by short
   word-parallel counts over the payload: the compressed classes'
-  internal length is 15 plus the high-code-point count, the
+  internal length is 15 plus the high-bit count, the
   verbatim valid classes' character count is 15 minus the
   continuation-byte count, and flag-on full-capacity compressed
   content is fifteen characters by implication, paying no count
@@ -1036,9 +1039,10 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   bytes**, which is why one scratch buffer of thirty serves all
   of them: the packed forms store two symbols per byte at four
   bits each, and the compressed classes decline to spend two
-  bytes on a code point, `U+0080`-`U+00FF` sitting inside UTF-8's
-  two-byte range.  The same factor from opposite directions — one
-  packing two units into a byte, the other refusing to let one
+  bytes on what Latin-1 writes in one, `U+0080`-`U+00FF` sitting
+  inside UTF-8's two-byte range.  The same factor from opposite
+  directions — one packing two units into a byte, the other
+  refusing to let one
   unit take two — so the bound is `15 x 2` by construction rather
   than the larger of two measured cases.  It is also a constraint
   on later additions: a non-heap encoding compressing more than
@@ -1096,7 +1100,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   order `Numeric`, `DateTimePlus`, `DateTimeZulu`, digits
   fitting more than one — and heap otherwise; Latin-1-range
   content with a high code point takes `InlineLatin1` at 0-15
-  code points (up to 30 encoded bytes) and heap past that, the
+  stored bytes (up to 30 internal bytes) and heap past that, the
   packed rungs unreachable for it since the alphabets are
   ASCII-only; non-Latin-1, extended, and bytes content takes its
   inline type at 0-15 octets and heap past that.  The growth
