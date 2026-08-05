@@ -1259,6 +1259,36 @@ behind a thin pointer (§2.2.3) — buffer bytes still shared
 zero-copy, and the zero-copy sanctioned-untaint dividend is
 unaffected.
 
+**Latin-1 compression on the heap: considered, declined.**  Storing
+a heap buffer's Latin-1-range UTF-8 as one byte per code point
+would halve it, but the reason not to is structural rather than
+statistical.  The borrowed view rests on a single stack scratch of
+`DECODE_MAX` bytes, which is sound only because every compressing
+form is bounded; heap buffers are not, so a compressed heap form
+could not expand into a fixed scratch.  `as_bytes` would need an
+allocation per read or a different signature, and the property that
+a caller supplies one array and never learns which form it got —
+what lets storage forms multiply without every consumer following
+along — would be lost.
+
+The statistical case is weak independently.  The 2:1 figure holds
+only for text that is *entirely* high-Latin-1; real prose sprinkles
+accents through ASCII, and measured on French, German, and Spanish
+samples the saving is 5-7%.  So the trade would be a decode on
+every read, against six percent.
+
+Inline is different in kind, which is why it is worth having there:
+compression does not buy a percentage but decides *which tier the
+string lives in*, so the payoff is an allocation avoided rather
+than bytes saved on a buffer already allocated.  The flag-on
+reading carries that case — fifteen high-Latin-1 characters whose
+encoding spans thirty bytes, with `utf8::upgrade`/`downgrade`
+becoming pure flag flips where perl re-encodes.  The flag-off
+reading has the same density problem inline as on the heap, a
+mostly-ASCII twenty-byte string compressing to about eighteen and
+staying on the heap regardless; it is merely not structurally
+impossible there.
+
 **Corpus tripwire** (ledgered, runs during implementation, does
 not gate the ruling): measure over representative Perl corpora
 (a) the share of strings in the 16-22-byte window — those
