@@ -1744,6 +1744,24 @@ sometimes slower.  Nothing does so today,
 the format not yet being live — the inline tier still stores raw
 bytes — and this is the obligation it must satisfy when it lands.
 
+**The mixed-flag ordering is the byte model, not a decode.**  Perl
+upgrades the unflagged operand and compares the encodings byte for
+byte (`sv_cmp`), so the flagged side's bytes pass verbatim and are
+never read as anything — malformed flagged content orders by
+exactly the bytes it has.  The unflagged side upgrades virtually
+as it walks, one octet presenting one byte below `0x80` and a
+lead/continuation pair above.  For valid flagged content this is
+indistinguishable from comparing decoded characters, UTF-8 being
+order-preserving; on malformed flagged content the two models
+diverge, and the byte model is perl's.  Container-pinned: flag-off
+`FF` against flagged `E9` compares `C3.BF` to `E9` — less — where
+decoding the flagged octet to a code point would report greater;
+flag-off `E9` against flagged `E9` is unequal, identical payload
+bytes under different flags being different strings.  The
+storage-pairing ordering corpus caught the decoded-side model
+returning the inverted sign, the old corpus's flagged operands all
+being valid UTF-8 where the models agree.
+
 **For seven-bit content the flag is semantically null.**  ASCII
 encodes identically as octets and as UTF-8, so the value is the
 same either way and the projection is the identity there too — it

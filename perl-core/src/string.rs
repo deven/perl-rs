@@ -1511,44 +1511,34 @@ impl PerlString {
     }
 }
 
-/// Compare a flagged string's code points against an unflagged string's octets, which are themselves code points.
+/// Compare a flagged string against an unflagged one: perl upgrades the unflagged side and compares the encodings byte
+/// for byte (`sv_cmp`), so the flagged side's bytes pass verbatim — malformed content included, where reading the bytes
+/// as code points would invent an ordering perl does not use.  The unflagged side upgrades virtually: each octet below
+/// 0x80 presents itself; each octet above presents its lead and its continuation in turn, no buffer needed.
 ///
-/// Malformed flagged content has no code points to compare, so it falls back to octets — the same bytes either way, and
-/// the only answer available.
+/// Container-pinned: flag-off `FF` against flagged `E9` is `C3.BF` against `E9` — less — and flag-off `E9` against
+/// flagged `E9` is `C3.A9` against `E9`: unequal, the monster's cousin, identical payload bytes under different flags
+/// being different strings.
 fn cmp_cross_flag(flagged: &PerlString, plain: &PerlString) -> Ordering {
     let (mut fs, mut ps) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
     let fb = flagged.as_bytes(&mut fs);
     let pb = plain.as_bytes(&mut ps);
 
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < fb.len() && j < pb.len() {
-        let window = &fb[i..(i + 4).min(fb.len())];
-        let (point, width) = match str::from_utf8(window) {
-            Ok(w) => match w.chars().next() {
-                Some(c) => (c as u32, c.len_utf8()),
-                None => return Ordering::Equal, // Unreachable: the window is non-empty.
-            },
-            Err(e) if e.valid_up_to() > 0 => {
-                let valid = &window[..e.valid_up_to()];
-                match str::from_utf8(valid).ok().and_then(|w| w.chars().next()) {
-                    Some(c) => (c as u32, c.len_utf8()),
-                    None => (fb[i] as u32, 1),
-                }
+    let mut i = 0;
+    for &b in pb {
+        let (lead, cont) = if b < 0x80 { (b, None) } else { (0xC0 | (b >> 6), Some(0x80 | (b & 0x3F))) };
+        for expected in std::iter::once(lead).chain(cont) {
+            let Some(&f) = fb.get(i) else {
+                return Ordering::Less; // The flagged side is a strict prefix of the upgrade: the lesser.
+            };
+            match f.cmp(&expected) {
+                Ordering::Equal => i += 1,
+                ordering => return ordering,
             }
-            Err(_) => (fb[i] as u32, 1), // Malformed: the octet stands for itself.
-        };
-
-        match point.cmp(&(pb[j] as u32)) {
-            Ordering::Equal => {}
-            ordering => return ordering,
         }
-
-        i += width;
-        j += 1;
     }
 
-    // Whichever still has content is the longer, hence the greater.
-    (i < fb.len()).cmp(&(j < pb.len()))
+    if i < fb.len() { Ordering::Greater } else { Ordering::Equal }
 }
 
 impl PartialEq for PerlString {
