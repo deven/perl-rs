@@ -321,13 +321,13 @@ enum PerlString {
     // Each format below is two length families (§2.2.9): content of
     // 14 bytes or fewer stores its length in the byte a fifteenth
     // would have used, and content of exactly 15 implies it.
-    Bytes([u8; 15]),        // internal octets
-    Utf8([u8; 15]),         // encoded bytes, beyond Latin-1
-    Latin1([u8; 15]),       // code points, flag-independent
+    Bytes([u8; 15]),               // internal octets
+    Utf8([u8; 15]),                // encoded bytes, beyond Latin-1
+    Latin1([u8; 15]),              // code points, flag-independent
     PackedNumeric([u8; 15]),       // nibbles, 16-30 chars, also
     PackedDateTimeZ([u8; 15]),     // two families; the alphabet
     PackedDateTimePlus([u8; 15]),  // has no byte — it IS the variant
-    Heap(..),               // thin handle; COW buffer
+    Heap(..),                      // thin handle; COW buffer
 }
 ```
 
@@ -617,17 +617,17 @@ U+0000–U+00FF can equal an unflagged string; a flagged string known
 to contain a character ≥ U+0100 can equal *no* unflagged string —
 the comparison is skippable, guaranteed false.  Nine states:
 
-| state | meaning |
-|---|---|
-| `ASCII` | entirely U+0000–U+007F |
-| `UTF8_LATIN1` | Rust-valid, entirely U+0000–U+00FF, non-ASCII |
-| `UTF8_NON_LATIN1` | Rust-valid, contains a character ≥ U+0100 |
-| `UTF8_UNKNOWN_RANGE` | Rust-valid; nothing further known (could narrow to any of the three above) |
-| `UTF8_NON_ASCII` | Rust-valid, known non-ASCII; Latin-1-range unresolved |
-| `EXTENDED_UTF8` | perl-decodable, Rust-invalid: contains a code point Rust rejects (a surrogate or ≥ U+110000), hence ≥ U+0100 |
-| `MALFORMED_UTF8` | violates the encoding patterns; invalid for Rust *and* perl |
-| `NON_ASCII` | a high bit is present; validity and range unknown |
-| `UNKNOWN` | completely unknown |
+| state                | meaning                                                                                                      |
+|----------------------|--------------------------------------------------------------------------------------------------------------|
+| `ASCII`              | entirely U+0000–U+007F                                                                                       |
+| `UTF8_LATIN1`        | Rust-valid, entirely U+0000–U+00FF, non-ASCII                                                                |
+| `UTF8_NON_LATIN1`    | Rust-valid, contains a character ≥ U+0100                                                                    |
+| `UTF8_UNKNOWN_RANGE` | Rust-valid; nothing further known (could narrow to any of the three above)                                   |
+| `UTF8_NON_ASCII`     | Rust-valid, known non-ASCII; Latin-1-range unresolved                                                        |
+| `EXTENDED_UTF8`      | perl-decodable, Rust-invalid: contains a code point Rust rejects (a surrogate or ≥ U+110000), hence ≥ U+0100 |
+| `MALFORMED_UTF8`     | violates the encoding patterns; invalid for Rust *and* perl                                                  |
+| `NON_ASCII`          | a high bit is present; validity and range unknown                                                            |
+| `UNKNOWN`            | completely unknown                                                                                           |
 
 The five fully-scanned terminals (`ASCII`, `UTF8_LATIN1`,
 `UTF8_NON_LATIN1`, `EXTENDED_UTF8`, `MALFORMED_UTF8`) are **mutually
@@ -1258,13 +1258,13 @@ leaving nowhere for a cache.  Adding one cache byte beside a bare
 `i64` therefore costs eight, for the same reason a taint byte did
 before taint became a discriminant twin.  Measured:
 
-| arrangement | size |
-|---|---|
-| `Integer(i64)` — datum alone | 16 |
-| `Integer(i64, [u8; 1])` — one cache byte | 24 |
-| `Integer([u8; 7], i64)` — cache first | 24 |
-| the pair as a `repr(C)` struct | 24 |
-| `repr(align(8))` on the enclosing enum | 24 |
+| arrangement                              |  size  |
+|------------------------------------------|--------|
+| `Integer(i64)` — datum alone             |   16   |
+| `Integer(i64, [u8; 1])` — one cache byte |   24   |
+| `Integer([u8; 7], i64)` — cache first    |   24   |
+| the pair as a `repr(C)` struct           |   24   |
+| `repr(align(8))` on the enclosing enum   |   24   |
 | **packed payload, aligned `PerlString`** | **16** |
 
 The arrangement that works gives the payload struct alignment 1, so
@@ -1481,11 +1481,13 @@ path.
 ```rust
 struct ConstScalar {
     payload: ScalarPayload,
+
     // All coercions materialized at construction — plain fields,
     // no interior mutability:
     int: i64,
     float: f64,
     string: PerlString,
+
     // The single exception (only present when the payload can warn):
     numify_warned: AtomicBool,
 }
@@ -3176,9 +3178,9 @@ The shared runtime holds only coordination structures:
 
 ```rust
 struct SharedRuntime {
-    symbol_tables: RwLock<SymbolTableSet>,  // package stashes
+    symbol_tables: RwLock<SymbolTableSet>,    // package stashes
     module_registry: RwLock<ModuleRegistry>,  // loaded module tracking
-    globals: Globals,                        // $/, $\, $", etc.
+    globals: Globals,                         // $/, $\, $", etc.
 }
 ```
 
@@ -3198,6 +3200,7 @@ struct Interpreter {
     mortal_stack: Vec<Value>,       // per-task temporaries
     special_vars: SpecialVars,      // $@, $_, $/, $!, etc.
     compiler: Compiler,             // per-task (for eval STRING)
+
     // Dynamic scope (local) uses per-variable task-local storage — see §3.3
 }
 ```
@@ -3247,6 +3250,7 @@ struct LocalStack {
 tokio::task_local! {
     static LOCAL_RECORD_SEP: Cell<Option<Box<LocalStack>>>;
     static LOCAL_OUTPUT_SEP: Cell<Option<Box<LocalStack>>>;
+
     // ... etc. for each special variable that supports local
 }
 ```
@@ -3442,14 +3446,14 @@ Perl is traditionally considered impossible to lex without parser
 feedback.  The same character sequences have different meanings
 depending on context:
 
-| Situation | How it parses | Why |
-|-----------|---------------|-----|
-| `print (1+2)*3` | `print(1+2) * 3` or `print((1+2)*3)` | depends on whether `print` is known as a named unary |
-| `map { ... } @list` | block or hashref | parser position in the grammar |
-| `$h{shift}` | hash subscript with bareword key | identifier after `{` in hash context |
-| `sub foo { ... }` | sub declaration | `sub` keyword triggers block-opening |
-| `Foo::Bar` | package name | `::` changes tokenization of preceding bareword |
-| `/regex/` vs `$x / $y` | regex or division | term vs operator position |
+| Situation              | How it parses                        | Why                                                  |
+|------------------------|--------------------------------------|------------------------------------------------------|
+| `print (1+2)*3`        | `print(1+2) * 3` or `print((1+2)*3)` | depends on whether `print` is known as a named unary |
+| `map { ... } @list`    | block or hashref                     | parser position in the grammar                       |
+| `$h{shift}`            | hash subscript with bareword key     | identifier after `{` in hash context                 |
+| `sub foo { ... }`      | sub declaration                      | `sub` keyword triggers block-opening                 |
+| `Foo::Bar`             | package name                         | `::` changes tokenization of preceding bareword      |
+| `/regex/` vs `$x / $y` | regex or division                    | term vs operator position                            |
 
 Perl 5 solves this by coupling the lexer to the parser via shared
 mutable state (`PL_expect`), so the lexer pre-decides ambiguous
@@ -3633,44 +3637,52 @@ built through `LexerLine::new`, keeping them authoritative:
 struct LexerLine {
     /// 1-based line number in the original source.
     number: u32,
+
     /// Byte offset of the start of this line in the original source.
     /// Always physical — never adjusted for `<<~` indentation or EOF
     /// narrowing — so it serves as a stable identity key, e.g. matching
     /// a frame bound or a lookahead endpoint against a re-delivered
     /// line (§5.4.4, §5.4.11).
     offset: u32,
+
     /// The *effective view*: line content without line ending, narrowed
     /// to the current frame's EOF bound by `set_eof`.  Equal to `full`
     /// when the bound lies at or past this line.  Rebuilt from `full`,
     /// never edited in place.  For `<<~` bodies the indentation is
     /// recorded in `indent`, not sliced out.
     line: Bytes,
+
     /// Effective termination: whether the *view* ends at a real
     /// newline.  `false` whenever `line` is narrowed below the
     /// physical extent, since the narrow strips the virtual newline
     /// first.
     terminated: bool,
+
     /// Leading bytes of `line` that are `<<~` indentation to skip;
     /// 0 for every fresh read.  A `<<~` body line is stamped with its
     /// required indent once, during the terminator scan (§5.4.5) —
     /// recorded rather than removed, so `line` and `offset` stay
     /// physical and the cursor (`pos`) begins here.
     indent: u32,
+
     /// Current scanning position within `line`.  A fresh read starts
     /// at 0, and so does `indent`; only the `<<~` scan raises `indent`
     /// and sets `pos = indent`.  Any later cursor-to-line-start reset —
     /// a lookahead replay among them — resets `pos = indent`, not 0.
     pos: u32,
+
     /// Whether the line contains only ASCII bytes (all < 0x80).
     /// Computed for free during newline scanning and used to skip
     /// UTF-8 decoding and NFC normalization on all-ASCII lines.
     /// See §5.8 for the `effective_utf8` optimization.
     ascii_only: bool,
+
     /// Physical line content, full width — what `set_eof` narrows or
     /// widens the view from.  `Bytes` is refcounted, so this is a
     /// second handle on the same buffer, not a copy.  Private:
     /// callers see only the view.
     full: Bytes,
+
     /// Physical termination, restored when `set_eof` widens to the full
     /// line.  Private.
     full_terminated: bool,
@@ -3687,6 +3699,7 @@ impl LexerLine {
     fn peek_byte_at(&self, offset: usize) -> Option<u8>;
     fn remaining(&self) -> &[u8];       // borrowed view for comparisons
     fn global_pos(&self) -> u32;        // offset + pos, global
+
     /// Apply a frame's EOF bound — a global byte offset, or `None` for
     /// real EOF — rebuilding the view from `full`.  Narrows when the
     /// bound falls within this line, widens to the full line when it
@@ -4094,12 +4107,15 @@ The source layer gains four fields:
 /// Displaced lines captured during an active lookahead scan, in displacement order (original current line first).
 /// Drained on guard drop: the original line is restored and the rest pushed onto `queued_lines` for replay.
 lookahead: VecDeque<LexerLine>,
+
 /// Source offset of the line a lookahead scan ended on, identifying it uniquely for `consume_lookahead`.  `Some`
 /// from guard drop until normal delivery reaches that line; `None` if the scan never left its starting line.
 lookahead_offset: Option<u32>,
+
 /// Cursor position the lookahead scan ended at, within the end line.  Taken by `consume_lookahead`, and cleared
 /// once normal delivery moves past the end line.
 lookahead_pos: Option<u32>,
+
 /// True while a lookahead guard is alive: `next_line` captures displaced lines and `# line` directive setters are
 /// suppressed.
 lookahead_mode: bool,
@@ -4251,26 +4267,33 @@ struct LexContext {
     /// the live line.  Its `terminated` flag is what the heredoc host-walk reads when it looks for the frame whose
     /// current line is terminated.
     line: Option<LexerLine>,
+
     /// The frame's bound: the global byte offset past which it reports virtual EOF (§5.4.3, §5.4.4).  `None` means
     /// no bound — real EOF — the base source's ceiling, and what `lookahead_to` installs when a heredoc scan's host
     /// is the base (§5.4.11).
     bound: Option<u32>,
+
     // --- lex mode ---
     /// The role this frame's body plays — which construct it belongs to and, for two-part constructs, which part.
     /// Selects the body lexer and the scanning mode within it (below), and projects to the unterminated-error
     /// wording (§5.5.6).
     role: FrameRole,
+
     /// Opening delimiter character.  `None` for heredocs and `s///` replacement bodies, where end-of-content is the
     /// frame's virtual EOF rather than a delimiter byte in the stream.  Purely mechanical: it drives close-scanning
     /// (§5.4.6) and `\<delim>` unescaping, and no `role` predicate reads it.
     delim: Option<char>,
+
     /// Brace depth inside `${expr}` or `@{expr}`.  When > 0, the lexer produces normal code tokens.  When 0, it
     /// produces string body tokens via `lex_body`.
     expr_depth: u32,
+
     /// Inside a subscript chain (e.g. `"$h->{k}[0]"`).
     chain_active: bool,
+
     /// Bracket/brace nesting inside the chain.
     chain_depth: u32,
+
     /// Chain end detected; emit `InterpChainEnd` on next call.
     chain_end_pending: bool,
 }
@@ -4285,41 +4308,52 @@ interpolate, or the `/e` replacement that is code:
 enum FrameRole {
     /// `format NAME = ... .` body — line-oriented (§5.5.5).
     Format,
+
     /// `sub name (...)` prototype — a raw character capture (§5.9.3).
     Prototype,
+
     /// `sub name (...)` signature — bounded code.
     Signature,
 
     /// `"..."`, `qq//`, `` `...` ``, `qx//` — interpolating string body.
     String,
+
     /// `'...'`, `q//` — soft literal: processes `\\` and `\<delim>`, leaves other backslashes intact; no interp.
     LiteralString,
+
     /// `qw//` — soft literal like `LiteralString`, then split on whitespace into words (§5.5.4).
     QuoteWords,
 
     /// `<<TAG`, `<<"TAG"` — interpolating heredoc body.
     Heredoc,
+
     /// `<<'TAG'`, `<<\TAG` — hard-raw heredoc: every backslash literal.
     LiteralHeredoc,
 
     /// `m//`, `qr//` — regex body: interpolates, keeps backslashes for the engine, detects `(?{...})`.
     Regex,
+
     /// `m'...'`, `qr'...'` — non-interpolating regex; backslashes still kept for the engine.
     LiteralRegex,
+
     /// `s///` pattern (interpolating).
     SubstRegex,
+
     /// `s'...'...'` pattern (non-interpolating).
     LiteralSubstRegex,
 
     /// `s/.../.../` replacement — interpolating string body.
     SubstReplacement,
+
     /// `s'...'...'` replacement — non-interpolating; `\\` still paired.
     LiteralSubstReplacement,
+
     /// `s/.../.../e` replacement — bounded code, not a string body.
     EvalSubstReplacement,
 
     /// `tr/.../`, `y/.../` search list.
     TrSearchList,
+
     /// `tr/.../.../`, `y/.../.../` replacement list.
     TrReplacementList,
 }
@@ -4339,6 +4373,7 @@ impl FrameRole {
         use FrameRole::*;
         matches!(self, String | Heredoc | Regex | SubstRegex | SubstReplacement)
     }
+
     /// Backslashes pass through the body untouched — kept for the regex engine, held literal in `<<'TAG'`, or
     /// captured raw by `lex_body_str` (prototypes, `tr///`).
     fn raw(self) -> bool {
@@ -4348,6 +4383,7 @@ impl FrameRole {
             LiteralHeredoc | Regex | LiteralRegex | SubstRegex | LiteralSubstRegex | Prototype | TrSearchList | TrReplacementList
         )
     }
+
     /// Detect `(?{...})` code blocks.
     fn regex(self) -> bool {
         use FrameRole::*;
@@ -4358,19 +4394,19 @@ impl FrameRole {
 
 For the eleven string-body roles those predicates are a truth table:
 
-| Role | Construct(s) | `interp` | `raw` | `regex` |
-|------|-------------|:--------:|:-----:|:-------:|
-| `String` | `"…"` `qq//` `` `…` `` `qx//` | ✓ | | |
-| `LiteralString` | `'…'` `q//` | | | |
-| `QuoteWords` | `qw//` | | | |
-| `Heredoc` | `<<TAG` `<<"TAG"` | ✓ | | |
-| `LiteralHeredoc` | `<<'TAG'` `<<\TAG` | | ✓ | |
-| `Regex` | `m//` `qr//` | ✓ | ✓ | ✓ |
-| `LiteralRegex` | `m'…'` `qr'…'` | | ✓ | ✓ |
-| `SubstRegex` | `s/…/` pattern | ✓ | ✓ | ✓ |
-| `LiteralSubstRegex` | `s'…'` pattern | | ✓ | ✓ |
-| `SubstReplacement` | `s/…/…/` replacement | ✓ | | |
-| `LiteralSubstReplacement` | `s'…'…'` replacement | | | |
+| Role                      | Construct(s)                  | `interp` | `raw` | `regex` |
+|---------------------------|-------------------------------|:--------:|:-----:|:-------:|
+| `String`                  | `"…"` `qq//` `` `…` `` `qx//` |     ✓    |       |         |
+| `LiteralString`           | `'…'` `q//`                   |          |       |         |
+| `QuoteWords`              | `qw//`                        |          |       |         |
+| `Heredoc`                 | `<<TAG` `<<"TAG"`             |     ✓    |       |         |
+| `LiteralHeredoc`          | `<<'TAG'` `<<\TAG`            |          |   ✓   |         |
+| `Regex`                   | `m//` `qr//`                  |     ✓    |   ✓   |    ✓    |
+| `LiteralRegex`            | `m'…'` `qr'…'`                |          |   ✓   |    ✓    |
+| `SubstRegex`              | `s/…/` pattern                |     ✓    |   ✓   |    ✓    |
+| `LiteralSubstRegex`       | `s'…'` pattern                |          |   ✓   |    ✓    |
+| `SubstReplacement`        | `s/…/…/` replacement          |     ✓    |       |         |
+| `LiteralSubstReplacement` | `s'…'…'` replacement          |          |       |         |
 
 A regex body is both interpolating and raw at once — interpolation
 handles `$`/`@`, the raw axis keeps every backslash for the engine — so
@@ -5132,15 +5168,15 @@ of grammatical position.
 scanning to resolve ambiguities where the same byte sequence means
 something different at the start of an expression:
 
-| Byte(s) | `lex_token()` | `lex_term()` |
-|---------|---------------|--------------|
-| `/pat/` | `Slash` | regex sublexing |
-| `//flags` | `DefinedOr` | empty regex |
-| `.5` | `Dot` | `FloatLit(0.5)` |
-| `.5.6` | `Dot` | `VersionLit("0.5.6")` |
-| `<STDIN>` | `NumLt` | `Readline("STDIN")` |
-| `<<TAG` | `ShiftLeft` | heredoc initiation |
-| `-f` | `Minus` | `Filetest(b'f')` |
+| Byte(s)   | `lex_token()` | `lex_term()`          |
+|-----------|---------------|-----------------------|
+| `/pat/`   | `Slash`       | regex sublexing       |
+| `//flags` | `DefinedOr`   | empty regex           |
+| `.5`      | `Dot`         | `FloatLit(0.5)`       |
+| `.5.6`    | `Dot`         | `VersionLit("0.5.6")` |
+| `<STDIN>` | `NumLt`       | `Readline("STDIN")`   |
+| `<<TAG`   | `ShiftLeft`   | heredoc initiation    |
+| `-f`      | `Minus`       | `Filetest(b'f')`      |
 
 `lex_term()` subsumes several specialized callback methods that
 previously existed as separate API:
@@ -5354,31 +5390,31 @@ container), or `None` if the token is not a prefix (proceed to
 
 Prefix cases handled iteratively by `try_prefix`:
 
-| Token | Frame variant | Inner prec |
-|-------|---------------|------------|
-| `(` | Paren | PREC_LOW |
-| `-` (general) | Negate | PREC_UNARY |
-| `+` | Unary(NumPositive) | PREC_UNARY |
-| `!` | Unary(LogNot) | PREC_UNARY |
-| `~` | Unary(BitNot) | PREC_UNARY |
-| `~.` | Unary(StringBitNot) | PREC_UNARY |
-| `\` | Ref | PREC_UNARY |
-| `not` | Unary(Not) | PREC_NOT_LOW |
-| `++` | PreIncDec(PreInc) | PREC_INC |
-| `--` | PreIncDec(PreDec) | PREC_INC |
-| `local` | Local | PREC_UNARY |
-| `[` | ArrayRef (accumulator) | PREC_COMMA + 1 |
-| `{` | HashRef (accumulator) | PREC_COMMA + 1 |
-| `$` + `{` | DerefBlock(Scalar) | PREC_LOW |
-| `@` + `{` | DerefBlock(Array) | PREC_LOW |
-| `%` + `{` | DerefBlock(Hash) | PREC_LOW |
-| `&` + `{` | DerefBlock(Code) | PREC_LOW |
-| `*` + `{` | DerefBlock(Glob) | PREC_LOW |
-| `eval` (not `{`) | EvalExpr | PREC_COMMA |
-| `do` (not `{`) | DoExpr | PREC_UNARY |
-| `return` | ReturnExpr | PREC_COMMA |
-| `goto` | GotoExpr | PREC_COMMA |
-| `dump` | DumpExpr | PREC_COMMA |
+| Token            | Frame variant          | Inner prec     |
+|------------------|------------------------|----------------|
+| `(`              | Paren                  | PREC_LOW       |
+| `-` (general)    | Negate                 | PREC_UNARY     |
+| `+`              | Unary(NumPositive)     | PREC_UNARY     |
+| `!`              | Unary(LogNot)          | PREC_UNARY     |
+| `~`              | Unary(BitNot)          | PREC_UNARY     |
+| `~.`             | Unary(StringBitNot)    | PREC_UNARY     |
+| `\`              | Ref                    | PREC_UNARY     |
+| `not`            | Unary(Not)             | PREC_NOT_LOW   |
+| `++`             | PreIncDec(PreInc)      | PREC_INC       |
+| `--`             | PreIncDec(PreDec)      | PREC_INC       |
+| `local`          | Local                  | PREC_UNARY     |
+| `[`              | ArrayRef (accumulator) | PREC_COMMA + 1 |
+| `{`              | HashRef (accumulator)  | PREC_COMMA + 1 |
+| `$` + `{`        | DerefBlock(Scalar)     | PREC_LOW       |
+| `@` + `{`        | DerefBlock(Array)      | PREC_LOW       |
+| `%` + `{`        | DerefBlock(Hash)       | PREC_LOW       |
+| `&` + `{`        | DerefBlock(Code)       | PREC_LOW       |
+| `*` + `{`        | DerefBlock(Glob)       | PREC_LOW       |
+| `eval` (not `{`) | EvalExpr               | PREC_COMMA     |
+| `do` (not `{`)   | DoExpr                 | PREC_UNARY     |
+| `return`         | ReturnExpr             | PREC_COMMA     |
+| `goto`           | GotoExpr               | PREC_COMMA     |
+| `dump`           | DumpExpr               | PREC_COMMA     |
 
 Several prefix tokens produce `Leaf` directly for non-recursive
 sub-cases: `-bareword` → StringLit, `-f` → filetest, `[]` → empty
@@ -5764,21 +5800,21 @@ them — in the optree, not the syntax tree.
 **Context determined by surrounding syntax.**  The context a position is
 in is fixed by the construct that encloses it, all knowable at parse time:
 
-| Syntax | Context imposed | Source |
-|--------|-----------------|--------|
-| top-level statement | void | statement position |
-| `$x = RHS` | RHS scalar | scalar lvalue LHS |
-| `@a = RHS`, `%h = RHS` | RHS list | aggregate lvalue LHS |
-| `($x) = RHS` | RHS list | parenthesized scalar LHS (§6.2.3) |
-| `my $x = RHS` | RHS scalar | scalar declaration |
-| `my ($x) = RHS`, `my @a = RHS` | RHS list | list-form / aggregate declaration |
-| `COND ? A : B` | COND scalar; A,B inherit | ternary (§6.2.5) |
-| `if (E)`, `while (E)`, `until (E)` | E scalar | boolean condition |
-| `for (LIST)` | LIST list | foreach iterates a list |
-| `print …`, `push @a, …` | args list | list operator (§6.1.6) |
-| `defined …`, `ref …` | arg scalar | named unary |
-| `scalar(E)` | E scalar | the explicit scalar coercion |
-| `foo(…)` | per prototype | §6.4 |
+| Syntax                             | Context imposed          | Source                            |
+|------------------------------------|--------------------------|-----------------------------------|
+| top-level statement                | void                     | statement position                |
+| `$x = RHS`                         | RHS scalar               | scalar lvalue LHS                 |
+| `@a = RHS`, `%h = RHS`             | RHS list                 | aggregate lvalue LHS              |
+| `($x) = RHS`                       | RHS list                 | parenthesized scalar LHS (§6.2.3) |
+| `my $x = RHS`                      | RHS scalar               | scalar declaration                |
+| `my ($x) = RHS`, `my @a = RHS`     | RHS list                 | list-form / aggregate declaration |
+| `COND ? A : B`                     | COND scalar; A,B inherit | ternary (§6.2.5)                  |
+| `if (E)`, `while (E)`, `until (E)` | E scalar                 | boolean condition                 |
+| `for (LIST)`                       | LIST list                | foreach iterates a list           |
+| `print …`, `push @a, …`            | args list                | list operator (§6.1.6)            |
+| `defined …`, `ref …`               | arg scalar               | named unary                       |
+| `scalar(E)`                        | E scalar                 | the explicit scalar coercion      |
+| `foo(…)`                           | per prototype            | §6.4                              |
 
 **Context is grammar-determined — with one runtime exception.**  Every
 entry in the table above is resolved *statically*, from the syntactic
@@ -5831,11 +5867,11 @@ carries whatever context the comma itself was in (scalar or void —
 "inherited", which unifies the two sub-cases).  This was verified against
 real Perl for flat lists of arbitrary length:
 
-| Form | Context of `a, b, c, d` |
-|------|-------------------------|
-| `$x = (a,b,c,d)` | a,b,c **void**; d **scalar** |
-| `(a,b,c,d);` (bare) | all four **void** |
-| `@x = (a,b,c,d)` | all four **list** |
+| Form                | Context of `a, b, c, d`      |
+|---------------------|------------------------------|
+| `$x = (a,b,c,d)`    | a,b,c **void**; d **scalar** |
+| `(a,b,c,d);` (bare) | all four **void**            |
+| `@x = (a,b,c,d)`    | all four **list**            |
 
 There is no such thing as "a C-comma in list context": a C-comma *is* a
 comma in scalar/void context.  The context simply *is* one or the other
@@ -6062,12 +6098,13 @@ pub fn save_context(&mut self, ctx: Context) {
 }
 
 // Per-node step: first-writer-wins guard, stamp, push children.
-fn save_context_step<'a>(&'a mut self, ctx: Context,
-                         queue: &mut Vec<(&'a mut Expr, Context)>) {
+fn save_context_step<'a>(&'a mut self, ctx: Context, queue: &mut Vec<(&'a mut Expr, Context)>) {
     if self.ctx.is_some() {
         return;                 // already stamped — do not re-stamp or recurse
     }
+
     self.ctx = Some(ctx);
+
     // push each Expr child with its appropriate context; non-Expr children
     // (blocks, interpolation parts, arrow targets, sub bodies) are pushed
     // by their own routers onto the same queue.
@@ -6611,20 +6648,20 @@ than its surface syntax.
 
 ### 8.2 Key Lowering Transformations
 
-| Syntax | Lowered Form |
-|--------|-------------|
-| Bare `/.../` in expression | `$_ =~ /.../` |
-| Postfix `... if COND` | `if (COND) { ... }` |
-| `print LIST` | `print(STDOUT, LIST)` |
-| `for (1..10)` | range + iterator |
-| `foreach $x (@arr)` | aliasing loop over array |
-| `chomp $x` | `$x = chomp($x)` (modifies in place) |
-| `chop`, `chomp` without args | operate on `$_` |
-| Diamond `<HANDLE>` | `readline(HANDLE)` |
-| Implicit `$_` | all implicit `$_` uses made explicit |
-| Context propagation | scalar/list/void context annotated |
-| String interpolation | concatenation chain |
-| `qw//` | literal list |
+| Syntax                       | Lowered Form                         |
+|------------------------------|--------------------------------------|
+| Bare `/.../` in expression   | `$_ =~ /.../`                        |
+| Postfix `... if COND`        | `if (COND) { ... }`                  |
+| `print LIST`                 | `print(STDOUT, LIST)`                |
+| `for (1..10)`                | range + iterator                     |
+| `foreach $x (@arr)`          | aliasing loop over array             |
+| `chomp $x`                   | `$x = chomp($x)` (modifies in place) |
+| `chop`, `chomp` without args | operate on `$_`                      |
+| Diamond `<HANDLE>`           | `readline(HANDLE)`                   |
+| Implicit `$_`                | all implicit `$_` uses made explicit |
+| Context propagation          | scalar/list/void context annotated   |
+| String interpolation         | concatenation chain                  |
+| `qw//`                       | literal list                         |
 
 ### 8.3 Mode-Dependent Lowering
 
@@ -6727,7 +6764,7 @@ enum IrOp {
 
     // Dynamic scope
     SaveLocal   { target: LocalId },  // push onto save stack
-    RestoreScope,                      // pop save stack to mark
+    RestoreScope,                     // pop save stack to mark
 
     // ... IO, system calls, etc.
 }
@@ -6782,6 +6819,7 @@ struct Interpreter {
     mortal_stack: Vec<Value>,
     special_vars: SpecialVars,
     compiler: Compiler,       // always available for eval STRING
+
     // Dynamic scope (local) uses per-variable task-local storage — see §3.3
 }
 ```
@@ -7201,6 +7239,7 @@ struct Interpreter {
     mortal_stack: Vec<Value>,       // per-task temporaries
     special_vars: SpecialVars,      // $@, $_, $/, $!, etc.
     compiler: Compiler,             // per-task (for eval STRING)
+
     // Dynamic scope (local) uses per-variable task-local storage — see §3.3
 }
 ```
@@ -7599,14 +7638,17 @@ async fn run_op(&mut self, op: &IrOp) -> Result<()> {
         }
         IrOp::CallBuiltin { builtin: BuiltinId::Open, .. } => {
             let fh = tokio::fs::File::open(path).await?;
+
             // ...
         }
         IrOp::CallBuiltin { builtin: BuiltinId::ReadLine, .. } => {
             let line = reader.read_line().await?;
+
             // ...
         }
         IrOp::CallBuiltin { builtin: BuiltinId::HttpGet, .. } => {
             let resp = reqwest::get(url).await?;
+
             // ...
         }
         _ => {
@@ -7925,11 +7967,11 @@ spawn thread { long_running_ffi_work() };
 All three get a full interpreter with access to the shared heap.
 The difference is scheduling:
 
-| Mechanism | Runs on | Yields at IO? | Task-local `local`? | Use case |
-|-----------|---------|---------------|---------------------|----------|
-| `spawn { }` | Tokio task | Yes | Yes (`tokio::task_local`) | IO, concurrency, general |
-| `spawn blocking { }` | Tokio blocking pool | No (dedicated thread) | Yes (`tokio::task_local`) | CPU-bound Perl |
-| `spawn thread { }` | Raw OS thread | No | Yes (`thread_local`) | FFI, pinned TLS, long-lived |
+| Mechanism            | Runs on             | Yields at IO?         | Task-local `local`?       | Use case                    |
+|----------------------|---------------------|-----------------------|---------------------------|-----------------------------|
+| `spawn { }`          | Tokio task          | Yes                   | Yes (`tokio::task_local`) | IO, concurrency, general    |
+| `spawn blocking { }` | Tokio blocking pool | No (dedicated thread) | Yes (`tokio::task_local`) | CPU-bound Perl              |
+| `spawn thread { }`   | Raw OS thread       | No                    | Yes (`thread_local`)      | FFI, pinned TLS, long-lived |
 
 Syntactically, `spawn` is a registered keyword.  The modifiers
 `blocking`, `thread`, and `all` are parsed within the keyword hook
@@ -7976,11 +8018,11 @@ Perl's filehandle idioms.
 
 #### 13.10.1 The three primitives:
 
-| Primitive | Semantics | Analogy |
-|-----------|-----------|---------|
-| **Channel** | Queue — each item goes to one consumer | Pipe / filehandle |
-| **Supply** | Broadcast — every subscriber gets every item | Event / pub-sub |
-| **Promise** | Single future value | Deferred result |
+| Primitive   | Semantics                                    | Analogy           |
+|-------------|----------------------------------------------|-------------------|
+| **Channel** | Queue — each item goes to one consumer       | Pipe / filehandle |
+| **Supply**  | Broadcast — every subscriber gets every item | Event / pub-sub   |
+| **Promise** | Single future value                          | Deferred result   |
 
 All three work with `react`/`whenever`, and channels additionally
 support Perl's filehandle syntax.
@@ -8523,12 +8565,12 @@ runtime checks where needed).
 
 #### 14.3.5 All four keywords coexist:
 
-| Keyword | Semantics | Typed | Mutable | Args |
-|---------|-----------|-------|---------|------|
-| `my` | Perl | No | Always | — |
-| `sub` | Perl | No | — | `@_`, prototypes |
-| `let` | Rust | Yes | Opt-in (`mut`) | — |
-| `fn` | Rust | Yes | — | Named, typed |
+| Keyword | Semantics | Typed | Mutable        | Args             |
+|---------|-----------|-------|----------------|------------------|
+| `my`    | Perl      |  No   | Always         | —                |
+| `sub`   | Perl      |  No   | —              | `@_`, prototypes |
+| `let`   | Rust      |  Yes  | Opt-in (`mut`) | —                |
+| `fn`    | Rust      |  Yes  | —              | Named, typed     |
 
 ### 14.4 Sigils, Aliases, and Interpolation
 
@@ -8756,11 +8798,11 @@ that is heavily sigil-less and does a lot of string formatting.
 
 #### 14.4.9 Summary of interpolation mechanisms:
 
-| String type | Sigiled `$foo` | Sigil-less `foo` | Expressions |
-|-------------|---------------|-----------------|-------------|
-| `"..."` | `$foo`, `${foo}` | `${+foo}` | `${expr}` |
-| `f"..."` | `{$foo}` | `{foo}` | `{expr}` |
-| `'...'` | no interpolation | no interpolation | no |
+| String type | Sigiled `$foo`   | Sigil-less `foo` | Expressions |
+|-------------|------------------|------------------|-------------|
+| `"..."`     | `$foo`, `${foo}` | `${+foo}`        | `${expr}`   |
+| `f"..."`    | `{$foo}`         | `{foo}`          | `{expr}`    |
+| `'...'`     | no interpolation | no interpolation | no          |
 
 ### 14.5 Mutability: Immutable by Default
 
@@ -8803,42 +8845,42 @@ set covers the most useful categories:
 
 #### 14.6.1 Primitive types:
 
-| Perl Syntax | Rust Type | Notes |
-|-------------|-----------|-------|
-| `i8`, `i16`, `i32`, `i64`, `i128` | same | Signed integers |
-| `u8`, `u16`, `u32`, `u64`, `u128` | same | Unsigned integers |
-| `isize`, `usize` | same | Pointer-width integers |
-| `f32`, `f64` | same | Floating point |
-| `bool` | `bool` | True/false, no Perl truthiness |
+| Perl Syntax                       | Rust Type | Notes                          |
+|-----------------------------------|-----------|--------------------------------|
+| `i8`, `i16`, `i32`, `i64`, `i128` |   same    | Signed integers                |
+| `u8`, `u16`, `u32`, `u64`, `u128` |   same    | Unsigned integers              |
+| `isize`, `usize`                  |   same    | Pointer-width integers         |
+| `f32`, `f64`                      |   same    | Floating point                 |
+| `bool`                            |  `bool`   | True/false, no Perl truthiness |
 
 #### 14.6.2 String and byte types:
 
-| Perl Syntax | Rust Type | Notes |
-|-------------|-----------|-------|
-| `String` | `String` | Owned, growable, valid UTF-8 |
-| `&str` | `&str` | Borrowed string slice (in parameters) |
-| `Bytes` | `bytes::Bytes` | Immutable, refcounted, zero-copy slice |
-| `BytesMut` | `bytes::BytesMut` | Mutable byte buffer, Tokio-native |
+| Perl Syntax | Rust Type         | Notes                                  |
+|-------------|-------------------|----------------------------------------|
+| `String`    | `String`          | Owned, growable, valid UTF-8           |
+| `&str`      | `&str`            | Borrowed string slice (in parameters)  |
+| `Bytes`     | `bytes::Bytes`    | Immutable, refcounted, zero-copy slice |
+| `BytesMut`  | `bytes::BytesMut` | Mutable byte buffer, Tokio-native      |
 
 #### 14.6.3 Smart pointers and wrappers:
 
-| Perl Syntax | Rust Type | Notes |
-|-------------|-----------|-------|
-| `Box<T>` | `Box<T>` | Heap-allocated owned value |
-| `Arc<T>` | `Arc<T>` | Shared ownership, atomic refcount |
-| `Mutex<T>` | `Mutex<T>` | Mutable shared state, exclusive lock |
-| `RwLock<T>` | `RwLock<T>` | Mutable shared state, reader/writer lock |
-| `Option<T>` | `Option<T>` | Nullable value (`undef` = `None`) |
-| `Result<T, E>` | `Result<T, E>` | Success-or-error value |
+| Perl Syntax    | Rust Type      | Notes                                    |
+|----------------|----------------|------------------------------------------|
+| `Box<T>`       | `Box<T>`       | Heap-allocated owned value               |
+| `Arc<T>`       | `Arc<T>`       | Shared ownership, atomic refcount        |
+| `Mutex<T>`     | `Mutex<T>`     | Mutable shared state, exclusive lock     |
+| `RwLock<T>`    | `RwLock<T>`    | Mutable shared state, reader/writer lock |
+| `Option<T>`    | `Option<T>`    | Nullable value (`undef` = `None`)        |
+| `Result<T, E>` | `Result<T, E>` | Success-or-error value                   |
 
 #### 14.6.4 Collections:
 
-| Perl Syntax | Rust Type | Notes |
-|-------------|-----------|-------|
-| `Vec<T>` | `Vec<T>` | Growable array |
-| `HashMap<K, V>` | `HashMap<K, V>` | Hash table |
-| `HashSet<T>` | `HashSet<T>` | Set |
-| `BTreeMap<K, V>` | `BTreeMap<K, V>` | Ordered map |
+| Perl Syntax      | Rust Type        | Notes          |
+|------------------|------------------|----------------|
+| `Vec<T>`         | `Vec<T>`         | Growable array |
+| `HashMap<K, V>`  | `HashMap<K, V>`  | Hash table     |
+| `HashSet<T>`     | `HashSet<T>`     | Set            |
+| `BTreeMap<K, V>` | `BTreeMap<K, V>` | Ordered map    |
 
 #### 14.6.5 What is explicitly not exposed:
 
@@ -9031,13 +9073,13 @@ finally { cleanup() }
 
 #### 14.8.5 Three mechanisms, three keywords, zero overlap:
 
-| Mechanism | Returns | Sets `$@`? | Use case |
-|-----------|---------|-----------|----------|
-| `eval { }` | Value or `undef` | Yes | Perl 5 compat |
-| `eval STRING` | Value or `undef` | Yes | Runtime compilation |
-| `result { }` | `Result<T, E>` | No | Typed error handling (expression) |
-| `try`/`catch`/`finally` | — (statement) | No | Structured exception handling |
-| `?` operator | Propagates `Err` | No | Error propagation in `fn` |
+| Mechanism               | Returns          | Sets `$@`? | Use case                          |
+|-------------------------|------------------|------------|-----------------------------------|
+| `eval { }`              | Value or `undef` | Yes        | Perl 5 compat                     |
+| `eval STRING`           | Value or `undef` | Yes        | Runtime compilation               |
+| `result { }`            | `Result<T, E>`   | No         | Typed error handling (expression) |
+| `try`/`catch`/`finally` | — (statement)    | No         | Structured exception handling     |
+| `?` operator            | Propagates `Err` | No         | Error propagation in `fn`         |
 
 The exception type unifies Perl's various `die` forms:
 
@@ -9217,12 +9259,12 @@ borrow default only applies to typed `let` values.
 
 #### 14.9.8 Summary of @_ aliasing by declaration type:
 
-| Declaration | `@_` alias type | Mutable via `@_`? |
-|-------------|----------------|-------------------|
-| `my $x` | Direct alias (interior mutability) | Yes (Perl 5 compat) |
-| `let $x: T` | `&T` | No |
-| `let mut $x: T`, caller passes `$x` | `&T` | No |
-| `let mut $x: T`, caller passes `mut $x` | `&mut T` | Yes |
+| Declaration                             | `@_` alias type                    | Mutable via `@_`?   |
+|-----------------------------------------|------------------------------------|---------------------|
+| `my $x`                                 | Direct alias (interior mutability) | Yes (Perl 5 compat) |
+| `let $x: T`                             | `&T`                               | No                  |
+| `let mut $x: T`, caller passes `$x`     | `&T`                               | No                  |
+| `let mut $x: T`, caller passes `mut $x` | `&mut T`                           | Yes                 |
 
 #### 14.9.9 Borrows do not escape.
 
@@ -9252,15 +9294,15 @@ call, use `\$x` to create an `Arc`.
 
 #### 14.9.10 Summary of how values move around:
 
-| Mechanism | Perl equivalent | What happens | Overhead | Escapes? |
-|-----------|----------------|--------------|----------|----------|
-| `let $y = $x` | `my $y = $x` | Clone | One clone | N/A (owned) |
-| `fn(x: T)` | `my ($x) = @_` | Clone into callee | One clone | N/A (owned) |
-| `fn(x: &T)` | `$_[0]` read alias | Immutable borrow | Zero | No |
-| `fn(x: &mut T)` | `$_[0]` write alias | Mutable borrow | Zero | No |
-| `sub(@_)` with typed arg | `$_[0]` aliasing | `&T` or `&mut T` | Zero | No |
-| `\$x` | `\$x` in Perl 5 | Upgrade to Arc | One Arc alloc (first time) | Yes |
-| `Arc::clone` | multiple `\$x` | Refcount bump | Atomic increment | Yes |
+| Mechanism                | Perl equivalent     | What happens      | Overhead                   | Escapes?    |
+|--------------------------|---------------------|-------------------|----------------------------|-------------|
+| `let $y = $x`            | `my $y = $x`        | Clone             | One clone                  | N/A (owned) |
+| `fn(x: T)`               | `my ($x) = @_`      | Clone into callee | One clone                  | N/A (owned) |
+| `fn(x: &T)`              | `$_[0]` read alias  | Immutable borrow  | Zero                       | No          |
+| `fn(x: &mut T)`          | `$_[0]` write alias | Mutable borrow    | Zero                       | No          |
+| `sub(@_)` with typed arg | `$_[0]` aliasing    | `&T` or `&mut T`  | Zero                       | No          |
+| `\$x`                    | `\$x` in Perl 5     | Upgrade to Arc    | One Arc alloc (first time) | Yes         |
+| `Arc::clone`             | multiple `\$x`      | Refcount bump     | Atomic increment           | Yes         |
 
 #### 14.9.11 Interaction between assignment and Arc:
 
@@ -9309,15 +9351,15 @@ The compiler should warn statically about potentially-failing coercions.
 
 #### 14.10.3 Coercion cost matrix for strings:
 
-| From | To | Cost |
-|------|----|------|
-| `String` → `PerlString` | Wrap as Bytes, set flags | Cheap (refcount) |
-| `PerlString` (Rust-valid) → `String` | Take bytes, no validation | Cheap (flag check) |
-| `PerlString` (unknown) → `String` | Full UTF-8 validation | O(n), may fail |
-| `PerlString` → `Bytes` | Access inner `buf` | Zero-cost |
-| `Bytes` → `PerlString` | Wrap with flags | Cheap (refcount bump) |
-| `String` → `&str` | Pointer cast | Zero-cost |
-| `Arc<str>` → `&str` | Deref | Zero-cost |
+| From                                 | To                        | Cost                  |
+|--------------------------------------|---------------------------|-----------------------|
+| `String` → `PerlString`              | Wrap as Bytes, set flags  | Cheap (refcount)      |
+| `PerlString` (Rust-valid) → `String` | Take bytes, no validation | Cheap (flag check)    |
+| `PerlString` (unknown) → `String`    | Full UTF-8 validation     | O(n), may fail        |
+| `PerlString` → `Bytes`               | Access inner `buf`        | Zero-cost             |
+| `Bytes` → `PerlString`               | Wrap with flags           | Cheap (refcount bump) |
+| `String` → `&str`                    | Pointer cast              | Zero-cost             |
+| `Arc<str>` → `&str`                  | Deref                     | Zero-cost             |
 
 ### 14.11 Compiler Optimization of Typed Code
 
@@ -10086,14 +10128,14 @@ print $$config;                  # fine — we still have our Arc
 
 #### 15.3.3 When to use which:
 
-| Syntax | Typed | Captures | `Send` | Portable to Perl 5 |
-|--------|-------|----------|--------|---------------------|
-| `sub { ... }` | No | Pad reference | No | Yes |
-| `fn($x: T) { ... }` | Yes | Reference | No | Yes (via `use Typed`) |
-| `move fn($x: T) { ... }` | Yes | Clone | Yes | Yes (via `use Typed`) |
-| `move \|x: T\| { ... }` | Yes | Clone | Yes | Yes (via `use Typed`) |
-| `async \|x: T\| { ... }` | Yes | Clone | Yes | Yes (via `use Typed`) |
-| `\|x: T\| { ... }` (bare) | Yes | Reference | No | With proposed core change (§15.4) |
+| Syntax                    | Typed | Captures      | `Send` | Portable to Perl 5                |
+|---------------------------|-------|---------------|--------|-----------------------------------|
+| `sub { ... }`             |   No  | Pad reference |   No   | Yes                               |
+| `fn($x: T) { ... }`       |  Yes  | Reference     |   No   | Yes (via `use Typed`)             |
+| `move fn($x: T) { ... }`  |  Yes  | Clone         |  Yes   | Yes (via `use Typed`)             |
+| `move \|x: T\| { ... }`   |  Yes  | Clone         |  Yes   | Yes (via `use Typed`)             |
+| `async \|x: T\| { ... }`  |  Yes  | Clone         |  Yes   | Yes (via `use Typed`)             |
+| `\|x: T\| { ... }` (bare) |  Yes  | Reference     |   No   | With proposed core change (§15.4) |
 
 #### 15.3.4 Keyword-triggered closure parsing:
 
@@ -10509,18 +10551,18 @@ Sigil-less variables (`let name: String`), Rust-style closures
 and cannot be supported by the CPAN module.  This gives a clean
 style guideline:
 
-| Style | Runs on standard Perl 5 | Runs on Rust runtime |
-|-------|------------------------|---------------------|
-| `my $x` / `sub foo { }` | Yes | Yes |
-| `let $x: Type` / `fn foo($x: Type)` | Yes (with `use Typed`) | Yes |
-| `fn($x: Type) { }` (anonymous) | Yes (with `use Typed`) | Yes |
-| `struct` / `enum` / `impl` / `trait` | Yes (with `use Typed`) | Yes |
-| `move \|x: Type\| expr` closures | Yes (with `use Typed`) | Yes |
-| `async \|x: Type\| expr` closures | Yes (with `use Typed`) | Yes |
-| `\|x: Type\| expr` (bare, no keyword) | With proposed core change (§15.4) | Yes |
-| `let x: Type` / `fn foo(x: Type)` | No | Yes |
-| `f"..."` format strings | No | Yes |
-| `extern fn foo(x: Type)` | No | Yes (standalone) |
+| Style                                 | Runs on standard Perl 5           | Runs on Rust runtime |
+|---------------------------------------|-----------------------------------|----------------------|
+| `my $x` / `sub foo { }`               | Yes                               | Yes                  |
+| `let $x: Type` / `fn foo($x: Type)`   | Yes (with `use Typed`)            | Yes                  |
+| `fn($x: Type) { }` (anonymous)        | Yes (with `use Typed`)            | Yes                  |
+| `struct` / `enum` / `impl` / `trait`  | Yes (with `use Typed`)            | Yes                  |
+| `move \|x: Type\| expr` closures      | Yes (with `use Typed`)            | Yes                  |
+| `async \|x: Type\| expr` closures     | Yes (with `use Typed`)            | Yes                  |
+| `\|x: Type\| expr` (bare, no keyword) | With proposed core change (§15.4) | Yes                  |
+| `let x: Type` / `fn foo(x: Type)`     | No                                | Yes                  |
+| `f"..."` format strings               | No                                | Yes                  |
+| `extern fn foo(x: Type)`              | No                                | Yes (standalone)     |
 
 Each tier is a superset of the one above.  A team can start at the
 second tier — typed code with `$` aliases that runs on both standard
@@ -11180,7 +11222,7 @@ fn payload_stays_authoritative_through_coercion() {
     // stringifies as "3.7" (FLAGS = NOK,pIOK — private cache only).
     let mut cell = ScalarCell::from_float(3.7);
     assert_eq!(cell.to_int(), 3);          // truncating coercion
-    assert_eq!(cell.stringify(), "3.7");       // payload answers
+    assert_eq!(cell.stringify(), "3.7");   // payload answers
 }
 
 #[test]
@@ -11321,14 +11363,14 @@ three independent leaf crates that have no cross-dependencies:
                         └──────┴─────────┘
 ```
 
-| Crate | Type | Dependencies | Contents |
-|---|---|---|---|
-| `perl-core` | lib | `bytes` | Strings, values, scalars, flags, typed value trait, extension API |
-| `perl-parser` | lib | `bytes`, `memchr`, `unicode-xid`, `unicode-normalization` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters |
-| `perl-regex` | lib | none | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11) |
-| `perl-compiler` | lib | `perl-core`, `perl-parser` | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
-| `perl-runtime` | lib | `perl-compiler`, `perl-core`, `perl-regex` | Interpreter loop, `Executor` impl, call frames, symbol tables, builtins, magic, concurrency, bytecode save/load, CLI, REPL, debug |
-| `perl` | bin | `perl-runtime` | Thin entry point: parses `std::env::args`, calls `perl_runtime::run`, exits |
+| Crate           | Type | Dependencies                                              | Contents                                                                                                                           |
+|-----------------|------|-----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| `perl-core`     | lib  | `bytes`                                                   | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
+| `perl-parser`   | lib  | `bytes`, `memchr`, `unicode-xid`, `unicode-normalization` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters  |
+| `perl-regex`    | lib  | none                                                      | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11)                    |
+| `perl-compiler` | lib  | `perl-core`, `perl-parser`                                | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
+| `perl-runtime`  | lib  | `perl-compiler`, `perl-core`, `perl-regex`                | Interpreter loop, `Executor` impl, call frames, symbol tables, builtins, magic, concurrency, bytecode save/load, CLI, REPL, debug  |
+| `perl`          | bin  | `perl-runtime`                                            | Thin entry point: parses `std::env::args`, calls `perl_runtime::run`, exits                                                        |
 
 #### 22.1.1 Design rationale:
 
