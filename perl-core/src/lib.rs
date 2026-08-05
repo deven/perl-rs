@@ -49,7 +49,6 @@
 
 mod inline;
 mod numeric;
-mod packed;
 
 pub mod containers;
 pub mod cow_buffer;
