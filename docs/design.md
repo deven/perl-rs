@@ -471,15 +471,14 @@ tag — and needs only the five *terminal* states (`ASCII`,
 `MALFORMED_UTF8`), because inline strings are scanned eagerly and
 completely at construction (§2.2.7): checking at most 15 bytes is
 nearly free.  Discriminant-state arithmetic under the fused
-variants (§2.2.9): inline-bytes 5 (scan) × 2 (warned) ×
-2 (tainted) = 20 (the flag is off by definition); inline-Utf8
-3 (scan) × 2 × 2 = 12 (the flag is on by definition);
-inline-Latin-1 2 (flag) × 2 (ascii) × 2 × 2 = 16; packed
-3 (alphabet) × 2 (utf8) × 2 (warned) × 2 (tainted) = 24 (the
-scan state is fixed — packed alphabets are ASCII by
-construction); heap 2 × 2 × 2 = 8.  80 string encodings plus the
-non-string twins still leave ample niche encodings for the
-enclosing `Value`/`ScalarCell` layouts (§2.3.6).
+variants (§2.2.9): inline 5 (class) × 2 (family) × 2 (utf8) ×
+2 (warned) × 2 (tainted) = 80; packed 3 (alphabet) ×
+2 (family) × 2 × 2 × 2 = 48 (the class is fixed — packed
+alphabets are ASCII by construction); heap 2 × 2 × 2 = 8, its
+class living in the buffer header rather than the tag.  136
+string encodings plus the non-string residents still leave ample
+niche encodings for the enclosing `Value`/`ScalarCell` layouts
+(§2.3.6).
 
 **The Perl flag and the scan cache must never be conflated.**
 Verified against container perl 5.38: `chr(0x110000)` is legal core
