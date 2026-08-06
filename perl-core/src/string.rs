@@ -476,6 +476,7 @@ macro_rules! define_perl_string {
         /// arrays, and `CowBuffer`'s own `Clone` is the refcount bump the heap forms need.  A hand-written impl that
         /// destructured the tag and rebuilt it cost thirteen nanoseconds to copy sixteen bytes (measured).
         #[derive(Clone)]
+        #[repr(transparent)]
         pub struct PerlString(Repr);
 
         /// The sealed representation: the folded tag itself.  `repr(align(8))` sits here, on the inner enum, where it
