@@ -9,7 +9,7 @@
 //! This module carries the §21.1 step-3 subset: the scalar payload variants.  The reference variants
 //! (`ScalarRef`/`ArrayRef`/`HashRef`/`CodeRef`/`RegexRef`), the `Scalar` aliasing variant, and `Typed` land with their
 //! own steps (§21.1 steps 4–6), which introduce the referent types; the enums are laid out so those additions preserve
-//! the 24-byte envelope (§2.3.6).  The module name is temporary in the same sense as `string.rs`: the final names
+//! the 16-byte envelope (§2.3.6).  The module name is temporary in the same sense as `string.rs`: the final names
 //! arrive when the superseded flag-matrix modules are deleted.
 //!
 //! Numeric contracts are container-verified against perl 5.38 and pin the **i64-visible** behavior only — the value

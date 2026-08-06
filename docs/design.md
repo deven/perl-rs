@@ -237,21 +237,30 @@ The single most important principle of the scalar model:
 
 ```rust
 enum ScalarPayload {
-    Undef(Tainted),
-    Int(i64, Tainted),         // Tainted is a bool newtype; rides padding
-    Float(f64, Tainted),
-    String(PerlString),        // taint in the PerlString tag
+    Undef,
+    UndefTainted,              // taint as discriminant twins (§2.3.6)
+    Integer(IntegerPayload),   // i64 beside its digit cache
+    IntegerTainted(IntegerPayload),
+    Unsigned(UnsignedPayload),
+    UnsignedTainted(UnsignedPayload),
+    Float(FloatPayload),
+    FloatTainted(FloatPayload),
+    ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
+    ScalarRefMutTainted(HeapArc<RwLock<ScalarCell>>),
+    ScalarRefConst(HeapArc<ConstScalar>),
+    ScalarRefConstTainted(HeapArc<ConstScalar>),
+    ArrayRef(ArrayRef),
+    ArrayRefTainted(ArrayRef),
+    HashRef(HashRef),
+    HashRefTainted(HashRef),
+    String(PerlString),              // taint in the PerlString tag
     True,
     False,
-    ScalarRef(ScalarRef, Tainted),
-    ArrayRef(ArrayRef, Tainted),
-    HashRef(HashRef, Tainted),
-    CodeRef(CodeRef, Tainted),
-    RegexRef(RegexRef, Tainted),
+    // CodeRef and RegexRef arrive with their own designs.
 }
 ```
 
-Taint state appears in the listings above as the `Tainted` fields
+Taint state appears in the listings above as the discriminant twins
 and the `PerlString` tag bit; its placement rules, semantics,
 laundering contract, and authoring API are §2.6.
 
@@ -462,8 +471,8 @@ In the buffer header (per-buffer, `Heap` only):
 - **The byte-content scan cache** (§2.2.4) — ASCII-ness and Rust
   UTF-8 validity are facts about the bytes; when a buffer is shared,
   one holder's scan benefits every sharer.  The scan byte rides in
-  the `CowBuffer` header next to the length (same
-  cache line as the length whenever the deref is in flight.
+  the `CowBuffer` header next to the length, on the same cache
+  line whenever the deref is in flight.
 
 `Inline` strings have no heap header; their scan state lives in the
 tag — and needs only the five *terminal* states (`ASCII`,
@@ -687,9 +696,10 @@ Rust-invalid (necessarily non-ASCII); `MALFORMED_UTF8` means
 malformed under perl's extended rules too.  `as_str` (a Rust-view
 question) excludes `EXTENDED_UTF8`; character-level operations on
 flagged strings (length, iteration, case, regex) include it and
-reject only `MALFORMED_UTF8`.  Inline strings gain a fourth terminal
-state (`Extended`), making the tag arithmetic Inline 4 x 2 x 2 x 2
-= 32 plus Heap 8 = 40 states — still ample niche headroom.  For
+reject only `MALFORMED_UTF8`.  Inline strings carry `Extended` as
+one of the five content classes in the tag (§2.2.9); the heap
+lattice holds it as a terminal state, and the discriminant
+arithmetic lives with the fused variants (§2.2.3).  For
 character-sequence equality and hashing, extended and malformed
 regions need only be *distinguishable from all Latin-1 characters*
 (code points above 0xFF can never equal an unflagged byte), so the
@@ -1193,11 +1203,12 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   Comparison against an *unpacked*
   representation derives the length first, normatively: a zero
   nibble is ambiguous against a raw space or a raw end-of-string
-  (packed "2026" versus raw "2026\n" must order Less, where a
-  naive space-decoding of the zero answers Greater), and the
-  derived length resolves every zero's meaning before it is
-  compared.  A leading decode-pair precheck and a speculative
-  dual-interpretation single pass are recorded measured options.
+  (packed "2026-07-28T14:33:07Z" against the same raw content
+  plus "\n" must order Less, where a naive space-decoding of the
+  zero answers Greater), and the derived length resolves every
+  zero's meaning before it is compared.  A leading decode-pair
+  precheck and a speculative dual-interpretation single pass are
+  recorded measured options.
 - **NUL is ordinary content** [DECISION, revised]: a string
   containing NUL in any spelling — the octet `0x00`, the encoded
   byte `0x00`, the character U+0000 — is stored like any other.
@@ -1215,8 +1226,9 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   explicit length.  The packed tier's length families are the
   template: a full-capacity family carrying its length implicitly
   beside a shorter family storing it in the byte the last
-  character would have used.  Inline variants double, 40 to 80,
-  taking the total from 116 to 156 of 256.  NUL then stops being a
+  character would have used.  The inline forms split into
+  the two length families, and the tag arithmetic is §2.2.3's:
+  136 of 256.  NUL then stops being a
   special case anywhere: content carrying one is stored inline
   like any other, which removes the rejection from both
   constructors, the check from the append path, and the hazard
@@ -1234,25 +1246,25 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   forward unchanged.
 
 The standalone `PerlString` is 16 bytes too — the tag budget
-closes in one byte (kind 2 bits, scan 3, utf8/warned/tainted 3),
-leaving 15 payload bytes: the three inline formats and the packed
-tier at the fused variants' capacities, with the heap kind a thin
-pointer plus a u48 mirrored length in the spare bytes.  The
-`Value`↔key boundary is an exhaustive-match reconstruction —
-which the optimizer reduces to a copy plus tag write in practice,
-but is **never a transmute**: the size assertions pin neither
-discriminant placement nor niche selection, so no code may depend
-on byte-level correspondence between the two types.  No capacity
-mismatch exists, `keys()` materializes heap-shared keys by
-refcount bump, hash entry pairs are 32 bytes (two per cache
-line), and one capacity ladder serves both contexts.  The raw key
-window (16-22 bytes) falls under the same
-corpus tripwire, softened for keys because keys repeat: the heap
-cost is per-distinct-key-per-hash, not per-operation.
+closes in one byte, the discriminant being the storage type times
+the three flag bits (§2.2.9) — leaving 15 payload bytes: the five
+inline classes and the packed tier at the fused variants'
+capacities, with the heap kind a thin pointer plus a u48 mirrored
+length in the spare bytes.  The `Value`↔key boundary is an
+exhaustive-match reconstruction — which the optimizer reduces to
+a copy plus tag write in practice, but is **never a transmute**:
+the size assertions pin neither discriminant placement nor niche
+selection, so no code may depend on byte-level correspondence
+between the two types.  No capacity mismatch exists, `keys()`
+materializes heap-shared keys by refcount bump, hash entry pairs
+are 32 bytes (two per cache line), and one capacity ladder serves
+both contexts.  The raw key window (16-22 bytes) falls under the
+same corpus tripwire, softened for keys because keys repeat: the
+heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PerlString`'s own tag, which uses 96 of its
+occupies the niche in `PerlString`'s own tag, which uses 136 of its
 256 values.  Rust's niche-filling requires every other variant's
 data to avoid that byte, and it lays a variant out as a
 self-contained struct *before* placing it — so a field wanting
@@ -1381,6 +1393,24 @@ folds to 16 (the `Plain` payload's spare discriminant encodings
 absorb the cell's own tag, as `Option<Value>` does); the §2.3.6
 assertion battery rebases to 16 wholesale.
 
+#### 2.2.10 Containers: the ordered map [DECISION]:
+
+`PerlArray` is a dense `Vec` of slots (`Option<Value>`: a hole is
+not `undef`, §21.1).  `PerlHash`'s map is an
+`IndexMap<PerlString, Value>`.  Perl's `each` contract needs a
+cursor that survives inserts and deletes with no guard object,
+and an index into insertion order is exactly that: the `each`
+cursor is a plain integer.  Deletes use `swap_remove` — O(1),
+the order perturbation sitting inside perl's unspecified-order
+contract — and the cursor adjustment on a delete at or before it
+makes delete-during-iteration *exact*, including the
+delete-current idiom perl documents as safe.  Entry pairs are
+dense at 16 + 16 = 32 bytes, two per cache line, which the
+§2.2.9 key economics and the §2.4.3 size budget both lean on.
+The dependency is `indexmap` (§22.1); the standard `HashMap`
+cannot host the cursor without a generation guard.  Ruled during
+§21.1 step 6 and recorded here as the normative home.
+
 ### 2.3 Promoted Scalars
 
 #### 2.3.1 `ScalarRef` — shared identity:
@@ -1463,21 +1493,26 @@ Full:   32 + one extension allocation; payload and rare state
         objects never create Full scalar cells.
 ```
 
-48 bytes lands exactly on a common allocator size class.  Comparison
-against perl 5 (head 24 + body ladder + separate string buffers +
-8-byte slot pointers; figures re-derived from the 5.42.2 reference
-sources): compact numbers beat perl's 32-bytes-plus-a-dereference
-array elements by 25% and all of the pointer chasing; short strings
-beat perl's three-allocation ~50 bytes with zero allocations; the one
-concession is the heavily aliased plain scalar (48 vs. perl's 24),
-inherent to the two-tier bet, not the envelope.
+The 32-byte cell — §2.4's combined `rc_state` word, the lock
+word, and the 16-byte `ScalarCell` — compares against perl 5
+(head 24 + body ladder + separate string buffers + 8-byte slot
+pointers; figures re-derived from the 5.42.2 reference sources):
+compact numbers beat perl's 32-bytes-plus-a-dereference array
+elements by 50% and all of the pointer chasing; short strings
+beat perl's three-allocation ~50 bytes with zero allocations; the
+one concession is the heavily aliased plain scalar (32 vs.
+perl's 24), inherent to the two-tier bet, not the envelope.  (The
+staged backend — `HeapArc` as a newtype over std `Arc` — allocates
+into the 48-byte class today, a double-word `ArcInner` standing
+where the combined word will; the figure converges when §2.4's
+custom node lands.)
 
 The lazy-cache slots exist because exact conversions of *shared*
 scalars are worth memoizing once at the identity rather than
-recomputed per reader.  The fill mechanism (populate under read lock
-via once-cells vs. write lock) is an open implementation choice; the
-design constraint is only that readers stay concurrent on the read
-path.
+recomputed per reader.  The fill mechanism is ruled: atomics
+for the numeric slots, `OnceLock` for the string slot — readers
+stay concurrent on the read path, and racing fillers store the
+same derived values.
 
 #### 2.3.3 `ConstScalar` and the boolean immortals:
 
@@ -1813,7 +1848,7 @@ The load-bearing layout facts:
 
 - **The envelope is 16 bytes** (ruled at §2.2.9): full inline
   `i64` and `f64` with taint as discriminant twins, the
-  three-format 15-byte inline plus 30-character nibble-packed
+  five-class 15-byte inline plus 30-character nibble-packed
   string tiers, thin heap
   pointers, `Option` at no cost, and per-value packed-decimal
   numeric caches.  A 24-byte envelope (22 raw-inline bytes, no
@@ -1962,7 +1997,7 @@ behavior is matched, vocabulary is not.  The type roster:
 
 ```text
 PerlString    a Perl string: bytes + utf8/warned/tainted in its tag
-CowBuffer     custom COW byte buffer: (ptr, len) handle;
+CowBuffer     custom COW byte buffer: thin one-word handle;
               {refcount, len, capacity, scan} header
 Value         the universal 16-byte slot value
 ScalarPayload the authoritative datum of one scalar
@@ -1972,7 +2007,7 @@ ScalarCell    mutable cell interior (Plain | Full), upgraded in place
 FullScalar    boxed rare state: payload + caches + magic + stash
 ConstScalar   lockless immutable cell, coercions materialized at birth
 PerlArray     Vec<ArraySlot> + array-level state
-PerlHash      HashMap<PerlString, Value> + iterator state
+PerlHash      IndexMap<PerlString, Value> + iterator state (§2.2.10)
 ArrayRef, HashRef, CodeRef, RegexRef
               Arc-backed shared identities of the container/code types
 MagicChain, Stash
@@ -3031,6 +3066,12 @@ semantics of a fatal sweep resurrection.
 
 ### 2.5 Magic (Tied Variables and Friends)
 
+> **Placeholder.**  A sketch awaiting the magic design, which
+> lands with `FullScalar`'s consumers; the trait shape and its
+> `Result` are illustrative, not a settled surface, and the
+> snapshot-under-lock mechanics of §2.3.1/§13.11 are not yet
+> reflected here.
+
 Perl "magic" is a mechanism for attaching callbacks to variable access.
 It implements `tie`, special variables (`$!`, `$/`, `$_`, etc.), `pos()`,
 `taint`, and other behaviors.
@@ -3062,18 +3103,18 @@ lock is held.
 #### 2.6.1 Placement:
 
 **Taint placement.**  Taint is per-value, copied on assignment, and
-lives where each variant affords it free storage: envelope padding
-for the sub-maximal variants, the `PerlString` tag for strings
-(§2.2.3), the cell's payload for promoted scalars.  Every payload
+lives in the discriminant: twin variants for the non-string
+payloads (§2.3.6), the `PerlString` tag for strings (§2.2.3), the
+cell's payload for promoted scalars.  Every payload
 kind can carry taint **including `Undef`**: readline at EOF returns
 a *tainted undef* (container-verified: `PVMG` with taint magic and
 no value flags; taint copies on assignment; `eval` on it dies
 "Insecure dependency") — an everyday value, the terminator of every
 `while (<$fh>)` loop — and perl's own `t/op/taint.t` asserts both
 that it exists and, via a `reset()` regression, that undef must not
-be tainted spuriously.  So `Undef(Tainted)` carries the padding bit
-like its siblings, and `Value`'s `Default` is a manual impl (a
-fielded variant cannot be a derived default).  Not every
+be tainted spuriously.  So `UndefTainted` stands beside `Undef`
+like every other twin, and `Value`'s `Default` is the clean
+`Undef`.  Not every
 undef-producing source taints — a missing `%ENV` key and an
 unmatched capture group are verified clean, including under
 `use locale` — so taint follows the *producing operation*, exactly
@@ -3128,7 +3169,7 @@ is explicit, clearing is impossible.
   the clean-from-tainted constructor is private to the taint module.
   Its two sanctioned consumers (§2.6.2) reach it through perl-core
   APIs: the regex engine hands match extents to a perl-core
-  capture-materialization function (which unaints, hint-conditional
+  capture-materialization function (which untaints, hint-conditional
   on `use locale`), and `PerlHash` key canonicalization untaints
   in-crate.  Laundering is not a reviewed-against bug class; it is
   uncompilable code.
@@ -3187,6 +3228,14 @@ wording against the 5.42 reference documentation.
 
 
 ## 3. Memory Management Details
+
+> **Stale stratum (rewrite pending).**  This section predates the
+> two-tier value model (§2.3) and the §2.4 memory architecture;
+> where they conflict, §2 is normative — in particular, §2.4.1's
+> arena enumeration supersedes the self-contained-`Arc` framing
+> below, and the mortal stack holds `Value`s.  Connecting
+> `SharedRuntime`/`Interpreter` to `DomainCore` and the domain
+> lease is unwritten design, not a substitution.
 
 ### 3.1 Shared Runtime State
 
@@ -11183,7 +11232,8 @@ internal ordering follows the dependency structure of §2:
 5. Reference creation and dereference — `\$x` promotion returning
    `ScalarRef` clones, `ptr_eq` identity, upgrade triggers (§2.2.8).
 
-6. Containers — `PerlArray`/`PerlHash` with their handle types,
+6. Containers — `PerlArray`/`PerlHash` with their handle types
+   (the ordered-map ruling is recorded in §2.2.10),
    exists/delete semantics against the slot model.
 
 7. Iterative teardown — the runtime-owned mechanical release
@@ -11257,7 +11307,7 @@ fn boolean_immortals_share_identity() {
 
 #[test]
 fn reference_identity() {
-    let mut val = Value::Int(42);
+    let mut val = Value::integer(42, Tainted::CLEAN);
     let r1 = val.take_ref();   // promotes in place
     let r2 = val.take_ref();   // same identity
     assert!(ScalarRef::ptr_eq(&r1, &r2));
@@ -11386,7 +11436,7 @@ three independent leaf crates that have no cross-dependencies:
 
 | Crate           | Type | Dependencies                                              | Contents                                                                                                                           |
 |-----------------|------|-----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
-| `perl-core`     | lib  | `bytes`                                                   | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
+| `perl-core`     | lib  | `indexmap`, `parking_lot`                                 | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
 | `perl-parser`   | lib  | `bytes`, `memchr`, `unicode-xid`, `unicode-normalization` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters  |
 | `perl-regex`    | lib  | none                                                      | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11)                    |
 | `perl-compiler` | lib  | `perl-core`, `perl-parser`                                | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
@@ -11400,12 +11450,13 @@ cross-dependencies.  Each is independently useful as a library:
 `perl-parser` for tools that need to parse Perl without executing it,
 `perl-regex` for Rust programs that want Perl-compatible regex, and
 `perl-core` for extensions that need the value types.  `perl-core`
-depends on the `bytes` crate for zero-copy reference-counted byte
-buffers.  `perl-parser` depends on `bytes` (source slicing), `memchr`
-(SIMD-optimized scanning and delimiter lookup), `unicode-xid`
-(Unicode identifier validation), and `unicode-normalization` (NFC
-normalization).  `perl-regex` remains dependency-free, operating on
-`&[u8]` and `&str` slices.
+carries its own `CowBuffer` (§2.2.3) for copy-on-write byte
+buffers, with `indexmap` for the ordered map (§2.2.10) and
+`parking_lot` for cell locks (§2.3.1).  `perl-parser` depends on
+`bytes` (source slicing), `memchr` (SIMD-optimized scanning and
+delimiter lookup), `unicode-xid` (Unicode identifier validation),
+and `unicode-normalization` (NFC normalization).  `perl-regex`
+remains dependency-free, operating on `&[u8]` and `&str` slices.
 
 `perl-compiler` contains the compilation pipeline: AST → HIR → IR →
 optimize.  It depends on `perl-parser` (for AST input) and
@@ -11611,6 +11662,11 @@ The following are real concerns but are deliberately deferred:
 
 ## 24. Design Summary
 
+> **Stale stratum (rewrite pending).**  Parts of this summary
+> predate §2.3/§2.4 and §2.2.9; where it conflicts with §2, §2 is
+> normative — in particular the "no centralized arena" framing,
+> which §2.4.1 supersedes.
+
 The key architectural decisions in this design:
 
 1. **`Arc<RwLock<T>>`-based value representation.**  Self-managing
@@ -11657,7 +11713,7 @@ The key architectural decisions in this design:
 7. **Value model first in implementation order**, because everything
    depends on it — not lexer first.
 
-8. **Six crates plus one binary** — three independent leaf crates
+8. **Five libraries plus one binary** — three independent leaf crates
    (`perl-core`, `perl-parser`, `perl-regex`) with no
    cross-dependencies.  `perl-core` depends on `bytes` for zero-copy
    reference-counted buffers; `perl-parser` depends on `bytes`,
