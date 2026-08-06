@@ -66,6 +66,46 @@ fn deep_hash_chain_releases_iteratively() {
 }
 
 #[test]
+fn deep_tainted_scalar_ref_chain_releases_iteratively() {
+    // The tainted twins are the same owning edges as their clean siblings (§2.6.1): a chain of them must release
+    // iteratively through the worklist, not recursively through Rust drop.  Before the shared exhaustive
+    // classification, the twins were absent from the edge lists and this chain overflowed the stack.
+    let mut slot = Value::undef(Tainted::CLEAN);
+    for _ in 0..200_000 {
+        slot = match Value::take_ref(&mut slot) {
+            Value::ScalarRefMut(cell) => Value::ScalarRefMutTainted(cell),
+            other => other,
+        };
+    }
+
+    drop(slot);
+}
+
+#[test]
+fn deep_tainted_array_chain_releases_iteratively() {
+    let mut inner = ArrayRef::new(PerlArray::new());
+    for _ in 0..200_000 {
+        let outer = ArrayRef::new(PerlArray::new());
+        outer.write().push_value(Value::array_ref(inner, Tainted::TAINTED)).unwrap();
+        inner = outer;
+    }
+
+    drop(inner);
+}
+
+#[test]
+fn deep_tainted_hash_chain_releases_iteratively() {
+    let mut inner = HashRef::new(PerlHash::new());
+    for _ in 0..100_000 {
+        let outer = HashRef::new(PerlHash::new());
+        outer.write().store("next".parse().unwrap(), Value::hash_ref(inner, Tainted::TAINTED)).unwrap();
+        inner = outer;
+    }
+
+    drop(inner);
+}
+
+#[test]
 fn deep_mixed_chain_releases_iteratively() {
     // Alternating array → hash → promoted-scalar links: every Drop interception point in one chain.
     let mut link = Value::integer(0, Tainted::CLEAN);

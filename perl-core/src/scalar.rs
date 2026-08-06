@@ -121,7 +121,7 @@ impl Drop for ScalarCell {
             ScalarCell::Plain(p) => mem::replace(p, ScalarPayload::undef(Tainted::CLEAN)),
             ScalarCell::Full(f) => mem::replace(&mut f.payload, ScalarPayload::undef(Tainted::CLEAN)),
         };
-        if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
+        if crate::value::Value::payload_carries_strong_edge(&payload) {
             release_payload(payload);
         }
     }
@@ -318,7 +318,7 @@ impl Drop for ConstScalar {
     /// Iterative teardown (§2.4.9): frozen payloads can carry graph edges too (§2.4.10).
     fn drop(&mut self) {
         let payload = mem::replace(&mut self.payload, ScalarPayload::undef(Tainted::CLEAN));
-        if matches!(payload, ScalarPayload::ScalarRefMut(..) | ScalarPayload::ScalarRefConst(..) | ScalarPayload::ArrayRef(..) | ScalarPayload::HashRef(..)) {
+        if crate::value::Value::payload_carries_strong_edge(&payload) {
             release_payload(payload);
         }
     }

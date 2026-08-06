@@ -642,10 +642,58 @@ impl Value {
     /// Whether this value holds a strong graph edge (§2.4.9): the reference and aliasing variants.  Non-edge values
     /// cannot recurse when dropped and skip the release worklist.
     pub(crate) fn carries_strong_edge(&self) -> bool {
-        matches!(
-            self,
-            Value::ScalarRefMut(..) | Value::ScalarRefConst(..) | Value::ArrayRef(..) | Value::HashRef(..) | Value::ScalarMut(_) | Value::ScalarConst(_)
-        )
+        // Exhaustive on purpose — no wildcard, no bare list.  A wildcard here is how the tainted twins went missing
+        // from the teardown classification: adding a variant must break this match, never silently classify as leaf.
+        match self {
+            Value::ScalarRefMut(..)
+            | Value::ScalarRefMutTainted(..)
+            | Value::ScalarRefConst(..)
+            | Value::ScalarRefConstTainted(..)
+            | Value::ArrayRef(..)
+            | Value::ArrayRefTainted(..)
+            | Value::HashRef(..)
+            | Value::HashRefTainted(..)
+            | Value::ScalarMut(_)
+            | Value::ScalarConst(_) => true,
+            Value::Undef
+            | Value::UndefTainted
+            | Value::Integer(..)
+            | Value::IntegerTainted(..)
+            | Value::Unsigned(..)
+            | Value::UnsignedTainted(..)
+            | Value::Float(..)
+            | Value::FloatTainted(..)
+            | Value::String(_)
+            | Value::True
+            | Value::False => false,
+        }
+    }
+
+    /// Whether this payload holds a strong owning edge into the heap graph — the teardown worklist's classification,
+    /// shared by every teardown path so the answer cannot drift between them.  Exhaustive on purpose, like
+    /// [`Value::carries_strong_edge`]: adding a variant must break this match.
+    pub(crate) fn payload_carries_strong_edge(p: &ScalarPayload) -> bool {
+        match p {
+            ScalarPayload::ScalarRefMut(..)
+            | ScalarPayload::ScalarRefMutTainted(..)
+            | ScalarPayload::ScalarRefConst(..)
+            | ScalarPayload::ScalarRefConstTainted(..)
+            | ScalarPayload::ArrayRef(..)
+            | ScalarPayload::ArrayRefTainted(..)
+            | ScalarPayload::HashRef(..)
+            | ScalarPayload::HashRefTainted(..) => true,
+            ScalarPayload::Undef
+            | ScalarPayload::UndefTainted
+            | ScalarPayload::Integer(..)
+            | ScalarPayload::IntegerTainted(..)
+            | ScalarPayload::Unsigned(..)
+            | ScalarPayload::UnsignedTainted(..)
+            | ScalarPayload::Float(..)
+            | ScalarPayload::FloatTainted(..)
+            | ScalarPayload::String(_)
+            | ScalarPayload::True
+            | ScalarPayload::False => false,
+        }
     }
 
     /// Rehydrate a payload as a slot value.  Consumers: the §2.4.9 release path (a dying cell's payload enters the
