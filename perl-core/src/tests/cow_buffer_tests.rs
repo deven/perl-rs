@@ -99,6 +99,18 @@ fn as_mut_slice_cow_breaks() {
 }
 
 #[test]
+fn mutable_escape_invalidates_content_caches() {
+    // The caches must never outlive the bytes they describe: handing out &mut resets the lattice to its no-knowledge
+    // top and the character count to unset, before the caller can write anything.
+    let mut cb = CowBuffer::from_slice(b"ascii content here").unwrap();
+    cb.narrow_scan(3); // Some terminal knowledge.
+    cb.set_char_count(18); // A filled count cache.
+    cb.as_mut_slice().unwrap()[0] = 0xFF;
+    assert_eq!(cb.scan(), 0, "the lattice must return to UNKNOWN on mutable escape");
+    assert_eq!(cb.char_count(), 0, "the count cache must return to unset, never outliving the bytes it counted");
+}
+
+#[test]
 fn scan_narrowing_is_visible_to_sharers() {
     let a = CowBuffer::from_slice(b"ascii").unwrap();
     let b = a.clone();

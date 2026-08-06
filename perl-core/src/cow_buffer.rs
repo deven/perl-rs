@@ -297,6 +297,13 @@ impl CowBuffer {
     pub fn as_mut_slice(&mut self) -> Result<&mut [u8], AllocError> {
         self.make_unique(0)?;
 
+        // Raw byte mutation invalidates every cached content fact before the caller can write: the scan lattice returns
+        // to its no-knowledge top and the character count to unset (§2.2.4).  A stale "valid UTF-8" state over freshly
+        // corrupted bytes would let the unchecked readers walk invalid content — the caches must never outlive the
+        // bytes they describe.
+        self.header().scan.store(0, Ordering::Relaxed); // 0 = UNKNOWN, the lattice top.
+        self.header().char_count.store(0, Ordering::Relaxed); // 0 = unset.
+
         // SAFETY: unique (just ensured); len bytes initialized.
         Ok(unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.header().len) })
     }
