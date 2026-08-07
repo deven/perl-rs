@@ -1026,6 +1026,62 @@ fn ref_repr(prefix: &str, addr: usize) -> Result<PerlString, AllocError> {
     PerlString::from_bytes(out.as_bytes())
 }
 
+/// All eight bytes are ASCII digits.  Masking to nibbles first keeps the comparison free of cross-byte carries: the
+/// high nibble must be `3` and the low nibble at most `9`, which adding six turns into a bit-four test.
+#[inline]
+fn word_all_digits(word: u64) -> bool {
+    const LOW: u64 = 0x0F0F_0F0F_0F0F_0F0F;
+    const HIGH: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    (word & HIGH) == 0x3030_3030_3030_3030 && ((word & LOW) + 0x0606_0606_0606_0606) & HIGH == 0
+}
+
+/// Vectorised leading-digit-run scan: subtracting `'0'` wraps every non-digit above nine, so a saturating subtract
+/// leaves a nonzero lane exactly where the run ends.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn digit_run_avx2(bytes: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+
+    unsafe {
+        let zero = _mm256_set1_epi8(b'0' as i8);
+        let nine = _mm256_set1_epi8(9);
+        while i + 32 <= bytes.len() {
+            let block = _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i);
+            let over = _mm256_subs_epu8(_mm256_sub_epi8(block, zero), nine);
+            if _mm256_testz_si256(over, over) == 0 {
+                break;
+            }
+            i += 32;
+        }
+    }
+
+    i + bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count()
+}
+
+/// The length of the leading run of ASCII digits.  This is the only part of numification that is O(the string) — past
+/// nineteen significant digits the remainder can only shift an exponent — so it is the part worth vectorising, and the
+/// block structure exits at the first non-digit rather than reading to the end.
+pub(crate) fn digit_run(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by the runtime feature check; the scan only reads within `bytes`.
+        return unsafe { digit_run_avx2(bytes) };
+    }
+
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        let chunk = &bytes[i..i + 8];
+        let word = u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
+        if !word_all_digits(word) {
+            break;
+        }
+        i += 8;
+    }
+
+    i + bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count()
+}
+
 /// Leading ASCII whitespace and optional sign; returns (negative, rest).
 fn split_sign(bytes: &[u8]) -> (bool, &[u8]) {
     let mut i = 0;
@@ -1100,6 +1156,10 @@ pub fn float_to_int_i64_visible(f: f64) -> i64 {
     f as i64 // truncation toward zero
 }
 
+/// Significant integer digits beyond which no `f64` is finite: `f64::MAX` is about `1.8e308`, so 310 digits is at least
+/// `10^309` and cannot be represented.
+const MAX_FINITE_DIGITS: usize = 309;
+
 /// The string→float coercion: perl's partial-parse rules plus the Inf/NaN prefix forms (module header).
 pub fn parse_float(bytes: &[u8]) -> f64 {
     let (negative, rest) = split_sign(bytes);
@@ -1119,18 +1179,15 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
 
     // Decimal scan: digits, optional fraction, exponent committed only when digits follow the marker ("1e" and "1e+"
     // numify as 1 — a dangling exponent marker is not part of the number).
-    let mut end = 0;
-    while end < rest.len() && rest[end].is_ascii_digit() {
-        end += 1;
-    }
+    let integer_digits = digit_run(rest);
+    let mut end = integer_digits;
 
     if end < rest.len() && rest[end] == b'.' {
         end += 1;
-
-        while end < rest.len() && rest[end].is_ascii_digit() {
-            end += 1;
-        }
+        end += digit_run(&rest[end..]);
     }
+
+    let mut has_exponent = false;
 
     if end < rest.len() && (rest[end] == b'e' || rest[end] == b'E') {
         let mut exp_end = end + 1;
@@ -1140,18 +1197,26 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
         }
 
         let exp_digits_start = exp_end;
-
-        while exp_end < rest.len() && rest[exp_end].is_ascii_digit() {
-            exp_end += 1;
-        }
+        exp_end += digit_run(&rest[exp_end..]);
 
         if exp_end > exp_digits_start {
             end = exp_end;
+            has_exponent = true;
         }
     }
 
     if end == 0 {
         return 0.0;
+    }
+
+    // A 310-digit integer part is at least 10^309, past `f64::MAX`, so with no exponent to pull it back the magnitude
+    // is infinite whatever follows the decimal point.  The general parser reaches the same answer by reading every
+    // digit; this reaches it from the count, which is what makes a pathological digit run O(1).
+    if !has_exponent && integer_digits > MAX_FINITE_DIGITS {
+        let leading_zeros = rest[..integer_digits].iter().take_while(|&&b| b == b'0').count();
+        if integer_digits - leading_zeros > MAX_FINITE_DIGITS {
+            return if negative { f64::NEG_INFINITY } else { f64::INFINITY };
+        }
     }
 
     // The scanned span is ASCII digits/'.'/'e'/sign by construction.
@@ -1190,27 +1255,21 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
         _ => token,
     };
 
-    // Signed case-insensitive inf/infinity/nan, entire.
-    let lower: Vec<u8> = body.iter().map(u8::to_ascii_lowercase).collect();
-    if lower == b"inf" || lower == b"infinity" || lower == b"nan" {
+    // Signed case-insensitive inf/infinity/nan, entire.  `eq_ignore_ascii_case` compares lengths first, where
+    // lowercasing into a fresh buffer copied the whole string to test three words of at most eight characters.
+    if body.eq_ignore_ascii_case(b"inf") || body.eq_ignore_ascii_case(b"infinity") || body.eq_ignore_ascii_case(b"nan") {
         return false;
     }
 
     // The complete numeric token grammar.
-    let mut i = 0;
-    let mut mantissa_digits = 0usize;
-    while i < body.len() && body[i].is_ascii_digit() {
-        i += 1;
-        mantissa_digits += 1;
-    }
+    let mut i = digit_run(body);
+    let mut mantissa_digits = i;
 
     if i < body.len() && body[i] == b'.' {
         i += 1;
-
-        while i < body.len() && body[i].is_ascii_digit() {
-            i += 1;
-            mantissa_digits += 1;
-        }
+        let fraction = digit_run(&body[i..]);
+        i += fraction;
+        mantissa_digits += fraction;
     }
 
     if mantissa_digits == 0 {
@@ -1224,9 +1283,7 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
         }
 
         let digits_start = j;
-        while j < body.len() && body[j].is_ascii_digit() {
-            j += 1;
-        }
+        j += digit_run(&body[j..]);
 
         if j == digits_start {
             return true; // dangling exponent marker: "1e", "1e+"
@@ -1243,10 +1300,7 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
 pub(crate) fn classify_numeric(bytes: &[u8]) -> Numeric {
     let (negative, rest) = split_sign(bytes);
 
-    let mut digit_end = 0;
-    while digit_end < rest.len() && rest[digit_end].is_ascii_digit() {
-        digit_end += 1;
-    }
+    let digit_end = digit_run(rest);
 
     // Integral iff there are digits and the token ends there (nothing numeric continues it).
     let integral_token = digit_end > 0 && !matches!(rest.get(digit_end), Some(b'.') | Some(b'e') | Some(b'E'));

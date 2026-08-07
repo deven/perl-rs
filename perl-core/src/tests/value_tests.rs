@@ -536,3 +536,61 @@ fn unsigned_constructors_canonicalize_to_integer() {
     assert!(matches!(ScalarPayload::unsigned(42, Tainted::CLEAN), ScalarPayload::Integer(_)));
     assert!(matches!(ScalarPayload::unsigned(u64::MAX, Tainted::CLEAN), ScalarPayload::Unsigned(_)));
 }
+
+#[test]
+fn digit_run_matches_the_scalar_scan() {
+    // The vectorised scan must agree with a byte-at-a-time one on every shape, including the block boundaries where an
+    // AVX2 lane or a SWAR word could straddle the end of the run.
+    let scalar = |b: &[u8]| b.iter().take_while(|c| c.is_ascii_digit()).count();
+    let mut cases: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        b"x".to_vec(),
+        b"0".to_vec(),
+        b"0123456789".to_vec(),
+        b"/9".to_vec(), // '/' is 0x2F, one below '0'
+        b"9:".to_vec(), // ':' is 0x3A, one above '9'
+    ];
+
+    for len in 0..80 {
+        cases.push(b"7".repeat(len));
+        cases.push([b"7".repeat(len), b"x".to_vec()].concat());
+        cases.push([b"7".repeat(len), vec![0x2F]].concat());
+        cases.push([b"7".repeat(len), vec![0x3A]].concat());
+        cases.push([b"7".repeat(len), vec![0xFF]].concat());
+    }
+
+    for c in &cases {
+        assert_eq!(digit_run(c), scalar(c), "digit_run disagrees on {c:?}");
+    }
+}
+
+#[test]
+fn the_overflow_shortcut_agrees_with_the_general_parser() {
+    // The shortcut answers from the digit count where the general parser reads every digit; they must not diverge.
+    let reference = |s: &str| s.parse::<f64>().unwrap_or(0.0);
+    for len in [1usize, 17, 100, 308, 309, 310, 311, 400, 5000] {
+        for lead in ["", "0", "0000"] {
+            let digits = format!("{lead}{}", "1".repeat(len));
+            let ours = parse_float(digits.as_bytes());
+            let theirs = reference(&digits);
+            assert_eq!(ours.is_infinite(), theirs.is_infinite(), "infinity disagreement at {len} digits (lead {lead:?})");
+
+            if theirs.is_finite() {
+                assert_eq!(ours, theirs, "value disagreement at {len} digits (lead {lead:?})");
+            }
+
+            // The sign must survive the shortcut.
+            assert_eq!(parse_float(format!("-{digits}").as_bytes()), -ours, "sign disagreement at {len} digits");
+        }
+    }
+
+    // An exponent can pull a long run back into range, so the shortcut must not fire there.
+    let pulled = format!("{}e-400", "1".repeat(400));
+    assert!(parse_float(pulled.as_bytes()).is_finite(), "a negative exponent must still be honoured");
+    assert_eq!(parse_float(pulled.as_bytes()), pulled.parse::<f64>().unwrap());
+
+    // A fraction cannot rescue an overflowing integer part.
+    let fractional = format!("{}.5", "1".repeat(400));
+    assert!(parse_float(fractional.as_bytes()).is_infinite());
+    assert!(fractional.parse::<f64>().unwrap().is_infinite());
+}
