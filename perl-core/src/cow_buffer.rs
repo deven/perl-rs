@@ -385,6 +385,120 @@ impl CowBuffer {
         Ok(out)
     }
 
+    /// Count the two-byte sequences in `bytes`, or `None` when any byte is not part of a Latin-1-range encoding —
+    /// exactly the content perl's downgrade refuses.  The count is what the contraction removes.
+    fn latin1_contractions(bytes: &[u8]) -> Option<usize> {
+        let (mut count, mut i) = (0usize, 0usize);
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if byte < 0x80 {
+                i += 1;
+            } else if (byte == 0xC2 || byte == 0xC3) && bytes.get(i + 1).is_some_and(|&c| c & 0xC0 == 0x80) {
+                count += 1;
+                i += 2;
+            } else {
+                return None;
+            }
+        }
+
+        Some(count)
+    }
+
+    /// Contract every two-byte sequence into the single byte it encodes, returning the new length, or `None` when
+    /// some character lies above `U+00FF` — where perl's downgrade dies.
+    ///
+    /// The content is validated before anything moves: a refusal discovered halfway through an in-place walk would
+    /// leave the buffer holding neither the old string nor the new one.  The invariant prefix stays where it is and
+    /// the compaction walks forward, the write cursor trailing the read cursor by the sequences already collapsed,
+    /// so the contraction never needs to grow and never overwrites a byte it has not read.
+    #[cfg_attr(not(test), allow(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
+    pub(crate) fn downgrade_in_place(&mut self) -> Result<Option<usize>, AllocError> {
+        let old_len = self.len();
+
+        let Some(first) = CowBuffer::first_variant(self.as_slice()) else {
+            return Ok(Some(old_len)); // Entirely invariant: already its own downgrade.
+        };
+
+        let Some(contractions) = CowBuffer::latin1_contractions(&self.as_slice()[first..]) else {
+            return Ok(None);
+        };
+
+        if !self.is_unique() {
+            match CowBuffer::downgraded_from_slice(self.as_slice())? {
+                Some(contracted) => *self = contracted,
+                None => return Ok(None),
+            }
+            return Ok(Some(old_len - contractions));
+        }
+
+        let new_len = old_len - contractions;
+
+        // SAFETY: unique (checked above) and shrinking, so every write lands inside the existing region.  `dst` trails
+        // `src` by the sequences already collapsed, reaching `new_len` exactly as `src` reaches `old_len`.
+        unsafe {
+            let base = self.ptr.as_ptr();
+            let (mut src, mut dst) = (first, first);
+            while src < old_len {
+                let byte = *base.add(src);
+                if byte < 0x80 {
+                    *base.add(dst) = byte;
+                    src += 1;
+                } else {
+                    *base.add(dst) = ((byte & 0x03) << 6) | (*base.add(src + 1) & 0x3F);
+                    src += 2;
+                }
+                dst += 1;
+            }
+            debug_assert_eq!(dst, new_len, "the counted contraction must land exactly");
+            self.set_len(new_len);
+        }
+
+        // The bytes changed and their class is not derivable without another look — contracted octets can themselves be
+        // valid UTF-8 — so the cached facts go and the next reader re-derives them.
+        self.narrow_scan(0);
+        self.set_char_count(0);
+
+        Ok(Some(new_len))
+    }
+
+    /// The copying form of [`CowBuffer::downgrade_in_place`]: a fresh buffer holding the contracted bytes, or `None`
+    /// when the content refuses to downgrade.  What a shared buffer requires, its other holders keeping the encoding.
+    pub(crate) fn downgraded_from_slice(bytes: &[u8]) -> Result<Option<CowBuffer>, AllocError> {
+        let first = CowBuffer::first_variant(bytes).unwrap_or(bytes.len());
+
+        let Some(contractions) = CowBuffer::latin1_contractions(&bytes[first..]) else {
+            return Ok(None);
+        };
+
+        let total = bytes.len() - contractions;
+        let mut out = CowBuffer::with_capacity(total)?;
+
+        // SAFETY: freshly allocated with capacity for the whole result, hence unique and large enough.  The invariant
+        // prefix copies wholesale; the remainder contracts into the space counted for it, so `dst` cannot pass `total`.
+        unsafe {
+            let base = out.ptr.as_ptr();
+            ptr::copy_nonoverlapping(bytes.as_ptr(), base, first);
+
+            let (mut src, mut dst) = (first, first);
+            while src < bytes.len() {
+                let byte = bytes[src];
+                if byte < 0x80 {
+                    *base.add(dst) = byte;
+                    src += 1;
+                } else {
+                    *base.add(dst) = ((byte & 0x03) << 6) | (bytes[src + 1] & 0x3F);
+                    src += 2;
+                }
+                dst += 1;
+            }
+
+            debug_assert_eq!(dst, total, "the counted contraction must fill the buffer exactly");
+            out.set_len(total);
+        }
+
+        Ok(Some(out))
+    }
+
     /// Truncate to `new_len` bytes (no-op if already shorter).  COW-breaks if shared: truncation is a mutation of this
     /// value, and other sharers must keep their full contents.  Scan state resets to `UNKNOWN`; the caller may
     /// re-narrow per the removal rules (§2.2.5).

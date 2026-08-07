@@ -1354,7 +1354,6 @@ impl PerlString {
     /// to Bytes, payload `E9` identical), re-compression where the octets happen to be valid Latin-1-range UTF-8.  The
     /// flagged verbatim classes cannot downgrade: NonLatin1 and Extended hold a character at or above U+0100 by their
     /// class, and the Bytes class flagged has no characters at all.
-    #[cfg_attr(not(test), expect(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
     fn downgraded(&self) -> Result<Option<PerlString>, AllocError> {
         if !self.is_utf8() {
             return Ok(Some(self.clone()));
@@ -1385,22 +1384,9 @@ impl PerlString {
             RawParts::Heap(cb) => {
                 // Walk the encoding: every character must sit in U+0000-U+00FF, emitted as its single byte.  The result
                 // re-runs the ladder — sixteen to thirty emitted octets can compress right back inline.
-                let bytes = cb.as_slice();
-                let mut out = CowBuffer::with_capacity(bytes.len())?;
-                let mut i = 0;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b @ 0x00..=0x7F => {
-                            out.extend_from_slice(&[b])?;
-                            i += 1;
-                        }
-                        lead @ (0xC2 | 0xC3) if i + 1 < bytes.len() && bytes[i + 1] & 0xC0 == 0x80 => {
-                            out.extend_from_slice(&[((lead & 0x03) << 6) | (bytes[i + 1] & 0x3F)])?;
-                            i += 2;
-                        }
-                        _ => return Ok(None), // A character past U+00FF, or no character at all.
-                    }
-                }
+                let Some(out) = CowBuffer::downgraded_from_slice(cb.as_slice())? else {
+                    return Ok(None); // A character past U+00FF, or no character at all.
+                };
 
                 if out.len() <= MAX_PACKED_LEN {
                     return Ok(Some(PerlString::tiered(out.as_slice(), false, w, t)?));
@@ -1409,6 +1395,41 @@ impl PerlString {
                 Ok(Some(PerlString::build_heap(false, w, t, out)))
             }
         }
+    }
+
+    /// The in-place form of [`PerlString::downgraded`]: the same characters, unflagged, contracting a unique heap
+    /// buffer rather than producing a fresh value.  `false` means the content refuses to downgrade — a character above
+    /// `U+00FF`, where perl's dies — and leaves this value untouched.  Contraction never grows, so unlike the upgrade
+    /// it needs no reallocation; the invariant prefix is still left exactly where it is.
+    #[cfg_attr(not(test), allow(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
+    fn downgrade_in_place(&mut self) -> Result<bool, AllocError> {
+        if !self.is_utf8() {
+            return Ok(true);
+        }
+
+        if self.is_ascii() {
+            self.reinterpret_utf8(false);
+            return Ok(true);
+        }
+
+        if let Some(cb) = self.heap_buf_mut() {
+            if cb.downgrade_in_place()?.is_none() {
+                return Ok(false);
+            }
+        } else {
+            match self.downgraded()? {
+                Some(contracted) => *self = contracted,
+                None => return Ok(false),
+            }
+
+            return Ok(true);
+        }
+
+        // Contracted octets can themselves be valid UTF-8, so the class is not derivable here; the buffer left its
+        // caches cleared and the next reader re-derives them.  Only the flag moves.
+        self.reinterpret_utf8(false);
+
+        Ok(true)
     }
 
     /// Set or propagate the taint bit.  Monotonic raise; clearing is the laundering capability's alone (§2.6.2).

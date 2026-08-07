@@ -3843,6 +3843,42 @@ fn upgrading_in_place_leaves_a_sharer_untouched() {
 }
 
 #[test]
+fn the_two_downgrade_forms_agree() {
+    // Contraction never grows, so the in-place form needs no reallocation — but it must validate before it moves, since
+    // a refusal discovered halfway would leave the buffer holding neither string.
+    for bytes in [
+        b"plain ascii long enough to reach the heap tier easily".to_vec(),
+        [b"an invariant prefix that never moves ".to_vec(), [0xC3u8, 0xA9].repeat(30)].concat(),
+        [0xC3u8, 0xA9].repeat(40),
+        b"short".to_vec(),
+        Vec::new(),
+    ] {
+        let src = PerlString::from_bytes(&bytes).unwrap().upgraded().unwrap();
+        let copied = src.downgraded().unwrap().expect("Latin-1-range content downgrades");
+        let mut in_place = src.clone();
+        assert!(in_place.downgrade_in_place().unwrap(), "and so does the in-place form");
+        assert_eq!(copied, in_place, "the two forms must agree for {bytes:?}");
+        assert!(!in_place.is_utf8());
+        assert_eq!(in_place.as_bytes(&mut [0u8; DECODE_MAX]), &bytes[..], "the original octets return");
+    }
+
+    // Beyond U+00FF refuses, and the refusal leaves the value untouched rather than half-contracted.
+    let mut wide = PerlString::from_str(&"€".repeat(40)).unwrap();
+    let before = wide.clone();
+    assert!(!wide.downgrade_in_place().unwrap(), "a character past U+00FF must refuse");
+    assert_eq!(wide, before, "a refused downgrade changes nothing");
+    assert_eq!(wide.downgraded().unwrap(), None, "and the copying form refuses alike");
+
+    // A shared buffer takes the copying route; the sharer keeps its encoding.
+    let shared = PerlString::from_bytes([0xC3u8, 0xA9].repeat(40)).unwrap().upgraded().unwrap();
+    let sharer = shared.clone();
+    let mut contracted = shared.clone();
+    assert!(contracted.downgrade_in_place().unwrap());
+    assert!(sharer.is_utf8(), "the sharer keeps its flag");
+    assert_eq!(sharer.char_len(), Some(80), "and its characters");
+}
+
+#[test]
 fn reinterpretation_is_a_pure_flag_flip() {
     // Container-probed: _utf8_off on an upgraded é yields the flag-off two-character C3.A9 with the payload untouched —
     // and the class axis never moves, being a fact about the bytes (§2.2.9).
