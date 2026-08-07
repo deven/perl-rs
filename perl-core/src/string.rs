@@ -464,9 +464,9 @@ impl StorageType {
 /// synthesized by identifier concatenation) so a grep for any variant finds this defining invocation.
 macro_rules! define_perl_string {
     (
-        inline: [ $( $iv:ident = ($iscan:ident, $istype:ident, $ifull:literal, $iu:literal, $iw:literal, $it:literal) ),* $(,)? ],
-        packed: [ $( $pv:ident = ($palpha:ident, $pstype:ident, $pfull:literal, $pu:literal, $pw:literal, $pt:literal) ),* $(,)? ],
-        heap:   [ $( $hv:ident = ($hu:literal, $hw:literal, $ht:literal) ),* $(,)? ]
+        inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_warned:literal, $inline_tainted:literal) ),* $(,)? ],
+        packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_warned:literal, $packed_tainted:literal) ),* $(,)? ],
+        heap:   [ $( $heap:ident = ($heap_utf8:literal, $heap_warned:literal, $heap_tainted:literal) ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
         /// behind this newtype: no variant is nameable outside the crate, so no payload can be forged or mutated around
@@ -485,45 +485,45 @@ macro_rules! define_perl_string {
         #[derive(Clone)]
         #[repr(align(8))]
         enum Repr {
-            $( $iv { buf: [u8; INLINE_MAX] }, )*
-            $( $pv { nibbles: [u8; PACKED_BYTES] }, )*
-            $( $hv(CowBuffer), )*
+            $( $inline { buf: [u8; INLINE_MAX] }, )*
+            $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
+            $( $heap(CowBuffer), )*
         }
 
         impl PerlString {
             /// The storage type (§2.2.9's normative vocabulary).
             pub fn storage_type(&self) -> StorageType {
                 match &self.0 {
-                    $( Repr::$iv { .. } => StorageType::$istype, )*
-                    $( Repr::$pv { .. } => StorageType::$pstype, )*
-                    $( Repr::$hv(_) => StorageType::Heap, )*
+                    $( Repr::$inline { .. } => StorageType::$inline_type, )*
+                    $( Repr::$packed { .. } => StorageType::$packed_type, )*
+                    $( Repr::$heap(_) => StorageType::Heap, )*
                 }
             }
 
             /// The Perl utf8 flag (semantic claim, not validity — see module docs).
             pub fn is_utf8(&self) -> bool {
                 match &self.0 {
-                    $( Repr::$iv { .. } => $iu, )*
-                    $( Repr::$pv { .. } => $pu, )*
-                    $( Repr::$hv(_) => $hu, )*
+                    $( Repr::$inline { .. } => $inline_utf8, )*
+                    $( Repr::$packed { .. } => $packed_utf8, )*
+                    $( Repr::$heap(_) => $heap_utf8, )*
                 }
             }
 
             /// Whether the numification warning has fired for this value (§2.3.4).
             pub fn is_warned(&self) -> bool {
                 match &self.0 {
-                    $( Repr::$iv { .. } => $iw, )*
-                    $( Repr::$pv { .. } => $pw, )*
-                    $( Repr::$hv(_) => $hw, )*
+                    $( Repr::$inline { .. } => $inline_warned, )*
+                    $( Repr::$packed { .. } => $packed_warned, )*
+                    $( Repr::$heap(_) => $heap_warned, )*
                 }
             }
 
             /// Whether this value is tainted (§2.6).
             pub fn is_tainted(&self) -> bool {
                 match &self.0 {
-                    $( Repr::$iv { .. } => $it, )*
-                    $( Repr::$pv { .. } => $pt, )*
-                    $( Repr::$hv(_) => $ht, )*
+                    $( Repr::$inline { .. } => $inline_tainted, )*
+                    $( Repr::$packed { .. } => $packed_tainted, )*
+                    $( Repr::$heap(_) => $heap_tainted, )*
                 }
             }
 
@@ -531,10 +531,10 @@ macro_rules! define_perl_string {
             /// [`StorageType`], of which this is the class projection.
             fn inline_class(&self) -> Option<InlineClass> {
                 match &self.0 {
-                    $( Repr::$iv { .. } => Some(InlineClass::$iscan), )*
+                    $( Repr::$inline { .. } => Some(InlineClass::$inline_class), )*
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
-                    $( Repr::$pv { .. } => Some(InlineClass::Ascii), )*
-                    $( Repr::$hv(_) => None, )*
+                    $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
+                    $( Repr::$heap(_) => None, )*
                 }
             }
 
@@ -562,7 +562,7 @@ macro_rules! define_perl_string {
                 }
 
                 match (class, s == INLINE_MAX, utf8, warned, tainted) {
-                    $( (InlineClass::$iscan, $ifull, $iu, $iw, $it) => PerlString(Repr::$iv { buf }), )*
+                    $( (InlineClass::$inline_class, $inline_full, $inline_utf8, $inline_warned, $inline_tainted) => PerlString(Repr::$inline { buf }), )*
                 }
             }
 
@@ -570,7 +570,7 @@ macro_rules! define_perl_string {
             /// given alphabet, length family, and tag dimensions.
             fn build_packed(packed: Packed, utf8: bool, warned: bool, tainted: bool) -> PerlString {
                 match (packed.alphabet, packed.full, utf8, warned, tainted) {
-                    $( (PackedAlphabet::$palpha, $pfull, $pu, $pw, $pt) => PerlString(Repr::$pv { nibbles: packed.nibbles }), )*
+                    $( (PackedAlphabet::$packed_alphabet, $packed_full, $packed_utf8, $packed_warned, $packed_tainted) => PerlString(Repr::$packed { nibbles: packed.nibbles }), )*
                 }
             }
 
@@ -578,13 +578,13 @@ macro_rules! define_perl_string {
             /// explicit variant lists ran past a hundred names, and the per-section repetition expresses it exactly.
             fn raw_parts(&self) -> RawParts<'_> {
                 match &self.0 {
-                    $( Repr::$iv { buf } => RawParts::Inline { class: InlineClass::$iscan, full: $ifull, buf }, )*
-                    $( Repr::$pv { nibbles } => RawParts::Packed(Packed {
-                        alphabet: PackedAlphabet::$palpha,
-                        full: $pfull,
+                    $( Repr::$inline { buf } => RawParts::Inline { class: InlineClass::$inline_class, full: $inline_full, buf }, )*
+                    $( Repr::$packed { nibbles } => RawParts::Packed(Packed {
+                        alphabet: PackedAlphabet::$packed_alphabet,
+                        full: $packed_full,
                         nibbles: *nibbles,
                     }), )*
-                    $( Repr::$hv(cb) => RawParts::Heap(cb), )*
+                    $( Repr::$heap(cb) => RawParts::Heap(cb), )*
                 }
             }
 
@@ -592,28 +592,28 @@ macro_rules! define_perl_string {
             /// whose payloads cannot be extended in place.
             fn inline_buf_mut(&mut self) -> Option<(bool, &mut [u8; INLINE_MAX])> {
                 match &mut self.0 {
-                    $( Repr::$iv { buf } => Some(($ifull, buf)), )*
-                    $( Repr::$pv { .. } => None, )*
-                    $( Repr::$hv(_) => None, )*
+                    $( Repr::$inline { buf } => Some(($inline_full, buf)), )*
+                    $( Repr::$packed { .. } => None, )*
+                    $( Repr::$heap(_) => None, )*
                 }
             }
 
             /// The payload behind the tag, owned — the shape mutation needs, since it rebuilds the tag afterward.
             fn into_raw(self) -> RawOwned {
                 match self.0 {
-                    $( Repr::$iv { buf } => RawOwned::Inline { class: InlineClass::$iscan, full: $ifull, buf }, )*
-                    $( Repr::$pv { nibbles } => RawOwned::Packed(Packed {
-                        alphabet: PackedAlphabet::$palpha,
-                        full: $pfull,
+                    $( Repr::$inline { buf } => RawOwned::Inline { class: InlineClass::$inline_class, full: $inline_full, buf }, )*
+                    $( Repr::$packed { nibbles } => RawOwned::Packed(Packed {
+                        alphabet: PackedAlphabet::$packed_alphabet,
+                        full: $packed_full,
                         nibbles,
                     }), )*
-                    $( Repr::$hv(cb) => RawOwned::Heap(cb), )*
+                    $( Repr::$heap(cb) => RawOwned::Heap(cb), )*
                 }
             }
 
             fn build_heap(utf8: bool, warned: bool, tainted: bool, cb: CowBuffer) -> PerlString {
                 match (utf8, warned, tainted) {
-                    $( ($hu, $hw, $ht) => PerlString(Repr::$hv(cb)), )*
+                    $( ($heap_utf8, $heap_warned, $heap_tainted) => PerlString(Repr::$heap(cb)), )*
                 }
             }
         }
