@@ -1088,15 +1088,21 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
 
   **The storage types are the normative vocabulary.**  The
   seventeen base variants — `InlineAscii`, `InlineLatin1`,
-  `InlineNonLatin1`, `InlineExtended`, and `InlineBytes`, each
-  beside its `Full` family twin; the `PackedNumeric`,
-  `PackedDateTimePlus`, and `PackedDateTimeZulu` pairs; and
-  `Heap` — are reified as `StorageType`, and the discriminant is
-  `type x 8 + flags` with the utf8, warned, and tainted bits as
-  the low three, so `storage_type()` is a shift once explicit
-  discriminants land, class is `type >> 1` and family `type & 1`
-  over the inline range, and every coarse question is a
-  projection on it.  `StorageKind`, `InlineScan`, and the model
+  `InlineNonLatin1`, `InlineExtended`, `InlineBytes`,
+  `PackedNumeric`, `PackedDateTimePlus`, and
+  `PackedDateTimeZulu`, each beside its `Full` family twin, and
+  `Heap`, alone without one — are reified as `StorageType`:
+  seventeen values dense from zero, which is the niche budget's
+  requirement (§2.2.3), with every coarse question a projection
+  on it.  The
+  declaration order is itself the selection [DECISION]: canonical
+  selection takes the first type, in this order, able to
+  represent the content — first-fit is the ladder — which is what
+  the derived `Ord` means: fourteen ASCII bytes fit `InlineAscii`
+  and take it; a fifteenth forces the `Full` twin; sixteen
+  alphabet characters fit nothing before `PackedNumeric`; and
+  content nothing else can hold falls through to `Heap`, the type
+  that can hold anything.  `StorageKind`, `InlineScan`, and the model
   `InlineStr` retire into it.  The inline bytes class and the
   §2.2.4 lattice terminal `MALFORMED_UTF8` are the same
   classification of the same content — one eager, in the tag;

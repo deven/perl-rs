@@ -384,7 +384,8 @@ enum InlineClass {
 
 /// The storage type: the seventeen-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
 /// the discriminant is this type times the three flag bits.  Coarse questions are the projection methods.  Declaration
-/// order is the deterministic tier-selection priority (§2.2.9), which is what the derived `Ord` means.
+/// order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able to represent
+/// the content — first-fit is the ladder — which is what the derived `Ord` means.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum StorageType {
     /// Inline, ≤ [`INLINE_MAX`] payload bytes, no allocation: the five content classes, each beside its full-capacity
