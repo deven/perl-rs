@@ -1059,14 +1059,46 @@ unsafe fn digit_run_avx2(bytes: &[u8]) -> usize {
     i + bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count()
 }
 
+/// AVX-512VL at 256-bit width.  The mask register locates the first non-digit exactly, so a partial block needs no
+/// scalar tail, and the narrower vector avoids the downclocking that 512-bit work provokes on some parts.  This is
+/// also the AVX10 baseline shape — 256-bit vectors with mask registers, 512-bit optional — so it is the form most
+/// likely to keep running unchanged on later hardware.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn digit_run_avx512vl(bytes: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+    unsafe {
+        let zero = _mm256_set1_epi8(b'0' as i8);
+        let nine = _mm256_set1_epi8(9);
+        while i + 32 <= bytes.len() {
+            let block = _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i);
+            let digits = _mm256_cmple_epu8_mask(_mm256_sub_epi8(block, zero), nine);
+            if digits != u32::MAX {
+                return i + (!digits).trailing_zeros() as usize;
+            }
+            i += 32;
+        }
+    }
+    i + bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count()
+}
+
 /// The length of the leading run of ASCII digits.  This is the only part of numification that is O(the string) — past
 /// nineteen significant digits the remainder can only shift an exponent — so it is the part worth vectorising, and the
 /// block structure exits at the first non-digit rather than reading to the end.
 pub(crate) fn digit_run(bytes: &[u8]) -> usize {
+    // A run shorter than one vector block — which is nearly every number a program actually numifies — skips dispatch
+    // entirely: the feature checks would cost more than the word loop below answers in.
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        // SAFETY: guarded by the runtime feature check; the scan only reads within `bytes`.
-        return unsafe { digit_run_avx2(bytes) };
+    if bytes.len() >= 32 {
+        // SAFETY (both arms): guarded by the runtime feature check; the scans only read within `bytes`.
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            return unsafe { digit_run_avx512vl(bytes) };
+        }
+
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { digit_run_avx2(bytes) };
+        }
     }
 
     let mut i = 0;
