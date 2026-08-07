@@ -362,7 +362,8 @@ unique-check mutation, nothing else.  Details:
   niche.
 - **Header: compact by default.**  The common buffer header is
   u32-field: `{refcount: AtomicU32, len: u32, capacity: u32,
-  char_count: AtomicU32 (MAX = unknown), scan: AtomicU8, flags:
+  char_count: AtomicU32 (0 = no cached count; §2.2.4), scan:
+  AtomicU8, flags:
   u8}` — 20 bytes at alignment 4 — where a usize-field layout
   would cost 40, more than many of the strings it fronts.  A
   `flags` bit selects the large-buffer header (usize lengths) for
@@ -710,10 +711,23 @@ with the character-operations design.  Cross-check against 5.42's
 **The character count rides the same pass.**  Perl's `length()` on a
 flagged string is a character count — a fact the classification
 decode walks right past, so under the single-pass fusion law it is
-counted then and cached in the buffer header (`char_count`,
-sentinel `MAX` = unknown — a zero sentinel is unsound because heap
-strings never demote and can truncate to empty; inline strings
-recount their ≤ 15 payload bytes trivially).  Relaxed atomic stores
+counted then and cached in the buffer header (`char_count`; inline
+strings recount their ≤ 15 payload bytes trivially) [DECISION].
+The cached count is the flag-on answer — code points under perl's
+own decoder, extended range included — a content fact, which is
+all a shared per-buffer header can hold: the flag lives per handle
+in the tag, and the flag-off length answer is the byte length the
+header already stores.  Zero means "no cached count", and the
+byte length dual-purposes it: length zero implies zero characters
+by definition, so readers short-circuit on the length and never
+consult the field, while any nonempty perl-decodable content has
+at least one character, making zero unambiguous where it is
+consulted.  Malformed content keeps zero permanently — there is
+no clean answer — with the scan byte distinguishing
+"no count exists" from "not yet counted".  Zeroed headers are
+born unset for free, and mutation resets the count with the scan,
+which for newly emptied content stores the correct count and the
+unset state in one value.  Relaxed atomic stores
 suffice here, unlike the scan byte: the character count of fixed
 bytes is unique, so racing writers store the *same* value through
 an atomic — benign by identity, where scan discoveries need the

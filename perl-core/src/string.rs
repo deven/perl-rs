@@ -1227,6 +1227,7 @@ impl PerlString {
                 }
             }
             RawParts::Heap(cb) => match cb.scan() {
+                _ if cb.is_empty() => Some(0), // Zero bytes hold zero characters: the count field is never consulted.
                 scan::ASCII => Some(cb.len()),
                 scan::MALFORMED_UTF8 => None,
                 _ => {

@@ -54,9 +54,11 @@ struct Header {
     len: usize,
     capacity: usize,
 
-    /// Cached character count under perl semantics (§2.2.4); 0 = unset.  Sound as a sentinel for heap buffers
-    /// specifically: heap strings exceed the inline maximum, hence contain at least two characters.  Self-validating,
-    /// so relaxed atomics suffice (deterministic content fact, like `scan`).
+    /// Cached flag-on character count (§2.2.4); 0 = no cached count.  The byte length dual-purposes the zero: length
+    /// zero implies zero characters by definition, so readers short-circuit on `len` and never consult this field, and
+    /// any nonempty perl-decodable content counts at least one character — zero is unambiguous where it is read.
+    /// Malformed content keeps zero permanently; the scan byte says which case holds.  Self-validating, so relaxed
+    /// atomics suffice (deterministic content fact, like `scan`).
     char_count: AtomicUsize,
     scan: AtomicU8,
 }

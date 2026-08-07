@@ -3870,3 +3870,30 @@ fn equal_content_takes_equal_representations_across_routes() {
     assert_eq!(data.storage_type(), via_flip.storage_type());
     assert_ne!(direct, data, "and the two groups are different strings");
 }
+
+#[test]
+fn char_count_zero_is_dual_purposed_by_the_byte_length() {
+    // The §2.2.4 ruling: zero means "no cached count", and the byte length disambiguates — zero bytes hold zero
+    // characters by definition, so the field is never consulted there; nonempty decodable content counts at least one;
+    // malformed content keeps zero permanently, the scan byte saying which case holds.
+    let mut s = PerlString::from_bytes(b"heap content that is long enough to stay heap").unwrap();
+    s.push_bytes(b"").unwrap();
+    assert_eq!(s.char_len(), Some(45));
+
+    // Truncation to empty through the mutable escape: the count answer is 0 without any recount possible or needed.
+    let empty = PerlString::from_bytes(vec![]).unwrap();
+    assert_eq!(empty.char_len(), Some(0));
+
+    // Malformed heap content: no clean answer, and the count field stays at zero behind the scan byte's verdict.
+    let mal = from_hex(&"e9".repeat(40), false);
+    assert!(mal.storage_type().is_heap());
+    assert_eq!(mal.char_len(), None);
+
+    // The cache holds the flag-on answer regardless of the handle's flag: the flag-off octets and their flagged
+    // reading are one buffer fact apart from the tag.
+    let off = from_hex(&"c3a9".repeat(40), false);
+    let on = from_hex(&"c3a9".repeat(40), true);
+    assert_eq!(on.char_len(), Some(40), "the flag-on count: forty characters");
+    assert_eq!(off.char_len(), Some(40), "char_len answers the flag-on question for either handle");
+    assert_eq!(off.len(), 80, "the flag-off length answer is the byte length the envelope already knows");
+}
