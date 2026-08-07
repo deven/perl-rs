@@ -3738,6 +3738,23 @@ fn nonzero_padding_is_detected() {
 // ── Representation transforms and canonical selection (§2.2.9) ───────────────────────────────────────────────────────
 
 #[test]
+fn equal_values_hash_alike_across_provenance_and_scan_knowledge() {
+    // One canonical stream, three provenances: a raw slice, the per-character downgrade emit, and the dual walk's
+    // block-wise spans.  The chunk feed makes the hasher call shapes identical; the Hasher contract does not.
+    let raw = from_hex(&"e9".repeat(80), false); // Heap Bytes class: the raw stream arrives as one slice.
+    let flagged = from_hex(&"c3a9".repeat(80), true); // Heap flagged Latin-1: the same stream, emitted per character.
+    assert_eq!(raw, flagged, "sv_eq upgrades the byte side: equal");
+    assert_eq!(hash_of(&raw), hash_of(&flagged), "equal values, different provenances, one digest");
+
+    // The same value hashed cold (unknown scan: the dual walk) and again after the knowledge narrows (the known Latin-1
+    // arm) must agree with itself across the arms.
+    let cold = from_hex(&"c3a9".repeat(80), true);
+    let under_unknown = hash_of(&cold);
+    let _ = cold.char_len(); // Narrows the heap lattice to the terminal state.
+    assert_eq!(hash_of(&cold), under_unknown, "the dual walk and the known arm must digest alike");
+}
+
+#[test]
 fn upgrade_and_downgrade_preserve_characters() {
     // The monster's transforms: flag-off E9 upgrades with zero byte work — Bytes re-tags to flagged Latin-1, the
     // payload identical — and flagged é downgrades back the same way.

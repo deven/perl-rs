@@ -2069,38 +2069,84 @@ impl PerlString {
             DIGEST_KEY.get_or_init(RandomState::new).build_hasher()
         }
 
+        /// Feeds a candidate's canonical byte stream to its hasher in provenance-independent chunks: identical streams
+        /// issue identical `write` calls whether the bytes arrive as one slice, as block spans, or one character at a
+        /// time.  The `Hasher` contract does not promise that mixed call shapes (`write` vs `write_u8`) hash alike, so
+        /// the shape is owned here rather than borrowed from SipHasher's current behaviour.
+        struct ChunkFeed<H: Hasher> {
+            h: H,
+            buf: [u8; 64],
+            n: usize,
+        }
+
+        impl<H: Hasher> ChunkFeed<H> {
+            fn new(h: H) -> Self {
+                ChunkFeed { h, buf: [0u8; 64], n: 0 }
+            }
+
+            fn push(&mut self, b: u8) {
+                self.buf[self.n] = b;
+                self.n += 1;
+                if self.n == self.buf.len() {
+                    self.h.write(&self.buf);
+                    self.n = 0;
+                }
+            }
+
+            fn extend(&mut self, bytes: &[u8]) {
+                let mut rest = bytes;
+                while !rest.is_empty() {
+                    let take = (self.buf.len() - self.n).min(rest.len());
+                    self.buf[self.n..self.n + take].copy_from_slice(&rest[..take]);
+                    self.n += take;
+                    rest = &rest[take..];
+                    if self.n == self.buf.len() {
+                        self.h.write(&self.buf);
+                        self.n = 0;
+                    }
+                }
+            }
+
+            fn finish(mut self) -> u64 {
+                if self.n > 0 {
+                    self.h.write(&self.buf[..self.n]);
+                }
+                self.h.finish()
+            }
+        }
+
         let mut scratch = [0u8; DECODE_MAX];
         let bytes = self.as_bytes(&mut scratch);
 
         // Unflagged, or flagged with known-ASCII content: the raw bytes ARE the canonical downgraded form.
         if !self.is_utf8() || self.scan_state() == scan::ASCII {
-            let mut h = hasher();
-            h.write(bytes);
-            return h.finish();
+            let mut feed = ChunkFeed::new(hasher());
+            feed.extend(bytes);
+            return feed.finish();
         }
 
         match self.scan_state() {
             // Known Latin-1 range: single decode-emit pass over the downgraded characters.
             scan::UTF8_LATIN1 => {
                 count_full_scan();
-                let mut h = hasher();
+                let mut feed = ChunkFeed::new(hasher());
                 let mut facts = ScanFacts::default();
-                let _ = scalar_decode_span(bytes, 0, bytes.len(), &mut facts, |v| h.write_u8(v as u8));
-                h.finish()
+                let _ = scalar_decode_span(bytes, 0, bytes.len(), &mut facts, |v| feed.push(v as u8));
+                feed.finish()
             }
 
             // Known beyond Latin-1 or invalid: the raw bytes are the canonical form.
             st if scan::is_known_beyond_latin1(st) || st == scan::MALFORMED_UTF8 => {
-                let mut h = hasher();
-                h.write(bytes);
-                h.finish()
+                let mut feed = ChunkFeed::new(hasher());
+                feed.extend(bytes);
+                feed.finish()
             }
 
             // Unresolved: the blocked dual calculation.
             _ => {
                 count_full_scan();
-                let mut raw = hasher();
-                let mut down = hasher();
+                let mut raw = ChunkFeed::new(hasher());
+                let mut down = ChunkFeed::new(hasher());
                 let mut downgradable = true;
                 let mut facts = ScanFacts::default();
                 let mut pos = 0usize;
@@ -2112,9 +2158,9 @@ impl PerlString {
                     // Exitless gate: a pure-ASCII block advances both candidates with the same bytes.
                     let hi = bytes[pos..soft_end].iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
                     if !hi {
-                        raw.write(&bytes[pos..soft_end]);
+                        raw.extend(&bytes[pos..soft_end]);
                         if downgradable {
-                            down.write(&bytes[pos..soft_end]);
+                            down.extend(&bytes[pos..soft_end]);
                         }
                         facts.chars += soft_end - pos;
                         pos = soft_end;
@@ -2127,19 +2173,19 @@ impl PerlString {
                         if v > 0xFF {
                             downgradable = false;
                         } else if downgradable {
-                            down.write_u8(v as u8);
+                            down.push(v as u8);
                         }
                     });
 
                     match stop {
                         Some(next) => {
-                            raw.write(&bytes[pos..next]);
+                            raw.extend(&bytes[pos..next]);
                             pos = next;
                         }
                         None => {
                             // Bytes: characters are undefined; the raw digest is the value's.  Finish the fetch
                             // raw-only.
-                            raw.write(&bytes[pos..]);
+                            raw.extend(&bytes[pos..]);
                             malformed = true;
                             downgradable = false;
                             pos = bytes.len();
