@@ -3796,6 +3796,53 @@ fn upgrade_and_downgrade_preserve_characters() {
 }
 
 #[test]
+fn the_two_upgrade_forms_agree() {
+    // Both ways, same value: the in-place form rewrites a unique heap buffer where it can (skipping the invariant
+    // prefix entirely, perl's shape), the copying form always produces a fresh one, and they must be indistinguishable
+    // from outside.
+    for bytes in [
+        b"plain ascii long enough to reach the heap tier easily".to_vec(),
+        [b"an invariant prefix that never moves ".to_vec(), vec![0xE9; 40]].concat(),
+        vec![0xE9; 64],
+        [0xC3u8, 0xA9].repeat(30),
+        b"short".to_vec(),
+        vec![0xE9],
+        Vec::new(),
+    ] {
+        let src = PerlString::from_bytes(&bytes).unwrap();
+        let copied = src.upgraded().unwrap();
+        let mut in_place = src.clone();
+        in_place.upgrade_in_place().unwrap();
+
+        assert_eq!(copied, in_place, "the two forms must produce the same value for {bytes:?}");
+        assert!(in_place.is_utf8());
+        assert_eq!(in_place.char_len(), Some(bytes.len()), "every original byte becomes one character");
+        assert_eq!(in_place.len(), bytes.len() + bytes.iter().filter(|&&b| b >= 0x80).count(), "the encoded length");
+        assert_eq!(in_place.downgraded().unwrap().unwrap(), src, "and the round trip returns the original");
+    }
+}
+
+#[test]
+fn upgrading_in_place_leaves_a_sharer_untouched() {
+    // A shared buffer cannot be rewritten under its other holders, so the in-place form falls back to copying.
+    let bytes = [b"an invariant prefix ".to_vec(), vec![0xE9; 40]].concat();
+    let sharer = PerlString::from_bytes(&bytes).unwrap();
+    let mut upgraded = sharer.clone();
+    upgraded.upgrade_in_place().unwrap();
+
+    assert!(upgraded.is_utf8());
+    assert_eq!(upgraded.char_len(), Some(bytes.len()));
+    assert!(!sharer.is_utf8(), "the sharer keeps its flag");
+    assert_eq!(sharer.len(), bytes.len(), "and its unexpanded bytes");
+    assert_eq!(sharer.as_bytes(&mut [0u8; DECODE_MAX]), &bytes[..]);
+
+    // The unique path rewrites the buffer it already owns and must reach the same answer.
+    let mut unique = PerlString::from_bytes(&bytes).unwrap();
+    unique.upgrade_in_place().unwrap();
+    assert_eq!(unique, upgraded);
+}
+
+#[test]
 fn reinterpretation_is_a_pure_flag_flip() {
     // Container-probed: _utf8_off on an upgraded é yields the flag-off two-character C3.A9 with the payload untouched —
     // and the class axis never moves, being a fact about the bytes (§2.2.9).

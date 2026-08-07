@@ -599,6 +599,16 @@ macro_rules! define_perl_string {
                 }
             }
 
+            /// The heap buffer behind the tag, mutably — `None` for the non-allocating forms.  In-place transforms need
+            /// it; every other consumer goes through the borrowed view.
+            fn heap_buf_mut(&mut self) -> Option<&mut CowBuffer> {
+                match &mut self.0 {
+                    $( Repr::$inline { .. } => None, )*
+                    $( Repr::$packed { .. } => None, )*
+                    $( Repr::$heap(cb) => Some(cb), )*
+                }
+            }
+
             /// The payload behind the tag, owned — the shape mutation needs, since it rebuilds the tag afterward.
             fn into_raw(self) -> RawOwned {
                 match self.0 {
@@ -1274,7 +1284,6 @@ impl PerlString {
     /// are not (upgrading flag-off `C3 A9` yields the two-character `Ã©`, not `é` — that reinterpretation is
     /// `_utf8_on`'s).  Past fifteen characters the result is heap: sixteen to thirty characters have no flagged
     /// non-heap form unless ASCII, and ASCII took the flip.
-    #[cfg_attr(not(test), expect(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
     fn upgraded(&self) -> Result<PerlString, AllocError> {
         if self.is_utf8() {
             return Ok(self.clone());
@@ -1299,16 +1308,44 @@ impl PerlString {
             return Ok(PerlString::build_inline(InlineClass::Latin1, true, w, t, internal.len(), h, buf));
         }
 
-        // Sixteen or more non-ASCII characters: heap, each byte expanding to its encoding.
-        let mut cb = CowBuffer::with_capacity(internal.len() + high_count(internal))?;
-        let mut pair = [0u8; 2];
-        for &b in internal {
-            let n = expand_latin1(b, &mut pair);
-            cb.extend_from_slice(&pair[..n])?;
-        }
+        // Sixteen or more non-ASCII characters: heap.  The buffer owns the expansion — appending byte by byte would pay
+        // a capacity check and two cache-invalidating atomic stores per input byte, and would rewrite an invariant
+        // prefix the buffer can copy wholesale.
+        let cb = CowBuffer::upgraded_from_slice(internal)?;
         cb.narrow_scan(scan::UTF8_LATIN1);
+        cb.set_char_count(internal.len());
 
         Ok(PerlString::build_heap(true, w, t, cb))
+    }
+
+    /// The in-place form of [`PerlString::upgraded`]: the same characters, flagged, rewriting a unique heap buffer
+    /// rather than producing a fresh value — perl's `utf8::upgrade` shape, and the only form that can leave the
+    /// invariant prefix untouched.  The non-heap forms hold at most thirty bytes, so they rebuild through the copying
+    /// form; a shared heap buffer does too, its other holders keeping the unexpanded content.
+    // `allow` rather than `expect`: gating the entry point marks it a live root, so its callees stop being reported and
+    // an `expect` here would itself go unfulfilled.
+    #[cfg_attr(not(test), allow(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
+    fn upgrade_in_place(&mut self) -> Result<(), AllocError> {
+        if self.is_utf8() {
+            return Ok(());
+        }
+        if self.is_ascii() {
+            // Characters, bytes, and encoding all coincide: the representation is already right in every tier.
+            self.reinterpret_utf8(true);
+            return Ok(());
+        }
+
+        if let Some(cb) = self.heap_buf_mut() {
+            let chars = cb.upgrade_in_place()?;
+            cb.narrow_scan(scan::UTF8_LATIN1);
+            cb.set_char_count(chars);
+        } else {
+            *self = self.upgraded()?;
+            return Ok(());
+        }
+
+        self.reinterpret_utf8(true); // The bytes are already the encoding now; only the tag moves.
+        Ok(())
     }
 
     /// `utf8::downgrade`: the same characters, unflagged — `None` where a character exceeds U+00FF, which is where

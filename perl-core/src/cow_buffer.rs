@@ -276,6 +276,115 @@ impl CowBuffer {
         Ok(())
     }
 
+    /// Count the bytes at or above `0x80` — the ones that take two bytes under UTF-8.  Word-at-a-time, matching perl's
+    /// `variant_under_utf8_count`; the per-byte form costs three times as much over a long buffer.
+    fn variant_count(bytes: &[u8]) -> usize {
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        let mut count = 0u32;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            count += (u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) & HIGH).count_ones();
+        }
+        count as usize + chunks.remainder().iter().filter(|&&b| b >= 0x80).count()
+    }
+
+    /// The offset of the first byte at or above `0x80`, or `None` when every byte is invariant.  Word-at-a-time with an
+    /// early exit: the invariant prefix needs no rewriting, so finding it cheaply is what lets the upgrade skip it.
+    fn first_variant(bytes: &[u8]) -> Option<usize> {
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        let mut offset = 0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            if u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) & HIGH != 0 {
+                break;
+            }
+            offset += 8;
+        }
+        bytes[offset..].iter().position(|&b| b >= 0x80).map(|k| offset + k)
+    }
+
+    /// Expand every byte at or above `0x80` into its two-byte UTF-8 encoding, returning the character count of the
+    /// result — the byte length before expansion, each original byte being one character.
+    ///
+    /// A shared buffer cannot be rewritten under its other holders, so it takes the copying form.  A unique one follows
+    /// perl's shape (`sv_utf8_upgrade_flags_grow`): the invariant prefix stays exactly where it is, and the expansion
+    /// walks backwards from the end, so one buffer serves and nothing before the first variant is touched.
+    pub(crate) fn upgrade_in_place(&mut self) -> Result<usize, AllocError> {
+        let old_len = self.len();
+        let Some(first) = CowBuffer::first_variant(self.as_slice()) else {
+            return Ok(old_len); // Entirely invariant: these bytes already are their own encoding.
+        };
+
+        if !self.is_unique() {
+            *self = CowBuffer::upgraded_from_slice(self.as_slice())?;
+            return Ok(old_len);
+        }
+
+        let expansion = CowBuffer::variant_count(&self.as_slice()[first..]);
+        let new_len = old_len + expansion;
+        self.reserve(expansion)?;
+
+        // SAFETY: unique (checked above; `reserve` preserves it) with capacity for `new_len`.  Both cursors descend
+        // from the ends of their regions, `dst` leading `src` by the expansions still owed and meeting it exactly at
+        // `first`, so no write lands on a byte not yet read.
+        unsafe {
+            let base = self.ptr.as_ptr();
+            let (mut src, mut dst) = (old_len, new_len);
+            while src > first {
+                src -= 1;
+                let byte = *base.add(src);
+                if byte < 0x80 {
+                    dst -= 1;
+                    *base.add(dst) = byte;
+                } else {
+                    dst -= 2;
+                    *base.add(dst) = 0xC0 | (byte >> 6);
+                    *base.add(dst + 1) = 0x80 | (byte & 0x3F);
+                }
+            }
+            debug_assert_eq!(dst, first, "the cursors must meet at the first variant byte");
+            self.set_len(new_len);
+        }
+
+        // The content changed, so the cached facts go.  The caller knows the result's class and count and restores
+        // them, which is the point of owning the loop here: two stores, not two per byte.
+        self.narrow_scan(0);
+        self.set_char_count(0);
+
+        Ok(old_len)
+    }
+
+    /// The copying form of [`CowBuffer::upgrade_in_place`]: a fresh buffer holding the upgraded encoding of `bytes`.
+    /// What a shared buffer requires, its other holders keeping the unexpanded content, and what an inline payload
+    /// spilling to the heap uses.
+    pub(crate) fn upgraded_from_slice(bytes: &[u8]) -> Result<CowBuffer, AllocError> {
+        let first = CowBuffer::first_variant(bytes).unwrap_or(bytes.len());
+        let total = bytes.len() + CowBuffer::variant_count(&bytes[first..]);
+        let mut out = CowBuffer::with_capacity(total)?;
+
+        // SAFETY: freshly allocated with capacity for the whole result, hence unique and large enough.  The invariant
+        // prefix copies wholesale; the remainder expands into the space counted for it, so `dst` cannot pass `total`.
+        unsafe {
+            let base = out.ptr.as_ptr();
+            ptr::copy_nonoverlapping(bytes.as_ptr(), base, first);
+            let mut dst = first;
+            for &byte in &bytes[first..] {
+                if byte < 0x80 {
+                    *base.add(dst) = byte;
+                    dst += 1;
+                } else {
+                    *base.add(dst) = 0xC0 | (byte >> 6);
+                    *base.add(dst + 1) = 0x80 | (byte & 0x3F);
+                    dst += 2;
+                }
+            }
+            debug_assert_eq!(dst, total, "the counted expansion must fill the buffer exactly");
+            out.set_len(total);
+        }
+
+        Ok(out)
+    }
+
     /// Truncate to `new_len` bytes (no-op if already shorter).  COW-breaks if shared: truncation is a mutation of this
     /// value, and other sharers must keep their full contents.  Scan state resets to `UNKNOWN`; the caller may
     /// re-narrow per the removal rules (§2.2.5).
