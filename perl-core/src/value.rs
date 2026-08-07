@@ -247,8 +247,13 @@ impl ScalarPayload {
         if taint.is_tainted() { ScalarPayload::IntegerTainted(p) } else { ScalarPayload::Integer(p) }
     }
 
-    /// A `Unsigned`, clean or tainted as `taint` says.
+    /// The canonical payload for a `u64`, clean or tainted as `taint` says [DECISION]: any value is accepted, and
+    /// values `Integer` can hold exactly route there, so `Unsigned` is only ever `[2^63, 2^64)` — its documented range,
+    /// enforced at the door rather than assumed of callers.
     pub fn unsigned(value: u64, taint: Tainted) -> ScalarPayload {
+        if let Ok(small) = i64::try_from(value) {
+            return ScalarPayload::integer(small, taint);
+        }
         let p = UnsignedPayload::new(value);
         if taint.is_tainted() { ScalarPayload::UnsignedTainted(p) } else { ScalarPayload::Unsigned(p) }
     }
@@ -298,8 +303,13 @@ impl Value {
         if taint.is_tainted() { Value::IntegerTainted(p) } else { Value::Integer(p) }
     }
 
-    /// A `Unsigned`, clean or tainted as `taint` says.
+    /// The canonical value for a `u64`, clean or tainted as `taint` says [DECISION]: any value is accepted, and values
+    /// `Integer` can hold exactly route there, so `Unsigned` is only ever `[2^63, 2^64)` — its documented range,
+    /// enforced at the door rather than assumed of callers.
     pub fn unsigned(value: u64, taint: Tainted) -> Value {
+        if let Ok(small) = i64::try_from(value) {
+            return Value::integer(small, taint);
+        }
         let p = UnsignedPayload::new(value);
         if taint.is_tainted() { Value::UnsignedTainted(p) } else { Value::Unsigned(p) }
     }

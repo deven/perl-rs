@@ -518,3 +518,21 @@ fn caching_preserves_taint_and_value() {
     assert!(!long.has_cached_digits(), "fifteen digits exceed the capacity");
     assert_eq!(long.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"0.333333333333333");
 }
+
+#[test]
+fn unsigned_constructors_canonicalize_to_integer() {
+    // The ruling: any u64 is accepted, and values Integer can hold exactly route there — Unsigned is only ever
+    // [2^63, 2^64), its documented range, enforced at the door.
+    assert!(matches!(Value::unsigned(42, Tainted::CLEAN), Value::Integer(_)));
+    assert!(matches!(Value::unsigned(i64::MAX as u64, Tainted::CLEAN), Value::Integer(_)));
+    assert!(matches!(Value::unsigned(i64::MAX as u64 + 1, Tainted::CLEAN), Value::Unsigned(_)));
+    assert!(matches!(Value::unsigned(u64::MAX, Tainted::CLEAN), Value::Unsigned(_)));
+
+    // The taint dimension survives both routes.
+    assert!(matches!(Value::unsigned(42, Tainted::TAINTED), Value::IntegerTainted(_)));
+    assert!(matches!(Value::unsigned(u64::MAX, Tainted::TAINTED), Value::UnsignedTainted(_)));
+
+    // And the payload-level constructor agrees with the value-level one.
+    assert!(matches!(ScalarPayload::unsigned(42, Tainted::CLEAN), ScalarPayload::Integer(_)));
+    assert!(matches!(ScalarPayload::unsigned(u64::MAX, Tainted::CLEAN), ScalarPayload::Unsigned(_)));
+}
