@@ -126,7 +126,7 @@ fn hash_key_flag_insensitive() {
 
 // ── Tag transitions ───────────────────────────────────────────
 #[test]
-fn warned_is_monotone_and_payload_preserving() {
+fn warned_is_monotonic_and_payload_preserving() {
     let mut s = PerlString::from_str("12abc").unwrap();
     assert!(!s.is_warned());
     s.mark_warned();
@@ -3535,7 +3535,7 @@ fn every_symbol_at_every_position() {
 }
 
 #[test]
-fn nibble_assignment_is_ascii_monotone() {
+fn nibble_assignment_is_ascii_monotonic() {
     // The order property's foundation, checked directly so a table edit cannot silently break it: nibbles are exactly
     // 0, 1, 2, ... in ASCII order, with the space — the least symbol — at 0.
     for (symbols, table) in [(NUMERIC_SYMBOLS, &NUMERIC_ENCODE), (DATETIME_PLUS_SYMBOLS, &DATETIME_PLUS_ENCODE), (DATETIME_ZULU_SYMBOLS, &DATETIME_ZULU_ENCODE)]

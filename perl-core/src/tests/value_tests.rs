@@ -161,7 +161,7 @@ fn format_float_matches_perl_g15() {
 
 // ── Taint (§2.6.1/§2.6.3) ─────────────────────────────────────
 #[test]
-fn taint_is_monotone_and_placed_per_variant() {
+fn taint_is_monotonic_and_placed_per_variant() {
     assert!(!Tainted::CLEAN.is_tainted());
     assert!(Tainted::TAINTED.is_tainted());
     assert!(Tainted::CLEAN.tainted_by(Tainted::TAINTED).is_tainted());

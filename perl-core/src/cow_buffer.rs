@@ -26,7 +26,7 @@
 //! 3. The refcount counts live handles; the allocation is freed exactly when the count falls from 1 to 0
 //!    (release/acquire protocol, as `Arc`).
 //! 4. Data bytes are never written through a handle unless the refcount is exactly 1 (checked with acquire ordering).
-//!    The `scan` byte is the sole exception (atomic, monotone-narrowing only).
+//!    The `scan` byte is the sole exception (atomic, monotonic-narrowing only).
 //!
 //! Verified by the test suite at every size-class and COW-transition boundary; the refcount protocol has targeted
 //! concurrency tests.  (Miri is unavailable under the container's apt toolchain — noted as an outstanding verification

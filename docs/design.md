@@ -3180,11 +3180,11 @@ is a guarantee perl itself cannot make (any XS code can call
 
 #### 2.6.3 The taint API and `taint_match!`:
 
-**The taint API: monotone algebra and `taint_match!`.**  Three verbs
+**The taint API: monotonic algebra and `taint_match!`.**  Three verbs
 with three strictness levels: propagation is automatic, observation
 is explicit, clearing is impossible.
 
-- `Tainted` is monotone: constructors produce clean values, the only
+- `Tainted` is monotonic: constructors produce clean values, the only
   public combinator is OR (`tainted_by` raises, never lowers), and
   the clean-from-tainted constructor is private to the taint module.
   Its two sanctioned consumers (§2.6.2) reach it through perl-core

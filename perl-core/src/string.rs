@@ -6,7 +6,7 @@
 //! - **The Perl utf8 flag**: a per-SV *semantic claim* ("interpret these bytes as characters"), not a validity fact.
 //!   It can be set on bytes Rust rejects (perl-extended UTF-8; verified `chr(0x110000)`); no code path may derive
 //!   `from_utf8_unchecked` from it.  Rust-level validity comes from the scan cache only.
-//! - **Warned**: the numification-warning once-bit (§2.3.4).  Monotone: set, never cleared.
+//! - **Warned**: the numification-warning once-bit (§2.3.4).  Monotonic: set, never cleared.
 //! - **Tainted**: the per-value taint bit (§2.6.1).  Cleared only through the laundering capability (§2.6.2).
 //!
 //! Inline strings additionally fold their **scan state** into the tag — and only the five mutually exclusive *terminal*
@@ -543,7 +543,7 @@ macro_rules! define_perl_string {
             /// selects the length family; `aux` is the class's second nibble (§2.2.9) — the high-bit count for the
             /// compressed classes, the decoded character count for the verbatim valid classes, zero for Ascii and
             /// Bytes — stored beside `s` in the short family, implied and derived at full capacity.  Internal: tag
-            /// transitions go through the public monotone/setter methods.
+            /// transitions go through the public monotonic/setter methods.
             fn build_inline(class: InlineClass, utf8: bool, warned: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PerlString {
                 debug_assert!(s <= INLINE_MAX);
                 debug_assert!(
@@ -1251,7 +1251,7 @@ impl PerlString {
     }
 
     // ── Tag transitions ───────────────────────────────────────────
-    /// Mark the numification warning as fired.  Monotone: there is no clearing method (§2.3.4).
+    /// Mark the numification warning as fired.  Monotonic: there is no clearing method (§2.3.4).
     pub fn mark_warned(&mut self) {
         self.rebuild_tag(|_u, _w, _t| (_u, true, _t));
     }
@@ -1374,7 +1374,7 @@ impl PerlString {
         }
     }
 
-    /// Set or propagate the taint bit.  Monotone raise; clearing is the laundering capability's alone (§2.6.2).
+    /// Set or propagate the taint bit.  Monotonic raise; clearing is the laundering capability's alone (§2.6.2).
     pub fn taint(&mut self) {
         self.rebuild_tag(|u, w, _t| (u, w, true));
     }
@@ -2381,7 +2381,7 @@ const fn decode_table(symbols: &[u8]) -> [u8; 16] {
     table
 }
 
-// ASCII-ordered symbol lists, space first.  Order is load-bearing: monotone nibble assignment is what makes
+// ASCII-ordered symbol lists, space first.  Order is load-bearing: monotonic nibble assignment is what makes
 // same-alphabet packed comparison agree with raw byte comparison.
 const NUMERIC_SYMBOLS: &[u8] = b" +-.0123456789Ee";
 const DATETIME_PLUS_SYMBOLS: &[u8] = b" +-.0123456789:T";

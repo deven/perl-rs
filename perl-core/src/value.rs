@@ -44,7 +44,7 @@ use crate::scalar::{ConstScalar, FALSE_SCALAR, ScalarCell, ScalarRef, TRUE_SCALA
 use crate::string::{DECODE_MAX, PerlString};
 
 // ── Tainted (§2.6.1, §2.6.3) ──────────────────────────────────────
-/// The per-value taint bit: a monotone bool newtype.  Constructors are explicit (`CLEAN` / `TAINTED` — sources that
+/// The per-value taint bit: a monotonic bool newtype.  Constructors are explicit (`CLEAN` / `TAINTED` — sources that
 /// produce tainted values name it), the only public combinator is OR (`tainted_by` raises, never lowers), there is no
 /// `Default`, and the clean-from-tainted constructor is crate-private: the untaint capability is confined to the two
 /// documented laundering paths (§2.6.2).  Laundering elsewhere is uncompilable.
@@ -63,7 +63,7 @@ impl Tainted {
         self.0
     }
 
-    /// The monotone combinator: propagation ORs, never lowers.
+    /// The monotonic combinator: propagation ORs, never lowers.
     #[inline]
     #[must_use]
     pub fn tainted_by(self, other: Tainted) -> Tainted {
