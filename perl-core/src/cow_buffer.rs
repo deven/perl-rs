@@ -62,6 +62,60 @@ pub struct AllocError {
 // Every tier counts in 32 bits and aborts on overflow, following `Arc`.  The check is a compare on the value
 // `fetch_add` already returned; the alternative is a wrap to zero and a use-after-free.
 
+/// The data pointer of a live tiered allocation, and the obligation to release it exactly once.
+///
+/// Deliberately **not** `Copy`.  Duplicating a data pointer without a matching `retain` is the bug this type
+/// exists to make impossible: because `PerlString`'s representation owns a `Drop`, a `Copy` pointer would let a
+/// `match` read the pointer out of a heap variant while the source still dropped — a double release the compiler
+/// would not diagnose, since `E0509` only fires for non-`Copy` fields.  With this newtype, every such site is a
+/// compile error naming the field.
+///
+/// It carries no state.  Length, capacity, character count and scan state live in the envelope for the small tiers
+/// and in the allocation for the large ones (§2.2.3), so this is not a second authority for anything — only a
+/// capability.  That is the distinction from the `CowBuffer` it replaces, which held both.
+#[repr(transparent)]
+// Staged: constructed once the heap variants of `PerlString` move over to the tiers.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Owned(NonNull<u8>);
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Owned {
+    /// The raw data pointer, for reads that do not transfer ownership.
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> NonNull<u8> {
+        self.0
+    }
+
+    /// Claim ownership of a pointer returned by a tier's `allocate`, or one whose refcount this caller has just
+    /// incremented.
+    ///
+    /// # Safety
+    /// The caller must hold a reference count that this `Owned` will consume when released.
+    #[inline]
+    pub(crate) unsafe fn from_raw(ptr: NonNull<u8>) -> Owned {
+        Owned(ptr)
+    }
+
+    /// Give up the obligation without releasing, for the sites that hand it onward.
+    ///
+    /// `Owned` implements no `Drop` of its own — only the enclosing representation knows which tier this pointer
+    /// belongs to and, for the small tiers, the capacity needed to compute the layout — so nothing needs
+    /// suppressing here.  The obligation is transferred by the caller taking the returned pointer, and a stray
+    /// `Owned` dropped outside a heap variant leaks rather than double-releasing.
+    ///
+    /// # Safety
+    /// The caller takes over the responsibility to release exactly once.
+    #[inline]
+    pub(crate) unsafe fn into_raw(self) -> NonNull<u8> {
+        self.0
+    }
+}
+
+// SAFETY: the pointee is an allocation whose only shared mutable state is atomic (the refcount, and for the large
+// tiers the lazily-filled caches).  Ownership transfer across threads is therefore sound, as it was for `CowBuffer`.
+unsafe impl Send for Owned {}
+unsafe impl Sync for Owned {}
+
 /// The refcount ceiling.  Reaching it needs 4,294,967,295 live handles and therefore at least 64 GiB of envelopes;
 /// the test exists because unchecked overflow wraps to zero, not because the ceiling is approachable.
 #[cfg_attr(not(test), allow(dead_code))]
