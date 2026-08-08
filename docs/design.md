@@ -347,6 +347,8 @@ enum PerlString {
     Heap32(..),                    // <= 4 GiB;    cached header
     Heap(..),                      // beyond;      cached header
     Immortal(..), Static(..),      // no header, no refcount
+    LargeImmortal(..),             // past 16 MiB: a small header,
+    LargeStatic(..),               // still no refcount
 }
 ```
 
@@ -416,15 +418,26 @@ unique-check mutation, nothing else.  Details:
   `tier_max / (16 · 2^bits)` of the memory that caused it: a
   16-bit count leaks at most 0.02% at `Heap8` and 6.25% at
   `Heap16`, and a wider count at `Heap16` brings that back to
-  0.02%.  `Heap32` and `Heap` use a word-width count, where the
-  bytes are free at those content sizes and saturation is
-  unreachable in any case.
+  0.02%.  `Heap8` therefore counts in 16 bits and every larger
+  tier in 32 or more, putting the bound below 0.02% everywhere
+  [DECISION].
+  Packing the count against the scan byte in one word — plausible
+  while `Heap16` was lazy — is moot under the eager ruling, since
+  the scan byte is in the envelope and the header has nothing to
+  pack it with; it would also have made the increment unsafe,
+  because a carry out of a 24-bit count corrupts the neighbouring
+  byte rather than merely saturating, which a whole-word count
+  never does.
 
 - **Header shapes.**  `Heap8`: refcount only, with `len`,
   `capacity`, character count and scan byte in the envelope beside
   the pointer (and `Heap8Ascii` omitting the last two).  `Heap16`:
   the same, at `u16` widths — `len`, `capacity`, count and scan
-  fill the seven spare envelope bytes exactly.  `Heap32`: a
+  fill the seven spare envelope bytes exactly — with a 32-bit
+  refcount, whose four bytes are under 1.6% of content that is at
+  least 256 bytes by construction.  A header's alignment follows
+  its count, so content begins two bytes past the allocation base
+  at `Heap8` and four at `Heap16`.  `Heap32`: a
   `{refcount, len, capacity, char_count, scan}` header with `u32`
   fields, and a `u32` length mirror in the envelope so the common
   length question skips the dereference.  `Heap`: the same with
@@ -439,7 +452,18 @@ unique-check mutation, nothing else.  Details:
   hold a 24-bit length, a 24-bit character count and the scan byte
   — seven bytes exactly, covering content to 16 MiB — so a
   compiled literal costs a tag, a pointer, and *no allocation
-  header at all*.  Writing to either copies out to a mutable tier,
+  header at all*.  `LargeImmortal` and `LargeStatic` carry the
+  remainder [DECISION]: the envelope points at a small header
+  holding a word-width length, character count and scan state, and
+  for `LargeStatic` a second pointer to the image bytes, which it
+  cannot prepend a header to.  That header is ours, so teardown
+  frees it and leaves the image untouched — nothing is leaked.
+  Both are expected to be rare, which argues for having them
+  rather than against: refusing content past 16 MiB would force a
+  caller with a large embedded literal to copy it, and that is
+  precisely the case where the copy hurts most.
+
+  Writing to any of these four copies out to a mutable tier,
   since without a refcount uniqueness is unprovable.  Teardown
   frees the immortal slab and never touches the image.
 - **Clone** is a relaxed refcount increment (`clone_cow` in the
