@@ -8,7 +8,7 @@
 
 use crate::cow_buffer::AllocError;
 use crate::string::PerlString;
-use crate::value::{Numeric, ScalarPayload, Tainted};
+use crate::value::{DualPayload, Numeric, ScalarPayload, Tainted};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::mem;
@@ -277,9 +277,13 @@ impl ScalarCell {
     }
 
     /// Numify, noting the once-only warning state (§2.3.4).  Returns the numeric result and whether the ops layer
-    /// should emit the warning *now*: true exactly when the payload would warn and this is the first such numification.
-    /// The once-bit rides the `PerlString` tag, so slot-to-slot copies carry it (the verified copy semantics); requires
-    /// the write lock because first-warn is a tag transition.
+    /// should emit the warning *now*: true exactly when the payload would warn and no numeric face has been cached yet.
+    ///
+    /// The suppressor is that cached face rather than a flag — perl's own mechanism, where numifying stores the
+    /// salvaged number under `IOKp` and later numifications read it instead of re-parsing.  Installing it replaces the
+    /// payload with a `Dual`, so the write lock is required; perl needs mutable access here too, since `$arr[0] + 0`
+    /// mutates the element's SV.  Copies then carry the face, which is why copy-after-numification is silent while
+    /// copy-before warns on both (container-verified).
     pub fn numify_noting_warning(&mut self) -> (Numeric, bool) {
         let n = self.numify();
 
@@ -288,15 +292,23 @@ impl ScalarCell {
             ScalarCell::Full(f) => &mut f.payload,
         };
 
-        let emit = match payload {
-            ScalarPayload::String(s) if s.would_warn() && !s.is_warned() => {
-                s.mark_warned();
-                true
+        // Only a bare string can warn: a `Dual` already holds the face, and every other payload is numeric already.
+        let warns = matches!(payload, ScalarPayload::String(s) if s.would_warn());
+        if !warns {
+            return (n, false);
+        }
+
+        let taken = mem::replace(payload, ScalarPayload::Undef);
+        *payload = match taken {
+            ScalarPayload::String(s) => {
+                let tainted = s.is_tainted();
+                let dual = HeapArc::new(DualPayload { string: s, numeric: n });
+                if tainted { ScalarPayload::DualTainted(dual) } else { ScalarPayload::Dual(dual) }
             }
-            _ => false,
+            other => other,
         };
 
-        (n, emit)
+        (n, true)
     }
 }
 

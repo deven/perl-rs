@@ -146,6 +146,11 @@ pub enum ScalarPayload {
     /// A string, whose taint rides its own tag (§2.2.3).
     String(PerlString),
 
+    /// Both faces real (§2.3.4): a dualvar, `$!`, or a string that has numified once.  Carrying a numeric face is what
+    /// suppresses the repeat warning, so no tag bit records it.
+    Dual(HeapArc<DualPayload>),
+    DualTainted(HeapArc<DualPayload>),
+
     /// The immortal booleans, always clean.
     True,
     False,
@@ -216,6 +221,11 @@ pub enum Value {
 
     /// A string, whose taint rides its own tag (§2.2.3).
     String(PerlString),
+
+    /// Both faces real (§2.3.4): a dualvar, `$!`, or a string that has numified once.  Carrying a numeric face is what
+    /// suppresses the repeat warning, so no tag bit records it.
+    Dual(HeapArc<DualPayload>),
+    DualTainted(HeapArc<DualPayload>),
 
     /// The immortal booleans, always clean.
     True,
@@ -354,6 +364,43 @@ const _: () = assert!(size_of::<Value>() == 16);
 const _: () = assert!(size_of::<Option<Value>>() == 16);
 
 // ── Coercions: one match each, written once (§2.2.2) ──────────────
+impl Numeric {
+    /// The i64-visible integer view, matching the payload coercion arm for arm: an unsigned value is the same
+    /// sixty-four bits read signed, and a float takes the pinned out-of-range path (§2.2.2).
+    pub fn to_int(self) -> i64 {
+        match self {
+            Numeric::Integer(n) => n,
+            Numeric::Unsigned(u) => u as i64,
+            Numeric::Float(f) => float_to_int_i64_visible(f),
+        }
+    }
+
+    /// The float view, matching the payload coercion.
+    pub fn to_float(self) -> f64 {
+        match self {
+            Numeric::Integer(n) => n as f64,
+            Numeric::Unsigned(u) => u as f64,
+            Numeric::Float(f) => f,
+        }
+    }
+}
+
+/// A value whose string and numeric faces are both real and may disagree: `Scalar::Util::dualvar`, `$!`, and — the
+/// common case — a string that has been numified once and cached the result (§2.3.4).
+///
+/// Immutable once built, so sharing through [`HeapArc`] is free and unobservable, and copying is a refcount bump rather
+/// than the deep copy a `Box` would force on every assignment.  It holds no [`Value`], so it can neither chain nor
+/// cycle: the §2.4.9 teardown worklist treats it as a leaf.
+#[derive(Debug)]
+pub struct DualPayload {
+    /// What stringification yields, and what decides truth — perl tests the string face, so `dualvar(5, "0")` is false
+    /// and `dualvar(0, "00")` is true (container-verified).
+    pub string: PerlString,
+
+    /// What numification yields, without re-parsing and therefore without warning again.
+    pub numeric: Numeric,
+}
+
 /// The result of numification: perl's numeric context yields an integer or a float per the value's nature.  i64-visible
 /// only (§2.2.2): integer strings exact as unsigned 64-bit values but beyond `i64::MAX` classify as `Float` here, with
 /// `to_int` supplying the pinned wrapped value through the exact-digits path independently.
@@ -380,6 +427,9 @@ macro_rules! impl_coercions {
                     $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.value() != 0,
                     $ty::Float(f) | $ty::FloatTainted(f) => f.value() != 0.0, // NaN != 0.0 is true; -0.0 == 0.0 — both perl-correct
                     $ty::String(s) => s.to_bool(),
+
+                    // Truth reads the string face: `dualvar(5, "0")` is false and `dualvar(0, "00")` is true.
+                    $ty::Dual(d) | $ty::DualTainted(d) => d.string.to_bool(),
                     $ty::True => true,
                     $ty::False => false,
                     $ty::ScalarRefMut(..)
@@ -410,6 +460,7 @@ macro_rules! impl_coercions {
                     $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.value() as i64, // The same 64 bits read signed — perl's IV view of a UV.
                     $ty::Float(f) | $ty::FloatTainted(f) => float_to_int_i64_visible(f.value()),
                     $ty::String(s) => s.to_int(),
+                    $ty::Dual(d) | $ty::DualTainted(d) => d.numeric.to_int(),
                     $ty::True => 1,
                     $ty::False => 0,
                     $ty::ScalarRefMut(c) | $ty::ScalarRefMutTainted(c) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
@@ -429,6 +480,7 @@ macro_rules! impl_coercions {
                     $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.value() as f64,
                     $ty::Float(f) | $ty::FloatTainted(f) => f.value(),
                     $ty::String(s) => s.to_float(),
+                    $ty::Dual(d) | $ty::DualTainted(d) => d.numeric.to_float(),
                     $ty::True => 1.0,
                     $ty::False => 0.0,
                     $ty::ScalarRefMut(c) | $ty::ScalarRefMutTainted(c) => HeapArc::as_ptr(c) as usize as f64,
@@ -449,6 +501,7 @@ macro_rules! impl_coercions {
                     $ty::Unsigned(u) | $ty::UnsignedTainted(u) => Numeric::Unsigned(u.value()),
                     $ty::Float(f) | $ty::FloatTainted(f) => Numeric::Float(f.value()),
                     $ty::String(s) => s.numify(),
+                    $ty::Dual(d) | $ty::DualTainted(d) => d.numeric,
                     $ty::True => Numeric::Integer(1),
                     $ty::False => Numeric::Integer(0),
                     $ty::ScalarRefMut(c) | $ty::ScalarRefMutTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
@@ -487,6 +540,7 @@ macro_rules! impl_coercions {
                         (rendered, self.taint())
                     }
                     $ty::String(s) => return Ok(s.clone()),
+                    $ty::Dual(d) | $ty::DualTainted(d) => return Ok(d.string.clone()),
                     $ty::True => (PerlString::from_bytes(b"1")?, Tainted::CLEAN),
                     $ty::False => (PerlString::empty(), Tainted::CLEAN),
 
@@ -534,6 +588,8 @@ macro_rules! impl_coercions {
                     | $ty::False => false,
 
                     $ty::String(s) => s.is_tainted(),
+                    $ty::Dual(_) => false,
+                    $ty::DualTainted(_) => true,
                     $($ty::$smut(c) => c.read().is_tainted(),)?
                     $($ty::$sconst(c) => c.is_tainted(),)?
                 }
@@ -630,6 +686,8 @@ impl Value {
             Value::HashRef(r) => ScalarPayload::HashRef(r),
             Value::HashRefTainted(r) => ScalarPayload::HashRefTainted(r),
             Value::String(s) => ScalarPayload::String(s),
+            Value::Dual(d) => ScalarPayload::Dual(d),
+            Value::DualTainted(d) => ScalarPayload::DualTainted(d),
             Value::True => ScalarPayload::True,
             Value::False => ScalarPayload::False,
             Value::ScalarMut(c) => {
@@ -674,6 +732,8 @@ impl Value {
             | Value::Float(..)
             | Value::FloatTainted(..)
             | Value::String(_)
+            | Value::Dual(_)
+            | Value::DualTainted(_)
             | Value::True
             | Value::False => false,
         }
@@ -701,6 +761,8 @@ impl Value {
             | ScalarPayload::Float(..)
             | ScalarPayload::FloatTainted(..)
             | ScalarPayload::String(_)
+            | ScalarPayload::Dual(_)
+            | ScalarPayload::DualTainted(_)
             | ScalarPayload::True
             | ScalarPayload::False => false,
         }
@@ -727,6 +789,8 @@ impl Value {
             ScalarPayload::HashRef(r) => Value::HashRef(r),
             ScalarPayload::HashRefTainted(r) => Value::HashRefTainted(r),
             ScalarPayload::String(s) => Value::String(s),
+            ScalarPayload::Dual(d) => Value::Dual(d),
+            ScalarPayload::DualTainted(d) => Value::DualTainted(d),
             ScalarPayload::True => Value::True,
             ScalarPayload::False => Value::False,
         }

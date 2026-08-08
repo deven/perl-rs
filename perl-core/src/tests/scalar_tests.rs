@@ -298,3 +298,57 @@ fn envelope_sizes() {
     assert_eq!(size_of::<ScalarCell>(), 16, "Full threads the payload's niche (measured, §2.3.2)");
     assert_eq!(size_of::<ScalarRef>(), 16);
 }
+
+#[test]
+fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
+    // §2.3.4: perl has no warned flag.  Numifying caches the salvaged number, and every later numification reads that
+    // cache instead of re-parsing — so warning once is a consequence of caching, verified in the container as one
+    // warning from "12abc" numified three times.
+    let mut cell = ScalarCell::Plain(str_payload("12abc"));
+
+    let (first, emit) = cell.numify_noting_warning();
+    assert!(emit, "the first numification of warn-worthy content emits");
+    assert_eq!(first, Numeric::Integer(12), "and salvages what perl salvages");
+
+    let (second, emit) = cell.numify_noting_warning();
+    assert!(!emit, "the second reads the cached face and stays silent");
+    assert_eq!(second, Numeric::Integer(12));
+
+    // The face is what changed, not a flag: the payload is now a Dual whose string side is untouched.
+    match &cell {
+        ScalarCell::Plain(ScalarPayload::Dual(d)) => {
+            assert_eq!(d.string.as_bytes(&mut [0u8; DECODE_MAX]), b"12abc", "the string face survives verbatim");
+            assert_eq!(d.numeric, Numeric::Integer(12));
+        }
+        other => panic!("expected a Dual payload, got {other:?}"),
+    }
+
+    // Stringification still yields the string face, and truth reads it too.
+    assert_eq!(cell.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"12abc");
+    assert!(cell.to_bool());
+}
+
+#[test]
+fn cleanly_numeric_content_never_caches_a_face() {
+    // Only warn-worthy content pays the allocation: a clean numeric string re-parses, which costs nanoseconds and
+    // avoids an allocation per numeric value (§2.3.4).
+    let mut cell = ScalarCell::Plain(str_payload("42"));
+    for _ in 0..3 {
+        let (n, emit) = cell.numify_noting_warning();
+        assert_eq!(n, Numeric::Integer(42));
+        assert!(!emit, "clean content never warns");
+    }
+    assert!(matches!(cell, ScalarCell::Plain(ScalarPayload::String(_))), "and stays a plain string");
+}
+
+#[test]
+fn taint_survives_the_face_installation() {
+    let mut tainted: PerlString = "12abc".parse().unwrap();
+    tainted.taint();
+    let mut cell = ScalarCell::Plain(ScalarPayload::String(tainted));
+
+    let (_, emit) = cell.numify_noting_warning();
+    assert!(emit);
+    assert!(matches!(cell, ScalarCell::Plain(ScalarPayload::DualTainted(_))), "the tainted twin is chosen");
+    assert!(cell.is_tainted(), "and taint reads through the Dual");
+}

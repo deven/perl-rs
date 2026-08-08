@@ -101,10 +101,9 @@ fn eq_cross_flag_different_bytes_can_match() {
 }
 
 #[test]
-fn eq_ignores_warned_and_tainted() {
+fn eq_ignores_tainted() {
     let a = PerlString::from_str("same").unwrap();
     let mut b = PerlString::from_str("same").unwrap();
-    b.mark_warned();
     b.taint();
     assert_eq!(a, b);
     assert_eq!(hash_of(&a), hash_of(&b));
@@ -126,33 +125,12 @@ fn hash_key_flag_insensitive() {
 
 // ── Tag transitions ───────────────────────────────────────────
 #[test]
-fn warned_is_monotonic_and_payload_preserving() {
-    let mut s = PerlString::from_str("12abc").unwrap();
-    assert!(!s.is_warned());
-    s.mark_warned();
-    assert!(s.is_warned());
-    assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"12abc");
-    assert_eq!(s.inline_class(), Some(InlineClass::Ascii));
-    s.mark_warned(); // idempotent
-    assert!(s.is_warned());
-}
-
-#[test]
 fn taint_round_trip_via_sanctioned_path() {
     let mut s = PerlString::from_str("data").unwrap();
     s.taint();
     assert!(s.is_tainted());
     s.untaint_for_sanctioned_path();
     assert!(!s.is_tainted());
-}
-
-#[test]
-fn warned_copies_with_the_value() {
-    // Verified perl 5.38 (§2.3.4): the warn state is copied on assignment.
-    let mut s = PerlString::from_str("abc").unwrap();
-    s.mark_warned();
-    let copy = s.clone();
-    assert!(copy.is_warned());
 }
 
 // ── Append transitions (§2.2.5) ───────────────────────────────
@@ -1104,7 +1082,7 @@ fn clone_shares_heap_buffer_and_append_cow_breaks() {
 impl PerlString {
     /// Test-only: force the utf8 flag on (simulating `Encode::_utf8_on` / upgrade provenance).
     pub(super) fn set_utf8_for_test(&mut self) {
-        self.rebuild_tag(|_u, w, t| (true, w, t));
+        self.rebuild_tag(|_u, t| (true, t));
     }
 }
 
@@ -1496,7 +1474,7 @@ fn rebuilding_zeroes_everything_past_the_content() {
     // and representation would stop standing in for content.
     let mut dirty = [0xEEu8; INLINE_MAX];
     dirty[..4].copy_from_slice(b"abcd");
-    let s = PerlString::build_inline(InlineClass::Ascii, false, false, false, 4, 0, dirty);
+    let s = PerlString::build_inline(InlineClass::Ascii, false, false, 4, 0, dirty);
 
     match s.raw_parts() {
         RawParts::Inline { full, buf, .. } => {
@@ -1565,17 +1543,17 @@ fn from_hex(hex: &str, flagged: bool) -> PerlString {
 
     if bytes.len() <= INLINE_MAX {
         let (class, stored, aux, buf) = classify_inline(&bytes).expect("fifteen bytes always classify");
-        return PerlString::build_inline(class, flagged, false, false, stored, aux, buf);
+        return PerlString::build_inline(class, flagged, false, stored, aux, buf);
     }
 
     if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
         && let Some(p) = pack(&bytes)
     {
-        return PerlString::build_packed(p, flagged, false, false);
+        return PerlString::build_packed(p, flagged, false);
     }
 
     let cb = CowBuffer::from_slice(&bytes).unwrap();
-    PerlString::build_heap(flagged, false, false, cb)
+    PerlString::build_heap(flagged, false, cb)
 }
 
 #[test]

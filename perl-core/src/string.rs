@@ -465,9 +465,9 @@ impl StorageType {
 /// synthesized by identifier concatenation) so a grep for any variant finds this defining invocation.
 macro_rules! define_perl_string {
     (
-        inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_warned:literal, $inline_tainted:literal) ),* $(,)? ],
-        packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_warned:literal, $packed_tainted:literal) ),* $(,)? ],
-        heap:   [ $( $heap:ident = ($heap_utf8:literal, $heap_warned:literal, $heap_tainted:literal) ),* $(,)? ]
+        inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
+        packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_tainted:literal) ),* $(,)? ],
+        heap:   [ $( $heap:ident = ($heap_utf8:literal, $heap_tainted:literal) ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
         /// behind this newtype: no variant is nameable outside the crate, so no payload can be forged or mutated around
@@ -510,15 +510,6 @@ macro_rules! define_perl_string {
                 }
             }
 
-            /// Whether the numification warning has fired for this value (§2.3.4).
-            pub fn is_warned(&self) -> bool {
-                match &self.0 {
-                    $( Repr::$inline { .. } => $inline_warned, )*
-                    $( Repr::$packed { .. } => $packed_warned, )*
-                    $( Repr::$heap(_) => $heap_warned, )*
-                }
-            }
-
             /// Whether this value is tainted (§2.6).
             pub fn is_tainted(&self) -> bool {
                 match &self.0 {
@@ -544,7 +535,7 @@ macro_rules! define_perl_string {
             /// compressed classes, the decoded character count for the verbatim valid classes, zero for Ascii and
             /// Bytes — stored beside `s` in the short family, implied and derived at full capacity.  Internal: tag
             /// transitions go through the public monotonic/setter methods.
-            fn build_inline(class: InlineClass, utf8: bool, warned: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PerlString {
+            fn build_inline(class: InlineClass, utf8: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PerlString {
                 debug_assert!(s <= INLINE_MAX);
                 debug_assert!(
                     match class {
@@ -562,16 +553,16 @@ macro_rules! define_perl_string {
                     buf[LENGTH_BYTE] = ((aux as u8) << 4) | s as u8;
                 }
 
-                match (class, s == INLINE_MAX, utf8, warned, tainted) {
-                    $( (InlineClass::$inline_class, $inline_full, $inline_utf8, $inline_warned, $inline_tainted) => PerlString(Repr::$inline { buf }), )*
+                match (class, s == INLINE_MAX, utf8, tainted) {
+                    $( (InlineClass::$inline_class, $inline_full, $inline_utf8, $inline_tainted) => PerlString(Repr::$inline { buf }), )*
                 }
             }
 
             /// Rebuild a heap value with the given tag dimensions (buffer preserved).  Build a packed value with the
             /// given alphabet, length family, and tag dimensions.
-            fn build_packed(packed: Packed, utf8: bool, warned: bool, tainted: bool) -> PerlString {
-                match (packed.alphabet, packed.full, utf8, warned, tainted) {
-                    $( (PackedAlphabet::$packed_alphabet, $packed_full, $packed_utf8, $packed_warned, $packed_tainted) => PerlString(Repr::$packed { nibbles: packed.nibbles }), )*
+            fn build_packed(packed: Packed, utf8: bool, tainted: bool) -> PerlString {
+                match (packed.alphabet, packed.full, utf8, tainted) {
+                    $( (PackedAlphabet::$packed_alphabet, $packed_full, $packed_utf8, $packed_tainted) => PerlString(Repr::$packed { nibbles: packed.nibbles }), )*
                 }
             }
 
@@ -622,9 +613,9 @@ macro_rules! define_perl_string {
                 }
             }
 
-            fn build_heap(utf8: bool, warned: bool, tainted: bool, cb: CowBuffer) -> PerlString {
-                match (utf8, warned, tainted) {
-                    $( ($heap_utf8, $heap_warned, $heap_tainted) => PerlString(Repr::$heap(cb)), )*
+            fn build_heap(utf8: bool, tainted: bool, cb: CowBuffer) -> PerlString {
+                match (utf8, tainted) {
+                    $( ($heap_utf8, $heap_tainted) => PerlString(Repr::$heap(cb)), )*
                 }
             }
         }
@@ -633,146 +624,78 @@ macro_rules! define_perl_string {
 
 define_perl_string! {
     inline: [
-        InlineAscii                                  = (Ascii, InlineAscii, false, false, false, false),
-        InlineAsciiFlagged                           = (Ascii, InlineAscii, false, true , false, false),
-        InlineAsciiWarned                            = (Ascii, InlineAscii, false, false, true , false),
-        InlineAsciiFlaggedWarned                     = (Ascii, InlineAscii, false, true , true , false),
-        InlineAsciiTainted                           = (Ascii, InlineAscii, false, false, false, true),
-        InlineAsciiFlaggedTainted                    = (Ascii, InlineAscii, false, true , false, true),
-        InlineAsciiWarnedTainted                     = (Ascii, InlineAscii, false, false, true , true),
-        InlineAsciiFlaggedWarnedTainted              = (Ascii, InlineAscii, false, true , true , true),
-        InlineAsciiFull                              = (Ascii, InlineAsciiFull, true , false, false, false),
-        InlineAsciiFullFlagged                       = (Ascii, InlineAsciiFull, true , true , false, false),
-        InlineAsciiFullWarned                        = (Ascii, InlineAsciiFull, true , false, true , false),
-        InlineAsciiFullFlaggedWarned                 = (Ascii, InlineAsciiFull, true , true , true , false),
-        InlineAsciiFullTainted                       = (Ascii, InlineAsciiFull, true , false, false, true),
-        InlineAsciiFullFlaggedTainted                = (Ascii, InlineAsciiFull, true , true , false, true),
-        InlineAsciiFullWarnedTainted                 = (Ascii, InlineAsciiFull, true , false, true , true),
-        InlineAsciiFullFlaggedWarnedTainted          = (Ascii, InlineAsciiFull, true , true , true , true),
-        InlineLatin1                                 = (Latin1, InlineLatin1, false, false, false, false),
-        InlineLatin1Flagged                          = (Latin1, InlineLatin1, false, true , false, false),
-        InlineLatin1Warned                           = (Latin1, InlineLatin1, false, false, true , false),
-        InlineLatin1FlaggedWarned                    = (Latin1, InlineLatin1, false, true , true , false),
-        InlineLatin1Tainted                          = (Latin1, InlineLatin1, false, false, false, true),
-        InlineLatin1FlaggedTainted                   = (Latin1, InlineLatin1, false, true , false, true),
-        InlineLatin1WarnedTainted                    = (Latin1, InlineLatin1, false, false, true , true),
-        InlineLatin1FlaggedWarnedTainted             = (Latin1, InlineLatin1, false, true , true , true),
-        InlineLatin1Full                             = (Latin1, InlineLatin1Full, true , false, false, false),
-        InlineLatin1FullFlagged                      = (Latin1, InlineLatin1Full, true , true , false, false),
-        InlineLatin1FullWarned                       = (Latin1, InlineLatin1Full, true , false, true , false),
-        InlineLatin1FullFlaggedWarned                = (Latin1, InlineLatin1Full, true , true , true , false),
-        InlineLatin1FullTainted                      = (Latin1, InlineLatin1Full, true , false, false, true),
-        InlineLatin1FullFlaggedTainted               = (Latin1, InlineLatin1Full, true , true , false, true),
-        InlineLatin1FullWarnedTainted                = (Latin1, InlineLatin1Full, true , false, true , true),
-        InlineLatin1FullFlaggedWarnedTainted         = (Latin1, InlineLatin1Full, true , true , true , true),
-        InlineNonLatin1                              = (NonLatin1, InlineNonLatin1, false, false, false, false),
-        InlineNonLatin1Flagged                       = (NonLatin1, InlineNonLatin1, false, true , false, false),
-        InlineNonLatin1Warned                        = (NonLatin1, InlineNonLatin1, false, false, true , false),
-        InlineNonLatin1FlaggedWarned                 = (NonLatin1, InlineNonLatin1, false, true , true , false),
-        InlineNonLatin1Tainted                       = (NonLatin1, InlineNonLatin1, false, false, false, true),
-        InlineNonLatin1FlaggedTainted                = (NonLatin1, InlineNonLatin1, false, true , false, true),
-        InlineNonLatin1WarnedTainted                 = (NonLatin1, InlineNonLatin1, false, false, true , true),
-        InlineNonLatin1FlaggedWarnedTainted          = (NonLatin1, InlineNonLatin1, false, true , true , true),
-        InlineNonLatin1Full                          = (NonLatin1, InlineNonLatin1Full, true , false, false, false),
-        InlineNonLatin1FullFlagged                   = (NonLatin1, InlineNonLatin1Full, true , true , false, false),
-        InlineNonLatin1FullWarned                    = (NonLatin1, InlineNonLatin1Full, true , false, true , false),
-        InlineNonLatin1FullFlaggedWarned             = (NonLatin1, InlineNonLatin1Full, true , true , true , false),
-        InlineNonLatin1FullTainted                   = (NonLatin1, InlineNonLatin1Full, true , false, false, true),
-        InlineNonLatin1FullFlaggedTainted            = (NonLatin1, InlineNonLatin1Full, true , true , false, true),
-        InlineNonLatin1FullWarnedTainted             = (NonLatin1, InlineNonLatin1Full, true , false, true , true),
-        InlineNonLatin1FullFlaggedWarnedTainted      = (NonLatin1, InlineNonLatin1Full, true , true , true , true),
-        InlineExtended                               = (Extended, InlineExtended, false, false, false, false),
-        InlineExtendedFlagged                        = (Extended, InlineExtended, false, true , false, false),
-        InlineExtendedWarned                         = (Extended, InlineExtended, false, false, true , false),
-        InlineExtendedFlaggedWarned                  = (Extended, InlineExtended, false, true , true , false),
-        InlineExtendedTainted                        = (Extended, InlineExtended, false, false, false, true),
-        InlineExtendedFlaggedTainted                 = (Extended, InlineExtended, false, true , false, true),
-        InlineExtendedWarnedTainted                  = (Extended, InlineExtended, false, false, true , true),
-        InlineExtendedFlaggedWarnedTainted           = (Extended, InlineExtended, false, true , true , true),
-        InlineExtendedFull                           = (Extended, InlineExtendedFull, true , false, false, false),
-        InlineExtendedFullFlagged                    = (Extended, InlineExtendedFull, true , true , false, false),
-        InlineExtendedFullWarned                     = (Extended, InlineExtendedFull, true , false, true , false),
-        InlineExtendedFullFlaggedWarned              = (Extended, InlineExtendedFull, true , true , true , false),
-        InlineExtendedFullTainted                    = (Extended, InlineExtendedFull, true , false, false, true),
-        InlineExtendedFullFlaggedTainted             = (Extended, InlineExtendedFull, true , true , false, true),
-        InlineExtendedFullWarnedTainted              = (Extended, InlineExtendedFull, true , false, true , true),
-        InlineExtendedFullFlaggedWarnedTainted       = (Extended, InlineExtendedFull, true , true , true , true),
-        InlineBytes                              = (Bytes, InlineBytes, false, false, false, false),
-        InlineBytesFlagged                       = (Bytes, InlineBytes, false, true , false, false),
-        InlineBytesWarned                        = (Bytes, InlineBytes, false, false, true , false),
-        InlineBytesFlaggedWarned                 = (Bytes, InlineBytes, false, true , true , false),
-        InlineBytesTainted                       = (Bytes, InlineBytes, false, false, false, true),
-        InlineBytesFlaggedTainted                = (Bytes, InlineBytes, false, true , false, true),
-        InlineBytesWarnedTainted                 = (Bytes, InlineBytes, false, false, true , true),
-        InlineBytesFlaggedWarnedTainted          = (Bytes, InlineBytes, false, true , true , true),
-        InlineBytesFull                          = (Bytes, InlineBytesFull, true , false, false, false),
-        InlineBytesFullFlagged                   = (Bytes, InlineBytesFull, true , true , false, false),
-        InlineBytesFullWarned                    = (Bytes, InlineBytesFull, true , false, true , false),
-        InlineBytesFullFlaggedWarned             = (Bytes, InlineBytesFull, true , true , true , false),
-        InlineBytesFullTainted                   = (Bytes, InlineBytesFull, true , false, false, true),
-        InlineBytesFullFlaggedTainted            = (Bytes, InlineBytesFull, true , true , false, true),
-        InlineBytesFullWarnedTainted             = (Bytes, InlineBytesFull, true , false, true , true),
-        InlineBytesFullFlaggedWarnedTainted      = (Bytes, InlineBytesFull, true , true , true , true),
+        InlineAscii                                  = (Ascii, InlineAscii, false, false, false),
+        InlineAsciiFlagged                           = (Ascii, InlineAscii, false, true, false),
+        InlineAsciiTainted                           = (Ascii, InlineAscii, false, false, true),
+        InlineAsciiFlaggedTainted                    = (Ascii, InlineAscii, false, true, true),
+        InlineAsciiFull                              = (Ascii, InlineAsciiFull, true, false, false),
+        InlineAsciiFullFlagged                       = (Ascii, InlineAsciiFull, true, true, false),
+        InlineAsciiFullTainted                       = (Ascii, InlineAsciiFull, true, false, true),
+        InlineAsciiFullFlaggedTainted                = (Ascii, InlineAsciiFull, true, true, true),
+        InlineLatin1                                 = (Latin1, InlineLatin1, false, false, false),
+        InlineLatin1Flagged                          = (Latin1, InlineLatin1, false, true, false),
+        InlineLatin1Tainted                          = (Latin1, InlineLatin1, false, false, true),
+        InlineLatin1FlaggedTainted                   = (Latin1, InlineLatin1, false, true, true),
+        InlineLatin1Full                             = (Latin1, InlineLatin1Full, true, false, false),
+        InlineLatin1FullFlagged                      = (Latin1, InlineLatin1Full, true, true, false),
+        InlineLatin1FullTainted                      = (Latin1, InlineLatin1Full, true, false, true),
+        InlineLatin1FullFlaggedTainted               = (Latin1, InlineLatin1Full, true, true, true),
+        InlineNonLatin1                              = (NonLatin1, InlineNonLatin1, false, false, false),
+        InlineNonLatin1Flagged                       = (NonLatin1, InlineNonLatin1, false, true, false),
+        InlineNonLatin1Tainted                       = (NonLatin1, InlineNonLatin1, false, false, true),
+        InlineNonLatin1FlaggedTainted                = (NonLatin1, InlineNonLatin1, false, true, true),
+        InlineNonLatin1Full                          = (NonLatin1, InlineNonLatin1Full, true, false, false),
+        InlineNonLatin1FullFlagged                   = (NonLatin1, InlineNonLatin1Full, true, true, false),
+        InlineNonLatin1FullTainted                   = (NonLatin1, InlineNonLatin1Full, true, false, true),
+        InlineNonLatin1FullFlaggedTainted            = (NonLatin1, InlineNonLatin1Full, true, true, true),
+        InlineExtended                               = (Extended, InlineExtended, false, false, false),
+        InlineExtendedFlagged                        = (Extended, InlineExtended, false, true, false),
+        InlineExtendedTainted                        = (Extended, InlineExtended, false, false, true),
+        InlineExtendedFlaggedTainted                 = (Extended, InlineExtended, false, true, true),
+        InlineExtendedFull                           = (Extended, InlineExtendedFull, true, false, false),
+        InlineExtendedFullFlagged                    = (Extended, InlineExtendedFull, true, true, false),
+        InlineExtendedFullTainted                    = (Extended, InlineExtendedFull, true, false, true),
+        InlineExtendedFullFlaggedTainted             = (Extended, InlineExtendedFull, true, true, true),
+        InlineBytes                              = (Bytes, InlineBytes, false, false, false),
+        InlineBytesFlagged                       = (Bytes, InlineBytes, false, true, false),
+        InlineBytesTainted                       = (Bytes, InlineBytes, false, false, true),
+        InlineBytesFlaggedTainted                = (Bytes, InlineBytes, false, true, true),
+        InlineBytesFull                          = (Bytes, InlineBytesFull, true, false, false),
+        InlineBytesFullFlagged                   = (Bytes, InlineBytesFull, true, true, false),
+        InlineBytesFullTainted                   = (Bytes, InlineBytesFull, true, false, true),
+        InlineBytesFullFlaggedTainted            = (Bytes, InlineBytesFull, true, true, true),
     ],
     packed: [
-        PackedNum                                    = (Numeric, PackedNumeric, false, false, false, false),
-        PackedNumFlagged                             = (Numeric, PackedNumeric, false, true , false, false),
-        PackedNumWarned                              = (Numeric, PackedNumeric, false, false, true , false),
-        PackedNumFlaggedWarned                       = (Numeric, PackedNumeric, false, true , true , false),
-        PackedNumTainted                             = (Numeric, PackedNumeric, false, false, false, true),
-        PackedNumFlaggedTainted                      = (Numeric, PackedNumeric, false, true , false, true),
-        PackedNumWarnedTainted                       = (Numeric, PackedNumeric, false, false, true , true),
-        PackedNumFlaggedWarnedTainted                = (Numeric, PackedNumeric, false, true , true , true),
-        PackedNumFull                                = (Numeric, PackedNumericFull, true , false, false, false),
-        PackedNumFullFlagged                         = (Numeric, PackedNumericFull, true , true , false, false),
-        PackedNumFullWarned                          = (Numeric, PackedNumericFull, true , false, true , false),
-        PackedNumFullFlaggedWarned                   = (Numeric, PackedNumericFull, true , true , true , false),
-        PackedNumFullTainted                         = (Numeric, PackedNumericFull, true , false, false, true),
-        PackedNumFullFlaggedTainted                  = (Numeric, PackedNumericFull, true , true , false, true),
-        PackedNumFullWarnedTainted                   = (Numeric, PackedNumericFull, true , false, true , true),
-        PackedNumFullFlaggedWarnedTainted            = (Numeric, PackedNumericFull, true , true , true , true),
-        PackedPlus                                   = (DateTimePlus, PackedDateTimePlus, false, false, false, false),
-        PackedPlusFlagged                            = (DateTimePlus, PackedDateTimePlus, false, true , false, false),
-        PackedPlusWarned                             = (DateTimePlus, PackedDateTimePlus, false, false, true , false),
-        PackedPlusFlaggedWarned                      = (DateTimePlus, PackedDateTimePlus, false, true , true , false),
-        PackedPlusTainted                            = (DateTimePlus, PackedDateTimePlus, false, false, false, true),
-        PackedPlusFlaggedTainted                     = (DateTimePlus, PackedDateTimePlus, false, true , false, true),
-        PackedPlusWarnedTainted                      = (DateTimePlus, PackedDateTimePlus, false, false, true , true),
-        PackedPlusFlaggedWarnedTainted               = (DateTimePlus, PackedDateTimePlus, false, true , true , true),
-        PackedPlusFull                               = (DateTimePlus, PackedDateTimePlusFull, true , false, false, false),
-        PackedPlusFullFlagged                        = (DateTimePlus, PackedDateTimePlusFull, true , true , false, false),
-        PackedPlusFullWarned                         = (DateTimePlus, PackedDateTimePlusFull, true , false, true , false),
-        PackedPlusFullFlaggedWarned                  = (DateTimePlus, PackedDateTimePlusFull, true , true , true , false),
-        PackedPlusFullTainted                        = (DateTimePlus, PackedDateTimePlusFull, true , false, false, true),
-        PackedPlusFullFlaggedTainted                 = (DateTimePlus, PackedDateTimePlusFull, true , true , false, true),
-        PackedPlusFullWarnedTainted                  = (DateTimePlus, PackedDateTimePlusFull, true , false, true , true),
-        PackedPlusFullFlaggedWarnedTainted           = (DateTimePlus, PackedDateTimePlusFull, true , true , true , true),
-        PackedZulu                                   = (DateTimeZulu, PackedDateTimeZulu, false, false, false, false),
-        PackedZuluFlagged                            = (DateTimeZulu, PackedDateTimeZulu, false, true , false, false),
-        PackedZuluWarned                             = (DateTimeZulu, PackedDateTimeZulu, false, false, true , false),
-        PackedZuluFlaggedWarned                      = (DateTimeZulu, PackedDateTimeZulu, false, true , true , false),
-        PackedZuluTainted                            = (DateTimeZulu, PackedDateTimeZulu, false, false, false, true),
-        PackedZuluFlaggedTainted                     = (DateTimeZulu, PackedDateTimeZulu, false, true , false, true),
-        PackedZuluWarnedTainted                      = (DateTimeZulu, PackedDateTimeZulu, false, false, true , true),
-        PackedZuluFlaggedWarnedTainted               = (DateTimeZulu, PackedDateTimeZulu, false, true , true , true),
-        PackedZuluFull                               = (DateTimeZulu, PackedDateTimeZuluFull, true , false, false, false),
-        PackedZuluFullFlagged                        = (DateTimeZulu, PackedDateTimeZuluFull, true , true , false, false),
-        PackedZuluFullWarned                         = (DateTimeZulu, PackedDateTimeZuluFull, true , false, true , false),
-        PackedZuluFullFlaggedWarned                  = (DateTimeZulu, PackedDateTimeZuluFull, true , true , true , false),
-        PackedZuluFullTainted                        = (DateTimeZulu, PackedDateTimeZuluFull, true , false, false, true),
-        PackedZuluFullFlaggedTainted                 = (DateTimeZulu, PackedDateTimeZuluFull, true , true , false, true),
-        PackedZuluFullWarnedTainted                  = (DateTimeZulu, PackedDateTimeZuluFull, true , false, true , true),
-        PackedZuluFullFlaggedWarnedTainted           = (DateTimeZulu, PackedDateTimeZuluFull, true , true , true , true),
+        PackedNum                                    = (Numeric, PackedNumeric, false, false, false),
+        PackedNumFlagged                             = (Numeric, PackedNumeric, false, true, false),
+        PackedNumTainted                             = (Numeric, PackedNumeric, false, false, true),
+        PackedNumFlaggedTainted                      = (Numeric, PackedNumeric, false, true, true),
+        PackedNumFull                                = (Numeric, PackedNumericFull, true, false, false),
+        PackedNumFullFlagged                         = (Numeric, PackedNumericFull, true, true, false),
+        PackedNumFullTainted                         = (Numeric, PackedNumericFull, true, false, true),
+        PackedNumFullFlaggedTainted                  = (Numeric, PackedNumericFull, true, true, true),
+        PackedPlus                                   = (DateTimePlus, PackedDateTimePlus, false, false, false),
+        PackedPlusFlagged                            = (DateTimePlus, PackedDateTimePlus, false, true, false),
+        PackedPlusTainted                            = (DateTimePlus, PackedDateTimePlus, false, false, true),
+        PackedPlusFlaggedTainted                     = (DateTimePlus, PackedDateTimePlus, false, true, true),
+        PackedPlusFull                               = (DateTimePlus, PackedDateTimePlusFull, true, false, false),
+        PackedPlusFullFlagged                        = (DateTimePlus, PackedDateTimePlusFull, true, true, false),
+        PackedPlusFullTainted                        = (DateTimePlus, PackedDateTimePlusFull, true, false, true),
+        PackedPlusFullFlaggedTainted                 = (DateTimePlus, PackedDateTimePlusFull, true, true, true),
+        PackedZulu                                   = (DateTimeZulu, PackedDateTimeZulu, false, false, false),
+        PackedZuluFlagged                            = (DateTimeZulu, PackedDateTimeZulu, false, true, false),
+        PackedZuluTainted                            = (DateTimeZulu, PackedDateTimeZulu, false, false, true),
+        PackedZuluFlaggedTainted                     = (DateTimeZulu, PackedDateTimeZulu, false, true, true),
+        PackedZuluFull                               = (DateTimeZulu, PackedDateTimeZuluFull, true, false, false),
+        PackedZuluFullFlagged                        = (DateTimeZulu, PackedDateTimeZuluFull, true, true, false),
+        PackedZuluFullTainted                        = (DateTimeZulu, PackedDateTimeZuluFull, true, false, true),
+        PackedZuluFullFlaggedTainted                 = (DateTimeZulu, PackedDateTimeZuluFull, true, true, true),
     ],
     heap: [
-        Heap                     = (false, false, false),
-        HeapFlagged              = (true,  false, false),
-        HeapWarned               = (false, true,  false),
-        HeapFlaggedWarned        = (true,  true,  false),
-        HeapTainted              = (false, false, true),
-        HeapFlaggedTainted       = (true,  false, true),
-        HeapWarnedTainted        = (false, true,  true),
-        HeapFlaggedWarnedTainted = (true,  true,  true),
+        Heap                     = (false, false),
+        HeapFlagged              = (true, false),
+        HeapTainted              = (false, true),
+        HeapFlaggedTainted       = (true, true),
     ]
 }
 
@@ -941,7 +864,7 @@ impl PerlString {
             let cb = CowBuffer::from_slice(bytes)?;
             let ascii = bytes.iter().all(|b| b.is_ascii());
             cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE });
-            Ok(PerlString::build_heap(!ascii, false, false, cb))
+            Ok(PerlString::build_heap(!ascii, false, cb))
         }
     }
 
@@ -953,7 +876,7 @@ impl PerlString {
             Some(inline) => Ok(inline),
             None => {
                 let cb = CowBuffer::from_slice(bytes)?; // scan byte born UNKNOWN
-                Ok(PerlString::build_heap(false, false, false, cb))
+                Ok(PerlString::build_heap(false, false, cb))
             }
         }
     }
@@ -961,21 +884,21 @@ impl PerlString {
     /// The full tier ladder with every tag dimension supplied — the transforms' constructor, and `from_bytes` in
     /// spirit: compressed inline, verbatim inline, packed, heap, in the ruled order (§2.2.9).  Internal: public
     /// construction fixes the flags.
-    fn tiered(bytes: &[u8], utf8: bool, warned: bool, tainted: bool) -> Result<PerlString, AllocError> {
+    fn tiered(bytes: &[u8], utf8: bool, tainted: bool) -> Result<PerlString, AllocError> {
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
-            return Ok(PerlString::build_inline(class, utf8, warned, tainted, stored, aux, buf));
+            return Ok(PerlString::build_inline(class, utf8, tainted, stored, aux, buf));
         }
         if let Some(p) = pack(bytes) {
-            return Ok(PerlString::build_packed(p, utf8, warned, tainted));
+            return Ok(PerlString::build_packed(p, utf8, tainted));
         }
         let cb = CowBuffer::from_slice(bytes)?;
-        Ok(PerlString::build_heap(utf8, warned, tainted, cb))
+        Ok(PerlString::build_heap(utf8, tainted, cb))
     }
 
     /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
     /// payload needs no allocation — which is also what lets `Default` exist.
     pub fn empty() -> PerlString {
-        PerlString::build_inline(InlineClass::Ascii, false, false, false, 0, 0, [0u8; INLINE_MAX])
+        PerlString::build_inline(InlineClass::Ascii, false, false, 0, 0, [0u8; INLINE_MAX])
     }
 
     /// Construct from a Rust `&str` **without allocating**, or `None` if the content cannot be stored in the value
@@ -993,7 +916,7 @@ impl PerlString {
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
             // Ascii stores unflagged, non-ASCII flagged, following `FromStr`.  Bytes/Extended are impossible from a
             // `&str`, whose bytes are Rust-valid.
-            return Some(PerlString::build_inline(class, class != InlineClass::Ascii, false, false, stored, aux, buf));
+            return Some(PerlString::build_inline(class, class != InlineClass::Ascii, false, stored, aux, buf));
         }
 
         // The packed band holds 16-30-character alphabet content and allocates nothing either.  Past it, `None` starts
@@ -1002,7 +925,7 @@ impl PerlString {
             return None;
         }
 
-        pack(bytes).map(|p| PerlString::build_packed(p, false, false, false))
+        pack(bytes).map(|p| PerlString::build_packed(p, false, false))
     }
 
     /// Construct from raw bytes **without allocating**, or `None` if the content cannot be stored in the value itself.
@@ -1011,14 +934,14 @@ impl PerlString {
         let bytes = bytes.as_ref();
 
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
-            return Some(PerlString::build_inline(class, false, false, false, stored, aux, buf));
+            return Some(PerlString::build_inline(class, false, false, stored, aux, buf));
         }
 
         if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
             return None;
         }
 
-        pack(bytes).map(|p| PerlString::build_packed(p, false, false, false))
+        pack(bytes).map(|p| PerlString::build_packed(p, false, false))
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -1261,11 +1184,6 @@ impl PerlString {
     }
 
     // ── Tag transitions ───────────────────────────────────────────
-    /// Mark the numification warning as fired.  Monotonic: there is no clearing method (§2.3.4).
-    pub fn mark_warned(&mut self) {
-        self.rebuild_tag(|_u, _w, _t| (_u, true, _t));
-    }
-
     // ── Representation transforms (§2.2.9) ────────────────────────
     // Private until the ops layer calls them — no public surface without a caller — with the tests pinning the
     // container-verified facts the design records.
@@ -1274,7 +1192,7 @@ impl PerlString {
     /// the representation is already right, verbatim and compressed classes alike (§2.2.9): an upgraded `é` becomes the
     /// flag-off two-character `C3.A9` with the payload untouched.
     fn reinterpret_utf8(&mut self, utf8: bool) {
-        self.rebuild_tag(|_, w, t| (utf8, w, t));
+        self.rebuild_tag(|_, t| (utf8, t));
     }
 
     /// `utf8::upgrade`: the same characters, flagged.  Flagged content is untouched.  An unflagged string's characters
@@ -1296,7 +1214,7 @@ impl PerlString {
             return Ok(s);
         }
 
-        let (w, t) = (self.is_warned(), self.is_tainted());
+        let t = self.is_tainted();
         let mut scratch = [0u8; DECODE_MAX];
         let internal = self.as_bytes(&mut scratch);
 
@@ -1305,7 +1223,7 @@ impl PerlString {
             buf[..internal.len()].copy_from_slice(internal);
             let h = high_count(internal);
             debug_assert!(h > 0, "all-ASCII content took the flip above");
-            return Ok(PerlString::build_inline(InlineClass::Latin1, true, w, t, internal.len(), h, buf));
+            return Ok(PerlString::build_inline(InlineClass::Latin1, true, t, internal.len(), h, buf));
         }
 
         // Sixteen or more non-ASCII characters: heap.  The buffer owns the expansion — appending byte by byte would pay
@@ -1315,7 +1233,7 @@ impl PerlString {
         cb.narrow_scan(scan::UTF8_LATIN1);
         cb.set_char_count(internal.len());
 
-        Ok(PerlString::build_heap(true, w, t, cb))
+        Ok(PerlString::build_heap(true, t, cb))
     }
 
     /// The in-place form of [`PerlString::upgraded`]: the same characters, flagged, rewriting a unique heap buffer
@@ -1365,12 +1283,12 @@ impl PerlString {
             return Ok(Some(s));
         }
 
-        let (w, t) = (self.is_warned(), self.is_tainted());
+        let t = self.is_tainted();
         match self.raw_parts() {
             RawParts::Inline { class: InlineClass::Latin1, full, buf } => {
                 let stored = inline_stored(full, buf);
 
-                Ok(Some(PerlString::tiered(&buf[..stored], false, w, t)?))
+                Ok(Some(PerlString::tiered(&buf[..stored], false, t)?))
             }
             RawParts::Inline { .. } => Ok(None),
             RawParts::Packed(_) => {
@@ -1389,10 +1307,10 @@ impl PerlString {
                 };
 
                 if out.len() <= MAX_PACKED_LEN {
-                    return Ok(Some(PerlString::tiered(out.as_slice(), false, w, t)?));
+                    return Ok(Some(PerlString::tiered(out.as_slice(), false, t)?));
                 }
 
-                Ok(Some(PerlString::build_heap(false, w, t, out)))
+                Ok(Some(PerlString::build_heap(false, t, out)))
             }
         }
     }
@@ -1434,20 +1352,20 @@ impl PerlString {
 
     /// Set or propagate the taint bit.  Monotonic raise; clearing is the laundering capability's alone (§2.6.2).
     pub fn taint(&mut self) {
-        self.rebuild_tag(|u, w, _t| (u, w, true));
+        self.rebuild_tag(|u, _t| (u, true));
     }
 
     /// Clear the taint bit.  Non-public: reachable only through the two sanctioned laundering paths (§2.6.2) — capture
     /// materialization and hash-key canonicalization, both inside perl-core.
     pub(crate) fn untaint_for_sanctioned_path(&mut self) {
-        self.rebuild_tag(|u, w, _t| (u, w, false));
+        self.rebuild_tag(|u, _t| (u, false));
     }
 
-    fn rebuild_tag(&mut self, f: impl FnOnce(bool, bool, bool) -> (bool, bool, bool)) {
-        let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
-        let (u2, w2, t2) = f(u, w, t);
+    fn rebuild_tag(&mut self, f: impl FnOnce(bool, bool) -> (bool, bool)) {
+        let (u, t) = (self.is_utf8(), self.is_tainted());
+        let (u2, t2) = f(u, t);
 
-        if (u, w, t) == (u2, w2, t2) {
+        if (u, t) == (u2, t2) {
             return;
         }
 
@@ -1456,10 +1374,10 @@ impl PerlString {
         *self = match old.into_raw() {
             RawOwned::Inline { class, full, buf } => {
                 let (s, aux) = (inline_stored(full, &buf), inline_derived_aux(class, full, &buf));
-                PerlString::build_inline(class, u2, w2, t2, s, aux, buf)
+                PerlString::build_inline(class, u2, t2, s, aux, buf)
             }
-            RawOwned::Packed(p) => PerlString::build_packed(p, u2, w2, t2),
-            RawOwned::Heap(cb) => PerlString::build_heap(u2, w2, t2, cb),
+            RawOwned::Packed(p) => PerlString::build_packed(p, u2, t2),
+            RawOwned::Heap(cb) => PerlString::build_heap(u2, t2, cb),
         };
     }
 
@@ -1519,7 +1437,7 @@ impl PerlString {
         };
 
         if let Some((class, stored, buf)) = inline {
-            let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
+            let (u, t) = (self.is_utf8(), self.is_tainted());
 
             let mut internal = [0u8; DECODE_MAX];
             let ilen = if class == InlineClass::Latin1 {
@@ -1540,12 +1458,12 @@ impl PerlString {
                 combined[ilen..total].copy_from_slice(bytes);
 
                 if let Some((nc, ns, naux, nbuf)) = classify_inline(&combined[..total]) {
-                    *self = PerlString::build_inline(nc, u, w, t, ns, naux, nbuf);
+                    *self = PerlString::build_inline(nc, u, t, ns, naux, nbuf);
                     return Ok(());
                 }
 
                 if let Some(packed) = pack(&combined[..total]) {
-                    *self = PerlString::build_packed(packed, u, w, t);
+                    *self = PerlString::build_packed(packed, u, t);
                     return Ok(());
                 }
 
@@ -1556,12 +1474,12 @@ impl PerlString {
             cb.extend_from_slice(&internal[..ilen])?;
             cb.extend_from_slice(bytes)?;
             cb.narrow_scan(append_transition_heap(inline_scan_to_heap(class), kind));
-            *self = PerlString::build_heap(u, w, t, cb);
+            *self = PerlString::build_heap(u, t, cb);
 
             return Ok(());
         }
 
-        let (u, w, t) = (self.is_utf8(), self.is_warned(), self.is_tainted());
+        let (u, t) = (self.is_utf8(), self.is_tainted());
         let old = mem::take(self);
 
         *self = match old.into_raw() {
@@ -1570,7 +1488,7 @@ impl PerlString {
                 if let Some(packed) = p.push(bytes) {
                     // In place: the existing nibbles are kept, rather than the whole result being decoded and
                     // re-encoded on every append.
-                    PerlString::build_packed(packed, u, w, t)
+                    PerlString::build_packed(packed, u, t)
                 } else {
                     // Past the band, or no longer alphabet-conformant: decode once, on the way out of the tier.  Packed
                     // content is ASCII, so the heap state starts from there.
@@ -1581,7 +1499,7 @@ impl PerlString {
                     cb.extend_from_slice(old_bytes)?;
                     cb.extend_from_slice(bytes)?;
                     cb.narrow_scan(append_transition_heap(scan::ASCII, kind));
-                    PerlString::build_heap(u, w, t, cb)
+                    PerlString::build_heap(u, t, cb)
                 }
             }
             RawOwned::Heap(mut cb) => {
@@ -1599,7 +1517,7 @@ impl PerlString {
                 {
                     cb.set_char_count(prior_chars + added);
                 }
-                PerlString::build_heap(u, w, t, cb)
+                PerlString::build_heap(u, t, cb)
             }
         };
 
@@ -1754,7 +1672,8 @@ impl PerlString {
     }
 
     /// Whether numifying this string would emit perl's `Argument isn't numeric` warning (§2.3.4).  A question about the
-    /// content; whether the warning has *already* fired is [`PerlString::is_warned`].
+    /// content.  Whether the warning has *already* fired is not a property of the string: it is whether the value
+    /// carries a cached numeric face, which lives on the payload (§2.3.4).
     pub fn would_warn(&self) -> bool {
         let mut scratch = [0u8; DECODE_MAX];
         string_would_warn(self.as_bytes(&mut scratch))
@@ -2304,7 +2223,6 @@ impl fmt::Debug for PerlString {
             .field("storage", &self.storage_type())
             .field("len", &self.len())
             .field("utf8", &self.is_utf8())
-            .field("warned", &self.is_warned())
             .field("tainted", &self.is_tainted())
             .field("bytes", &ByteLiteral(self.as_bytes(&mut [0u8; DECODE_MAX])))
             .finish()
