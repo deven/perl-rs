@@ -1046,12 +1046,18 @@ unsafe fn digit_run_avx2(bytes: &[u8]) -> usize {
     unsafe {
         let zero = _mm256_set1_epi8(b'0' as i8);
         let nine = _mm256_set1_epi8(9);
+        let null = _mm256_setzero_si256();
         while i + 32 <= bytes.len() {
             let block = _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i);
             let over = _mm256_subs_epu8(_mm256_sub_epi8(block, zero), nine);
-            if _mm256_testz_si256(over, over) == 0 {
-                break;
+
+            // `movemask` locates the boundary exactly where `testz` only detects one, so a mismatching block is
+            // answered here instead of being handed whole to the word scan and read a second time.
+            let digits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(over, null)) as u32;
+            if digits != u32::MAX {
+                return i + (!digits).trailing_zeros() as usize;
             }
+
             i += 32;
         }
     }
