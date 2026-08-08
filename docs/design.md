@@ -429,6 +429,45 @@ unique-check mutation, nothing else.  Details:
   byte rather than merely saturating, which a whole-word count
   never does.
 
+- **How the ceiling is enforced [DECISION].**  Increment with
+  `fetch_add` and test the old value it returns, repairing on the
+  cold path.  Both alternatives fail, for opposite reasons.
+  Leaving the increment unchecked does not saturate, it *wraps to
+  zero*, and the next release then frees a buffer with billions of
+  live handles.  A compare-exchange loop does saturate, but
+  measures 84% slower than a plain `fetch_add` — 11.6 ns against
+  6.3 — a tax on every clone.  The test costs 0.1%: a compare on a
+  register the increment already produced, under a branch the
+  predictor never misses, in the shadow of a locked
+  read-modify-write that costs 6 ns unaided.  With the repair on a
+  path taken at most once, saturation and abort cost the same, so
+  the choice is semantic; saturation wins because `Heap8` needs it
+  regardless, and one policy is less code than two.
+
+  The two tiers reach the ceiling on different terms.  `Heap8`
+  saturates at 65,535 shares — roughly a mebibyte of live
+  envelopes around a string of at most 255 bytes, which a program
+  really can reach by sharing one small string that widely — so
+  the immortal transition there is a state to expect.  A 32-bit
+  count saturates at 4,294,967,295 shares, needing 64 GiB of
+  envelopes: not a bound protecting against anything, only the
+  point past which the arithmetic cannot continue.  Its test will
+  never fire, which is the reason to document it rather than to
+  mistake it for dead weight.
+
+  Retagging a saturated handle so later clones skip the atomic
+  entirely is a dead end, and instructively so.  The tag is
+  per-handle, so it would not stop the other sharers counting; the
+  saturated buffer is in the general allocator, not the immortal
+  slab, so it cannot reuse that variant's teardown path; and
+  observing saturation before incrementing — which is what skipping
+  the increment requires — replaces a free test with a load on
+  *every* clone to save one on clones that need 65,535 live handles
+  to exist.  Immortality known at birth is free, which is precisely
+  why `Immortal` and `Static` carry no count at all; immortality
+  discovered at saturation cannot be, because discovering it costs
+  the operation it would avoid.
+
 - **Header shapes.**  `Heap8`: refcount only, with `len`,
   `capacity`, character count and scan byte in the envelope beside
   the pointer (and `Heap8Ascii` omitting the last two).  `Heap16`:
