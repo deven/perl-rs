@@ -3490,6 +3490,279 @@ chores: keys-under-`use locale`, and cross-checking the perlsec
 wording against the 5.42 reference documentation.
 
 
+### 2.7 The Rust API Surface
+
+**`perl-core` is a library in its own right [DECISION].**  Its types
+are meant to be used directly from Rust, by callers who never
+instantiate the interpreter — not solely as building blocks the ops
+layer assembles.  Much of that ops layer will be thin calls into
+implementations here, and those implementations are the same ones a
+Rust program reaches for.  This has been the intent from the
+outset; what is new here is only its being written down, and the
+consequences below follow from it.  A shape that would serve an
+interpreter well enough — because an interpreter can be told to work
+around it — must stand on its own for a caller who cannot be.
+
+#### 2.7.1 Fallible operations and Rust's fixed signatures:
+
+The no-panic rule and Rust's operator traits collide.  `Add::add`,
+`Ord::cmp`, `Display::fmt`, and `Hash::hash` have signatures that
+cannot return a `Result`, and their perl semantics can fail —
+concatenation allocates, and comparison can run overloaded or tied
+code that dies.  Note that std resolves this the other way:
+`String::push_str` and `Vec::push` abort on allocation failure, and
+only `try_reserve` reports it.
+
+**The bargain [DECISION]: a trait implementation with a fixed
+signature may panic, and every one delegates to a fallible inherent
+twin.**  The trait is the ergonomic spelling, the twin is the honest
+one, the ops layer calls only twins, and each panicking impl
+documents the hazard.  Rust code choosing operator ergonomics is
+choosing the panic, and must be told so.
+
+The twin cannot share the trait method's name.  Inherent methods take
+precedence in resolution, so an inherent `add` would silently shadow
+`Add::add` for `a.add(b)` while `a + b` still routed to the trait —
+two spellings of one operation with different return types.  The
+prefix is therefore `try_`, following `try_reserve`.
+
+`Hash::hash` is the sharpest case: hashing a tied `Value` needs a
+`FETCH`, which can die, and the unwind happens inside `HashMap`'s
+probe sequence.  It never affects us internally, since perl's hashes
+key on strings and `PerlHash` is keyed by `PerlString`, which cannot
+be magical; `Value: Hash` exists for Rust callers building their own
+maps, and its documentation says so.
+
+Perl's own failure mode is worth recording as the contrast.  A dying
+`sort` comparator propagates and leaves its input **completely
+intact**, because `sort` builds a new list and the assignment never
+happens.  Rust's `slice::sort_by` sorts in place, so a panicking
+comparator leaves the slice in an unspecified order.  Perl's failure
+mode is "nothing happened"; ours would be "your data is reordered."
+That is a documented hazard of the panicking `Ord`, and the reason
+the fallible methods are the advertised API.
+
+#### 2.7.2 `PerlError`:
+
+Anything that raises a perl exception returns an error type covering
+it.  Allocation failure is one cause among several — `1/0` raises
+`Illegal division by zero`, and any operation on a magical value can
+run Perl that dies, verified in the container from all four
+"infallible" contexts (interpolation, `length`, boolean test,
+numeric addition).  There is no exception-free layer to carve out:
+even `utf8::downgrade` dies on a wide character, with `FAIL_OK` as
+an explicit opt-out.
+
+**Shape [DECISION]:**
+
+```rust
+enum PerlError {
+    Alloc,                  // payload-free, and necessarily so
+    Raised(Box<Raised>),    // everything else, behind one pointer
+}
+
+struct Raised {
+    kind: Kind,   // a one-byte enum; the taxonomy is free
+    value: Value, // `die $object` propagates an arbitrary value
+}
+```
+
+Two variants, because **`Result<Value, E>` stays 16 bytes exactly
+when `E` fits in 8** — and the variant count is irrelevant to that,
+only `E`'s own size.  Measured: a two-variant `E` is 8 bytes and the
+`Result` is 16; ten variants and fifty variants are both 16 bytes and
+both push the `Result` to 24.  Two variants fit only because `Box` is
+non-null, so the payload-free variant occupies the pointer's own
+niche.  rustc places `E`'s eight bytes in `Value`'s payload area and
+spends a couple of `Value`'s spare discriminants to mark `Err`, so
+the cost is niches — §2.2.9 leaves about 126 — not a second
+envelope byte.
+
+`Alloc` must be the payload-free variant, and two independent
+arguments demand it: it has to occupy the pointer's niche for the
+size to work, and an allocator failure cannot allocate a box to
+describe itself.
+
+The error *taxonomy* is then free.  `Kind` is one byte behind the
+box, so it can name every die reason and every warning category
+without touching any envelope, and `Raised` can grow fields at no
+cost to the hot path.  This layout is rustc's niche optimisation
+rather than a guaranteed ABI, so a `const _: () = assert!(...)`
+beside the §2.3.6 size laws pins it: if a future compiler stops, the
+build says so.
+
+#### 2.7.3 Comparison:
+
+**`Ord` on `Value` is `cmp`, perl's string comparison [DECISION]** —
+the precedent being perl's own default `sort`, which orders by
+`cmp` without a comparison block.  Perl does decide here, so we
+need not.
+
+That decision propagates.  Rust requires `Ord` to agree with `Eq`,
+so `==` on `Value` is perl's `eq`: `Value::integer(1)` equals
+`Value::from_str("1")`, and `undef` equals `""`.  Faithful, but it
+means `==` is not structural identity and tests wanting
+representation identity need an explicit method.  `Hash` follows the
+same equality and therefore hashes the stringification — which is
+what perl's hashes do, so the cost is fidelity rather than waste.
+
+Three comparison primitives, and the third has exactly one consumer:
+
+- **`try_cmp`** — perl's `cmp`.  Total, feeds `Ord` and all six
+  string relationals.
+- **`try_partial_num_cmp`** — perl's `<=>` faithfully, `None` being
+  its `undef`.  Feeds all six numeric relationals.
+- **`try_num_cmp`** — a total numeric order, feeding the numeric
+  context wrapper's `Ord` **and nothing else**.  Any other caller
+  reaching for it has a bug.
+
+That last rule is not stylistic.  Perl gives **false** for `<`, `>`,
+`<=`, `>=`, and `==` against NaN, and **true** for `!=` — including
+`NaN != NaN` (container-verified).  Derived from the total order,
+`NaN > 1` would come out true.  So `None` from the partial
+comparison maps to false for every relational except `try_num_ne`,
+which maps to true.
+
+Naming: unsuffixed is the string form, `num_` marks the numeric one,
+matching perl where `cmp`/`eq`/`lt` are the string operators and
+`<=>`/`==`/`<` the numeric.  There is no `try_partial_cmp`: string
+comparison is total, so it could only ever return `Ok(Some(_))`.
+
+**Mixed numeric comparison converts to `f64` [DECISION].**  Perl's
+`<=>` compares exactly only when both operands are integral;
+otherwise it converts, so `9007199254740993 <=> 9007199254740992.0`
+is **0** (container-verified).  An exact mixed comparison would be a
+*divergence*, not an improvement.
+
+#### 2.7.4 Context wrappers:
+
+Perl's numeric and string coercions are reified as types whose
+**construction performs the coercion**:
+
+```rust
+NumericContext<T>   // T viewed numerically
+StringContext<T>    // T viewed as a string
+```
+
+Construction is fallible and is where everything that can go wrong
+does: numifying warns, may install a `Dual` (§2.3.4), and dies under
+fatal warnings; stringifying can run an overloaded `""`.  Afterwards
+the wrapper holds the coerced face, so `Ord`, `Eq`, and `Hash` are
+arithmetic or byte comparison and cannot fail.  The fallible boundary
+is not a workaround for `Ord`'s signature — it is the perl operation
+faithfully modelled, since entering numeric context is exactly the
+moment perl warns.
+
+Reading: `NumericContext<Value>` is "this `Value`, viewed
+numerically," not "a numeric `Value`."
+
+Three consequences make these worth having over a comparator
+closure.  A `BTreeMap` key must not change its ordering while in the
+map, so freezing the face at insertion is *required*, not merely
+convenient.  A sort over wrapped values numifies once per element
+rather than once per comparison — and warns once per element, where
+a comparator holding `&Value` cannot install faces and would warn
+O(n log n) times where perl warns once.  And the failure moves from
+inside a sort comparator, where a panic scrambles the slice, to
+construction, where the caller holds a `Result`.
+
+The face is a **snapshot**, taken when the context was entered.  A
+tied or aliased scalar can diverge from it afterwards.  Perl has the
+same property — `$x <=> $y` numifies when evaluated, not
+continuously — the difference being only that the wrapper makes the
+moment explicit and reusable.
+
+`NumericContext`'s `Ord` needs a total order where perl's `<=>` gives
+a partial one, so it **canonicalises then uses `f64::total_cmp`**:
+`-0.0` maps to `+0.0` and every NaN to one canonical NaN, matching
+perl's single zero and single NaN, and `total_cmp` then places NaN.
+Two divergences remain, both forced rather than chosen — NaN's
+*position*, which perl leaves unspecified since it coerces `<=>`'s
+undef to zero, and NaN's *self-equality*, which `Eq` requires and
+perl denies.  Neither is avoidable inside `Ord`, and both are
+confined to the wrapper: bare `Value` is untouched, since string
+comparison is total and `NaN eq NaN` is true in perl too.
+
+**Which coercions earn a wrapper [DECISION]:** the ones anyone needs
+as an `Ord` or `Hash` participant.  Numeric and string qualify.
+Boolean does not — no ordering falls out, so a fallible `try_to_bool`
+suffices.  Scalar context over a container does not either: its whole
+content is a count, which `len()` says more directly, and nobody keys
+a map on an array's length.
+
+**Scalar-versus-list context is not a wrapper at all**, and the
+distinction matters because it shares perl's word.  It is an
+evaluation mode for *expressions* — a sub consulting `wantarray`, a
+list assignment taking the first element versus the count, a slice,
+`readline` yielding one line or all — and none of those are values.
+A wrapper around an existing `T` has nothing to ask, because the
+choice was made when the `T` was produced.  That machinery belongs to
+the ops layer.  Should a `PerlExpr` type ever want a uniform way to
+say it, the coercion half over containers is where `ScalarContext<T>`
+would fit; it is recorded here so the two mechanisms are not later
+unified under one name.
+
+#### 2.7.5 Warnings:
+
+`perl-core` can supply exactly one thing about a warning: **that this
+operation on this content is warn-worthy, now**.  It cannot format
+the message, which needs the operation name and source location; it
+cannot decide whether the category is enabled, since `use warnings`
+is lexically scoped and lives in the compiled op tree; and it cannot
+decide fatality, which is lexical too.
+
+**So warn-worthiness travels in the `Ok` channel as a category
+[DECISION]**, beside the value it accompanies — because a warning
+accompanies a *successful* result: `"12abc" + 0` warns and yields
+12.  A category rather than a boolean, since the caller must consult
+the lexical bit for that specific category (`numeric` and
+`uninitialized` are separately enableable) and, if fatal, raise an
+error naming it.  The byproduct type and `Kind` therefore share one
+vocabulary, so adding a category is one edit.
+
+Fatality is the caller's, and belongs in `PerlError`: both
+mechanisms were container-verified to turn emission into an
+exception — `use warnings FATAL => 'numeric'`, and a `$SIG{__WARN__}`
+handler that dies.
+
+Returning a warning through `Err` is rejected, and the reasoning is
+worth recording because it is the obvious first idea.  It would make
+`Result` lie: `Err(Warning { value, .. })` means "actually both,
+look inside," so `?` becomes wrong at every call site by discarding a
+value that exists.  It would route a *successful* numification
+through the cold path and an allocation.  And it would turn
+warn-worthiness — a pure content property, decidable from the
+bytes — into something the type system calls a failure.
+
+#### 2.7.6 Layering:
+
+`PerlString` is content, and content cannot run user code.  Its
+string comparisons numify nothing and cannot warn, so they return
+directly rather than through a `Result`.  Its numification reports
+warn-worthiness as a byproduct rather than emitting, so it cannot
+raise either.
+
+**Numeric comparison is therefore a `Value`-level operation**, not a
+`PerlString` one: comparing two strings numerically must numify, and
+numifying is where a fatal warning can die.  A `PerlString::num_cmp`
+would be either unfaithful or fallible, and an unfaithful primitive
+that looks authoritative is the worse of the two.
+
+The `try_` prefix consequently marks exactly the boundary where perl
+code can run, which makes it informative rather than decoration.
+
+A public trait abstracting the numeric methods was considered and
+dropped.  Over `Value` and `ScalarCell` an associated error type
+distinguishes nothing, both being `PerlError`; `PerlString` does not
+belong in it at all, per the layering above; and its only concrete
+consumer would have been the context wrappers' `Ord`, which two
+concrete impls cover in a few lines.  The wrappers are generic over
+one small internal trait — "enter this context" — which is the
+honest amount of abstraction and is not exported.  Adding a public
+trait later is backward-compatible; reshaping a published one is
+not.
+
+
 ## 3. Memory Management Details
 
 > **Stale stratum (rewrite pending).**  This section predates the
