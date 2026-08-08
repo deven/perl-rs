@@ -326,7 +326,7 @@ storage kinds:
 ```rust
 // Conceptual shape; the literal variant set folds the per-value
 // state dimensions below into the tag byte and is macro-generated
-// behind accessors (storage_kind(), is_utf8(), is_warned(),
+// behind accessors (storage_kind(), is_utf8(),
 // is_tainted(), scan-state and tag-transition methods).
 enum PerlString {
     // Each format below is two length families (§2.2.9): content of
@@ -338,7 +338,15 @@ enum PerlString {
     PackedNumeric([u8; 15]),       // nibbles, 16-30 chars, also
     PackedDateTimeZ([u8; 15]),     // two families; the alphabet
     PackedDateTimePlus([u8; 15]),  // has no byte — it IS the variant
-    Heap(..),                      // thin handle; COW buffer
+
+    // Four heap tiers by content length (§2.2.3), the smaller two
+    // with Ascii twins; plus Immortal and Static, which are never
+    // freed and carry no allocation header at all.
+    Heap8(..), Heap8Ascii(..),     // <= 255 bytes; 2-byte header
+    Heap16(..), Heap16Ascii(..),   // <= 64 KiB;   2-byte header
+    Heap32(..),                    // <= 4 GiB;    cached header
+    Heap(..),                      // beyond;      cached header
+    Immortal(..), Static(..),      // no header, no refcount
 }
 ```
 
@@ -350,31 +358,90 @@ mirrored length rides the handle's spare bytes — §2.2.9) and a
 `{refcount, len, capacity, char_count, scan}` header — COW clone,
 unique-check mutation, nothing else.  Details:
 
-- **Handle: thin pointer plus mirrored length, in-envelope.**  The
-  heap form is a thin `NonNull` to the buffer, with a u48 length
-  mirror riding the envelope's spare bytes — a `(pointer, usize)`
-  fat handle is ruled out by the envelope's fat-pointer rule
-  (§2.2.9).  Coherence falls out of COW: a shared buffer is
-  immutable, so its header length never changes under any handle;
-  mutation requires this handle's `&mut` (COW-break first if
-  shared) and updates both copies.  `length`, emptiness, bounds
-  checks, and the compare-lengths-first `eq` short-circuit all
-  skip the dereference; lengths at or beyond 2^48 read the header
-  (the large-buffer form, below).  The `NonNull` supplies the
-  niche.
-- **Header: compact by default.**  The common buffer header is
-  u32-field: `{refcount: AtomicU32, len: u32, capacity: u32,
-  char_count: AtomicU32 (0 = no cached count; §2.2.4), scan:
-  AtomicU8, flags:
-  u8}` — 20 bytes at alignment 4 — where a usize-field layout
-  would cost 40, more than many of the strings it fronts.  A
-  `flags` bit selects the large-buffer header (usize lengths) for
-  buffers at or beyond 4 GiB, so no semantic length cap exists
-  (the tendril lesson); `len` stays authoritative in the header —
-  handles carry mirrors, and mutation under the unique-buffer rule
-  updates one place.  Perl's own 32-bit SV refcount is the
-  precedent for the count width; overflow promotes to the large
-  header before wrap.
+- **Storage tiers, by content length [DECISION].**  One header
+  shape for every heap string would cost the smallest strings most,
+  and small strings are the common case, so the heap splits into
+  four tiers reified in the tag beside the inline and packed types
+  (§2.2.9): `Heap8` for content of 255 bytes or fewer, `Heap16`
+  through 64 KiB, `Heap32` through 4 GiB, and `Heap` for anything
+  larger.  `Heap8` and `Heap16` each carry an `Ascii` twin, since
+  ASCII content needs neither a scan byte nor a character count and
+  the distinction is free to establish (below).  Growth crosses
+  tiers at the ceilings, on the reallocation growth was doing
+  anyway; there is no demotion, so a truncated string keeps its
+  tier.  `Heap` is compiled on every target even where 32-bit
+  pointers make it unreachable — a `usize` length there cannot
+  exceed `Heap32`'s range, so `Heap32` covers everything the
+  address space can hold — because uniform discriminants across
+  targets mean bytecode need not encode a target-dependent tag.
+  The variant is deliberately unreachable on 32-bit rather than
+  missing, and the coverage gap that shows in tests there is
+  expected.
+
+- **What lives where: shared state in the allocation, frozen state
+  in the envelope [DECISION].**  The refcount is intrinsically
+  shared and can live nowhere else.  The scan state and character
+  count are shared *caches* — one reader's discovery must be
+  visible to every other holder — so they belong in the allocation
+  too whenever they are discovered lazily.  But `len` and
+  `capacity` are *frozen while shared*: COW makes a shared buffer
+  immutable, so every handle agrees by construction, and mutation
+  requires this handle's `&mut` after a COW break.  They can
+  therefore live in the envelope authoritatively, with no copy
+  anywhere and no coherence question — and the envelope has room
+  for them below `Heap32`, where a `u32` pair would need eight
+  bytes and only seven are spare.
+
+- **Eager below 64 KiB, lazy above [DECISION].**  Classifying
+  content at construction costs one vectorised pass, which for
+  `Heap8` is at most ~117 ns and for ASCII content of any size is
+  cheaper than the copy that just happened (§2.2.11).  Paying it
+  eagerly lets the class and count live in the envelope, which
+  removes the shared cache entirely: `Heap8` and `Heap16` headers
+  hold **the refcount and nothing else**.  No atomics beyond the
+  count, no fill protocol, no interior mutability, no dereference
+  to answer a length or a character count, and the facts travel
+  with every assignment for free.  Above 64 KiB the flags pass
+  stops being affordable — 4 GiB at 65 B/ns is ~66 ms — so
+  `Heap32` and `Heap` keep the lazily-filled shared cache and the
+  larger header it needs.  Perl by comparison pays roughly 110 µs
+  to learn the same facts about a 64 KiB string, lazily.
+
+- **Refcount width follows the cost of leaking [DECISION].**  A
+  saturating refcount that stops counting becomes immortal, which
+  is safe and matches §2.4's `IMMORTAL` sentinel, so the width
+  question is how much a saturated string wastes rather than how
+  often saturation happens.  Saturation at `N` shares implies at
+  least `16N` bytes of live envelopes, so the leak is bounded by
+  `tier_max / (16 · 2^bits)` of the memory that caused it: a
+  16-bit count leaks at most 0.02% at `Heap8` and 6.25% at
+  `Heap16`, and a wider count at `Heap16` brings that back to
+  0.02%.  `Heap32` and `Heap` use a word-width count, where the
+  bytes are free at those content sizes and saturation is
+  unreachable in any case.
+
+- **Header shapes.**  `Heap8`: refcount only, with `len`,
+  `capacity`, character count and scan byte in the envelope beside
+  the pointer (and `Heap8Ascii` omitting the last two).  `Heap16`:
+  the same, at `u16` widths — `len`, `capacity`, count and scan
+  fill the seven spare envelope bytes exactly.  `Heap32`: a
+  `{refcount, len, capacity, char_count, scan}` header with `u32`
+  fields, and a `u32` length mirror in the envelope so the common
+  length question skips the dereference.  `Heap`: the same with
+  `usize` fields; at gigabyte content one dependent load is
+  immaterial, so it carries no mirror.
+
+- **Immortal and static forms [DECISION].**  Two further tag types
+  hold content that is never freed and never grown, so they need
+  neither a refcount nor a capacity: `Immortal` for bytes in an
+  interpreter-lifetime slab, and `Static` for bytes in the
+  program image reached from a `&'static [u8]`.  Their envelopes
+  hold a 24-bit length, a 24-bit character count and the scan byte
+  — seven bytes exactly, covering content to 16 MiB — so a
+  compiled literal costs a tag, a pointer, and *no allocation
+  header at all*.  Writing to either copies out to a mutable tier,
+  since without a refcount uniqueness is unprovable.  Teardown
+  frees the immortal slab and never touches the image.
 - **Clone** is a relaxed refcount increment (`clone_cow` in the
   original design's vocabulary; the mechanism carried forward from
   its `Bytes`/`BytesMut` model).  **Mutation**: unique → mutate in
@@ -382,9 +449,13 @@ unique-check mutation, nothing else.  Details:
   `BytesMut` reclaim path); shared → copy out into a fresh unique
   buffer (the COW break), leaving other sharers undisturbed.
   Drop follows the standard Arc release/acquire protocol.
-- **Growth** allocates with headroom (perl's `sv_grow` uses roughly
-  25%; the exact policy is an implementation constant to be tuned)
-  and rounds to allocator size classes.
+- **Growth** sizes to the allocator's size class at birth, so the
+  rounding the allocator performs anyway becomes usable capacity,
+  and doubles within a tier thereafter, crossing to the next tier
+  at its ceiling.  Excess capacity is shed at a COW break rather
+  than when a buffer becomes shared: the break is already copying,
+  so the trim is free there, where trimming at the share would add
+  a copy that a subsequent append then pays for twice.
 - **Scans** (`is_ascii`, UTF-8 validation) use SIMD-accelerated
   byte search (`memchr`-class routines) — the one dependency this
   ruling leaves optional.
