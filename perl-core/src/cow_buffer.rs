@@ -47,6 +47,353 @@ pub struct AllocError {
     pub requested: usize,
 }
 
+// ── Tiered allocations (§2.2.3) ───────────────────────────────────────────────────────────────────────────────────
+//
+// Four tiers, two shapes.  The *small* tiers (`Heap8`, `Heap16`) hold length, capacity, character count and scan
+// state in the envelope — eager facts established at construction, so the allocation carries a refcount and nothing
+// else.  The *large* tiers (`Heap32`, `Heap`) discover those facts lazily and share them, so they live in the
+// allocation where every holder sees one copy.
+//
+// That difference is not a width: it decides which operations can be told a length and which must read one.  The
+// macro therefore has two arms rather than one generic path, and the resulting signatures enforce the placement rule
+// — a small tier's `release` *takes* the capacity it must free, because nothing in its allocation can supply it,
+// while a large tier's takes only a pointer.  Getting that wrong is a compile error rather than a corruption.
+//
+// Every tier counts in 32 bits and aborts on overflow, following `Arc`.  The check is a compare on the value
+// `fetch_add` already returned; the alternative is a wrap to zero and a use-after-free.
+
+/// The refcount ceiling.  Reaching it needs 4,294,967,295 live handles and therefore at least 64 GiB of envelopes;
+/// the test exists because unchecked overflow wraps to zero, not because the ceiling is approachable.
+#[cfg_attr(not(test), allow(dead_code))]
+const REFCOUNT_CEILING: u32 = u32::MAX;
+
+/// Overflowing the refcount aborts rather than panicking, as `Arc` does.  Unwinding would run `Drop` impls that
+/// touch refcounts on a structure whose invariant has already failed, and `catch_unwind` could resume on top of a
+/// corrupt count.  An abort is not a panic: nothing catches it, so §1's no-panic rule is untouched.
+#[cold]
+#[inline(never)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn refcount_overflow() -> ! {
+    // `Arc` uses the same escape hatch for the same reason.
+    std::process::abort()
+}
+
+macro_rules! heap_tier {
+    // ── Small tiers: the envelope is authoritative, so the allocation is a bare refcount ──
+    ($tier:ident, width = $w:ty, meta = envelope) => {
+        // Staged migration: the tiers are exercised by tests until `PerlString`'s variants move over to them.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) mod $tier {
+            use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};
+            use std::alloc::{self, Layout};
+            use std::ptr::NonNull;
+            use std::sync::atomic::{AtomicU32, Ordering, fence};
+
+            /// The whole allocation header: a refcount.  Everything else this tier knows is in the envelope.
+            #[repr(C)]
+            struct Head {
+                refcount: AtomicU32,
+            }
+
+            /// Data begins this far into the allocation.
+            pub(crate) const HEADER: usize = size_of::<Head>();
+
+            /// The largest content this tier can address, which is what its envelope width can express.
+            pub(crate) const MAX_CAPACITY: usize = <$w>::MAX as usize;
+
+            /// The header sits immediately before the data.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            unsafe fn head<'a>(ptr: NonNull<u8>) -> &'a Head {
+                // SAFETY: the caller vouches for a live allocation, whose header precedes the data by `HEADER`.
+                unsafe { &*(ptr.as_ptr().sub(HEADER).cast::<Head>()) }
+            }
+
+            fn layout(capacity: usize) -> Result<Layout, AllocError> {
+                let size = HEADER.checked_add(capacity).ok_or(AllocError { requested: capacity })?;
+                Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
+            }
+
+            /// Allocate room for `capacity` bytes, refcount one.  The data is uninitialised: the caller writes it
+            /// and records the length in the envelope, which is the only place this tier keeps one.
+            pub(crate) fn allocate(capacity: $w) -> Result<NonNull<u8>, AllocError> {
+                let capacity = capacity as usize;
+                let layout = layout(capacity)?;
+
+                // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
+                let raw = unsafe { alloc::alloc(layout) };
+                let Some(base) = NonNull::new(raw) else {
+                    return Err(AllocError { requested: capacity });
+                };
+
+                // SAFETY: `base` is a fresh allocation of `layout`, aligned for `Head`.
+                unsafe { base.cast::<Head>().write(Head { refcount: AtomicU32::new(1) }) };
+
+                // SAFETY: `HEADER` is within the allocation by construction.
+                Ok(unsafe { NonNull::new_unchecked(base.as_ptr().add(HEADER)) })
+            }
+
+            /// One more handle.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn retain(ptr: NonNull<u8>) {
+                // SAFETY: the caller vouches for a live allocation.
+                let old = unsafe { head(ptr) }.refcount.fetch_add(1, Ordering::Relaxed);
+                if old == REFCOUNT_CEILING {
+                    refcount_overflow();
+                }
+            }
+
+            /// One fewer handle, freeing at the last.  Takes the capacity because the allocation does not record it
+            /// — that is the envelope's job in this tier, and the layout cannot be reconstructed without it.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`] with exactly `capacity`, and
+            /// the caller must not use `ptr` afterwards through this handle.
+            #[inline]
+            pub(crate) unsafe fn release(ptr: NonNull<u8>, capacity: $w) {
+                // SAFETY: the caller vouches for a live allocation.
+                if unsafe { head(ptr) }.refcount.fetch_sub(1, Ordering::Release) != 1 {
+                    return;
+                }
+
+                // Everything done through other handles happens-before the free.  The `Arc` protocol.
+                fence(Ordering::Acquire);
+
+                // A live allocation's layout was computable when it was made, so this cannot fail; leaking would be
+                // the only no-panic recourse if it somehow did, and is better than a mismatched deallocation.
+                if let Ok(layout) = layout(capacity as usize) {
+                    // SAFETY: last handle, and the allocation was made with exactly this layout — capacity never
+                    // changes for a given allocation, since growth allocates afresh.
+                    unsafe { alloc::dealloc(ptr.as_ptr().sub(HEADER), layout) };
+                }
+            }
+
+            /// Whether this is the only handle, which is what licenses mutation in place.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn is_unique(ptr: NonNull<u8>) -> bool {
+                // Acquire pairs with the release in `release`, so a buffer seen unique here really is.
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.refcount.load(Ordering::Acquire) == 1
+            }
+
+            /// The live handle count, for tests and diagnostics.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn refcount(ptr: NonNull<u8>) -> u32 {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.refcount.load(Ordering::Relaxed)
+            }
+        }
+    };
+
+    // ── Large tiers: the allocation is authoritative, because the facts are discovered lazily and shared ──
+    ($tier:ident, width = $w:ty, meta = header) => {
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) mod $tier {
+            use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};
+            use std::alloc::{self, Layout};
+            use std::ptr::NonNull;
+            use std::sync::atomic::{AtomicU8, AtomicU32, Ordering, fence};
+
+            /// The allocation header.  Unlike the small tiers, this one carries the metadata: at these sizes the
+            /// classifying pass is too expensive to run eagerly (§2.2.3), so scan state and character count are
+            /// filled lazily and must be visible to every holder.
+            #[repr(C)]
+            struct Head {
+                refcount: AtomicU32,
+                len: $w,
+                capacity: $w,
+
+                /// Cached flag-on character count (§2.2.4); zero means none, dual-purposed by the byte length.
+                char_count: AtomicU32,
+                scan: AtomicU8,
+            }
+
+            pub(crate) const HEADER: usize = size_of::<Head>();
+            pub(crate) const MAX_CAPACITY: usize = <$w>::MAX as usize;
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            unsafe fn head<'a>(ptr: NonNull<u8>) -> &'a Head {
+                // SAFETY: the caller vouches for a live allocation, whose header precedes the data by `HEADER`.
+                unsafe { &*(ptr.as_ptr().sub(HEADER).cast::<Head>()) }
+            }
+
+            /// # Safety
+            /// As [`head`], and the caller must hold the only handle.
+            #[inline]
+            unsafe fn head_mut<'a>(ptr: NonNull<u8>) -> &'a mut Head {
+                // SAFETY: the caller vouches for a live allocation and for uniqueness.
+                unsafe { &mut *(ptr.as_ptr().sub(HEADER).cast::<Head>()) }
+            }
+
+            fn layout(capacity: usize) -> Result<Layout, AllocError> {
+                let size = HEADER.checked_add(capacity).ok_or(AllocError { requested: capacity })?;
+                Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
+            }
+
+            /// Allocate room for `capacity` bytes, refcount one, length zero, no cached facts.
+            pub(crate) fn allocate(capacity: $w) -> Result<NonNull<u8>, AllocError> {
+                let layout = layout(capacity as usize)?;
+
+                // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
+                let raw = unsafe { alloc::alloc(layout) };
+                let Some(base) = NonNull::new(raw) else {
+                    return Err(AllocError { requested: capacity as usize });
+                };
+
+                // SAFETY: `base` is a fresh allocation of `layout`, aligned for `Head`.
+                unsafe {
+                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), len: 0, capacity, char_count: AtomicU32::new(0), scan: AtomicU8::new(0) });
+                }
+
+                // SAFETY: `HEADER` is within the allocation by construction.
+                Ok(unsafe { NonNull::new_unchecked(base.as_ptr().add(HEADER)) })
+            }
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn retain(ptr: NonNull<u8>) {
+                // SAFETY: the caller vouches for a live allocation.
+                let old = unsafe { head(ptr) }.refcount.fetch_add(1, Ordering::Relaxed);
+                if old == REFCOUNT_CEILING {
+                    refcount_overflow();
+                }
+            }
+
+            /// One fewer handle, freeing at the last.  Takes no capacity: this tier records its own.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`], unused afterwards through
+            /// this handle.
+            #[inline]
+            pub(crate) unsafe fn release(ptr: NonNull<u8>) {
+                // SAFETY: the caller vouches for a live allocation.
+                let header = unsafe { head(ptr) };
+                if header.refcount.fetch_sub(1, Ordering::Release) != 1 {
+                    return;
+                }
+
+                fence(Ordering::Acquire);
+                let capacity = header.capacity as usize;
+
+                if let Ok(layout) = layout(capacity) {
+                    // SAFETY: last handle, and the allocation was made with exactly this layout.
+                    unsafe { alloc::dealloc(ptr.as_ptr().sub(HEADER), layout) };
+                }
+            }
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn is_unique(ptr: NonNull<u8>) -> bool {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.refcount.load(Ordering::Acquire) == 1
+            }
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn refcount(ptr: NonNull<u8>) -> u32 {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.refcount.load(Ordering::Relaxed)
+            }
+
+            /// The authoritative length, which for this tier lives in the allocation.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn len(ptr: NonNull<u8>) -> usize {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.len as usize
+            }
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn capacity(ptr: NonNull<u8>) -> usize {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.capacity as usize
+            }
+
+            /// Record a new length.
+            ///
+            /// # Safety
+            /// As [`head_mut`]: a live allocation, and the caller must hold the only handle.  `len` must not exceed
+            /// the capacity, and the bytes below it must be initialised.
+            #[inline]
+            pub(crate) unsafe fn set_len(ptr: NonNull<u8>, len: $w) {
+                // SAFETY: the caller vouches for a live allocation and for uniqueness.
+                unsafe { head_mut(ptr) }.len = len;
+            }
+
+            /// The cached scan state (§2.2.4); zero is `UNKNOWN`.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn scan(ptr: NonNull<u8>) -> u8 {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.scan.load(Ordering::Relaxed)
+            }
+
+            /// Record a scan state.  Relaxed suffices: the value is a deterministic fact about bytes that are
+            /// immutable while shared, so a racing writer can only store the same answer.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn set_scan(ptr: NonNull<u8>, state: u8) {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.scan.store(state, Ordering::Relaxed);
+            }
+
+            /// The cached character count (§2.2.4); zero means none is cached.
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn char_count(ptr: NonNull<u8>) -> u32 {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.char_count.load(Ordering::Relaxed)
+            }
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn set_char_count(ptr: NonNull<u8>, count: u32) {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.char_count.store(count, Ordering::Relaxed);
+            }
+        }
+    };
+}
+
+heap_tier!(heap8, width = u8, meta = envelope);
+heap_tier!(heap16, width = u16, meta = envelope);
+heap_tier!(heap32, width = u32, meta = header);
+heap_tier!(heapw, width = usize, meta = header);
+
+// The placement rule, checked rather than described: a small tier's allocation is a refcount and nothing else.
+const _: () = assert!(heap8::HEADER == 4);
+const _: () = assert!(heap16::HEADER == 4);
+const _: () = assert!(heap8::MAX_CAPACITY == 255);
+const _: () = assert!(heap16::MAX_CAPACITY == 65535);
+const _: () = assert!(heap32::MAX_CAPACITY == 4_294_967_295);
+
 /// Heap header preceding the data bytes.
 #[repr(C)]
 struct Header {

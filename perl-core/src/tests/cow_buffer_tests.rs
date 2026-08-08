@@ -208,3 +208,151 @@ fn concurrent_scan_narrowing_races_are_benign() {
         assert!(h.join().is_ok());
     }
 }
+
+// ── Tiered allocations (§2.2.3) ───────────────────────────────
+
+/// The placement rule is meant to be enforced by signatures, not by discipline.  These exercise both shapes through
+/// the allocate/retain/release protocol and confirm the small tiers really do carry a refcount and nothing else.
+#[test]
+fn small_tier_allocations_carry_only_a_refcount() {
+    // SAFETY: every pointer below comes from this tier's `allocate` and is released exactly once per handle.
+    unsafe {
+        let cap: u8 = 200;
+        let ptr = heap8::allocate(cap).unwrap();
+        assert_eq!(heap8::refcount(ptr), 1);
+        assert!(heap8::is_unique(ptr));
+
+        // Writing through the data pointer is the caller's business; the tier only vouches for the room.
+        std::ptr::write_bytes(ptr.as_ptr(), b'x', cap as usize);
+        assert_eq!(std::slice::from_raw_parts(ptr.as_ptr(), 8), b"xxxxxxxx");
+
+        heap8::retain(ptr);
+        assert_eq!(heap8::refcount(ptr), 2);
+        assert!(!heap8::is_unique(ptr), "two handles is not unique");
+
+        heap8::release(ptr, cap);
+        assert!(heap8::is_unique(ptr), "back to one");
+        heap8::release(ptr, cap); // frees
+    }
+}
+
+#[test]
+fn large_tier_allocations_carry_their_own_metadata() {
+    // SAFETY: as above; `set_len` and `set_scan` are called while the single handle is held.
+    unsafe {
+        let cap: u32 = 100_000;
+        let ptr = heap32::allocate(cap).unwrap();
+        assert_eq!(heap32::capacity(ptr), cap as usize, "capacity is recorded, not passed back in");
+        assert_eq!(heap32::len(ptr), 0);
+        assert_eq!(heap32::scan(ptr), 0, "UNKNOWN is the zero-initialised state");
+        assert_eq!(heap32::char_count(ptr), 0, "no cached count");
+
+        heap32::set_len(ptr, 12_345);
+        assert_eq!(heap32::len(ptr), 12_345);
+        heap32::set_scan(ptr, 3);
+        assert_eq!(heap32::scan(ptr), 3);
+        heap32::set_char_count(ptr, 999);
+        assert_eq!(heap32::char_count(ptr), 999);
+
+        heap32::retain(ptr);
+        heap32::release(ptr); // takes no capacity: this tier knows its own
+        assert!(heap32::is_unique(ptr));
+        heap32::release(ptr);
+    }
+}
+
+/// The macro generates four modules, so all four are exercised through the whole protocol — otherwise a tier can be
+/// generated wrong and no test notices, which is precisely the failure a table-driven macro invites.
+macro_rules! small_tier_protocol {
+    ($tier:ident, $cap:expr) => {{
+        // SAFETY: the pointer comes from this tier's `allocate` and is released once per handle held.
+        unsafe {
+            let cap = $cap;
+            let ptr = $tier::allocate(cap).unwrap();
+            assert_eq!($tier::refcount(ptr), 1, concat!(stringify!($tier), ": born with one handle"));
+            assert!($tier::is_unique(ptr));
+            $tier::retain(ptr);
+            assert_eq!($tier::refcount(ptr), 2);
+            assert!(!$tier::is_unique(ptr));
+            $tier::release(ptr, cap);
+            assert!($tier::is_unique(ptr), concat!(stringify!($tier), ": back to one"));
+            $tier::release(ptr, cap);
+        }
+    }};
+}
+
+macro_rules! large_tier_protocol {
+    ($tier:ident, $cap:expr) => {{
+        // SAFETY: as above; the metadata setters run while the single handle is held.
+        unsafe {
+            let cap = $cap;
+            let ptr = $tier::allocate(cap).unwrap();
+            assert_eq!($tier::refcount(ptr), 1);
+            assert!($tier::is_unique(ptr));
+            assert_eq!($tier::capacity(ptr), cap as usize);
+            assert_eq!($tier::len(ptr), 0);
+            $tier::set_len(ptr, 7);
+            assert_eq!($tier::len(ptr), 7);
+            $tier::set_scan(ptr, 2);
+            assert_eq!($tier::scan(ptr), 2);
+            $tier::set_char_count(ptr, 5);
+            assert_eq!($tier::char_count(ptr), 5);
+            $tier::retain(ptr);
+            assert!(!$tier::is_unique(ptr));
+            $tier::release(ptr);
+            assert!($tier::is_unique(ptr));
+            $tier::release(ptr);
+        }
+    }};
+}
+
+#[test]
+fn all_four_tiers_honour_the_whole_protocol() {
+    small_tier_protocol!(heap8, 255u8);
+    small_tier_protocol!(heap16, 65_535u16);
+    large_tier_protocol!(heap32, 4096u32);
+    large_tier_protocol!(heapw, 4096usize);
+    assert_eq!(heap8::MAX_CAPACITY, 255);
+    assert_eq!(heap16::MAX_CAPACITY, 65_535);
+    assert_eq!(heap32::MAX_CAPACITY, u32::MAX as usize);
+    assert_eq!(heapw::MAX_CAPACITY, usize::MAX);
+}
+
+#[test]
+fn every_tier_allocates_at_its_ceiling_and_at_zero() {
+    // SAFETY: each pointer is from the matching tier's `allocate` and released once.
+    unsafe {
+        let p = heap8::allocate(0).unwrap();
+        assert!(heap8::is_unique(p));
+        heap8::release(p, 0);
+
+        let p = heap8::allocate(u8::MAX).unwrap();
+        heap8::release(p, u8::MAX);
+
+        let p = heap16::allocate(u16::MAX).unwrap();
+        assert_eq!(heap16::refcount(p), 1);
+        heap16::release(p, u16::MAX);
+
+        let p = heapw::allocate(4096).unwrap();
+        assert_eq!(heapw::capacity(p), 4096);
+        heapw::release(p);
+    }
+}
+
+#[test]
+fn an_unsatisfiable_tier_capacity_is_an_error_not_a_panic() {
+    // The word tier is the only one whose width can express a request the allocator cannot meet.
+    assert!(heapw::allocate(usize::MAX).is_err(), "capacity arithmetic overflow reports as AllocError");
+}
+
+#[test]
+fn tier_headers_match_the_placement_rule() {
+    // Small tiers: a refcount and nothing else.  Large tiers: refcount plus the shared lazily-filled facts.
+    assert_eq!(heap8::HEADER, 4);
+    assert_eq!(heap16::HEADER, 4);
+    // The large tiers pay for what they cache: a refcount plus length, capacity, character count and scan state.
+    assert_eq!(heap32::HEADER, 20, "u32 fields, padded to alignment 4");
+    assert_eq!(heapw::HEADER, 32, "usize lengths, padded to alignment 8");
+    assert_eq!(heap8::MAX_CAPACITY, 255);
+    assert_eq!(heap16::MAX_CAPACITY, 65_535);
+}
