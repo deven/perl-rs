@@ -254,6 +254,8 @@ enum ScalarPayload {
     HashRef(HashRef),
     HashRefTainted(HashRef),
     String(PerlString),              // taint in the PerlString tag
+    Dual(HeapArc<DualPayload>),      // both faces real (§2.3.4)
+    DualTainted(HeapArc<DualPayload>),
     True,
     False,
     // CodeRef and RegexRef arrive with their own designs.
@@ -482,13 +484,15 @@ tag — and needs only the five *terminal* states (`ASCII`,
 completely at construction (§2.2.7): checking at most 15 bytes is
 nearly free.  Discriminant-state arithmetic under the fused
 variants (§2.2.9): inline 5 (class) × 2 (family) × 2 (utf8) ×
-2 (warned) × 2 (tainted) = 80; packed 3 (alphabet) ×
-2 (family) × 2 × 2 × 2 = 48 (the class is fixed — packed
-alphabets are ASCII by construction); heap 2 × 2 × 2 = 8, its
-class living in the buffer header rather than the tag.  136
-string encodings plus the non-string residents still leave ample
-niche encodings for the enclosing `Value`/`ScalarCell` layouts
-(§2.3.6).
+2 (tainted) = 40; packed 3 (alphabet) × 2 (family) × 2 × 2 = 24
+(the class is fixed — packed alphabets are ASCII by
+construction); heap 2 × 2 = 4, its class living in the buffer
+header rather than the tag.  68 string encodings, the flag axis
+being utf8 and tainted only since the numification warning is
+suppressed by a cached numeric face rather than a tag bit
+(§2.3.4).  That plus the non-string residents leaves the
+enclosing `Value`/`ScalarCell` layouts (§2.3.6) most of the
+discriminant space.
 
 **The Perl flag and the scan cache must never be conflated.**
 Verified against container perl 5.38: `chr(0x110000)` is legal core
@@ -1675,14 +1679,55 @@ Container-verified contract (perl 5.38, all under `-w`):
   (`^A`).  Nothing is precomputed; the message (fragment, op name,
   use-site location) is composed entirely at emit time.
 
-Mechanism: the would-warn property is decidable from the payload at
-construction; the once-only state is one bit.  For strings it rides
-the `PerlString` tag (a tag transition at first numification — zero
-allocation, and slot-to-slot copies carry it automatically, matching
-the verified copy semantics).  For `Const` cells it is the
-`numify_warned` `AtomicBool`, present only when the payload can warn
-(most Const cells statically cannot and carry nothing).  Eager
-knowledge, lazy surfacing.
+**Mechanism: the suppressor is a cached numeric face, not a bit
+[DECISION].**  Perl has no warned flag.  Numifying `"12abc"` stores
+the salvaged number in the SV under `IOKp`/`NOKp`, and every later
+numification reads that cache instead of re-parsing — so warning
+once is a *consequence* of caching, not a separate piece of state.
+Modelling the symptom with a tag bit reproduced the observable but
+not the cause, and cost a third of the string tag's flag axis to do
+it.
+
+A value carrying a numeric face therefore does not warn, and a bare
+string does; numifying a bare warn-worthy string emits the warning
+and installs the face.  That unifies with `dualvar` and `$!`, which
+are the same shape — a string face and a numeric face, both
+authoritative — and which likewise never warn on numification.  One
+representation, `ScalarPayload::Dual`, serves both, and the once-only
+bit leaves the tag entirely.
+
+The payload is a `HeapArc<DualPayload>` holding a `PerlString` and a
+`Numeric` [DECISION].  It never mutates after construction, so
+sharing is free and unobservable, and copying a `Dual` is a refcount
+bump rather than the deep copy a `Box` would force on `$!` and on
+every numified string.  It holds no `Value`, so it cannot chain or
+cycle: the §2.4.9 teardown worklist classifies it as a leaf, like
+`String`.  The allocation is the cost, paid once per warn-worthy
+numification — the unusual and usually buggy case — and never for
+clean numeric strings, which re-parse instead.  Caching those too
+would buy speed at the price of an allocation per numeric value,
+which is the fat SV bought back through the side door; the digit
+caches go the other way (number to digits) precisely because they
+ride padding that already exists.
+
+The three observables fall out without any flag.  Copy a bare string
+and neither copy has a face, so both warn; copy a `Dual` and both
+share one, so both stay silent; numify an element in place and it
+keeps its face.  Container-verified, and note the third requires
+mutable access to the value being numified — perl needs it too,
+since `$arr[0] + 0` mutates the element's SV, so this is inherent to
+the semantics rather than an artifact of our representation.
+`"12abc"` and `"12abc"` in two scalars warn twice, because the state
+is per value and not per content.  Uninitialized-value warnings fire
+every time, so no other warn-once state exists to carry.
+
+`Dual` truth follows the **string** face, as perl's does
+(container-verified: `dualvar(0, "true")` is true, `dualvar(5, "0")`
+is false, `dualvar(0, "00")` is true) — which is simply perl's
+ordinary string-truth rule applied to the face that stringification
+would yield.  For `Const` cells the once-only state remains the
+`numify_warned` `AtomicBool`, present only where the payload can
+warn.
 
 #### 2.3.5 String equality and hashing:
 
