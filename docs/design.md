@@ -1413,6 +1413,70 @@ folds to 16 (the `Plain` payload's spare discriminant encodings
 absorb the cell's own tag, as `Option<Value>` does); the §2.3.6
 assertion battery rebases to 16 wholesale.
 
+#### 2.2.11 Scanning kernels [DECISION]:
+
+Two scans run over string bytes often enough to be worth writing
+by hand: finding where a leading digit run ends, which numeric
+parsing needs, and counting characters, which `char_len` needs on
+the heap tiers.  They want opposite shapes, and the difference is
+the design rather than an implementation detail.
+
+**A scan that wants a *position* uses masks; a scan that wants a
+*count* uses accumulators.**  The digit run exits at the first
+non-digit, so it compares into a mask register and takes the
+trailing-zero count, which locates the boundary exactly and needs
+no scalar walk over the block.  Character counting traverses
+everything, so it accumulates in-lane — the comparison yields
+all-ones lanes, and subtracting them adds one apiece — flushing
+through a widening reduction before the byte lanes overflow.
+Using the position idiom for counting is the trap: reducing a
+mask to a scalar per block forces a register-domain crossing and
+a serial dependency through a general register, measured at a
+quarter of the accumulator's throughput on x86 and worse on Arm.
+
+**Accumulator chains must be split.**  A single accumulator makes
+each iteration wait on the previous one's result, so the loop
+retires one block per dependency latency however many vector
+pipes exist.  Four independent accumulators over four blocks is
+2.66x on Apple silicon, where the two-cycle latency against
+16-byte blocks caps a single chain near 8 bytes per cycle; on x86
+the same change is worth about 1.12x, the one-cycle latency
+against 32-byte blocks leaving that loop port-limited rather than
+dependency-limited.  The generated code for the split version is
+64 bytes in twelve instructions with paired loads, close enough
+to the issue limit that nothing further is available.
+
+**Per-architecture block guards.**  Every vector path loses below
+its own block size, since a short input falls through to the
+scalar tail having paid for the vector setup.  The threshold is
+therefore the dispatched path's block size, not one constant: a
+twelve-character number — the commonest input numification sees
+— runs slower through every vector path than through the word
+loop on all three architectures.  Dispatch checks length before
+it checks features, so short inputs never reach the runtime
+feature cache at all.
+
+**Hand-written kernels rather than autovectorisation.**  LLVM
+does vectorise the portable word loop on aarch64, but the result
+is unstable and slower: the same source measured 29.1 B/ns as a
+standalone function and 15.5 B/ns inlined into a larger one, and
+the generated loop re-zeroes its accumulator every iteration
+rather than carrying it.  Against the hand-written kernel at 65.8
+B/ns that is a factor of two to four, and it moves with compiler
+version, inlining decisions, and edits to neighbouring code.
+Autovectorisation is an optimisation, not a contract; a
+hand-written kernel with differential tests against a scalar
+reference is a floor.  The portable word loop remains as the
+fallback where no hand-written path exists.
+
+**Measured throughput** (Apple M1 Pro and a Xeon with AVX-512,
+64 KiB inputs, L1-resident): digit run 52.1 B/ns with NEON and
+75.6 with AVX-512; character counting 65.8 B/ns with NEON and
+107.5 with AVX2.  WASM SIMD128 reaches 25.5 and 31.8 with
+`v128_any_true`, which is markedly better than `u8x16_bitmask`
+there — that instruction is an x86 idiom with no Arm equivalent,
+so a WASM host on Arm emulates it.
+
 #### 2.2.10 Containers: the ordered map [DECISION]:
 
 `PerlArray` is a dense `Vec` of slots (`Option<Value>`: a hole is
@@ -11253,7 +11317,8 @@ internal ordering follows the dependency structure of §2:
    `ScalarRef` clones, `ptr_eq` identity, upgrade triggers (§2.2.8).
 
 6. Containers — `PerlArray`/`PerlHash` with their handle types
-   (the ordered-map ruling is recorded in §2.2.10),
+   (the ordered-map ruling is recorded in §2.2.10, and the
+   scanning kernels `char_len` needs in §2.2.11),
    exists/delete semantics against the slot model.
 
 7. Iterative teardown — the runtime-owned mechanical release
