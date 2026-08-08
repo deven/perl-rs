@@ -409,74 +409,74 @@ unique-check mutation, nothing else.  Details:
   larger header it needs.  Perl by comparison pays roughly 110 µs
   to learn the same facts about a 64 KiB string, lazily.
 
-- **Refcount width follows the cost of leaking [DECISION].**  A
-  saturating refcount that stops counting becomes immortal, which
-  is safe and matches §2.4's `IMMORTAL` sentinel, so the width
-  question is how much a saturated string wastes rather than how
-  often saturation happens.  Saturation at `N` shares implies at
-  least `16N` bytes of live envelopes, so the leak is bounded by
-  `tier_max / (16 · 2^bits)` of the memory that caused it: a
-  16-bit count leaks at most 0.02% at `Heap8` and 6.25% at
-  `Heap16`, and a wider count at `Heap16` brings that back to
-  0.02%.  `Heap8` therefore counts in 16 bits and every larger
-  tier in 32 or more, putting the bound below 0.02% everywhere
-  [DECISION].
+- **A 32-bit refcount in every tier, and overflow aborts
+  [DECISION].**  Saturating into immortality was the earlier
+  ruling, on the grounds that a count which stops counting merely
+  leaks a bounded fraction of the memory that caused it.  It does
+  not survive implementation.  §2.4.7's `IMMORTAL` sentinel is
+  decided *at birth* — the boolean singletons are born immortal,
+  so clone and drop are no-ops from the first instant and no
+  transition ever occurs — whereas saturation must make a live,
+  concurrently-mutated count become immortal.  `fetch_add` and
+  `fetch_sub` both modify unconditionally, so a racing release can
+  walk a saturated count back down; making that sound needs either
+  a load before every retain *and* every release, paying the hot
+  path for a case that never happens, or a compare-exchange loop
+  with a margin whose reasoning is subtle enough to be a liability.
+
+  Aborting instead is free and obviously correct.  `Arc` sets the
+  precedent, and the test is the same one measured at 0.1% below.
+  `abort` rather than `panic`: unwinding would run `Drop` impls
+  that touch refcounts on a structure whose invariant has already
+  failed, and `catch_unwind` could resume atop a corrupt count.
+  This is not an exception to the no-panic rule (§1) — an abort is
+  not a panic, and nothing catches it.
+
+  The uniform width costs `Heap8` two bytes it would rather not
+  spend, which is the whole of what saturation was buying.  A
+  32-bit count overflows at 4,294,967,295 live handles, needing at
+  least 64 GiB of envelopes to reach; the check exists because the
+  alternative is a wrap to zero and a use-after-free, not because
+  the ceiling is approachable.
+
   Packing the count against the scan byte in one word — plausible
   while `Heap16` was lazy — is moot under the eager ruling, since
   the scan byte is in the envelope and the header has nothing to
   pack it with; it would also have made the increment unsafe,
   because a carry out of a 24-bit count corrupts the neighbouring
-  byte rather than merely saturating, which a whole-word count
-  never does.
+  byte where a whole-word count merely overflows detectably.
 
 - **How the ceiling is enforced [DECISION].**  Increment with
-  `fetch_add` and test the old value it returns, repairing on the
-  cold path.  Both alternatives fail, for opposite reasons.
-  Leaving the increment unchecked does not saturate, it *wraps to
+  `fetch_add` and test the old value it returns; abort on the cold
+  path.  Both alternatives fail, for opposite reasons.  Leaving the
+  increment unchecked does not stop at the ceiling, it *wraps to
   zero*, and the next release then frees a buffer with billions of
-  live handles.  A compare-exchange loop does saturate, but
+  live handles.  A compare-exchange loop stops correctly but
   measures 84% slower than a plain `fetch_add` — 11.6 ns against
   6.3 — a tax on every clone.  The test costs 0.1%: a compare on a
   register the increment already produced, under a branch the
   predictor never misses, in the shadow of a locked
-  read-modify-write that costs 6 ns unaided.  With the repair on a
-  path taken at most once, saturation and abort cost the same, so
-  the choice is semantic; saturation wins because `Heap8` needs it
-  regardless, and one policy is less code than two.
+  read-modify-write that costs 6 ns unaided.
 
-  The two tiers reach the ceiling on different terms.  `Heap8`
-  saturates at 65,535 shares — roughly a mebibyte of live
-  envelopes around a string of at most 255 bytes, which a program
-  really can reach by sharing one small string that widely — so
-  the immortal transition there is a state to expect.  A 32-bit
-  count saturates at 4,294,967,295 shares, needing 64 GiB of
-  envelopes: not a bound protecting against anything, only the
-  point past which the arithmetic cannot continue.  Its test will
-  never fire, which is the reason to document it rather than to
-  mistake it for dead weight.
-
-  Retagging a saturated handle so later clones skip the atomic
-  entirely is a dead end, and instructively so.  The tag is
-  per-handle, so it would not stop the other sharers counting; the
-  saturated buffer is in the general allocator, not the immortal
-  slab, so it cannot reuse that variant's teardown path; and
-  observing saturation before incrementing — which is what skipping
-  the increment requires — replaces a free test with a load on
-  *every* clone to save one on clones that need 65,535 live handles
-  to exist.  Immortality known at birth is free, which is precisely
-  why `Immortal` and `Static` carry no count at all; immortality
-  discovered at saturation cannot be, because discovering it costs
-  the operation it would avoid.
+  Retagging a handle at the ceiling so later clones skip the atomic
+  is a dead end, and instructively so.  The tag is per-handle, so
+  it would not stop the other sharers counting; the buffer is in the
+  general allocator, not the immortal slab, so it cannot reuse that
+  variant's teardown path; and observing the state before
+  incrementing — which is what skipping the increment requires —
+  replaces a free test with a load on *every* clone.  Immortality
+  known at birth is free, which is precisely why `Immortal` and
+  `Static` carry no count at all; immortality discovered at a
+  ceiling cannot be, because discovering it costs the operation it
+  would avoid.
 
 - **Header shapes.**  `Heap8`: refcount only, with `len`,
   `capacity`, character count and scan byte in the envelope beside
   the pointer (and `Heap8Ascii` omitting the last two).  `Heap16`:
   the same, at `u16` widths — `len`, `capacity`, count and scan
-  fill the seven spare envelope bytes exactly — with a 32-bit
-  refcount, whose four bytes are under 1.6% of content that is at
-  least 256 bytes by construction.  A header's alignment follows
-  its count, so content begins two bytes past the allocation base
-  at `Heap8` and four at `Heap16`.  `Heap32`: a
+  fill the seven spare envelope bytes exactly.  Every tier counts
+  in 32 bits, so a small tier's header is four bytes and content
+  begins four bytes past the allocation base.  `Heap32`: a
   `{refcount, len, capacity, char_count, scan}` header with `u32`
   fields, and a `u32` length mirror in the envelope so the common
   length question skips the dereference.  `Heap`: the same with
