@@ -109,6 +109,32 @@ a construct *means* — array `into_iter` yields values rather than references
 from 2021, closures capture disjoint fields — so identical source can compile
 to different code.  Build benchmarks with `--edition=2024` to match the crate.
 
+## Confirm what landed, not what was intended
+
+The same failure appears in a second guise: measuring or verifying a tree that
+does not contain the change.  A scripted edit whose anchor no longer matches
+writes nothing; the assertion aborts, `git commit` reports a clean tree, and
+every check afterwards passes — against the old code.  Tests, wrap checks,
+and lint runs cannot catch this: they are all correct about a tree where
+nothing happened.
+
+Both symptoms are visible in output already being produced:
+
+- **After a commit, the hash and subject must be the new ones.**  An unchanged
+  hash is the whole report.  This is cheaper than adding a `git status` step,
+  and it was already on screen when it was missed.
+- **After a scripted edit, a non-empty diff proves the anchors matched.**
+  A script that replaces N sites should say how many it replaced, and the
+  number should be the expected one — a pattern matching N when N-1 was meant
+  produced infinite recursion once by rewriting a helper's own tail.
+
+The same discipline applies to what is being benchmarked.  Every x86 kernel
+figure in this file's history was measured against a copy of the algorithm
+written fresh in the harness, not against the crate's own code — which is how
+an AVX2 kernel sat for several commits still using an inferior formulation that
+had already been measured and rejected.  No amount of benchmarking finds that;
+one look at the emitted assembly does.
+
 ## Checklist
 
 1. Does the reference row read exactly 1.00?
@@ -119,3 +145,6 @@ to different code.  Build benchmarks with `--edition=2024` to match the crate.
 5. Is the variance small enough for the difference claimed?
 6. Do the compared variants differ in exactly one way?
 7. Has the assembly been read before any explanation is offered for *why*?
+8. Is the code being measured the code that ships, or a copy of it?
+9. Did the commit hash change, and did the scripted edit report the expected
+   number of replacements?
