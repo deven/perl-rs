@@ -640,8 +640,7 @@ macro_rules! define_perl_string {
                 }
             }
 
-            /// Rebuild a heap value with the given tag dimensions (buffer preserved).  Build a packed value with the
-            /// given alphabet, length family, and tag dimensions.
+            /// Build a packed value with the given alphabet, length family, and tag dimensions.
             fn build_packed(packed: Packed, utf8: bool, tainted: bool) -> PerlString {
                 match (packed.alphabet, packed.full, utf8, tainted) {
                     $( (PackedAlphabet::$packed_alphabet, $packed_full, $packed_utf8, $packed_tainted) => PerlString(Repr::$packed { nibbles: packed.nibbles }), )*
@@ -883,6 +882,7 @@ macro_rules! define_perl_string {
                 }
             }
 
+            /// Rebuild a heap value with the given tag dimensions (buffer preserved).
             fn build_heap(utf8: bool, tainted: bool, parts: HeapParts) -> PerlString {
                 // The one place the obligation leaves a `HeapParts` without releasing: the variant built below is its
                 // next owner.  `E0509` forbids the plain destructure now that `HeapParts` owns a `Drop`, which is the
@@ -1121,11 +1121,6 @@ fn expand_latin1(b: u8, out: &mut [u8]) -> usize {
     }
 }
 
-/// Classify content into its canonical inline form: the class, the two nibbles, and the payload — `None` when no inline
-/// form holds it, packed and heap lying past (§2.2.9's ladder, inline rungs).  Determinism is disjointness: valid
-/// Latin-1-range UTF-8 always compresses — up to thirty input bytes — and the verbatim classes hold exactly the
-/// fifteen-byte-or-shorter content failing that test, the Bytes class by default when the tag rules out every other.
-/// The flag is never consulted: the class is a fact about the bytes.
 /// Allocate heap parts for `bytes`, classifying eagerly where the tier keeps its scan state in the envelope.
 ///
 /// §2.2.3 pairs the small tiers with eager classification, and the two go together necessarily: with no scan byte
@@ -1142,6 +1137,11 @@ fn heap_parts_classified(bytes: &[u8]) -> Result<HeapParts, AllocError> {
     Ok(parts)
 }
 
+/// Classify content into its canonical inline form: the class, the two nibbles, and the payload — `None` when no inline
+/// form holds it, packed and heap lying past (§2.2.9's ladder, inline rungs).  Determinism is disjointness: valid
+/// Latin-1-range UTF-8 always compresses — up to thirty input bytes — and the verbatim classes hold exactly the
+/// fifteen-byte-or-shorter content failing that test, the Bytes class by default when the tag rules out every other.
+/// The flag is never consulted: the class is a fact about the bytes.
 fn classify_inline(bytes: &[u8]) -> Option<(InlineClass, usize, usize, [u8; INLINE_MAX])> {
     if let Some((cp, s, h)) = decode_latin1_range(bytes) {
         let class = if h == 0 { InlineClass::Ascii } else { InlineClass::Latin1 };

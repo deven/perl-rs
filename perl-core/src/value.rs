@@ -796,10 +796,8 @@ impl Value {
         }
     }
 
-    /// `$$r` — scalar dereference: the identity behind a reference value (through the aliasing variant if the slot is
-    /// promoted).  `None` for non-references; the "Not a SCALAR reference" error is ops-layer.  `@$r` — array
-    /// dereference: the shared identity behind an array-reference value (through the aliasing variant if the slot is
-    /// promoted).  "Not an ARRAY reference" is ops-layer.
+    /// `@$r` — array dereference: the shared identity behind an array-reference value (through the aliasing variant if
+    /// the slot is promoted).  "Not an ARRAY reference" is ops-layer.
     pub fn deref_array(&self) -> Option<ArrayRef> {
         fn from_payload(p: &ScalarPayload) -> Option<ArrayRef> {
             match p {
@@ -833,6 +831,8 @@ impl Value {
         }
     }
 
+    /// `$$r` — scalar dereference: the identity behind a reference value (through the aliasing variant if the slot is
+    /// promoted).  `None` for non-references; the "Not a SCALAR reference" error is ops-layer.
     pub fn deref_scalar(&self) -> Option<ScalarRef> {
         fn from_payload(p: &ScalarPayload) -> Option<ScalarRef> {
             match p {
