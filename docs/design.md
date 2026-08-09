@@ -3503,6 +3503,17 @@ consequences below follow from it.  A shape that would serve an
 interpreter well enough — because an interpreter can be told to work
 around it — must stand on its own for a caller who cannot be.
 
+One vocabulary rule governs the whole surface: `unsafe` is reserved
+for preconditions whose violation causes undefined behavior, and for
+nothing else.  Resource obligations — a pointer the caller now owes a
+release on, a value that must reach a consumer — are enforced by
+types and dynamic checks and documented in prose, never by the
+keyword.  This is the standard library's own division
+(`Box::into_raw` is safe; `Box::from_raw` is not), and it keeps the
+audit channel pure: every `unsafe` block in the crate means UB is
+possible at that spot, so a reviewer reading SAFETY comments is
+reading the complete list of places soundness can be lost.
+
 #### 2.7.1 Fallible operations and Rust's fixed signatures:
 
 The no-panic rule and Rust's operator traits collide.  `Add::add`,

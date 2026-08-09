@@ -211,8 +211,8 @@ fn concurrent_scan_narrowing_races_are_benign() {
 
 // ── Tiered allocations (§2.2.3) ───────────────────────────────
 
-/// The placement rule is meant to be enforced by signatures, not by discipline.  These exercise both shapes through
-/// the allocate/retain/release protocol and confirm the small tiers really do carry a refcount and nothing else.
+/// The placement rule is meant to be enforced by signatures, not by discipline.  These exercise both shapes through the
+/// allocate/retain/release protocol and confirm the small tiers really do carry a refcount and nothing else.
 #[test]
 fn small_tier_allocations_carry_only_a_refcount() {
     // SAFETY: every pointer below comes from this tier's `allocate` and is released exactly once per handle.
@@ -350,6 +350,7 @@ fn tier_headers_match_the_placement_rule() {
     // Small tiers: a refcount and nothing else.  Large tiers: refcount plus the shared lazily-filled facts.
     assert_eq!(heap8::HEADER, 4);
     assert_eq!(heap16::HEADER, 4);
+
     // The large tiers pay for what they cache: a refcount plus length, capacity, character count and scan state.
     assert_eq!(heap32::HEADER, 20, "u32 fields, padded to alignment 4");
     assert_eq!(heapw::HEADER, 32, "usize lengths, padded to alignment 8");
@@ -359,22 +360,29 @@ fn tier_headers_match_the_placement_rule() {
 
 #[test]
 fn owned_carries_the_release_obligation_and_nothing_else() {
-    // `Owned` exists so that reading a pointer out of a heap variant is a compile error rather than a silent
-    // double release — `E0509` fires only for non-`Copy` fields, and a bare `NonNull` would be copied out while
-    // the source still dropped.  That property is checked by the compiler, not here; what this pins is that the
-    // marker is a capability and not a second authority: it is pointer-sized and knows nothing about the buffer.
+    // `Owned` exists so that reading a pointer out of a heap variant is a compile error rather than a silent double
+    // release — `E0509` fires only for non-`Copy` fields, and a bare `NonNull` would be copied out while the source
+    // still dropped.  That property is checked by the compiler, not here; what this pins is that the marker is a
+    // capability and not a second authority: it is pointer-sized and knows nothing about the buffer.
     assert_eq!(size_of::<Owned>(), size_of::<std::ptr::NonNull<u8>>(), "no state, no cost");
 
-    // SAFETY: the pointer comes from this tier's `allocate`, is wrapped once, and is released exactly once.
-    unsafe {
-        let cap = 64u16;
-        let raw = heap16::allocate(cap).unwrap();
-        let owned = Owned::from_raw(raw);
-        assert_eq!(owned.as_ptr(), raw, "reads do not transfer the obligation");
-        assert_eq!(heap16::refcount(owned.as_ptr()), 1);
+    let cap = 64u16;
+    let raw = heap16::allocate(cap).unwrap();
 
-        // Handing the obligation onward must not release: `into_raw` forgets rather than drops.
-        let handed_on = owned.into_raw();
+    // SAFETY: freshly allocated with one reference, which this `Owned` takes on.
+    let owned = unsafe { Owned::from_raw(raw) };
+    assert_eq!(owned.as_ptr(), raw, "reads do not transfer the obligation");
+
+    // SAFETY: a live allocation of this tier.
+    assert_eq!(unsafe { heap16::refcount(owned.as_ptr()) }, 1);
+
+    // Handing the obligation onward must not release — and it is a safe call, per `Box::into_raw`'s precedent: the only
+    // misuse it permits is a leak, which is the bomb's jurisdiction.  Only reconstitution and release need `unsafe`,
+    // and the blocks above and below now mark exactly the places UB is possible.
+    let handed_on = owned.into_raw();
+
+    // SAFETY: a live allocation, whose one outstanding reference this release consumes.
+    unsafe {
         assert_eq!(heap16::refcount(handed_on), 1, "still exactly one outstanding release");
         heap16::release(handed_on, cap);
     }

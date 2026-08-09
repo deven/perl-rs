@@ -155,12 +155,18 @@ impl Owned {
         }
     }
 
-    /// Give up the obligation without releasing, for the sites that hand it onward.
+    /// Give up the obligation without releasing: the caller now owes exactly one release on the returned pointer, and
+    /// this is where the tracking ends — past here, only the test-build allocation counters still see it.
     ///
-    /// # Safety
-    /// The caller takes over the responsibility to release exactly once.
+    /// Safe, deliberately, and by the standard library's own precedent (`Box::into_raw`, `Arc::into_raw`,
+    /// `mem::forget`): `unsafe` marks preconditions whose violation causes undefined behavior, and there is nothing
+    /// safe code can do with the returned pointer that does — dereferencing, releasing and reconstituting are all
+    /// behind their own `unsafe` gates.  Misuse of this function alone is a leak, which is the bomb's and the counters'
+    /// jurisdiction, not the keyword's.  Contrast [`Owned::from_raw`], which is genuinely unsafe: it mints a value
+    /// whose entirely safe destruction performs a release predicated on the refcount the caller claimed to hold.  UB
+    /// enters at reconstitution, never at discharge.
     #[inline]
-    pub(crate) unsafe fn into_raw(mut self) -> NonNull<u8> {
+    pub(crate) fn into_raw(mut self) -> NonNull<u8> {
         self.claim()
     }
 }
