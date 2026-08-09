@@ -769,20 +769,30 @@ macro_rules! define_perl_string {
                 let new_len = old_len - contractions;
 
                 // SAFETY (each arm): unique and shrinking, both established above.  The contracted octets can
-                // themselves be valid UTF-8, so the class is not derivable here: the caches are cleared and the
-                // next reader re-derives them.
+                // themselves be valid UTF-8, so the class is not derivable without a scan — and here the tiers part
+                // ways.  A large tier records UNKNOWN and lets the next reader both derive and store.  A small tier has
+                // nowhere to store a later discovery, so UNKNOWN there means re-deriving on every read forever; it must
+                // classify now, exactly as construction does, and at these sizes the pass costs what the construction
+                // pass cost.  The audit caught this arm writing UNKNOWN into the envelope: (1, 1) scans across two
+                // validity reads where (1, 0) is the invariant.
                 match &mut self.0 {
                     $( Repr::$h8 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u8;
-                        *count = 0;
-                        *scan = scan::UNKNOWN;
+
+                        // SAFETY: the first `new_len` bytes were just written by the contraction.
+                        let (state, chars) = classify_full(unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr(), new_len) });
+                        *count = chars as u8;
+                        *scan = state;
                     }, )*
                     $( Repr::$h16 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u16;
-                        *count = 0;
-                        *scan = scan::UNKNOWN;
+
+                        // SAFETY: the first `new_len` bytes were just written by the contraction.
+                        let (state, chars) = classify_full(unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr(), new_len) });
+                        *count = chars as u16;
+                        *scan = state;
                     }, )*
                     $( Repr::$h32 { ptr, mirror } => {
                         unsafe {
@@ -820,11 +830,11 @@ macro_rules! define_perl_string {
 
             /// The payload behind the tag, owned — the shape mutation needs, since it rebuilds the tag afterward.
             fn into_raw(self) -> RawOwned {
-                // `Owned` is not `Copy`, so taking a heap variant's pointer out is a genuine move, and `Repr`'s
-                // `Drop` forbids that (E0509).  The refusal is the point: a `Copy` pointer would be read out here
-                // while `self` still dropped, releasing an allocation the caller believes it owns.  Matching on a
-                // reference and reading the one non-`Copy` field makes the transfer explicit, and suppressing the
-                // source's drop is what makes it sound.
+                // `Owned` is not `Copy`, so taking a heap variant's pointer out is a genuine move, and `Repr`'s `Drop`
+                // forbids that (E0509).  The refusal is the point: a `Copy` pointer would be read out here while `self`
+                // still dropped, releasing an allocation the caller believes it owns.  Matching on a reference and
+                // reading the one non-`Copy` field makes the transfer explicit, and suppressing the source's drop is
+                // what makes it sound.
                 let this = core::mem::ManuallyDrop::new(self);
 
                 // SAFETY (each heap arm): `this` is never dropped, so the pointer is read out exactly once and the
@@ -874,12 +884,13 @@ macro_rules! define_perl_string {
             }
 
             fn build_heap(utf8: bool, tainted: bool, parts: HeapParts) -> PerlString {
-                // The one place the obligation leaves a `HeapParts` without releasing: the variant built below is
-                // its next owner.  `E0509` forbids the plain destructure now that `HeapParts` owns a `Drop`, which
-                // is the compiler confirming this transfer must be spelled out.
+                // The one place the obligation leaves a `HeapParts` without releasing: the variant built below is its
+                // next owner.  `E0509` forbids the plain destructure now that `HeapParts` owns a `Drop`, which is the
+                // compiler confirming this transfer must be spelled out.
                 let mut parts = core::mem::ManuallyDrop::new(parts);
                 let ptr = parts.ptr.claim();
                 let (len, cap, count, scan, tier) = (parts.len, parts.cap, parts.count, parts.scan, parts.tier);
+
                 // SAFETY: `ptr` was claimed above and every field is `Copy`; the `ManuallyDrop` shell holds only a
                 // disarmed `Owned` and is never dropped.
                 let ptr = unsafe { Owned::from_raw(ptr) };

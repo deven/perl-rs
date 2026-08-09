@@ -4121,6 +4121,30 @@ fn downgrade_refuses_content_past_the_latin1_range() {
     assert!(wide.is_utf8(), "still flagged");
 }
 
+#[test]
+fn downgraded_small_tier_is_classified_not_left_unknown() {
+    // Regression for the audit's second finding: the in-place downgrade wrote UNKNOWN into a small tier's envelope, and
+    // narrow_scan is deliberately a no-op there, so every subsequent validity question re-derived — (1, 1) scans across
+    // two reads.  The rule is the same one construction follows: below 64 KiB the state is settled now or never.
+    let mut s = PerlString::from_str(&"é".repeat(20)).unwrap();
+    assert!(s.storage_type().is_small_heap_tier());
+    assert!(s.downgrade_in_place().unwrap());
+
+    // The downgrade itself paid the classifying pass, so the state is terminal and every read is a state read.
+    assert_ne!(s.scan_state(), scan::UNKNOWN, "a small tier is never left indeterminate (§2.2.3)");
+    eq_probe::reset();
+    let _ = s.is_perl_utf8_valid();
+    let _ = s.is_perl_utf8_valid();
+    assert_eq!(eq_probe::scans().0, 0, "both reads answered from the state the downgrade recorded");
+
+    // Oracle: the recorded state and count must be exactly what constructing from the same bytes records.
+    let mut buf = [0u8; DECODE_MAX];
+    let bytes = s.as_bytes(&mut buf).to_vec();
+    let fresh = PerlString::from_bytes(&bytes).unwrap();
+    assert_eq!(s.scan_state(), fresh.scan_state(), "in-place downgrade agrees with construction");
+    assert_eq!(s.char_len(), fresh.char_len(), "and on the cached count");
+}
+
 // ── Leak accounting (the bomb's second layer) ──────────────────────────────
 
 #[test]
