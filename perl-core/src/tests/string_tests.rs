@@ -4028,3 +4028,95 @@ fn char_count_zero_is_dual_purposed_by_the_byte_length() {
     assert_eq!(off.char_len(), Some(40), "char_len answers the flag-on question for either handle");
     assert_eq!(off.len(), 80, "the flag-off length answer is the byte length the envelope already knows");
 }
+
+// ── In-place transforms (§2.2.3) ──────────────────────────────
+
+/// The address of a heap string's data, for proving a rewrite stayed where it was.
+fn heap_addr(s: &PerlString) -> Option<usize> {
+    match s.raw_parts() {
+        RawParts::Heap(view) => Some(view.as_slice().as_ptr() as usize),
+        _ => None,
+    }
+}
+
+#[test]
+fn upgrade_moves_when_the_expansion_does_not_fit() {
+    // A buffer born sized exactly to its content has no room for an upgrade that doubles the length, so this one must
+    // move.  Nothing in the public API reveals whether a rewrite reallocated, so the allocation's address is the
+    // witness.
+    let mut s = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    assert!(s.storage_type().is_small_heap_tier());
+    let before = heap_addr(&s).expect("heap-resident");
+    let cap_before = match s.raw_parts() {
+        RawParts::Heap(v) => v.capacity(),
+        _ => unreachable!(),
+    };
+
+    // Born sized to its content, so 40 Latin-1 bytes expanding to 80 cannot fit and must move.
+    assert!(cap_before < 80, "the premise: this one has to reallocate");
+    s.upgrade_in_place().unwrap();
+    assert_eq!(s.len(), 80, "each Latin-1 byte becomes two UTF-8 bytes");
+    assert!(s.is_utf8());
+    assert_ne!(heap_addr(&s), Some(before), "no room, so the copying form ran");
+}
+
+#[test]
+fn upgrade_rewrites_in_place_when_the_expansion_fits() {
+    // A contraction leaves its spare capacity behind — §2.2.3 defers trimming deliberately — so a downgraded buffer
+    // holds exactly the headroom its own re-upgrade needs.  The round trip is therefore both the natural test and the
+    // case where in-place rewriting is reachable at all, birth allocation being exact.
+    let mut s = PerlString::from_str(&"é".repeat(40)).unwrap();
+    assert!(s.downgrade_in_place().unwrap());
+    assert_eq!(s.len(), 40);
+
+    let after_downgrade = heap_addr(&s).expect("heap-resident");
+    let spare = match s.raw_parts() {
+        RawParts::Heap(v) => v.capacity(),
+        _ => unreachable!(),
+    };
+    assert!(spare >= 80, "the contraction kept room for its own reversal");
+
+    s.upgrade_in_place().unwrap();
+    assert_eq!(s.len(), 80, "back to the UTF-8 encoding");
+    assert!(s.is_utf8());
+    assert_eq!(heap_addr(&s), Some(after_downgrade), "the rewrite stayed in the allocation it found");
+    assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("é".repeat(40).as_str()), "and round-trips exactly");
+    assert_eq!(s.char_len(), Some(40), "the count the rewrite recorded, not a rescan");
+}
+
+#[test]
+fn downgrade_rewrites_in_place_and_never_reallocates() {
+    // Contraction only shrinks, so it always fits: the buffer must be the same one afterwards, whatever its tier.
+    let mut s = PerlString::from_str(&"é".repeat(40)).unwrap();
+    assert!(s.is_utf8());
+    let before = heap_addr(&s).expect("heap-resident");
+
+    assert!(s.downgrade_in_place().unwrap(), "Latin-1 range contracts");
+    assert_eq!(s.len(), 40, "two UTF-8 bytes become one Latin-1 byte");
+    assert!(!s.is_utf8());
+    assert_eq!(heap_addr(&s), Some(before), "contraction never reallocates (§2.2.3)");
+    assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &[0xE9u8; 40]);
+}
+
+#[test]
+fn a_shared_buffer_forces_the_copying_form() {
+    // Neither rewrite may touch bytes another handle can see, so sharing sends both down the copying path.
+    let original = PerlString::from_str(&"é".repeat(40)).unwrap();
+    let mut copy = original.clone();
+    let shared_addr = heap_addr(&original).expect("heap-resident");
+    assert_eq!(heap_addr(&copy), Some(shared_addr), "the clone shares the allocation");
+
+    assert!(copy.downgrade_in_place().unwrap());
+    assert_ne!(heap_addr(&copy), Some(shared_addr), "shared: contracted into a buffer of its own");
+    assert_eq!(original.len(), 80, "the other handle is untouched");
+    assert!(original.is_utf8());
+}
+
+#[test]
+fn downgrade_refuses_content_past_the_latin1_range() {
+    let mut wide = PerlString::from_str(&"字".repeat(20)).unwrap();
+    let before = heap_addr(&wide).expect("heap-resident");
+    assert!(!wide.downgrade_in_place().unwrap(), "a character past U+00FF cannot contract");
+    assert_eq!(heap_addr(&wide), Some(before), "and the refusal leaves the buffer alone");
+    assert!(wide.is_utf8(), "still flagged");
+}

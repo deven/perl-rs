@@ -240,12 +240,73 @@ impl HeapParts {
     }
 }
 
+/// Rewrite `bytes[first..old_len]` in place as the UTF-8 upgrade of its Latin-1 content, returning the new length.
+///
+/// Tier-independent: this is byte manipulation inside one allocation, and every tier-specific question — is there room,
+/// is the buffer unique, where does the new length get recorded — belongs to the caller, which is the only code that
+/// can see the envelope (§2.2.3).
+///
+/// # Safety
+/// `base` must own a live allocation, unique to the caller, with at least `old_len + expansion` bytes of capacity,
+/// where `expansion` is [`CowBuffer::variant_count`] of the region from `first`.  The first `old_len` bytes must be
+/// initialised.
+pub(crate) unsafe fn expand_latin1_in_place(base: NonNull<u8>, first: usize, old_len: usize, new_len: usize) {
+    // SAFETY: both cursors descend from the ends of their regions, `dst` leading `src` by the expansions still owed
+    // and meeting it exactly at `first`, so no write lands on a byte not yet read.  The caller vouches for the room.
+    unsafe {
+        let base = base.as_ptr();
+        let (mut src, mut dst) = (old_len, new_len);
+        while src > first {
+            src -= 1;
+            let byte = *base.add(src);
+            if byte < 0x80 {
+                dst -= 1;
+                *base.add(dst) = byte;
+            } else {
+                dst -= 2;
+                *base.add(dst) = 0xC0 | (byte >> 6);
+                *base.add(dst + 1) = 0x80 | (byte & 0x3F);
+            }
+        }
+        debug_assert_eq!(dst, first, "the cursors must meet at the first variant byte");
+    }
+}
+
+/// Rewrite `bytes[first..old_len]` in place as the Latin-1 contraction of its UTF-8 content.
+///
+/// Contraction only ever shrinks, so it needs no room and can never leave its tier — which is why, unlike the upgrade,
+/// it has no fallback to the copying form on capacity grounds.
+///
+/// # Safety
+/// `base` must own a live allocation, unique to the caller, whose first `old_len` bytes are initialised and whose
+/// region from `first` contracts to exactly `new_len` (per [`CowBuffer::latin1_contractions`]).
+pub(crate) unsafe fn contract_latin1_in_place(base: NonNull<u8>, first: usize, old_len: usize, new_len: usize) {
+    // SAFETY: shrinking, so every write lands inside the existing region; `dst` trails `src` by the sequences already
+    // collapsed, reaching `new_len` exactly as `src` reaches `old_len`.
+    unsafe {
+        let base = base.as_ptr();
+        let (mut src, mut dst) = (first, first);
+        while src < old_len {
+            let byte = *base.add(src);
+            if byte < 0x80 {
+                *base.add(dst) = byte;
+                src += 1;
+            } else {
+                *base.add(dst) = ((byte & 0x03) << 6) | (*base.add(src + 1) & 0x3F);
+                src += 2;
+            }
+            dst += 1;
+        }
+        debug_assert_eq!(dst, new_len, "the counted contraction must land exactly");
+    }
+}
+
 /// A borrowed look at a heap buffer, whatever its tier.
 ///
-/// The four-way dispatch lives here and nowhere else: the metadata is read at construction from whichever place
-/// that tier keeps it — the envelope for the small tiers, the allocation for the large — so every reader below is
-/// tier-agnostic.  Lazy filling is the exception and is offered only where it applies (§2.2.3): a small tier is
-/// scanned eagerly at construction, so it has nothing to fill in later.
+/// The four-way dispatch lives here and nowhere else: the metadata is read at construction from whichever place that
+/// tier keeps it — the envelope for the small tiers, the allocation for the large — so every reader below is
+/// tier-agnostic.  Lazy filling is the exception and is offered only where it applies (§2.2.3): a small tier is scanned
+/// eagerly at construction, so it has nothing to fill in later.
 pub(crate) struct HeapView<'a> {
     ptr: NonNull<u8>,
     len: usize,
@@ -920,7 +981,7 @@ impl CowBuffer {
 
     /// Count the bytes at or above `0x80` — the ones that take two bytes under UTF-8.  Word-at-a-time, matching perl's
     /// `variant_under_utf8_count`; the per-byte form costs three times as much over a long buffer.
-    fn variant_count(bytes: &[u8]) -> usize {
+    pub(crate) fn variant_count(bytes: &[u8]) -> usize {
         const HIGH: u64 = 0x8080_8080_8080_8080;
         let mut count = 0u32;
         let mut chunks = bytes.chunks_exact(8);
@@ -932,7 +993,7 @@ impl CowBuffer {
 
     /// The offset of the first byte at or above `0x80`, or `None` when every byte is invariant.  Word-at-a-time with an
     /// early exit: the invariant prefix needs no rewriting, so finding it cheaply is what lets the upgrade skip it.
-    fn first_variant(bytes: &[u8]) -> Option<usize> {
+    pub(crate) fn first_variant(bytes: &[u8]) -> Option<usize> {
         const HIGH: u64 = 0x8080_8080_8080_8080;
         let mut offset = 0;
         let mut chunks = bytes.chunks_exact(8);
@@ -970,7 +1031,7 @@ impl CowBuffer {
 
     /// Count the two-byte sequences in `bytes`, or `None` when any byte is not part of a Latin-1-range encoding —
     /// exactly the content perl's downgrade refuses.  The count is what the contraction removes.
-    fn latin1_contractions(bytes: &[u8]) -> Option<usize> {
+    pub(crate) fn latin1_contractions(bytes: &[u8]) -> Option<usize> {
         let (mut count, mut i) = (0usize, 0usize);
         while i < bytes.len() {
             let byte = bytes[i];

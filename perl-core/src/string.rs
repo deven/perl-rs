@@ -681,6 +681,129 @@ macro_rules! define_perl_string {
                 }
             }
 
+            /// Rewrite a heap buffer as the UTF-8 upgrade of its Latin-1 content, where that is possible without
+            /// leaving the allocation.  `None` means the caller must take the copying form.
+            ///
+            /// Two conditions, and both are refusals rather than problems to solve: a shared buffer cannot be
+            /// written at all, and one whose expansion exceeds its spare capacity would have to reallocate — at
+            /// which point copying *is* the operation, and it picks the right tier on the way (§2.2.3).  So there
+            /// is no growth here and no tier change: either it fits where it stands, or it moves.
+            fn upgrade_heap_in_place(&mut self) -> Option<usize> {
+                let (first, expansion, old_len) = match self.raw_parts() {
+                    RawParts::Heap(view) => {
+                        let bytes = view.as_slice();
+                        let first = CowBuffer::first_variant(bytes)?;
+                        if !view.is_unique() {
+                            return None;
+                        }
+                        let expansion = CowBuffer::variant_count(&bytes[first..]);
+                        if bytes.len() + expansion > view.capacity() {
+                            return None;
+                        }
+                        (first, expansion, bytes.len())
+                    }
+                    _ => return None,
+                };
+                let new_len = old_len + expansion;
+
+                // SAFETY (each arm): unique and within capacity, both checked above; the loop rewrites only bytes
+                // this handle owns.  Every old byte becomes exactly one character, so the count is the old length,
+                // and the result is Latin-1 range by construction.
+                match &mut self.0 {
+                    $( Repr::$h8 { ptr, len, count, scan, .. } => {
+                        unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
+                        *len = new_len as u8;
+                        *count = old_len as u8;
+                        *scan = scan::UTF8_LATIN1;
+                    }, )*
+                    $( Repr::$h16 { ptr, len, count, scan, .. } => {
+                        unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
+                        *len = new_len as u16;
+                        *count = old_len as u16;
+                        *scan = scan::UTF8_LATIN1;
+                    }, )*
+                    $( Repr::$h32 { ptr, mirror } => {
+                        unsafe {
+                            cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
+                            cow_buffer::heap32::set_len(ptr.as_ptr(), new_len as u32);
+                            cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1);
+                            cow_buffer::heap32::set_char_count(ptr.as_ptr(), old_len as u32);
+                        }
+                        *mirror = new_len as u32;
+                    }, )*
+                    $( Repr::$hw { ptr } => unsafe {
+                        cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
+                        cow_buffer::heapw::set_len(ptr.as_ptr(), new_len);
+                        cow_buffer::heapw::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1);
+                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), old_len as u32);
+                    }, )*
+                    _ => return None,
+                }
+                Some(new_len)
+            }
+
+            /// Rewrite a heap buffer as the Latin-1 contraction of its UTF-8 content.  `Some(false)` means a
+            /// character past U+00FF made the contraction impossible; `None` means the buffer is shared and the
+            /// caller must copy.
+            ///
+            /// Contraction only shrinks, so unlike the upgrade it can never want room it lacks, never reallocate
+            /// and never change tier.  It leaves spare capacity behind; whether that should be trimmed is a
+            /// question about trimming in general, deliberately left open.
+            fn downgrade_heap_in_place(&mut self) -> Option<bool> {
+                let (first, contractions, old_len) = match self.raw_parts() {
+                    RawParts::Heap(view) => {
+                        let bytes = view.as_slice();
+                        let Some(first) = CowBuffer::first_variant(bytes) else {
+                            return Some(true); // Already its own downgrade.
+                        };
+                        if !view.is_unique() {
+                            return None;
+                        }
+                        let Some(contractions) = CowBuffer::latin1_contractions(&bytes[first..]) else {
+                            return Some(false);
+                        };
+                        (first, contractions, bytes.len())
+                    }
+                    _ => return None,
+                };
+                let new_len = old_len - contractions;
+
+                // SAFETY (each arm): unique and shrinking, both established above.  The contracted octets can
+                // themselves be valid UTF-8, so the class is not derivable here: the caches are cleared and the
+                // next reader re-derives them.
+                match &mut self.0 {
+                    $( Repr::$h8 { ptr, len, count, scan, .. } => {
+                        unsafe { cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
+                        *len = new_len as u8;
+                        *count = 0;
+                        *scan = scan::UNKNOWN;
+                    }, )*
+                    $( Repr::$h16 { ptr, len, count, scan, .. } => {
+                        unsafe { cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
+                        *len = new_len as u16;
+                        *count = 0;
+                        *scan = scan::UNKNOWN;
+                    }, )*
+                    $( Repr::$h32 { ptr, mirror } => {
+                        unsafe {
+                            cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
+                            cow_buffer::heap32::set_len(ptr.as_ptr(), new_len as u32);
+                            cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UNKNOWN);
+                            cow_buffer::heap32::set_char_count(ptr.as_ptr(), 0);
+                        }
+                        *mirror = new_len as u32;
+                    }, )*
+                    $( Repr::$hw { ptr } => unsafe {
+                        cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
+                        cow_buffer::heapw::set_len(ptr.as_ptr(), new_len);
+                        cow_buffer::heapw::set_scan(ptr.as_ptr(), scan::UNKNOWN);
+                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), 0);
+                    }, )*
+                    _ => return None,
+                }
+                Some(true)
+            }
+
             /// Whether this value is held on the heap, and in which tier.  In-place transforms need the variant itself
             /// rather than a handle, because a small tier's length lives in the envelope beside the pointer.
             #[allow(dead_code)]
@@ -703,6 +826,7 @@ macro_rules! define_perl_string {
                 // reference and reading the one non-`Copy` field makes the transfer explicit, and suppressing the
                 // source's drop is what makes it sound.
                 let this = core::mem::ManuallyDrop::new(self);
+
                 // SAFETY (each heap arm): `this` is never dropped, so the pointer is read out exactly once and the
                 // reference it carries transfers to the returned `RawOwned`.
                 match &this.0 {
@@ -728,6 +852,7 @@ macro_rules! define_perl_string {
                         scan: *scan,
                         tier: Tier::Heap16,
                     }, )*
+
                     // Large tiers keep their metadata in the allocation, so only the pointer travels.
                     $( Repr::$h32 { ptr, .. } => RawOwned::Heap {
                         ptr: unsafe { core::ptr::read(ptr) },
@@ -1443,11 +1568,15 @@ impl PerlString {
             return Ok(());
         }
 
-        // Rewriting a heap buffer where it stands needs the tier-aware growth path, and an upgrade can *change*
-        // tier — expanding a `Heap8` string past 255 bytes lands it in `Heap16` — so "in place" is available only
-        // when the result still fits.  Until that path exists both routes go through the copying form, which is
-        // correct at every tier and is what a shared buffer would have forced regardless.
-        *self = self.upgraded()?;
+        // In place where the expansion fits the spare capacity and the buffer is unique; otherwise the copying
+        // form, which is what reallocating means and which picks the right tier on the way.
+        if self.upgrade_heap_in_place().is_none() {
+            *self = self.upgraded()?;
+            return Ok(());
+        }
+
+        self.reinterpret_utf8(true); // The bytes are already the encoding now; only the tag moves.
+
         Ok(())
     }
 
@@ -1515,12 +1644,23 @@ impl PerlString {
             return Ok(true);
         }
 
-        // As with the upgrade: contraction never grows, but it can drop a tier, and rewriting where it stands needs the
-        // tier-aware path.  The copying form is correct at every tier.
-        match self.downgraded()? {
-            Some(contracted) => *self = contracted,
-            None => return Ok(false),
+        // Contraction only shrinks, so it never needs room, never reallocates and never leaves its tier: the only
+        // reason to copy is a shared buffer.
+        match self.downgrade_heap_in_place() {
+            Some(false) => return Ok(false), // A character past U+00FF.
+            Some(true) => {}
+            None => match self.downgraded()? {
+                Some(contracted) => {
+                    *self = contracted;
+                    return Ok(true);
+                }
+                None => return Ok(false),
+            },
         }
+
+        // Contracted octets can themselves be valid UTF-8, so the class is not derivable here; the caches were
+        // cleared and the next reader re-derives them.  Only the flag moves.
+        self.reinterpret_utf8(false);
 
         Ok(true)
     }
