@@ -22,7 +22,8 @@
 //! mapping, so same-bytes/different-flags can be different strings and different-bytes can be the same string.  Warned
 //! and tainted are ignored by `Eq`/`Hash`.
 
-use crate::cow_buffer::{AllocError, CowBuffer};
+use crate::cow_buffer;
+use crate::cow_buffer::{AllocError, CowBuffer, HeapParts, HeapView, Owned, Tier};
 use crate::value::{Numeric, classify_numeric, parse_float, parse_int_i64_visible, string_would_warn};
 use std::cmp::Ordering;
 use std::fmt;
@@ -439,7 +440,19 @@ pub enum StorageType {
     /// DateTimeZulu content at the full thirty characters.
     PackedDateTimeZuluFull,
 
-    /// Heap: a shared [`CowBuffer`].
+    /// Heap, content of 255 bytes or fewer: a two-byte allocation header, everything else in the envelope
+    /// (§2.2.3).
+    Heap8,
+
+    /// Heap, content through 64 KiB: the same shape at `u16` widths.
+    Heap16,
+
+    /// Heap, content through 4 GiB: metadata in the allocation, since at this size it is filled lazily and
+    /// shared.
+    Heap32,
+
+    /// Heap, content beyond 4 GiB.  Unreachable where pointers are 32 bits, and compiled there anyway so that
+    /// discriminants match across targets.
     Heap,
 }
 
@@ -455,9 +468,15 @@ impl StorageType {
         matches!(self, PackedNumeric | PackedNumericFull | PackedDateTimePlus | PackedDateTimePlusFull | PackedDateTimeZulu | PackedDateTimeZuluFull)
     }
 
-    /// The heap type.
+    /// The heap tiers that classify eagerly, keeping their scan state in the envelope (§2.2.3).
+    pub fn is_small_heap_tier(self) -> bool {
+        matches!(self, StorageType::Heap8 | StorageType::Heap16)
+    }
+
+    /// Any of the four heap tiers.
     pub fn is_heap(self) -> bool {
-        matches!(self, StorageType::Heap)
+        use StorageType::*;
+        matches!(self, Heap8 | Heap16 | Heap32 | Heap)
     }
 }
 
@@ -467,7 +486,10 @@ macro_rules! define_perl_string {
     (
         inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
         packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_tainted:literal) ),* $(,)? ],
-        heap:   [ $( $heap:ident = ($heap_utf8:literal, $heap_tainted:literal) ),* $(,)? ]
+        heap8:  [ $( $h8:ident  = ($h8_utf8:literal,  $h8_tainted:literal)  ),* $(,)? ],
+        heap16: [ $( $h16:ident = ($h16_utf8:literal, $h16_tainted:literal) ),* $(,)? ],
+        heap32: [ $( $h32:ident = ($h32_utf8:literal, $h32_tainted:literal) ),* $(,)? ],
+        heapw:  [ $( $hw:ident  = ($hw_utf8:literal,  $hw_tainted:literal)  ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
         /// behind this newtype: no variant is nameable outside the crate, so no payload can be forged or mutated around
@@ -483,12 +505,60 @@ macro_rules! define_perl_string {
         /// The sealed representation: the folded tag itself.  `repr(align(8))` sits here, on the inner enum, where it
         /// costs nothing — on a wrapper of the enclosing fusion it would defeat niche-filling (§2.3.6) — and the
         /// wrapper inherits the alignment.
-        #[derive(Clone)]
+        ///
+        /// `Clone` and `Drop` are hand-written rather than derived, and must be: a heap variant holds an [`Owned`]
+        /// pointer whose duplication requires the tier's `retain`, and whose release requires — for the small tiers
+        /// — the capacity stored beside it in this very variant.  Only code that sees both can do either, which is
+        /// why the obligation lives here rather than in a handle type (§2.2.3).
         #[repr(align(8))]
         enum Repr {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
-            $( $heap(CowBuffer), )*
+            $( $h8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: u8 }, )*
+            $( $h16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: u8 }, )*
+            $( $h32 { ptr: Owned, mirror: u32 }, )*
+            $( $hw  { ptr: Owned }, )*
+        }
+
+        impl Clone for Repr {
+            fn clone(&self) -> Repr {
+                match self {
+                    $( Repr::$inline { buf } => Repr::$inline { buf: *buf }, )*
+                    $( Repr::$packed { nibbles } => Repr::$packed { nibbles: *nibbles }, )*
+                    // SAFETY (each heap arm): the variant owns a live allocation of its tier, and the new handle
+                    // takes the reference this `retain` adds.
+                    $( Repr::$h8 { ptr, len, cap, count, scan } => Repr::$h8 {
+                        ptr: unsafe { cow_buffer::heap8::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                        len: *len, cap: *cap, count: *count, scan: *scan,
+                    }, )*
+                    $( Repr::$h16 { ptr, len, cap, count, scan } => Repr::$h16 {
+                        ptr: unsafe { cow_buffer::heap16::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                        len: *len, cap: *cap, count: *count, scan: *scan,
+                    }, )*
+                    $( Repr::$h32 { ptr, mirror } => Repr::$h32 {
+                        ptr: unsafe { cow_buffer::heap32::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                        mirror: *mirror,
+                    }, )*
+                    $( Repr::$hw { ptr } => Repr::$hw {
+                        ptr: unsafe { cow_buffer::heapw::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                    }, )*
+                }
+            }
+        }
+
+        impl Drop for Repr {
+            fn drop(&mut self) {
+                // SAFETY (each heap arm): the variant owns exactly one reference on a live allocation of its tier,
+                // consumed here; the small tiers pass the capacity their allocation does not record.
+                match self {
+                    $( Repr::$inline { .. } => {}, )*
+                    $( Repr::$packed { .. } => {}, )*
+                    $( Repr::$h8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.as_ptr(), *cap) }, )*
+                    $( Repr::$h16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.as_ptr(), *cap) }, )*
+                    $( Repr::$h32 { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.as_ptr()) }, )*
+                    $( Repr::$hw { ptr } => unsafe { cow_buffer::heapw::release(ptr.as_ptr()) }, )*
+                }
+            }
         }
 
         impl PerlString {
@@ -497,7 +567,10 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => StorageType::$inline_type, )*
                     $( Repr::$packed { .. } => StorageType::$packed_type, )*
-                    $( Repr::$heap(_) => StorageType::Heap, )*
+                    $( Repr::$h8 { .. } => StorageType::Heap8, )*
+                    $( Repr::$h16 { .. } => StorageType::Heap16, )*
+                    $( Repr::$h32 { .. } => StorageType::Heap32, )*
+                    $( Repr::$hw { .. } => StorageType::Heap, )*
                 }
             }
 
@@ -506,7 +579,10 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_utf8, )*
                     $( Repr::$packed { .. } => $packed_utf8, )*
-                    $( Repr::$heap(_) => $heap_utf8, )*
+                    $( Repr::$h8 { .. } => $h8_utf8, )*
+                    $( Repr::$h16 { .. } => $h16_utf8, )*
+                    $( Repr::$h32 { .. } => $h32_utf8, )*
+                    $( Repr::$hw { .. } => $hw_utf8, )*
                 }
             }
 
@@ -515,7 +591,10 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_tainted, )*
                     $( Repr::$packed { .. } => $packed_tainted, )*
-                    $( Repr::$heap(_) => $heap_tainted, )*
+                    $( Repr::$h8 { .. } => $h8_tainted, )*
+                    $( Repr::$h16 { .. } => $h16_tainted, )*
+                    $( Repr::$h32 { .. } => $h32_tainted, )*
+                    $( Repr::$hw { .. } => $hw_tainted, )*
                 }
             }
 
@@ -526,7 +605,10 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { .. } => Some(InlineClass::$inline_class), )*
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
                     $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
-                    $( Repr::$heap(_) => None, )*
+                    $( Repr::$h8 { .. } => None, )*
+                    $( Repr::$h16 { .. } => None, )*
+                    $( Repr::$h32 { .. } => None, )*
+                    $( Repr::$hw { .. } => None, )*
                 }
             }
 
@@ -576,7 +658,13 @@ macro_rules! define_perl_string {
                         full: $packed_full,
                         nibbles: *nibbles,
                     }), )*
-                    $( Repr::$heap(cb) => RawParts::Heap(cb), )*
+                    $( Repr::$h8 { ptr, len, cap, count, scan } =>
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, *scan, Tier::Heap8)), )*
+                    $( Repr::$h16 { ptr, len, cap, count, scan } =>
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, *scan, Tier::Heap16)), )*
+                    // SAFETY: a live allocation of this tier, whose header carries the metadata.
+                    $( Repr::$h32 { ptr, .. } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::Heap32) }), )*
+                    $( Repr::$hw { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::HeapW) }), )*
                 }
             }
 
@@ -586,36 +674,99 @@ macro_rules! define_perl_string {
                 match &mut self.0 {
                     $( Repr::$inline { buf } => Some(($inline_full, buf)), )*
                     $( Repr::$packed { .. } => None, )*
-                    $( Repr::$heap(_) => None, )*
+                    $( Repr::$h8 { .. } => None, )*
+                    $( Repr::$h16 { .. } => None, )*
+                    $( Repr::$h32 { .. } => None, )*
+                    $( Repr::$hw { .. } => None, )*
                 }
             }
 
-            /// The heap buffer behind the tag, mutably — `None` for the non-allocating forms.  In-place transforms need
-            /// it; every other consumer goes through the borrowed view.
-            fn heap_buf_mut(&mut self) -> Option<&mut CowBuffer> {
-                match &mut self.0 {
+            /// Whether this value is held on the heap, and in which tier.  In-place transforms need the variant itself
+            /// rather than a handle, because a small tier's length lives in the envelope beside the pointer.
+            #[allow(dead_code)]
+            fn heap_tier(&self) -> Option<Tier> {
+                match &self.0 {
                     $( Repr::$inline { .. } => None, )*
                     $( Repr::$packed { .. } => None, )*
-                    $( Repr::$heap(cb) => Some(cb), )*
+                    $( Repr::$h8 { .. } => Some(Tier::Heap8), )*
+                    $( Repr::$h16 { .. } => Some(Tier::Heap16), )*
+                    $( Repr::$h32 { .. } => Some(Tier::Heap32), )*
+                    $( Repr::$hw { .. } => Some(Tier::HeapW), )*
                 }
             }
 
             /// The payload behind the tag, owned — the shape mutation needs, since it rebuilds the tag afterward.
             fn into_raw(self) -> RawOwned {
-                match self.0 {
-                    $( Repr::$inline { buf } => RawOwned::Inline { class: InlineClass::$inline_class, full: $inline_full, buf }, )*
+                // `Owned` is not `Copy`, so taking a heap variant's pointer out is a genuine move, and `Repr`'s
+                // `Drop` forbids that (E0509).  The refusal is the point: a `Copy` pointer would be read out here
+                // while `self` still dropped, releasing an allocation the caller believes it owns.  Matching on a
+                // reference and reading the one non-`Copy` field makes the transfer explicit, and suppressing the
+                // source's drop is what makes it sound.
+                let this = core::mem::ManuallyDrop::new(self);
+                // SAFETY (each heap arm): `this` is never dropped, so the pointer is read out exactly once and the
+                // reference it carries transfers to the returned `RawOwned`.
+                match &this.0 {
+                    $( Repr::$inline { buf } => RawOwned::Inline { class: InlineClass::$inline_class, full: $inline_full, buf: *buf }, )*
                     $( Repr::$packed { nibbles } => RawOwned::Packed(Packed {
                         alphabet: PackedAlphabet::$packed_alphabet,
                         full: $packed_full,
-                        nibbles,
+                        nibbles: *nibbles,
                     }), )*
-                    $( Repr::$heap(cb) => RawOwned::Heap(cb), )*
+                    $( Repr::$h8 { ptr, len, cap, count, scan } => RawOwned::Heap {
+                        ptr: unsafe { core::ptr::read(ptr) },
+                        len: *len as usize,
+                        cap: *cap as usize,
+                        count: *count as u32,
+                        scan: *scan,
+                        tier: Tier::Heap8,
+                    }, )*
+                    $( Repr::$h16 { ptr, len, cap, count, scan } => RawOwned::Heap {
+                        ptr: unsafe { core::ptr::read(ptr) },
+                        len: *len as usize,
+                        cap: *cap as usize,
+                        count: *count as u32,
+                        scan: *scan,
+                        tier: Tier::Heap16,
+                    }, )*
+                    // Large tiers keep their metadata in the allocation, so only the pointer travels.
+                    $( Repr::$h32 { ptr, .. } => RawOwned::Heap {
+                        ptr: unsafe { core::ptr::read(ptr) },
+                        len: 0,
+                        cap: 0,
+                        count: 0,
+                        scan: 0,
+                        tier: Tier::Heap32,
+                    }, )*
+                    $( Repr::$hw { ptr } => RawOwned::Heap {
+                        ptr: unsafe { core::ptr::read(ptr) },
+                        len: 0,
+                        cap: 0,
+                        count: 0,
+                        scan: 0,
+                        tier: Tier::HeapW,
+                    }, )*
                 }
             }
 
-            fn build_heap(utf8: bool, tainted: bool, cb: CowBuffer) -> PerlString {
-                match (utf8, tainted) {
-                    $( ($heap_utf8, $heap_tainted) => PerlString(Repr::$heap(cb)), )*
+            fn build_heap(utf8: bool, tainted: bool, parts: HeapParts) -> PerlString {
+                let HeapParts { ptr, len, cap, count, scan, tier } = parts;
+                match tier {
+                    Tier::Heap8 => match (utf8, tainted) {
+                        $( ($h8_utf8, $h8_tainted) => PerlString(Repr::$h8 {
+                            ptr, len: len as u8, cap: cap as u8, count: count as u8, scan,
+                        }), )*
+                    },
+                    Tier::Heap16 => match (utf8, tainted) {
+                        $( ($h16_utf8, $h16_tainted) => PerlString(Repr::$h16 {
+                            ptr, len: len as u16, cap: cap as u16, count: count as u16, scan,
+                        }), )*
+                    },
+                    Tier::Heap32 => match (utf8, tainted) {
+                        $( ($h32_utf8, $h32_tainted) => PerlString(Repr::$h32 { ptr, mirror: len as u32 }), )*
+                    },
+                    Tier::HeapW => match (utf8, tainted) {
+                        $( ($hw_utf8, $hw_tainted) => PerlString(Repr::$hw { ptr }), )*
+                    },
                 }
             }
         }
@@ -691,7 +842,25 @@ define_perl_string! {
         PackedZuluFullTainted                        = (DateTimeZulu, PackedDateTimeZuluFull, true, false, true),
         PackedZuluFullFlaggedTainted                 = (DateTimeZulu, PackedDateTimeZuluFull, true, true, true),
     ],
-    heap: [
+    heap8: [
+        Heap8                     = (false, false),
+        Heap8Flagged              = (true, false),
+        Heap8Tainted              = (false, true),
+        Heap8FlaggedTainted       = (true, true),
+    ],
+    heap16: [
+        Heap16                     = (false, false),
+        Heap16Flagged              = (true, false),
+        Heap16Tainted              = (false, true),
+        Heap16FlaggedTainted       = (true, true),
+    ],
+    heap32: [
+        Heap32                     = (false, false),
+        Heap32Flagged              = (true, false),
+        Heap32Tainted              = (false, true),
+        Heap32FlaggedTainted       = (true, true),
+    ],
+    heapw: [
         Heap                     = (false, false),
         HeapFlagged              = (true, false),
         HeapTainted              = (false, true),
@@ -813,6 +982,22 @@ fn expand_latin1(b: u8, out: &mut [u8]) -> usize {
 /// Latin-1-range UTF-8 always compresses — up to thirty input bytes — and the verbatim classes hold exactly the
 /// fifteen-byte-or-shorter content failing that test, the Bytes class by default when the tag rules out every other.
 /// The flag is never consulted: the class is a fact about the bytes.
+/// Allocate heap parts for `bytes`, classifying eagerly where the tier keeps its scan state in the envelope.
+///
+/// §2.2.3 pairs the small tiers with eager classification, and the two go together necessarily: with no scan byte
+/// in the allocation there is nowhere to record a later discovery, so a small tier that were born unknown would
+/// rescan on every read.  The pass costs at most ~117 ns at `Heap8` and, for ASCII content of any size, less than
+/// the copy that just happened (§2.2.11).  The large tiers are left unknown deliberately — at those sizes the pass
+/// is what they cannot afford, and their allocation has the room to record what a reader discovers.
+fn heap_parts_classified(bytes: &[u8]) -> Result<HeapParts, AllocError> {
+    let parts = HeapParts::from_slice(bytes)?;
+    if parts.tier.is_small() {
+        let (state, chars) = classify_full(bytes);
+        return Ok(parts.with_classification(state, chars));
+    }
+    Ok(parts)
+}
+
 fn classify_inline(bytes: &[u8]) -> Option<(InlineClass, usize, usize, [u8; INLINE_MAX])> {
     if let Some((cp, s, h)) = decode_latin1_range(bytes) {
         let class = if h == 0 { InlineClass::Ascii } else { InlineClass::Latin1 };
@@ -861,10 +1046,20 @@ impl PerlString {
             Ok(inline)
         } else {
             let bytes = s.as_bytes();
-            let cb = CowBuffer::from_slice(bytes)?;
             let ascii = bytes.iter().all(|b| b.is_ascii());
-            cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE });
-            Ok(PerlString::build_heap(!ascii, false, cb))
+
+            // A `&str` is known-valid UTF-8 of unknown range, which is why the cheap probe suffices for the tiers
+            // that can narrow later.  A small tier cannot: its scan state lives in the envelope with no allocation
+            // slot for a later discovery, so the range must be settled now or never (§2.2.3).
+            let parts = HeapParts::from_slice(bytes)?;
+            let parts = if parts.tier.is_small() {
+                let (state, chars) = classify_full(bytes);
+                parts.with_classification(state, chars)
+            } else {
+                parts.with_classification(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE }, 0)
+            };
+
+            Ok(PerlString::build_heap(!ascii, false, parts))
         }
     }
 
@@ -874,10 +1069,7 @@ impl PerlString {
         let bytes = bytes.as_ref();
         match PerlString::inline_bytes(bytes) {
             Some(inline) => Ok(inline),
-            None => {
-                let cb = CowBuffer::from_slice(bytes)?; // scan byte born UNKNOWN
-                Ok(PerlString::build_heap(false, false, cb))
-            }
+            None => Ok(PerlString::build_heap(false, false, heap_parts_classified(bytes)?)),
         }
     }
 
@@ -891,8 +1083,7 @@ impl PerlString {
         if let Some(p) = pack(bytes) {
             return Ok(PerlString::build_packed(p, utf8, tainted));
         }
-        let cb = CowBuffer::from_slice(bytes)?;
-        Ok(PerlString::build_heap(utf8, tainted, cb))
+        Ok(PerlString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
     }
 
     /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
@@ -1229,11 +1420,10 @@ impl PerlString {
         // Sixteen or more non-ASCII characters: heap.  The buffer owns the expansion — appending byte by byte would pay
         // a capacity check and two cache-invalidating atomic stores per input byte, and would rewrite an invariant
         // prefix the buffer can copy wholesale.
-        let cb = CowBuffer::upgraded_from_slice(internal)?;
-        cb.narrow_scan(scan::UTF8_LATIN1);
-        cb.set_char_count(internal.len());
+        let upgraded = CowBuffer::upgraded_bytes(internal)?;
+        let parts = HeapParts::from_slice(&upgraded)?.with_classification(scan::UTF8_LATIN1, internal.len());
 
-        Ok(PerlString::build_heap(true, t, cb))
+        Ok(PerlString::build_heap(true, t, parts))
     }
 
     /// The in-place form of [`PerlString::upgraded`]: the same characters, flagged, rewriting a unique heap buffer
@@ -1253,16 +1443,11 @@ impl PerlString {
             return Ok(());
         }
 
-        if let Some(cb) = self.heap_buf_mut() {
-            let chars = cb.upgrade_in_place()?;
-            cb.narrow_scan(scan::UTF8_LATIN1);
-            cb.set_char_count(chars);
-        } else {
-            *self = self.upgraded()?;
-            return Ok(());
-        }
-
-        self.reinterpret_utf8(true); // The bytes are already the encoding now; only the tag moves.
+        // Rewriting a heap buffer where it stands needs the tier-aware growth path, and an upgrade can *change*
+        // tier — expanding a `Heap8` string past 255 bytes lands it in `Heap16` — so "in place" is available only
+        // when the result still fits.  Until that path exists both routes go through the copying form, which is
+        // correct at every tier and is what a shared buffer would have forced regardless.
+        *self = self.upgraded()?;
         Ok(())
     }
 
@@ -1302,15 +1487,15 @@ impl PerlString {
             RawParts::Heap(cb) => {
                 // Walk the encoding: every character must sit in U+0000-U+00FF, emitted as its single byte.  The result
                 // re-runs the ladder — sixteen to thirty emitted octets can compress right back inline.
-                let Some(out) = CowBuffer::downgraded_from_slice(cb.as_slice())? else {
+                let Some(out) = CowBuffer::downgraded_bytes(cb.as_slice())? else {
                     return Ok(None); // A character past U+00FF, or no character at all.
                 };
 
                 if out.len() <= MAX_PACKED_LEN {
-                    return Ok(Some(PerlString::tiered(out.as_slice(), false, t)?));
+                    return Ok(Some(PerlString::tiered(&out, false, t)?));
                 }
 
-                Ok(Some(PerlString::build_heap(false, t, out)))
+                Ok(Some(PerlString::build_heap(false, t, HeapParts::from_slice(&out)?)))
             }
         }
     }
@@ -1330,22 +1515,12 @@ impl PerlString {
             return Ok(true);
         }
 
-        if let Some(cb) = self.heap_buf_mut() {
-            if cb.downgrade_in_place()?.is_none() {
-                return Ok(false);
-            }
-        } else {
-            match self.downgraded()? {
-                Some(contracted) => *self = contracted,
-                None => return Ok(false),
-            }
-
-            return Ok(true);
+        // As with the upgrade: contraction never grows, but it can drop a tier, and rewriting where it stands needs the
+        // tier-aware path.  The copying form is correct at every tier.
+        match self.downgraded()? {
+            Some(contracted) => *self = contracted,
+            None => return Ok(false),
         }
-
-        // Contracted octets can themselves be valid UTF-8, so the class is not derivable here; the buffer left its
-        // caches cleared and the next reader re-derives them.  Only the flag moves.
-        self.reinterpret_utf8(false);
 
         Ok(true)
     }
@@ -1377,7 +1552,7 @@ impl PerlString {
                 PerlString::build_inline(class, u2, t2, s, aux, buf)
             }
             RawOwned::Packed(p) => PerlString::build_packed(p, u2, t2),
-            RawOwned::Heap(cb) => PerlString::build_heap(u2, t2, cb),
+            RawOwned::Heap { ptr, len, cap, count, scan, tier } => PerlString::build_heap(u2, t2, HeapParts { ptr, len, cap, count, scan, tier }),
         };
     }
 
@@ -1470,11 +1645,12 @@ impl PerlString {
                 // Sixteen to thirty bytes fitting neither a compressed payload nor an alphabet: the heap, below.
             }
 
-            let mut cb = CowBuffer::with_capacity(total + (total >> 2))?;
-            cb.extend_from_slice(&internal[..ilen])?;
-            cb.extend_from_slice(bytes)?;
-            cb.narrow_scan(append_transition_heap(inline_scan_to_heap(class), kind));
-            *self = PerlString::build_heap(u, t, cb);
+            let mut joined = Vec::new();
+            joined.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
+            joined.extend_from_slice(&internal[..ilen]);
+            joined.extend_from_slice(bytes);
+            let state = append_transition_heap(inline_scan_to_heap(class), kind);
+            *self = PerlString::build_heap(u, t, HeapParts::from_slice(&joined)?.with_classification(state, 0));
 
             return Ok(());
         }
@@ -1495,29 +1671,44 @@ impl PerlString {
                     let (decoded, len) = p.unpack();
                     let old_bytes = &decoded[..len];
                     let new_len = len + bytes.len();
-                    let mut cb = CowBuffer::with_capacity(new_len + (new_len >> 2))?;
-                    cb.extend_from_slice(old_bytes)?;
-                    cb.extend_from_slice(bytes)?;
-                    cb.narrow_scan(append_transition_heap(scan::ASCII, kind));
-                    PerlString::build_heap(u, t, cb)
+                    let mut joined = Vec::new();
+                    joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
+                    joined.extend_from_slice(old_bytes);
+                    joined.extend_from_slice(bytes);
+                    let state = append_transition_heap(scan::ASCII, kind);
+                    PerlString::build_heap(u, t, HeapParts::from_slice(&joined)?.with_classification(state, 0))
                 }
             }
-            RawOwned::Heap(mut cb) => {
-                let prior = cb.scan();
-                let prior_chars = cb.char_count();
-                cb.extend_from_slice(bytes)?; // resets buffer scan and count to unknown
-                cb.narrow_scan(append_transition_heap(prior, kind));
+            RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
+                // The appended result may not fit the tier it started in, so the buffer is rebuilt rather than
+                // extended: growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what
+                // `HeapParts::from_slice` does.  Reading the old bytes needs the view, which needs the metadata
+                // that travelled with the pointer.
+                let view = if tier.is_small() {
+                    HeapView::small(&ptr, len, cap, count, prior, tier)
+                } else {
+                    // SAFETY: a live allocation of a large tier, still owned by `ptr`.
+                    unsafe { HeapView::large(&ptr, tier) }
+                };
+                let (prior, prior_chars) = (view.scan(), view.char_count());
+
+                let old_bytes = view.as_slice();
+                let total = old_bytes.len() + bytes.len();
+                let mut joined = Vec::new();
+                joined.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
+                joined.extend_from_slice(old_bytes);
+                joined.extend_from_slice(bytes);
+
+                let state = append_transition_heap(prior, kind);
 
                 // Maintain the character count incrementally when both sides know theirs (§2.2.5): the appended
                 // content's own classification counted its characters in its own pass.
-                if let AppendKind::Valid { chars: added, .. } = kind
-                    && prior_chars > 0
-                    && added > 0
-                    && scan::is_perl_decodable(cb.scan())
-                {
-                    cb.set_char_count(prior_chars + added);
-                }
-                PerlString::build_heap(u, t, cb)
+                let chars = match kind {
+                    AppendKind::Valid { chars: added, .. } if prior_chars > 0 && added > 0 && scan::is_perl_decodable(state) => prior_chars + added,
+                    _ => 0,
+                };
+
+                PerlString::build_heap(u, t, HeapParts::from_slice(&joined)?.with_classification(state, chars))
             }
         };
 
@@ -1526,15 +1717,34 @@ impl PerlString {
 }
 
 enum RawParts<'a> {
-    Inline { class: InlineClass, full: bool, buf: &'a [u8; INLINE_MAX] },
+    Inline {
+        class: InlineClass,
+        full: bool,
+        buf: &'a [u8; INLINE_MAX],
+    },
     Packed(Packed),
-    Heap(&'a CowBuffer),
+    /// Whatever the tier, read through one view: the metadata is gathered at construction from wherever that tier
+    /// keeps it, so nothing below dispatches on it (§2.2.3).
+    Heap(HeapView<'a>),
 }
 
 enum RawOwned {
-    Inline { class: InlineClass, full: bool, buf: [u8; INLINE_MAX] },
+    Inline {
+        class: InlineClass,
+        full: bool,
+        buf: [u8; INLINE_MAX],
+    },
     Packed(Packed),
-    Heap(CowBuffer),
+    /// The owned pointer with the metadata its tier keeps in the envelope; the large tiers carry their own and
+    /// leave these fields at zero.
+    Heap {
+        ptr: Owned,
+        len: usize,
+        cap: usize,
+        count: u32,
+        scan: u8,
+        tier: Tier,
+    },
 }
 
 /// What is known about appended content, for the §2.2.5 transition rules.  For Rust-valid content the range is carried

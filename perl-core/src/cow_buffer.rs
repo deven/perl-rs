@@ -34,6 +34,7 @@
 
 use std::alloc::{self, Layout};
 use std::fmt;
+use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering, fence};
@@ -115,6 +116,246 @@ impl Owned {
 // tiers the lazily-filled caches).  Ownership transfer across threads is therefore sound, as it was for `CowBuffer`.
 unsafe impl Send for Owned {}
 unsafe impl Sync for Owned {}
+
+/// Which tier an allocation belongs to.  The tag already encodes it, so this exists for the paths that hold a
+/// pointer without its variant — release, growth, and the borrowed view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Tier {
+    Heap8,
+    Heap16,
+    Heap32,
+    HeapW,
+}
+
+impl Tier {
+    /// The largest content this tier can address.  The growth path is its caller-to-be: growth crosses tiers at
+    /// the ceilings (§2.2.3), which is the comparison this answers.
+    #[allow(dead_code)]
+    pub(crate) const fn max_capacity(self) -> usize {
+        match self {
+            Tier::Heap8 => heap8::MAX_CAPACITY,
+            Tier::Heap16 => heap16::MAX_CAPACITY,
+            Tier::Heap32 => heap32::MAX_CAPACITY,
+            Tier::HeapW => heapw::MAX_CAPACITY,
+        }
+    }
+
+    /// The smallest tier that can hold `len` bytes.  First fit, as the storage ladder is throughout (§2.2.9).
+    pub(crate) const fn for_length(len: usize) -> Tier {
+        if len <= heap8::MAX_CAPACITY {
+            Tier::Heap8
+        } else if len <= heap16::MAX_CAPACITY {
+            Tier::Heap16
+        } else if len <= heap32::MAX_CAPACITY {
+            Tier::Heap32
+        } else {
+            Tier::HeapW
+        }
+    }
+
+    /// Whether this tier keeps its metadata in the envelope rather than the allocation.
+    pub(crate) const fn is_small(self) -> bool {
+        matches!(self, Tier::Heap8 | Tier::Heap16)
+    }
+}
+
+/// An owned pointer with the metadata its tier keeps in the envelope, for the paths that move a heap payload
+/// between representations.  The large tiers hold their own, so their metadata fields are ignored.
+#[allow(dead_code)] // `cap` is read inside `build_heap`'s macro expansion, which the lint cannot see.
+pub(crate) struct HeapParts {
+    pub(crate) ptr: Owned,
+    pub(crate) len: usize,
+    pub(crate) cap: usize,
+    pub(crate) count: u32,
+    pub(crate) scan: u8,
+    pub(crate) tier: Tier,
+}
+
+impl HeapParts {
+    /// Allocate the smallest tier that can hold `bytes`, copy them in, and hand back the pointer with whatever
+    /// metadata that tier keeps in the envelope.  First fit, as the storage ladder is throughout (§2.2.9).
+    ///
+    /// Scan state and character count are left at zero for the caller to establish: the small tiers are classified
+    /// eagerly at construction and the caller knows the answer, while the large tiers discover it lazily and should
+    /// not be told one now (§2.2.3).
+    pub(crate) fn from_slice(bytes: &[u8]) -> Result<HeapParts, AllocError> {
+        let len = bytes.len();
+        let tier = Tier::for_length(len);
+
+        // SAFETY (each arm): the pointer comes from this tier's `allocate` with room for `len`, so the copy stays
+        // inside the allocation, and the single reference it carries is handed to the returned `HeapParts`.
+        let ptr = unsafe {
+            match tier {
+                Tier::Heap8 => {
+                    let p = heap8::allocate(len as u8)?;
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
+                    p
+                }
+                Tier::Heap16 => {
+                    let p = heap16::allocate(len as u16)?;
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
+                    p
+                }
+                Tier::Heap32 => {
+                    let p = heap32::allocate(len as u32)?;
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
+                    heap32::set_len(p, len as u32);
+                    p
+                }
+                Tier::HeapW => {
+                    let p = heapw::allocate(len)?;
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
+                    heapw::set_len(p, len);
+                    p
+                }
+            }
+        };
+
+        // SAFETY: the allocation above carries exactly one reference, which this `Owned` now owes.
+        Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap: len, count: 0, scan: 0, tier })
+    }
+
+    /// Record the classification the caller established, for the tiers that keep it in the envelope.  The large
+    /// tiers hold theirs in the allocation, so this writes there instead.
+    pub(crate) fn with_classification(mut self, scan: u8, count: usize) -> HeapParts {
+        if self.tier.is_small() {
+            self.scan = scan;
+            self.count = count as u32;
+        } else {
+            // SAFETY: a live allocation of a large tier, held solely by this `HeapParts`.
+            unsafe {
+                match self.tier {
+                    Tier::Heap32 => {
+                        heap32::set_scan(self.ptr.as_ptr(), scan);
+                        heap32::set_char_count(self.ptr.as_ptr(), count as u32);
+                    }
+                    _ => {
+                        heapw::set_scan(self.ptr.as_ptr(), scan);
+                        heapw::set_char_count(self.ptr.as_ptr(), count as u32);
+                    }
+                }
+            }
+        }
+        self
+    }
+}
+
+/// A borrowed look at a heap buffer, whatever its tier.
+///
+/// The four-way dispatch lives here and nowhere else: the metadata is read at construction from whichever place
+/// that tier keeps it — the envelope for the small tiers, the allocation for the large — so every reader below is
+/// tier-agnostic.  Lazy filling is the exception and is offered only where it applies (§2.2.3): a small tier is
+/// scanned eagerly at construction, so it has nothing to fill in later.
+pub(crate) struct HeapView<'a> {
+    ptr: NonNull<u8>,
+    len: usize,
+    cap: usize,
+    count: u32,
+    scan: u8,
+    tier: Tier,
+    _life: PhantomData<&'a Owned>,
+}
+
+impl<'a> HeapView<'a> {
+    /// A small tier's view: the caller supplies the metadata, because its allocation holds none.
+    pub(crate) fn small(ptr: &'a Owned, len: usize, cap: usize, count: u32, scan: u8, tier: Tier) -> HeapView<'a> {
+        HeapView { ptr: ptr.as_ptr(), len, cap, count, scan, tier, _life: PhantomData }
+    }
+
+    /// A large tier's view, read from the allocation.
+    ///
+    /// # Safety
+    /// `ptr` must own a live allocation of `tier`, which must be `Heap32` or `HeapW`.
+    pub(crate) unsafe fn large(ptr: &'a Owned, tier: Tier) -> HeapView<'a> {
+        let raw = ptr.as_ptr();
+        // SAFETY: the caller vouches for a live allocation of a large tier.
+        let (len, cap, count, scan) = unsafe {
+            match tier {
+                Tier::Heap32 => (heap32::len(raw), heap32::capacity(raw), heap32::char_count(raw), heap32::scan(raw)),
+                _ => (heapw::len(raw), heapw::capacity(raw), heapw::char_count(raw), heapw::scan(raw)),
+            }
+        };
+        HeapView { ptr: raw, len, cap, count, scan, tier, _life: PhantomData }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Room in the allocation.  Read by the growth path, which decides between extending in place and moving to
+    /// the next tier.
+    #[allow(dead_code)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    pub(crate) fn as_slice(&self) -> &'a [u8] {
+        // SAFETY: the view borrows a live allocation whose first `len` bytes are initialised, and `Owned`'s
+        // lifetime is threaded through `_life` so the slice cannot outlive it.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// The cached scan state (§2.2.4); zero is `UNKNOWN`, which a small tier never reports since it is classified
+    /// at construction.
+    pub(crate) fn scan(&self) -> u8 {
+        self.scan
+    }
+
+    /// The cached character count; zero means none, dual-purposed by the byte length (§2.2.4).
+    pub(crate) fn char_count(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Whether this is the only handle on the allocation, which is what licenses writing through it.  Unused while
+    /// every mutation rebuilds: restoring in-place growth is what brings the COW break back (§2.2.3).
+    #[allow(dead_code)]
+    pub(crate) fn is_unique(&self) -> bool {
+        // SAFETY: the view borrows a live allocation of its tier.
+        unsafe {
+            match self.tier {
+                Tier::Heap8 => heap8::is_unique(self.ptr),
+                Tier::Heap16 => heap16::is_unique(self.ptr),
+                Tier::Heap32 => heap32::is_unique(self.ptr),
+                Tier::HeapW => heapw::is_unique(self.ptr),
+            }
+        }
+    }
+
+    /// Record a discovered scan state, for the tiers that discover one.  A small tier's is settled at
+    /// construction and lives in the envelope, so this is a no-op there rather than an error: the caller learns
+    /// nothing the value does not already know.
+    pub(crate) fn narrow_scan(&self, state: u8) {
+        // SAFETY: the view borrows a live allocation of its tier.
+        unsafe {
+            match self.tier {
+                Tier::Heap32 => heap32::set_scan(self.ptr, state),
+                Tier::HeapW => heapw::set_scan(self.ptr, state),
+                Tier::Heap8 | Tier::Heap16 => {}
+            }
+        }
+    }
+
+    /// Record a computed character count, for the tiers that compute one lazily.
+    pub(crate) fn set_char_count(&self, count: usize) {
+        // SAFETY: the view borrows a live allocation of its tier.
+        unsafe {
+            match self.tier {
+                Tier::Heap32 => heap32::set_char_count(self.ptr, count as u32),
+                Tier::HeapW => heapw::set_char_count(self.ptr, count as u32),
+                Tier::Heap8 | Tier::Heap16 => {}
+            }
+        }
+    }
+}
 
 /// The refcount ceiling.  Reaching it needs 4,294,967,295 live handles and therefore at least 64 GiB of envelopes;
 /// the test exists because unchecked overflow wraps to zero, not because the ceiling is approachable.
@@ -704,84 +945,25 @@ impl CowBuffer {
         bytes[offset..].iter().position(|&b| b >= 0x80).map(|k| offset + k)
     }
 
-    /// Expand every byte at or above `0x80` into its two-byte UTF-8 encoding, returning the character count of the
-    /// result — the byte length before expansion, each original byte being one character.
-    ///
-    /// A shared buffer cannot be rewritten under its other holders, so it takes the copying form.  A unique one follows
-    /// perl's shape (`sv_utf8_upgrade_flags_grow`): the invariant prefix stays exactly where it is, and the expansion
-    /// walks backwards from the end, so one buffer serves and nothing before the first variant is touched.
-    pub(crate) fn upgrade_in_place(&mut self) -> Result<usize, AllocError> {
-        let old_len = self.len();
-        let Some(first) = CowBuffer::first_variant(self.as_slice()) else {
-            return Ok(old_len); // Entirely invariant: these bytes already are their own encoding.
-        };
-
-        if !self.is_unique() {
-            *self = CowBuffer::upgraded_from_slice(self.as_slice())?;
-            return Ok(old_len);
-        }
-
-        let expansion = CowBuffer::variant_count(&self.as_slice()[first..]);
-        let new_len = old_len + expansion;
-        self.reserve(expansion)?;
-
-        // SAFETY: unique (checked above; `reserve` preserves it) with capacity for `new_len`.  Both cursors descend
-        // from the ends of their regions, `dst` leading `src` by the expansions still owed and meeting it exactly at
-        // `first`, so no write lands on a byte not yet read.
-        unsafe {
-            let base = self.ptr.as_ptr();
-            let (mut src, mut dst) = (old_len, new_len);
-            while src > first {
-                src -= 1;
-                let byte = *base.add(src);
-                if byte < 0x80 {
-                    dst -= 1;
-                    *base.add(dst) = byte;
-                } else {
-                    dst -= 2;
-                    *base.add(dst) = 0xC0 | (byte >> 6);
-                    *base.add(dst + 1) = 0x80 | (byte & 0x3F);
-                }
-            }
-            debug_assert_eq!(dst, first, "the cursors must meet at the first variant byte");
-            self.set_len(new_len);
-        }
-
-        // The content changed, so the cached facts go.  The caller knows the result's class and count and restores
-        // them, which is the point of owning the loop here: two stores, not two per byte.
-        self.narrow_scan(0);
-        self.set_char_count(0);
-
-        Ok(old_len)
-    }
-
     /// The copying form of [`CowBuffer::upgrade_in_place`]: a fresh buffer holding the upgraded encoding of `bytes`.
     /// What a shared buffer requires, its other holders keeping the unexpanded content, and what an inline payload
     /// spilling to the heap uses.
-    pub(crate) fn upgraded_from_slice(bytes: &[u8]) -> Result<CowBuffer, AllocError> {
+    pub(crate) fn upgraded_bytes(bytes: &[u8]) -> Result<Vec<u8>, AllocError> {
         let first = CowBuffer::first_variant(bytes).unwrap_or(bytes.len());
         let total = bytes.len() + CowBuffer::variant_count(&bytes[first..]);
-        let mut out = CowBuffer::with_capacity(total)?;
 
-        // SAFETY: freshly allocated with capacity for the whole result, hence unique and large enough.  The invariant
-        // prefix copies wholesale; the remainder expands into the space counted for it, so `dst` cannot pass `total`.
-        unsafe {
-            let base = out.ptr.as_ptr();
-            ptr::copy_nonoverlapping(bytes.as_ptr(), base, first);
-            let mut dst = first;
-            for &byte in &bytes[first..] {
-                if byte < 0x80 {
-                    *base.add(dst) = byte;
-                    dst += 1;
-                } else {
-                    *base.add(dst) = 0xC0 | (byte >> 6);
-                    *base.add(dst + 1) = 0x80 | (byte & 0x3F);
-                    dst += 2;
-                }
+        let mut out = Vec::new();
+        out.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
+        out.extend_from_slice(&bytes[..first]);
+        for &byte in &bytes[first..] {
+            if byte < 0x80 {
+                out.push(byte);
+            } else {
+                out.push(0xC0 | (byte >> 6));
+                out.push(0x80 | (byte & 0x3F));
             }
-            debug_assert_eq!(dst, total, "the counted expansion must fill the buffer exactly");
-            out.set_len(total);
         }
+        debug_assert_eq!(out.len(), total, "the counted expansion must fill the buffer exactly");
 
         Ok(out)
     }
@@ -805,66 +987,9 @@ impl CowBuffer {
         Some(count)
     }
 
-    /// Contract every two-byte sequence into the single byte it encodes, returning the new length, or `None` when
-    /// some character lies above `U+00FF` — where perl's downgrade dies.
-    ///
-    /// The content is validated before anything moves: a refusal discovered halfway through an in-place walk would
-    /// leave the buffer holding neither the old string nor the new one.  The invariant prefix stays where it is and
-    /// the compaction walks forward, the write cursor trailing the read cursor by the sequences already collapsed,
-    /// so the contraction never needs to grow and never overwrites a byte it has not read.
-    #[cfg_attr(not(test), allow(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
-    pub(crate) fn downgrade_in_place(&mut self) -> Result<Option<usize>, AllocError> {
-        let old_len = self.len();
-
-        let Some(first) = CowBuffer::first_variant(self.as_slice()) else {
-            return Ok(Some(old_len)); // Entirely invariant: already its own downgrade.
-        };
-
-        let Some(contractions) = CowBuffer::latin1_contractions(&self.as_slice()[first..]) else {
-            return Ok(None);
-        };
-
-        if !self.is_unique() {
-            match CowBuffer::downgraded_from_slice(self.as_slice())? {
-                Some(contracted) => *self = contracted,
-                None => return Ok(None),
-            }
-            return Ok(Some(old_len - contractions));
-        }
-
-        let new_len = old_len - contractions;
-
-        // SAFETY: unique (checked above) and shrinking, so every write lands inside the existing region.  `dst` trails
-        // `src` by the sequences already collapsed, reaching `new_len` exactly as `src` reaches `old_len`.
-        unsafe {
-            let base = self.ptr.as_ptr();
-            let (mut src, mut dst) = (first, first);
-            while src < old_len {
-                let byte = *base.add(src);
-                if byte < 0x80 {
-                    *base.add(dst) = byte;
-                    src += 1;
-                } else {
-                    *base.add(dst) = ((byte & 0x03) << 6) | (*base.add(src + 1) & 0x3F);
-                    src += 2;
-                }
-                dst += 1;
-            }
-            debug_assert_eq!(dst, new_len, "the counted contraction must land exactly");
-            self.set_len(new_len);
-        }
-
-        // The bytes changed and their class is not derivable without another look — contracted octets can themselves be
-        // valid UTF-8 — so the cached facts go and the next reader re-derives them.
-        self.narrow_scan(0);
-        self.set_char_count(0);
-
-        Ok(Some(new_len))
-    }
-
     /// The copying form of [`CowBuffer::downgrade_in_place`]: a fresh buffer holding the contracted bytes, or `None`
     /// when the content refuses to downgrade.  What a shared buffer requires, its other holders keeping the encoding.
-    pub(crate) fn downgraded_from_slice(bytes: &[u8]) -> Result<Option<CowBuffer>, AllocError> {
+    pub(crate) fn downgraded_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, AllocError> {
         let first = CowBuffer::first_variant(bytes).unwrap_or(bytes.len());
 
         let Some(contractions) = CowBuffer::latin1_contractions(&bytes[first..]) else {
@@ -872,30 +997,22 @@ impl CowBuffer {
         };
 
         let total = bytes.len() - contractions;
-        let mut out = CowBuffer::with_capacity(total)?;
 
-        // SAFETY: freshly allocated with capacity for the whole result, hence unique and large enough.  The invariant
-        // prefix copies wholesale; the remainder contracts into the space counted for it, so `dst` cannot pass `total`.
-        unsafe {
-            let base = out.ptr.as_ptr();
-            ptr::copy_nonoverlapping(bytes.as_ptr(), base, first);
-
-            let (mut src, mut dst) = (first, first);
-            while src < bytes.len() {
-                let byte = bytes[src];
-                if byte < 0x80 {
-                    *base.add(dst) = byte;
-                    src += 1;
-                } else {
-                    *base.add(dst) = ((byte & 0x03) << 6) | (bytes[src + 1] & 0x3F);
-                    src += 2;
-                }
-                dst += 1;
+        let mut out = Vec::new();
+        out.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
+        out.extend_from_slice(&bytes[..first]);
+        let mut src = first;
+        while src < bytes.len() {
+            let byte = bytes[src];
+            if byte < 0x80 {
+                out.push(byte);
+                src += 1;
+            } else {
+                out.push(((byte & 0x03) << 6) | (bytes[src + 1] & 0x3F));
+                src += 2;
             }
-
-            debug_assert_eq!(dst, total, "the counted contraction must fill the buffer exactly");
-            out.set_len(total);
         }
+        debug_assert_eq!(out.len(), total, "the counted contraction must fill the buffer exactly");
 
         Ok(Some(out))
     }

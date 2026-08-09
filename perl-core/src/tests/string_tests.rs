@@ -520,67 +520,128 @@ fn design_decides_false(a: &PerlString, sa: u8, b: &PerlString, sb: u8) -> bool 
         || sf == scan::MALFORMED_UTF8
 }
 
+/// A heap string large enough to still classify lazily.  §2.2.3 pairs the small tiers with an eager pass, so
+/// `UNKNOWN` and the whole narrowing protocol are observable only above 64 KiB — below it a heap string knows its
+/// own state from birth, which is the point of the tiering and not a gap in the tests.
+fn lazy_heap(pattern: &[u8]) -> PerlString {
+    let mut bytes = Vec::with_capacity(LAZY_MIN + pattern.len());
+    while bytes.len() < LAZY_MIN {
+        bytes.extend_from_slice(pattern);
+    }
+    let s = PerlString::from_bytes(&bytes).unwrap();
+    assert!(!s.storage_type().is_small_heap_tier(), "the lazy tiers begin above 64 KiB");
+    s
+}
+
+/// The `&str` counterpart: known-valid UTF-8, large enough that its *range* is still undetermined.  Below 64 KiB
+/// `from_str` classifies fully, so `UTF8_UNKNOWN_RANGE` — valid, range unknown — exists only up here.
+fn lazy_str(pattern: &str) -> PerlString {
+    let mut text = String::with_capacity(LAZY_MIN + pattern.len());
+    while text.len() < LAZY_MIN {
+        text.push_str(pattern);
+    }
+    let s = PerlString::from_str(&text).unwrap();
+    assert!(!s.storage_type().is_small_heap_tier(), "the lazy tiers begin above 64 KiB");
+    s
+}
+
+/// One byte past `Heap16`'s ceiling — the smallest content that still classifies lazily.  Kept minimal because
+/// several witnesses allocate one each and the suite pays for every byte.
+const LAZY_MIN: usize = 65_536;
+
 /// Build every reachable (state, storage) witness configuration, with several byte contents behind the indeterminate
 /// states.  Each witness's state is asserted at construction.
-fn grid_witnesses() -> Vec<(String, PerlString)> {
-    let mut out: Vec<(String, PerlString)> = Vec::new();
+/// How many witnesses the grid has, building none of them.
+fn grid_witness_count() -> usize {
+    grid_witnesses_range(1, 0).1
+}
 
-    let mut push = |name: &str, s: PerlString, want: u8| {
+/// The one witness at `index`, built fresh.
+///
+/// The grid needs a fresh witness per comparison — `eq` narrows scan states as a side effect, so a reused witness
+/// would silently degrade indeterminate-state coverage into terminal-state coverage — but building all of them to
+/// keep one made the cost quadratic in witness size, and the indeterminate states now live above 64 KiB where only
+/// the lazy tiers still hold them (§2.2.3).
+fn grid_witness(index: usize) -> (String, PerlString) {
+    grid_witnesses_range(index, index).0.pop().expect("index within the witness set")
+}
+
+/// Build the witnesses whose indices fall in `lo..=hi`, and report how many exist.  A range that selects none
+/// still walks the list, so the count is available without paying for a single allocation.
+fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PerlString)>, usize) {
+    let mut out: Vec<(String, PerlString)> = Vec::new();
+    let mut seen = 0usize;
+
+    // The witness is passed as a thunk, not a value, so asking for one does not build the other eighteen.  That
+    // mattered little when every witness was a couple of dozen bytes; the indeterminate states now live above
+    // 64 KiB, because only the lazy tiers still hold them (§2.2.3), and the grid asks for a fresh witness per
+    // comparison.
+    let mut push = |name: &str, build: &dyn Fn() -> PerlString, want: u8| {
+        let index = seen;
+        seen += 1;
+        if index < lo || index > hi {
+            return;
+        }
+        let s = build();
         assert_eq!(s.scan_state(), want, "witness {name} state");
         out.push((name.to_string(), s));
     };
 
     // Inline terminals.
-    push("inl-ascii", PerlString::from_bytes(b"ab").unwrap(), scan::ASCII);
-    push("inl-latin1", PerlString::from_bytes([0xC3, 0xA9]).unwrap(), scan::UTF8_LATIN1);
-    push("inl-nonlatin1", PerlString::from_str("字").unwrap(), scan::UTF8_NON_LATIN1);
-    push("inl-extended", PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap(), scan::EXTENDED_UTF8);
-    push("inl-malformed", PerlString::from_bytes([0x80]).unwrap(), scan::MALFORMED_UTF8);
+    push("inl-ascii", &|| PerlString::from_bytes(b"ab").unwrap(), scan::ASCII);
+    push("inl-latin1", &|| PerlString::from_bytes([0xC3, 0xA9]).unwrap(), scan::UTF8_LATIN1);
+    push("inl-nonlatin1", &|| PerlString::from_str("字").unwrap(), scan::UTF8_NON_LATIN1);
+    push("inl-extended", &|| PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap(), scan::EXTENDED_UTF8);
+    push("inl-malformed", &|| PerlString::from_bytes([0x80]).unwrap(), scan::MALFORMED_UTF8);
 
-    // Heap terminals (narrowed via probes).
-    let h_ascii = PerlString::from_bytes(b"a".repeat(24)).unwrap();
-    assert!(h_ascii.is_ascii());
-    push("heap-ascii", h_ascii, scan::ASCII);
-    let h_l1 = PerlString::from_str(&"é".repeat(16)).unwrap();
-    let _ = h_l1.char_len(); // classifies via the fused pass
-    push("heap-latin1", h_l1, scan::UTF8_LATIN1);
-    let h_nl1 = PerlString::from_str(&"字".repeat(8)).unwrap();
-    let _ = h_nl1.char_len();
-    push("heap-nonlatin1", h_nl1, scan::UTF8_NON_LATIN1);
-    let h_ext = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
-    assert!(h_ext.is_perl_utf8_valid());
-    push("heap-extended", h_ext, scan::EXTENDED_UTF8);
-    let h_mal = PerlString::from_bytes([0x80; 24]).unwrap();
-    assert!(!h_mal.is_perl_utf8_valid());
-    push("heap-malformed", h_mal, scan::MALFORMED_UTF8);
+    // Heap terminals.  Below 64 KiB these are classified at construction, so no probe is needed to reach the state.
+    push("heap-ascii", &|| PerlString::from_bytes(b"a".repeat(24)).unwrap(), scan::ASCII);
+    push("heap-latin1", &|| PerlString::from_str(&"é".repeat(16)).unwrap(), scan::UTF8_LATIN1);
+    push("heap-nonlatin1", &|| PerlString::from_str(&"字".repeat(8)).unwrap(), scan::UTF8_NON_LATIN1);
+    push(
+        "heap-extended",
+        &|| {
+            let s = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
+            assert!(s.is_perl_utf8_valid());
+            s
+        },
+        scan::EXTENDED_UTF8,
+    );
+    push(
+        "heap-malformed",
+        &|| {
+            let s = PerlString::from_bytes([0x80; 24]).unwrap();
+            assert!(!s.is_perl_utf8_valid());
+            s
+        },
+        scan::MALFORMED_UTF8,
+    );
 
-    // Indeterminate states, several contents each.
-    push("heap-unknown-ascii", PerlString::from_bytes(b"x".repeat(24)).unwrap(), scan::UNKNOWN);
-    push("heap-unknown-latin1", PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap(), scan::UNKNOWN);
-    push("heap-unknown-malformed", PerlString::from_bytes([0x81; 23]).unwrap(), scan::UNKNOWN);
-    push("heap-ur-latin1", PerlString::from_str(&"é".repeat(16)).unwrap(), scan::UTF8_UNKNOWN_RANGE);
-    push("heap-ur-wide", PerlString::from_str(&"字".repeat(8)).unwrap(), scan::UTF8_UNKNOWN_RANGE);
-    let na8_l1 = PerlString::from_str(&"é".repeat(16)).unwrap();
-    assert!(!na8_l1.is_ascii());
-    push("heap-na8-latin1", na8_l1, scan::UTF8_NON_ASCII);
-    let na8_wide = PerlString::from_str(&"字".repeat(8)).unwrap();
-    assert!(!na8_wide.is_ascii());
-    push("heap-na8-wide", na8_wide, scan::UTF8_NON_ASCII);
-    let na_raw = PerlString::from_bytes([0x82; 24]).unwrap();
-    assert!(!na_raw.is_ascii());
-    push("heap-nonascii-raw", na_raw, scan::NON_ASCII);
-    let na_raw_valid = PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap();
-    assert!(!na_raw_valid.is_ascii());
-    push("heap-nonascii-valid-bytes", na_raw_valid, scan::NON_ASCII);
+    // Indeterminate states, which exist only above 64 KiB.
+    push("heap-unknown-ascii", &|| lazy_heap(b"x"), scan::UNKNOWN);
+    push("heap-unknown-latin1", &|| lazy_heap(&[0xC3, 0xA9]), scan::UNKNOWN);
+    push("heap-unknown-malformed", &|| lazy_heap(&[0x81]), scan::UNKNOWN);
+    push("heap-ur-latin1", &|| lazy_str("é"), scan::UTF8_UNKNOWN_RANGE);
+    push("heap-ur-wide", &|| lazy_str("字"), scan::UTF8_UNKNOWN_RANGE);
 
-    out
+    // The probe-narrowed states need a probe with something left to narrow, which again is the lazy tiers alone.
+    let narrowed = |s: PerlString| {
+        assert!(!s.is_ascii());
+        s
+    };
+    push("heap-na8-latin1", &|| narrowed(lazy_str("é")), scan::UTF8_NON_ASCII);
+    push("heap-na8-wide", &|| narrowed(lazy_str("字")), scan::UTF8_NON_ASCII);
+    push("heap-nonascii-raw", &|| narrowed(lazy_heap(&[0x82])), scan::NON_ASCII);
+    push("heap-nonascii-valid-bytes", &|| narrowed(lazy_heap(&[0xC3, 0xA9])), scan::NON_ASCII);
+
+    (out, seen)
 }
 
 #[test]
 fn full_scan_runs_once_then_state_answers() {
     // A heap string's first as_str pays one validation pass (+ one classification); afterwards every question is a
     // state read — the never-scan-twice law, mechanically.
-    let s = PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap(); // heap UNKNOWN: 32 bytes exceed the intake
+    let s = lazy_heap(&[0xC3, 0xA9]); // above 64 KiB, where the pass is still deferred
     eq_probe::reset();
     assert!(s.as_str(&mut [0u8; DECODE_MAX]).is_some());
     let (scans_first, _) = eq_probe::scans();
@@ -589,7 +650,7 @@ fn full_scan_runs_once_then_state_answers() {
     assert!(s.as_str(&mut [0u8; DECODE_MAX]).is_some());
     assert!(s.is_perl_utf8_valid());
     assert!(!s.is_ascii());
-    assert_eq!(s.char_len(), Some(16));
+    assert_eq!(s.char_len(), Some(LAZY_MIN / 2), "two bytes per character across the whole buffer");
     assert_eq!(eq_probe::scans(), (0, 0), "cached state must answer every subsequent question");
 }
 
@@ -597,8 +658,8 @@ fn full_scan_runs_once_then_state_answers() {
 fn cheap_probe_bails_at_first_high_bit() {
     // The ninth state's raison d'être (§2.2.4): the ASCII probe examines O(first-high-bit) bytes.
     let mut bytes = vec![0x80u8];
-    bytes.extend_from_slice(&b"a".repeat(5000));
-    let s = PerlString::from_bytes(&bytes).unwrap(); // heap UNKNOWN
+    bytes.extend_from_slice(&b"a".repeat(LAZY_MIN));
+    let s = PerlString::from_bytes(&bytes).unwrap(); // a lazy tier: still UNKNOWN at birth
     eq_probe::reset();
     assert!(!s.is_ascii());
     let (_, probe_bytes) = eq_probe::scans();
@@ -606,7 +667,7 @@ fn cheap_probe_bails_at_first_high_bit() {
     assert_eq!(s.scan_state(), scan::NON_ASCII);
 
     // Same bail on the validity-known tier.
-    let f = PerlString::from_str(&format!("é{}", "a".repeat(5000))).unwrap(); // heap UNKNOWN_RANGE
+    let f = PerlString::from_str(&format!("é{}", "a".repeat(LAZY_MIN))).unwrap(); // a lazy tier: UNKNOWN_RANGE
     eq_probe::reset();
     assert!(!f.is_ascii());
     let (_, pb2) = eq_probe::scans();
@@ -655,7 +716,7 @@ fn eq_grid_decided_pairs_perform_no_scan() {
     // scan happened on it).
     let wide = PerlString::from_str("字").unwrap(); // inline NL1, flagged
     assert!(wide.is_utf8()); // from_str of non-ASCII is flagged already
-    let unknown = PerlString::from_bytes([0x90u8; 24]).unwrap(); // heap UNKNOWN
+    let unknown = lazy_heap(&[0x90u8]); // only the lazy tiers still hold UNKNOWN
     assert_eq!(unknown.scan_state(), scan::UNKNOWN);
     eq_probe::reset();
     assert_ne!(wide, unknown); // cross-flag, flagged NL1: grid row 4
@@ -669,9 +730,9 @@ fn eq_grid_exhaustive_over_all_state_flag_combinations() {
     // Every (witness × flag) against every (witness × flag).  Witnesses are constructed FRESH for every pair: eq
     // narrows scan states as a side effect and heap clones share buffer state, so reused witnesses would silently
     // degrade indeterminate-state coverage into terminal-state coverage.
-    let n = grid_witnesses().len();
+    let n = grid_witness_count();
     let fresh = |i: usize, flagged: bool| -> (String, PerlString) {
-        let (name, mut w) = grid_witnesses().swap_remove(i);
+        let (name, mut w) = grid_witness(i);
         if flagged {
             let st = w.scan_state();
             w.set_utf8_for_test();
@@ -795,21 +856,22 @@ fn hash_dual_calculation_is_single_fetch_and_keeps_knowledge() {
 #[test]
 fn hash_dual_calculation_wide_and_malformed_outcomes() {
     // Wide content: the raw candidate wins; byte-identical flagged strings agree.
-    let a = PerlString::from_str(&"字".repeat(14)).unwrap(); // heap, flagged, UNKNOWN_RANGE
+    let a = PerlString::from_str(&"字".repeat(14)).unwrap(); // a small heap tier: classified at construction
     let b = PerlString::from_str(&"字".repeat(14)).unwrap();
+    assert_eq!(a.scan_state(), scan::UTF8_NON_LATIN1, "the construction pass settled the wide outcome");
     eq_probe::reset();
     let da = digest_of(&a);
-    assert_eq!(eq_probe::scans().0, 1);
-    assert_eq!(a.scan_state(), scan::UTF8_NON_LATIN1, "classification kept on the wide outcome too");
+    assert_eq!(eq_probe::scans().0, 0, "no pass left to pay");
     assert_eq!(da, digest_of(&b));
 
     // Malformed discovered mid-pass: raw digest, MALFORMED_UTF8 recorded, agrees with the known-malformed path on
     // byte-identical content.
-    let mut bad_bytes = vec![b'a'; 30];
+    // A lazy tier, so the malformation really is discovered by the digest's own pass rather than at construction.
+    let mut bad_bytes = vec![b'a'; LAZY_MIN];
     bad_bytes.push(0xC0);
     bad_bytes.push(0x80);
     let mut m1 = PerlString::from_bytes(&bad_bytes).unwrap();
-    m1.set_utf8_for_test(); // flagged, heap UNKNOWN
+    m1.set_utf8_for_test(); // flagged, still UNKNOWN above 64 KiB
     eq_probe::reset();
     let dm = digest_of(&m1);
     assert_eq!(eq_probe::scans().0, 1);
@@ -1012,14 +1074,22 @@ fn char_len_semantics_and_caching() {
     assert_eq!(li.char_len(), Some(12));
     assert_eq!(eq_probe::scans().0, 0, "the count is the stored nibble: no pass at all");
 
-    // Latin-1 heap: first call pays ONE fused pass; second call is a cache read.
+    // Latin-1 in a small heap tier: classified at construction (§2.2.3), so every read is a state read — the
+    // stronger property the eager tiers buy, where the lazy tiers pay one fused pass at first read instead.
     let l = PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap();
-    eq_probe::reset();
-    assert_eq!(l.char_len(), Some(16));
-    assert_eq!(eq_probe::scans().0, 1, "exactly one fused pass classifies and counts");
+    assert!(l.storage_type().is_small_heap_tier());
     eq_probe::reset();
     assert_eq!(l.char_len(), Some(16));
     assert!(l.as_str(&mut [0u8; DECODE_MAX]).is_some());
+    assert_eq!(eq_probe::scans().0, 0, "the construction pass already answered both questions");
+
+    // Above 64 KiB the pass is deferred, and then paid exactly once.
+    let big = lazy_heap(&[0xC3, 0xA9]);
+    eq_probe::reset();
+    assert_eq!(big.char_len(), Some(LAZY_MIN / 2));
+    assert_eq!(eq_probe::scans().0, 1, "exactly one fused pass classifies and counts");
+    eq_probe::reset();
+    assert_eq!(big.char_len(), Some(LAZY_MIN / 2));
     assert_eq!(eq_probe::scans().0, 0, "count and state both cached from the one pass");
 
     // Extended: counted (a 4-byte and a 13-byte character are one character each).
@@ -1464,7 +1534,7 @@ fn compressed_payloads_and_the_nibble_scheme() {
     // Deterministic ladder: 16-30-byte ASCII goes packed where an alphabet fits and heap otherwise — never compressed,
     // sixteen characters not fitting fifteen payload bytes.
     assert_eq!(PerlString::from_bytes(b"1234567890123456").unwrap().storage_type(), StorageType::PackedNumeric);
-    assert_eq!(PerlString::from_bytes(b"abcdefghabcdefgh").unwrap().storage_type(), StorageType::Heap);
+    assert_eq!(PerlString::from_bytes(b"abcdefghabcdefgh").unwrap().storage_type(), StorageType::Heap8);
 }
 
 #[test]
@@ -1552,8 +1622,8 @@ fn from_hex(hex: &str, flagged: bool) -> PerlString {
         return PerlString::build_packed(p, flagged, false);
     }
 
-    let cb = CowBuffer::from_slice(&bytes).unwrap();
-    PerlString::build_heap(flagged, false, cb)
+    let parts = HeapParts::from_slice(&bytes).unwrap();
+    PerlString::build_heap(flagged, false, parts)
 }
 
 #[test]
