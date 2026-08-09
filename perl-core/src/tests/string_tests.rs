@@ -167,11 +167,11 @@ fn heap_append_transitions() {
     s.push_str("é").unwrap();
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]).map(|v| v.len()), Some(32));
 
-    // ASCII + valid-non-ascii → UTF8_NON_ASCII, without rescanning.
+    // The transition raised the range without a rescan; below 64 KiB the answer is terminal by type.
     assert!(!s.is_ascii());
-    let mut raw = PerlString::from_bytes([0x80u8; 30]).unwrap(); // Heap, UNKNOWN
-    raw.push_bytes(&[0x81]).unwrap();
-    assert_eq!(raw.as_str(&mut [0u8; DECODE_MAX]), None); // lazy scan resolves to invalid
+    let mut raw = PerlString::from_bytes([0x80u8; 30]).unwrap(); // small tier: terminal (malformed) at construction
+    raw.push_bytes(&[0x81]).unwrap(); // indeterminate transition → the funnel reclassifies (§2.2.3)
+    assert_eq!(raw.as_str(&mut [0u8; DECODE_MAX]), None); // answered from the recorded state
 }
 
 #[test]
@@ -908,11 +908,11 @@ fn hash_dual_calculation_across_block_boundary() {
 // ── Blocked hybrid classifier boundaries (§2.2.5) ─────────────
 /// Test-only reference: the scalar single-byte-scan classifier, transcribed as the oracle for the blocked hybrid (same
 /// decode rules, no blocking).
-fn reference_classify(bytes: &[u8]) -> (u8, usize) {
+fn reference_classify(bytes: &[u8]) -> (scan::Terminal, usize) {
     let mut facts = ScanFacts::default();
     match scalar_decode_span(bytes, 0, bytes.len(), &mut facts, |_| {}) {
         Some(_) => (facts.state(), facts.chars),
-        None => (scan::MALFORMED_UTF8, 0),
+        None => (scan::Terminal::Malformed, 0),
     }
 }
 
@@ -955,7 +955,7 @@ fn block_boundary_straddles_every_sequence_length() {
             bytes.extend_from_slice(seq);
             bytes.extend_from_slice(b"tail");
             let (st, chars) = classify_full(&bytes);
-            assert_eq!(st, want_state, "state for seq len {} cut {}", seq.len(), cut);
+            assert_eq!(st.state(), want_state, "state for seq len {} cut {}", seq.len(), cut);
             assert_eq!(chars, lead_len + 1 + 4, "chars for seq len {} cut {}", seq.len(), cut);
         }
     }
@@ -975,7 +975,7 @@ fn block_boundaries_realign_to_the_grid_after_straddles() {
     bytes.extend_from_slice(b"tail");
 
     let (st, chars) = classify_full(&bytes);
-    assert_eq!(st, scan::UTF8_NON_LATIN1);
+    assert_eq!(st, scan::Terminal::NonLatin1);
 
     // chars: (BLOCK-1) a's + 字 + b-fill + é + 4 tail.
     let b_fill = (2 * CLASSIFY_BLOCK - 1) - (CLASSIFY_BLOCK - 1 + 3);
@@ -987,12 +987,12 @@ fn block_boundary_truncation_and_malformation() {
     // Lead byte as the final byte of the slice, exactly at the boundary: truncated.
     let mut t = vec![b'a'; CLASSIFY_BLOCK - 1];
     t.push(0xC3);
-    assert_eq!(classify_full(&t), (scan::MALFORMED_UTF8, 0));
+    assert_eq!(classify_full(&t), (scan::Terminal::Malformed, 0));
 
     // Bad continuation lands in the next block: malformed.
     let mut m = vec![b'a'; CLASSIFY_BLOCK - 1];
     m.extend_from_slice(&[0xC3, 0x28]);
-    assert_eq!(classify_full(&m), (scan::MALFORMED_UTF8, 0));
+    assert_eq!(classify_full(&m), (scan::Terminal::Malformed, 0));
 }
 
 #[test]
@@ -1622,7 +1622,7 @@ fn from_hex(hex: &str, flagged: bool) -> PerlString {
         return PerlString::build_packed(p, flagged, false);
     }
 
-    let parts = HeapParts::from_slice(&bytes).unwrap();
+    let parts = heap_parts_classified(&bytes).unwrap();
     PerlString::build_heap(flagged, false, parts)
 }
 
@@ -4054,6 +4054,7 @@ fn upgrade_moves_when_the_expansion_does_not_fit() {
 
     // Born sized to its content, so 40 Latin-1 bytes expanding to 80 cannot fit and must move.
     assert!(cap_before < 80, "the premise: this one has to reallocate");
+
     s.upgrade_in_place().unwrap();
     assert_eq!(s.len(), 80, "each Latin-1 byte becomes two UTF-8 bytes");
     assert!(s.is_utf8());
@@ -4122,6 +4123,28 @@ fn downgrade_refuses_content_past_the_latin1_range() {
 }
 
 #[test]
+fn raw_append_onto_a_small_tier_is_classified_not_left_unknown() {
+    // Finding 2's second door, which the terminal envelope type found: a raw-byte append transitions to UNKNOWN in the
+    // lattice, and a small tier cannot hold that — the transition funnel must pay the construction-grade pass.
+    let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();
+    assert!(s.storage_type().is_small_heap_tier());
+    s.push_bytes(&[0x81, 0x82]).unwrap(); // AppendKind::Unknown: nothing known about these bytes
+
+    assert_ne!(s.scan_state(), scan::UNKNOWN, "indeterminate states are unrepresentable below 64 KiB");
+    eq_probe::reset();
+    let _ = s.is_perl_utf8_valid();
+    let _ = s.is_perl_utf8_valid();
+    assert_eq!(eq_probe::scans().0, 0, "both reads answered from the state the append recorded");
+
+    // Oracle: the append's classification must be exactly construction's on the same bytes.
+    let mut buf = [0u8; DECODE_MAX];
+    let bytes = s.as_bytes(&mut buf).to_vec();
+    let fresh = PerlString::from_bytes(&bytes).unwrap();
+    assert_eq!(s.scan_state(), fresh.scan_state(), "the transition funnel agrees with construction");
+    assert_eq!(s.char_len(), fresh.char_len(), "and on the cached count");
+}
+
+#[test]
 fn downgraded_small_tier_is_classified_not_left_unknown() {
     // Regression for the audit's second finding: the in-place downgrade wrote UNKNOWN into a small tier's envelope, and
     // narrow_scan is deliberately a no-op there, so every subsequent validity question re-derived — (1, 1) scans across
@@ -4149,9 +4172,9 @@ fn downgraded_small_tier_is_classified_not_left_unknown() {
 
 #[test]
 fn heap_append_releases_the_buffer_it_replaces() {
-    // Regression for the audit's first finding: the heap-to-heap append rebuilds into a fresh allocation, and the
-    // old one must be released, not abandoned.  The bomb catches the abandonment at the drop site; this counts the
-    // balance, which also covers a leak that never touches an `Owned`.
+    // Regression for the audit's first finding: the heap-to-heap append rebuilds into a fresh allocation, and the old
+    // one must be released, not abandoned.  The bomb catches the abandonment at the drop site; this counts the balance,
+    // which also covers a leak that never touches an `Owned`.
     let before = crate::cow_buffer::live::count();
     {
         let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();
@@ -4181,10 +4204,11 @@ fn construction_and_transform_round_trips_balance_allocations() {
 #[test]
 #[should_panic(expected = "Owned dropped while still armed")]
 fn the_bomb_detonates_on_an_abandoned_obligation() {
-    // The mechanism's own test: an armed `Owned` dropped without release is the defect, reported at its site.
-    // Balance is restored via a manual release inside the panic path being impossible — so this test intentionally
-    // leaks one allocation on its own thread; the counter is thread-local and this thread ends here.
+    // The mechanism's own test: an armed `Owned` dropped without release is the defect, reported at its site.  Balance
+    //  is restored via a manual release inside the panic path being impossible — so this test intentionally leaks one
+    // allocation on its own thread; the counter is thread-local and this thread ends here.
     let ptr = crate::cow_buffer::heap16::allocate(32).unwrap();
+
     // SAFETY: freshly allocated with one reference, which this `Owned` takes on — and then abandons.
     let _armed = unsafe { crate::cow_buffer::Owned::from_raw(ptr) };
 }

@@ -81,6 +81,54 @@ pub mod scan {
     /// A high bit is present; validity and range unknown.
     pub const NON_ASCII: u8 = 8;
 
+    /// The five states a full classification can produce — the *terminal* subset of the lattice, as a closed type.
+    ///
+    /// The small tiers' envelopes hold this type rather than the raw `u8`, and that is the enforcement of §2.2.3's
+    /// eager rule: with no allocation slot to record a later discovery, a small tier holding an indeterminate state
+    /// would re-derive on every read forever, so the states that need narrowing are not merely rejected below 64 KiB —
+    /// they are unrepresentable there.  Writing `UNKNOWN` into a small envelope is a type error, which is how the
+    /// defect this type answers was written twice (the in-place downgrade, and the raw-byte append transition) before
+    /// the compiler was given the means to refuse it.
+    ///
+    /// Discriminants equal the lattice constants, pinned by the asserts below, so projection is a cast.
+    #[repr(u8)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Terminal {
+        Ascii = 1,
+        Latin1 = 2,
+        NonLatin1 = 3,
+        Extended = 6,
+        Malformed = 7,
+    }
+
+    const _: () = assert!(Terminal::Ascii as u8 == ASCII);
+    const _: () = assert!(Terminal::Latin1 as u8 == UTF8_LATIN1);
+    const _: () = assert!(Terminal::NonLatin1 as u8 == UTF8_NON_LATIN1);
+    const _: () = assert!(Terminal::Extended as u8 == EXTENDED_UTF8);
+    const _: () = assert!(Terminal::Malformed as u8 == MALFORMED_UTF8);
+
+    impl Terminal {
+        /// Project into the shared `u8` lattice, for the readers and the large tiers that speak it.
+        #[inline]
+        pub const fn state(self) -> u8 {
+            self as u8
+        }
+
+        /// The reverse projection, for the one seam where a state round-trips through tier-agnostic transport
+        /// (`HeapParts`).  Every path feeding a small tier establishes a terminal state first, so the panic is of the
+        /// bomb's family: unreachable in correct code, and reporting rather than misbehaving if a future path is not.
+        pub fn from_state(state: u8) -> Terminal {
+            match state {
+                ASCII => Terminal::Ascii,
+                UTF8_LATIN1 => Terminal::Latin1,
+                UTF8_NON_LATIN1 => Terminal::NonLatin1,
+                EXTENDED_UTF8 => Terminal::Extended,
+                MALFORMED_UTF8 => Terminal::Malformed,
+                other => panic!("non-terminal scan state {other} reached a small tier"),
+            }
+        }
+    }
+
     /// Rust-valid ⟺ 1..=5 under the numbering (§2.2.4).
     #[inline]
     pub const fn is_rust_valid(state: u8) -> bool {
@@ -205,7 +253,7 @@ fn block_end(pos: usize, len: usize) -> usize {
 /// forms decode; overlongs (minimal-length rule at every width), bare continuations, and truncations are malformed;
 /// values cap at perl's `IV_MAX`, 2^63-1.  Rust additionally rejects surrogates, values above U+10FFFF, and any
 /// sequence longer than 4 bytes — decidable per-sequence during the same decode.
-fn classify_full(bytes: &[u8]) -> (u8, usize) {
+fn classify_full(bytes: &[u8]) -> (scan::Terminal, usize) {
     count_full_scan();
 
     let mut facts = ScanFacts::default();
@@ -226,7 +274,7 @@ fn classify_full(bytes: &[u8]) -> (u8, usize) {
         // sequence that straddles it.
         match scalar_decode_span(bytes, pos, soft_end, &mut facts, |_| {}) {
             Some(next) => pos = next,
-            None => return (scan::MALFORMED_UTF8, 0),
+            None => return (scan::Terminal::Malformed, 0),
         }
     }
 
@@ -243,15 +291,15 @@ struct ScanFacts {
 }
 
 impl ScanFacts {
-    fn state(&self) -> u8 {
+    fn state(&self) -> scan::Terminal {
         if self.saw_rust_rejected {
-            scan::EXTENDED_UTF8
+            scan::Terminal::Extended
         } else if self.saw_beyond_latin1 {
-            scan::UTF8_NON_LATIN1
+            scan::Terminal::NonLatin1
         } else if self.saw_multibyte {
-            scan::UTF8_LATIN1
+            scan::Terminal::Latin1
         } else {
-            scan::ASCII
+            scan::Terminal::Ascii
         }
     }
 }
@@ -514,8 +562,8 @@ macro_rules! define_perl_string {
         enum Repr {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
-            $( $h8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: u8 }, )*
-            $( $h16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: u8 }, )*
+            $( $h8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: scan::Terminal }, )*
+            $( $h16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
             $( $h32 { ptr: Owned, mirror: u32 }, )*
             $( $hw  { ptr: Owned }, )*
         }
@@ -658,9 +706,9 @@ macro_rules! define_perl_string {
                         nibbles: *nibbles,
                     }), )*
                     $( Repr::$h8 { ptr, len, cap, count, scan } =>
-                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, *scan, Tier::Heap8)), )*
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, scan.state(), Tier::Heap8)), )*
                     $( Repr::$h16 { ptr, len, cap, count, scan } =>
-                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, *scan, Tier::Heap16)), )*
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, scan.state(), Tier::Heap16)), )*
                     // SAFETY: a live allocation of this tier, whose header carries the metadata.
                     $( Repr::$h32 { ptr, .. } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::Heap32) }), )*
                     $( Repr::$hw { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::HeapW) }), )*
@@ -713,13 +761,13 @@ macro_rules! define_perl_string {
                         unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u8;
                         *count = old_len as u8;
-                        *scan = scan::UTF8_LATIN1;
+                        *scan = scan::Terminal::Latin1;
                     }, )*
                     $( Repr::$h16 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u16;
                         *count = old_len as u16;
-                        *scan = scan::UTF8_LATIN1;
+                        *scan = scan::Terminal::Latin1;
                     }, )*
                     $( Repr::$h32 { ptr, mirror } => {
                         unsafe {
@@ -850,7 +898,7 @@ macro_rules! define_perl_string {
                         len: *len as usize,
                         cap: *cap as usize,
                         count: *count as u32,
-                        scan: *scan,
+                        scan: scan.state(),
                         tier: Tier::Heap8,
                     }, )*
                     $( Repr::$h16 { ptr, len, cap, count, scan } => RawOwned::Heap {
@@ -858,7 +906,7 @@ macro_rules! define_perl_string {
                         len: *len as usize,
                         cap: *cap as usize,
                         count: *count as u32,
-                        scan: *scan,
+                        scan: scan.state(),
                         tier: Tier::Heap16,
                     }, )*
 
@@ -897,12 +945,14 @@ macro_rules! define_perl_string {
                 match tier {
                     Tier::Heap8 => match (utf8, tainted) {
                         $( ($h8_utf8, $h8_tainted) => PerlString(Repr::$h8 {
-                            ptr, len: len as u8, cap: cap as u8, count: count as u8, scan,
+                            ptr, len: len as u8, cap: cap as u8, count: count as u8,
+                            scan: scan::Terminal::from_state(scan),
                         }), )*
                     },
                     Tier::Heap16 => match (utf8, tainted) {
                         $( ($h16_utf8, $h16_tainted) => PerlString(Repr::$h16 {
-                            ptr, len: len as u16, cap: cap as u16, count: count as u16, scan,
+                            ptr, len: len as u16, cap: cap as u16, count: count as u16,
+                            scan: scan::Terminal::from_state(scan),
                         }), )*
                     },
                     Tier::Heap32 => match (utf8, tainted) {
@@ -1121,18 +1171,34 @@ fn expand_latin1(b: u8, out: &mut [u8]) -> usize {
     }
 }
 
+/// Allocate heap parts for appended content, classified by the transition where that suffices.
+///
+/// The append lattice (§2.2.5) can answer `UNKNOWN` — a raw-byte append, or growth onto content whose validity was
+/// never established — and a large tier records that and moves on.  A small tier cannot: its envelope holds only the
+/// terminal type, so an indeterminate transition means paying the construction-grade pass over the joined content.
+/// This is finding 2's second door, held shut by the same eager rule that shuts the first — and the type is what found
+/// it: the seam's integrity check detonated on six existing tests the audit had passed over.
+fn heap_parts_transitioned(bytes: &[u8], state: u8, chars: usize) -> Result<HeapParts, AllocError> {
+    let parts = HeapParts::from_slice(bytes)?;
+    if parts.tier.is_small() && !scan::is_terminal(state) {
+        let (terminal, counted) = classify_full(bytes);
+        return Ok(parts.with_classification(terminal.state(), counted));
+    }
+    Ok(parts.with_classification(state, chars))
+}
+
 /// Allocate heap parts for `bytes`, classifying eagerly where the tier keeps its scan state in the envelope.
 ///
-/// §2.2.3 pairs the small tiers with eager classification, and the two go together necessarily: with no scan byte
-/// in the allocation there is nowhere to record a later discovery, so a small tier that were born unknown would
-/// rescan on every read.  The pass costs at most ~117 ns at `Heap8` and, for ASCII content of any size, less than
-/// the copy that just happened (§2.2.11).  The large tiers are left unknown deliberately — at those sizes the pass
-/// is what they cannot afford, and their allocation has the room to record what a reader discovers.
+/// §2.2.3 pairs the small tiers with eager classification, and the two go together necessarily: with no scan byte in
+/// the allocation there is nowhere to record a later discovery, so a small tier that were born unknown would rescan on
+/// every read.  The pass costs at most ~117 ns at `Heap8` and, for ASCII content of any size, less than the copy that
+/// just happened (§2.2.11).  The large tiers are left unknown deliberately — at those sizes the pass is what they
+/// cannot afford, and their allocation has the room to record what a reader discovers.
 fn heap_parts_classified(bytes: &[u8]) -> Result<HeapParts, AllocError> {
     let parts = HeapParts::from_slice(bytes)?;
     if parts.tier.is_small() {
         let (state, chars) = classify_full(bytes);
-        return Ok(parts.with_classification(state, chars));
+        return Ok(parts.with_classification(state.state(), chars));
     }
     Ok(parts)
 }
@@ -1153,8 +1219,8 @@ fn classify_inline(bytes: &[u8]) -> Option<(InlineClass, usize, usize, [u8; INLI
     }
 
     let (class, aux) = match classify_full(bytes) {
-        (scan::UTF8_NON_LATIN1, chars) => (InlineClass::NonLatin1, chars),
-        (scan::EXTENDED_UTF8, chars) => (InlineClass::Extended, chars),
+        (scan::Terminal::NonLatin1, chars) => (InlineClass::NonLatin1, chars),
+        (scan::Terminal::Extended, chars) => (InlineClass::Extended, chars),
         // ASCII and Latin-1-range content took the compressed branch above; what remains is the Bytes residual.
         _ => (InlineClass::Bytes, 0),
     };
@@ -1198,7 +1264,7 @@ impl PerlString {
             let parts = HeapParts::from_slice(bytes)?;
             let parts = if parts.tier.is_small() {
                 let (state, chars) = classify_full(bytes);
-                parts.with_classification(state, chars)
+                parts.with_classification(state.state(), chars)
             } else {
                 parts.with_classification(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE }, 0)
             };
@@ -1383,6 +1449,7 @@ impl PerlString {
                     scan::MALFORMED_UTF8 | scan::EXTENDED_UTF8 => None,
                     _ => {
                         let (st, chars) = classify_full(bytes); // one pass: validity (both tiers) + range + count
+                        let st = st.state();
                         cb.narrow_scan(st);
 
                         if chars > 0 {
@@ -1462,6 +1529,7 @@ impl PerlString {
                 scan::MALFORMED_UTF8 => false,
                 _ => {
                     let (st, chars) = classify_full(cb.as_slice()); // the single pass
+                    let st = st.state();
                     cb.narrow_scan(st);
 
                     if chars > 0 {
@@ -1505,6 +1573,7 @@ impl PerlString {
                     }
 
                     let (st, chars) = classify_full(cb.as_slice()); // one pass classifies AND counts
+                    let st = st.state();
                     cb.narrow_scan(st);
 
                     if st == scan::MALFORMED_UTF8 {
@@ -1643,7 +1712,7 @@ impl PerlString {
                     return Ok(Some(PerlString::tiered(&out, false, t)?));
                 }
 
-                Ok(Some(PerlString::build_heap(false, t, HeapParts::from_slice(&out)?)))
+                Ok(Some(PerlString::build_heap(false, t, heap_parts_classified(&out)?)))
             }
         }
     }
@@ -1809,7 +1878,7 @@ impl PerlString {
             joined.extend_from_slice(&internal[..ilen]);
             joined.extend_from_slice(bytes);
             let state = append_transition_heap(inline_scan_to_heap(class), kind);
-            *self = PerlString::build_heap(u, t, HeapParts::from_slice(&joined)?.with_classification(state, 0));
+            *self = PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?);
 
             return Ok(());
         }
@@ -1835,7 +1904,7 @@ impl PerlString {
                     joined.extend_from_slice(old_bytes);
                     joined.extend_from_slice(bytes);
                     let state = append_transition_heap(scan::ASCII, kind);
-                    PerlString::build_heap(u, t, HeapParts::from_slice(&joined)?.with_classification(state, 0))
+                    PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
                 }
             }
             RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
@@ -1869,7 +1938,7 @@ impl PerlString {
                     _ => 0,
                 };
 
-                PerlString::build_heap(u, t, HeapParts::from_slice(&joined)?.with_classification(state, chars))
+                PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, chars)?)
             }
         };
 
@@ -2547,7 +2616,7 @@ impl PerlString {
                     if malformed {
                         cb.narrow_scan(scan::MALFORMED_UTF8);
                     } else {
-                        cb.narrow_scan(facts.state());
+                        cb.narrow_scan(facts.state().state());
                         if facts.chars > 0 {
                             cb.set_char_count(facts.chars);
                         }

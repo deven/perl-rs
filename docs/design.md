@@ -409,6 +409,20 @@ unique-check mutation, nothing else.  Details:
   larger header it needs.  Perl by comparison pays roughly 110 µs
   to learn the same facts about a 64 KiB string, lazily.
 
+  The pairing is enforced by type, not convention: the small tiers'
+  envelope scan field is `scan::Terminal`, the closed enum of the
+  five states a full classification can produce, so an indeterminate
+  state below 64 KiB is unrepresentable rather than merely wrong.
+  This is load-bearing, not decorative — a small tier has no
+  allocation slot to record a later discovery, so one holding
+  `UNKNOWN` would re-derive on every read forever, and that defect
+  was written twice (the in-place downgrade, and the raw-byte append
+  transition) before the field's type could refuse it.  Every path
+  that cannot hand a small tier a terminal state pays the
+  construction-grade pass instead: the append lattice's
+  indeterminate answers route through reclassification, at the same
+  price construction charges for the same content.
+
 - **A 32-bit refcount in every tier, and overflow aborts
   [DECISION].**  Saturating into immortality was the earlier
   ruling, on the grounds that a count which stops counting merely
