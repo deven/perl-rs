@@ -553,10 +553,10 @@ macro_rules! define_perl_string {
                 match self {
                     $( Repr::$inline { .. } => {}, )*
                     $( Repr::$packed { .. } => {}, )*
-                    $( Repr::$h8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.as_ptr(), *cap) }, )*
-                    $( Repr::$h16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.as_ptr(), *cap) }, )*
-                    $( Repr::$h32 { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.as_ptr()) }, )*
-                    $( Repr::$hw { ptr } => unsafe { cow_buffer::heapw::release(ptr.as_ptr()) }, )*
+                    $( Repr::$h8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
+                    $( Repr::$h16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
+                    $( Repr::$h32 { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
+                    $( Repr::$hw { ptr } => unsafe { cow_buffer::heapw::release(ptr.claim()) }, )*
                 }
             }
         }
@@ -874,7 +874,15 @@ macro_rules! define_perl_string {
             }
 
             fn build_heap(utf8: bool, tainted: bool, parts: HeapParts) -> PerlString {
-                let HeapParts { ptr, len, cap, count, scan, tier } = parts;
+                // The one place the obligation leaves a `HeapParts` without releasing: the variant built below is
+                // its next owner.  `E0509` forbids the plain destructure now that `HeapParts` owns a `Drop`, which
+                // is the compiler confirming this transfer must be spelled out.
+                let mut parts = core::mem::ManuallyDrop::new(parts);
+                let ptr = parts.ptr.claim();
+                let (len, cap, count, scan, tier) = (parts.len, parts.cap, parts.count, parts.scan, parts.tier);
+                // SAFETY: `ptr` was claimed above and every field is `Copy`; the `ManuallyDrop` shell holds only a
+                // disarmed `Owned` and is never dropped.
+                let ptr = unsafe { Owned::from_raw(ptr) };
                 match tier {
                     Tier::Heap8 => match (utf8, tainted) {
                         $( ($h8_utf8, $h8_tainted) => PerlString(Repr::$h8 {
@@ -1822,13 +1830,15 @@ impl PerlString {
             RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
                 // The appended result may not fit the tier it started in, so the buffer is rebuilt rather than
                 // extended: growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what
-                // `HeapParts::from_slice` does.  Reading the old bytes needs the view, which needs the metadata
-                // that traveled with the pointer.
+                // `HeapParts::from_slice` does.  Reassembling the parts first makes the old allocation owned for
+                // the whole arm: dropping `old` — at the end or through either `?` — is the release.  The first
+                // run of the leak bomb caught this arm abandoning the pointer instead.
+                let old = HeapParts { ptr, len, cap, count, scan: prior, tier };
                 let view = if tier.is_small() {
-                    HeapView::small(&ptr, len, cap, count, prior, tier)
+                    HeapView::small(&old.ptr, len, cap, count, prior, tier)
                 } else {
-                    // SAFETY: a live allocation of a large tier, still owned by `ptr`.
-                    unsafe { HeapView::large(&ptr, tier) }
+                    // SAFETY: a live allocation of a large tier, owned by `old`.
+                    unsafe { HeapView::large(&old.ptr, tier) }
                 };
                 let (prior, prior_chars) = (view.scan(), view.char_count());
 

@@ -4120,3 +4120,47 @@ fn downgrade_refuses_content_past_the_latin1_range() {
     assert_eq!(heap_addr(&wide), Some(before), "and the refusal leaves the buffer alone");
     assert!(wide.is_utf8(), "still flagged");
 }
+
+// ── Leak accounting (the bomb's second layer) ──────────────────────────────
+
+#[test]
+fn heap_append_releases_the_buffer_it_replaces() {
+    // Regression for the audit's first finding: the heap-to-heap append rebuilds into a fresh allocation, and the
+    // old one must be released, not abandoned.  The bomb catches the abandonment at the drop site; this counts the
+    // balance, which also covers a leak that never touches an `Owned`.
+    let before = crate::cow_buffer::live::count();
+    {
+        let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();
+        assert!(s.storage_type().is_small_heap_tier());
+        for _ in 0..8 {
+            s.push_str("bcdefghij").unwrap();
+        }
+        assert!(crate::cow_buffer::live::count() > before, "the appends allocated");
+    }
+    assert_eq!(crate::cow_buffer::live::count(), before, "every allocation the appends made was released");
+}
+
+#[test]
+fn construction_and_transform_round_trips_balance_allocations() {
+    let before = crate::cow_buffer::live::count();
+    {
+        let mut s = PerlString::from_str(&"é".repeat(40)).unwrap();
+        assert!(s.downgrade_in_place().unwrap());
+        s.upgrade_in_place().unwrap();
+        let _clone = s.clone();
+        let _big = lazy_heap(&[0xC3, 0xA9]);
+    }
+    assert_eq!(crate::cow_buffer::live::count(), before, "constructions, transforms and clones all balance");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "Owned dropped while still armed")]
+fn the_bomb_detonates_on_an_abandoned_obligation() {
+    // The mechanism's own test: an armed `Owned` dropped without release is the defect, reported at its site.
+    // Balance is restored via a manual release inside the panic path being impossible — so this test intentionally
+    // leaks one allocation on its own thread; the counter is thread-local and this thread ends here.
+    let ptr = crate::cow_buffer::heap16::allocate(32).unwrap();
+    // SAFETY: freshly allocated with one reference, which this `Owned` takes on — and then abandons.
+    let _armed = unsafe { crate::cow_buffer::Owned::from_raw(ptr) };
+}
