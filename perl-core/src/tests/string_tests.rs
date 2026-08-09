@@ -3649,7 +3649,7 @@ fn timestamps_transcode_into_zulu_by_decrement() {
 }
 
 /// The transition specification, written out rather than re-derived from the symbol lists, so the test fails if the
-/// tables and the intended behaviour ever diverge.  `None` means the content leaves the packed tier for the heap.
+/// tables and the intended behavior ever diverge.  `None` means the content leaves the packed tier for the heap.
 fn expected_mapping(from: PackedAlphabet, to: PackedAlphabet, nibble: u8) -> Option<u8> {
     match (from, to) {
         (PackedAlphabet::Numeric, PackedAlphabet::DateTimePlus) => match nibble {

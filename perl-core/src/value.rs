@@ -1099,7 +1099,7 @@ fn word_all_digits(word: u64) -> bool {
     (word & HIGH) == 0x3030_3030_3030_3030 && ((word & LOW) + 0x0606_0606_0606_0606) & HIGH == 0
 }
 
-/// Vectorised leading-digit-run scan: subtracting `'0'` wraps every non-digit above nine, so a saturating subtract
+/// Vectorized leading-digit-run scan: subtracting `'0'` wraps every non-digit above nine, so a saturating subtract
 /// leaves a nonzero lane exactly where the run ends.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -1211,7 +1211,7 @@ fn digit_run_words(bytes: &[u8]) -> usize {
 }
 
 /// The length of the leading run of ASCII digits.  This is the only part of numification that is O(the string) — past
-/// nineteen significant digits the remainder can only shift an exponent — so it is the part worth vectorising, and the
+/// nineteen significant digits the remainder can only shift an exponent — so it is the part worth vectorizing, and the
 /// block structure exits at the first non-digit rather than reading to the end.
 pub(crate) fn digit_run(bytes: &[u8]) -> usize {
     // A run shorter than one vector block — which is nearly every number a program actually numifies — skips dispatch

@@ -1743,7 +1743,7 @@ impl PerlString {
             }
         }
 
-        // Otherwise the payload has to move.  For inline content that is still only a materialisation of at most thirty
+        // Otherwise the payload has to move.  For inline content that is still only a materialization of at most thirty
         // bytes and one rebuild: append is byte mutation, so the result re-runs canonical selection (§2.2.9) over the
         // value's internal bytes — the compressed classes expand first, exactly as `as_bytes` would.
         let inline = match self.raw_parts() {
@@ -1823,7 +1823,7 @@ impl PerlString {
                 // The appended result may not fit the tier it started in, so the buffer is rebuilt rather than
                 // extended: growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what
                 // `HeapParts::from_slice` does.  Reading the old bytes needs the view, which needs the metadata
-                // that travelled with the pointer.
+                // that traveled with the pointer.
                 let view = if tier.is_small() {
                     HeapView::small(&ptr, len, cap, count, prior, tier)
                 } else {
@@ -2215,7 +2215,7 @@ impl PartialEq for PerlString {
                 return a.alphabet == b.alphabet && a.full == b.full && a.nibbles == b.nibbles;
             }
 
-            // One side packed: compare against the other's bytes without materialising this side's.
+            // One side packed: compare against the other's bytes without materializing this side's.
             if let RawParts::Packed(p) = self.raw_parts() {
                 let mut rs = [0u8; DECODE_MAX];
                 return p.eq_bytes(other.as_bytes(&mut rs));
@@ -2387,7 +2387,7 @@ impl PerlString {
         use std::hash::BuildHasher;
         use std::sync::OnceLock;
 
-        /// The per-process digest key (§2.3.5): the analogue of perl's `PL_hash_seed`.  An unkeyed digest would let
+        /// The per-process digest key (§2.3.5): the analog of perl's `PL_hash_seed`.  An unkeyed digest would let
         /// attackers precompute colliding keys offline (the pre-5.8.1 HashDoS posture); collisions in this inner digest
         /// collapse hash-map buckets regardless of the outer map's own seed, so the hardening must live here.  One
         /// state per process: digests must agree within a process and need not (must not, for hardening) agree across
@@ -2400,7 +2400,7 @@ impl PerlString {
         /// Feeds a candidate's canonical byte stream to its hasher in provenance-independent chunks: identical streams
         /// issue identical `write` calls whether the bytes arrive as one slice, as block spans, or one character at a
         /// time.  The `Hasher` contract does not promise that mixed call shapes (`write` vs `write_u8`) hash alike, so
-        /// the shape is owned here rather than borrowed from SipHasher's current behaviour.
+        /// the shape is owned here rather than borrowed from SipHasher's current behavior.
         struct ChunkFeed<H: Hasher> {
             h: H,
             buf: [u8; 64],

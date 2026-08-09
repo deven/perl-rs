@@ -21,7 +21,7 @@ blamed.
 gave three different rankings of the same kernels:
 
 - Dispatching through a `fn` pointer costs an indirect call that LLVM
-  devirtualises for some variants and not others.  At small inputs that is as
+  devirtualizes for some variants and not others.  At small inputs that is as
   expensive as the work, and it reversed the ranking of the loop-form variants
   entirely.
 - Pasting the algorithm inline (a macro taking the body as a token stream)
@@ -40,8 +40,8 @@ Every ratio in the table was wrong.  If the reference does not read exactly
 
 **Batch short inputs, and vary them.**  Below roughly 30 ns the timing loop's
 own machinery is a measurable fraction of the result.  Running the algorithm
-over a batch of distinct inputs inside one timed iteration amortises that, and
-the variation also stops the branch predictor memorising a single answer.  A
+over a batch of distinct inputs inside one timed iteration amortizes that, and
+the variation also stops the branch predictor memorizing a single answer.  A
 sweep from batch 1 to 1M showed the median falling about 16-19% out to batch 8,
 flat through roughly 128K, then rising again as the working set left cache.
 **Use 256 to 1024**: past the knee, well clear of the cliff.
@@ -69,11 +69,11 @@ occasional excursions of 10-70%; a quiet laptop resolves to under 0.5%.
 Spikes that move between runs are the machine, not the code.  Do not draw
 conclusions the hardware cannot support.
 
-## Read the assembly before theorising
+## Read the assembly before theorizing
 
 Four hypotheses about *why* two measurements differed —
 algorithm-versus-width, population counts, `chunks_exact` versus indexing,
-and inlining-versus-vectorisation — were each falsified by the next
+and inlining-versus-vectorization — were each falsified by the next
 measurement.  Every one could
 have been settled by looking at the generated code, which was available
 throughout and took one command:
@@ -91,11 +91,11 @@ What that showed, in the end:
 - `digit_run` survives as a real symbol and `parse_float` calls it seven times,
   so the direct-call harness is the right model for it.
 - Runtime feature detection is a cached load and a bit test on the steady-state
-  path; the initialisation call sits in a cold branch.  The length guard skips
+  path; the initialization call sits in a cold branch.  The length guard skips
   it entirely for short inputs.
-- LLVM does auto-vectorise the portable word loop on aarch64, but it
+- LLVM does auto-vectorize the portable word loop on aarch64, but it
   re-zeroes the accumulator every iteration instead of carrying it —
-  vectorised, with the accumulation strategy thrown away.  Hence 29.1 B/ns
+  vectorized, with the accumulation strategy thrown away.  Hence 29.1 B/ns
   standalone, 15.5 inlined, against 65.8 hand-written.
 - The bounds check in `&bytes[i..i + 8]` is not always elided even under a
   `while i + 8 <= bytes.len()` guard, which is the likely reason `chunks_exact`

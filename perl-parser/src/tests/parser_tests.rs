@@ -7074,7 +7074,7 @@ fn parse_empty_list_count_of_idiom() {
 fn parse_empty_list_kept_as_comma_operand() {
     // `()` is NOT dropped as a comma operand: `(1, 2, ())` keeps the trailing
     // EmptyList, because scalar(1, 2, ()) is undef (the last C-comma operand is
-    // `()`).  The empty-list-flattens behaviour of list context is a lowering
+    // `()`).  The empty-list-flattens behavior of list context is a lowering
     // concern, not a parse-time structural drop.  Verified against perl.
     let e = parse_expr_str("(1, 2, ());");
     match &e.kind {

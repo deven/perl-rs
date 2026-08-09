@@ -3844,7 +3844,7 @@ const DELIM_ASCII_END: usize = 4;
 ///
 /// Returns `(Some(open), close)` for paired delimiters or `(None, delim)` for non-paired (same char open and close).
 ///
-/// ASCII pairs `()`, `[]`, `{}`, `<>` are always recognised.  Unicode pairs require `extra_paired` (the
+/// ASCII pairs `()`, `[]`, `{}`, `<>` are always recognized.  Unicode pairs require `extra_paired` (the
 /// `extra_paired_delimiters` feature flag).
 ///
 /// Uses SIMD-optimized `memmem` on packed UTF-8 tables.

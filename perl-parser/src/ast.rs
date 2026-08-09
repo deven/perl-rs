@@ -1022,10 +1022,10 @@ pub enum ExprKind {
     /// it is `undef`; in list context it is the zero-element list.  It is a
     /// valid assignment lvalue (`() = LIST` discards the list; `my $n = ()
     /// = LIST` is the count-of idiom), and will be reused as the operand of
-    /// an empty-list slice `()[...]` once list slices are modelled.  As a
+    /// an empty-list slice `()[...]` once list slices are modeled.  As a
     /// comma operand it is *kept*, not dropped — `scalar(1, 2, ())` is
     /// `undef` because the last C-comma operand is `()` — so the empty-list-
-    /// flattens behaviour of list context is a lowering concern, not a
+    /// flattens behavior of list context is a lowering concern, not a
     /// parse-time drop.
     EmptyList,
 

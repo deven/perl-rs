@@ -3,8 +3,8 @@
 //! Specification: a `Send + Sync` refcounted growable byte buffer with a `(ptr, len)` handle and a `{refcount, len,
 //! capacity, char_count, scan}` header — COW clone, unique-check mutation, nothing else.
 //!
-//! This is the analogue of perl's `SvPV_COW`/`CowREFCNT` mechanism (the COW refcount stored with the string buffer),
-//! done with a real atomic.  "Owned" is not a separate kind: it is the refcount == 1 *state*, checked before in-place
+//! This is the analog of perl's `SvPV_COW`/`CowREFCNT` mechanism (the COW refcount stored with the string buffer), done
+//! with a real atomic.  "Owned" is not a separate kind: it is the refcount == 1 *state*, checked before in-place
 //! mutation.  Clone is a refcount bump; mutation of a shared buffer copies out into a fresh unique buffer (the COW
 //! break), leaving other sharers undisturbed.
 //!
@@ -249,7 +249,7 @@ impl HeapParts {
 /// # Safety
 /// `base` must own a live allocation, unique to the caller, with at least `old_len + expansion` bytes of capacity,
 /// where `expansion` is [`CowBuffer::variant_count`] of the region from `first`.  The first `old_len` bytes must be
-/// initialised.
+/// initialized.
 pub(crate) unsafe fn expand_latin1_in_place(base: NonNull<u8>, first: usize, old_len: usize, new_len: usize) {
     // SAFETY: both cursors descend from the ends of their regions, `dst` leading `src` by the expansions still owed
     // and meeting it exactly at `first`, so no write lands on a byte not yet read.  The caller vouches for the room.
@@ -278,7 +278,7 @@ pub(crate) unsafe fn expand_latin1_in_place(base: NonNull<u8>, first: usize, old
 /// it has no fallback to the copying form on capacity grounds.
 ///
 /// # Safety
-/// `base` must own a live allocation, unique to the caller, whose first `old_len` bytes are initialised and whose
+/// `base` must own a live allocation, unique to the caller, whose first `old_len` bytes are initialized and whose
 /// region from `first` contracts to exactly `new_len` (per [`CowBuffer::latin1_contractions`]).
 pub(crate) unsafe fn contract_latin1_in_place(base: NonNull<u8>, first: usize, old_len: usize, new_len: usize) {
     // SAFETY: shrinking, so every write lands inside the existing region; `dst` trails `src` by the sequences already
@@ -360,7 +360,7 @@ impl<'a> HeapView<'a> {
     }
 
     pub(crate) fn as_slice(&self) -> &'a [u8] {
-        // SAFETY: the view borrows a live allocation whose first `len` bytes are initialised, and `Owned`'s
+        // SAFETY: the view borrows a live allocation whose first `len` bytes are initialized, and `Owned`'s
         // lifetime is threaded through `_life` so the slice cannot outlive it.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
@@ -472,7 +472,7 @@ macro_rules! heap_tier {
                 Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
             }
 
-            /// Allocate room for `capacity` bytes, refcount one.  The data is uninitialised: the caller writes it
+            /// Allocate room for `capacity` bytes, refcount one.  The data is uninitialized: the caller writes it
             /// and records the length in the envelope, which is the only place this tier keeps one.
             pub(crate) fn allocate(capacity: $w) -> Result<NonNull<u8>, AllocError> {
                 let capacity = capacity as usize;
@@ -689,7 +689,7 @@ macro_rules! heap_tier {
             ///
             /// # Safety
             /// As [`head_mut`]: a live allocation, and the caller must hold the only handle.  `len` must not exceed
-            /// the capacity, and the bytes below it must be initialised.
+            /// the capacity, and the bytes below it must be initialized.
             #[inline]
             pub(crate) unsafe fn set_len(ptr: NonNull<u8>, len: $w) {
                 // SAFETY: the caller vouches for a live allocation and for uniqueness.

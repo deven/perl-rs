@@ -244,7 +244,7 @@ fn large_tier_allocations_carry_their_own_metadata() {
         let ptr = heap32::allocate(cap).unwrap();
         assert_eq!(heap32::capacity(ptr), cap as usize, "capacity is recorded, not passed back in");
         assert_eq!(heap32::len(ptr), 0);
-        assert_eq!(heap32::scan(ptr), 0, "UNKNOWN is the zero-initialised state");
+        assert_eq!(heap32::scan(ptr), 0, "UNKNOWN is the zero-initialized state");
         assert_eq!(heap32::char_count(ptr), 0, "no cached count");
 
         heap32::set_len(ptr, 12_345);
@@ -307,7 +307,7 @@ macro_rules! large_tier_protocol {
 }
 
 #[test]
-fn all_four_tiers_honour_the_whole_protocol() {
+fn all_four_tiers_honor_the_whole_protocol() {
     small_tier_protocol!(heap8, 255u8);
     small_tier_protocol!(heap16, 65_535u16);
     large_tier_protocol!(heap32, 4096u32);

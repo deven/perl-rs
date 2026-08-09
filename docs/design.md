@@ -395,7 +395,7 @@ unique-check mutation, nothing else.  Details:
   bytes and only seven are spare.
 
 - **Eager below 64 KiB, lazy above [DECISION].**  Classifying
-  content at construction costs one vectorised pass, which for
+  content at construction costs one vectorized pass, which for
   `Heap8` is at most ~117 ns and for ASCII content of any size is
   cheaper than the copy that just happened (§2.2.11).  Paying it
   eagerly lets the class and count live in the envelope, which
@@ -443,7 +443,7 @@ unique-check mutation, nothing else.  Details:
   while `Heap16` was lazy — is moot under the eager ruling, since
   the scan byte is in the envelope and the header has nothing to
   pack it with; it would also have made the increment unsafe,
-  because a carry out of a 24-bit count corrupts the neighbouring
+  because a carry out of a 24-bit count corrupts the neighboring
   byte where a whole-word count merely overflows detectably.
 
 - **How the ceiling is enforced [DECISION].**  Increment with
@@ -583,7 +583,7 @@ normality guard is load-bearing, subnormals carrying fewer
 significant digits than `%.15g` prints.  That is 3x on the path
 that money-shaped and parse-born values all take.  Beyond it lies
 a direct digit-generation algorithm, which would need a decision
-about porting versus depending, and about licence provenance.
+about porting versus depending, and about license provenance.
 
 **Per-value state vs. per-buffer facts.**  String state splits into
 two locations by one criterion: copies duplicate the tag and share
@@ -1594,15 +1594,15 @@ loop on all three architectures.  Dispatch checks length before
 it checks features, so short inputs never reach the runtime
 feature cache at all.
 
-**Hand-written kernels rather than autovectorisation.**  LLVM
-does vectorise the portable word loop on aarch64, but the result
+**Hand-written kernels rather than autovectorization.**  LLVM
+does vectorize the portable word loop on aarch64, but the result
 is unstable and slower: the same source measured 29.1 B/ns as a
 standalone function and 15.5 B/ns inlined into a larger one, and
 the generated loop re-zeroes its accumulator every iteration
 rather than carrying it.  Against the hand-written kernel at 65.8
 B/ns that is a factor of two to four, and it moves with compiler
-version, inlining decisions, and edits to neighbouring code.
-Autovectorisation is an optimisation, not a contract; a
+version, inlining decisions, and edits to neighboring code.
+Autovectorization is an optimization, not a contract; a
 hand-written kernel with differential tests against a scalar
 reference is a floor.  The portable word loop remains as the
 fallback where no hand-written path exists.
@@ -1818,7 +1818,7 @@ Container-verified contract (perl 5.38, all under `-w`):
 the salvaged number in the SV under `IOKp`/`NOKp`, and every later
 numification reads that cache instead of re-parsing — so warning
 once is a *consequence* of caching, not a separate piece of state.
-Modelling the symptom with a tag bit reproduced the observable but
+Modeling the symptom with a tag bit reproduced the observable but
 not the cause, and cost a third of the string tag's flag axis to do
 it.
 
@@ -1904,7 +1904,7 @@ since 5.28 the SBOX32/StadtX (Zaphod32 on 32-bit) construction
 keyed by `PL_hash_seed`.  The bit-level function is not observable
 semantics — iteration order is documented as unspecified — so what
 must be reproduced is the *property*: the content digest is keyed by
-a per-process random state (the `PL_hash_seed` analogue), created
+a per-process random state (the `PL_hash_seed` analog), created
 once and shared by every digest, so colliding keys cannot be
 precomputed offline.  The outer map's own seed cannot substitute:
 collisions in the inner digest collapse buckets regardless of it.
@@ -2022,7 +2022,7 @@ flag:
 
 Neither reading needs a buffer: the characters are computed as the
 comparison walks, one stored byte yielding one or two.  Verified
-over 300,000 random pairs against the materialised expansion, both
+over 300,000 random pairs against the materialized expansion, both
 flags, against code points from ASCII to beyond the BMP, zero
 disagreements.  It resolves both inversions — a flagged `E9`
 against `U+00E9` is `Equal` where bytes said `Greater`, and against
@@ -3586,7 +3586,7 @@ describe itself.
 The error *taxonomy* is then free.  `Kind` is one byte behind the
 box, so it can name every die reason and every warning category
 without touching any envelope, and `Raised` can grow fields at no
-cost to the hot path.  This layout is rustc's niche optimisation
+cost to the hot path.  This layout is rustc's niche optimization
 rather than a guaranteed ABI, so a `const _: () = assert!(...)`
 beside the §2.3.6 size laws pins it: if a future compiler stops, the
 build says so.
@@ -3650,7 +3650,7 @@ fatal warnings; stringifying can run an overloaded `""`.  Afterwards
 the wrapper holds the coerced face, so `Ord`, `Eq`, and `Hash` are
 arithmetic or byte comparison and cannot fail.  The fallible boundary
 is not a workaround for `Ord`'s signature — it is the perl operation
-faithfully modelled, since entering numeric context is exactly the
+faithfully modeled, since entering numeric context is exactly the
 moment perl warns.
 
 Reading: `NumericContext<Value>` is "this `Value`, viewed
@@ -3673,7 +3673,7 @@ continuously — the difference being only that the wrapper makes the
 moment explicit and reusable.
 
 `NumericContext`'s `Ord` needs a total order where perl's `<=>` gives
-a partial one, so it **canonicalises then uses `f64::total_cmp`**:
+a partial one, so it **canonicalizes then uses `f64::total_cmp`**:
 `-0.0` maps to `+0.0` and every NaN to one canonical NaN, matching
 perl's single zero and single NaN, and `total_cmp` then places NaN.
 Two divergences remain, both forced rather than chosen — NaN's
@@ -4546,7 +4546,7 @@ A delimited body — an `s///` pattern or replacement, `q//` and its kin,
 a regex, a `qw//` list, an interpolating string — is the text from the
 cursor, just inside the opening delimiter, to the matching close,
 possibly spanning lines.  The close is found by a byte walk over the
-`lookahead()` (§5.4.11) stream, the direct analogue of perl's `scan_str`
+`lookahead()` (§5.4.11) stream, the direct analog of perl's `scan_str`
 over its flat buffer: the lookahead delivers bytes across line
 boundaries transparently, so the scan is oblivious to where lines fall
 and never handles a line itself.  It is flat and textual — it finds
@@ -8093,7 +8093,7 @@ interpreter handles it transparently.
 #### 13.7.3 `async fn` is optional, not required.
 
 The `async` keyword on `fn` is available for when you *want* explicit
-control — composing futures, using `select!`, timing out, cancelling.
+control — composing futures, using `select!`, timing out, canceling.
 But it is never *required* for basic concurrent IO.  The sync/async
 monomorphization described below applies to all functions, whether or
 not they are marked `async`:
@@ -8390,7 +8390,7 @@ my @results = spawn all {
 This maps to Tokio's `JoinSet` internally.  The `spawn all` block
 creates a `JoinSet`, each `spawn` inside it adds a task, and the
 block returns only when all tasks have completed.  If any task
-panics, the remaining tasks are cancelled and the panic propagates
+panics, the remaining tasks are canceled and the panic propagates
 to the parent.
 
 The typed equivalent uses explicit futures:
@@ -8467,7 +8467,7 @@ async fn process_stream(stream: Stream<String>) -> Vec<Parsed> {
 
 #### 13.8.4 Cancellation and timeouts.
 
-Perl 5 has no concept of cancelling work in progress.  Tokio does —
+Perl 5 has no concept of canceling work in progress.  Tokio does —
 dropping a future or task handle cancels it at the next `.await`
 point.  This surfaces in both the Perl and typed layers:
 
@@ -8493,19 +8493,19 @@ spawn all {
     spawn { monitoring_sidecar() };
 };
 # When primary_operation completes (or dies), monitoring_sidecar
-# is cancelled automatically — no orphaned tasks
+# is canceled automatically — no orphaned tasks
 ```
 
 The `timeout` function wraps any operation in a Tokio `timeout`
 future.  If the deadline expires, the inner future is dropped,
-cancelling it at the next yield point.  For `sub`-based code, the
+canceling it at the next yield point.  For `sub`-based code, the
 interpreter checks a cancellation flag at each yield point (IO
 operations, loop iterations) and throws a timeout exception.
 
 #### 13.8.5 Select — first to complete wins.
 
 Multiple concurrent operations can race, with the first to complete
-providing the result and the rest being cancelled:
+providing the result and the rest being canceled:
 
 ```perl
 # Perl style — first successful response wins

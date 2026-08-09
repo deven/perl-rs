@@ -539,7 +539,7 @@ fn unsigned_constructors_canonicalize_to_integer() {
 
 #[test]
 fn digit_run_matches_the_scalar_scan() {
-    // The vectorised scan must agree with a byte-at-a-time one on every shape, including the block boundaries where an
+    // The vectorized scan must agree with a byte-at-a-time one on every shape, including the block boundaries where an
     // AVX2 lane or a SWAR word could straddle the end of the run.
     let scalar = |b: &[u8]| b.iter().take_while(|c| c.is_ascii_digit()).count();
     let mut cases: Vec<Vec<u8>> = vec![
@@ -586,7 +586,7 @@ fn the_overflow_shortcut_agrees_with_the_general_parser() {
 
     // An exponent can pull a long run back into range, so the shortcut must not fire there.
     let pulled = format!("{}e-400", "1".repeat(400));
-    assert!(parse_float(pulled.as_bytes()).is_finite(), "a negative exponent must still be honoured");
+    assert!(parse_float(pulled.as_bytes()).is_finite(), "a negative exponent must still be honored");
     assert_eq!(parse_float(pulled.as_bytes()), pulled.parse::<f64>().unwrap());
 
     // A fraction cannot rescue an overflowing integer part.
