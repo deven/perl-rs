@@ -135,6 +135,31 @@ an AVX2 kernel sat for several commits still using an inferior formulation that
 had already been measured and rejected.  No amount of benchmarking finds that;
 one look at the emitted assembly does.
 
+## A check that shares the defect cannot fail
+
+Verification has to be independent of the thing it verifies.  Two ways that
+went wrong here, both of which reported success:
+
+**A sweep verified with its own pattern.**  A pass converting British
+spellings used `\b` word boundaries, which do not fire inside `snake_case`:
+Python and Rust regex both treat `_` as a word character, so `_honour_` has
+no boundary on either side and `all_four_tiers_honour_the_whole_protocol`
+went untouched.  Rescanning with the same regex then reported zero
+remaining.  Letter-only boundaries, `(?<![A-Za-z])word(?![A-Za-z])`, treat
+`_` and digits as separators and are what an identifier-aware pass wants.
+
+**A rewrite that lost what the draft had.**  That same name *had* been caught
+by an earlier, cruder pass which hard-coded the rename after spotting it by
+eye.  Replacing that pass with a systematic one, far better in vocabulary,
+silently dropped the fix.  A broader second version is not automatically a
+superset of the first, and the same thing happened to an AVX2 kernel earlier:
+a measured improvement, then a rewrite that did not carry it.
+
+Both are the same rule.  Check against something that does not share the
+suspect assumption — a different pattern, the previous version's output, the
+emitted assembly, the file on disk — because a check built from the same
+premise as the work will agree with it.
+
 ## Checklist
 
 1. Does the reference row read exactly 1.00?
@@ -148,3 +173,6 @@ one look at the emitted assembly does.
 8. Is the code being measured the code that ships, or a copy of it?
 9. Did the commit hash change, and did the scripted edit report the expected
    number of replacements?
+10. Is the verification independent of the work — a different pattern, an
+    earlier version, the artifact on disk — or does it share the assumption
+    being tested?
