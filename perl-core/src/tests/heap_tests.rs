@@ -124,6 +124,7 @@ fn deep_mixed_chain_releases_iteratively() {
             _ => {
                 let mut slot = link;
                 Value::take_ref(&mut slot)
+
                 // The promoted slot (the aliased cell) dies here; the ref value carries the chain.
             }
         };

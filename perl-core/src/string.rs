@@ -671,6 +671,7 @@ macro_rules! define_perl_string {
                 match self {
                     $( Repr::$inline { buf } => Repr::$inline { buf: *buf }, )*
                     $( Repr::$packed { nibbles } => Repr::$packed { nibbles: *nibbles }, )*
+
                     // SAFETY (each heap arm): the variant owns a live allocation of its tier, and the new handle
                     // takes the reference this `retain` adds.
                     $( Repr::$h8 { ptr, len, cap, count, scan } => Repr::$h8 {
@@ -749,6 +750,7 @@ macro_rules! define_perl_string {
             fn inline_class(&self) -> Option<InlineClass> {
                 match &self.0 {
                     $( Repr::$inline { .. } => Some(InlineClass::$inline_class), )*
+
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
                     $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
                     $( Repr::$h8 { .. } => None, )*
@@ -1316,6 +1318,7 @@ fn classify_inline(bytes: &[u8]) -> Option<(InlineClass, usize, usize, [u8; INLI
     let (class, aux) = match classify_full(bytes) {
         (scan::Terminal::NonLatin1, chars) => (InlineClass::NonLatin1, chars),
         (scan::Terminal::Extended, chars) => (InlineClass::Extended, chars),
+
         // ASCII and Latin-1-range content took the compressed branch above; what remains is the Bytes residual.
         _ => (InlineClass::Bytes, 0),
     };
@@ -1655,6 +1658,7 @@ impl PerlString {
                     // raw-byte tier could only shortcut ASCII.
                     InlineClass::Ascii | InlineClass::Latin1 => Some(stored),
                     InlineClass::Bytes => None,
+
                     // The verbatim valid classes carry their count in the aux nibble; the full family derives it.
                     InlineClass::NonLatin1 | InlineClass::Extended => Some(if full { classify_full(&buf[..stored]).1 } else { inline_aux(buf) }),
                 }
@@ -2050,6 +2054,7 @@ enum RawParts<'a> {
         buf: &'a [u8; INLINE_MAX],
     },
     Packed(Packed),
+
     /// Whatever the tier, read through one view: the metadata is gathered at construction from wherever that tier
     /// keeps it, so nothing below dispatches on it (§2.2.3).
     Heap(HeapView<'a>),
@@ -2062,6 +2067,7 @@ enum RawOwned {
         buf: [u8; INLINE_MAX],
     },
     Packed(Packed),
+
     /// The owned pointer with the metadata its tier keeps in the envelope; the large tiers carry their own and
     /// leave these fields at zero.
     Heap {
