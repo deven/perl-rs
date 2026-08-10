@@ -266,9 +266,8 @@ impl HeapParts {
                     p
                 }
                 Tier::Heap => {
-                    let p = heap::allocate(len)?;
+                    let p = heap::allocate(len, len)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
-                    heap::set_len(p, len);
                     p
                 }
             }
@@ -707,8 +706,12 @@ macro_rules! heap_tier {
                 Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
             }
 
-            /// Allocate room for `capacity` bytes, refcount one, length zero, no cached facts.
-            pub(crate) fn allocate(capacity: $w) -> Result<NonNull<u8>, AllocError> {
+            /// Allocate room for `capacity` bytes holding `len` of content, refcount one, no cached facts.  The length
+            /// is a fact the caller holds at birth, so it is written once here rather than zeroed and patched;
+            /// `set_len` exists for the in-place transforms, which change an existing allocation's content.  The cache
+            /// fields start zero because their facts do not exist yet — `UNKNOWN` and no-cached-count are the
+            /// lazily-filled caches' genuine birth states, not placeholders.
+            pub(crate) fn allocate(capacity: $w, len: $w) -> Result<NonNull<u8>, AllocError> {
                 let layout = layout(capacity as usize)?;
 
                 // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
@@ -722,7 +725,7 @@ macro_rules! heap_tier {
 
                 // SAFETY: `base` is a fresh allocation of `layout`, aligned for `Head`.
                 unsafe {
-                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), len: 0, capacity, char_count: <$c>::new(0), scan: AtomicU8::new(0) });
+                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), len, capacity, char_count: <$c>::new(0), scan: AtomicU8::new(0) });
                 }
 
                 // SAFETY: `HEADER` is within the allocation by construction.
