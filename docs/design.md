@@ -1431,10 +1431,13 @@ The standalone `PerlString` is 16 bytes too — the tag budget
 closes in one byte, the discriminant being the storage type times
 the three flag bits (§2.2.9) — leaving 15 payload bytes: the five
 inline classes and the packed tier at the fused variants'
-capacities, with the heap kind a thin pointer plus a u48 mirrored
-length in the spare bytes.  The `Value`↔key boundary is an
-exhaustive-match reconstruction — which the optimizer reduces to
-a copy plus tag write in practice, but is **never a transmute**:
+capacities, and the heap tiers a thin pointer plus whatever
+envelope metadata each tier's ruling assigns (§2.2.3): the small
+tiers' full length/capacity/count/state, `Heap32`'s authoritative
+`u32` length, the word tier the bare pointer.  The `Value`↔key
+boundary is an exhaustive-match reconstruction — which the
+optimizer reduces to a copy plus tag write in practice, but is
+**never a transmute**:
 the size assertions pin neither discriminant placement nor niche
 selection, so no code may depend on byte-level correspondence
 between the two types.  No capacity mismatch exists, `keys()`
@@ -2146,11 +2149,12 @@ The load-bearing layout facts:
   window is monitored by the §2.2.9 corpus tripwire with
   in-envelope mitigations recorded.
 - **Padding placement follows variant size.**  Sub-maximal variants
-  may carry redundant or flag fields in their padding for free,
-  provided every mutation path that invalidates the redundancy
-  passes through `&mut` on the same handle (the mirrored length in
-  the string handle; formerly the taint bools, now discriminant
-  twins per §2.2.9);
+  may carry per-handle fields in their padding for free, provided
+  every mutation path that invalidates them passes through `&mut`
+  on the same handle (the small tiers' envelope metadata and
+  `Heap32`'s length, per-handle and authoritative under COW since
+  content is immutable while shared; formerly the taint bools, now
+  discriminant twins per §2.2.9);
   maximal variants (strings) must fold flags into the *inner*
   type's discriminant —
   adding outer `Value` variants that carry `PerlString` defeats the
