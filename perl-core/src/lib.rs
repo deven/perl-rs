@@ -49,6 +49,7 @@
 
 mod numeric;
 
+pub(crate) mod alloc_backend;
 pub mod containers;
 pub mod cow_buffer;
 pub mod heap;

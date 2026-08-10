@@ -247,35 +247,43 @@ impl HeapParts {
         let len = bytes.len();
         let tier = Tier::for_length(len);
 
-        // SAFETY (each arm): the pointer comes from this tier's `allocate` with room for `len`, so the copy stays
-        // inside the allocation, and the single reference it carries is handed to the returned `HeapParts`.
-        let ptr = unsafe {
+        // Birth capacity is the allocator's size class for the whole allocation (§2.2.3): requesting the class the
+        // request would occupy anyway makes the headroom free, and growth doubles from there.  The tier is chosen by
+        // content length; class headroom never promotes a value across a tier (the clamp inside `class_capacity`).
+        //
+        // SAFETY (each arm): the pointer comes from this tier's `allocate` with room for at least `len`, so the copy
+        // stays inside the allocation, and the single reference it carries is handed to the returned `HeapParts`.
+        let (ptr, cap) = unsafe {
             match tier {
                 Tier::Heap8 => {
-                    let p = heap8::allocate(len as u8)?;
+                    let cap = heap8::class_capacity(len);
+                    let p = heap8::allocate(cap as u8)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
-                    p
+                    (p, cap)
                 }
                 Tier::Heap16 => {
-                    let p = heap16::allocate(len as u16)?;
+                    let cap = heap16::class_capacity(len);
+                    let p = heap16::allocate(cap as u16)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
-                    p
+                    (p, cap)
                 }
                 Tier::Heap32 => {
-                    let p = heap32::allocate(len as u32, scan.as_u8(), count as u32)?;
+                    let cap = heap32::class_capacity(len);
+                    let p = heap32::allocate(cap as u32, scan.as_u8(), count as u32)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
-                    p
+                    (p, cap)
                 }
                 Tier::Heap => {
-                    let p = heap::allocate(len, len, scan.as_u8(), count)?;
+                    let cap = heap::class_capacity(len);
+                    let p = heap::allocate(cap, len, scan.as_u8(), count)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
-                    p
+                    (p, cap)
                 }
             }
         };
 
         // SAFETY: the allocation above carries exactly one reference, which this `Owned` now owes.
-        Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap: len, count, scan, tier })
+        Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap, count, scan, tier })
     }
 }
 
@@ -514,7 +522,9 @@ macro_rules! heap_tier {
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) mod $tier {
             use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};
-            use std::alloc::{self, Layout};
+            use std::alloc::Layout;
+
+            use crate::alloc_backend;
             use std::ptr::NonNull;
             use std::sync::atomic::{AtomicU32, Ordering, fence};
 
@@ -532,6 +542,18 @@ macro_rules! heap_tier {
 
             /// The header sits immediately before the data.
             ///
+
+            /// The capacity a buffer of `len` content bytes is born with: the allocator's size class for the whole
+            /// allocation, minus this tier's header, clamped to the tier ceiling.  Allocating this capacity requests
+            /// exactly the class, so the headroom costs nothing (§2.2.3) — the class is asked, not guessed.
+            pub(crate) fn class_capacity(len: usize) -> usize {
+                let total = HEADER.saturating_add(len);
+                let Ok(layout) = Layout::from_size_align(total, align_of::<Head>()) else {
+                    return len;
+                };
+                (crate::alloc_backend::size_class(layout) - HEADER).min(MAX_CAPACITY)
+            }
+
             /// # Safety
             /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
             #[inline]
@@ -552,9 +574,7 @@ macro_rules! heap_tier {
                 let capacity = capacity as usize;
                 let layout = layout(capacity)?;
 
-                // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
-                let raw = unsafe { alloc::alloc(layout) };
-                let Some(base) = NonNull::new(raw) else {
+                let Some(base) = alloc_backend::allocate(layout) else {
                     return Err(AllocError { requested: capacity });
                 };
                 #[cfg(test)]
@@ -604,7 +624,7 @@ macro_rules! heap_tier {
                 if let Ok(layout) = layout(capacity as usize) {
                     // SAFETY: last handle, and the allocation was made with exactly this layout — capacity never
                     // changes for a given allocation, since growth allocates afresh.
-                    unsafe { alloc::dealloc(ptr.as_ptr().sub(HEADER), layout) };
+                    unsafe { alloc_backend::release(NonNull::new_unchecked(ptr.as_ptr().sub(HEADER)), layout) };
                 }
             }
 
@@ -636,7 +656,9 @@ macro_rules! heap_tier {
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) mod $tier {
             use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};
-            use std::alloc::{self, Layout};
+            use std::alloc::Layout;
+
+            use crate::alloc_backend;
             use std::ptr::NonNull;
 
             #[allow(unused_imports)] // Each arm names the counter type it needs; the others go unused.
@@ -660,6 +682,17 @@ macro_rules! heap_tier {
 
             pub(crate) const HEADER: usize = size_of::<Head>();
             pub(crate) const MAX_CAPACITY: usize = <$w>::MAX as usize;
+
+            /// The capacity a buffer of `len` content bytes is born with: the allocator's size class for the whole
+            /// allocation, minus this tier's header, clamped to the tier ceiling.  Allocating this capacity requests
+            /// exactly the class, so the headroom costs nothing (§2.2.3) — the class is asked, not guessed.
+            pub(crate) fn class_capacity(len: usize) -> usize {
+                let total = HEADER.saturating_add(len);
+                let Ok(layout) = Layout::from_size_align(total, align_of::<Head>()) else {
+                    return len;
+                };
+                (crate::alloc_backend::size_class(layout) - HEADER).min(MAX_CAPACITY)
+            }
 
             /// # Safety
             /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
@@ -691,9 +724,7 @@ macro_rules! heap_tier {
             pub(crate) fn allocate(capacity: $w, len: $w, scan: u8, count: $w) -> Result<NonNull<u8>, AllocError> {
                 let layout = layout(capacity as usize)?;
 
-                // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
-                let raw = unsafe { alloc::alloc(layout) };
-                let Some(base) = NonNull::new(raw) else {
+                let Some(base) = alloc_backend::allocate(layout) else {
                     return Err(AllocError { requested: capacity as usize });
                 };
 
@@ -741,7 +772,7 @@ macro_rules! heap_tier {
 
                 if let Ok(layout) = layout(capacity) {
                     // SAFETY: last handle, and the allocation was made with exactly this layout.
-                    unsafe { alloc::dealloc(ptr.as_ptr().sub(HEADER), layout) };
+                    unsafe { alloc_backend::release(NonNull::new_unchecked(ptr.as_ptr().sub(HEADER)), layout) };
                 }
             }
 
@@ -838,7 +869,9 @@ macro_rules! heap_tier {
     ($tier:ident, width = u32, meta = compact) => {
         pub(crate) mod $tier {
             use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};
-            use std::alloc::{self, Layout};
+            use std::alloc::Layout;
+
+            use crate::alloc_backend;
             use std::ptr::NonNull;
 
             #[allow(unused_imports)] // Each arm names the counter type it needs; the others go unused.
@@ -859,6 +892,17 @@ macro_rules! heap_tier {
 
             pub(crate) const HEADER: usize = size_of::<Head>();
             pub(crate) const MAX_CAPACITY: usize = u32::MAX as usize;
+
+            /// The capacity a buffer of `len` content bytes is born with: the allocator's size class for the whole
+            /// allocation, minus this tier's header, clamped to the tier ceiling.  Allocating this capacity requests
+            /// exactly the class, so the headroom costs nothing (§2.2.3) — the class is asked, not guessed.
+            pub(crate) fn class_capacity(len: usize) -> usize {
+                let total = HEADER.saturating_add(len);
+                let Ok(layout) = Layout::from_size_align(total, align_of::<Head>()) else {
+                    return len;
+                };
+                (crate::alloc_backend::size_class(layout) - HEADER).min(MAX_CAPACITY)
+            }
 
             /// # Safety
             /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
@@ -881,9 +925,7 @@ macro_rules! heap_tier {
             pub(crate) fn allocate(capacity: u32, scan: u8, count: u32) -> Result<NonNull<u8>, AllocError> {
                 let layout = layout(capacity as usize)?;
 
-                // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
-                let raw = unsafe { alloc::alloc(layout) };
-                let Some(base) = NonNull::new(raw) else {
+                let Some(base) = alloc_backend::allocate(layout) else {
                     return Err(AllocError { requested: capacity as usize });
                 };
 
@@ -929,7 +971,7 @@ macro_rules! heap_tier {
                 // only no-panic recourse if it somehow did, and is better than a mismatched deallocation.
                 if let Ok(layout) = layout(capacity as usize) {
                     // SAFETY: last handle, and the allocation was made with exactly this layout.
-                    unsafe { alloc::dealloc(ptr.as_ptr().sub(HEADER), layout) };
+                    unsafe { alloc_backend::release(NonNull::new_unchecked(ptr.as_ptr().sub(HEADER)), layout) };
                 }
             }
 

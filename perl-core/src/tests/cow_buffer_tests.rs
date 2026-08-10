@@ -284,3 +284,34 @@ fn concurrent_scan_narrowing_races_are_benign() {
         heap::release(ptr);
     }
 }
+
+#[test]
+fn birth_capacity_is_the_allocator_size_class() {
+    // The class is asked, not guessed (§2.2.3): a buffer's birth capacity plus its tier header equals exactly the size
+    // class jemalloc names for the birth request, so the headroom is memory the allocation occupied anyway.
+    let parts = HeapParts::from_slice(&[0u8; 40], crate::string::scan::ASCII, 40).unwrap();
+    assert_eq!(parts.tier, Tier::Heap8);
+    assert!(parts.cap >= 40, "capacity covers the content");
+    assert_eq!(heap8::HEADER + parts.cap, heap8::HEADER + heap8::class_capacity(40), "born at the class");
+    assert!(parts.cap > 40, "the class for header + 40 leaves headroom on every allocator family at this size");
+
+    // The clamp: class headroom never promotes across a tier ceiling.
+    let parts = HeapParts::from_slice(&[0u8; 250], crate::string::scan::ASCII, 250).unwrap();
+    assert_eq!(parts.tier, Tier::Heap8);
+    assert!(parts.cap <= heap8::MAX_CAPACITY, "headroom clamps at the tier ceiling");
+}
+
+#[test]
+fn buffers_allocate_inside_the_jemalloc_instance() {
+    // The -ctl crate reads the same jemalloc our seam allocates from, so a large buffer's birth must move the
+    // instance's allocated-bytes statistic by at least its size — the sanity that the seam really routes there.
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    epoch::advance().unwrap();
+    let before = stats::allocated::read().unwrap();
+    let parts = HeapParts::from_slice(&[7u8; 100_000], crate::string::scan::UNKNOWN, 0).unwrap();
+    epoch::advance().unwrap();
+    let after = stats::allocated::read().unwrap();
+    assert!(after >= before + 100_000, "the buffer lives in the instance the stats read");
+    drop(parts);
+}

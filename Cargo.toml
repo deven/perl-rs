@@ -23,6 +23,8 @@ phf_codegen           = "0.13.1"
 phf_generator         = "0.13.1"
 phf_macros            = "0.13.1"
 phf_shared            = "0.13.1"
+tikv-jemalloc-ctl     = { version = "0.7.0", features = ["stats"] }
+tikv-jemalloc-sys     = "0.7.0"
 unicode-normalization = "0.1.25"
 unicode-xid           = "0.2.6"
 unicode_names2        = "2.0.0"

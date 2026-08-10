@@ -6,5 +6,9 @@ license.workspace = true
 description = "Perl core types"
 
 [dependencies]
-indexmap    = { workspace = true }
-parking_lot = { workspace = true }
+indexmap          = { workspace = true }
+parking_lot       = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
+
+[dev-dependencies]
+tikv-jemalloc-ctl = { workspace = true }
