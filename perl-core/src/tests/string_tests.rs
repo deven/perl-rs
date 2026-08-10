@@ -4124,8 +4124,8 @@ fn downgrade_refuses_content_past_the_latin1_range() {
 
 #[test]
 fn raw_append_onto_a_small_tier_is_classified_not_left_unknown() {
-    // Finding 2's second door, which the terminal envelope type found: a raw-byte append transitions to UNKNOWN in the
-    // lattice, and a small tier cannot hold that — the transition funnel must pay the construction-grade pass.
+    // A raw-byte append transitions to UNKNOWN in the lattice, and a small tier cannot hold that — the transition
+    // funnel must pay the construction-grade pass instead of recording an indeterminate state (§2.2.3).
     let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();
     assert!(s.storage_type().is_small_heap_tier());
     s.push_bytes(&[0x81, 0x82]).unwrap(); // AppendKind::Unknown: nothing known about these bytes
@@ -4146,9 +4146,9 @@ fn raw_append_onto_a_small_tier_is_classified_not_left_unknown() {
 
 #[test]
 fn downgraded_small_tier_is_classified_not_left_unknown() {
-    // Regression for the audit's second finding: the in-place downgrade wrote UNKNOWN into a small tier's envelope, and
-    // narrow_scan is deliberately a no-op there, so every subsequent validity question re-derived — (1, 1) scans across
-    // two reads.  The rule is the same one construction follows: below 64 KiB the state is settled now or never.
+    // An in-place downgrade that left a small tier's envelope UNKNOWN would re-derive on every subsequent validity
+    // question, since narrow_scan is deliberately a no-op there — (1, 1) scans across two reads where (1, 0) is the
+    // invariant.  The rule is the same one construction follows: below 64 KiB the state is settled now or never.
     let mut s = PerlString::from_str(&"é".repeat(20)).unwrap();
     assert!(s.storage_type().is_small_heap_tier());
     assert!(s.downgrade_in_place().unwrap());
@@ -4186,9 +4186,9 @@ fn small_tier_str_construction_is_one_pass() {
 
 #[test]
 fn heap_append_releases_the_buffer_it_replaces() {
-    // Regression for the audit's first finding: the heap-to-heap append rebuilds into a fresh allocation, and the old
-    // one must be released, not abandoned.  The bomb catches the abandonment at the drop site; this counts the balance,
-    // which also covers a leak that never touches an `Owned`.
+    // The heap-to-heap append rebuilds into a fresh allocation, and the old one must be released, not abandoned.
+    // The bomb catches an abandonment at the drop site; this counts the balance, which also covers a leak that never
+    // touches an `Owned`.
     let before = crate::cow_buffer::live::count();
     {
         let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();

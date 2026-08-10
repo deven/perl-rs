@@ -917,8 +917,8 @@ macro_rules! define_perl_string {
                 // ways.  A large tier records UNKNOWN and lets the next reader both derive and store.  A small tier has
                 // nowhere to store a later discovery, so UNKNOWN there means re-deriving on every read forever; it must
                 // classify now, exactly as construction does, and at these sizes the pass costs what the construction
-                // pass cost.  The audit caught this arm writing UNKNOWN into the envelope: (1, 1) scans across two
-                // validity reads where (1, 0) is the invariant.
+                // pass cost.  Writing UNKNOWN here would cost a scan on every subsequent validity read — (1, 1) across
+                // two reads where (1, 0) is the invariant.
                 match &mut self.0 {
                     $( Repr::$h8 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
@@ -1271,9 +1271,8 @@ fn expand_latin1(b: u8, out: &mut [u8]) -> usize {
 ///
 /// The append lattice (§2.2.5) can answer `UNKNOWN` — a raw-byte append, or growth onto content whose validity was
 /// never established — and a large tier records that and moves on.  A small tier cannot: its envelope holds only the
-/// terminal type, so an indeterminate transition means paying the construction-grade pass over the joined content.
-/// This is finding 2's second door, held shut by the same eager rule that shuts the first — and the type is what found
-/// it: the seam's integrity check detonated on six existing tests the audit had passed over.
+/// terminal type, so an indeterminate transition means paying the construction-grade pass over the joined content.  The
+/// same eager rule construction follows, for the same reason: below 64 KiB the state is settled now or never (§2.2.3).
 fn heap_parts_transitioned(bytes: &[u8], state: scan::ScanState, chars: usize) -> Result<HeapParts, AllocError> {
     let parts = HeapParts::from_slice(bytes)?;
     if parts.tier.is_small() && !scan::is_terminal(state) {
