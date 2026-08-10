@@ -4168,6 +4168,20 @@ fn downgraded_small_tier_is_classified_not_left_unknown() {
     assert_eq!(s.char_len(), fresh.char_len(), "and on the cached count");
 }
 
+#[test]
+fn small_tier_str_construction_is_one_pass() {
+    // Probing for ASCII and then classifying would scan the same bytes twice for one fact: the classifying pass answers
+    // the ASCII question through the terminal state, so a small tier pays one pass and no probe bytes.
+    eq_probe::reset();
+
+    let s = PerlString::from_str(&"a".repeat(40)).unwrap();
+    assert!(s.storage_type().is_small_heap_tier());
+
+    let (full, probe) = eq_probe::scans();
+    assert_eq!((full, probe), (1, 0), "one classifying pass, no separate ASCII probe");
+    assert!(s.is_ascii(), "and the state answers the flag question");
+}
+
 // ── Leak accounting (the bomb's second layer) ──────────────────────────────
 
 #[test]
@@ -4179,9 +4193,11 @@ fn heap_append_releases_the_buffer_it_replaces() {
     {
         let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();
         assert!(s.storage_type().is_small_heap_tier());
+
         for _ in 0..8 {
             s.push_str("bcdefghij").unwrap();
         }
+
         assert!(crate::cow_buffer::live::count() > before, "the appends allocated");
     }
     assert_eq!(crate::cow_buffer::live::count(), before, "every allocation the appends made was released");

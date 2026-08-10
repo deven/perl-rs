@@ -1351,17 +1351,19 @@ impl PerlString {
             Ok(inline)
         } else {
             let bytes = s.as_bytes();
-            let ascii = bytes.iter().all(|b| b.is_ascii());
 
-            // A `&str` is known-valid UTF-8 of unknown range, which is why the cheap probe suffices for the tiers
-            // that can narrow later.  A small tier cannot: its scan state lives in the envelope with no allocation
-            // slot for a later discovery, so the range must be settled now or never (§2.2.3).
+            // A `&str` is known-valid UTF-8 of unknown range, which is why the cheap probe suffices for the tiers that
+            // can narrow later.  A small tier cannot — its scan state lives in the envelope with no allocation slot for
+            // a later discovery, so the range must be settled now or never (§2.2.3) — and since it pays the classifying
+            // pass anyway, the ASCII question is answered by the terminal state for free: probing first would scan the
+            // same bytes twice for one fact.
             let parts = HeapParts::from_slice(bytes)?;
-            let parts = if parts.tier.is_small() {
+            let (parts, ascii) = if parts.tier.is_small() {
                 let (state, chars) = classify_full(bytes);
-                parts.with_classification(state.widen(), chars)
+                (parts.with_classification(state.widen(), chars), state == scan::Terminal::Ascii)
             } else {
-                parts.with_classification(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE }, 0)
+                let ascii = bytes.iter().all(|b| b.is_ascii());
+                (parts.with_classification(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE }, 0), ascii)
             };
 
             Ok(PerlString::build_heap(!ascii, false, parts))
