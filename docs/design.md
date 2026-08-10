@@ -557,9 +557,14 @@ Details:
   free lists, not granularity — and its mmap threshold is dynamic,
   so class-ladder cleverness against it wastes footprint; measured
   ns/op on string-shaped churn: jemalloc 14.9, mimalloc 22.7,
-  glibc 49.8, dlmalloc 86.7.  If a C-free build is ever required,
-  the fallback behind the same seam is the system allocator with
-  requests rounded to the 16-byte quantum every family shares.
+  glibc 49.8, dlmalloc 86.7.  The seam selects its backend at
+  compile time — runtime dispatch would put an indirect call in
+  the hottest path — via one additive crate feature, `jemalloc`,
+  on by default; in its absence buffers come from the system
+  allocator with the class computed as the 16-byte quantum every
+  family shares.  Presence/absence of one feature can never
+  conflict under cargo's feature unification, and no backend is
+  load-bearing beyond the seam's four functions.
   The eventual §2.4-pool buffer backend inherits this seam and
   this benchmark bar; `ferroc` (pure Rust, mimalloc-shaped,
   nightly-only today) is the watch-list adoptee.

@@ -302,6 +302,7 @@ fn birth_capacity_is_the_allocator_size_class() {
 }
 
 #[test]
+#[cfg(feature = "jemalloc")]
 fn buffers_allocate_inside_the_jemalloc_instance() {
     // The -ctl crate reads the same jemalloc our seam allocates from, so a large buffer's birth must move the
     // instance's allocated-bytes statistic by at least its size — the sanity that the seam really routes there.

@@ -10,38 +10,79 @@
 use std::alloc::Layout;
 use std::ptr::NonNull;
 
-use tikv_jemalloc_sys as je;
+/// The jemalloc backend: the measured default (§2.2.3), where the class is asked through `nallocx`.
+#[cfg(feature = "jemalloc")]
+mod backend {
+    use super::*;
+    use tikv_jemalloc_sys as je;
 
-/// `mallocx` flags for a layout: jemalloc's default alignment covers ≤ 16, and larger alignments are requested
-/// explicitly.  `MALLOCX_ALIGN(a)` is `log2(a)` in the low bits, valid for any power of two, so it is simply always
-/// passed; alignment zero cannot occur (`Layout` forbids it).
-#[inline]
-fn flags(layout: Layout) -> std::ffi::c_int {
-    layout.align().trailing_zeros() as std::ffi::c_int
+    /// `mallocx` flags for a layout: jemalloc's default alignment covers ≤ 16, and larger alignments are requested
+    /// explicitly.  `MALLOCX_ALIGN(a)` is `log2(a)` in the low bits, valid for any power of two, so it is simply always
+    /// passed; alignment zero cannot occur (`Layout` forbids it).
+    #[inline]
+    fn flags(layout: Layout) -> std::ffi::c_int {
+        layout.align().trailing_zeros() as std::ffi::c_int
+    }
+
+    /// The size class a request of `layout` would occupy: allocating this many bytes costs exactly what allocating
+    /// `layout.size()` costs, so the difference is free capacity.  Zero-sized requests are the caller's to avoid, as
+    /// with the raw allocator APIs.
+    #[inline]
+    pub(crate) fn size_class(layout: Layout) -> usize {
+        // SAFETY: `nallocx` computes without allocating; a `Layout` guarantees a power-of-two alignment.
+        unsafe { je::nallocx(layout.size(), flags(layout)) }
+    }
+
+    /// Allocate `layout` from the buffer instance.  Returns `None` on exhaustion; the caller maps that to its own
+    /// error.
+    #[inline]
+    pub(crate) fn allocate(layout: Layout) -> Option<NonNull<u8>> {
+        // SAFETY: size is nonzero at every call site (headers alone guarantee it), and the alignment is a power of
+        // two.
+        NonNull::new(unsafe { je::mallocx(layout.size(), flags(layout)) }.cast::<u8>())
+    }
+
+    /// Release an allocation made by [`allocate`] with this exact `layout`.
+    ///
+    /// # Safety
+    /// `ptr` must come from [`allocate`] with the same `layout`, not yet released.
+    #[inline]
+    pub(crate) unsafe fn release(ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller vouches for provenance and layout; `sdallocx` is the sized free.
+        unsafe { je::sdallocx(ptr.as_ptr().cast(), layout.size(), flags(layout)) }
+    }
 }
 
-/// The size class a request of `layout` would occupy: allocating this many bytes costs exactly what allocating
-/// `layout.size()` costs, so the difference is free capacity.  Zero-sized requests are the caller's to avoid, as with
-/// the raw allocator APIs.
-#[inline]
-pub(crate) fn size_class(layout: Layout) -> usize {
-    // SAFETY: `nallocx` computes without allocating; a `Layout` guarantees a power-of-two alignment.
-    unsafe { je::nallocx(layout.size(), flags(layout)) }
+/// The C-free backend when the `jemalloc` feature is absent: the system allocator, with the class computed rather than
+/// asked — the 16-byte quantum every allocator family shares (§2.2.3), which the empirical probes showed is also
+/// glibc's true granularity at every heap-served size.
+#[cfg(not(feature = "jemalloc"))]
+mod backend {
+    use super::*;
+
+    /// The size class for `layout`: its size rounded up to the 16-byte quantum.  Conservative by design — a family with
+    /// coarser classes wastes nothing on a 16-shaped request, and no family is finer.
+    #[inline]
+    pub(crate) fn size_class(layout: Layout) -> usize {
+        (layout.size() + 15) & !15
+    }
+
+    /// Allocate `layout` from the system allocator.
+    #[inline]
+    pub(crate) fn allocate(layout: Layout) -> Option<NonNull<u8>> {
+        // SAFETY: size is nonzero at every call site (headers alone guarantee it).
+        NonNull::new(unsafe { std::alloc::alloc(layout) })
+    }
+
+    /// Release an allocation made by [`allocate`] with this exact `layout`.
+    ///
+    /// # Safety
+    /// `ptr` must come from [`allocate`] with the same `layout`, not yet released.
+    #[inline]
+    pub(crate) unsafe fn release(ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller vouches for provenance and layout.
+        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) }
+    }
 }
 
-/// Allocate `layout` from the buffer instance.  Returns `None` on exhaustion; the caller maps that to its own error.
-#[inline]
-pub(crate) fn allocate(layout: Layout) -> Option<NonNull<u8>> {
-    // SAFETY: size is nonzero at every call site (headers alone guarantee it), and the alignment is a power of two.
-    NonNull::new(unsafe { je::mallocx(layout.size(), flags(layout)) }.cast::<u8>())
-}
-
-/// Release an allocation made by [`allocate`] with this exact `layout`.
-///
-/// # Safety
-/// `ptr` must come from [`allocate`] with the same `layout`, not yet released.
-#[inline]
-pub(crate) unsafe fn release(ptr: NonNull<u8>, layout: Layout) {
-    // SAFETY: the caller vouches for provenance and layout; `sdallocx` is the sized free.
-    unsafe { je::sdallocx(ptr.as_ptr().cast(), layout.size(), flags(layout)) }
-}
+pub(crate) use backend::{allocate, release, size_class};

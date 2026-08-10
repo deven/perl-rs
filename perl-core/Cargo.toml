@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Perl core types"
 
+[features]
+# The buffer allocation backend (§2.2.3): `jemalloc` is on by default, and in its absence buffers come from the
+# system allocator — presence/absence of one additive feature, so cargo's feature unification can never conflict.
+default  = ["jemalloc"]
+jemalloc = ["dep:tikv-jemalloc-sys"]
+
 [dependencies]
 indexmap          = { workspace = true }
 parking_lot       = { workspace = true }
-tikv-jemalloc-sys = { workspace = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tikv-jemalloc-ctl = { workspace = true }
