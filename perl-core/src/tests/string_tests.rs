@@ -4182,6 +4182,21 @@ fn small_tier_str_construction_is_one_pass() {
     assert!(s.is_ascii(), "and the state answers the flag question");
 }
 
+#[test]
+fn large_tier_append_preserves_known_scan_state() {
+    // The take that feeds an append reads the large tier's header rather than discarding its facts: an append onto a
+    // buffer whose state a reader already narrowed must transition from that state, not from UNKNOWN — otherwise every
+    // rebuild forgets what a scan already paid to learn.
+    let mut s = PerlString::from_bytes(b"a".repeat(100_000)).unwrap();
+    assert!(!s.storage_type().is_small_heap_tier());
+    assert!(s.is_ascii(), "the probe narrows the shared scan slot");
+    let narrowed = s.scan_state();
+    assert_ne!(narrowed, scan::UNKNOWN);
+
+    s.push_str("bcd").unwrap();
+    assert_eq!(s.scan_state(), narrowed, "ASCII onto a narrowed buffer keeps the narrowed state across the rebuild");
+}
+
 // ── Leak accounting (the bomb's second layer) ──────────────────────────────
 
 #[test]

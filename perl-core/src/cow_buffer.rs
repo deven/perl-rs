@@ -230,7 +230,7 @@ pub(crate) struct HeapParts {
     pub(crate) ptr: Owned,
     pub(crate) len: usize,
     pub(crate) cap: usize,
-    pub(crate) count: u32,
+    pub(crate) count: usize,
     pub(crate) scan: ScanState,
     pub(crate) tier: Tier,
 }
@@ -239,10 +239,11 @@ impl HeapParts {
     /// Allocate the smallest tier that can hold `bytes`, copy them in, and hand back the pointer with whatever metadata
     /// that tier keeps in the envelope.  First fit, as the storage ladder is throughout (§2.2.9).
     ///
-    /// Scan state and character count are left at zero for the caller to establish: the small tiers are classified
-    /// eagerly at construction and the caller knows the answer, while the large tiers discover it lazily and should not
-    /// be told one now (§2.2.3).
-    pub(crate) fn from_slice(bytes: &[u8]) -> Result<HeapParts, AllocError> {
+    /// The scan state and character count are the caller's facts, passed in and written exactly once at birth: the
+    /// small tiers carry them in the envelope, the large tiers in the allocation header, and a caller that has no
+    /// classification passes `UNKNOWN` and zero, which are the lazily-filled caches' genuine unfilled states (§2.2.3),
+    /// not placeholders to patch.
+    pub(crate) fn from_slice(bytes: &[u8], scan: ScanState, count: usize) -> Result<HeapParts, AllocError> {
         let len = bytes.len();
         let tier = Tier::for_length(len);
 
@@ -261,12 +262,12 @@ impl HeapParts {
                     p
                 }
                 Tier::Heap32 => {
-                    let p = heap32::allocate(len as u32)?;
+                    let p = heap32::allocate(len as u32, scan.as_u8(), count as u32)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
                     p
                 }
                 Tier::Heap => {
-                    let p = heap::allocate(len, len)?;
+                    let p = heap::allocate(len, len, scan.as_u8(), count)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
                     p
                 }
@@ -274,31 +275,7 @@ impl HeapParts {
         };
 
         // SAFETY: the allocation above carries exactly one reference, which this `Owned` now owes.
-        Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap: len, count: 0, scan: ScanState::Unknown, tier })
-    }
-
-    /// Record the classification the caller established, for the tiers that keep it in the envelope.  The large tiers
-    /// hold theirs in the allocation, so this writes there instead.
-    pub(crate) fn with_classification(mut self, scan: ScanState, count: usize) -> HeapParts {
-        if self.tier.is_small() {
-            self.scan = scan;
-            self.count = count as u32;
-        } else {
-            // SAFETY: a live allocation of a large tier, held solely by this `HeapParts`.
-            unsafe {
-                match self.tier {
-                    Tier::Heap32 => {
-                        heap32::set_scan(self.ptr.as_ptr(), scan.as_u8());
-                        heap32::set_char_count(self.ptr.as_ptr(), count as u32);
-                    }
-                    _ => {
-                        heap::set_scan(self.ptr.as_ptr(), scan.as_u8());
-                        heap::set_char_count(self.ptr.as_ptr(), count);
-                    }
-                }
-            }
-        }
-        self
+        Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap: len, count, scan, tier })
     }
 }
 
@@ -706,12 +683,12 @@ macro_rules! heap_tier {
                 Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
             }
 
-            /// Allocate room for `capacity` bytes holding `len` of content, refcount one, no cached facts.  The length
-            /// is a fact the caller holds at birth, so it is written once here rather than zeroed and patched;
-            /// `set_len` exists for the in-place transforms, which change an existing allocation's content.  The cache
-            /// fields start zero because their facts do not exist yet — `UNKNOWN` and no-cached-count are the
-            /// lazily-filled caches' genuine birth states, not placeholders.
-            pub(crate) fn allocate(capacity: $w, len: $w) -> Result<NonNull<u8>, AllocError> {
+            /// Allocate room for `capacity` bytes holding `len` of content, refcount one, carrying the caller's scan
+            /// state and character count — every header field written exactly once at birth.  `set_len` and the cache
+            /// setters exist for later change: the in-place transforms and lazy narrowing operate on an existing
+            /// allocation, while a fact known at birth arrives here.  A caller without classification passes `UNKNOWN`
+            /// and zero, the caches' genuine unfilled states, not placeholders.
+            pub(crate) fn allocate(capacity: $w, len: $w, scan: u8, count: $w) -> Result<NonNull<u8>, AllocError> {
                 let layout = layout(capacity as usize)?;
 
                 // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
@@ -725,7 +702,7 @@ macro_rules! heap_tier {
 
                 // SAFETY: `base` is a fresh allocation of `layout`, aligned for `Head`.
                 unsafe {
-                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), len, capacity, char_count: <$c>::new(0), scan: AtomicU8::new(0) });
+                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), len, capacity, char_count: <$c>::new(count), scan: AtomicU8::new(scan) });
                 }
 
                 // SAFETY: `HEADER` is within the allocation by construction.
@@ -897,9 +874,11 @@ macro_rules! heap_tier {
                 Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
             }
 
-            /// Allocate room for `capacity` bytes, refcount one, no cached facts.  Length is the caller's to keep: this
-            /// tier's allocations do not record one.
-            pub(crate) fn allocate(capacity: u32) -> Result<NonNull<u8>, AllocError> {
+            /// Allocate room for `capacity` bytes, refcount one, carrying the caller's scan state and character count —
+            /// every header field written exactly once at birth.  A caller without classification passes `UNKNOWN` and
+            /// zero, the lazily-filled caches' genuine unfilled states, later narrowed through
+            /// `set_scan`/`set_char_count`.  Length is the caller's to keep: this tier's allocations do not record one.
+            pub(crate) fn allocate(capacity: u32, scan: u8, count: u32) -> Result<NonNull<u8>, AllocError> {
                 let layout = layout(capacity as usize)?;
 
                 // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
@@ -913,7 +892,7 @@ macro_rules! heap_tier {
 
                 // SAFETY: a fresh allocation of at least `HEADER` bytes, aligned for `Head`.
                 unsafe {
-                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), capacity, char_count: AtomicU32::new(0), scan: AtomicU8::new(0) });
+                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), capacity, char_count: AtomicU32::new(count), scan: AtomicU8::new(scan) });
                     Ok(base.add(HEADER))
                 }
             }

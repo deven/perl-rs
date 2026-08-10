@@ -995,7 +995,7 @@ macro_rules! define_perl_string {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: *cap as usize,
-                        count: *count as u32,
+                        count: *count as usize,
                         scan: scan.widen(),
                         tier: Tier::Heap8,
                     }, )*
@@ -1003,26 +1003,28 @@ macro_rules! define_perl_string {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: *cap as usize,
-                        count: *count as u32,
+                        count: *count as usize,
                         scan: scan.widen(),
                         tier: Tier::Heap16,
                     }, )*
 
                     // Large tiers keep their metadata in the allocation, so only the pointer travels.
+                    // SAFETY (both large arms): a live allocation still owned here; reading its header preserves the
+                    // facts it knew across the take instead of discarding them.
                     $( Repr::$heap32 { ptr, len } => RawOwned::Heap {
-                        ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
-                        cap: 0,
-                        count: 0,
-                        scan: scan::UNKNOWN,
+                        cap: unsafe { cow_buffer::heap32::capacity(ptr.as_ptr()) },
+                        count: unsafe { cow_buffer::heap32::char_count(ptr.as_ptr()) } as usize,
+                        scan: scan::ScanState::from_u8(unsafe { cow_buffer::heap32::scan(ptr.as_ptr()) }),
+                        ptr: unsafe { std::ptr::read(ptr) },
                         tier: Tier::Heap32,
                     }, )*
                     $( Repr::$heap { ptr } => RawOwned::Heap {
+                        len: unsafe { cow_buffer::heap::len(ptr.as_ptr()) },
+                        cap: unsafe { cow_buffer::heap::capacity(ptr.as_ptr()) },
+                        count: unsafe { cow_buffer::heap::char_count(ptr.as_ptr()) },
+                        scan: scan::ScanState::from_u8(unsafe { cow_buffer::heap::scan(ptr.as_ptr()) }),
                         ptr: unsafe { std::ptr::read(ptr) },
-                        len: 0,
-                        cap: 0,
-                        count: 0,
-                        scan: scan::UNKNOWN,
                         tier: Tier::Heap,
                     }, )*
                 }
@@ -1276,12 +1278,11 @@ fn expand_latin1(b: u8, out: &mut [u8]) -> usize {
 /// terminal type, so an indeterminate transition means paying the construction-grade pass over the joined content.  The
 /// same eager rule construction follows, for the same reason: below 64 KiB the state is settled now or never (§2.2.3).
 fn heap_parts_transitioned(bytes: &[u8], state: scan::ScanState, chars: usize) -> Result<HeapParts, AllocError> {
-    let parts = HeapParts::from_slice(bytes)?;
-    if parts.tier.is_small() && !scan::is_terminal(state) {
+    if Tier::for_length(bytes.len()).is_small() && !scan::is_terminal(state) {
         let (terminal, counted) = classify_full(bytes);
-        return Ok(parts.with_classification(terminal.widen(), counted));
+        return HeapParts::from_slice(bytes, terminal.widen(), counted);
     }
-    Ok(parts.with_classification(state, chars))
+    HeapParts::from_slice(bytes, state, chars)
 }
 
 /// Allocate heap parts for `bytes`, classifying eagerly where the tier keeps its scan state in the envelope.
@@ -1292,12 +1293,11 @@ fn heap_parts_transitioned(bytes: &[u8], state: scan::ScanState, chars: usize) -
 /// just happened (§2.2.11).  The large tiers are left unknown deliberately — at those sizes the pass is what they
 /// cannot afford, and their allocation has the room to record what a reader discovers.
 fn heap_parts_classified(bytes: &[u8]) -> Result<HeapParts, AllocError> {
-    let parts = HeapParts::from_slice(bytes)?;
-    if parts.tier.is_small() {
+    if Tier::for_length(bytes.len()).is_small() {
         let (state, chars) = classify_full(bytes);
-        return Ok(parts.with_classification(state.widen(), chars));
+        return HeapParts::from_slice(bytes, state.widen(), chars);
     }
-    Ok(parts)
+    HeapParts::from_slice(bytes, scan::UNKNOWN, 0)
 }
 
 /// Classify content into its canonical inline form: the class, the two nibbles, and the payload — `None` when no inline
@@ -1360,13 +1360,12 @@ impl PerlString {
             // a later discovery, so the range must be settled now or never (§2.2.3) — and since it pays the classifying
             // pass anyway, the ASCII question is answered by the terminal state for free: probing first would scan the
             // same bytes twice for one fact.
-            let parts = HeapParts::from_slice(bytes)?;
-            let (parts, ascii) = if parts.tier.is_small() {
+            let (parts, ascii) = if Tier::for_length(bytes.len()).is_small() {
                 let (state, chars) = classify_full(bytes);
-                (parts.with_classification(state.widen(), chars), state == scan::Terminal::Ascii)
+                (HeapParts::from_slice(bytes, state.widen(), chars)?, state == scan::Terminal::Ascii)
             } else {
                 let ascii = bytes.iter().all(|b| b.is_ascii());
-                (parts.with_classification(if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE }, 0), ascii)
+                (HeapParts::from_slice(bytes, if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE }, 0)?, ascii)
             };
 
             Ok(PerlString::build_heap(!ascii, false, parts))
@@ -1735,7 +1734,7 @@ impl PerlString {
         // a capacity check and two cache-invalidating atomic stores per input byte, and would rewrite an invariant
         // prefix the buffer can copy wholesale.
         let upgraded = cow_buffer::upgraded_bytes(internal)?;
-        let parts = HeapParts::from_slice(&upgraded)?.with_classification(scan::UTF8_LATIN1, internal.len());
+        let parts = HeapParts::from_slice(&upgraded, scan::UTF8_LATIN1, internal.len())?;
 
         Ok(PerlString::build_heap(true, t, parts))
     }
@@ -2015,11 +2014,14 @@ impl PerlString {
                 // the whole arm: dropping `old` — at the end or through either `?` — is the release.  The first
                 // run of the leak bomb caught this arm abandoning the pointer instead.
                 let old = HeapParts { ptr, len, cap, count, scan: prior, tier };
-                let view = if tier.is_small() {
-                    HeapView::small(&old.ptr, len, cap, count as usize, prior, tier)
-                } else {
-                    // SAFETY: a live allocation of a large tier, owned by `old`.
-                    unsafe { HeapView::large(&old.ptr, tier) }
+                let view = match tier {
+                    Tier::Heap8 | Tier::Heap16 => HeapView::small(&old.ptr, len, cap, count, prior, tier),
+
+                    // SAFETY (both large arms): a live allocation of the matching tier, owned by `old`.  The compact
+                    // tier's length is envelope-authoritative, so its view takes the length this arm already holds
+                    // (§2.2.3).
+                    Tier::Heap32 => unsafe { HeapView::heap32(&old.ptr, len) },
+                    Tier::Heap => unsafe { HeapView::large(&old.ptr, tier) },
                 };
                 let (prior, prior_chars) = (view.scan(), view.char_count());
 
@@ -2068,13 +2070,15 @@ enum RawOwned {
     },
     Packed(Packed),
 
-    /// The owned pointer with the metadata its tier keeps in the envelope; the large tiers carry their own and
-    /// leave these fields at zero.
+    /// The owned pointer with its tier's full metadata, wherever the tier keeps it: the small tiers' fields come from
+    /// the envelope, the large tiers' from the allocation header, read at the take.  Every field is true — nothing
+    /// rides at zero on the strength of nobody reading it, and the append transition starts from the state the buffer
+    /// actually knew rather than discarding it to `UNKNOWN`.
     Heap {
         ptr: Owned,
         len: usize,
         cap: usize,
-        count: u32,
+        count: usize,
         scan: scan::ScanState,
         tier: Tier,
     },

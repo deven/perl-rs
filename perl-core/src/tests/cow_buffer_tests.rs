@@ -32,7 +32,7 @@ fn large_tier_allocations_carry_their_own_metadata() {
     // SAFETY: as above; the setters are called while the single handle is held.
     unsafe {
         let cap: u32 = 100_000;
-        let ptr = heap32::allocate(cap).unwrap();
+        let ptr = heap32::allocate(cap, 0, 0).unwrap();
         assert_eq!(heap32::capacity(ptr), cap as usize, "capacity is recorded, not passed back in");
         assert_eq!(heap32::scan(ptr), 0, "UNKNOWN is the zero-initialized state");
         assert_eq!(heap32::char_count(ptr), 0, "no cached count");
@@ -77,7 +77,7 @@ macro_rules! large_tier_protocol {
         // SAFETY: the setters run while the single handle is held.
         unsafe {
             let cap = $cap;
-            let ptr = $tier::allocate(cap, 7).unwrap();
+            let ptr = $tier::allocate(cap, 7, 0, 0).unwrap();
             assert_eq!($tier::len(ptr), 7, "the birth write records the length allocate was given");
             $tier::set_len(ptr, 9);
             assert_eq!($tier::len(ptr), 9, "set_len serves the in-place transforms");
@@ -99,7 +99,7 @@ macro_rules! large_tier_protocol {
         // SAFETY: as above; the metadata setters run while the single handle is held.
         unsafe {
             let cap = $cap;
-            let ptr = $tier::allocate(cap).unwrap();
+            let ptr = $tier::allocate(cap, 0, 0).unwrap();
             assert_eq!($tier::refcount(ptr), 1);
             assert!($tier::is_unique(ptr));
             assert_eq!($tier::capacity(ptr), cap as usize);
@@ -143,7 +143,7 @@ fn every_tier_allocates_at_its_ceiling_and_at_zero() {
         assert_eq!(heap16::refcount(p), 1);
         heap16::release(p, u16::MAX);
 
-        let p = heap::allocate(4096, 0).unwrap();
+        let p = heap::allocate(4096, 0, 0, 0).unwrap();
         assert_eq!(heap::capacity(p), 4096);
         heap::release(p);
     }
@@ -152,7 +152,7 @@ fn every_tier_allocates_at_its_ceiling_and_at_zero() {
 #[test]
 fn an_unsatisfiable_tier_capacity_is_an_error_not_a_panic() {
     // The word tier is the only one whose width can express a request the allocator cannot meet.
-    assert!(heap::allocate(usize::MAX, 0).is_err(), "capacity arithmetic overflow reports as AllocError");
+    assert!(heap::allocate(usize::MAX, 0, 0, 0).is_err(), "capacity arithmetic overflow reports as AllocError");
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn word_tier_char_count_is_word_width() {
 
     // SAFETY: a live allocation; the setter runs while the single handle is held.
     unsafe {
-        let ptr = heap::allocate(64, 0).unwrap();
+        let ptr = heap::allocate(64, 0, 0, 0).unwrap();
         heap::set_char_count(ptr, big);
         assert_eq!(heap::char_count(ptr), big, "no truncation below the word's ceiling");
         heap::release(ptr);
@@ -228,7 +228,7 @@ fn concurrent_retain_release_refcount_protocol() {
 
     // SAFETY: a live allocation; every thread holds a reference across its retain/release pair.
     unsafe {
-        let ptr = heap::allocate(64, 0).unwrap();
+        let ptr = heap::allocate(64, 0, 0, 0).unwrap();
         let addr = ptr.as_ptr() as usize;
         let threads: Vec<_> = (0..8)
             .map(|_| {
@@ -262,7 +262,7 @@ fn concurrent_scan_narrowing_races_are_benign() {
     // holding one of the written values, never a torn or invented byte.
     // SAFETY: a live allocation; set_scan is the atomic store the protocol allows from any handle.
     unsafe {
-        let ptr = heap::allocate(16, 0).unwrap();
+        let ptr = heap::allocate(16, 0, 0, 0).unwrap();
         let addr = ptr.as_ptr() as usize;
         let threads: Vec<_> = [2u8, 3, 5]
             .into_iter()
