@@ -34,6 +34,8 @@
 
 use std::alloc::{self, Layout};
 use std::fmt;
+
+use crate::string::scan::ScanState;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::slice;
@@ -231,7 +233,7 @@ pub(crate) struct HeapParts {
     pub(crate) len: usize,
     pub(crate) cap: usize,
     pub(crate) count: u32,
-    pub(crate) scan: u8,
+    pub(crate) scan: ScanState,
     pub(crate) tier: Tier,
 }
 
@@ -276,12 +278,12 @@ impl HeapParts {
         };
 
         // SAFETY: the allocation above carries exactly one reference, which this `Owned` now owes.
-        Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap: len, count: 0, scan: 0, tier })
+        Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap: len, count: 0, scan: ScanState::Unknown, tier })
     }
 
     /// Record the classification the caller established, for the tiers that keep it in the envelope.  The large tiers
     /// hold theirs in the allocation, so this writes there instead.
-    pub(crate) fn with_classification(mut self, scan: u8, count: usize) -> HeapParts {
+    pub(crate) fn with_classification(mut self, scan: ScanState, count: usize) -> HeapParts {
         if self.tier.is_small() {
             self.scan = scan;
             self.count = count as u32;
@@ -290,11 +292,11 @@ impl HeapParts {
             unsafe {
                 match self.tier {
                     Tier::Heap32 => {
-                        heap32::set_scan(self.ptr.as_ptr(), scan);
+                        heap32::set_scan(self.ptr.as_ptr(), scan.as_u8());
                         heap32::set_char_count(self.ptr.as_ptr(), count as u32);
                     }
                     _ => {
-                        heapw::set_scan(self.ptr.as_ptr(), scan);
+                        heapw::set_scan(self.ptr.as_ptr(), scan.as_u8());
                         heapw::set_char_count(self.ptr.as_ptr(), count as u32);
                     }
                 }
@@ -392,14 +394,14 @@ pub(crate) struct HeapView<'a> {
     len: usize,
     cap: usize,
     count: u32,
-    scan: u8,
+    scan: ScanState,
     tier: Tier,
     _life: PhantomData<&'a Owned>,
 }
 
 impl<'a> HeapView<'a> {
     /// A small tier's view: the caller supplies the metadata, because its allocation holds none.
-    pub(crate) fn small(ptr: &'a Owned, len: usize, cap: usize, count: u32, scan: u8, tier: Tier) -> HeapView<'a> {
+    pub(crate) fn small(ptr: &'a Owned, len: usize, cap: usize, count: u32, scan: ScanState, tier: Tier) -> HeapView<'a> {
         HeapView { ptr: ptr.as_ptr(), len, cap, count, scan, tier, _life: PhantomData }
     }
 
@@ -416,9 +418,11 @@ impl<'a> HeapView<'a> {
                 _ => (heapw::len(raw), heapw::capacity(raw), heapw::char_count(raw), heapw::scan(raw)),
             }
         };
-        HeapView { ptr: raw, len, cap, count, scan, tier, _life: PhantomData }
+        // The one seam where a storage byte re-enters the type; corruption reports here rather than flowing on.
+        HeapView { ptr: raw, len, cap, count, scan: ScanState::from_u8(scan), tier, _life: PhantomData }
     }
 
+    /// Content length in bytes.
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -447,7 +451,7 @@ impl<'a> HeapView<'a> {
 
     /// The cached scan state (§2.2.4); zero is `UNKNOWN`, which a small tier never reports since it is classified at
     /// construction.
-    pub(crate) fn scan(&self) -> u8 {
+    pub(crate) fn scan(&self) -> ScanState {
         self.scan
     }
 
@@ -474,12 +478,13 @@ impl<'a> HeapView<'a> {
     /// Record a discovered scan state, for the tiers that discover one.  A small tier's is settled at construction and
     /// lives in the envelope, so this is a no-op there rather than an error: the caller learns nothing the value does
     /// not already know.
-    pub(crate) fn narrow_scan(&self, state: u8) {
-        // SAFETY: the view borrows a live allocation of its tier.
+    pub(crate) fn narrow_scan(&self, state: ScanState) {
+        // SAFETY: the view borrows a live allocation of its tier.  The storage byte is the type's projection, so a scan
+        // slot can only ever hold a value `ScanState::from_u8` will accept back.
         unsafe {
             match self.tier {
-                Tier::Heap32 => heap32::set_scan(self.ptr, state),
-                Tier::HeapW => heapw::set_scan(self.ptr, state),
+                Tier::Heap32 => heap32::set_scan(self.ptr, state.as_u8()),
+                Tier::HeapW => heapw::set_scan(self.ptr, state.as_u8()),
                 Tier::Heap8 | Tier::Heap16 => {}
             }
         }

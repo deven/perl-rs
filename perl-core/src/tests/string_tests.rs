@@ -500,7 +500,7 @@ fn reference_eq(a: &PerlString, b: &PerlString) -> bool {
 }
 
 /// The design's decided-false table (§2.3.5 rows 1–4), transcribed independently of the implementation.
-fn design_decides_false(a: &PerlString, sa: u8, b: &PerlString, sb: u8) -> bool {
+fn design_decides_false(a: &PerlString, sa: scan::ScanState, b: &PerlString, sb: scan::ScanState) -> bool {
     if a.is_utf8() == b.is_utf8() {
         return a.len() != b.len()
             || (scan::is_terminal(sa) && scan::is_terminal(sb) && sa != sb)
@@ -576,7 +576,7 @@ fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PerlString)>, usi
     // mattered little when every witness was a couple of dozen bytes; the indeterminate states now live above
     // 64 KiB, because only the lazy tiers still hold them (§2.2.3), and the grid asks for a fresh witness per
     // comparison.
-    let mut push = |name: &str, build: &dyn Fn() -> PerlString, want: u8| {
+    let mut push = |name: &str, build: &dyn Fn() -> PerlString, want: scan::ScanState| {
         let index = seen;
         seen += 1;
         if index < lo || index > hi {
@@ -758,18 +758,18 @@ fn eq_grid_exhaustive_over_all_state_flag_combinations() {
                     let (full_scans, _) = super::eq_probe::scans();
                     assert_eq!(full_scans, 0, "eq performed a full scan on {na} vs {nb} — the walk is its only byte access");
                     let want = reference_eq(&a, &b);
-                    assert_eq!(got, want, "eq vs oracle for {na} vs {nb} (states {sa}/{sb})");
+                    assert_eq!(got, want, "eq vs oracle for {na} vs {nb} (states {sa:?}/{sb:?})");
 
                     if design_decides_false(&a, sa, &b, sb) {
                         decided += 1;
-                        assert!(!want, "design table unsound for {na} vs {nb} (states {sa}/{sb})");
+                        assert!(!want, "design table unsound for {na} vs {nb} (states {sa:?}/{sb:?})");
 
                         // The mechanism assertion: a decided pair must be decided BY THE GRID — same-flag decided pairs
                         // may resolve in the pre-memcmp rows or memcmp's length check; cross-flag decided pairs must
                         // hit a grid row and must never enter the streaming walk.
                         if a.is_utf8() != b.is_utf8() {
-                            assert!(grid_hits >= 1, "grid row failed to fire for {na} vs {nb} (states {sa}/{sb})");
-                            assert_eq!(walk_entries, 0, "walk entered on decided pair {na} vs {nb} (states {sa}/{sb})");
+                            assert!(grid_hits >= 1, "grid row failed to fire for {na} vs {nb} (states {sa:?}/{sb:?})");
+                            assert_eq!(walk_entries, 0, "walk entered on decided pair {na} vs {nb} (states {sa:?}/{sb:?})");
                         }
                     }
 
@@ -939,7 +939,7 @@ fn block_boundary_straddles_every_sequence_length() {
 
     fe_min.extend_from_slice(&c2);
 
-    let cases: [(&[u8], u8); 5] = [
+    let cases: [(&[u8], scan::ScanState); 5] = [
         ("é".as_bytes(), scan::UTF8_LATIN1),
         ("字".as_bytes(), scan::UTF8_NON_LATIN1),
         ("\u{10000}".as_bytes(), scan::UTF8_NON_LATIN1),
@@ -955,7 +955,7 @@ fn block_boundary_straddles_every_sequence_length() {
             bytes.extend_from_slice(seq);
             bytes.extend_from_slice(b"tail");
             let (st, chars) = classify_full(&bytes);
-            assert_eq!(st.state(), want_state, "state for seq len {} cut {}", seq.len(), cut);
+            assert_eq!(st.widen(), want_state, "state for seq len {} cut {}", seq.len(), cut);
             assert_eq!(chars, lead_len + 1 + 4, "chars for seq len {} cut {}", seq.len(), cut);
         }
     }
@@ -1039,7 +1039,7 @@ fn blocked_known_valid_boundaries() {
     s.push('é');
     s.push_str("tail");
     let (st, chars) = classify_known_valid(s.as_bytes());
-    assert_eq!(st, scan::UTF8_LATIN1);
+    assert_eq!(st, scan::ValidRange::Latin1);
     assert_eq!(chars, CLASSIFY_BLOCK - 1 + 1 + 4);
 
     // A wide character first appearing blocks later still bails (block-granular, count forfeited).
@@ -1049,11 +1049,11 @@ fn blocked_known_valid_boundaries() {
     }
 
     w.push('字');
-    assert_eq!(classify_known_valid(w.as_bytes()), (scan::UTF8_NON_LATIN1, 0));
+    assert_eq!(classify_known_valid(w.as_bytes()), (scan::ValidRange::NonLatin1, 0));
 
     // Multi-block pure Latin-1: exact count.
     let l = "é".repeat(CLASSIFY_BLOCK); // 2 bytes each: two blocks
-    assert_eq!(classify_known_valid(l.as_bytes()), (scan::UTF8_LATIN1, CLASSIFY_BLOCK));
+    assert_eq!(classify_known_valid(l.as_bytes()), (scan::ValidRange::Latin1, CLASSIFY_BLOCK));
 }
 
 // ── Character-length cache (§2.2.4) ───────────────────────────
