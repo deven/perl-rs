@@ -541,6 +541,28 @@ Details:
   than when a buffer becomes shared: the break is already copying,
   so the trim is free there, where trimming at the share would add
   a copy that a subsequent append then pays for twice.
+
+  The size class is *asked, not guessed* [DECISION]: buffers come
+  from a jemalloc instance (the `tikv-jemalloc-sys` family — the
+  maintained fork; upstream archived June 2025) called through its
+  C API behind the tier seam, where `nallocx` names the class for
+  a request and the allocation then requests exactly that class —
+  perl's `malloc_usable_size` harvest, made contract-legal by
+  owning the allocator.  Never `#[global_allocator]` in the
+  library: the host keeps its malloc (§2.7), and only the `perl`
+  binary may set jemalloc globally for itself.  Empirical footing
+  (address-stride, `malloc_usable_size`, and `/proc/self/maps`
+  probes, plus a 4-thread churn benchmark): glibc charges
+  `align(n+8,16)` at every heap size — its bin ladder organizes
+  free lists, not granularity — and its mmap threshold is dynamic,
+  so class-ladder cleverness against it wastes footprint; measured
+  ns/op on string-shaped churn: jemalloc 14.9, mimalloc 22.7,
+  glibc 49.8, dlmalloc 86.7.  If a C-free build is ever required,
+  the fallback behind the same seam is the system allocator with
+  requests rounded to the 16-byte quantum every family shares.
+  The eventual §2.4-pool buffer backend inherits this seam and
+  this benchmark bar; `ferroc` (pure Rust, mimalloc-shaped,
+  nightly-only today) is the watch-list adoptee.
 - **Scans** (`is_ascii`, UTF-8 validation) use SIMD-accelerated
   byte search (`memchr`-class routines) — the one dependency this
   ruling leaves optional.
