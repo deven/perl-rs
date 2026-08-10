@@ -326,6 +326,12 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
     // Stringification still yields the string face, and truth reads it too.
     assert_eq!(cell.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"12abc");
     assert!(cell.to_bool());
+
+    // A dual's rendering is its string face, present by construction, so the digit-cache predicate answers yes:
+    // a caller consulting it to skip formatting must skip for a dual.
+    if let ScalarCell::Plain(payload) = &cell {
+        assert!(payload.has_cached_digits(), "the string face is the cached rendering");
+    }
 }
 
 #[test]

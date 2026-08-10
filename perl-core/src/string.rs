@@ -978,7 +978,7 @@ macro_rules! define_perl_string {
                 // still dropped, releasing an allocation the caller believes it owns.  Matching on a reference and
                 // reading the one non-`Copy` field makes the transfer explicit, and suppressing the source's drop is
                 // what makes it sound.
-                let this = core::mem::ManuallyDrop::new(self);
+                let this = std::mem::ManuallyDrop::new(self);
 
                 // SAFETY (each heap arm): `this` is never dropped, so the pointer is read out exactly once and the
                 // reference it carries transfers to the returned `RawOwned`.
@@ -990,7 +990,7 @@ macro_rules! define_perl_string {
                         nibbles: *nibbles,
                     }), )*
                     $( Repr::$h8 { ptr, len, cap, count, scan } => RawOwned::Heap {
-                        ptr: unsafe { core::ptr::read(ptr) },
+                        ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: *cap as usize,
                         count: *count as u32,
@@ -998,7 +998,7 @@ macro_rules! define_perl_string {
                         tier: Tier::Heap8,
                     }, )*
                     $( Repr::$h16 { ptr, len, cap, count, scan } => RawOwned::Heap {
-                        ptr: unsafe { core::ptr::read(ptr) },
+                        ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: *cap as usize,
                         count: *count as u32,
@@ -1008,7 +1008,7 @@ macro_rules! define_perl_string {
 
                     // Large tiers keep their metadata in the allocation, so only the pointer travels.
                     $( Repr::$h32 { ptr, len } => RawOwned::Heap {
-                        ptr: unsafe { core::ptr::read(ptr) },
+                        ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: 0,
                         count: 0,
@@ -1016,7 +1016,7 @@ macro_rules! define_perl_string {
                         tier: Tier::Heap32,
                     }, )*
                     $( Repr::$hw { ptr } => RawOwned::Heap {
-                        ptr: unsafe { core::ptr::read(ptr) },
+                        ptr: unsafe { std::ptr::read(ptr) },
                         len: 0,
                         cap: 0,
                         count: 0,
@@ -1031,7 +1031,7 @@ macro_rules! define_perl_string {
                 // The one place the obligation leaves a `HeapParts` without releasing: the variant built below is its
                 // next owner.  `E0509` forbids the plain destructure now that `HeapParts` owns a `Drop`, which is the
                 // compiler confirming this transfer must be spelled out.
-                let mut parts = core::mem::ManuallyDrop::new(parts);
+                let mut parts = std::mem::ManuallyDrop::new(parts);
                 let ptr = parts.ptr.claim();
                 let (len, cap, count, scan, tier) = (parts.len, parts.cap, parts.count, parts.scan, parts.tier);
 

@@ -625,6 +625,13 @@ macro_rules! impl_coercions {
                     $ty::Integer(n) | $ty::IntegerTainted(n) => n.is_cached(),
                     $ty::Unsigned(u) | $ty::UnsignedTainted(u) => u.is_cached(),
                     $ty::Float(f) | $ty::FloatTainted(f) => f.is_cached(),
+
+                    // A dual's rendering is its string face, present by construction — no digits ever need formatting,
+                    // which is exactly what this predicate promises to its caller.
+                    $ty::Dual(_) | $ty::DualTainted(_) => true,
+
+                    // Everything else renders from no digit cache; a later numeric kind falling here costs the
+                    // optimization, never correctness (as with `filled` above).
                     _ => false,
                 }
             }

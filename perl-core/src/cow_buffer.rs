@@ -89,10 +89,12 @@ pub(crate) mod live {
         static LIVE: Cell<isize> = const { Cell::new(0) };
     }
 
+    /// Record one tier allocation on this thread.
     pub(crate) fn allocated() {
         LIVE.with(|c| c.set(c.get() + 1));
     }
 
+    /// Record one tier release on this thread.
     pub(crate) fn released() {
         LIVE.with(|c| c.set(c.get() - 1));
     }
@@ -224,7 +226,6 @@ impl Tier {
 /// holding one leak-free without ceremony.  It holds exactly what release needs — the pointer, the capacity, the tier —
 /// so it is the natural owner, and [`PerlString`]'s `build_heap` is the one place that takes the obligation onward
 /// instead, under `ManuallyDrop`.
-#[allow(dead_code)] // `cap` is read inside `build_heap`'s macro expansion, which the lint cannot see.
 pub(crate) struct HeapParts {
     pub(crate) ptr: Owned,
     pub(crate) len: usize,
@@ -435,6 +436,7 @@ impl<'a> HeapView<'a> {
         self.len
     }
 
+    /// Whether the content is zero bytes.
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -446,11 +448,13 @@ impl<'a> HeapView<'a> {
         self.cap
     }
 
+    /// Which tier owns the allocation this view borrows.
     #[allow(dead_code)]
     pub(crate) fn tier(&self) -> Tier {
         self.tier
     }
 
+    /// The content bytes.
     pub(crate) fn as_slice(&self) -> &'a [u8] {
         // SAFETY: the view borrows a live allocation whose first `len` bytes are initialized, and `Owned`'s lifetime is
         // threaded through `_life` so the slice cannot outlive it.
@@ -560,6 +564,7 @@ macro_rules! heap_tier {
                 unsafe { &*(ptr.as_ptr().sub(HEADER).cast::<Head>()) }
             }
 
+            /// The allocation layout for `capacity` content bytes below this tier's header.
             fn layout(capacity: usize) -> Result<Layout, AllocError> {
                 let size = HEADER.checked_add(capacity).ok_or(AllocError { requested: capacity })?;
                 Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
@@ -696,6 +701,7 @@ macro_rules! heap_tier {
                 unsafe { &mut *(ptr.as_ptr().sub(HEADER).cast::<Head>()) }
             }
 
+            /// The allocation layout for `capacity` content bytes below this tier's header.
             fn layout(capacity: usize) -> Result<Layout, AllocError> {
                 let size = HEADER.checked_add(capacity).ok_or(AllocError { requested: capacity })?;
                 Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
@@ -882,6 +888,7 @@ macro_rules! heap_tier {
                 unsafe { &*(ptr.as_ptr().sub(HEADER).cast::<Head>()) }
             }
 
+            /// The allocation layout for `capacity` content bytes below this tier's header.
             fn layout(capacity: usize) -> Result<Layout, AllocError> {
                 let size = HEADER.checked_add(capacity).ok_or(AllocError { requested: capacity })?;
                 Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
