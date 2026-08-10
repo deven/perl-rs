@@ -490,12 +490,19 @@ unique-check mutation, nothing else.  Details:
   the same, at `u16` widths — `len`, `capacity`, count and scan
   fill the seven spare envelope bytes exactly.  Every tier counts
   in 32 bits, so a small tier's header is four bytes and content
-  begins four bytes past the allocation base.  `Heap32`: a
-  `{refcount, len, capacity, char_count, scan}` header with `u32`
-  fields, and a `u32` length mirror in the envelope so the common
-  length question skips the dereference.  `Heap`: the same with
-  `usize` fields; at gigabyte content one dependent load is
-  immaterial, so it carries no mirror.
+  begins four bytes past the allocation base.  `Heap32`: a compact
+  `{refcount, capacity, char_count, scan}` header with `u32` fields
+  — no length, because the envelope owns it: a `u32` length rides
+  beside the pointer in the variant at no size cost, every length
+  question skips the dereference, and copy-on-write is what makes a
+  per-handle length correct (content is immutable while shared,
+  hence so is length).  `Heap`: a `{refcount, len, capacity,
+  char_count, scan}` header with `usize` fields — a word-width
+  length cannot ride the envelope without growing the value, and at
+  gigabyte content one dependent load is immaterial.  Character
+  counts take each tier's own width, since a count can reach the
+  byte length and a narrower field would cache wrong answers past
+  its ceiling.
 
 - **Immortal and static forms [DECISION].**  Two further tag types
   hold content that is never freed and never grown, so they need

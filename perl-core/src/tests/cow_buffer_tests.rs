@@ -238,17 +238,15 @@ fn small_tier_allocations_carry_only_a_refcount() {
 
 #[test]
 fn large_tier_allocations_carry_their_own_metadata() {
-    // SAFETY: as above; `set_len` and `set_scan` are called while the single handle is held.
+    // SAFETY: as above; the setters are called while the single handle is held.
     unsafe {
         let cap: u32 = 100_000;
         let ptr = heap32::allocate(cap).unwrap();
         assert_eq!(heap32::capacity(ptr), cap as usize, "capacity is recorded, not passed back in");
-        assert_eq!(heap32::len(ptr), 0);
         assert_eq!(heap32::scan(ptr), 0, "UNKNOWN is the zero-initialized state");
         assert_eq!(heap32::char_count(ptr), 0, "no cached count");
 
-        heap32::set_len(ptr, 12_345);
-        assert_eq!(heap32::len(ptr), 12_345);
+        // No length: the envelope owns it (§2.2.3), so the compact header holds only the shared caches.
         heap32::set_scan(ptr, 3);
         assert_eq!(heap32::scan(ptr), 3);
         heap32::set_char_count(ptr, 999);
@@ -282,6 +280,18 @@ macro_rules! small_tier_protocol {
 }
 
 macro_rules! large_tier_protocol {
+    // The word tier keeps a header length; the compact tier does not (§2.2.3), so the length probe is an arm apart.
+    ($tier:ident, $cap:expr, len = header) => {{
+        // SAFETY: the setters run while the single handle is held.
+        unsafe {
+            let ptr = $tier::allocate($cap).unwrap();
+            assert_eq!($tier::len(ptr), 0);
+            $tier::set_len(ptr, 7);
+            assert_eq!($tier::len(ptr), 7);
+            $tier::release(ptr);
+        }
+        large_tier_protocol!($tier, $cap);
+    }};
     ($tier:ident, $cap:expr) => {{
         // SAFETY: as above; the metadata setters run while the single handle is held.
         unsafe {
@@ -290,9 +300,6 @@ macro_rules! large_tier_protocol {
             assert_eq!($tier::refcount(ptr), 1);
             assert!($tier::is_unique(ptr));
             assert_eq!($tier::capacity(ptr), cap as usize);
-            assert_eq!($tier::len(ptr), 0);
-            $tier::set_len(ptr, 7);
-            assert_eq!($tier::len(ptr), 7);
             $tier::set_scan(ptr, 2);
             assert_eq!($tier::scan(ptr), 2);
             $tier::set_char_count(ptr, 5);
@@ -311,7 +318,7 @@ fn all_four_tiers_honor_the_whole_protocol() {
     small_tier_protocol!(heap8, 255u8);
     small_tier_protocol!(heap16, 65_535u16);
     large_tier_protocol!(heap32, 4096u32);
-    large_tier_protocol!(heapw, 4096usize);
+    large_tier_protocol!(heapw, 4096usize, len = header);
     assert_eq!(heap8::MAX_CAPACITY, 255);
     assert_eq!(heap16::MAX_CAPACITY, 65_535);
     assert_eq!(heap32::MAX_CAPACITY, u32::MAX as usize);
@@ -351,9 +358,10 @@ fn tier_headers_match_the_placement_rule() {
     assert_eq!(heap8::HEADER, 4);
     assert_eq!(heap16::HEADER, 4);
 
-    // The large tiers pay for what they cache: a refcount plus length, capacity, character count and scan state.
-    assert_eq!(heap32::HEADER, 20, "u32 fields, padded to alignment 4");
-    assert_eq!(heapw::HEADER, 32, "usize lengths, padded to alignment 8");
+    // The large tiers pay for what they cache.  Heap32 is compact: no length (the envelope owns it, §2.2.3), so a
+    // refcount, capacity, count and scan pad to sixteen.  The word tier keeps its length and a word-width count.
+    assert_eq!(heap32::HEADER, 16, "u32 fields without a length, padded to alignment 4");
+    assert_eq!(heapw::HEADER, 40, "usize lengths and a word-width count, padded to alignment 8");
     assert_eq!(heap8::MAX_CAPACITY, 255);
     assert_eq!(heap16::MAX_CAPACITY, 65_535);
 }
@@ -385,5 +393,25 @@ fn owned_carries_the_release_obligation_and_nothing_else() {
     unsafe {
         assert_eq!(heap16::refcount(handed_on), 1, "still exactly one outstanding release");
         heap16::release(handed_on, cap);
+    }
+}
+
+#[test]
+fn word_tier_char_count_is_word_width() {
+    // Finding 3's regression: a character count can reach the byte length, so the counter must carry the tier's full
+    // word width — a narrower field would cache wrong answers past its ceiling.  Probing at the word's own ceiling
+    // proves no narrower storage hides inside, on any architecture: on 64-bit targets this exercises far past the u32
+    // boundary the defect sat at, and on 32-bit targets the word and u32 coincide, which is the width the tier is then
+    // entitled to.  (`u32::MAX as usize + 5` here would itself overflow on 32-bit — the probe must not presume the
+    // width it is probing.)  A raw header write suffices: the property is about storage, not about allocating four
+    // gigabytes in a test.
+    let big = usize::MAX - 3;
+
+    // SAFETY: a live allocation; the setter runs while the single handle is held.
+    unsafe {
+        let ptr = heapw::allocate(64).unwrap();
+        heapw::set_char_count(ptr, big);
+        assert_eq!(heapw::char_count(ptr), big, "no truncation below the word's ceiling");
+        heapw::release(ptr);
     }
 }

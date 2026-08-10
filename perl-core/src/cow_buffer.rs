@@ -128,6 +128,7 @@ impl Owned {
     pub(crate) fn as_ptr(&self) -> NonNull<u8> {
         match self.0 {
             Some(p) => p,
+
             // Unreachable in correct code: the only disarm sites are the consumption paths, after which the `Owned` is
             // gone or about to be.  Part of the bomb machinery, so it reports rather than misbehaves.
             None => panic!("read of a consumed Owned"),
@@ -265,7 +266,6 @@ impl HeapParts {
                 Tier::Heap32 => {
                     let p = heap32::allocate(len as u32)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
-                    heap32::set_len(p, len as u32);
                     p
                 }
                 Tier::HeapW => {
@@ -297,7 +297,7 @@ impl HeapParts {
                     }
                     _ => {
                         heapw::set_scan(self.ptr.as_ptr(), scan.as_u8());
-                        heapw::set_char_count(self.ptr.as_ptr(), count as u32);
+                        heapw::set_char_count(self.ptr.as_ptr(), count);
                     }
                 }
             }
@@ -370,6 +370,7 @@ pub(crate) unsafe fn contract_latin1_in_place(base: NonNull<u8>, first: usize, o
 impl Drop for HeapParts {
     fn drop(&mut self) {
         let ptr = self.ptr.claim();
+
         // SAFETY: the parts own exactly one reference on a live allocation of `tier`; the small tiers release by the
         // capacity carried beside the pointer.
         unsafe {
@@ -393,7 +394,7 @@ pub(crate) struct HeapView<'a> {
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
-    count: u32,
+    count: usize,
     scan: ScanState,
     tier: Tier,
     _life: PhantomData<&'a Owned>,
@@ -401,7 +402,7 @@ pub(crate) struct HeapView<'a> {
 
 impl<'a> HeapView<'a> {
     /// A small tier's view: the caller supplies the metadata, because its allocation holds none.
-    pub(crate) fn small(ptr: &'a Owned, len: usize, cap: usize, count: u32, scan: ScanState, tier: Tier) -> HeapView<'a> {
+    pub(crate) fn small(ptr: &'a Owned, len: usize, cap: usize, count: usize, scan: ScanState, tier: Tier) -> HeapView<'a> {
         HeapView { ptr: ptr.as_ptr(), len, cap, count, scan, tier, _life: PhantomData }
     }
 
@@ -410,16 +411,27 @@ impl<'a> HeapView<'a> {
     /// # Safety
     /// `ptr` must own a live allocation of `tier`, which must be `Heap32` or `HeapW`.
     pub(crate) unsafe fn large(ptr: &'a Owned, tier: Tier) -> HeapView<'a> {
+        debug_assert!(matches!(tier, Tier::HeapW), "Heap32 views take their envelope length via `heap32`");
         let raw = ptr.as_ptr();
-        // SAFETY: the caller vouches for a live allocation of a large tier.
-        let (len, cap, count, scan) = unsafe {
-            match tier {
-                Tier::Heap32 => (heap32::len(raw), heap32::capacity(raw), heap32::char_count(raw), heap32::scan(raw)),
-                _ => (heapw::len(raw), heapw::capacity(raw), heapw::char_count(raw), heapw::scan(raw)),
-            }
-        };
+
+        // SAFETY: the caller vouches for a live allocation of the word tier.
+        let (len, cap, count, scan) = unsafe { (heapw::len(raw), heapw::capacity(raw), heapw::char_count(raw), heapw::scan(raw)) };
+
         // The one seam where a storage byte re-enters the type; corruption reports here rather than flowing on.
         HeapView { ptr: raw, len, cap, count, scan: ScanState::from_u8(scan), tier, _life: PhantomData }
+    }
+
+    /// A `Heap32` view: the length is envelope-authoritative (§2.2.3), so the caller supplies it and everything else
+    /// comes from the compact header.
+    ///
+    /// # Safety
+    /// `ptr` must own a live `Heap32` allocation whose first `len` bytes are initialized.
+    pub(crate) unsafe fn heap32(ptr: &'a Owned, len: usize) -> HeapView<'a> {
+        let raw = ptr.as_ptr();
+
+        // SAFETY: the caller vouches for a live Heap32 allocation.
+        let (cap, count, scan) = unsafe { (heap32::capacity(raw), heap32::char_count(raw), heap32::scan(raw)) };
+        HeapView { ptr: raw, len, cap, count: count as usize, scan: ScanState::from_u8(scan), tier: Tier::Heap32, _life: PhantomData }
     }
 
     /// Content length in bytes.
@@ -457,7 +469,7 @@ impl<'a> HeapView<'a> {
 
     /// The cached character count; zero means none, dual-purposed by the byte length (§2.2.4).
     pub(crate) fn char_count(&self) -> usize {
-        self.count as usize
+        self.count
     }
 
     /// Whether this is the only handle on the allocation, which is what licenses writing through it.  Unused while
@@ -496,7 +508,7 @@ impl<'a> HeapView<'a> {
         unsafe {
             match self.tier {
                 Tier::Heap32 => heap32::set_char_count(self.ptr, count as u32),
-                Tier::HeapW => heapw::set_char_count(self.ptr, count as u32),
+                Tier::HeapW => heapw::set_char_count(self.ptr, count),
                 Tier::Heap8 | Tier::Heap16 => {}
             }
         }
@@ -603,6 +615,7 @@ macro_rules! heap_tier {
                 if unsafe { head(ptr) }.refcount.fetch_sub(1, Ordering::Release) != 1 {
                     return;
                 }
+
                 #[cfg(test)]
                 super::live::released();
 
@@ -642,13 +655,15 @@ macro_rules! heap_tier {
     };
 
     // ── Large tiers: the allocation is authoritative, because the facts are discovered lazily and shared ──
-    ($tier:ident, width = $w:ty, meta = header) => {
+    ($tier:ident, width = $w:ty, counter = $c:ty, meta = header) => {
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) mod $tier {
             use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};
             use std::alloc::{self, Layout};
             use std::ptr::NonNull;
-            use std::sync::atomic::{AtomicU8, AtomicU32, Ordering, fence};
+
+            #[allow(unused_imports)] // Each arm names the counter type it needs; the others go unused.
+            use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering, fence};
 
             /// The allocation header.  Unlike the small tiers, this one carries the metadata: at these sizes the
             /// classifying pass is too expensive to run eagerly (§2.2.3), so scan state and character count are filled
@@ -659,8 +674,10 @@ macro_rules! heap_tier {
                 len: $w,
                 capacity: $w,
 
-                /// Cached flag-on character count (§2.2.4); zero means none, dual-purposed by the byte length.
-                char_count: AtomicU32,
+                /// Cached flag-on character count (§2.2.4) at the tier's own width — a count can reach the byte
+                /// length, so a narrower field would cache wrong answers past its ceiling.  Zero means none, dual-
+                /// purposed by the byte length.
+                char_count: $c,
                 scan: AtomicU8,
             }
 
@@ -697,12 +714,13 @@ macro_rules! heap_tier {
                 let Some(base) = NonNull::new(raw) else {
                     return Err(AllocError { requested: capacity as usize });
                 };
+
                 #[cfg(test)]
                 super::live::allocated();
 
                 // SAFETY: `base` is a fresh allocation of `layout`, aligned for `Head`.
                 unsafe {
-                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), len: 0, capacity, char_count: AtomicU32::new(0), scan: AtomicU8::new(0) });
+                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), len: 0, capacity, char_count: <$c>::new(0), scan: AtomicU8::new(0) });
                 }
 
                 // SAFETY: `HEADER` is within the allocation by construction.
@@ -732,6 +750,7 @@ macro_rules! heap_tier {
                 if header.refcount.fetch_sub(1, Ordering::Release) != 1 {
                     return;
                 }
+
                 #[cfg(test)]
                 super::live::released();
 
@@ -815,13 +834,175 @@ macro_rules! heap_tier {
             /// # Safety
             /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
             #[inline]
-            pub(crate) unsafe fn char_count(ptr: NonNull<u8>) -> u32 {
+            pub(crate) unsafe fn char_count(ptr: NonNull<u8>) -> $w {
                 // SAFETY: the caller vouches for a live allocation.
                 unsafe { head(ptr) }.char_count.load(Ordering::Relaxed)
             }
 
             /// # Safety
             /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn set_char_count(ptr: NonNull<u8>, count: $w) {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.char_count.store(count, Ordering::Relaxed);
+            }
+        }
+    };
+
+    // The compact large tier: metadata in the allocation except the length, which is envelope-authoritative (§2.2.3).
+    // A `u32` length rides beside the pointer in the variant at no size cost, and eliminating it here spares both the
+    // header bytes and the dereference on every length question — the mirror design's goal, without maintaining two
+    // copies of one fact.
+    ($tier:ident, width = u32, meta = compact) => {
+        pub(crate) mod $tier {
+            use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};
+            use std::alloc::{self, Layout};
+            use std::ptr::NonNull;
+
+            #[allow(unused_imports)] // Each arm names the counter type it needs; the others go unused.
+            use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering, fence};
+
+            /// The allocation header: refcount, capacity and the two lazily-filled caches.  No length — the envelope
+            /// owns it, so shared handles each carry their own, which copy-on-write makes correct: content is immutable
+            /// while shared, hence so is length.
+            #[repr(C)]
+            struct Head {
+                refcount: AtomicU32,
+                capacity: u32,
+
+                /// Cached flag-on character count (§2.2.4); zero means none, dual-purposed by the byte length.
+                char_count: AtomicU32,
+                scan: AtomicU8,
+            }
+
+            pub(crate) const HEADER: usize = size_of::<Head>();
+            pub(crate) const MAX_CAPACITY: usize = u32::MAX as usize;
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            unsafe fn head<'a>(ptr: NonNull<u8>) -> &'a Head {
+                // SAFETY: the caller vouches for a live allocation, whose header precedes the data by `HEADER`.
+                unsafe { &*(ptr.as_ptr().sub(HEADER).cast::<Head>()) }
+            }
+
+            fn layout(capacity: usize) -> Result<Layout, AllocError> {
+                let size = HEADER.checked_add(capacity).ok_or(AllocError { requested: capacity })?;
+                Layout::from_size_align(size, align_of::<Head>()).map_err(|_| AllocError { requested: capacity })
+            }
+
+            /// Allocate room for `capacity` bytes, refcount one, no cached facts.  Length is the caller's to keep: this
+            /// tier's allocations do not record one.
+            pub(crate) fn allocate(capacity: u32) -> Result<NonNull<u8>, AllocError> {
+                let layout = layout(capacity as usize)?;
+
+                // SAFETY: the layout has non-zero size, the header alone guaranteeing it.
+                let raw = unsafe { alloc::alloc(layout) };
+                let Some(base) = NonNull::new(raw) else {
+                    return Err(AllocError { requested: capacity as usize });
+                };
+
+                #[cfg(test)]
+                super::live::allocated();
+
+                // SAFETY: a fresh allocation of at least `HEADER` bytes, aligned for `Head`.
+                unsafe {
+                    base.cast::<Head>().write(Head { refcount: AtomicU32::new(1), capacity, char_count: AtomicU32::new(0), scan: AtomicU8::new(0) });
+                    Ok(base.add(HEADER))
+                }
+            }
+
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation of this tier.
+            #[inline]
+            pub(crate) unsafe fn retain(ptr: NonNull<u8>) {
+                // SAFETY: the caller vouches for a live allocation.
+                let prior = unsafe { head(ptr) }.refcount.fetch_add(1, Ordering::Relaxed);
+                if prior >= REFCOUNT_CEILING {
+                    refcount_overflow();
+                }
+            }
+
+            /// # Safety
+            /// As [`retain`]; consumes one reference, freeing on the last.
+            pub(crate) unsafe fn release(ptr: NonNull<u8>) {
+                // SAFETY: the caller vouches for a live allocation.
+                let header = unsafe { head(ptr) };
+                if header.refcount.fetch_sub(1, Ordering::Release) != 1 {
+                    return;
+                }
+
+                #[cfg(test)]
+                super::live::released();
+
+                // Everything done through other handles happens-before the free.  The `Arc` protocol.
+                fence(Ordering::Acquire);
+
+                let capacity = header.capacity;
+
+                // A live allocation's layout was computable when it was made, so this cannot fail; leaking would be the
+                // only no-panic recourse if it somehow did, and is better than a mismatched deallocation.
+                if let Ok(layout) = layout(capacity as usize) {
+                    // SAFETY: last handle, and the allocation was made with exactly this layout.
+                    unsafe { alloc::dealloc(ptr.as_ptr().sub(HEADER), layout) };
+                }
+            }
+
+            /// # Safety
+            /// As [`retain`].
+            #[inline]
+            pub(crate) unsafe fn is_unique(ptr: NonNull<u8>) -> bool {
+                // SAFETY: the caller vouches for a live allocation.  Acquire pairs with the Release decrements, so a
+                // count of one proves every other handle's writes are visible.
+                unsafe { head(ptr) }.refcount.load(Ordering::Acquire) == 1
+            }
+
+            /// # Safety
+            /// As [`retain`].
+            #[cfg_attr(not(test), allow(dead_code))] // The refcount protocol tests are its callers.
+            #[inline]
+            pub(crate) unsafe fn refcount(ptr: NonNull<u8>) -> u32 {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.refcount.load(Ordering::Relaxed)
+            }
+
+            /// # Safety
+            /// As [`retain`].
+            #[inline]
+            pub(crate) unsafe fn capacity(ptr: NonNull<u8>) -> usize {
+                // SAFETY: the caller vouches for a live allocation; capacity is immutable after birth.
+                unsafe { head(ptr) }.capacity as usize
+            }
+
+            /// # Safety
+            /// As [`retain`].
+            #[inline]
+            pub(crate) unsafe fn scan(ptr: NonNull<u8>) -> u8 {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.scan.load(Ordering::Relaxed)
+            }
+
+            /// Record a discovered scan state.  Relaxed store: every stored value is a true fact about content that is
+            /// immutable while shared, so a race can only replace a precise truth with a coarser one (§2.2.4).
+            ///
+            /// # Safety
+            /// As [`retain`].
+            #[inline]
+            pub(crate) unsafe fn set_scan(ptr: NonNull<u8>, state: u8) {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.scan.store(state, Ordering::Relaxed);
+            }
+
+            /// # Safety
+            /// As [`retain`].
+            #[inline]
+            pub(crate) unsafe fn char_count(ptr: NonNull<u8>) -> u32 {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.char_count.load(Ordering::Relaxed)
+            }
+
+            /// # Safety
+            /// As [`retain`].
             #[inline]
             pub(crate) unsafe fn set_char_count(ptr: NonNull<u8>, count: u32) {
                 // SAFETY: the caller vouches for a live allocation.
@@ -833,8 +1014,8 @@ macro_rules! heap_tier {
 
 heap_tier!(heap8, width = u8, meta = envelope);
 heap_tier!(heap16, width = u16, meta = envelope);
-heap_tier!(heap32, width = u32, meta = header);
-heap_tier!(heapw, width = usize, meta = header);
+heap_tier!(heap32, width = u32, meta = compact);
+heap_tier!(heapw, width = usize, counter = AtomicUsize, meta = header);
 
 // The placement rule, checked rather than described: a small tier's allocation is a refcount and nothing else.
 const _: () = assert!(heap8::HEADER == 4);
@@ -1078,9 +1259,11 @@ impl CowBuffer {
         const HIGH: u64 = 0x8080_8080_8080_8080;
         let mut count = 0u32;
         let mut chunks = bytes.chunks_exact(8);
+
         for c in &mut chunks {
             count += (u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) & HIGH).count_ones();
         }
+
         count as usize + chunks.remainder().iter().filter(|&&b| b >= 0x80).count()
     }
 
@@ -1090,12 +1273,14 @@ impl CowBuffer {
         const HIGH: u64 = 0x8080_8080_8080_8080;
         let mut offset = 0;
         let mut chunks = bytes.chunks_exact(8);
+
         for c in &mut chunks {
             if u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) & HIGH != 0 {
                 break;
             }
             offset += 8;
         }
+
         bytes[offset..].iter().position(|&b| b >= 0x80).map(|k| offset + k)
     }
 
@@ -1109,6 +1294,7 @@ impl CowBuffer {
         let mut out = Vec::new();
         out.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
         out.extend_from_slice(&bytes[..first]);
+
         for &byte in &bytes[first..] {
             if byte < 0x80 {
                 out.push(byte);
@@ -1117,6 +1303,7 @@ impl CowBuffer {
                 out.push(0x80 | (byte & 0x3F));
             }
         }
+
         debug_assert_eq!(out.len(), total, "the counted expansion must fill the buffer exactly");
 
         Ok(out)
@@ -1155,6 +1342,7 @@ impl CowBuffer {
         let mut out = Vec::new();
         out.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
         out.extend_from_slice(&bytes[..first]);
+
         let mut src = first;
         while src < bytes.len() {
             let byte = bytes[src];
@@ -1166,6 +1354,7 @@ impl CowBuffer {
                 src += 2;
             }
         }
+
         debug_assert_eq!(out.len(), total, "the counted contraction must fill the buffer exactly");
 
         Ok(Some(out))

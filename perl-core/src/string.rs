@@ -661,7 +661,7 @@ macro_rules! define_perl_string {
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
             $( $h8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: scan::Terminal }, )*
             $( $h16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
-            $( $h32 { ptr: Owned, mirror: u32 }, )*
+            $( $h32 { ptr: Owned, len: u32 }, )*
             $( $hw  { ptr: Owned }, )*
         }
 
@@ -680,9 +680,9 @@ macro_rules! define_perl_string {
                         ptr: unsafe { cow_buffer::heap16::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                         len: *len, cap: *cap, count: *count, scan: *scan,
                     }, )*
-                    $( Repr::$h32 { ptr, mirror } => Repr::$h32 {
+                    $( Repr::$h32 { ptr, len } => Repr::$h32 {
                         ptr: unsafe { cow_buffer::heap32::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
-                        mirror: *mirror,
+                        len: *len,
                     }, )*
                     $( Repr::$hw { ptr } => Repr::$hw {
                         ptr: unsafe { cow_buffer::heapw::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
@@ -803,11 +803,11 @@ macro_rules! define_perl_string {
                         nibbles: *nibbles,
                     }), )*
                     $( Repr::$h8 { ptr, len, cap, count, scan } =>
-                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, scan.widen(), Tier::Heap8)), )*
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap8)), )*
                     $( Repr::$h16 { ptr, len, cap, count, scan } =>
-                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as u32, scan.widen(), Tier::Heap16)), )*
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap16)), )*
                     // SAFETY: a live allocation of this tier, whose header carries the metadata.
-                    $( Repr::$h32 { ptr, .. } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::Heap32) }), )*
+                    $( Repr::$h32 { ptr, len } => RawParts::Heap(unsafe { HeapView::heap32(ptr, *len as usize) }), )*
                     $( Repr::$hw { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::HeapW) }), )*
                 }
             }
@@ -866,20 +866,19 @@ macro_rules! define_perl_string {
                         *count = old_len as u16;
                         *scan = scan::Terminal::Latin1;
                     }, )*
-                    $( Repr::$h32 { ptr, mirror } => {
+                    $( Repr::$h32 { ptr, len } => {
                         unsafe {
                             cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
-                            cow_buffer::heap32::set_len(ptr.as_ptr(), new_len as u32);
                             cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1.as_u8());
                             cow_buffer::heap32::set_char_count(ptr.as_ptr(), old_len as u32);
                         }
-                        *mirror = new_len as u32;
+                        *len = new_len as u32;
                     }, )*
                     $( Repr::$hw { ptr } => unsafe {
                         cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
                         cow_buffer::heapw::set_len(ptr.as_ptr(), new_len);
                         cow_buffer::heapw::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1.as_u8());
-                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), old_len as u32);
+                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), old_len);
                     }, )*
                     _ => return None,
                 }
@@ -938,20 +937,19 @@ macro_rules! define_perl_string {
                         *count = chars as u16;
                         *scan = state;
                     }, )*
-                    $( Repr::$h32 { ptr, mirror } => {
+                    $( Repr::$h32 { ptr, len } => {
                         unsafe {
                             cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
-                            cow_buffer::heap32::set_len(ptr.as_ptr(), new_len as u32);
                             cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UNKNOWN.as_u8());
                             cow_buffer::heap32::set_char_count(ptr.as_ptr(), 0);
                         }
-                        *mirror = new_len as u32;
+                        *len = new_len as u32;
                     }, )*
                     $( Repr::$hw { ptr } => unsafe {
                         cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
                         cow_buffer::heapw::set_len(ptr.as_ptr(), new_len);
                         cow_buffer::heapw::set_scan(ptr.as_ptr(), scan::UNKNOWN.as_u8());
-                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), 0);
+                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), 0usize);
                     }, )*
                     _ => return None,
                 }
@@ -1008,9 +1006,9 @@ macro_rules! define_perl_string {
                     }, )*
 
                     // Large tiers keep their metadata in the allocation, so only the pointer travels.
-                    $( Repr::$h32 { ptr, .. } => RawOwned::Heap {
+                    $( Repr::$h32 { ptr, len } => RawOwned::Heap {
                         ptr: unsafe { core::ptr::read(ptr) },
-                        len: 0,
+                        len: *len as usize,
                         cap: 0,
                         count: 0,
                         scan: scan::UNKNOWN,
@@ -1053,7 +1051,7 @@ macro_rules! define_perl_string {
                         }), )*
                     },
                     Tier::Heap32 => match (utf8, tainted) {
-                        $( ($h32_utf8, $h32_tainted) => PerlString(Repr::$h32 { ptr, mirror: len as u32 }), )*
+                        $( ($h32_utf8, $h32_tainted) => PerlString(Repr::$h32 { ptr, len: len as u32 }), )*
                     },
                     Tier::HeapW => match (utf8, tainted) {
                         $( ($hw_utf8, $hw_tainted) => PerlString(Repr::$hw { ptr }), )*
@@ -2012,7 +2010,7 @@ impl PerlString {
                 // run of the leak bomb caught this arm abandoning the pointer instead.
                 let old = HeapParts { ptr, len, cap, count, scan: prior, tier };
                 let view = if tier.is_small() {
-                    HeapView::small(&old.ptr, len, cap, count, prior, tier)
+                    HeapView::small(&old.ptr, len, cap, count as usize, prior, tier)
                 } else {
                     // SAFETY: a live allocation of a large tier, owned by `old`.
                     unsafe { HeapView::large(&old.ptr, tier) }
