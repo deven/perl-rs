@@ -352,13 +352,14 @@ enum PerlString {
 }
 ```
 
-`CowBuffer` is the custom copy-on-write byte buffer (ruled: custom
+The heap storage is a custom copy-on-write scheme (ruled: custom
 over `bytes::Bytes`, `ecow`, and a tendril hybrid — see the ledger
-in §2.3.6).  Its specification fits in a sentence: a `Send + Sync`
-refcounted growable byte buffer with a thin-pointer handle (a u48
-mirrored length rides the handle's spare bytes — §2.2.9) and a
-`{refcount, len, capacity, char_count, scan}` header — COW clone,
-unique-check mutation, nothing else.  Details:
+in §2.3.6), dissolved into the string value itself rather than
+standing as a separate buffer type: each heap variant holds an
+owned thin pointer into a refcounted tier allocation, with the
+metadata split between envelope and header as each tier's section
+below rules.  COW clone, unique-check mutation, nothing else.
+Details:
 
 - **Storage tiers, by content length [DECISION].**  One header
   shape for every heap string would cost the smallest strings most,
@@ -619,18 +620,20 @@ In the tag (per-value):
   not a validity fact.  In perl it lives in SV flags, not the PV;
   two values can share a buffer while claiming different
   interpretations.
-- **Warned** (§2.3.4) — verified per-copy: copying an unwarned
-  string before first numification yields two warnings, one per
-  copy, so a buffer-shared bit would diverge.
 - **Tainted** — untainting one copy must not untaint another.
+  (An earlier draft listed a per-copy *warned* bit here; perl has
+  no such flag — warn-once is a consequence of the salvaged-number
+  cache under `IOKp` (§2.3.4) — and the tag carries none.)
 
 In the buffer header (per-buffer, `Heap` only):
 
 - **The byte-content scan cache** (§2.2.4) — ASCII-ness and Rust
   UTF-8 validity are facts about the bytes; when a buffer is shared,
-  one holder's scan benefits every sharer.  The scan byte rides in
-  the `CowBuffer` header next to the length, on the same cache
-  line whenever the deref is in flight.
+  one holder's scan benefits every sharer.  The large tiers keep the
+  scan byte atomically in the allocation header beside the other
+  caches; the small tiers carry a terminal state in the envelope
+  instead (§2.2.3), where sharing costs nothing because the state
+  is settled at construction.
 
 `Inline` strings have no heap header; their scan state lives in the
 tag — and needs only the five *terminal* states (`ASCII`,

@@ -2,7 +2,7 @@
 //!
 //! Two storage kinds and three per-value state dimensions fold into the enum discriminant:
 //!
-//! - **Storage**: `Inline` (≤ 22 bytes, no heap allocation) or `Heap` (a [`CowBuffer`]).
+//! - **Storage**: `Inline` (≤ 22 bytes, no heap allocation) or `Heap` (a tiered refcounted buffer, §2.2.3).
 //! - **The Perl utf8 flag**: a per-SV *semantic claim* ("interpret these bytes as characters"), not a validity fact.
 //!   It can be set on bytes Rust rejects (perl-extended UTF-8; verified `chr(0x110000)`); no code path may derive
 //!   `from_utf8_unchecked` from it.  Rust-level validity comes from the scan cache only.
@@ -23,7 +23,7 @@
 //! and tainted are ignored by `Eq`/`Hash`.
 
 use crate::cow_buffer;
-use crate::cow_buffer::{AllocError, CowBuffer, HeapParts, HeapView, Owned, Tier};
+use crate::cow_buffer::{AllocError, HeapParts, HeapView, Owned, Tier};
 use crate::value::{Numeric, classify_numeric, parse_float, parse_int_i64_visible, string_would_warn};
 use std::cmp::Ordering;
 use std::fmt;
@@ -48,8 +48,9 @@ pub const INLINE_MAX: usize = 15;
 /// later: a non-heap encoding compressing more than 2:1 would overflow every scratch buffer in the crate.
 pub const DECODE_MAX: usize = INLINE_MAX * 2;
 
-/// Heap scan-cache states, stored in the `CowBuffer` header byte (§2.2.4).  Zero is `UNKNOWN`, the lattice top — the
-/// natural zero-initialized state can never assert a validity claim (§2.2.6).
+/// The heap scan lattice (§2.2.4): terminal states live typed in the small tiers' envelopes, and the large tiers keep
+/// an atomic byte in the allocation header.  Zero is `UNKNOWN`, the lattice top — the natural zero-initialized state
+/// can never assert a validity claim (§2.2.6).
 pub mod scan {
     // The numbering, single-sourced: private raw bytes serve as the discriminants of every scan type and as the storage
     // representation.  Nothing else in the crate speaks these numbers.
@@ -641,8 +642,8 @@ macro_rules! define_perl_string {
         /// the invariants the unchecked readers rely on (probed: `#[non_exhaustive]` blocks construction but not
         /// mutation through `&mut` pattern binding, so the seal must be privacy).  Construct through the constructors;
         /// inspect through the methods and [`StorageType`].  `Clone` is derived: inline and packed payloads are plain
-        /// arrays, and `CowBuffer`'s own `Clone` is the refcount bump the heap forms need.  A hand-written impl that
-        /// destructured the tag and rebuilt it cost thirteen nanoseconds to copy sixteen bytes (measured).
+        /// arrays, and the heap variants' hand-written `Clone` is the refcount bump they need.  A hand-written impl
+        /// that destructured the tag and rebuilt it cost thirteen nanoseconds to copy sixteen bytes (measured).
         #[derive(Clone)]
         #[repr(transparent)]
         pub struct PerlString(Repr);
@@ -836,11 +837,11 @@ macro_rules! define_perl_string {
                 let (first, expansion, old_len) = match self.raw_parts() {
                     RawParts::Heap(view) => {
                         let bytes = view.as_slice();
-                        let first = CowBuffer::first_variant(bytes)?;
+                        let first = cow_buffer::first_variant(bytes)?;
                         if !view.is_unique() {
                             return None;
                         }
-                        let expansion = CowBuffer::variant_count(&bytes[first..]);
+                        let expansion = cow_buffer::variant_count(&bytes[first..]);
                         if bytes.len() + expansion > view.capacity() {
                             return None;
                         }
@@ -896,13 +897,13 @@ macro_rules! define_perl_string {
                 let (first, contractions, old_len) = match self.raw_parts() {
                     RawParts::Heap(view) => {
                         let bytes = view.as_slice();
-                        let Some(first) = CowBuffer::first_variant(bytes) else {
+                        let Some(first) = cow_buffer::first_variant(bytes) else {
                             return Some(true); // Already its own downgrade.
                         };
                         if !view.is_unique() {
                             return None;
                         }
-                        let Some(contractions) = CowBuffer::latin1_contractions(&bytes[first..]) else {
+                        let Some(contractions) = cow_buffer::latin1_contractions(&bytes[first..]) else {
                             return Some(false);
                         };
                         (first, contractions, bytes.len())
@@ -1730,7 +1731,7 @@ impl PerlString {
         // Sixteen or more non-ASCII characters: heap.  The buffer owns the expansion — appending byte by byte would pay
         // a capacity check and two cache-invalidating atomic stores per input byte, and would rewrite an invariant
         // prefix the buffer can copy wholesale.
-        let upgraded = CowBuffer::upgraded_bytes(internal)?;
+        let upgraded = cow_buffer::upgraded_bytes(internal)?;
         let parts = HeapParts::from_slice(&upgraded)?.with_classification(scan::UTF8_LATIN1, internal.len());
 
         Ok(PerlString::build_heap(true, t, parts))
@@ -1801,7 +1802,7 @@ impl PerlString {
             RawParts::Heap(cb) => {
                 // Walk the encoding: every character must sit in U+0000-U+00FF, emitted as its single byte.  The result
                 // re-runs the ladder — sixteen to thirty emitted octets can compress right back inline.
-                let Some(out) = CowBuffer::downgraded_bytes(cb.as_slice())? else {
+                let Some(out) = cow_buffer::downgraded_bytes(cb.as_slice())? else {
                     return Ok(None); // A character past U+00FF, or no character at all.
                 };
 
@@ -1908,12 +1909,12 @@ impl PerlString {
         }
 
         // Inline content never needs `mem::take`: the payload is a fifteen-byte `Copy` array, so it can be read out,
-        // extended, and written back.  Taking exists to move a `CowBuffer` out of `&mut self`, which only the heap arm
-        // below actually requires.  Cheapest case first, and touching nothing it does not have to: only the Ascii class
-        // writes through — its payload is the raw bytes with a zero aux nibble, so appending ASCII content that still
-        // fits short extends the existing variant bit-identically to the raw-byte tier, the length byte updated in
-        // place.  Every other class, and any append reaching full capacity (which changes the family), rebuilds through
-        // canonical selection below — append is byte mutation (§2.2.9).
+        // extended, and written back.  Taking exists to move an owned heap pointer out of `&mut self`, which only the
+        // heap arm below actually requires.  Cheapest case first, and touching nothing it does not have to: only the
+        // Ascii class writes through — its payload is the raw bytes with a zero aux nibble, so appending ASCII content
+        // that still fits short extends the existing variant bit-identically to the raw-byte tier, the length byte
+        // updated in place.  Every other class, and any append reaching full capacity (which changes the family),
+        // rebuilds through canonical selection below — append is byte mutation (§2.2.9).
         if self.inline_class() == Some(InlineClass::Ascii)
             && matches!(kind, AppendKind::Valid { class: scan::ValidRange::Ascii, .. })
             && let Some((full, dst)) = self.inline_buf_mut()
