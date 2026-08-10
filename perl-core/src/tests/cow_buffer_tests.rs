@@ -109,11 +109,11 @@ fn all_four_tiers_honor_the_whole_protocol() {
     small_tier_protocol!(heap8, 255u8);
     small_tier_protocol!(heap16, 65_535u16);
     large_tier_protocol!(heap32, 4096u32);
-    large_tier_protocol!(heapw, 4096usize, len = header);
+    large_tier_protocol!(heap, 4096usize, len = header);
     assert_eq!(heap8::MAX_CAPACITY, 255);
     assert_eq!(heap16::MAX_CAPACITY, 65_535);
     assert_eq!(heap32::MAX_CAPACITY, u32::MAX as usize);
-    assert_eq!(heapw::MAX_CAPACITY, usize::MAX);
+    assert_eq!(heap::MAX_CAPACITY, usize::MAX);
 }
 
 #[test]
@@ -131,16 +131,16 @@ fn every_tier_allocates_at_its_ceiling_and_at_zero() {
         assert_eq!(heap16::refcount(p), 1);
         heap16::release(p, u16::MAX);
 
-        let p = heapw::allocate(4096).unwrap();
-        assert_eq!(heapw::capacity(p), 4096);
-        heapw::release(p);
+        let p = heap::allocate(4096).unwrap();
+        assert_eq!(heap::capacity(p), 4096);
+        heap::release(p);
     }
 }
 
 #[test]
 fn an_unsatisfiable_tier_capacity_is_an_error_not_a_panic() {
     // The word tier is the only one whose width can express a request the allocator cannot meet.
-    assert!(heapw::allocate(usize::MAX).is_err(), "capacity arithmetic overflow reports as AllocError");
+    assert!(heap::allocate(usize::MAX).is_err(), "capacity arithmetic overflow reports as AllocError");
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn tier_headers_match_the_placement_rule() {
     // The large tiers pay for what they cache.  Heap32 is compact: no length (the envelope owns it, §2.2.3), so a
     // refcount, capacity, count and scan pad to sixteen.  The word tier keeps its length and a word-width count.
     assert_eq!(heap32::HEADER, 16, "u32 fields without a length, padded to alignment 4");
-    assert_eq!(heapw::HEADER, 40, "usize lengths and a word-width count, padded to alignment 8");
+    assert_eq!(heap::HEADER, 40, "usize lengths and a word-width count, padded to alignment 8");
     assert_eq!(heap8::MAX_CAPACITY, 255);
     assert_eq!(heap16::MAX_CAPACITY, 65_535);
 }
@@ -200,10 +200,10 @@ fn word_tier_char_count_is_word_width() {
 
     // SAFETY: a live allocation; the setter runs while the single handle is held.
     unsafe {
-        let ptr = heapw::allocate(64).unwrap();
-        heapw::set_char_count(ptr, big);
-        assert_eq!(heapw::char_count(ptr), big, "no truncation below the word's ceiling");
-        heapw::release(ptr);
+        let ptr = heap::allocate(64).unwrap();
+        heap::set_char_count(ptr, big);
+        assert_eq!(heap::char_count(ptr), big, "no truncation below the word's ceiling");
+        heap::release(ptr);
     }
 }
 
@@ -216,15 +216,15 @@ fn concurrent_retain_release_refcount_protocol() {
 
     // SAFETY: a live allocation; every thread holds a reference across its retain/release pair.
     unsafe {
-        let ptr = heapw::allocate(64).unwrap();
+        let ptr = heap::allocate(64).unwrap();
         let addr = ptr.as_ptr() as usize;
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 std::thread::spawn(move || {
                     let p = std::ptr::NonNull::new(addr as *mut u8).unwrap();
                     for _ in 0..1000 {
-                        heapw::retain(p);
-                        heapw::release(p);
+                        heap::retain(p);
+                        heap::release(p);
                     }
                 })
             })
@@ -234,8 +234,8 @@ fn concurrent_retain_release_refcount_protocol() {
             t.join().unwrap();
         }
 
-        assert_eq!(heapw::refcount(ptr), 1, "every thread's retains and releases balanced");
-        heapw::release(ptr);
+        assert_eq!(heap::refcount(ptr), 1, "every thread's retains and releases balanced");
+        heap::release(ptr);
     }
 
     // The allocation counter is thread-local, so cross-thread retain/release pairs do not disturb this thread's
@@ -250,7 +250,7 @@ fn concurrent_scan_narrowing_races_are_benign() {
     // holding one of the written values, never a torn or invented byte.
     // SAFETY: a live allocation; set_scan is the atomic store the protocol allows from any handle.
     unsafe {
-        let ptr = heapw::allocate(16).unwrap();
+        let ptr = heap::allocate(16).unwrap();
         let addr = ptr.as_ptr() as usize;
         let threads: Vec<_> = [2u8, 3, 5]
             .into_iter()
@@ -258,7 +258,7 @@ fn concurrent_scan_narrowing_races_are_benign() {
                 std::thread::spawn(move || {
                     let p = std::ptr::NonNull::new(addr as *mut u8).unwrap();
                     for _ in 0..1000 {
-                        heapw::set_scan(p, state);
+                        heap::set_scan(p, state);
                     }
                 })
             })
@@ -268,7 +268,7 @@ fn concurrent_scan_narrowing_races_are_benign() {
             t.join().unwrap();
         }
 
-        assert!(matches!(heapw::scan(ptr), 2 | 3 | 5), "the slot holds one of the written states");
-        heapw::release(ptr);
+        assert!(matches!(heap::scan(ptr), 2 | 3 | 5), "the slot holds one of the written states");
+        heap::release(ptr);
     }
 }

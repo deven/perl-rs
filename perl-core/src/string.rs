@@ -632,10 +632,10 @@ macro_rules! define_perl_string {
     (
         inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
         packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_tainted:literal) ),* $(,)? ],
-        heap8:  [ $( $h8:ident  = ($h8_utf8:literal,  $h8_tainted:literal)  ),* $(,)? ],
-        heap16: [ $( $h16:ident = ($h16_utf8:literal, $h16_tainted:literal) ),* $(,)? ],
-        heap32: [ $( $h32:ident = ($h32_utf8:literal, $h32_tainted:literal) ),* $(,)? ],
-        heapw:  [ $( $hw:ident  = ($hw_utf8:literal,  $hw_tainted:literal)  ),* $(,)? ]
+        heap8:  [ $( $heap8:ident  = ($heap8_utf8:literal,  $heap8_tainted:literal)  ),* $(,)? ],
+        heap16: [ $( $heap16:ident = ($heap16_utf8:literal, $heap16_tainted:literal) ),* $(,)? ],
+        heap32: [ $( $heap32:ident = ($heap32_utf8:literal, $heap32_tainted:literal) ),* $(,)? ],
+        heap:   [ $( $heap:ident  = ($heap_utf8:literal,  $heap_tainted:literal)  ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
         /// behind this newtype: no variant is nameable outside the crate, so no payload can be forged or mutated around
@@ -660,10 +660,10 @@ macro_rules! define_perl_string {
         enum Repr {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
-            $( $h8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: scan::Terminal }, )*
-            $( $h16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
-            $( $h32 { ptr: Owned, len: u32 }, )*
-            $( $hw  { ptr: Owned }, )*
+            $( $heap8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: scan::Terminal }, )*
+            $( $heap16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
+            $( $heap32 { ptr: Owned, len: u32 }, )*
+            $( $heap  { ptr: Owned }, )*
         }
 
         impl Clone for Repr {
@@ -674,20 +674,20 @@ macro_rules! define_perl_string {
 
                     // SAFETY (each heap arm): the variant owns a live allocation of its tier, and the new handle
                     // takes the reference this `retain` adds.
-                    $( Repr::$h8 { ptr, len, cap, count, scan } => Repr::$h8 {
+                    $( Repr::$heap8 { ptr, len, cap, count, scan } => Repr::$heap8 {
                         ptr: unsafe { cow_buffer::heap8::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                         len: *len, cap: *cap, count: *count, scan: *scan,
                     }, )*
-                    $( Repr::$h16 { ptr, len, cap, count, scan } => Repr::$h16 {
+                    $( Repr::$heap16 { ptr, len, cap, count, scan } => Repr::$heap16 {
                         ptr: unsafe { cow_buffer::heap16::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                         len: *len, cap: *cap, count: *count, scan: *scan,
                     }, )*
-                    $( Repr::$h32 { ptr, len } => Repr::$h32 {
+                    $( Repr::$heap32 { ptr, len } => Repr::$heap32 {
                         ptr: unsafe { cow_buffer::heap32::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                         len: *len,
                     }, )*
-                    $( Repr::$hw { ptr } => Repr::$hw {
-                        ptr: unsafe { cow_buffer::heapw::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                    $( Repr::$heap { ptr } => Repr::$heap {
+                        ptr: unsafe { cow_buffer::heap::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                     }, )*
                 }
             }
@@ -700,10 +700,10 @@ macro_rules! define_perl_string {
                 match self {
                     $( Repr::$inline { .. } => {}, )*
                     $( Repr::$packed { .. } => {}, )*
-                    $( Repr::$h8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
-                    $( Repr::$h16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
-                    $( Repr::$h32 { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
-                    $( Repr::$hw { ptr } => unsafe { cow_buffer::heapw::release(ptr.claim()) }, )*
+                    $( Repr::$heap8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
+                    $( Repr::$heap16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
+                    $( Repr::$heap32 { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
+                    $( Repr::$heap { ptr } => unsafe { cow_buffer::heap::release(ptr.claim()) }, )*
                 }
             }
         }
@@ -714,10 +714,10 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => StorageType::$inline_type, )*
                     $( Repr::$packed { .. } => StorageType::$packed_type, )*
-                    $( Repr::$h8 { .. } => StorageType::Heap8, )*
-                    $( Repr::$h16 { .. } => StorageType::Heap16, )*
-                    $( Repr::$h32 { .. } => StorageType::Heap32, )*
-                    $( Repr::$hw { .. } => StorageType::Heap, )*
+                    $( Repr::$heap8 { .. } => StorageType::Heap8, )*
+                    $( Repr::$heap16 { .. } => StorageType::Heap16, )*
+                    $( Repr::$heap32 { .. } => StorageType::Heap32, )*
+                    $( Repr::$heap { .. } => StorageType::Heap, )*
                 }
             }
 
@@ -726,10 +726,10 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_utf8, )*
                     $( Repr::$packed { .. } => $packed_utf8, )*
-                    $( Repr::$h8 { .. } => $h8_utf8, )*
-                    $( Repr::$h16 { .. } => $h16_utf8, )*
-                    $( Repr::$h32 { .. } => $h32_utf8, )*
-                    $( Repr::$hw { .. } => $hw_utf8, )*
+                    $( Repr::$heap8 { .. } => $heap8_utf8, )*
+                    $( Repr::$heap16 { .. } => $heap16_utf8, )*
+                    $( Repr::$heap32 { .. } => $heap32_utf8, )*
+                    $( Repr::$heap { .. } => $heap_utf8, )*
                 }
             }
 
@@ -738,10 +738,10 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_tainted, )*
                     $( Repr::$packed { .. } => $packed_tainted, )*
-                    $( Repr::$h8 { .. } => $h8_tainted, )*
-                    $( Repr::$h16 { .. } => $h16_tainted, )*
-                    $( Repr::$h32 { .. } => $h32_tainted, )*
-                    $( Repr::$hw { .. } => $hw_tainted, )*
+                    $( Repr::$heap8 { .. } => $heap8_tainted, )*
+                    $( Repr::$heap16 { .. } => $heap16_tainted, )*
+                    $( Repr::$heap32 { .. } => $heap32_tainted, )*
+                    $( Repr::$heap { .. } => $heap_tainted, )*
                 }
             }
 
@@ -753,10 +753,10 @@ macro_rules! define_perl_string {
 
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
                     $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
-                    $( Repr::$h8 { .. } => None, )*
-                    $( Repr::$h16 { .. } => None, )*
-                    $( Repr::$h32 { .. } => None, )*
-                    $( Repr::$hw { .. } => None, )*
+                    $( Repr::$heap8 { .. } => None, )*
+                    $( Repr::$heap16 { .. } => None, )*
+                    $( Repr::$heap32 { .. } => None, )*
+                    $( Repr::$heap { .. } => None, )*
                 }
             }
 
@@ -805,13 +805,13 @@ macro_rules! define_perl_string {
                         full: $packed_full,
                         nibbles: *nibbles,
                     }), )*
-                    $( Repr::$h8 { ptr, len, cap, count, scan } =>
+                    $( Repr::$heap8 { ptr, len, cap, count, scan } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap8)), )*
-                    $( Repr::$h16 { ptr, len, cap, count, scan } =>
+                    $( Repr::$heap16 { ptr, len, cap, count, scan } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap16)), )*
                     // SAFETY: a live allocation of this tier, whose header carries the metadata.
-                    $( Repr::$h32 { ptr, len } => RawParts::Heap(unsafe { HeapView::heap32(ptr, *len as usize) }), )*
-                    $( Repr::$hw { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::HeapW) }), )*
+                    $( Repr::$heap32 { ptr, len } => RawParts::Heap(unsafe { HeapView::heap32(ptr, *len as usize) }), )*
+                    $( Repr::$heap { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::Heap) }), )*
                 }
             }
 
@@ -821,10 +821,10 @@ macro_rules! define_perl_string {
                 match &mut self.0 {
                     $( Repr::$inline { buf } => Some(($inline_full, buf)), )*
                     $( Repr::$packed { .. } => None, )*
-                    $( Repr::$h8 { .. } => None, )*
-                    $( Repr::$h16 { .. } => None, )*
-                    $( Repr::$h32 { .. } => None, )*
-                    $( Repr::$hw { .. } => None, )*
+                    $( Repr::$heap8 { .. } => None, )*
+                    $( Repr::$heap16 { .. } => None, )*
+                    $( Repr::$heap32 { .. } => None, )*
+                    $( Repr::$heap { .. } => None, )*
                 }
             }
 
@@ -857,19 +857,19 @@ macro_rules! define_perl_string {
                 // this handle owns.  Every old byte becomes exactly one character, so the count is the old length,
                 // and the result is Latin-1 range by construction.
                 match &mut self.0 {
-                    $( Repr::$h8 { ptr, len, count, scan, .. } => {
+                    $( Repr::$heap8 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u8;
                         *count = old_len as u8;
                         *scan = scan::Terminal::Latin1;
                     }, )*
-                    $( Repr::$h16 { ptr, len, count, scan, .. } => {
+                    $( Repr::$heap16 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u16;
                         *count = old_len as u16;
                         *scan = scan::Terminal::Latin1;
                     }, )*
-                    $( Repr::$h32 { ptr, len } => {
+                    $( Repr::$heap32 { ptr, len } => {
                         unsafe {
                             cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
                             cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1.as_u8());
@@ -877,11 +877,11 @@ macro_rules! define_perl_string {
                         }
                         *len = new_len as u32;
                     }, )*
-                    $( Repr::$hw { ptr } => unsafe {
+                    $( Repr::$heap { ptr } => unsafe {
                         cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
-                        cow_buffer::heapw::set_len(ptr.as_ptr(), new_len);
-                        cow_buffer::heapw::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1.as_u8());
-                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), old_len);
+                        cow_buffer::heap::set_len(ptr.as_ptr(), new_len);
+                        cow_buffer::heap::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1.as_u8());
+                        cow_buffer::heap::set_char_count(ptr.as_ptr(), old_len);
                     }, )*
                     _ => return None,
                 }
@@ -922,7 +922,7 @@ macro_rules! define_perl_string {
                 // pass cost.  Writing UNKNOWN here would cost a scan on every subsequent validity read — (1, 1) across
                 // two reads where (1, 0) is the invariant.
                 match &mut self.0 {
-                    $( Repr::$h8 { ptr, len, count, scan, .. } => {
+                    $( Repr::$heap8 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u8;
 
@@ -931,7 +931,7 @@ macro_rules! define_perl_string {
                         *count = chars as u8;
                         *scan = state;
                     }, )*
-                    $( Repr::$h16 { ptr, len, count, scan, .. } => {
+                    $( Repr::$heap16 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u16;
 
@@ -940,7 +940,7 @@ macro_rules! define_perl_string {
                         *count = chars as u16;
                         *scan = state;
                     }, )*
-                    $( Repr::$h32 { ptr, len } => {
+                    $( Repr::$heap32 { ptr, len } => {
                         unsafe {
                             cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
                             cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UNKNOWN.as_u8());
@@ -948,11 +948,11 @@ macro_rules! define_perl_string {
                         }
                         *len = new_len as u32;
                     }, )*
-                    $( Repr::$hw { ptr } => unsafe {
+                    $( Repr::$heap { ptr } => unsafe {
                         cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
-                        cow_buffer::heapw::set_len(ptr.as_ptr(), new_len);
-                        cow_buffer::heapw::set_scan(ptr.as_ptr(), scan::UNKNOWN.as_u8());
-                        cow_buffer::heapw::set_char_count(ptr.as_ptr(), 0usize);
+                        cow_buffer::heap::set_len(ptr.as_ptr(), new_len);
+                        cow_buffer::heap::set_scan(ptr.as_ptr(), scan::UNKNOWN.as_u8());
+                        cow_buffer::heap::set_char_count(ptr.as_ptr(), 0usize);
                     }, )*
                     _ => return None,
                 }
@@ -966,10 +966,10 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => None, )*
                     $( Repr::$packed { .. } => None, )*
-                    $( Repr::$h8 { .. } => Some(Tier::Heap8), )*
-                    $( Repr::$h16 { .. } => Some(Tier::Heap16), )*
-                    $( Repr::$h32 { .. } => Some(Tier::Heap32), )*
-                    $( Repr::$hw { .. } => Some(Tier::HeapW), )*
+                    $( Repr::$heap8 { .. } => Some(Tier::Heap8), )*
+                    $( Repr::$heap16 { .. } => Some(Tier::Heap16), )*
+                    $( Repr::$heap32 { .. } => Some(Tier::Heap32), )*
+                    $( Repr::$heap { .. } => Some(Tier::Heap), )*
                 }
             }
 
@@ -991,7 +991,7 @@ macro_rules! define_perl_string {
                         full: $packed_full,
                         nibbles: *nibbles,
                     }), )*
-                    $( Repr::$h8 { ptr, len, cap, count, scan } => RawOwned::Heap {
+                    $( Repr::$heap8 { ptr, len, cap, count, scan } => RawOwned::Heap {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: *cap as usize,
@@ -999,7 +999,7 @@ macro_rules! define_perl_string {
                         scan: scan.widen(),
                         tier: Tier::Heap8,
                     }, )*
-                    $( Repr::$h16 { ptr, len, cap, count, scan } => RawOwned::Heap {
+                    $( Repr::$heap16 { ptr, len, cap, count, scan } => RawOwned::Heap {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: *cap as usize,
@@ -1009,7 +1009,7 @@ macro_rules! define_perl_string {
                     }, )*
 
                     // Large tiers keep their metadata in the allocation, so only the pointer travels.
-                    $( Repr::$h32 { ptr, len } => RawOwned::Heap {
+                    $( Repr::$heap32 { ptr, len } => RawOwned::Heap {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
                         cap: 0,
@@ -1017,13 +1017,13 @@ macro_rules! define_perl_string {
                         scan: scan::UNKNOWN,
                         tier: Tier::Heap32,
                     }, )*
-                    $( Repr::$hw { ptr } => RawOwned::Heap {
+                    $( Repr::$heap { ptr } => RawOwned::Heap {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: 0,
                         cap: 0,
                         count: 0,
                         scan: scan::UNKNOWN,
-                        tier: Tier::HeapW,
+                        tier: Tier::Heap,
                     }, )*
                 }
             }
@@ -1042,22 +1042,22 @@ macro_rules! define_perl_string {
                 let ptr = unsafe { Owned::from_raw(ptr) };
                 match tier {
                     Tier::Heap8 => match (utf8, tainted) {
-                        $( ($h8_utf8, $h8_tainted) => PerlString(Repr::$h8 {
+                        $( ($heap8_utf8, $heap8_tainted) => PerlString(Repr::$heap8 {
                             ptr, len: len as u8, cap: cap as u8, count: count as u8,
                             scan: scan::Terminal::from_scan(scan),
                         }), )*
                     },
                     Tier::Heap16 => match (utf8, tainted) {
-                        $( ($h16_utf8, $h16_tainted) => PerlString(Repr::$h16 {
+                        $( ($heap16_utf8, $heap16_tainted) => PerlString(Repr::$heap16 {
                             ptr, len: len as u16, cap: cap as u16, count: count as u16,
                             scan: scan::Terminal::from_scan(scan),
                         }), )*
                     },
                     Tier::Heap32 => match (utf8, tainted) {
-                        $( ($h32_utf8, $h32_tainted) => PerlString(Repr::$h32 { ptr, len: len as u32 }), )*
+                        $( ($heap32_utf8, $heap32_tainted) => PerlString(Repr::$heap32 { ptr, len: len as u32 }), )*
                     },
-                    Tier::HeapW => match (utf8, tainted) {
-                        $( ($hw_utf8, $hw_tainted) => PerlString(Repr::$hw { ptr }), )*
+                    Tier::Heap => match (utf8, tainted) {
+                        $( ($heap_utf8, $heap_tainted) => PerlString(Repr::$heap { ptr }), )*
                     },
                 }
             }
@@ -1152,7 +1152,7 @@ define_perl_string! {
         Heap32Tainted              = (false, true),
         Heap32FlaggedTainted       = (true, true),
     ],
-    heapw: [
+    heap: [
         Heap                     = (false, false),
         HeapFlagged              = (true, false),
         HeapTainted              = (false, true),

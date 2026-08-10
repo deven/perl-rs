@@ -1,8 +1,8 @@
 //! The tiered copy-on-write heap storage backing heap strings (§2.2.3).
 //!
-//! Four tiers by content length — `heap8`, `heap16`, `heap32`, `heapw` — each a module owning one allocation shape: the
+//! Four tiers by content length — `heap8`, `heap16`, `heap32`, `heap` — each a module owning one allocation shape: the
 //! small tiers a bare refcount header with every other fact in the string's envelope, `heap32` a compact header whose
-//! length is envelope-authoritative, and `heapw` a full word-width header.  Around them, the ownership and viewing
+//! length is envelope-authoritative, and `heap` a full word-width header.  Around them, the ownership and viewing
 //! machinery: `Owned` (the release obligation as a linear token, bomb-armed), `HeapParts` (the owning transport between
 //! representations), `HeapView` (the borrowed tier-agnostic read), and the byte-level transform functions the tiers
 //! share.
@@ -184,7 +184,7 @@ pub(crate) enum Tier {
     Heap8,
     Heap16,
     Heap32,
-    HeapW,
+    Heap,
 }
 
 impl Tier {
@@ -196,7 +196,7 @@ impl Tier {
             Tier::Heap8 => heap8::MAX_CAPACITY,
             Tier::Heap16 => heap16::MAX_CAPACITY,
             Tier::Heap32 => heap32::MAX_CAPACITY,
-            Tier::HeapW => heapw::MAX_CAPACITY,
+            Tier::Heap => heap::MAX_CAPACITY,
         }
     }
 
@@ -209,7 +209,7 @@ impl Tier {
         } else if len <= heap32::MAX_CAPACITY {
             Tier::Heap32
         } else {
-            Tier::HeapW
+            Tier::Heap
         }
     }
 
@@ -265,10 +265,10 @@ impl HeapParts {
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
                     p
                 }
-                Tier::HeapW => {
-                    let p = heapw::allocate(len)?;
+                Tier::Heap => {
+                    let p = heap::allocate(len)?;
                     ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), len);
-                    heapw::set_len(p, len);
+                    heap::set_len(p, len);
                     p
                 }
             }
@@ -293,8 +293,8 @@ impl HeapParts {
                         heap32::set_char_count(self.ptr.as_ptr(), count as u32);
                     }
                     _ => {
-                        heapw::set_scan(self.ptr.as_ptr(), scan.as_u8());
-                        heapw::set_char_count(self.ptr.as_ptr(), count);
+                        heap::set_scan(self.ptr.as_ptr(), scan.as_u8());
+                        heap::set_char_count(self.ptr.as_ptr(), count);
                     }
                 }
             }
@@ -375,7 +375,7 @@ impl Drop for HeapParts {
                 Tier::Heap8 => heap8::release(ptr, self.cap as u8),
                 Tier::Heap16 => heap16::release(ptr, self.cap as u16),
                 Tier::Heap32 => heap32::release(ptr),
-                Tier::HeapW => heapw::release(ptr),
+                Tier::Heap => heap::release(ptr),
             }
         }
     }
@@ -406,13 +406,13 @@ impl<'a> HeapView<'a> {
     /// A large tier's view, read from the allocation.
     ///
     /// # Safety
-    /// `ptr` must own a live allocation of `tier`, which must be `Heap32` or `HeapW`.
+    /// `ptr` must own a live allocation of `tier`, which must be `Heap32` or `Heap`.
     pub(crate) unsafe fn large(ptr: &'a Owned, tier: Tier) -> HeapView<'a> {
-        debug_assert!(matches!(tier, Tier::HeapW), "Heap32 views take their envelope length via `heap32`");
+        debug_assert!(matches!(tier, Tier::Heap), "Heap32 views take their envelope length via `heap32`");
         let raw = ptr.as_ptr();
 
         // SAFETY: the caller vouches for a live allocation of the word tier.
-        let (len, cap, count, scan) = unsafe { (heapw::len(raw), heapw::capacity(raw), heapw::char_count(raw), heapw::scan(raw)) };
+        let (len, cap, count, scan) = unsafe { (heap::len(raw), heap::capacity(raw), heap::char_count(raw), heap::scan(raw)) };
 
         // The one seam where a storage byte re-enters the type; corruption reports here rather than flowing on.
         HeapView { ptr: raw, len, cap, count, scan: ScanState::from_u8(scan), tier, _life: PhantomData }
@@ -482,7 +482,7 @@ impl<'a> HeapView<'a> {
                 Tier::Heap8 => heap8::is_unique(self.ptr),
                 Tier::Heap16 => heap16::is_unique(self.ptr),
                 Tier::Heap32 => heap32::is_unique(self.ptr),
-                Tier::HeapW => heapw::is_unique(self.ptr),
+                Tier::Heap => heap::is_unique(self.ptr),
             }
         }
     }
@@ -496,7 +496,7 @@ impl<'a> HeapView<'a> {
         unsafe {
             match self.tier {
                 Tier::Heap32 => heap32::set_scan(self.ptr, state.as_u8()),
-                Tier::HeapW => heapw::set_scan(self.ptr, state.as_u8()),
+                Tier::Heap => heap::set_scan(self.ptr, state.as_u8()),
                 Tier::Heap8 | Tier::Heap16 => {}
             }
         }
@@ -508,7 +508,7 @@ impl<'a> HeapView<'a> {
         unsafe {
             match self.tier {
                 Tier::Heap32 => heap32::set_char_count(self.ptr, count as u32),
-                Tier::HeapW => heapw::set_char_count(self.ptr, count),
+                Tier::Heap => heap::set_char_count(self.ptr, count),
                 Tier::Heap8 | Tier::Heap16 => {}
             }
         }
@@ -1018,7 +1018,7 @@ macro_rules! heap_tier {
 heap_tier!(heap8, width = u8, meta = envelope);
 heap_tier!(heap16, width = u16, meta = envelope);
 heap_tier!(heap32, width = u32, meta = compact);
-heap_tier!(heapw, width = usize, counter = AtomicUsize, meta = header);
+heap_tier!(heap, width = usize, counter = AtomicUsize, meta = header);
 
 // The placement rule, checked rather than described: a small tier's allocation is a refcount and nothing else.
 const _: () = assert!(heap8::HEADER == 4);
