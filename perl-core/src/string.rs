@@ -564,6 +564,49 @@ fn classify_known_valid(bytes: &[u8]) -> (scan::ValidRange, usize) {
     (if saw_high { scan::ValidRange::Latin1 } else { scan::ValidRange::Ascii }, chars)
 }
 
+/// The copying twin of [`classify_known_valid`]: one traversal ranges, counts, and emits every byte.  Standalone rather
+/// than sink-generic because the control flow genuinely diverges — the pure walker bails once `NonLatin1` is
+/// determined, forfeiting the count, but a copy cannot stop, and since the remaining blocks stream through anyway,
+/// counting them is free: this twin returns a real count where the pure one forfeits.
+///
+/// # Safety
+/// `dst` must be valid for `src.len()` writes and must not overlap `src`.
+unsafe fn classify_known_valid_into(dst: *mut u8, src: &[u8]) -> (scan::ValidRange, usize) {
+    count_full_scan();
+    debug_assert!({
+        let (d, s, n) = (dst as usize, src.as_ptr() as usize, src.len());
+        d + n <= s || s + n <= d
+    });
+
+    let mut range = scan::ValidRange::Ascii;
+    let mut chars = 0usize;
+    let mut pos = 0usize;
+
+    while pos < src.len() {
+        let end = block_end(pos, src.len());
+        let block = &src[pos..end];
+
+        // SAFETY: the caller vouches for a non-overlapping destination valid for the whole source.
+        unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), dst.add(pos), block.len()) };
+        pos = end;
+
+        let hi = block.iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
+        if !hi {
+            chars += block.len();
+            continue;
+        }
+        if range != scan::ValidRange::NonLatin1 && block.iter().fold(0u8, |a, &b| a | u8::from(b >= 0xC4)) != 0 {
+            range = scan::ValidRange::NonLatin1;
+        }
+        if range != scan::ValidRange::NonLatin1 {
+            range = scan::ValidRange::Latin1;
+        }
+        chars += block.iter().map(|&b| usize::from(b & 0xC0 != 0x80)).sum::<usize>();
+    }
+
+    (range, chars)
+}
+
 /// The inline content class (§2.2.9), eagerly established at construction.  One vocabulary with the §2.2.4 heap
 /// lattice: the same classification, eager and in the tag here, lazy and in the buffer header there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1490,18 +1533,16 @@ impl PerlString {
         } else {
             let bytes = s.as_bytes();
 
-            // A `&str` is known-valid UTF-8 of unknown range, which is why the cheap probe suffices for the tiers that
-            // can narrow later.  A small tier cannot — its scan state lives in the envelope with no allocation slot for
-            // a later discovery, so the range must be settled now or never (§2.2.3) — and since it pays the classifying
-            // pass anyway, the ASCII question is answered by the terminal state for free: probing first would scan the
-            // same bytes twice for one fact.
-            let (parts, ascii) = if Tier::for_length(bytes.len()).is_small() {
-                let (state, chars) = classify_full(bytes);
-                (HeapParts::from_slice(bytes, state.widen(), chars)?, state == scan::Terminal::Ascii)
-            } else {
-                let ascii = bytes.iter().all(|b| b.is_ascii());
-                (HeapParts::from_slice(bytes, if ascii { scan::ASCII } else { scan::UTF8_UNKNOWN_RANGE }, 0)?, ascii)
-            };
+            // Known-valid input classifies through the cheaper ranging walker, fused with the copy (§2.2.3) at every
+            // size, so a `&str` birth is settled at its exact range with its character count in the one traversal the
+            // copy already pays — and the ASCII question is answered by the settled state for free, where probing first
+            // would scan the same bytes twice for one fact.
+            let parts = HeapParts::from_slice_classifying(bytes, |dst, src| {
+                // SAFETY: `dst` is a fresh allocation with room for `src.len()`, disjoint from `src` by construction.
+                let (class, chars) = unsafe { classify_known_valid_into(dst, src) };
+                (class.widen(), chars)
+            })?;
+            let ascii = parts.scan == scan::ASCII;
 
             Ok(PerlString::build_heap(!ascii, false, parts))
         }

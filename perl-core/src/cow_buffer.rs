@@ -212,11 +212,6 @@ impl Tier {
             Tier::Heap
         }
     }
-
-    /// Whether this tier keeps its metadata in the envelope rather than the allocation.
-    pub(crate) const fn is_small(self) -> bool {
-        matches!(self, Tier::Heap8 | Tier::Heap16)
-    }
 }
 
 /// An owned pointer with the metadata its tier keeps in the envelope, for the paths that move a heap payload between

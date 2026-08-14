@@ -289,9 +289,9 @@ fn latin1_vs_non_latin1_terminals() {
 
 #[test]
 fn unknown_range_classifies_on_ascii_probe() {
-    let s = PerlString::from_str(&"é".repeat(20)).unwrap(); // 40 bytes: heap, UTF8_UNKNOWN_RANGE
+    let s = PerlString::from_str(&"é".repeat(20)).unwrap(); // 40 bytes: small tier, settled UTF8_LATIN1 at birth
     assert!(s.storage_type().is_heap());
-    assert!(!s.is_ascii(), "probe performs the range classification, not just an ASCII scan");
+    assert!(!s.is_ascii(), "the ASCII question is a state read on a settled birth");
 
     // The classification left terminal Latin-1 knowledge behind: cross-flag equality against the downgraded form
     // succeeds (and would fast-negative if the state had wrongly become NON_LATIN1).
@@ -352,9 +352,9 @@ fn eq_grid_both_flagged_terminal_mismatch() {
 
 #[test]
 fn eq_grid_valid_vs_invalid_same_flag() {
-    // Flagged terminal Rust-invalid vs flagged known-Rust-valid nonterminal (heap UTF8_UNKNOWN_RANGE): valid bytes
+    // Flagged terminal Rust-invalid vs flagged known-Rust-valid (small tier, settled UTF8_LATIN1 at birth): valid bytes
     // never equal invalid bytes.
-    let flagged_valid = PerlString::from_str(&"é".repeat(20)).unwrap(); // heap, flagged, UNKNOWN_RANGE
+    let flagged_valid = PerlString::from_str(&"é".repeat(20)).unwrap();
     let mut ext = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     ext.set_utf8_for_test();
     assert_ne!(flagged_valid, ext);
@@ -417,9 +417,9 @@ fn eq_grid_length_rows() {
 
 #[test]
 fn streaming_compare_narrows_on_completed_walk() {
-    // Heap flagged UTF8_UNKNOWN_RANGE vs matching latin1 bytes: undecided by the grid, resolved by the single walk,
-    // which narrows both sides.
-    let flagged = PerlString::from_str(&"é".repeat(20)).unwrap(); // heap, flagged, UNKNOWN_RANGE
+    // Heap flagged UTF8_LATIN1 (settled at birth) vs matching latin1 bytes: cross-flag content equality resolved by the
+    // single walk.
+    let flagged = PerlString::from_str(&"é".repeat(20)).unwrap();
     let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(flagged, plain);
 
@@ -430,8 +430,8 @@ fn streaming_compare_narrows_on_completed_walk() {
 
 #[test]
 fn cheap_probe_defers_range() {
-    let s = PerlString::from_str(&"é".repeat(20)).unwrap(); // heap, UTF8_UNKNOWN_RANGE
-    assert!(!s.is_ascii()); // cheap probe: narrows to UTF8_NON_ASCII, range still deferred
+    let s = PerlString::from_str(&"é".repeat(20)).unwrap(); // small tier, settled UTF8_LATIN1 at birth
+    assert!(!s.is_ascii()); // a state read: nothing left to defer on a settled birth
 
     // Equality resolves range on demand and still matches the downgraded form.
     let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
@@ -539,18 +539,6 @@ fn lazy_heap(pattern: &[u8]) -> PerlString {
     s
 }
 
-/// The `&str` counterpart: known-valid UTF-8, large enough that its *range* is still undetermined.  Below 64 KiB
-/// `from_str` classifies fully, so `UTF8_UNKNOWN_RANGE` — valid, range unknown — exists only up here.
-fn lazy_str(pattern: &str) -> PerlString {
-    let mut text = String::with_capacity(LAZY_MIN + pattern.len());
-    while text.len() < LAZY_MIN {
-        text.push_str(pattern);
-    }
-    let s = PerlString::from_str(&text).unwrap();
-    assert!(!s.storage_type().is_small_heap_tier(), "the lazy tiers begin above 64 KiB");
-    s
-}
-
 /// One 16-byte quantum past `Heap16`'s ceiling, 16-aligned: the append-reset manufacture needs its base — the content
 /// minus a withheld one- or two-byte pattern — on a large tier AND inside the birth headroom, so the reset append
 /// extends in place instead of rebuilding (a rebuild classifies, defeating the manufacture).  The 16-quantum system
@@ -631,16 +619,18 @@ fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PerlString)>, usi
     // state.  The witness is retired, not skipped.
     push("heap-unknown-latin1", &|| lazy_heap(&[0xC3, 0xA9]), scan::UNKNOWN);
     push("heap-unknown-malformed", &|| lazy_heap(&[0x81]), scan::UNKNOWN);
-    push("heap-ur-latin1", &|| lazy_str("é"), scan::UTF8_UNKNOWN_RANGE);
-    push("heap-ur-wide", &|| lazy_str("字"), scan::UTF8_UNKNOWN_RANGE);
+
+    // UTF8_UNKNOWN_RANGE and UTF8_NON_ASCII (valid side) are unreachable from today's constructor inventory: every
+    // initializer copies and classification rides the copy (§2.2.3), so a known-valid birth is settled at its exact
+    // range.  The states stay in the lattice as the zero-copy adoption forms' vocabulary — witnesses return when a
+    // constructor without a copy exists.
 
     // The probe-narrowed states need a probe with something left to narrow, which again is the lazy tiers alone.
     let narrowed = |s: PerlString| {
         assert!(!s.is_ascii());
         s
     };
-    push("heap-na8-latin1", &|| narrowed(lazy_str("é")), scan::UTF8_NON_ASCII);
-    push("heap-na8-wide", &|| narrowed(lazy_str("字")), scan::UTF8_NON_ASCII);
+
     push("heap-nonascii-raw", &|| narrowed(lazy_heap(&[0x82])), scan::NON_ASCII);
     push("heap-nonascii-valid-bytes", &|| narrowed(lazy_heap(&[0xC3, 0xA9])), scan::NON_ASCII);
 
@@ -677,13 +667,14 @@ fn cheap_probe_bails_at_first_high_bit() {
     assert_eq!(probe_bytes, 1, "first byte is high: the probe must bail immediately");
     assert_eq!(s.scan_state(), scan::NON_ASCII);
 
-    // Same bail on the validity-known tier.
-    let f = PerlString::from_str(&format!("é{}", "a".repeat(LAZY_MIN))).unwrap(); // a lazy tier: UNKNOWN_RANGE
+    // The validity-known side has no probe to bail: a `&str` birth is settled at its exact range during the copy
+    // (§2.2.3), so the ASCII question is a state read and the probe never runs at all.
+    let f = PerlString::from_str(&format!("é{}", "a".repeat(LAZY_MIN))).unwrap();
     eq_probe::reset();
     assert!(!f.is_ascii());
     let (_, pb2) = eq_probe::scans();
-    assert!(pb2 <= 2, "high bit at byte 0: probe examined {pb2} bytes");
-    assert_eq!(f.scan_state(), scan::UTF8_NON_ASCII);
+    assert_eq!(pb2, 0, "born settled: no probe at all");
+    assert_eq!(f.scan_state(), scan::UTF8_LATIN1);
 }
 
 #[test]
