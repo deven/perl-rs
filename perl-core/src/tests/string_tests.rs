@@ -4197,6 +4197,69 @@ fn large_tier_append_preserves_known_scan_state() {
     assert_eq!(s.scan_state(), narrowed, "ASCII onto a narrowed buffer keeps the narrowed state across the rebuild");
 }
 
+#[test]
+fn append_within_class_headroom_extends_in_place() {
+    // The fast path the class headroom exists for (§2.2.3): a unique buffer whose spare capacity holds the result
+    // extends in place — no allocation, same buffer, facts maintained.
+    let mut s = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let mut buf = [0u8; DECODE_MAX];
+    let live = cow_buffer::live::count();
+    let addr = s.as_bytes(&mut buf).as_ptr() as usize;
+
+    s.push_str("yz").unwrap();
+    assert_eq!(cow_buffer::live::count(), live, "the fast path allocates nothing");
+    assert_eq!(s.as_bytes(&mut buf).as_ptr() as usize, addr, "the buffer is the same one");
+    assert_eq!(s.as_bytes(&mut buf), format!("{}yz", "x".repeat(40)).as_bytes());
+    assert!(s.is_ascii(), "ASCII onto ASCII stays established");
+}
+
+#[test]
+fn append_past_capacity_rebuilds_through_the_constructor() {
+    // Over capacity there is nothing to extend into: the rebuild releases the old buffer (net zero live) and the
+    // tier-choosing constructor establishes the result's facts.
+    let mut s = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let mut buf = [0u8; DECODE_MAX];
+    let live = cow_buffer::live::count();
+    let addr = s.as_bytes(&mut buf).as_ptr() as usize;
+
+    s.push_str(&"y".repeat(100)).unwrap();
+    assert_eq!(cow_buffer::live::count(), live, "one allocated, one released");
+    assert_ne!(s.as_bytes(&mut buf).as_ptr() as usize, addr, "a rebuilt buffer is a different one");
+    assert_eq!(s.as_bytes(&mut buf).len(), 140);
+    assert!(s.is_ascii());
+}
+
+#[test]
+fn append_onto_a_shared_buffer_rebuilds_and_leaves_the_sharer() {
+    // Shared means no in-place anything: the appender rebuilds into its own allocation and the sharer keeps the
+    // original untouched — append is where COW pays its copy.
+    let a = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let mut b = a.clone();
+    let live = cow_buffer::live::count();
+
+    b.push_str("z").unwrap();
+    let (mut ba, mut bb) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
+    assert_eq!(cow_buffer::live::count(), live + 1, "the appender got its own allocation; the sharer keeps the old");
+    assert_eq!(a.as_bytes(&mut ba), "x".repeat(40).as_bytes(), "the sharer is untouched");
+    assert_eq!(b.as_bytes(&mut bb), format!("{}z", "x".repeat(40)).as_bytes());
+    assert_ne!(a.as_bytes(&mut ba).as_ptr(), b.as_bytes(&mut bb).as_ptr());
+}
+
+#[test]
+fn raw_append_in_place_settles_a_small_tier() {
+    // A raw append transitions to UNKNOWN, which a small tier cannot hold: the in-place path classifies the joined
+    // content — one pass, still no allocation — so the envelope ends settled exactly as construction leaves it.
+    let mut s = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let live = cow_buffer::live::count();
+
+    s.push_bytes(&[0xC3, 0xA9]).unwrap();
+    let mut buf = [0u8; DECODE_MAX];
+    assert_eq!(cow_buffer::live::count(), live, "settling in place allocates nothing");
+    assert_eq!(s.as_bytes(&mut buf).len(), 42);
+    assert!(!s.is_ascii());
+    assert!(scan::is_terminal(s.scan_state()), "a small tier ends settled, never UNKNOWN");
+}
+
 // ── Leak accounting (the bomb's second layer) ──────────────────────────────
 
 #[test]

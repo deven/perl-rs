@@ -959,6 +959,84 @@ macro_rules! define_perl_string {
                 Some(true)
             }
 
+            /// Extend a unique heap buffer in place when the appended result fits its spare capacity (§2.2.3): the
+            /// class headroom buffers are born with exists for exactly this, so the common append pays one suffix copy
+            /// and no allocation.  `false` means the fast path does not apply — not heap, shared, or over capacity —
+            /// and the caller rebuilds through the tier-choosing constructor, which is also the only road across a tier
+            /// ceiling.
+            fn append_heap_in_place(&mut self, bytes: &[u8], kind: AppendKind) -> bool {
+                let (old_len, new_len, prior, prior_chars) = match self.raw_parts() {
+                    RawParts::Heap(view) => {
+                        let old_len = view.as_slice().len();
+                        let Some(new_len) = old_len.checked_add(bytes.len()) else { return false };
+                        if !view.is_unique() || new_len > view.capacity() {
+                            return false;
+                        }
+                        (old_len, new_len, view.scan(), view.char_count())
+                    }
+                    _ => return false,
+                };
+
+                let state = append_transition_heap(prior, kind);
+
+                // Maintain the character count incrementally when both sides know theirs (§2.2.5), exactly as the
+                // rebuild does.
+                let chars = match kind {
+                    AppendKind::Valid { chars: added, .. } if prior_chars > 0 && added > 0 && scan::is_perl_decodable(state) => prior_chars + added,
+                    _ => 0,
+                };
+
+                // SAFETY (each arm): unique and within capacity, both established above, so the suffix copy stays
+                // inside the allocation this handle solely owns, and `bytes` cannot alias it while `&mut self` is held.
+                // The small tiers must end settled — below 64 KiB the state is now or never (§2.2.3) — so where the
+                // transition or the count came out indeterminate they classify the joined content: one pass, still no
+                // allocation.  The large tiers record what is known and let the next reader derive the rest.
+                match &mut self.0 {
+                    $( Repr::$heap8 { ptr, len, count, scan, .. } => {
+                        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().as_ptr().add(old_len), bytes.len()) };
+                        *len = new_len as u8;
+                        if scan::is_terminal(state) && chars > 0 {
+                            *scan = scan::Terminal::from_scan(state);
+                            *count = chars as u8;
+                        } else {
+                            // SAFETY: the first `new_len` bytes are the old content plus the suffix just copied.
+                            let (settled, counted) = classify_full(unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr(), new_len) });
+                            *scan = settled;
+                            *count = counted as u8;
+                        }
+                    }, )*
+                    $( Repr::$heap16 { ptr, len, count, scan, .. } => {
+                        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().as_ptr().add(old_len), bytes.len()) };
+                        *len = new_len as u16;
+                        if scan::is_terminal(state) && chars > 0 {
+                            *scan = scan::Terminal::from_scan(state);
+                            *count = chars as u16;
+                        } else {
+                            // SAFETY: the first `new_len` bytes are the old content plus the suffix just copied.
+                            let (settled, counted) = classify_full(unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr(), new_len) });
+                            *scan = settled;
+                            *count = counted as u16;
+                        }
+                    }, )*
+                    $( Repr::$heap32 { ptr, len } => {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().as_ptr().add(old_len), bytes.len());
+                            cow_buffer::heap32::set_scan(ptr.as_ptr(), state.as_u8());
+                            cow_buffer::heap32::set_char_count(ptr.as_ptr(), chars as u32);
+                        }
+                        *len = new_len as u32;
+                    }, )*
+                    $( Repr::$heap { ptr } => unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().as_ptr().add(old_len), bytes.len());
+                        cow_buffer::heap::set_len(ptr.as_ptr(), new_len);
+                        cow_buffer::heap::set_scan(ptr.as_ptr(), state.as_u8());
+                        cow_buffer::heap::set_char_count(ptr.as_ptr(), chars);
+                    }, )*
+                    _ => return false,
+                }
+                true
+            }
+
             /// Whether this value is held on the heap, and in which tier.  In-place transforms need the variant itself
             /// rather than a handle, because a small tier's length lives in the envelope beside the pointer.
             #[allow(dead_code)]
@@ -1983,6 +2061,12 @@ impl PerlString {
             return Ok(());
         }
 
+        // The fast path the class headroom exists for (§2.2.3): a unique buffer whose spare capacity holds the result
+        // extends in place — one suffix copy, no allocation.  Everything else rebuilds below.
+        if self.append_heap_in_place(bytes, kind) {
+            return Ok(());
+        }
+
         let (u, t) = (self.is_utf8(), self.is_tainted());
         let old = mem::take(self);
 
@@ -2008,11 +2092,11 @@ impl PerlString {
                 }
             }
             RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
-                // The appended result may not fit the tier it started in, so the buffer is rebuilt rather than
-                // extended: growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what
-                // `HeapParts::from_slice` does.  Reassembling the parts first makes the old allocation owned for
-                // the whole arm: dropping `old` — at the end or through either `?` — is the release.  The first
-                // run of the leak bomb caught this arm abandoning the pointer instead.
+                // Reached only past the in-place fast path — shared, or over capacity — so the buffer is rebuilt:
+                // growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what `HeapParts::from_slice`
+                // does.  Reassembling the parts first makes the old allocation owned for the whole arm: dropping `old`
+                // — at the end or through either `?` — is the release.  The first run of the leak bomb caught this arm
+                // abandoning the pointer instead.
                 let old = HeapParts { ptr, len, cap, count, scan: prior, tier };
                 let view = match tier {
                     Tier::Heap8 | Tier::Heap16 => HeapView::small(&old.ptr, len, cap, count, prior, tier),
