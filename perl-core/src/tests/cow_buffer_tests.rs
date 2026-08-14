@@ -304,15 +304,15 @@ fn birth_capacity_is_the_allocator_size_class() {
 #[test]
 #[cfg(feature = "jemalloc")]
 fn buffers_allocate_inside_the_jemalloc_instance() {
-    // The -ctl crate reads the same jemalloc our seam allocates from, so a large buffer's birth must move the
-    // instance's allocated-bytes statistic by at least its size — the sanity that the seam really routes there.
-    use tikv_jemalloc_ctl::{epoch, stats};
+    // The -ctl crate reads the same jemalloc our seam allocates from, so a large buffer's birth must move this thread's
+    // allocation counter by at least its size — the sanity that the seam really routes there.  The *thread-local*
+    // monotonic counter, not the process-global live-bytes statistic: the global number is racy under the parallel test
+    // harness, where other threads' frees between two reads can offset any allocation.
+    use tikv_jemalloc_ctl::thread;
 
-    epoch::advance().unwrap();
-    let before = stats::allocated::read().unwrap();
+    let counter = thread::allocatedp::read().unwrap();
+    let before = counter.get();
     let parts = HeapParts::from_slice(&[7u8; 100_000], crate::string::scan::UNKNOWN, 0).unwrap();
-    epoch::advance().unwrap();
-    let after = stats::allocated::read().unwrap();
-    assert!(after >= before + 100_000, "the buffer lives in the instance the stats read");
+    assert!(counter.get() >= before + 100_000, "the buffer lives in the instance the counter reads");
     drop(parts);
 }
