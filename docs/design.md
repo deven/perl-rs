@@ -584,6 +584,21 @@ Details:
   where nothing is copied — the in-place transitions on the large
   tiers, whose shared scan slot exists for exactly that remainder.
 
+  The indeterminate states stay in the lattice [DECISION].  Their
+  unreachability from today's constructors is a fact about the
+  constructor inventory — every initializer copies — not about
+  the lattice: a zero-copy adoption form (a `bytes::Bytes`-backed
+  tier for ecosystems already holding those, an mmap'd-file tier)
+  has no copy for classification to ride and legitimately births
+  `UNKNOWN` or, for known-valid sources, `UNKNOWN_RANGE`.
+  Retiring the states would bake a contingent property of the
+  constructors into the type system and force their
+  re-introduction through every exhaustive match at the worst
+  time; keeping them costs named arms in a lattice whose
+  exhaustiveness discipline is already paid for.  The witness
+  grid records which states are currently unreachable and by what
+  argument.
+
   The size class is *asked, not guessed* [DECISION]: buffers come
   from a jemalloc instance (the `tikv-jemalloc-sys` family — the
   maintained fork; upstream archived June 2025) called through its
