@@ -352,6 +352,54 @@ fn block_end(pos: usize, len: usize) -> usize {
 /// values cap at perl's `IV_MAX`, 2^63-1.  Rust additionally rejects surrogates, values above U+10FFFF, and any
 /// sequence longer than 4 bytes — decidable per-sequence during the same decode.
 fn classify_full(bytes: &[u8]) -> (scan::Terminal, usize) {
+    classify_walk(bytes, &mut NullSink)
+}
+
+/// Classify `src` while copying it to `dst`: one traversal determines the terminal state and character count and emits
+/// every byte, including on the malformed path — a perl string legitimately holds malformed content, so the copy always
+/// completes even where classification stops.  The pair with [`classify_full`] is one generic walker monomorphized
+/// twice; the null sink's stores are deleted by the compiler, verified against the pre-split assembly.
+///
+/// # Safety
+/// `dst` must be valid for `src.len()` writes and must not overlap `src` — the in-place transforms, which do overlap,
+/// have their facts known a priori and never come here.
+unsafe fn classify_into(dst: *mut u8, src: &[u8]) -> (scan::Terminal, usize) {
+    debug_assert!({
+        let (d, s, n) = (dst as usize, src.as_ptr() as usize, src.len());
+        d + n <= s || s + n <= d
+    });
+    classify_walk(src, &mut CopySink { dst })
+}
+
+/// Where a classification pass sends the bytes it has just read: nowhere, or to a destination buffer.  A zero-sized
+/// null sink monomorphizes the walker back to the pure classifier — the emit calls vanish — so the non-copying path
+/// pays nothing for the copying path's existence.
+trait ScanSink {
+    /// Emit `src[range]`, which the walker has just classified.  Ranges arrive in order and cover `src` exactly.
+    fn emit(&mut self, src: &[u8], start: usize, end: usize);
+}
+
+struct NullSink;
+
+impl ScanSink for NullSink {
+    #[inline(always)]
+    fn emit(&mut self, _src: &[u8], _start: usize, _end: usize) {}
+}
+
+struct CopySink {
+    dst: *mut u8,
+}
+
+impl ScanSink for CopySink {
+    #[inline(always)]
+    fn emit(&mut self, src: &[u8], start: usize, end: usize) {
+        // SAFETY: `classify_into`'s caller vouches for a non-overlapping destination valid for the whole source, and
+        // the walker's ranges stay inside it.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(start), self.dst.add(start), end - start) };
+    }
+}
+
+fn classify_walk(bytes: &[u8], sink: &mut impl ScanSink) -> (scan::Terminal, usize) {
     count_full_scan();
 
     let mut facts = ScanFacts::default();
@@ -364,6 +412,7 @@ fn classify_full(bytes: &[u8]) -> (scan::Terminal, usize) {
         let hi = bytes[pos..soft_end].iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
         if !hi {
             facts.chars += soft_end - pos; // ASCII block: characters are bytes; no further passes
+            sink.emit(bytes, pos, soft_end);
             pos = soft_end;
             continue;
         }
@@ -371,8 +420,15 @@ fn classify_full(bytes: &[u8]) -> (scan::Terminal, usize) {
         // Non-ASCII block: scalar fused decode over the cached bytes, running to at least soft_end and completing any
         // sequence that straddles it.
         match scalar_decode_span(bytes, pos, soft_end, &mut facts, |_| {}) {
-            Some(next) => pos = next,
-            None => return (scan::Terminal::Malformed, 0),
+            Some(next) => {
+                sink.emit(bytes, pos, next);
+                pos = next;
+            }
+            None => {
+                // The copy completes even though classification stops: malformed content is still content.
+                sink.emit(bytes, pos, bytes.len());
+                return (scan::Terminal::Malformed, 0);
+            }
         }
     }
 
@@ -1356,9 +1412,8 @@ fn expand_latin1(b: u8, out: &mut [u8]) -> usize {
 /// terminal type, so an indeterminate transition means paying the construction-grade pass over the joined content.  The
 /// same eager rule construction follows, for the same reason: below 64 KiB the state is settled now or never (§2.2.3).
 fn heap_parts_transitioned(bytes: &[u8], state: scan::ScanState, chars: usize) -> Result<HeapParts, AllocError> {
-    if Tier::for_length(bytes.len()).is_small() && !scan::is_terminal(state) {
-        let (terminal, counted) = classify_full(bytes);
-        return HeapParts::from_slice(bytes, terminal.widen(), counted);
+    if !scan::is_terminal(state) {
+        return heap_parts_classified(bytes);
     }
     HeapParts::from_slice(bytes, state, chars)
 }
@@ -1371,11 +1426,13 @@ fn heap_parts_transitioned(bytes: &[u8], state: scan::ScanState, chars: usize) -
 /// just happened (§2.2.11).  The large tiers are left unknown deliberately — at those sizes the pass is what they
 /// cannot afford, and their allocation has the room to record what a reader discovers.
 fn heap_parts_classified(bytes: &[u8]) -> Result<HeapParts, AllocError> {
-    if Tier::for_length(bytes.len()).is_small() {
-        let (state, chars) = classify_full(bytes);
-        return HeapParts::from_slice(bytes, state.widen(), chars);
-    }
-    HeapParts::from_slice(bytes, scan::UNKNOWN, 0)
+    // Classification rides the copy at every size (§2.2.3): one traversal classifies and emits, so the buffer is born
+    // settled without a pass the copy was not already paying for.
+    HeapParts::from_slice_classifying(bytes, |dst, src| {
+        // SAFETY: `dst` is a fresh allocation with room for `src.len()`, disjoint from `src` by construction.
+        let (terminal, chars) = unsafe { classify_into(dst, src) };
+        (terminal.widen(), chars)
+    })
 }
 
 /// Classify content into its canonical inline form: the class, the two nibbles, and the payload — `None` when no inline
@@ -2213,8 +2270,8 @@ fn append_transition_heap(prior: scan::ScanState, kind: AppendKind) -> scan::Sca
             ScanState::Extended => ScanState::Extended,
 
             // Prior validity unknown or invalid: fallback, lazily recoverable above 64 KiB and reclassified below
-            // (§2.2.3's funnel).  Named rather than wildcarded: the second door of finding 2 lived in a `_` arm, and a
-            // tenth state added to the lattice must land here by decision, not by omission.
+            // (§2.2.3's funnel).  Named rather than wildcarded: an indeterminate-state defect once hid in a `_` arm
+            // here, and a tenth state added to the lattice must land here by decision, not by omission.
             ScanState::Unknown | ScanState::Malformed | ScanState::NonAscii => ScanState::Unknown,
         },
         AppendKind::Unknown => ScanState::Unknown,

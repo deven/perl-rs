@@ -285,6 +285,53 @@ impl HeapParts {
         // SAFETY: the allocation above carries exactly one reference, which this `Owned` now owes.
         Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap, count, scan, tier })
     }
+
+    /// The classifying birth: allocate at the class, and determine the terminal state and character count during the
+    /// copy itself (§2.2.3) — `classify_into` is one traversal that does both, so the buffer is born settled at every
+    /// size without a pass the copy was not already paying for.  The closure seam keeps the walker where it lives
+    /// (`string`) without this module depending on it.
+    pub(crate) fn from_slice_classifying(bytes: &[u8], classify_into: impl FnOnce(*mut u8, &[u8]) -> (ScanState, usize)) -> Result<HeapParts, AllocError> {
+        let len = bytes.len();
+        let tier = Tier::for_length(len);
+
+        // SAFETY (each arm): the pointer comes from this tier's `allocate` with room for at least `len`, and the
+        // classifying copy writes exactly `len` bytes into it; the single reference is handed to the returned
+        // `HeapParts`.  The scan and count are written after the copy determines them — for the small tiers into the
+        // envelope by the caller of this constructor's result, for the large tiers through the cache setters, each
+        // field still written once with its true birth value.
+        unsafe {
+            match tier {
+                Tier::Heap8 => {
+                    let cap = heap8::class_capacity(len);
+                    let p = heap8::allocate(cap as u8)?;
+                    let (scan, count) = classify_into(p.as_ptr(), bytes);
+                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                }
+                Tier::Heap16 => {
+                    let cap = heap16::class_capacity(len);
+                    let p = heap16::allocate(cap as u16)?;
+                    let (scan, count) = classify_into(p.as_ptr(), bytes);
+                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                }
+                Tier::Heap32 => {
+                    let cap = heap32::class_capacity(len);
+                    let p = heap32::allocate(cap as u32, ScanState::Unknown.as_u8(), 0)?;
+                    let (scan, count) = classify_into(p.as_ptr(), bytes);
+                    heap32::set_scan(p, scan.as_u8());
+                    heap32::set_char_count(p, count as u32);
+                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                }
+                Tier::Heap => {
+                    let cap = heap::class_capacity(len);
+                    let p = heap::allocate(cap, len, ScanState::Unknown.as_u8(), 0)?;
+                    let (scan, count) = classify_into(p.as_ptr(), bytes);
+                    heap::set_scan(p, scan.as_u8());
+                    heap::set_char_count(p, count);
+                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                }
+            }
+        }
+    }
 }
 
 /// Rewrite `bytes[first..old_len]` in place as the UTF-8 upgrade of its Latin-1 content, returning the new length.
