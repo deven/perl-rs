@@ -52,67 +52,82 @@ pub const DECODE_MAX: usize = INLINE_MAX * 2;
 /// an atomic byte in the allocation header.  Zero is `UNKNOWN`, the lattice top — the natural zero-initialized state
 /// can never assert a validity claim (§2.2.6).
 pub mod scan {
-    // The numbering, single-sourced: private raw bytes serve as the discriminants of every scan type and as the storage
-    // representation.  Nothing else in the crate speaks these numbers.
-    const UNKNOWN_RAW: u8 = 0;
-    const ASCII_RAW: u8 = 1;
-    const UTF8_LATIN1_RAW: u8 = 2;
-    const UTF8_NON_LATIN1_RAW: u8 = 3;
-    const UTF8_UNKNOWN_RANGE_RAW: u8 = 4;
-    const UTF8_NON_ASCII_RAW: u8 = 5;
-    const EXTENDED_UTF8_RAW: u8 = 6;
-    const MALFORMED_UTF8_RAW: u8 = 7;
-    const NON_ASCII_RAW: u8 = 8;
-
-    /// The scan lattice as a closed type.  Every value a scan byte can legally hold is a variant, so "the byte is a
-    /// valid state" stops being a convention the writers maintain and becomes a fact the loader establishes once:
-    /// [`ScanState::from_u8`] is the single place a raw byte re-enters the type, and it is of the bomb's family.
+    /// The scan lattice as a closed type, and the numbering's single home: the variants carry the discriminants, the
+    /// related enums source theirs symbolically from the variant names, and a private projection module derives
+    /// pattern-position constants — no numeric fact is stated twice (§2.2.4).  Every value a scan byte can legally
+    /// hold is a variant, so "the byte is a valid state" stops being a convention the writers maintain and becomes a
+    /// fact the loader establishes once: [`ScanState::from_u8`] is the single place a raw byte re-enters the type,
+    /// and it is of the bomb's family.  The variants are re-exported, so `scan::Unknown` is the working vocabulary —
+    /// true variant paths, not aliases.
     ///
-    /// The public constants below are typed aliases of the variants, so `match` arms and comparisons written against
-    /// the old vocabulary compile unchanged — the churn of the promotion collapses to the storage seams.
+    /// Each state is an assertion set (§2.2.4).  The two `Maybe` states are the ambiguous twins the slice births
+    /// demand — the strong assertion minus the witness a subrange may exclude — currently unreachable, retained by
+    /// ruling: their births arrive with zero-copy slicing.
     #[repr(u8)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum ScanState {
-        Unknown = UNKNOWN_RAW,
-        Ascii = ASCII_RAW,
-        Latin1 = UTF8_LATIN1_RAW,
-        NonLatin1 = UTF8_NON_LATIN1_RAW,
-        UnknownRange = UTF8_UNKNOWN_RANGE_RAW,
-        ValidNonAscii = UTF8_NON_ASCII_RAW,
-        Extended = EXTENDED_UTF8_RAW,
-        Malformed = MALFORMED_UTF8_RAW,
-        NonAscii = NON_ASCII_RAW,
+        /// Asserts nothing.  Zero-pinned (§2.2.6): fresh headers can never assert a claim.
+        Unknown = 0,
+
+        /// All bytes `0x00`–`0x7F`.  Terminal.
+        Ascii = 1,
+
+        /// Rust-valid, all code points ≤ U+00FF, at least one ≥ U+0080.  Terminal.  Can equal an unflagged string.
+        Utf8Latin1 = 2,
+
+        /// Rust-valid, at least one code point ≥ U+0100.  Terminal.  Cannot equal an unflagged string.
+        Utf8NonLatin1 = 3,
+
+        /// Rust-valid; nothing further known.  Narrows to the range terminals, or to `Utf8NonAscii` via the cheap
+        /// high-bit probe.
+        ValidUtf8 = 4,
+
+        /// Rust-valid, at least one code point ≥ U+0080; Latin-1-range unresolved.  The cheap `is_ascii` probe lands
+        /// here from `ValidUtf8` without paying the full-range lead-byte pass (§2.2.4).
+        Utf8NonAscii = 5,
+
+        /// Perl-decodable, Rust-invalid: contains a code point Rust rejects (a surrogate or ≥ U+110000, each
+        /// ≥ U+0100 — so the beyond-Latin-1 range fact is derivable, and the range predicates lean on it).
+        /// Terminal.  Cannot equal an unflagged string.
+        ExtendedUtf8 = 6,
+
+        /// Violates the encoding patterns; invalid for Rust and perl both (§2.2.4).  Terminal.  Cannot equal an
+        /// unflagged string.
+        MalformedUtf8 = 7,
+
+        /// A high bit is present; validity and range unknown.
+        NonAscii = 8,
+
+        /// Rust-valid, all code points ≤ U+00FF; the non-Ascii witness is not asserted.  Narrows to `Ascii` or
+        /// `Utf8Latin1` — and a failed Ascii probe alone completes it to `Utf8Latin1`, both witnesses then in hand.
+        MaybeUtf8Latin1 = 9,
+
+        /// Perl-decodable; Rust validity and range unasserted.  `is_perl_decodable` answers with no scan; a full
+        /// classification of content honestly in this state can never land on `MalformedUtf8` — that outcome would
+        /// falsify the assertion, and debug builds treat the contradiction as the bomb family does.
+        MaybeExtendedUtf8 = 10,
     }
 
-    /// Completely unknown.  Zero-pinned (§2.2.6): fresh headers can never assert a claim.
-    pub const UNKNOWN: ScanState = ScanState::Unknown;
+    pub use ScanState::*;
 
-    /// Entirely U+0000–U+007F.
-    pub const ASCII: ScanState = ScanState::Ascii;
+    /// Pattern-position projections of the variants: a cast is not a pattern, and a `u8` scrutinee cannot match an
+    /// enum path, so these one-line derivations exist solely for `match` arms over raw bytes.  The variants remain
+    /// the numbering's only home — nothing here states a number.
+    mod raw {
+        use super::ScanState;
 
-    /// Rust-valid, entirely U+0000–U+00FF, non-ASCII.  Can equal an unflagged string.
-    pub const UTF8_LATIN1: ScanState = ScanState::Latin1;
-
-    /// Rust-valid, contains a character ≥ U+0100.  Cannot equal an unflagged string.
-    pub const UTF8_NON_LATIN1: ScanState = ScanState::NonLatin1;
-
-    /// Rust-valid; nothing further known (narrows to ASCII / UTF8_LATIN1 / UTF8_NON_LATIN1, or to UTF8_NON_ASCII via
-    /// the cheap high-bit probe).
-    pub const UTF8_UNKNOWN_RANGE: ScanState = ScanState::UnknownRange;
-
-    /// Rust-valid, known non-ASCII; Latin-1-range unresolved.  The cheap `is_ascii` probe lands here from
-    /// UTF8_UNKNOWN_RANGE without paying the full-range lead-byte pass (§2.2.4).
-    pub const UTF8_NON_ASCII: ScanState = ScanState::ValidNonAscii;
-
-    /// Perl-decodable, Rust-invalid: contains a code point Rust rejects (a surrogate or ≥ U+110000), hence ≥ U+0100.
-    /// Cannot equal an unflagged string.
-    pub const EXTENDED_UTF8: ScanState = ScanState::Extended;
-
-    /// Violates the encoding patterns; invalid for Rust and perl both (§2.2.4).  Cannot equal an unflagged string.
-    pub const MALFORMED_UTF8: ScanState = ScanState::Malformed;
-
-    /// A high bit is present; validity and range unknown.
-    pub const NON_ASCII: ScanState = ScanState::NonAscii;
+        pub const UNKNOWN: u8 = ScanState::Unknown as u8;
+        pub const ASCII: u8 = ScanState::Ascii as u8;
+        pub const UTF8_LATIN1: u8 = ScanState::Utf8Latin1 as u8;
+        pub const UTF8_NON_LATIN1: u8 = ScanState::Utf8NonLatin1 as u8;
+        pub const VALID_UTF8: u8 = ScanState::ValidUtf8 as u8;
+        pub const UTF8_NON_ASCII: u8 = ScanState::Utf8NonAscii as u8;
+        pub const EXTENDED_UTF8: u8 = ScanState::ExtendedUtf8 as u8;
+        pub const MALFORMED_UTF8: u8 = ScanState::MalformedUtf8 as u8;
+        pub const NON_ASCII: u8 = ScanState::NonAscii as u8;
+        pub const MAYBE_UTF8_LATIN1: u8 = ScanState::MaybeUtf8Latin1 as u8;
+        pub const MAYBE_EXTENDED_UTF8: u8 = ScanState::MaybeExtendedUtf8 as u8;
+    }
 
     impl ScanState {
         /// Project to the storage byte, for the atomic scan slots the large tiers keep in their allocations.
@@ -121,48 +136,51 @@ pub mod scan {
             self as u8
         }
 
-        /// The single seam where a storage byte re-enters the type.  Only this crate writes scan bytes and only through
-        /// [`ScanState::as_u8`], so anything else is corruption; of the bomb's family, this reports at the site rather
-        /// than laundering a garbage byte into a legal-looking state.
+        /// The single seam where a storage byte re-enters the type.  Only this crate writes scan bytes and only
+        /// through [`ScanState::as_u8`], so anything else is corruption; of the bomb's family, this reports at the
+        /// site rather than laundering a garbage byte into a legal-looking state.
         pub fn from_u8(byte: u8) -> ScanState {
             match byte {
-                UNKNOWN_RAW => ScanState::Unknown,
-                ASCII_RAW => ScanState::Ascii,
-                UTF8_LATIN1_RAW => ScanState::Latin1,
-                UTF8_NON_LATIN1_RAW => ScanState::NonLatin1,
-                UTF8_UNKNOWN_RANGE_RAW => ScanState::UnknownRange,
-                UTF8_NON_ASCII_RAW => ScanState::ValidNonAscii,
-                EXTENDED_UTF8_RAW => ScanState::Extended,
-                MALFORMED_UTF8_RAW => ScanState::Malformed,
-                NON_ASCII_RAW => ScanState::NonAscii,
+                raw::UNKNOWN => Unknown,
+                raw::ASCII => Ascii,
+                raw::UTF8_LATIN1 => Utf8Latin1,
+                raw::UTF8_NON_LATIN1 => Utf8NonLatin1,
+                raw::VALID_UTF8 => ValidUtf8,
+                raw::UTF8_NON_ASCII => Utf8NonAscii,
+                raw::EXTENDED_UTF8 => ExtendedUtf8,
+                raw::MALFORMED_UTF8 => MalformedUtf8,
+                raw::NON_ASCII => NonAscii,
+                raw::MAYBE_UTF8_LATIN1 => MaybeUtf8Latin1,
+                raw::MAYBE_EXTENDED_UTF8 => MaybeExtendedUtf8,
                 other => panic!("scan byte {other} is not a state: header corruption or a write that bypassed the type"),
             }
         }
 
-        /// The terminal subset, where this state is in it.
+        /// The terminal subset, where this state is in it.  The non-terminal arms are named rather than wildcarded:
+        /// a state added to the lattice must land here by decision, not by omission.
         #[inline]
         pub const fn terminal(self) -> Option<Terminal> {
             match self {
-                ScanState::Ascii => Some(Terminal::Ascii),
-                ScanState::Latin1 => Some(Terminal::Latin1),
-                ScanState::NonLatin1 => Some(Terminal::NonLatin1),
-                ScanState::Extended => Some(Terminal::Extended),
-                ScanState::Malformed => Some(Terminal::Malformed),
-                _ => None,
+                Ascii => Some(Terminal::Ascii),
+                Utf8Latin1 => Some(Terminal::Utf8Latin1),
+                Utf8NonLatin1 => Some(Terminal::Utf8NonLatin1),
+                ExtendedUtf8 => Some(Terminal::ExtendedUtf8),
+                MalformedUtf8 => Some(Terminal::MalformedUtf8),
+                Unknown | ValidUtf8 | Utf8NonAscii | NonAscii | MaybeUtf8Latin1 | MaybeExtendedUtf8 => None,
             }
         }
     }
 
-    /// The valid-range chain as a closed type: the three states known-valid content can classify to, which are the only
-    /// classes `classify_known_valid` can produce and the only ones an `AppendKind::Valid` may carry — a documented
-    /// convention until this type made it a fact.  The chain is totally ordered (ASCII < Latin-1 < non-Latin-1), which
-    /// is what makes the append range join a max; the join lives here so the numbering trick has exactly one home.
+    /// The valid-range chain as a closed type: the three classes known-valid content can classify to, which are the
+    /// only classes `classify_known_valid` can produce and the only ones an `AppendKind::Valid` may carry.  The chain
+    /// is totally ordered (Ascii < Latin-1 < non-Latin-1) with discriminants sourced from the lattice, which is what
+    /// makes the append range join a max.
     #[repr(u8)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum ValidRange {
-        Ascii = ASCII_RAW,
-        Latin1 = UTF8_LATIN1_RAW,
-        NonLatin1 = UTF8_NON_LATIN1_RAW,
+        Ascii = ScanState::Ascii as u8,
+        Latin1 = ScanState::Utf8Latin1 as u8,
+        NonLatin1 = ScanState::Utf8NonLatin1 as u8,
     }
 
     impl ValidRange {
@@ -170,9 +188,9 @@ pub mod scan {
         #[inline]
         pub const fn widen(self) -> ScanState {
             match self {
-                ValidRange::Ascii => ScanState::Ascii,
-                ValidRange::Latin1 => ScanState::Latin1,
-                ValidRange::NonLatin1 => ScanState::NonLatin1,
+                ValidRange::Ascii => Ascii,
+                ValidRange::Latin1 => Utf8Latin1,
+                ValidRange::NonLatin1 => Utf8NonLatin1,
             }
         }
 
@@ -187,20 +205,20 @@ pub mod scan {
     ///
     /// The small tiers' envelopes hold this type rather than the raw `u8`, and that is the enforcement of §2.2.3's
     /// eager rule: with no allocation slot to record a later discovery, a small tier holding an indeterminate state
-    /// would re-derive on every read forever, so the states that need narrowing are not merely rejected below 64 KiB —
-    /// they are unrepresentable there.  Writing `UNKNOWN` into a small envelope is a type error, which is how the
-    /// defect this type answers was written twice (the in-place downgrade, and the raw-byte append transition) before
-    /// the compiler was given the means to refuse it.
+    /// would re-derive on every read forever, so the states that need narrowing are not merely rejected below 64 KiB
+    /// — they are unrepresentable there.  Writing `Unknown` into a small envelope is a type error, which is how the
+    /// defect this type answers was written twice (the in-place downgrade, and the raw-byte append transition)
+    /// before the compiler was given the means to refuse it.
     ///
-    /// Discriminants equal the lattice constants, pinned by the asserts below, so projection is a cast.
+    /// Discriminants are sourced from the lattice's variants, so projection is a cast.
     #[repr(u8)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Terminal {
-        Ascii = ASCII_RAW,
-        Latin1 = UTF8_LATIN1_RAW,
-        NonLatin1 = UTF8_NON_LATIN1_RAW,
-        Extended = EXTENDED_UTF8_RAW,
-        Malformed = MALFORMED_UTF8_RAW,
+        Ascii = ScanState::Ascii as u8,
+        Utf8Latin1 = ScanState::Utf8Latin1 as u8,
+        Utf8NonLatin1 = ScanState::Utf8NonLatin1 as u8,
+        ExtendedUtf8 = ScanState::ExtendedUtf8 as u8,
+        MalformedUtf8 = ScanState::MalformedUtf8 as u8,
     }
 
     impl Terminal {
@@ -208,11 +226,11 @@ pub mod scan {
         #[inline]
         pub const fn widen(self) -> ScanState {
             match self {
-                Terminal::Ascii => ScanState::Ascii,
-                Terminal::Latin1 => ScanState::Latin1,
-                Terminal::NonLatin1 => ScanState::NonLatin1,
-                Terminal::Extended => ScanState::Extended,
-                Terminal::Malformed => ScanState::Malformed,
+                Terminal::Ascii => Ascii,
+                Terminal::Utf8Latin1 => Utf8Latin1,
+                Terminal::Utf8NonLatin1 => Utf8NonLatin1,
+                Terminal::ExtendedUtf8 => ExtendedUtf8,
+                Terminal::MalformedUtf8 => MalformedUtf8,
             }
         }
 
@@ -227,22 +245,23 @@ pub mod scan {
         }
     }
 
-    /// Rust-valid ⟺ 1..=5 under the numbering (§2.2.4).
+    /// Rust-valid: the states whose assertion includes it (§2.2.4).
     #[inline]
     pub const fn is_rust_valid(state: ScanState) -> bool {
-        matches!(state, ASCII | UTF8_LATIN1 | UTF8_NON_LATIN1 | UTF8_UNKNOWN_RANGE | UTF8_NON_ASCII)
+        matches!(state, Ascii | Utf8Latin1 | MaybeUtf8Latin1 | Utf8NonLatin1 | ValidUtf8 | Utf8NonAscii)
     }
 
-    /// Perl-decodable: every Rust-valid state plus the extended forms perl accepts.
+    /// Perl-decodable: every Rust-valid state plus the extended forms perl accepts, asserted or possible-with-proof.
     #[inline]
     pub const fn is_perl_decodable(state: ScanState) -> bool {
-        matches!(state, ASCII | UTF8_LATIN1 | UTF8_NON_LATIN1 | UTF8_UNKNOWN_RANGE | UTF8_NON_ASCII | EXTENDED_UTF8)
+        matches!(state, Ascii | Utf8Latin1 | MaybeUtf8Latin1 | Utf8NonLatin1 | ValidUtf8 | Utf8NonAscii | ExtendedUtf8 | MaybeExtendedUtf8)
     }
 
-    /// Known entirely ≤ U+00FF (downgradable).
+    /// Known entirely ≤ U+00FF (downgradable).  `MaybeUtf8Latin1` qualifies: the range bound is asserted even where
+    /// the non-Ascii witness is not.
     #[inline]
     pub const fn is_known_latin1_range(state: ScanState) -> bool {
-        matches!(state, ASCII | UTF8_LATIN1)
+        matches!(state, Ascii | Utf8Latin1 | MaybeUtf8Latin1)
     }
 
     /// Fully-scanned terminal classification (§2.2.4): mutually exclusive byte-content classes.
@@ -251,16 +270,16 @@ pub mod scan {
         state.terminal().is_some()
     }
 
-    /// Known non-ASCII (a high bit is known used).
+    /// Known non-ASCII (a high bit is known used).  The `Maybe` states do not assert their witnesses.
     #[inline]
     pub const fn is_known_non_ascii(state: ScanState) -> bool {
-        !matches!(state, UNKNOWN | ASCII | UTF8_UNKNOWN_RANGE)
+        !matches!(state, Unknown | Ascii | ValidUtf8 | MaybeUtf8Latin1 | MaybeExtendedUtf8)
     }
 
     /// Known to contain a character ≥ U+0100.
     #[inline]
     pub const fn is_known_beyond_latin1(state: ScanState) -> bool {
-        matches!(state, UTF8_NON_LATIN1 | EXTENDED_UTF8)
+        matches!(state, Utf8NonLatin1 | ExtendedUtf8)
     }
 }
 
@@ -427,7 +446,7 @@ fn classify_walk(bytes: &[u8], sink: &mut impl ScanSink) -> (scan::Terminal, usi
             None => {
                 // The copy completes even though classification stops: malformed content is still content.
                 sink.emit(bytes, pos, bytes.len());
-                return (scan::Terminal::Malformed, 0);
+                return (scan::Terminal::MalformedUtf8, 0);
             }
         }
     }
@@ -447,11 +466,11 @@ struct ScanFacts {
 impl ScanFacts {
     fn state(&self) -> scan::Terminal {
         if self.saw_rust_rejected {
-            scan::Terminal::Extended
+            scan::Terminal::ExtendedUtf8
         } else if self.saw_beyond_latin1 {
-            scan::Terminal::NonLatin1
+            scan::Terminal::Utf8NonLatin1
         } else if self.saw_multibyte {
-            scan::Terminal::Latin1
+            scan::Terminal::Utf8Latin1
         } else {
             scan::Terminal::Ascii
         }
@@ -960,18 +979,18 @@ macro_rules! define_perl_string {
                         unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u8;
                         *count = old_len as u8;
-                        *scan = scan::Terminal::Latin1;
+                        *scan = scan::Terminal::Utf8Latin1;
                     }, )*
                     $( Repr::$heap16 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
                         *len = new_len as u16;
                         *count = old_len as u16;
-                        *scan = scan::Terminal::Latin1;
+                        *scan = scan::Terminal::Utf8Latin1;
                     }, )*
                     $( Repr::$heap32 { ptr, len } => {
                         unsafe {
                             cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
-                            cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1.as_u8());
+                            cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::Utf8Latin1.as_u8());
                             cow_buffer::heap32::set_char_count(ptr.as_ptr(), old_len as u32);
                         }
                         *len = new_len as u32;
@@ -979,7 +998,7 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { ptr } => unsafe {
                         cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
                         cow_buffer::heap::set_len(ptr.as_ptr(), new_len);
-                        cow_buffer::heap::set_scan(ptr.as_ptr(), scan::UTF8_LATIN1.as_u8());
+                        cow_buffer::heap::set_scan(ptr.as_ptr(), scan::Utf8Latin1.as_u8());
                         cow_buffer::heap::set_char_count(ptr.as_ptr(), old_len);
                     }, )*
                     _ => return None,
@@ -1042,7 +1061,7 @@ macro_rules! define_perl_string {
                     $( Repr::$heap32 { ptr, len } => {
                         unsafe {
                             cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
-                            cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::UNKNOWN.as_u8());
+                            cow_buffer::heap32::set_scan(ptr.as_ptr(), scan::Unknown.as_u8());
                             cow_buffer::heap32::set_char_count(ptr.as_ptr(), 0);
                         }
                         *len = new_len as u32;
@@ -1050,7 +1069,7 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { ptr } => unsafe {
                         cow_buffer::contract_latin1_in_place(ptr.as_ptr(), first, old_len, new_len);
                         cow_buffer::heap::set_len(ptr.as_ptr(), new_len);
-                        cow_buffer::heap::set_scan(ptr.as_ptr(), scan::UNKNOWN.as_u8());
+                        cow_buffer::heap::set_scan(ptr.as_ptr(), scan::Unknown.as_u8());
                         cow_buffer::heap::set_char_count(ptr.as_ptr(), 0usize);
                     }, )*
                     _ => return None,
@@ -1494,8 +1513,8 @@ fn classify_inline(bytes: &[u8]) -> Option<(InlineClass, usize, usize, [u8; INLI
     }
 
     let (class, aux) = match classify_full(bytes) {
-        (scan::Terminal::NonLatin1, chars) => (InlineClass::NonLatin1, chars),
-        (scan::Terminal::Extended, chars) => (InlineClass::Extended, chars),
+        (scan::Terminal::Utf8NonLatin1, chars) => (InlineClass::NonLatin1, chars),
+        (scan::Terminal::ExtendedUtf8, chars) => (InlineClass::Extended, chars),
 
         // ASCII and Latin-1-range content took the compressed branch above; what remains is the Bytes residual.
         _ => (InlineClass::Bytes, 0),
@@ -1542,7 +1561,7 @@ impl PerlString {
                 let (class, chars) = unsafe { classify_known_valid_into(dst, src) };
                 (class.widen(), chars)
             })?;
-            let ascii = parts.scan == scan::ASCII;
+            let ascii = parts.scan == scan::Ascii;
 
             Ok(PerlString::build_heap(!ascii, false, parts))
         }
@@ -1721,7 +1740,7 @@ impl PerlString {
                     // SAFETY: these lattice states certify prior successful validation of these exact bytes (states
                     // only narrow; mutation resets to UNKNOWN).
                     st if scan::is_rust_valid(st) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
-                    scan::MALFORMED_UTF8 | scan::EXTENDED_UTF8 => None,
+                    scan::MalformedUtf8 | scan::ExtendedUtf8 => None,
                     _ => {
                         let (st, chars) = classify_full(bytes); // one pass: validity (both tiers) + range + count
                         let st = st.widen();
@@ -1753,16 +1772,16 @@ impl PerlString {
             // content — unlike the inline forms, whose bytes are whatever they are.
             RawParts::Packed(_) => true,
             RawParts::Heap(cb) => match cb.scan() {
-                scan::ASCII => true,
-                scan::UTF8_LATIN1 | scan::UTF8_NON_LATIN1 | scan::UTF8_NON_ASCII | scan::MALFORMED_UTF8 | scan::NON_ASCII | scan::EXTENDED_UTF8 => false,
-                scan::UTF8_UNKNOWN_RANGE => {
+                scan::Ascii => true,
+                scan::Utf8Latin1 | scan::Utf8NonLatin1 | scan::Utf8NonAscii | scan::MalformedUtf8 | scan::NonAscii | scan::ExtendedUtf8 => false,
+                scan::ValidUtf8 => {
                     // Cheap probe: bail at the first high bit; range stays deferred (§2.2.4/§2.2.5).
                     let ascii = cb.as_slice().iter().all(|b| {
                         count_probe_byte();
                         b.is_ascii()
                     });
 
-                    cb.narrow_scan(if ascii { scan::ASCII } else { scan::UTF8_NON_ASCII });
+                    cb.narrow_scan(if ascii { scan::Ascii } else { scan::Utf8NonAscii });
 
                     ascii
                 }
@@ -1772,7 +1791,7 @@ impl PerlString {
                         b.is_ascii()
                     });
 
-                    cb.narrow_scan(if ascii { scan::ASCII } else { scan::NON_ASCII });
+                    cb.narrow_scan(if ascii { scan::Ascii } else { scan::NonAscii });
 
                     ascii
                 }
@@ -1786,9 +1805,9 @@ impl PerlString {
         match self.raw_parts() {
             RawParts::Inline { .. } => match self.inline_class() {
                 Some(st) => inline_scan_to_heap(st),
-                None => scan::UNKNOWN, // unreachable by construction
+                None => scan::Unknown, // unreachable by construction
             },
-            RawParts::Packed(_) => scan::ASCII,
+            RawParts::Packed(_) => scan::Ascii,
             RawParts::Heap(cb) => cb.scan(),
         }
     }
@@ -1801,7 +1820,7 @@ impl PerlString {
             RawParts::Packed(_) => true, // ASCII is valid under every reading.
             RawParts::Heap(cb) => match cb.scan() {
                 st if scan::is_perl_decodable(st) => true,
-                scan::MALFORMED_UTF8 => false,
+                scan::MalformedUtf8 => false,
                 _ => {
                     let (st, chars) = classify_full(cb.as_slice()); // the single pass
                     let st = st.widen();
@@ -1840,8 +1859,8 @@ impl PerlString {
             }
             RawParts::Heap(cb) => match cb.scan() {
                 _ if cb.is_empty() => Some(0), // Zero bytes hold zero characters: the count field is never consulted.
-                scan::ASCII => Some(cb.len()),
-                scan::MALFORMED_UTF8 => None,
+                scan::Ascii => Some(cb.len()),
+                scan::MalformedUtf8 => None,
                 _ => {
                     let cached = cb.char_count();
                     if cached > 0 {
@@ -1852,7 +1871,7 @@ impl PerlString {
                     let st = st.widen();
                     cb.narrow_scan(st);
 
-                    if st == scan::MALFORMED_UTF8 {
+                    if st == scan::MalformedUtf8 {
                         None
                     } else {
                         cb.set_char_count(chars);
@@ -1910,7 +1929,7 @@ impl PerlString {
         // a capacity check and two cache-invalidating atomic stores per input byte, and would rewrite an invariant
         // prefix the buffer can copy wholesale.
         let upgraded = cow_buffer::upgraded_bytes(internal)?;
-        let parts = HeapParts::from_slice(&upgraded, scan::UTF8_LATIN1, internal.len())?;
+        let parts = HeapParts::from_slice(&upgraded, scan::Utf8Latin1, internal.len())?;
 
         Ok(PerlString::build_heap(true, t, parts))
     }
@@ -2185,7 +2204,7 @@ impl PerlString {
                     joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
                     joined.extend_from_slice(old_bytes);
                     joined.extend_from_slice(bytes);
-                    let state = append_transition_heap(scan::ASCII, kind);
+                    let state = append_transition_heap(scan::Ascii, kind);
                     PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
                 }
             }
@@ -2281,11 +2300,11 @@ enum AppendKind {
 
 fn inline_scan_to_heap(s: InlineClass) -> scan::ScanState {
     match s {
-        InlineClass::Ascii => scan::ASCII,
-        InlineClass::Latin1 => scan::UTF8_LATIN1,
-        InlineClass::NonLatin1 => scan::UTF8_NON_LATIN1,
-        InlineClass::Extended => scan::EXTENDED_UTF8,
-        InlineClass::Bytes => scan::MALFORMED_UTF8,
+        InlineClass::Ascii => scan::Ascii,
+        InlineClass::Latin1 => scan::Utf8Latin1,
+        InlineClass::NonLatin1 => scan::Utf8NonLatin1,
+        InlineClass::Extended => scan::ExtendedUtf8,
+        InlineClass::Bytes => scan::MalformedUtf8,
     }
 }
 
@@ -2298,22 +2317,30 @@ fn append_transition_heap(prior: scan::ScanState, kind: AppendKind) -> scan::Sca
         AppendKind::Valid { class, .. } => match prior {
             // Valid + valid: the range join (§2.2.5), total on the chain and typed there.
             ScanState::Ascii => ValidRange::Ascii.join(class).widen(),
-            ScanState::Latin1 => ValidRange::Latin1.join(class).widen(),
-            ScanState::NonLatin1 => ValidRange::NonLatin1.join(class).widen(),
+            ScanState::Utf8Latin1 => ValidRange::Latin1.join(class).widen(),
+            ScanState::Utf8NonLatin1 => ValidRange::NonLatin1.join(class).widen(),
 
             // Range-unresolved priors: the addition can prove non-ASCII or beyond-Latin-1, never below.
-            ScanState::UnknownRange if class == ValidRange::NonLatin1 => ScanState::NonLatin1,
-            ScanState::UnknownRange => ScanState::ValidNonAscii,
-            ScanState::ValidNonAscii if class == ValidRange::NonLatin1 => ScanState::NonLatin1,
-            ScanState::ValidNonAscii => ScanState::ValidNonAscii,
+            ScanState::ValidUtf8 if class == ValidRange::NonLatin1 => ScanState::Utf8NonLatin1,
+            ScanState::ValidUtf8 => ScanState::Utf8NonAscii,
+            ScanState::Utf8NonAscii if class == ValidRange::NonLatin1 => ScanState::Utf8NonLatin1,
+            ScanState::Utf8NonAscii => ScanState::Utf8NonAscii,
 
             // Perl-decodable onto extended: the Rust-rejected code point is still there.
-            ScanState::Extended => ScanState::Extended,
+            ScanState::ExtendedUtf8 => ScanState::ExtendedUtf8,
+
+            // The ambiguous twins (§2.2.4): appended Latin-1-class content supplies exactly the witness
+            // `MaybeUtf8Latin1` lacks, completing it; NonLatin1-class content proves the stronger terminal outright.
+            // `MaybeExtendedUtf8` stays — appended Rust-valid content resolves nothing about the extended code
+            // points that may already be present.
+            ScanState::MaybeUtf8Latin1 if class == ValidRange::NonLatin1 => ScanState::Utf8NonLatin1,
+            ScanState::MaybeUtf8Latin1 => ScanState::Utf8Latin1,
+            ScanState::MaybeExtendedUtf8 => ScanState::MaybeExtendedUtf8,
 
             // Prior validity unknown or invalid: fallback, lazily recoverable above 64 KiB and reclassified below
             // (§2.2.3's funnel).  Named rather than wildcarded: an indeterminate-state defect once hid in a `_` arm
             // here, and a tenth state added to the lattice must land here by decision, not by omission.
-            ScanState::Unknown | ScanState::Malformed | ScanState::NonAscii => ScanState::Unknown,
+            ScanState::Unknown | ScanState::MalformedUtf8 | ScanState::NonAscii => ScanState::Unknown,
         },
         AppendKind::Unknown => ScanState::Unknown,
     }
@@ -2623,19 +2650,19 @@ impl PartialEq for PerlString {
             return false; // character count never exceeds byte count
         }
 
-        if (sf == scan::UTF8_LATIN1 || sf == scan::UTF8_NON_ASCII) && plain.len() == flagged.len() {
+        if (sf == scan::Utf8Latin1 || sf == scan::Utf8NonAscii) && plain.len() == flagged.len() {
             grid_hit!();
             return false; // a multi-byte sequence forces char count < byte count
         }
 
         // Grid row 3: ASCII vs known-non-ASCII, either orientation.
-        if (sf == scan::ASCII && scan::is_known_non_ascii(sp)) || (sp == scan::ASCII && scan::is_known_non_ascii(sf)) {
+        if (sf == scan::Ascii && scan::is_known_non_ascii(sp)) || (sp == scan::Ascii && scan::is_known_non_ascii(sf)) {
             grid_hit!();
             return false;
         }
 
         // Grid row 4: cross-flag range disjointness and the malformed rule.
-        if scan::is_known_beyond_latin1(sf) || sf == scan::MALFORMED_UTF8 {
+        if scan::is_known_beyond_latin1(sf) || sf == scan::MalformedUtf8 {
             grid_hit!();
             return false;
         }
@@ -2717,11 +2744,11 @@ impl PartialEq for PerlString {
 
         // Completed walk: equality proven, and with it both sides' range (all characters ≤ U+00FF).
         if let RawParts::Heap(cb) = flagged.raw_parts() {
-            cb.narrow_scan(if saw_non_ascii { scan::UTF8_LATIN1 } else { scan::ASCII });
+            cb.narrow_scan(if saw_non_ascii { scan::Utf8Latin1 } else { scan::Ascii });
         }
 
         if let RawParts::Heap(cb) = plain.raw_parts() {
-            cb.narrow_scan(if saw_non_ascii { scan::NON_ASCII } else { scan::ASCII });
+            cb.narrow_scan(if saw_non_ascii { scan::NonAscii } else { scan::Ascii });
         }
 
         true
@@ -2831,7 +2858,7 @@ impl PerlString {
         let bytes = self.as_bytes(&mut scratch);
 
         // Unflagged, or flagged with known-ASCII content: the raw bytes ARE the canonical downgraded form.
-        if !self.is_utf8() || self.scan_state() == scan::ASCII {
+        if !self.is_utf8() || self.scan_state() == scan::Ascii {
             let mut feed = ChunkFeed::new(hasher());
             feed.extend(bytes);
             return feed.finish();
@@ -2839,7 +2866,7 @@ impl PerlString {
 
         match self.scan_state() {
             // Known Latin-1 range: single decode-emit pass over the downgraded characters.
-            scan::UTF8_LATIN1 => {
+            scan::Utf8Latin1 => {
                 count_full_scan();
                 let mut feed = ChunkFeed::new(hasher());
                 let mut facts = ScanFacts::default();
@@ -2848,7 +2875,7 @@ impl PerlString {
             }
 
             // Known beyond Latin-1 or invalid: the raw bytes are the canonical form.
-            st if scan::is_known_beyond_latin1(st) || st == scan::MALFORMED_UTF8 => {
+            st if scan::is_known_beyond_latin1(st) || st == scan::MalformedUtf8 => {
                 let mut feed = ChunkFeed::new(hasher());
                 feed.extend(bytes);
                 feed.finish()
@@ -2908,7 +2935,7 @@ impl PerlString {
                 // The pass classified the content — keep the knowledge (heap only; inline is terminal at birth).
                 if let RawParts::Heap(cb) = self.raw_parts() {
                     if malformed {
-                        cb.narrow_scan(scan::MALFORMED_UTF8);
+                        cb.narrow_scan(scan::MalformedUtf8);
                     } else {
                         cb.narrow_scan(facts.state().widen());
                         if facts.chars > 0 {
