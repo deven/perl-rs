@@ -525,8 +525,40 @@ Details:
   precisely the case where the copy hurts most.
 
   Writing to any of these four copies out to a mutable tier,
-  since without a refcount uniqueness is unprovable.  Teardown
-  frees the immortal slab and never touches the image.
+  since without a refcount uniqueness is unprovable — and no
+  access level changes that: `&mut` on a handle proves exclusive
+  access to the envelope, never to bytes other bitwise-copied
+  handles share, and image bytes cannot be written at all.  All
+  four are readonly by nature, so the scan byte is set to a
+  terminal state during construction and never changed [DECISION]:
+  construction already touches every byte, classification rides
+  that pass nearly free, and a per-handle cache that cannot
+  propagate narrowing is worthless as a lazy cache anyway.
+
+  Mutability for immortal content exists only before the value
+  does [DECISION].  The slab's builder holds exclusive access to
+  slab bytes while no handle yet exists; `finish` classifies,
+  seals, and returns the first handle — mutability ends exactly
+  where handles begin, enforced by construction rather than by any
+  runtime state.  A second door, `immortalize`, admits content
+  built elsewhere by copying it into the builder: one copy,
+  unavoidable because teardown must own the bytes, and cheap
+  against slab-lifetime amortization (the compiler's constant
+  folding is the canonical customer).  Blessing an existing tier
+  buffer in place is ruled out: its bytes have the wrong allocator
+  provenance for the slab's teardown, its header would leak or
+  need a free the never-freed contract does not perform, and
+  sharers already holding refcounted views cannot be revoked.
+
+  The forms are not interpreter-bound [DECISION].  `Immortal`'s
+  contract is slab-*owner* lifetime — the bytes outlive every
+  handle and are freed by whoever owns the slab — with the
+  interpreter merely the canonical owner; a Rust utility user
+  owning an interner or arena is an equally legitimate one, and
+  `immortalize` is exactly an interner's admit operation.
+  `Static` serves any `&'static` data with allocation-free,
+  copy-cheap handles.  Teardown frees the immortal slab and never
+  touches the image.
 - **Clone** is a relaxed refcount increment (`clone_cow` in the
   original design's vocabulary; the mechanism carried forward from
   its `Bytes`/`BytesMut` model).  **Mutation**: unique → mutate in
@@ -541,6 +573,16 @@ Details:
   than when a buffer becomes shared: the break is already copying,
   so the trim is free there, where trimming at the share would add
   a copy that a subsequent append then pays for twice.
+
+  **Classification rides every copy [DECISION].**  Whenever
+  content is copied and its terminal state is not already known,
+  the copying path determines it: the bytes are in cache, the
+  classifying pass fuses with the copy nearly free, and the result
+  is born settled instead of deferring a full-price scan to some
+  later reader.  This retires lazy `UNKNOWN` births on every
+  copying constructor at every size; lazy discovery remains only
+  where nothing is copied — the in-place transitions on the large
+  tiers, whose shared scan slot exists for exactly that remainder.
 
   The size class is *asked, not guessed* [DECISION]: buffers come
   from a jemalloc instance (the `tikv-jemalloc-sys` family — the
@@ -671,13 +713,17 @@ nearly free.  Discriminant-state arithmetic under the fused
 variants (§2.2.9): inline 5 (class) × 2 (family) × 2 (utf8) ×
 2 (tainted) = 40; packed 3 (alphabet) × 2 (family) × 2 × 2 = 24
 (the class is fixed — packed alphabets are ASCII by
-construction); heap 2 × 2 = 4, its class living in the buffer
-header rather than the tag.  68 string encodings, the flag axis
+construction); heap 4 (tier) × 2 × 2 = 16, plus the Ascii twins
+of the smaller two tiers (2 × 4 = 8) and the four immortal forms
+(4 × 4 = 16) — the tier class otherwise living in the buffer
+header rather than the tag.  104 string encodings, the flag axis
 being utf8 and tainted only since the numification warning is
 suppressed by a cached numeric face rather than a tag bit
-(§2.3.4).  That plus the non-string residents leaves the
-enclosing `Value`/`ScalarCell` layouts (§2.3.6) most of the
-discriminant space.
+(§2.3.4): a third flag axis would double the string count past
+200 before the non-string residents, which is the whole budget.
+That plus the non-string residents still leaves the enclosing
+`Value`/`ScalarCell` layouts (§2.3.6) most of the discriminant
+space.
 
 **The Perl flag and the scan cache must never be conflated.**
 Verified against container perl 5.38: `chr(0x110000)` is legal core
