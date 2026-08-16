@@ -56,3 +56,4 @@ pub mod heap;
 pub mod scalar;
 pub mod string;
 pub mod value;
+pub mod warnings;

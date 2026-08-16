@@ -2059,6 +2059,27 @@ Container-verified contract (perl 5.38, all under `-w`):
   Category bits, FATALization, and `$SIG{__WARN__}` dispatch
   remain interpreter logic.
 
+- The diagnostics architecture, crate-wide [DECISION]: perl's
+  81-category warning tree is `perl-core` vocabulary — a
+  `WarningCategory` enum extracted from 5.44.0's
+  `regen/warnings.pl` joined with `%warnings::Offsets`, its
+  discriminants perl's own bit numbers so pragma bit vectors
+  index by discriminant, its 28-strong default-enabled set
+  cross-checked against `$warnings::DEFAULT`, the tree walkable
+  through `parent` — while the *messages* live in the crate that
+  generates them, one warning enum per crate, aggregated by
+  consumers through wrapper enums with `From` impls and
+  delegating `Display`.  Every warning enum speaks the
+  `PerlWarning` trait: perl-exact `Display` of the body, the
+  gating category, and `for_each_part` decomposing compounds —
+  a compound spans categories, and emission gates each part by
+  its own, so the parts visit as singletons in emission order.
+  FATALization is promotion at emit time: a FATALized warning
+  stays typed as a warning and the interpreter routes it to the
+  die path — policy, not type.  Error (die-class) messages
+  follow the same per-crate, byte-exact-`Display` discipline on
+  the `Result` channel.
+
 - The fragment law, two regimes by flag (probed and read from
   `S_sv_display`): *unflagged* walks bytes with output cap 56
   (buffer 64 − 8, checked before each byte, the last expansion

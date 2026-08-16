@@ -9,6 +9,7 @@
 use crate::cow_buffer::AllocError;
 use crate::string::{DECODE_MAX, PerlString};
 use crate::value::{DualPayload, Numeric, ScalarPayload, Tainted};
+use crate::warnings::{PerlWarning, WarningCategory};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::mem;
@@ -528,6 +529,37 @@ impl fmt::Display for NumifyWarning {
                 fmt_non_portable(f, *base)
             }
             NumifyWarning::Uninitialized => write!(f, "Use of uninitialized value"),
+        }
+    }
+}
+
+impl PerlWarning for NumifyWarning {
+    fn category(&self) -> WarningCategory {
+        match self {
+            NumifyWarning::NotNumeric { .. } | NumifyWarning::NotIncrementable { .. } => WarningCategory::Numeric,
+            NumifyWarning::LostPrecision { .. } => WarningCategory::Imprecision,
+            NumifyWarning::IllegalDigit { .. } => WarningCategory::Digit,
+            NumifyWarning::Overflow { .. } => WarningCategory::Overflow,
+            NumifyWarning::NonPortable { .. } => WarningCategory::Portable,
+            NumifyWarning::Uninitialized => WarningCategory::Uninitialized,
+
+            // A compound's own category is its first part's; per-part gating goes through for_each_part.
+            NumifyWarning::OverflowThenIllegalDigit { .. } => WarningCategory::Overflow,
+            NumifyWarning::IllegalDigitThenNonPortable { .. } => WarningCategory::Digit,
+        }
+    }
+
+    fn for_each_part(&self, mut f: impl FnMut(&Self)) {
+        match self {
+            NumifyWarning::OverflowThenIllegalDigit { base, digit } => {
+                f(&NumifyWarning::Overflow { base: *base });
+                f(&NumifyWarning::IllegalDigit { base: *base, digit: *digit });
+            }
+            NumifyWarning::IllegalDigitThenNonPortable { base, digit } => {
+                f(&NumifyWarning::IllegalDigit { base: *base, digit: *digit });
+                f(&NumifyWarning::NonPortable { base: *base });
+            }
+            _ => f(self),
         }
     }
 }
