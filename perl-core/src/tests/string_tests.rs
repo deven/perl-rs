@@ -1151,6 +1151,48 @@ fn char_count_shared_across_cow_sharers() {
 
 // ── COW behavior through the string layer ─────────────────────
 #[test]
+fn large_immortal_forms_share_a_leaked_header_and_read_zero_copy() {
+    // Past the compact ceiling: one leaked header, zero tier allocations, facts settled at birth.  The image here is
+    // itself leaked — the test standing in for a program's large embedded literal.
+    let big: &'static [u8] = Box::leak(b"z".repeat(U24_TEST_CEILING + 3).into_boxed_slice());
+    let live = cow_buffer::live::count();
+    let s = PerlString::from_static_bytes(big).unwrap();
+    assert_eq!(s.storage_type(), StorageType::LargeStatic);
+    assert_eq!(s.scan_state(), scan::Ascii);
+    assert_eq!(s.len(), big.len());
+    assert_eq!(s.char_len(), Some(big.len()));
+    assert!(s.is_ascii() && !s.is_shared());
+
+    // Bitwise clones share the header; teardown touches neither header nor image, and the tier counter never moves.
+    let c = s.clone();
+    assert_eq!(c.len(), s.len());
+
+    // A flag flip points a fresh envelope at the same shared header: still large, still zero-copy.
+    let mut f = c.clone();
+    f.set_utf8_for_test();
+    assert_eq!(f.storage_type(), StorageType::LargeStatic);
+    assert!(f.is_utf8());
+    drop(f);
+    drop(c);
+    drop(s);
+    assert_eq!(cow_buffer::live::count(), live, "no tier allocation anywhere in the large form's life");
+
+    // The unsafe immortal door at large size, and copy-out on write: the append lands in a tier, the image and its
+    // other handles untouched.
+    // SAFETY: leaked memory outlives every handle and nothing writes it.
+    let im = unsafe { PerlString::from_immortal_bytes(big) }.unwrap();
+    assert_eq!(im.storage_type(), StorageType::LargeImmortal);
+    let mut w = im.clone();
+    w.push_str("!").unwrap();
+    assert_eq!(w.len(), big.len() + 1);
+    assert!(w.storage_type().is_heap(), "the write landed in a tier");
+    assert_eq!(im.len(), big.len(), "the image and its other handles are untouched");
+}
+
+/// One past the compact ceiling, kept as a named constant so the test reads as what it is.
+const U24_TEST_CEILING: usize = 0xFF_FFFF;
+
+#[test]
 fn ascii_twins_are_the_class_specific_selection_with_derived_facts() {
     // Both tiers route settled-Ascii births to their twin, whose omitted count and scan are derived: every byte a
     // character, the class in the variant.

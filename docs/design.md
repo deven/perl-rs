@@ -516,9 +516,19 @@ Details:
   header at all*.  `LargeImmortal` and `LargeStatic` carry the
   remainder [DECISION]: the envelope points at a small header
   holding a word-width length, character count and scan state, and
-  for `LargeStatic` a second pointer to the image bytes, which it
-  cannot prepend a header to.  That header is ours, so teardown
-  frees it and leaves the image untouched — nothing is leaked.
+  a pointer to the image bytes, which neither form can prepend a
+  header to.  The header is shared by every bitwise clone and
+  deliberately leaked when ownerless [DECISION]: handles cannot
+  free what they share without the refcount these forms decline,
+  so ownership belongs above them, decided at construction.  The
+  plain doors mint ownerless headers that leak for the process's
+  life — the Arc-precedent stance ruled for ownerless cycles —
+  while a domain door mints slab-tracked ones the owner's
+  teardown frees, whether that owner is the interpreter's domain
+  or one a standalone-crate user creates; the constructor's
+  warranty (the owner frees only after the last handle is gone)
+  is what makes freeing shared headers sound.  Teardown leaves
+  the image untouched either way.
   Both are expected to be rare, which argues for having them
   rather than against: refusing content past 16 MiB would force a
   caller with a large embedded literal to copy it, and that is
@@ -1429,16 +1439,17 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   reclassifies (a lone `E9` stays bytes-class, now flagged).
 
   **The storage types are the normative vocabulary.**  The
-  twenty-one base variants — `InlineAscii`, `InlineLatin1`,
+  twenty-three base variants — `InlineAscii`, `InlineLatin1`,
   `InlineNonLatin1`, `InlineExtended`, `InlineBytes`,
   `PackedNumeric`, `PackedDateTimePlus`, and
   `PackedDateTimeZulu`, each beside its `Full` family twin;
   `Heap8` and `Heap16`, each beside its Ascii twin (§2.2.3);
-  `Heap32` and `Heap`; and the immortal pair `Immortal` and
-  `Static` (§2.2.3), constructed explicitly and never canonically
-  selected — are reified as `StorageType`: twenty-one values
-  dense from zero, which is the niche budget's requirement
-  (§2.2.3), with every coarse question a projection on it.  The
+  `Heap32` and `Heap`; and the immortal quartet `Immortal`,
+  `Static`, `LargeImmortal`, and `LargeStatic` (§2.2.3),
+  constructed explicitly and never canonically selected — are
+  reified as `StorageType`: twenty-three values dense from zero,
+  which is the niche budget's requirement (§2.2.3), with every
+  coarse question a projection on it.  The
   declaration order is itself the selection [DECISION]: canonical
   selection takes the first type, in this order, able to
   represent the content — first-fit is the ladder — which is what

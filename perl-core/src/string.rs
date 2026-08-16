@@ -647,10 +647,10 @@ enum InlineClass {
     Bytes,
 }
 
-/// The storage type: the twenty-one-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
-/// the discriminant is this type times the three flag bits.  Coarse questions are the projection methods.  Declaration
-/// order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able to represent
-/// the content — first-fit is the ladder — which is what the derived `Ord` means.
+/// The storage type: the twenty-three-value normative vocabulary (§2.2.9), one value per base variant of the folded
+/// tag — the discriminant is this type times the three flag bits.  Coarse questions are the projection methods.
+/// Declaration order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able to
+/// represent the content — first-fit is the ladder — which is what the derived `Ord` means.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum StorageType {
     /// Inline, ≤ [`INLINE_MAX`] payload bytes, no allocation: the five content classes, each beside its full-capacity
@@ -733,6 +733,12 @@ pub enum StorageType {
     /// A `'static` image (§2.2.3): the program's bytes, alive forever.  Constructed explicitly, never canonically
     /// selected.
     Static,
+
+    /// An immortal image past the compact ceiling (§2.2.3): the envelope points at a shared, leaked side header.
+    LargeImmortal,
+
+    /// A `'static` image past the compact ceiling (§2.2.3).
+    LargeStatic,
 }
 
 impl StorageType {
@@ -773,7 +779,9 @@ macro_rules! define_perl_string {
         heap32: [ $( $heap32:ident = ($heap32_utf8:literal, $heap32_tainted:literal) ),* $(,)? ],
         heap:   [ $( $heap:ident  = ($heap_utf8:literal,  $heap_tainted:literal)  ),* $(,)? ],
         immortal: [ $( $immortal:ident = ($immortal_utf8:literal, $immortal_tainted:literal) ),* $(,)? ],
-        statics:  [ $( $static:ident  = ($static_utf8:literal,  $static_tainted:literal)  ),* $(,)? ]
+        statics:  [ $( $static:ident  = ($static_utf8:literal,  $static_tainted:literal)  ),* $(,)? ],
+        large_immortal: [ $( $large_immortal:ident = ($large_immortal_utf8:literal, $large_immortal_tainted:literal) ),* $(,)? ],
+        large_statics:  [ $( $large_static:ident  = ($large_static_utf8:literal,  $large_static_tainted:literal)  ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
         /// behind this newtype: no variant is nameable outside the crate, so no payload can be forged or mutated around
@@ -806,6 +814,8 @@ macro_rules! define_perl_string {
             $( $heap  { ptr: Owned }, )*
             $( $immortal { ptr: Image, len: [u8; 3], count: [u8; 3], scan: scan::Terminal }, )*
             $( $static { ptr: Image, len: [u8; 3], count: [u8; 3], scan: scan::Terminal }, )*
+            $( $large_immortal { head: &'static ImmortalHead }, )*
+            $( $large_static { head: &'static ImmortalHead }, )*
         }
 
         impl Clone for Repr {
@@ -846,6 +856,8 @@ macro_rules! define_perl_string {
                         Repr::$immortal { ptr: *ptr, len: *len, count: *count, scan: *scan }, )*
                     $( Repr::$static { ptr, len, count, scan } =>
                         Repr::$static { ptr: *ptr, len: *len, count: *count, scan: *scan }, )*
+                    $( Repr::$large_immortal { head } => Repr::$large_immortal { head }, )*
+                    $( Repr::$large_static { head } => Repr::$large_static { head }, )*
                 }
             }
         }
@@ -868,6 +880,8 @@ macro_rules! define_perl_string {
                     // program's.
                     $( Repr::$immortal { .. } => {}, )*
                     $( Repr::$static { .. } => {}, )*
+                    $( Repr::$large_immortal { .. } => {}, )*
+                    $( Repr::$large_static { .. } => {}, )*
                 }
             }
         }
@@ -886,6 +900,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { .. } => StorageType::Heap, )*
                     $( Repr::$immortal { .. } => StorageType::Immortal, )*
                     $( Repr::$static { .. } => StorageType::Static, )*
+                    $( Repr::$large_immortal { .. } => StorageType::LargeImmortal, )*
+                    $( Repr::$large_static { .. } => StorageType::LargeStatic, )*
                 }
             }
 
@@ -902,6 +918,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { .. } => $heap_utf8, )*
                     $( Repr::$immortal { .. } => $immortal_utf8, )*
                     $( Repr::$static { .. } => $static_utf8, )*
+                    $( Repr::$large_immortal { .. } => $large_immortal_utf8, )*
+                    $( Repr::$large_static { .. } => $large_static_utf8, )*
                 }
             }
 
@@ -918,6 +936,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { .. } => $heap_tainted, )*
                     $( Repr::$immortal { .. } => $immortal_tainted, )*
                     $( Repr::$static { .. } => $static_tainted, )*
+                    $( Repr::$large_immortal { .. } => $large_immortal_tainted, )*
+                    $( Repr::$large_static { .. } => $large_static_tainted, )*
                 }
             }
 
@@ -927,6 +947,9 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => Some(InlineClass::$inline_class), )*
                     $( Repr::$immortal { .. } => None, )*
+                    $( Repr::$static { .. } => None, )*
+                    $( Repr::$large_immortal { .. } => None, )*
+                    $( Repr::$large_static { .. } => None, )*
                     $( Repr::$heap8a { .. } => None, )*
                     $( Repr::$heap16a { .. } => None, )*
 
@@ -1011,6 +1034,16 @@ macro_rules! define_perl_string {
                         count: u24_get(count),
                         scan: *scan,
                     }, )*
+                    $( Repr::$large_immortal { head } => RawParts::Borrowed {
+                        bytes: head.bytes(),
+                        count: head.count,
+                        scan: head.scan,
+                    }, )*
+                    $( Repr::$large_static { head } => RawParts::Borrowed {
+                        bytes: head.bytes(),
+                        count: head.count,
+                        scan: head.scan,
+                    }, )*
                 }
             }
 
@@ -1022,6 +1055,8 @@ macro_rules! define_perl_string {
                     $( Repr::$packed { .. } => None, )*
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
+                    $( Repr::$large_immortal { .. } => None, )*
+                    $( Repr::$large_static { .. } => None, )*
                     $( Repr::$heap8 { .. } => None, )*
                     $( Repr::$heap8a { .. } => None, )*
                     $( Repr::$heap16 { .. } => None, )*
@@ -1265,6 +1300,8 @@ macro_rules! define_perl_string {
                     $( Repr::$packed { .. } => None, )*
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
+                    $( Repr::$large_immortal { .. } => None, )*
+                    $( Repr::$large_static { .. } => None, )*
                     $( Repr::$heap8 { .. } => Some(Tier::Heap8), )*
                     $( Repr::$heap8a { .. } => Some(Tier::Heap8), )*
                     $( Repr::$heap16a { .. } => Some(Tier::Heap16), )*
@@ -1352,6 +1389,8 @@ macro_rules! define_perl_string {
                     $( Repr::$static { ptr, len, count, scan } => RawOwned::Borrowed {
                         form: BorrowedForm::Static, ptr: ptr.0, len: u24_get(len), count: u24_get(count), scan: *scan,
                     }, )*
+                    $( Repr::$large_immortal { head } => RawOwned::BorrowedLarge { form: BorrowedForm::Immortal, head }, )*
+                    $( Repr::$large_static { head } => RawOwned::BorrowedLarge { form: BorrowedForm::Static, head }, )*
                 }
             }
 
@@ -1409,6 +1448,20 @@ macro_rules! define_perl_string {
                 match (utf8, tainted) {
                     $( ($immortal_utf8, $immortal_tainted) =>
                         PerlString(Repr::$immortal { ptr: Image(ptr), len: u24_new(len), count: u24_new(count), scan }), )*
+                }
+            }
+
+            /// Rebuild a large immortal value with the given tag dimensions (header shared, image untouched).
+            fn build_large_immortal(utf8: bool, tainted: bool, head: &'static ImmortalHead) -> PerlString {
+                match (utf8, tainted) {
+                    $( ($large_immortal_utf8, $large_immortal_tainted) => PerlString(Repr::$large_immortal { head }), )*
+                }
+            }
+
+            /// Rebuild a large static value with the given tag dimensions (header shared, image untouched).
+            fn build_large_static(utf8: bool, tainted: bool, head: &'static ImmortalHead) -> PerlString {
+                match (utf8, tainted) {
+                    $( ($large_static_utf8, $large_static_tainted) => PerlString(Repr::$large_static { head }), )*
                 }
             }
 
@@ -1542,6 +1595,18 @@ define_perl_string! {
         StaticFlagged            = (true, false),
         StaticTainted            = (false, true),
         StaticFlaggedTainted     = (true, true),
+    ],
+    large_immortal: [
+        LargeImmortal                 = (false, false),
+        LargeImmortalFlagged          = (true, false),
+        LargeImmortalTainted          = (false, true),
+        LargeImmortalFlaggedTainted   = (true, true),
+    ],
+    large_statics: [
+        LargeStatic                   = (false, false),
+        LargeStaticFlagged            = (true, false),
+        LargeStaticTainted            = (false, true),
+        LargeStaticFlaggedTainted     = (true, true),
     ]
 }
 
@@ -1764,46 +1829,52 @@ impl PerlString {
         }
     }
 
-    /// A string over `'static` UTF-8: zero-copy, zero-allocation, never freed (§2.2.3).  Classification is eager and
-    /// terminal at any size — the full walk rather than the cheaper ranging one, because facts settled once for content
-    /// that lives forever should include the character count the ranging walker forfeits.  Content past the compact
-    /// ceiling is copied into a tier instead, until the large immortal forms land.
+    /// A string over `'static` UTF-8: zero-copy, never freed (§2.2.3).  Classification is eager and terminal at any
+    /// size — the full walk rather than the cheaper ranging one, because facts settled once for content that lives
+    /// forever should include the character count the ranging walker forfeits.  Below the compact ceiling this
+    /// allocates nothing; past it, the one allocation is the shared, deliberately leaked side header.
     pub fn from_static_str(s: &'static str) -> Result<PerlString, AllocError> {
         PerlString::from_static_bytes(s.as_bytes())
     }
 
-    /// A string over `'static` bytes: zero-copy, zero-allocation, never freed (§2.2.3).  Classification is eager and
-    /// terminal at any size, malformed content included — a static image can hold any bytes the program does.  Content
-    /// past the compact ceiling is copied into a tier instead, until the large immortal forms land.
+    /// A string over `'static` bytes: zero-copy, never freed (§2.2.3).  Classification is eager and terminal at any
+    /// size, malformed content included — a static image can hold any bytes the program does.  Below the compact
+    /// ceiling this allocates nothing; past it, the one allocation is the shared, deliberately leaked side header.
     pub fn from_static_bytes(bytes: &'static [u8]) -> Result<PerlString, AllocError> {
-        if bytes.len() > U24_MAX {
-            return PerlString::from_bytes(bytes);
-        }
         let (scan, count) = classify_full(bytes);
 
         // A slice pointer is never null, so the fallback arm is unreachable; it exists to keep this path panic-free,
         // and a dangling pointer with length zero reads soundly anyway.
         let ptr = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).unwrap_or(std::ptr::NonNull::dangling());
+
+        if bytes.len() > U24_MAX {
+            let head = ImmortalHead::leaked(Image(ptr), bytes.len(), count, scan)?;
+            return Ok(PerlString::build_large_static(false, false, head));
+        }
+
         Ok(PerlString::build_static(false, false, ptr, bytes.len(), count, scan))
     }
 
     /// A string over an immortal image: bytes some owner keeps alive longer than every handle (§2.2.3) — the
     /// interpreter's slab canonically; any arena or interner legitimately.  Zero-copy; classification is eager and
-    /// terminal.  `None` past the compact ceiling, until the large immortal forms land.
+    /// terminal.  Past the compact ceiling the one allocation is the shared, deliberately leaked side header.
     ///
     /// # Safety
     /// The caller warrants that the image outlives every handle, clones included; that it is never written while any
     /// handle lives; and that its owner frees it only after the last handle is gone.
     #[cfg_attr(not(test), expect(dead_code, reason = "the §2.4 slab is the production caller; until it lands, tests are"))]
-    pub(crate) unsafe fn from_immortal_bytes(bytes: &[u8]) -> Option<PerlString> {
-        if bytes.len() > U24_MAX {
-            return None;
-        }
+    pub(crate) unsafe fn from_immortal_bytes(bytes: &[u8]) -> Result<PerlString, AllocError> {
         let (scan, count) = classify_full(bytes);
 
         // See from_static_bytes: never null, never panics, sound at zero length.
         let ptr = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).unwrap_or(std::ptr::NonNull::dangling());
-        Some(PerlString::build_immortal(false, false, ptr, bytes.len(), count, scan))
+
+        if bytes.len() > U24_MAX {
+            let head = ImmortalHead::leaked(Image(ptr), bytes.len(), count, scan)?;
+            return Ok(PerlString::build_large_immortal(false, false, head));
+        }
+
+        Ok(PerlString::build_immortal(false, false, ptr, bytes.len(), count, scan))
     }
 
     /// The full tier ladder with every tag dimension supplied — the transforms' constructor, and `from_bytes` in
@@ -2369,6 +2440,8 @@ impl PerlString {
             RawOwned::Heap { ptr, len, cap, count, scan, tier } => PerlString::build_heap(u2, t2, HeapParts { ptr, len, cap, count, scan, tier }),
             RawOwned::Borrowed { form: BorrowedForm::Immortal, ptr, len, count, scan } => PerlString::build_immortal(u2, t2, ptr, len, count, scan),
             RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PerlString::build_static(u2, t2, ptr, len, count, scan),
+            RawOwned::BorrowedLarge { form: BorrowedForm::Immortal, head } => PerlString::build_large_immortal(u2, t2, head),
+            RawOwned::BorrowedLarge { form: BorrowedForm::Static, head } => PerlString::build_large_static(u2, t2, head),
         };
     }
 
@@ -2514,6 +2587,18 @@ impl PerlString {
                 let state = append_transition_heap(scan.widen(), kind);
                 PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
             }
+            RawOwned::BorrowedLarge { form: _, head } => {
+                // Copy-out on write, at large size: the image is readonly, so the append is a rebuild seeded by the
+                // settled state, exactly the compact forms' path.
+                let old_bytes = head.bytes();
+                let new_len = old_bytes.len() + bytes.len();
+                let mut joined = Vec::new();
+                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
+                joined.extend_from_slice(old_bytes);
+                joined.extend_from_slice(bytes);
+                let state = append_transition_heap(head.scan.widen(), kind);
+                PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+            }
             RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
                 // Reached only past the in-place fast path — shared, or over capacity — so the buffer is rebuilt:
                 // growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what `HeapParts::from_slice`
@@ -2573,6 +2658,41 @@ struct Image(std::ptr::NonNull<u8>);
 // sharing references to it across threads is sharing immutable bytes; no operation writes through this pointer.
 unsafe impl Send for Image {}
 unsafe impl Sync for Image {}
+
+/// The large immortal forms' side header (§2.2.3): word-width facts for images past the compact ceiling, plus the image
+/// pointer neither form can prepend a header to.  Shared by every bitwise clone and deliberately leaked per the ruling
+/// — handles cannot free what they share without the refcount these forms decline, so ownership belongs above them: the
+/// §2.4 slab when it lands, the process's life in standalone use.  Allocated raw rather than through the tier backend,
+/// so the live counters keep meaning tier balance and a ruled leak indicts no balance test.
+struct ImmortalHead {
+    image: Image,
+    len: usize,
+    count: usize,
+    scan: scan::Terminal,
+}
+
+impl ImmortalHead {
+    /// Allocate and leak a header.  Fallible by hand — `Box::new` aborts on exhaustion, and this crate reports.
+    fn leaked(image: Image, len: usize, count: usize, scan: scan::Terminal) -> Result<&'static ImmortalHead, AllocError> {
+        let layout = std::alloc::Layout::new::<ImmortalHead>();
+
+        // SAFETY: the layout is non-zero-sized; the write initializes the allocation before any read.
+        let ptr = unsafe { std::alloc::alloc(layout) }.cast::<ImmortalHead>();
+        let Some(ptr) = std::ptr::NonNull::new(ptr) else {
+            return Err(AllocError { requested: layout.size() });
+        };
+        unsafe { ptr.as_ptr().write(ImmortalHead { image, len, count, scan }) };
+
+        // SAFETY: just initialized, never freed — 'static by the leak this type's contract rules.
+        Ok(unsafe { &*ptr.as_ptr() })
+    }
+
+    /// The image bytes.
+    fn bytes(&self) -> &'static [u8] {
+        // SAFETY: the image outlives every handle by the forms' contract, and the header itself is leaked.
+        unsafe { std::slice::from_raw_parts(self.image.0.as_ptr(), self.len) }
+    }
+}
 
 /// The immortal envelopes' 24-bit fields (§2.2.3): compact forms hold lengths and counts below 16 MiB.
 const U24_MAX: usize = 0xFF_FFFF;
@@ -2637,6 +2757,12 @@ enum RawOwned {
         len: usize,
         count: usize,
         scan: scan::Terminal,
+    },
+
+    /// A large immortal form's shared header: rebuilds point a fresh envelope at the same header.
+    BorrowedLarge {
+        form: BorrowedForm,
+        head: &'static ImmortalHead,
     },
 }
 
