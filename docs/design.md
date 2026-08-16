@@ -827,7 +827,22 @@ longer does [DECISION].  So
 the `Maybe` prefix means validity is certified and the non-ASCII
 witness is what a cut un-certified, and the probe's byte is that
 witness.  A union asserting a contradiction cannot arise from
-two truths and is the bomb family's in debug.  Widening (the
+two truths and is the bomb family's in debug.  The enum stays
+the storage format [DECISION]: the fact bits are the meet's
+*local* algebra — a transformation of the states, not their
+representation — because presence-bit storage would need eight
+facts exactly, filling the byte with no headroom where the enum
+holds twelve of 256; because the closed-type property (every
+legal scan byte is a variant, the loader an exact bomb) would
+decay to a consistency predicate over bit patterns; and because
+append transitions widen facts as content changes, so the hand
+table survives either way.  The quotient forfeits one place the
+bits would not: `PerlValidNonAscii` plus `Valid{NonLatin1}`
+truthfully learns the beyond-Latin-1 range, and the table stays
+at `PerlValidNonAscii` for want of a `PerlValidNonLatin1` —
+precision lost, never truth, self-healing at the next
+classification, and a one-state seat if profiling ever shows it
+mattering.  Widening (the
 reset to `Unknown`) stays reserved to exclusive `&mut` sites;
 `Relaxed` suffices throughout, the bytes having been published
 with the buffer pointer.  Measured before ruling: the probe and
