@@ -7,8 +7,9 @@ use std::fmt;
 
 /// One of perl's 81 warning categories.  The discriminant is perl's bit number; [`WarningCategory::name`] is perl's
 /// spelling; [`WarningCategory::parent`] encodes the tree (`use warnings 'io'` enables the whole `io` subtree), with
-/// `all` at the root.  Categories are vocabulary, not messages: every warning enum names its category through
-/// [`PerlWarning::category`], and the interpreter's pragma state is a bit vector indexed by these discriminants.
+/// `all` at the root.  Categories are vocabulary, not messages: every warning enum pairs its atomic parts with
+/// their categories through [`PerlWarning::parts`], and the interpreter's pragma state is a bit vector indexed by
+/// these discriminants.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum WarningCategory {
@@ -574,22 +575,18 @@ impl WarningCategory {
     }
 }
 
-/// The contract every warning enum speaks (§2.3.4): perl-exact `Display` of the message body, the category the pragma
-/// system gates it by, and decomposition for compound events — a compound spans categories, and emission gates each
-/// part by its own, so `for_each_part` yields the singleton parts (the default is the value itself).
-pub trait PerlWarning: fmt::Display {
-    /// The warning category the pragma system gates this warning by.  For a compound event this is the first part's
-    /// category; per-part gating goes through [`PerlWarning::for_each_part`].
-    fn category(&self) -> WarningCategory;
-
-    /// Visit each atomic warning in emission order: singletons visit themselves, compounds their parts.
-    fn for_each_part(&self, f: impl FnMut(&Self))
-    where
-        Self: Sized,
-    {
-        let mut f = f;
-        f(self);
-    }
+/// The contract every warning enum speaks (§2.3.4): perl-exact `Display` of the message body, and [`parts`] as the
+/// whole gating truth — atomic warnings in emission order, each paired with the category that gates it.  There is
+/// deliberately no `category` method: a compound spans categories, so any single answer would be arbitrary, and
+/// delivering each category beside its part makes the question unaskable instead of awkwardly answered.  An atomic
+/// warning yields one pair (itself); a compound yields its parts, whose own `Display`s are the per-line bodies the
+/// whole's `Display` joins.
+///
+/// [`parts`]: PerlWarning::parts
+pub trait PerlWarning: fmt::Display + Clone + Sized {
+    /// The atomic warnings in emission order, each with its gating category.  Emission gates each pair by its category
+    /// and renders the part; a whole-event pre-check is `parts().any(|(c, _)| enabled(c))`.
+    fn parts(&self) -> impl Iterator<Item = (WarningCategory, Self)>;
 }
 
 #[cfg(test)]

@@ -2070,10 +2070,14 @@ Container-verified contract (perl 5.38, all under `-w`):
   generates them, one warning enum per crate, aggregated by
   consumers through wrapper enums with `From` impls and
   delegating `Display`.  Every warning enum speaks the
-  `PerlWarning` trait: perl-exact `Display` of the body, the
-  gating category, and `for_each_part` decomposing compounds —
-  a compound spans categories, and emission gates each part by
-  its own, so the parts visit as singletons in emission order.
+  `PerlWarning` trait: perl-exact `Display` of the body, and
+  `parts()` — an iterator of `(WarningCategory, Self)` pairs,
+  the atomic warnings in emission order each beside the category
+  that gates it — as the whole gating truth [DECISION].  There
+  is deliberately no `category` method: a compound spans
+  categories, so any single answer would be arbitrary, and a
+  sentinel would pollute perl's category vocabulary; delivering
+  each category with its part makes the question unaskable.
   FATALization is promotion at emit time: a FATALized warning
   stays typed as a warning and the interpreter routes it to the
   die path — policy, not type.  Error (die-class) messages

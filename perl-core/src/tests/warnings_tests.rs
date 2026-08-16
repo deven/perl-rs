@@ -56,15 +56,16 @@ fn the_tree_matches_perl_bit_for_bit() {
 }
 
 #[test]
-fn warnings_speak_their_categories_and_compounds_decompose() {
+fn warnings_yield_their_parts_with_gating_categories() {
+    // An atomic warning is one pair: itself, beside the category that gates it.
     let warn = NumifyWarning::Overflow { base: RadixBase::Hexadecimal };
-    assert_eq!(warn.category(), WarningCategory::Overflow);
+    let atoms: Vec<_> = warn.parts().map(|(cat, part)| (cat, format!("{part}"))).collect();
+    assert_eq!(atoms, vec![(WarningCategory::Overflow, "Integer overflow in hexadecimal number".to_string())]);
 
-    // A compound spans categories: gating goes per part, in emission order, each part a singleton whose Display is one
-    // perl body.
+    // A compound spans categories, so there is no category of the whole — the pairs are the truth, in emission order,
+    // each part's Display one perl body.
     let compound = NumifyWarning::OverflowThenIllegalDigit { base: RadixBase::Hexadecimal, digit: b'G' };
-    let mut parts = Vec::new();
-    compound.for_each_part(|part| parts.push((part.category(), format!("{part}"))));
+    let parts: Vec<_> = compound.parts().map(|(cat, part)| (cat, format!("{part}"))).collect();
     assert_eq!(
         parts,
         vec![
@@ -77,11 +78,8 @@ fn warnings_speak_their_categories_and_compounds_decompose() {
     let joined = parts.into_iter().map(|(_, body)| body).collect::<Vec<_>>().join("\n");
     assert_eq!(joined, format!("{compound}"));
 
-    // Singletons visit themselves.
-    let mut count = 0;
-    warn.for_each_part(|part| {
-        assert_eq!(part.category(), WarningCategory::Overflow);
-        count += 1;
-    });
-    assert_eq!(count, 1);
+    // Per-part gating in the shape emission uses: with digit disabled, only the overflow line survives.
+    let enabled = |cat: WarningCategory| cat != WarningCategory::Digit;
+    let emitted: Vec<_> = compound.parts().filter(|(cat, _)| enabled(*cat)).map(|(_, p)| format!("{p}")).collect();
+    assert_eq!(emitted, vec!["Integer overflow in hexadecimal number".to_string()]);
 }

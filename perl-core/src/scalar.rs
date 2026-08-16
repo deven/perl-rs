@@ -419,7 +419,7 @@ impl ConstScalar {
 /// per the two-regime fragment law (§2.3.4), compound variants emitting their bodies as emission-ordered lines.  The
 /// interpreter composes by suffixing — the op clause (`NotNumeric` only, per perl's `PL_op` behavior) and the location
 /// follow the body in every form — and owns category bits, FATALization, and `$SIG{__WARN__}` dispatch.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum NumifyWarning {
     /// `Argument "%s" isn't numeric`: not one complete numeric token (§2.3.4).  The snippet is bounded by the rendering
     /// law — [`WARN_SNIPPET_BYTES`] unflagged, [`WARN_SNIPPET_CHARS`] flagged, the cut sequence-clean, under the face's
@@ -534,33 +534,24 @@ impl fmt::Display for NumifyWarning {
 }
 
 impl PerlWarning for NumifyWarning {
-    fn category(&self) -> WarningCategory {
-        match self {
-            NumifyWarning::NotNumeric { .. } | NumifyWarning::NotIncrementable { .. } => WarningCategory::Numeric,
-            NumifyWarning::LostPrecision { .. } => WarningCategory::Imprecision,
-            NumifyWarning::IllegalDigit { .. } => WarningCategory::Digit,
-            NumifyWarning::Overflow { .. } => WarningCategory::Overflow,
-            NumifyWarning::NonPortable { .. } => WarningCategory::Portable,
-            NumifyWarning::Uninitialized => WarningCategory::Uninitialized,
-
-            // A compound's own category is its first part's; per-part gating goes through for_each_part.
-            NumifyWarning::OverflowThenIllegalDigit { .. } => WarningCategory::Overflow,
-            NumifyWarning::IllegalDigitThenNonPortable { .. } => WarningCategory::Digit,
-        }
-    }
-
-    fn for_each_part(&self, mut f: impl FnMut(&Self)) {
-        match self {
-            NumifyWarning::OverflowThenIllegalDigit { base, digit } => {
-                f(&NumifyWarning::Overflow { base: *base });
-                f(&NumifyWarning::IllegalDigit { base: *base, digit: *digit });
+    fn parts(&self) -> impl Iterator<Item = (WarningCategory, NumifyWarning)> {
+        use NumifyWarning::*;
+        use WarningCategory as Cat;
+        let (first, second) = match self {
+            NotNumeric { .. } | NotIncrementable { .. } => ((Cat::Numeric, self.clone()), None),
+            LostPrecision { .. } => ((Cat::Imprecision, self.clone()), None),
+            IllegalDigit { .. } => ((Cat::Digit, self.clone()), None),
+            Overflow { .. } => ((Cat::Overflow, self.clone()), None),
+            NonPortable { .. } => ((Cat::Portable, self.clone()), None),
+            Uninitialized => ((Cat::Uninitialized, self.clone()), None),
+            OverflowThenIllegalDigit { base, digit } => {
+                ((Cat::Overflow, Overflow { base: *base }), Some((Cat::Digit, IllegalDigit { base: *base, digit: *digit })))
             }
-            NumifyWarning::IllegalDigitThenNonPortable { base, digit } => {
-                f(&NumifyWarning::IllegalDigit { base: *base, digit: *digit });
-                f(&NumifyWarning::NonPortable { base: *base });
+            IllegalDigitThenNonPortable { base, digit } => {
+                ((Cat::Digit, IllegalDigit { base: *base, digit: *digit }), Some((Cat::Portable, NonPortable { base: *base })))
             }
-            _ => f(self),
-        }
+        };
+        std::iter::once(first).chain(second)
     }
 }
 
