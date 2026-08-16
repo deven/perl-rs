@@ -196,41 +196,51 @@ fn dynamic_readonly_is_toggleable() {
 // ── Numification-warning state (§2.3.4, container-verified) ───
 #[test]
 fn numify_warns_once_and_copies_carry_the_state() {
-    // "abc" + 1 twice warns once.
+    // "abc" + 1 twice warns once, and the event carries the face — the exact string the message quotes, intact even
+    // though the payload just promoted to Dual.
     let r = plain(str_payload("abc"));
     let (n1, emit1) = r.write().unwrap().numify_noting_warning();
     assert_eq!(n1, Numeric::Float(0.0));
-    assert!(emit1, "first numification warns");
-    let (_, emit2) = r.write().unwrap().numify_noting_warning();
-    assert!(!emit2, "second is silent — the once-bit");
 
-    // Copy AFTER first numification: the copy is silent (the bit rides the PerlString tag).
+    let Some(NumifyWarning::NotNumeric { face }) = emit1 else {
+        panic!("first numification warns, with the face");
+    };
+    assert_eq!(face.as_bytes(&mut [0u8; DECODE_MAX]), b"abc", "the event quotes the original string");
+
+    let (_, emit2) = r.write().unwrap().numify_noting_warning();
+    assert!(emit2.is_none(), "second is silent — the cached face is the suppressor");
+
+    // Copy AFTER first numification: the copy is silent (the face rides the payload).
     let copied = r.read().payload().clone();
     let r2 = plain(copied);
     let (_, emit3) = r2.write().unwrap().numify_noting_warning();
-    assert!(!emit3, "copy after first numification is silent (verified)");
+    assert!(emit3.is_none(), "copy after first numification is silent (verified)");
 
     // Copy BEFORE: both warn.
     let a = plain(str_payload("12abc"));
     let b = plain(a.read().payload().clone());
-    assert!(a.write().unwrap().numify_noting_warning().1);
-    assert!(b.write().unwrap().numify_noting_warning().1, "copy before numification warns independently");
+    assert!(a.write().unwrap().numify_noting_warning().1.is_some());
+    assert!(b.write().unwrap().numify_noting_warning().1.is_some(), "copy before numification warns independently");
 
     // Clean numerics never emit.
     let c = plain(str_payload("  12  "));
-    assert!(!c.write().unwrap().numify_noting_warning().1);
+    assert!(c.write().unwrap().numify_noting_warning().1.is_none());
 }
 
 #[test]
 fn const_cell_warning_state() {
     let warns = ConstScalar::materialize(str_payload("abc")).unwrap();
-    assert!(warns.note_numify_warning(), "first note emits");
-    assert!(!warns.note_numify_warning(), "second is silent");
+    let Some(NumifyWarning::NotNumeric { face }) = warns.note_numify_warning() else {
+        panic!("first note emits, with the face");
+    };
+    assert_eq!(face.as_bytes(&mut [0u8; DECODE_MAX]), b"abc");
+    assert!(warns.note_numify_warning().is_none(), "second is silent");
 
     // Statically-unwarnable payloads carry nothing (§2.3.4).
     let silent = ConstScalar::materialize(ScalarPayload::integer(5, Tainted::CLEAN)).unwrap();
     assert!(silent.numify_warned.is_none());
-    assert!(!silent.note_numify_warning());
+    assert!(silent.note_numify_warning().is_none());
+
     let clean_str = ConstScalar::materialize(str_payload("42")).unwrap();
     assert!(clean_str.numify_warned.is_none());
 }
@@ -309,11 +319,11 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
     let mut cell = ScalarCell::Plain(str_payload("12abc"));
 
     let (first, emit) = cell.numify_noting_warning();
-    assert!(emit, "the first numification of warn-worthy content emits");
+    assert!(emit.is_some(), "the first numification of warn-worthy content emits");
     assert_eq!(first, Numeric::Integer(12), "and salvages what perl salvages");
 
     let (second, emit) = cell.numify_noting_warning();
-    assert!(!emit, "the second reads the cached face and stays silent");
+    assert!(emit.is_none(), "the second reads the cached face and stays silent");
     assert_eq!(second, Numeric::Integer(12));
 
     // The face is what changed, not a flag: the payload is now a Dual whose string side is untouched.
@@ -344,7 +354,7 @@ fn cleanly_numeric_content_never_caches_a_face() {
     for _ in 0..3 {
         let (n, emit) = cell.numify_noting_warning();
         assert_eq!(n, Numeric::Integer(42));
-        assert!(!emit, "clean content never warns");
+        assert!(emit.is_none(), "clean content never warns");
     }
     assert!(matches!(cell, ScalarCell::Plain(ScalarPayload::String(_))), "and stays a plain string");
 }
@@ -356,7 +366,7 @@ fn taint_survives_the_face_installation() {
     let mut cell = ScalarCell::Plain(ScalarPayload::String(tainted));
 
     let (_, emit) = cell.numify_noting_warning();
-    assert!(emit);
+    assert!(emit.is_some());
     assert!(matches!(cell, ScalarCell::Plain(ScalarPayload::DualTainted(_))), "the tainted twin is chosen");
     assert!(cell.is_tainted(), "and taint reads through the Dual");
 }

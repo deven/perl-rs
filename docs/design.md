@@ -2025,7 +2025,13 @@ Container-verified contract (perl 5.38, all under `-w`):
 - The quoted fragment in the message is a *rendering*: truncated at
   ~56 characters with `...`, control characters caret-escaped
   (`^A`).  Nothing is precomputed; the message (fragment, op name,
-  use-site location) is composed entirely at emit time.
+  use-site location) is composed entirely at emit time.  The crate
+  surfaces the event as typed data [DECISION]: numify operations
+  return a `NumifyWarning` variant carrying the raw source snippet
+  the message quotes — the face, whole, never a preformatted
+  string — because composition (fragment rendering, op name,
+  location, warning-category bits, FATALization, `$SIG{__WARN__}`
+  dispatch) is interpreter logic the crate does not own.
 
 **Mechanism: the suppressor is a cached numeric face, not a bit
 [DECISION].**  Perl has no warned flag.  Numifying `"12abc"` stores

@@ -284,7 +284,7 @@ impl ScalarCell {
     /// payload with a `Dual`, so the write lock is required; perl needs mutable access here too, since `$arr[0] + 0`
     /// mutates the element's SV.  Copies then carry the face, which is why copy-after-numification is silent while
     /// copy-before warns on both (container-verified).
-    pub fn numify_noting_warning(&mut self) -> (Numeric, bool) {
+    pub fn numify_noting_warning(&mut self) -> (Numeric, Option<NumifyWarning>) {
         let payload = match self {
             ScalarCell::Plain(p) => p,
             ScalarCell::Full(f) => &mut f.payload,
@@ -297,20 +297,28 @@ impl ScalarCell {
             other => (other.numify(), false),
         };
         if !warns {
-            return (n, false);
+            return (n, None);
         }
 
         let taken = mem::replace(payload, ScalarPayload::Undef);
-        *payload = match taken {
+        let face = match taken {
             ScalarPayload::String(s) => {
                 let tainted = s.is_tainted();
+                let face = s.clone();
                 let dual = HeapArc::new(DualPayload { string: s, numeric: n });
-                if tainted { ScalarPayload::DualTainted(dual) } else { ScalarPayload::Dual(dual) }
+                *payload = if tainted { ScalarPayload::DualTainted(dual) } else { ScalarPayload::Dual(dual) };
+                face
             }
-            other => other,
+            other => {
+                *payload = other;
+
+                // Unreachable: `warns` is true only for the string arm above.  Reported rather than silently laundered,
+                // of the bomb's family.
+                unreachable!("a non-string payload claimed a numify warning");
+            }
         };
 
-        (n, true)
+        (n, Some(NumifyWarning::NotNumeric { face }))
     }
 }
 
@@ -381,14 +389,27 @@ impl ConstScalar {
         self.payload.is_tainted()
     }
 
-    /// Note a numification against the once-only warning state; returns whether the ops layer should emit the warning
-    /// now.  Statically-unwarnable payloads (`None`) answer false with no atomic traffic.
-    pub fn note_numify_warning(&self) -> bool {
+    /// Note a numification against the once-only warning state; `Some` carries the typed event exactly once, the first
+    /// time.  Statically-unwarnable payloads answer `None` with no atomic traffic; the face is the frozen cell's own
+    /// string image, whose string face never moves.
+    pub fn note_numify_warning(&self) -> Option<NumifyWarning> {
         match &self.numify_warned {
-            Some(flag) => !flag.swap(true, Ordering::AcqRel),
-            None => false,
+            Some(flag) if !flag.swap(true, Ordering::AcqRel) => Some(NumifyWarning::NotNumeric { face: self.string.clone() }),
+            Some(_) | None => None,
         }
     }
+}
+
+// ── NumifyWarning — the typed warning event (§2.3.4) ──────────────
+/// A warning a numify operation raises, as data: the variant names perl's warning, and the payload is the raw source
+/// snippet the message quotes — never a preformatted string, because composing the message (fragment truncation and
+/// caret-escaping, op name, location, warning-category bits, FATALization, `$SIG{__WARN__}` dispatch) is interpreter
+/// logic the crate does not own.  Variants grow as numify-adjacent operations land.
+#[derive(Debug)]
+pub enum NumifyWarning {
+    /// Perl's `Argument "%s" isn't numeric`: the string was not one complete numeric token (§2.3.4).  Carries the face
+    /// whole — the exact string the message quotes, cloned before the payload promoted to `Dual`.
+    NotNumeric { face: PerlString },
 }
 
 // ── ScalarRef — shared identity (§2.3.1) ──────────────────────────
