@@ -2022,16 +2022,56 @@ Container-verified contract (perl 5.38, all under `-w`):
   walk.  The independent grammar predicate above survives as the
   test oracle the byproduct is checked against, valuable precisely
   because it is a second statement of the same law.
-- The quoted fragment in the message is a *rendering*: truncated at
-  ~56 characters with `...`, control characters caret-escaped
-  (`^A`).  Nothing is precomputed; the message (fragment, op name,
-  use-site location) is composed entirely at emit time.  The crate
-  surfaces the event as typed data [DECISION]: numify operations
-  return a `NumifyWarning` variant carrying the raw source snippet
-  the message quotes — the face, whole, never a preformatted
-  string — because composition (fragment rendering, op name,
-  location, warning-category bits, FATALization, `$SIG{__WARN__}`
-  dispatch) is interpreter logic the crate does not own.
+- The warning inventory, from 5.44.0's `sv.c` and `numeric.c`
+  [DECISION]: `Argument "%s" isn't numeric [in %s]`
+  (`WARN_NUMERIC`; `!numtype` or trailing garbage; once per
+  conversion); `Argument "%s" treated as 0 in increment (++)`
+  (`WARN_NUMERIC`); `Lost precision when
+  incrementing/decrementing %f by 1`; the radix-grok cluster —
+  `Illegal %s digit '%c' ignored` (`WARN_DIGIT`; never base 10,
+  octal only for digits 8/9), `Integer overflow in %s number`
+  (`WARN_OVERFLOW`, on by default), `%s non-portable`
+  (`WARN_PORTABLE`, past 32 bits) — and `Use of uninitialized
+  value` (`WARN_UNINITIALIZED`), whose variable-name diagnosis is
+  interpreter machinery entire.  Verified silent: Inf→IV
+  saturates, NaN→IV yields 0, no warning.  One grok call can emit
+  *two* warnings — overflow mid-scan, then illegal-digit at the
+  scan's end — while overflow suppresses non-portable, so the
+  legal sequences are overflow→digit, digit→portable, or any
+  singleton, in emission order; the grok event is one compound
+  variant.
+
+- `NumifyWarning` carries raw data, never a preformatted string,
+  and never more than the message uses [DECISION]: for the
+  fragment-quoting variants, a snippet bounded by the rendering
+  law plus a truncated flag — a caller wanting the full value
+  clones it before numifying.  The enum's `Display` *is* perl's
+  standard formatting [DECISION]: the message body (compound
+  variants emit their bodies as emission-ordered lines), rendered
+  on demand from the raw payload — cleaner than every embedder
+  reimplementing the law, and the interpreter composes by
+  suffixing, since the op clause (`NotNumeric` only, per
+  `PL_op`) and the location follow the body in every form.
+  Category bits, FATALization, and `$SIG{__WARN__}` dispatch
+  remain interpreter logic.
+
+- The fragment law, two regimes by flag (probed and read from
+  `S_sv_display`): *unflagged* walks bytes with output cap 56
+  (buffer 64 − 8, checked before each byte, the last expansion
+  may overrun) — non-ASCII non-printable emits `M-` and
+  re-dispatches the low-seven-bit byte through the same table
+  (`E9` → `M-i`, `8A` → `M-\n`); `\n \r \f \\ \0`
+  backslash-escaped; other controls caret (`^A`, DEL `^?`);
+  printability pinned to the C locale (perl's `isPRINT_LC` is
+  locale-dependent; the divergence is the interpreter's if it
+  wants it).  *Flagged* renders at output cap 32: printable
+  ASCII verbatim, backslash doubled, everything else —
+  newline included — `\x{lowercase-hex}` per code point.  Both
+  regimes append ASCII `...` (three periods, never U+2026) iff
+  source remains.  Sufficient snippets fall out: every unit
+  renders at least one column, so 57 bytes (unflagged) or 33
+  characters (flagged) plus the truncated flag serve any
+  conforming renderer.
 
 **Mechanism: the suppressor is a cached numeric face, not a bit
 [DECISION].**  Perl has no warned flag.  Numifying `"12abc"` stores
