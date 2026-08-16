@@ -1324,6 +1324,14 @@ const MAX_FINITE_DIGITS: usize = 309;
 
 /// The string→float coercion: perl's partial-parse rules plus the Inf/NaN prefix forms (module header).
 pub fn parse_float(bytes: &[u8]) -> f64 {
+    parse_float_spanned(bytes).0
+}
+
+/// [`parse_float`] with its consumption surfaced: the second field is how many bytes of the sign-stripped rest the
+/// numeric token occupied — the fact the would-warn byproduct is made of (§2.3.4), free because the parse walks exactly
+/// that far anyway.  For the `inf`/`nan` forms the span is the recognized word (`infinity` counts all eight), so
+/// completeness against the trimmed token falls out of one comparison.
+fn parse_float_spanned(bytes: &[u8]) -> (f64, usize) {
     let (negative, rest) = split_sign(bytes);
 
     // Case-insensitive inf/nan *prefixes* after the sign ("infx" is Inf, "in" is not).
@@ -1331,27 +1339,33 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
         let p = [rest[0].to_ascii_lowercase(), rest[1].to_ascii_lowercase(), rest[2].to_ascii_lowercase()];
 
         if p == *b"inf" {
-            return if negative { f64::NEG_INFINITY } else { f64::INFINITY };
+            let consumed = if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case(b"infinity") { 8 } else { 3 };
+            return (if negative { f64::NEG_INFINITY } else { f64::INFINITY }, consumed);
         }
 
         if p == *b"nan" {
-            return f64::NAN;
+            return (f64::NAN, 3);
         }
     }
 
     // Decimal scan: digits, optional fraction, exponent committed only when digits follow the marker ("1e" and "1e+"
-    // numify as 1 — a dangling exponent marker is not part of the number).
+    // numify as 1 — a dangling exponent marker is not part of the number).  The dot and the exponent extend only a span
+    // that has mantissa digits: a bare "." or "e5" is no numeric token at all, and consuming them would change no value
+    // (the magnitude parse of either fails to zero) while falsely claiming span for the would-warn completeness
+    // measure.
     let integer_digits = digit_run(rest);
     let mut end = integer_digits;
 
     if end < rest.len() && rest[end] == b'.' {
-        end += 1;
-        end += digit_run(&rest[end..]);
+        let fraction_digits = digit_run(&rest[end + 1..]);
+        if integer_digits > 0 || fraction_digits > 0 {
+            end += 1 + fraction_digits;
+        }
     }
 
     let mut has_exponent = false;
 
-    if end < rest.len() && (rest[end] == b'e' || rest[end] == b'E') {
+    if end > 0 && end < rest.len() && (rest[end] == b'e' || rest[end] == b'E') {
         let mut exp_end = end + 1;
 
         if exp_end < rest.len() && (rest[exp_end] == b'+' || rest[exp_end] == b'-') {
@@ -1368,7 +1382,7 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
     }
 
     if end == 0 {
-        return 0.0;
+        return (0.0, 0);
     }
 
     // A 310-digit integer part is at least 10^309, past `f64::MAX`, so with no exponent to pull it back the magnitude
@@ -1377,22 +1391,27 @@ pub fn parse_float(bytes: &[u8]) -> f64 {
     if !has_exponent && integer_digits > MAX_FINITE_DIGITS {
         let leading_zeros = rest[..integer_digits].iter().take_while(|&&b| b == b'0').count();
         if integer_digits - leading_zeros > MAX_FINITE_DIGITS {
-            return if negative { f64::NEG_INFINITY } else { f64::INFINITY };
+            return (if negative { f64::NEG_INFINITY } else { f64::INFINITY }, end);
         }
     }
 
     // The scanned span is ASCII digits/'.'/'e'/sign by construction.
     let magnitude = str::from_utf8(&rest[..end]).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 
-    if negative { -magnitude } else { magnitude }
+    (if negative { -magnitude } else { magnitude }, end)
 }
 
-/// The §2.3.4 would-warn predicate over the container-mapped boundary table: a string is silent iff it is exactly
-/// `"0 but true"` (case-sensitive, no surrounding whitespace) or, after trimming ASCII whitespace from both ends, the
-/// entire remainder is one complete numeric token — `[sign] (digits [. digits?] | . digits) [e/E [sign] digits+]` with
-/// at least one mantissa digit, or case-insensitive signed `inf`/`infinity`/`nan` whole.  Independent of what the parse
-/// salvages: `"1e"` numifies as 1 yet warns.
-pub fn string_would_warn(bytes: &[u8]) -> bool {
+/// The §2.3.4 would-warn predicate over the container-mapped boundary table, as an independent grammar: a string is
+/// silent iff it is exactly `"0 but true"` (case-sensitive, no surrounding whitespace) or, after trimming ASCII
+/// whitespace from both ends, the entire remainder is one complete numeric token — `[sign] (digits [. digits?] | .
+/// digits) [e/E [sign] digits+]` with at least one mantissa digit, or case-insensitive signed `inf`/`infinity`/`nan`
+/// whole.  Independent of what the parse salvages: `"1e"` numifies as 1 yet warns.
+///
+/// Production answers this question as a byproduct of the numification walk ([`classify_numeric_noting_warning`]); this
+/// predicate survives as the test oracle the byproduct is checked against, valuable precisely because it is a second,
+/// independent statement of the same law.
+#[cfg(test)]
+pub(crate) fn string_would_warn(bytes: &[u8]) -> bool {
     if bytes == b"0 but true" {
         return false;
     }
@@ -1460,7 +1479,27 @@ pub fn string_would_warn(bytes: &[u8]) -> bool {
 /// String numification classification: an exactly-integral token within i64 range numifies as an integer; everything
 /// else (fractions, exponents, overflow, Inf/NaN forms, garbage) as a float.
 pub(crate) fn classify_numeric(bytes: &[u8]) -> Numeric {
-    let (negative, rest) = split_sign(bytes);
+    classify_numeric_noting_warning(bytes).0
+}
+
+/// The §2.3.4 fusion: how the string numifies, and whether numifying it warns, from one walk.  The parse surfaces its
+/// own consumption, and warn-worthiness is that consumption measured against the whitespace-trimmed token — nothing is
+/// scanned that the numification was not already scanning.  `"0 but true"` is the one lexical exception, silent by
+/// perl's law.  The independent grammar predicate survives as a test oracle only.
+pub(crate) fn classify_numeric_noting_warning(bytes: &[u8]) -> (Numeric, bool) {
+    if bytes == b"0 but true" {
+        return (Numeric::Integer(0), false);
+    }
+
+    // Silence is a fact about the whole trimmed token: leading whitespace the sign split forgives, trailing whitespace
+    // perl forgives, and everything between must be one complete numeric token.
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let token = &bytes[..end];
+
+    let (negative, rest) = split_sign(token);
 
     let digit_end = digit_run(rest);
 
@@ -1476,21 +1515,23 @@ pub(crate) fn classify_numeric(bytes: &[u8]) -> Numeric {
             }
         }
 
+        let complete = digit_end == rest.len();
         let in_range = if negative { value <= i64::MAX as u128 + 1 } else { value <= i64::MAX as u128 };
         if in_range {
             let n = if negative { if value == i64::MAX as u128 + 1 { i64::MIN } else { -(value as i64) } } else { value as i64 };
-            return Numeric::Integer(n);
+            return (Numeric::Integer(n), !complete);
         }
 
         // Beyond i64 but within u64: exact as an unsigned value, which is where perl reaches for its unsigned slot.
         if !negative && value <= u128::from(u64::MAX) {
-            return Numeric::Unsigned(value as u64);
+            return (Numeric::Unsigned(value as u64), !complete);
         }
 
         // Larger still (or negative past i64::MIN): only a float can hold it, inexactly.
     }
 
-    Numeric::Float(parse_float(bytes))
+    let (value, consumed) = parse_float_spanned(token);
+    (Numeric::Float(value), consumed != rest.len() || rest.is_empty())
 }
 
 #[cfg(test)]

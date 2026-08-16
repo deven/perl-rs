@@ -24,7 +24,7 @@
 
 use crate::cow_buffer;
 use crate::cow_buffer::{AllocError, HeapParts, HeapView, Owned, Tier};
-use crate::value::{Numeric, classify_numeric, parse_float, parse_int_i64_visible, string_would_warn};
+use crate::value::{Numeric, classify_numeric, classify_numeric_noting_warning, parse_float, parse_int_i64_visible};
 use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::Write as _;
@@ -2913,12 +2913,20 @@ impl PerlString {
         classify_numeric(self.as_bytes(&mut scratch))
     }
 
+    /// [`PerlString::numify`] and [`PerlString::would_warn`] from the one walk the numification already pays (§2.3.4):
+    /// the parse surfaces its own consumption, and warn-worthiness is that consumption measured against the trimmed
+    /// token.  The sites that need both answers — payload numification, frozen-cell materialization — come here rather
+    /// than walking twice.
+    pub fn numify_noting_warning(&self) -> (Numeric, bool) {
+        let mut scratch = [0u8; DECODE_MAX];
+        classify_numeric_noting_warning(self.as_bytes(&mut scratch))
+    }
+
     /// Whether numifying this string would emit perl's `Argument isn't numeric` warning (§2.3.4).  A question about the
     /// content.  Whether the warning has *already* fired is not a property of the string: it is whether the value
     /// carries a cached numeric face, which lives on the payload (§2.3.4).
     pub fn would_warn(&self) -> bool {
-        let mut scratch = [0u8; DECODE_MAX];
-        string_would_warn(self.as_bytes(&mut scratch))
+        self.numify_noting_warning().1
     }
 }
 

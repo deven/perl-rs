@@ -285,15 +285,17 @@ impl ScalarCell {
     /// mutates the element's SV.  Copies then carry the face, which is why copy-after-numification is silent while
     /// copy-before warns on both (container-verified).
     pub fn numify_noting_warning(&mut self) -> (Numeric, bool) {
-        let n = self.numify();
-
         let payload = match self {
             ScalarCell::Plain(p) => p,
             ScalarCell::Full(f) => &mut f.payload,
         };
 
         // Only a bare string can warn: a `Dual` already holds the face, and every other payload is numeric already.
-        let warns = matches!(payload, ScalarPayload::String(s) if s.would_warn());
+        // For the string the value and the verdict come from the one walk (§2.3.4).
+        let (n, warns) = match &*payload {
+            ScalarPayload::String(s) => s.numify_noting_warning(),
+            other => (other.numify(), false),
+        };
         if !warns {
             return (n, false);
         }
@@ -349,7 +351,7 @@ impl ConstScalar {
         let float = payload.to_float();
         let string = payload.stringify()?;
 
-        let can_warn = matches!(&payload, ScalarPayload::String(s) if s.would_warn());
+        let can_warn = matches!(&payload, ScalarPayload::String(s) if s.numify_noting_warning().1);
         let numify_warned = can_warn.then(|| AtomicBool::new(false));
 
         Ok(ConstScalar { payload, int, float, string, numify_warned })

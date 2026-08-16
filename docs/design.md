@@ -2013,7 +2013,15 @@ Container-verified contract (perl 5.38, all under `-w`):
   empty and whitespace-only strings, `"0x10"` (radix prefixes),
   `"1_000"` (underscores are literal syntax only), `"0.5.3"`,
   `"0 but false"`.  (`\x0B` in the whitespace set is unprobed — a
-  note for the ops layer, not a blocker.)
+  note for the ops layer, not a blocker.)  The answer is a
+  *byproduct of the numification walk* [DECISION]: the parse
+  surfaces how far it consumed, warn-worthiness is that
+  consumption measured against the whitespace-trimmed token, and
+  nothing is scanned that the numification was not already
+  scanning — the sites needing value and verdict together pay one
+  walk.  The independent grammar predicate above survives as the
+  test oracle the byproduct is checked against, valuable precisely
+  because it is a second statement of the same law.
 - The quoted fragment in the message is a *rendering*: truncated at
   ~56 characters with `...`, control characters caret-escaped
   (`^A`).  Nothing is precomputed; the message (fragment, op name,
