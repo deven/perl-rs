@@ -759,6 +759,14 @@ knowledge.
   as the bomb family does.
 - `MalformedUtf8` — invalid to both Rust and perl.  Terminal.
 - `NonAscii` — at least one byte with the high bit set.
+- `PerlValidNonAscii` — perl-decodable with a high-bit byte
+  present (under perl validity that byte's sequence decodes at or
+  above U+0080): `Utf8NonAscii`'s perl-layer analog, Rust
+  validity and range unasserted.  The meet's home for a probe's
+  byte fact landing on `MaybeExtendedUtf8` content, seated so no
+  union of true certifications forfeits anything [DECISION]; a
+  full classification can land on any perl-valid non-`Ascii`
+  terminal, `MalformedUtf8` and `Ascii` both falsifying.
 
 **Slice births** (zero-copy views; nothing is scanned, so the
 birth state is what clean cuts provably preserve).  Cuts are
@@ -780,7 +788,9 @@ birth `MalformedUtf8`, terminal and free.  Under clean cuts:
 - `ValidUtf8` → `ValidUtf8`.
 - `ExtendedUtf8` → `MaybeExtendedUtf8` (perl-decodability
   survives; the Rust-invalid witness may be excluded).
-- `MaybeExtendedUtf8` → `MaybeExtendedUtf8`.
+- `MaybeExtendedUtf8` → `MaybeExtendedUtf8`;
+  `PerlValidNonAscii` → `MaybeExtendedUtf8` (perl-decodability
+  survives the clean cut; the byte witness may be excluded).
 - `MalformedUtf8` → `Unknown`; `NonAscii` → `Unknown` (the
   witness may be excluded; nothing else was asserted).
 
@@ -793,7 +803,9 @@ descendant, since view envelopes cannot propagate narrowing.
 **Append transitions** for the ambiguous pair: `MaybeUtf8Latin1`
 plus `Valid{Ascii}` stays; plus `Valid{Latin1}` gains the witness
 and completes to `Utf8Latin1`; plus `Valid{NonLatin1}` becomes
-`Utf8NonLatin1`.  `MaybeExtendedUtf8` plus any `Valid` stays.
+`Utf8NonLatin1`.  `MaybeExtendedUtf8` plus any `Valid` stays, as does
+`PerlValidNonAscii` — appended Rust-valid content resolves
+nothing about the extended forms that may already be present.
 Raw appends blanket to `Unknown` as everywhere.
 
 **Shared-path narrowing is a monotonic CAS meet loop
@@ -807,9 +819,11 @@ bytes, canonicalized to the most precise representable state:
 each state is its §2.2.4 assertion set, the union is closed
 under derivation (Rust validity beside a high-bit byte yields
 the U+0080 code-point witness; the stronger witnesses imply the
-weaker), and exactly one union is unrepresentable — bare
-perl-decodability beside a byte witness — which forfeits the
-witness.  So `meet(NonAscii, MaybeUtf8Latin1) = Utf8Latin1`:
+weaker), and every union of true certifications is exactly
+representable — the lattice gained `PerlValidNonAscii`
+precisely so the one combination that once forfeited a fact no
+longer does [DECISION].  So
+`meet(NonAscii, MaybeUtf8Latin1) = Utf8Latin1`:
 the `Maybe` prefix means validity is certified and the non-ASCII
 witness is what a cut un-certified, and the probe's byte is that
 witness.  A union asserting a contradiction cannot arise from

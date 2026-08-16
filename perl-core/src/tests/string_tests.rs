@@ -1246,7 +1246,7 @@ fn ascii_twin_appends_stay_in_place_only_while_ascii_holds() {
 #[test]
 fn the_meet_is_the_fact_union_canonicalized() {
     use scan::meet;
-    let all = || (0..=10u8).map(scan::ScanState::from_u8);
+    let all = || (0..=11u8).map(scan::ScanState::from_u8);
 
     // Idempotent everywhere; Unknown the identity everywhere; commutative over the compatible pairs below.
     for s in all() {
@@ -1264,8 +1264,12 @@ fn the_meet_is_the_fact_union_canonicalized() {
     assert_eq!(meet(scan::NonAscii, scan::Utf8NonLatin1), scan::Utf8NonLatin1);
     assert_eq!(meet(scan::NonAscii, scan::ExtendedUtf8), scan::ExtendedUtf8);
 
-    // The one representable forfeiture: perl-decodability beside a byte witness has no state — the witness yields.
-    assert_eq!(meet(scan::NonAscii, scan::MaybeExtendedUtf8), scan::MaybeExtendedUtf8);
+    // The union that once forfeited: perl-decodability beside a byte witness now has its own state, so the meet is
+    // total — no combination of true certifications loses a fact.
+    assert_eq!(meet(scan::NonAscii, scan::MaybeExtendedUtf8), scan::PerlValidNonAscii);
+    assert_eq!(meet(scan::PerlValidNonAscii, scan::MaybeExtendedUtf8), scan::PerlValidNonAscii);
+    assert_eq!(meet(scan::PerlValidNonAscii, scan::ValidUtf8), scan::Utf8NonAscii);
+    assert_eq!(meet(scan::PerlValidNonAscii, scan::ExtendedUtf8), scan::ExtendedUtf8);
 
     // Terminals absorb their compatible weaker facts; witness states refine the bare-validity states.
     assert_eq!(meet(scan::ValidUtf8, scan::MaybeUtf8Latin1), scan::MaybeUtf8Latin1);
@@ -1274,10 +1278,16 @@ fn the_meet_is_the_fact_union_canonicalized() {
     assert_eq!(meet(scan::Utf8NonLatin1, scan::ValidUtf8), scan::Utf8NonLatin1);
     assert_eq!(meet(scan::Ascii, scan::MaybeUtf8Latin1), scan::Ascii);
 
-    // Monotonic: over every compatible pair, the meet's facts contain each side's representable facts — checked here
-    // as: meeting the result with either input is the result again (absorption).
+    // Monotonic and *total*: over every compatible pair, meeting the result with either input is the result again
+    // (absorption).  Absorption is the totality proof — had canonicalization dropped a fact, re-meeting with the input
+    // carrying it would re-derive it and land elsewhere — so this list passing is the mechanical demonstration that the
+    // twelve-state lattice is meet-closed and needs no thirteenth state.
     let compatible: &[(scan::ScanState, scan::ScanState)] = &[
         (scan::NonAscii, scan::MaybeUtf8Latin1),
+        (scan::NonAscii, scan::MaybeExtendedUtf8),
+        (scan::PerlValidNonAscii, scan::MaybeExtendedUtf8),
+        (scan::PerlValidNonAscii, scan::ValidUtf8),
+        (scan::PerlValidNonAscii, scan::ExtendedUtf8),
         (scan::NonAscii, scan::ValidUtf8),
         (scan::NonAscii, scan::Utf8NonAscii),
         (scan::NonAscii, scan::Utf8NonLatin1),
@@ -1289,6 +1299,14 @@ fn the_meet_is_the_fact_union_canonicalized() {
         (scan::Ascii, scan::MaybeUtf8Latin1),
         (scan::Utf8Latin1, scan::MaybeUtf8Latin1),
         (scan::ExtendedUtf8, scan::MaybeExtendedUtf8),
+        (scan::PerlValidNonAscii, scan::NonAscii),
+        (scan::PerlValidNonAscii, scan::MaybeUtf8Latin1),
+        (scan::PerlValidNonAscii, scan::Utf8Latin1),
+        (scan::PerlValidNonAscii, scan::Utf8NonLatin1),
+        (scan::PerlValidNonAscii, scan::Utf8NonAscii),
+        (scan::MaybeExtendedUtf8, scan::MaybeUtf8Latin1),
+        (scan::MaybeExtendedUtf8, scan::Utf8NonLatin1),
+        (scan::NonAscii, scan::Utf8Latin1),
     ];
     for &(a, b) in compatible {
         let m = meet(a, b);

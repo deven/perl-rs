@@ -60,9 +60,9 @@ pub mod scan {
     /// and it is of the bomb's family.  The variants are re-exported, so `scan::Unknown` is the working vocabulary —
     /// true variant paths, not aliases.
     ///
-    /// Each state is an assertion set (§2.2.4).  The two `Maybe` states are the ambiguous twins the slice births
-    /// demand — the strong assertion minus the witness a subrange may exclude — currently unreachable, retained by
-    /// ruling: their births arrive with zero-copy slicing.
+    /// Each state is an assertion set (§2.2.4).  The two `Maybe` states — the strong assertion minus the witness a
+    /// subrange may exclude — and `PerlValidNonAscii` are currently unreachable, seated by ruling: slicing is
+    /// certain to come, their births arrive with it, and the meet is total only with all twelve seated.
     #[repr(u8)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum ScanState {
@@ -106,6 +106,13 @@ pub mod scan {
         /// classification of content honestly in this state can never land on `MalformedUtf8` — that outcome would
         /// falsify the assertion, and debug builds treat the contradiction as the bomb family does.
         MaybeExtendedUtf8 = 10,
+
+        /// Perl-decodable with a high-bit byte present — under perl validity that byte's sequence decodes at or
+        /// above U+0080, so this is `Utf8NonAscii`'s perl-layer analog, with Rust validity and range unasserted.
+        /// The meet's home for a probe's byte fact landing on `MaybeExtendedUtf8` content, seated so that no union
+        /// of true certifications forfeits anything; a full classification can land on any perl-valid non-`Ascii`
+        /// terminal, with `MalformedUtf8` and `Ascii` both falsifying and bomb-family in debug.
+        PerlValidNonAscii = 11,
     }
 
     pub use ScanState::*;
@@ -127,6 +134,7 @@ pub mod scan {
         pub const NON_ASCII: u8 = ScanState::NonAscii as u8;
         pub const MAYBE_UTF8_LATIN1: u8 = ScanState::MaybeUtf8Latin1 as u8;
         pub const MAYBE_EXTENDED_UTF8: u8 = ScanState::MaybeExtendedUtf8 as u8;
+        pub const PERL_VALID_NON_ASCII: u8 = ScanState::PerlValidNonAscii as u8;
     }
 
     impl ScanState {
@@ -152,6 +160,7 @@ pub mod scan {
                 raw::NON_ASCII => NonAscii,
                 raw::MAYBE_UTF8_LATIN1 => MaybeUtf8Latin1,
                 raw::MAYBE_EXTENDED_UTF8 => MaybeExtendedUtf8,
+                raw::PERL_VALID_NON_ASCII => PerlValidNonAscii,
                 other => panic!("scan byte {other} is not a state: header corruption or a write that bypassed the type"),
             }
         }
@@ -166,7 +175,7 @@ pub mod scan {
                 Utf8NonLatin1 => Some(Terminal::Utf8NonLatin1),
                 ExtendedUtf8 => Some(Terminal::ExtendedUtf8),
                 MalformedUtf8 => Some(Terminal::MalformedUtf8),
-                Unknown | ValidUtf8 | Utf8NonAscii | NonAscii | MaybeUtf8Latin1 | MaybeExtendedUtf8 => None,
+                Unknown | ValidUtf8 | Utf8NonAscii | NonAscii | MaybeUtf8Latin1 | MaybeExtendedUtf8 | PerlValidNonAscii => None,
             }
         }
     }
@@ -254,7 +263,7 @@ pub mod scan {
     /// Perl-decodable: every Rust-valid state plus the extended forms perl accepts, asserted or possible-with-proof.
     #[inline]
     pub const fn is_perl_decodable(state: ScanState) -> bool {
-        matches!(state, Ascii | Utf8Latin1 | MaybeUtf8Latin1 | Utf8NonLatin1 | ValidUtf8 | Utf8NonAscii | ExtendedUtf8 | MaybeExtendedUtf8)
+        matches!(state, Ascii | Utf8Latin1 | MaybeUtf8Latin1 | Utf8NonLatin1 | ValidUtf8 | Utf8NonAscii | ExtendedUtf8 | MaybeExtendedUtf8 | PerlValidNonAscii)
     }
 
     /// Known entirely ≤ U+00FF (downgradable).  `MaybeUtf8Latin1` qualifies: the range bound is asserted even where
@@ -285,8 +294,8 @@ pub mod scan {
     // ── The narrowing meet (§2.2.4) ────────────────────────────────
     // Each state is a set of certified facts about the bytes; two states stored by racing readers are both true of the
     // same immutable content, so their conjunction is true, and the meet is that union canonicalized to the most
-    // precise representable state.  One union is not representable — perl-decodable plus a high-bit byte witness has no
-    // state — and forfeits the witness; every other combination lands exactly.
+    // precise representable state.  Every union of true certifications lands exactly: the lattice was extended by one
+    // state (`PerlValidNonAscii`) precisely so that no combination forfeits a fact.
 
     /// Rust-valid (which implies perl-decodable).
     const RUST_VALID: u16 = 1 << 0;
@@ -319,6 +328,7 @@ pub mod scan {
     fn facts(state: ScanState) -> u16 {
         match state {
             Unknown => 0,
+            PerlValidNonAscii => PERL_VALID | HIGH_BIT,
             Ascii => RUST_VALID | PERL_VALID | ALL_LE_00FF | ALL_ASCII,
             Utf8Latin1 => RUST_VALID | PERL_VALID | ALL_LE_00FF | CONTAINS_GE_0080,
             MaybeUtf8Latin1 => RUST_VALID | PERL_VALID | ALL_LE_00FF,
@@ -373,8 +383,7 @@ pub mod scan {
                 ValidUtf8
             }
         } else if f & PERL_VALID != 0 {
-            // The one representable forfeiture: a high-bit witness beside bare perl-decodability has no state.
-            MaybeExtendedUtf8
+            if f & HIGH_BIT != 0 { PerlValidNonAscii } else { MaybeExtendedUtf8 }
         } else if f & HIGH_BIT != 0 {
             NonAscii
         } else {
@@ -2917,6 +2926,7 @@ fn append_transition_heap(prior: scan::ScanState, kind: AppendKind) -> scan::Sca
             ScanState::MaybeUtf8Latin1 if class == ValidRange::NonLatin1 => ScanState::Utf8NonLatin1,
             ScanState::MaybeUtf8Latin1 => ScanState::Utf8Latin1,
             ScanState::MaybeExtendedUtf8 => ScanState::MaybeExtendedUtf8,
+            ScanState::PerlValidNonAscii => ScanState::PerlValidNonAscii,
 
             // Prior validity unknown or invalid: fallback, lazily recoverable above 64 KiB and reclassified below
             // (§2.2.3's funnel).  Named rather than wildcarded: an indeterminate-state defect once hid in a `_` arm
