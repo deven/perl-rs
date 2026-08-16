@@ -32,7 +32,7 @@ fn the_tree_matches_perl_bit_for_bit() {
     // Names are perl's spellings, subcategories included.
     assert_eq!(WarningCategory::Numeric.name(), "numeric");
     assert_eq!(WarningCategory::DotInInc.name(), "deprecated::dot_in_inc");
-    assert_eq!(WarningCategory::ReStrict.name(), "experimental::re_strict");
+    assert_eq!(WarningCategory::RegexStrict.name(), "experimental::re_strict");
 
     // The spelling map runs both directions: the parser's from_name inverts name over the whole vocabulary, and
     // variants stay stable leaf identifiers while the spelling — prefix included — is data.

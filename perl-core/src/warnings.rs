@@ -6,11 +6,12 @@
 use std::fmt;
 
 /// One of perl's 81 warning categories.  The discriminant is perl's bit number; the variant is a *stable* leaf-derived
-/// identifier, while perl's spelling — parent path included — is data, living only in [`WarningCategory::name`] and
-/// [`WarningCategory::from_name`]: perl has both prefixed names when subcategorizing (`deprecated::*`) and unprefixed
-/// them when experiments graduate, and spelling drift should move one string table, not every use site.
-/// [`WarningCategory::parent`] encodes the tree (`use warnings 'io'` enables the whole `io` subtree), with `all` at the
-/// root.
+/// identifier — with judgment overrides where mechanical derivation misleads (`RegexStrict` for `re_strict`, the `re`
+/// pragma's strict mode; `VariableLengthLookbehind` for `vlb`) — while perl's spelling, parent path included, is data,
+/// living only in [`WarningCategory::name`] and [`WarningCategory::from_name`]: perl has both prefixed names when
+/// subcategorizing (`deprecated::*`) and unprefixed them when experiments graduate, and spelling drift should move one
+/// string table, not every use site.  [`WarningCategory::parent`] encodes the tree (`use warnings 'io'` enables the
+/// whole `io` subtree), with `all` at the root.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum WarningCategory {
@@ -180,7 +181,7 @@ pub enum WarningCategory {
     Syscalls = 54,
 
     /// `experimental::re_strict` — enabled by default (`ckWARN_d` semantics).
-    ReStrict = 55,
+    RegexStrict = 55,
 
     /// `experimental::refaliasing` — enabled by default (`ckWARN_d` semantics).
     Refaliasing = 56,
@@ -210,7 +211,7 @@ pub enum WarningCategory {
     UnipropWildcards = 64,
 
     /// `experimental::vlb` — enabled by default (`ckWARN_d` semantics).
-    Vlb = 65,
+    VariableLengthLookbehind = 65,
 
     /// `experimental::try` — enabled by default (`ckWARN_d` semantics).
     Try = 66,
@@ -320,7 +321,7 @@ impl WarningCategory {
             WarningCategory::Experimental => "experimental",
             WarningCategory::RegexSets => "experimental::regex_sets",
             WarningCategory::Syscalls => "syscalls",
-            WarningCategory::ReStrict => "experimental::re_strict",
+            WarningCategory::RegexStrict => "experimental::re_strict",
             WarningCategory::Refaliasing => "experimental::refaliasing",
             WarningCategory::Locale => "locale",
             WarningCategory::Missing => "missing",
@@ -330,7 +331,7 @@ impl WarningCategory {
             WarningCategory::Shadow => "shadow",
             WarningCategory::PrivateUse => "experimental::private_use",
             WarningCategory::UnipropWildcards => "experimental::uniprop_wildcards",
-            WarningCategory::Vlb => "experimental::vlb",
+            WarningCategory::VariableLengthLookbehind => "experimental::vlb",
             WarningCategory::Try => "experimental::try",
             WarningCategory::ArgsArrayWithSignatures => "experimental::args_array_with_signatures",
             WarningCategory::Builtin => "experimental::builtin",
@@ -407,7 +408,7 @@ impl WarningCategory {
             "experimental" => Some(WarningCategory::Experimental),
             "experimental::regex_sets" => Some(WarningCategory::RegexSets),
             "syscalls" => Some(WarningCategory::Syscalls),
-            "experimental::re_strict" => Some(WarningCategory::ReStrict),
+            "experimental::re_strict" => Some(WarningCategory::RegexStrict),
             "experimental::refaliasing" => Some(WarningCategory::Refaliasing),
             "locale" => Some(WarningCategory::Locale),
             "missing" => Some(WarningCategory::Missing),
@@ -417,7 +418,7 @@ impl WarningCategory {
             "shadow" => Some(WarningCategory::Shadow),
             "experimental::private_use" => Some(WarningCategory::PrivateUse),
             "experimental::uniprop_wildcards" => Some(WarningCategory::UnipropWildcards),
-            "experimental::vlb" => Some(WarningCategory::Vlb),
+            "experimental::vlb" => Some(WarningCategory::VariableLengthLookbehind),
             "experimental::try" => Some(WarningCategory::Try),
             "experimental::args_array_with_signatures" => Some(WarningCategory::ArgsArrayWithSignatures),
             "experimental::builtin" => Some(WarningCategory::Builtin),
@@ -496,7 +497,7 @@ impl WarningCategory {
             WarningCategory::Experimental => Some(WarningCategory::All),
             WarningCategory::RegexSets => Some(WarningCategory::Experimental),
             WarningCategory::Syscalls => Some(WarningCategory::Io),
-            WarningCategory::ReStrict => Some(WarningCategory::Experimental),
+            WarningCategory::RegexStrict => Some(WarningCategory::Experimental),
             WarningCategory::Refaliasing => Some(WarningCategory::Experimental),
             WarningCategory::Locale => Some(WarningCategory::All),
             WarningCategory::Missing => Some(WarningCategory::All),
@@ -506,7 +507,7 @@ impl WarningCategory {
             WarningCategory::Shadow => Some(WarningCategory::All),
             WarningCategory::PrivateUse => Some(WarningCategory::Experimental),
             WarningCategory::UnipropWildcards => Some(WarningCategory::Experimental),
-            WarningCategory::Vlb => Some(WarningCategory::Experimental),
+            WarningCategory::VariableLengthLookbehind => Some(WarningCategory::Experimental),
             WarningCategory::Try => Some(WarningCategory::Experimental),
             WarningCategory::ArgsArrayWithSignatures => Some(WarningCategory::Experimental),
             WarningCategory::Builtin => Some(WarningCategory::Experimental),
@@ -550,14 +551,14 @@ impl WarningCategory {
                 | WarningCategory::Inplace
                 | WarningCategory::Malloc
                 | WarningCategory::UnicodePropertyName
-                | WarningCategory::ReStrict
+                | WarningCategory::RegexStrict
                 | WarningCategory::Refaliasing
                 | WarningCategory::Locale
                 | WarningCategory::DeclaredRefs
                 | WarningCategory::DotInInc
                 | WarningCategory::PrivateUse
                 | WarningCategory::UnipropWildcards
-                | WarningCategory::Vlb
+                | WarningCategory::VariableLengthLookbehind
                 | WarningCategory::Try
                 | WarningCategory::ArgsArrayWithSignatures
                 | WarningCategory::Builtin
@@ -633,7 +634,7 @@ impl WarningCategory {
             52 => Some(WarningCategory::Experimental),
             53 => Some(WarningCategory::RegexSets),
             54 => Some(WarningCategory::Syscalls),
-            55 => Some(WarningCategory::ReStrict),
+            55 => Some(WarningCategory::RegexStrict),
             56 => Some(WarningCategory::Refaliasing),
             57 => Some(WarningCategory::Locale),
             58 => Some(WarningCategory::Missing),
@@ -643,7 +644,7 @@ impl WarningCategory {
             62 => Some(WarningCategory::Shadow),
             63 => Some(WarningCategory::PrivateUse),
             64 => Some(WarningCategory::UnipropWildcards),
-            65 => Some(WarningCategory::Vlb),
+            65 => Some(WarningCategory::VariableLengthLookbehind),
             66 => Some(WarningCategory::Try),
             67 => Some(WarningCategory::ArgsArrayWithSignatures),
             68 => Some(WarningCategory::Builtin),

@@ -2067,7 +2067,9 @@ Container-verified contract (perl 5.38, all under `-w`):
   index by discriminant, its 28-strong default-enabled set
   cross-checked against `$warnings::DEFAULT`, the tree walkable
   through `parent`.  Variants are stable leaf-derived
-  identifiers; perl's spelling, parent path included, is data
+  identifiers, with judgment overrides where mechanical
+  derivation misleads (`RegexStrict`, `VariableLengthLookbehind`)
+  [DECISION]; perl's spelling, parent path included, is data
   living only in `name` and the parser-direction `from_name`
   [DECISION], so spelling drift — perl prefixing when it
   subcategorizes, unprefixing when experiments graduate — moves
