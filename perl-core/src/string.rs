@@ -647,7 +647,7 @@ enum InlineClass {
     Bytes,
 }
 
-/// The storage type: the nineteen-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
+/// The storage type: the twenty-one-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
 /// the discriminant is this type times the three flag bits.  Coarse questions are the projection methods.  Declaration
 /// order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able to represent
 /// the content — first-fit is the ladder — which is what the derived `Ord` means.
@@ -704,9 +704,16 @@ pub enum StorageType {
     /// DateTimeZulu content at the full thirty characters.
     PackedDateTimeZuluFull,
 
+    /// Heap, content of 255 bytes or fewer, ASCII: the twin stands before its tier — more specific first, per the
+    /// ladder — with count and scan omitted from the envelope, both derivable from the variant itself (§2.2.3).
+    Heap8Ascii,
+
     /// Heap, content of 255 bytes or fewer: a two-byte allocation header, everything else in the envelope
     /// (§2.2.3).
     Heap8,
+
+    /// Heap, content through 64 KiB, ASCII: the twin at `u16` widths.
+    Heap16Ascii,
 
     /// Heap, content through 64 KiB: the same shape at `u16` widths.
     Heap16,
@@ -740,15 +747,16 @@ impl StorageType {
         matches!(self, PackedNumeric | PackedNumericFull | PackedDateTimePlus | PackedDateTimePlusFull | PackedDateTimeZulu | PackedDateTimeZuluFull)
     }
 
-    /// The heap tiers that classify eagerly, keeping their scan state in the envelope (§2.2.3).
+    /// The heap tiers that classify eagerly, keeping their scan state in the envelope or the variant (§2.2.3).
     pub fn is_small_heap_tier(self) -> bool {
-        matches!(self, StorageType::Heap8 | StorageType::Heap16)
+        use StorageType::*;
+        matches!(self, Heap8 | Heap8Ascii | Heap16 | Heap16Ascii)
     }
 
-    /// Any of the four heap tiers.
+    /// Any of the four heap tiers, Ascii twins included.
     pub fn is_heap(self) -> bool {
         use StorageType::*;
-        matches!(self, Heap8 | Heap16 | Heap32 | Heap)
+        matches!(self, Heap8 | Heap8Ascii | Heap16 | Heap16Ascii | Heap32 | Heap)
     }
 }
 
@@ -759,7 +767,9 @@ macro_rules! define_perl_string {
         inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
         packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_tainted:literal) ),* $(,)? ],
         heap8:  [ $( $heap8:ident  = ($heap8_utf8:literal,  $heap8_tainted:literal)  ),* $(,)? ],
+        heap8_ascii:  [ $( $heap8a:ident  = ($heap8a_utf8:literal,  $heap8a_tainted:literal)  ),* $(,)? ],
         heap16: [ $( $heap16:ident = ($heap16_utf8:literal, $heap16_tainted:literal) ),* $(,)? ],
+        heap16_ascii: [ $( $heap16a:ident = ($heap16a_utf8:literal, $heap16a_tainted:literal) ),* $(,)? ],
         heap32: [ $( $heap32:ident = ($heap32_utf8:literal, $heap32_tainted:literal) ),* $(,)? ],
         heap:   [ $( $heap:ident  = ($heap_utf8:literal,  $heap_tainted:literal)  ),* $(,)? ],
         immortal: [ $( $immortal:ident = ($immortal_utf8:literal, $immortal_tainted:literal) ),* $(,)? ],
@@ -789,7 +799,9 @@ macro_rules! define_perl_string {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
             $( $heap8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: scan::Terminal }, )*
+            $( $heap8a { ptr: Owned, len: u8,  cap: u8 }, )*
             $( $heap16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
+            $( $heap16a { ptr: Owned, len: u16, cap: u16 }, )*
             $( $heap32 { ptr: Owned, len: u32 }, )*
             $( $heap  { ptr: Owned }, )*
             $( $immortal { ptr: Image, len: [u8; 3], count: [u8; 3], scan: scan::Terminal }, )*
@@ -811,6 +823,14 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16 { ptr, len, cap, count, scan } => Repr::$heap16 {
                         ptr: unsafe { cow_buffer::heap16::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                         len: *len, cap: *cap, count: *count, scan: *scan,
+                    }, )*
+                    $( Repr::$heap8a { ptr, len, cap } => Repr::$heap8a {
+                        ptr: unsafe { cow_buffer::heap8::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                        len: *len, cap: *cap,
+                    }, )*
+                    $( Repr::$heap16a { ptr, len, cap } => Repr::$heap16a {
+                        ptr: unsafe { cow_buffer::heap16::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                        len: *len, cap: *cap,
                     }, )*
                     $( Repr::$heap32 { ptr, len } => Repr::$heap32 {
                         ptr: unsafe { cow_buffer::heap32::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
@@ -839,6 +859,8 @@ macro_rules! define_perl_string {
                     $( Repr::$packed { .. } => {}, )*
                     $( Repr::$heap8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
                     $( Repr::$heap16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
+                    $( Repr::$heap8a { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
+                    $( Repr::$heap16a { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
                     $( Repr::$heap32 { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
                     $( Repr::$heap { ptr } => unsafe { cow_buffer::heap::release(ptr.claim()) }, )*
 
@@ -858,6 +880,8 @@ macro_rules! define_perl_string {
                     $( Repr::$packed { .. } => StorageType::$packed_type, )*
                     $( Repr::$heap8 { .. } => StorageType::Heap8, )*
                     $( Repr::$heap16 { .. } => StorageType::Heap16, )*
+                    $( Repr::$heap8a { .. } => StorageType::Heap8Ascii, )*
+                    $( Repr::$heap16a { .. } => StorageType::Heap16Ascii, )*
                     $( Repr::$heap32 { .. } => StorageType::Heap32, )*
                     $( Repr::$heap { .. } => StorageType::Heap, )*
                     $( Repr::$immortal { .. } => StorageType::Immortal, )*
@@ -872,6 +896,8 @@ macro_rules! define_perl_string {
                     $( Repr::$packed { .. } => $packed_utf8, )*
                     $( Repr::$heap8 { .. } => $heap8_utf8, )*
                     $( Repr::$heap16 { .. } => $heap16_utf8, )*
+                    $( Repr::$heap8a { .. } => $heap8a_utf8, )*
+                    $( Repr::$heap16a { .. } => $heap16a_utf8, )*
                     $( Repr::$heap32 { .. } => $heap32_utf8, )*
                     $( Repr::$heap { .. } => $heap_utf8, )*
                     $( Repr::$immortal { .. } => $immortal_utf8, )*
@@ -886,6 +912,8 @@ macro_rules! define_perl_string {
                     $( Repr::$packed { .. } => $packed_tainted, )*
                     $( Repr::$heap8 { .. } => $heap8_tainted, )*
                     $( Repr::$heap16 { .. } => $heap16_tainted, )*
+                    $( Repr::$heap8a { .. } => $heap8a_tainted, )*
+                    $( Repr::$heap16a { .. } => $heap16a_tainted, )*
                     $( Repr::$heap32 { .. } => $heap32_tainted, )*
                     $( Repr::$heap { .. } => $heap_tainted, )*
                     $( Repr::$immortal { .. } => $immortal_tainted, )*
@@ -899,7 +927,8 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => Some(InlineClass::$inline_class), )*
                     $( Repr::$immortal { .. } => None, )*
-                    $( Repr::$static { .. } => None, )*
+                    $( Repr::$heap8a { .. } => None, )*
+                    $( Repr::$heap16a { .. } => None, )*
 
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
                     $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
@@ -959,6 +988,13 @@ macro_rules! define_perl_string {
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap8)), )*
                     $( Repr::$heap16 { ptr, len, cap, count, scan } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap16)), )*
+
+                    // The Ascii twins' omitted fields are derivable (§2.2.3): every byte is a character, and the
+                    // class is the variant.
+                    $( Repr::$heap8a { ptr, len, cap } =>
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *len as usize, scan::Ascii, Tier::Heap8)), )*
+                    $( Repr::$heap16a { ptr, len, cap } =>
+                        RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *len as usize, scan::Ascii, Tier::Heap16)), )*
                     // SAFETY: a live allocation of this tier, whose header carries the metadata.
                     $( Repr::$heap32 { ptr, len } => RawParts::Heap(unsafe { HeapView::heap32(ptr, *len as usize) }), )*
                     $( Repr::$heap { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::Heap) }), )*
@@ -987,7 +1023,9 @@ macro_rules! define_perl_string {
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
                     $( Repr::$heap8 { .. } => None, )*
+                    $( Repr::$heap8a { .. } => None, )*
                     $( Repr::$heap16 { .. } => None, )*
+                    $( Repr::$heap16a { .. } => None, )*
                     $( Repr::$heap32 { .. } => None, )*
                     $( Repr::$heap { .. } => None, )*
                 }
@@ -1157,6 +1195,22 @@ macro_rules! define_perl_string {
                 // transition or the count came out indeterminate they classify the joined content: one pass, still no
                 // allocation.  The large tiers record what is known and let the next reader derive the rest.
                 match &mut self.0 {
+                    // A twin's implied class survives only an append that stays Ascii; anything else bails to the
+                    // rebuild, which re-dispatches the variant by the joined content's class.
+                    $( Repr::$heap8a { ptr, len, .. } => {
+                        if state != scan::Ascii {
+                            return false;
+                        }
+                        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().as_ptr().add(old_len), bytes.len()) };
+                        *len = new_len as u8;
+                    }, )*
+                    $( Repr::$heap16a { ptr, len, .. } => {
+                        if state != scan::Ascii {
+                            return false;
+                        }
+                        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().as_ptr().add(old_len), bytes.len()) };
+                        *len = new_len as u16;
+                    }, )*
                     $( Repr::$heap8 { ptr, len, count, scan, .. } => {
                         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().as_ptr().add(old_len), bytes.len()) };
                         *len = new_len as u8;
@@ -1212,6 +1266,8 @@ macro_rules! define_perl_string {
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
                     $( Repr::$heap8 { .. } => Some(Tier::Heap8), )*
+                    $( Repr::$heap8a { .. } => Some(Tier::Heap8), )*
+                    $( Repr::$heap16a { .. } => Some(Tier::Heap16), )*
                     $( Repr::$heap16 { .. } => Some(Tier::Heap16), )*
                     $( Repr::$heap32 { .. } => Some(Tier::Heap32), )*
                     $( Repr::$heap { .. } => Some(Tier::Heap), )*
@@ -1250,6 +1306,22 @@ macro_rules! define_perl_string {
                         cap: *cap as usize,
                         count: *count as usize,
                         scan: scan.widen(),
+                        tier: Tier::Heap16,
+                    }, )*
+                    $( Repr::$heap8a { ptr, len, cap } => RawOwned::Heap {
+                        ptr: unsafe { std::ptr::read(ptr) },
+                        len: *len as usize,
+                        cap: *cap as usize,
+                        count: *len as usize,
+                        scan: scan::Ascii,
+                        tier: Tier::Heap8,
+                    }, )*
+                    $( Repr::$heap16a { ptr, len, cap } => RawOwned::Heap {
+                        ptr: unsafe { std::ptr::read(ptr) },
+                        len: *len as usize,
+                        cap: *cap as usize,
+                        count: *len as usize,
+                        scan: scan::Ascii,
                         tier: Tier::Heap16,
                     }, )*
 
@@ -1296,6 +1368,18 @@ macro_rules! define_perl_string {
                 // disarmed `Owned` and is never dropped.
                 let ptr = unsafe { Owned::from_raw(ptr) };
                 match tier {
+                    // The Ascii twins are the class-specific selection (§2.2.3): same tier, count and scan derivable,
+                    // chosen whenever the settled state is Ascii.
+                    Tier::Heap8 if scan == scan::Ascii => match (utf8, tainted) {
+                        $( ($heap8a_utf8, $heap8a_tainted) => PerlString(Repr::$heap8a {
+                            ptr, len: len as u8, cap: cap as u8,
+                        }), )*
+                    },
+                    Tier::Heap16 if scan == scan::Ascii => match (utf8, tainted) {
+                        $( ($heap16a_utf8, $heap16a_tainted) => PerlString(Repr::$heap16a {
+                            ptr, len: len as u16, cap: cap as u16,
+                        }), )*
+                    },
                     Tier::Heap8 => match (utf8, tainted) {
                         $( ($heap8_utf8, $heap8_tainted) => PerlString(Repr::$heap8 {
                             ptr, len: len as u8, cap: cap as u8, count: count as u8,
@@ -1417,11 +1501,23 @@ define_perl_string! {
         Heap8Tainted              = (false, true),
         Heap8FlaggedTainted       = (true, true),
     ],
+    heap8_ascii: [
+        Heap8Ascii                     = (false, false),
+        Heap8AsciiFlagged              = (true, false),
+        Heap8AsciiTainted              = (false, true),
+        Heap8AsciiFlaggedTainted       = (true, true),
+    ],
     heap16: [
         Heap16                     = (false, false),
         Heap16Flagged              = (true, false),
         Heap16Tainted              = (false, true),
         Heap16FlaggedTainted       = (true, true),
+    ],
+    heap16_ascii: [
+        Heap16Ascii                     = (false, false),
+        Heap16AsciiFlagged              = (true, false),
+        Heap16AsciiTainted              = (false, true),
+        Heap16AsciiFlaggedTainted      = (true, true),
     ],
     heap32: [
         Heap32                     = (false, false),

@@ -1151,6 +1151,57 @@ fn char_count_shared_across_cow_sharers() {
 
 // ── COW behavior through the string layer ─────────────────────
 #[test]
+fn ascii_twins_are_the_class_specific_selection_with_derived_facts() {
+    // Both tiers route settled-Ascii births to their twin, whose omitted count and scan are derived: every byte a
+    // character, the class in the variant.
+    let small = PerlString::from_bytes(b"x".repeat(40)).unwrap();
+    assert_eq!(small.storage_type(), StorageType::Heap8Ascii);
+    assert_eq!(small.scan_state(), scan::Ascii);
+    assert!(small.is_ascii());
+    assert_eq!(small.char_len(), Some(40));
+
+    let mid = PerlString::from_bytes(b"y".repeat(300)).unwrap();
+    assert_eq!(mid.storage_type(), StorageType::Heap16Ascii);
+    assert_eq!(mid.char_len(), Some(300));
+
+    // Non-Ascii small heap content stays on the plain variant.
+    let plain = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    assert_eq!(plain.storage_type(), StorageType::Heap8);
+
+    // A twin and a plain tier holding the same bytes are equal: the twin is a selection, not a meaning.
+    let as_heap16 = PerlString::from_bytes(b"x".repeat(40)).unwrap();
+    assert_eq!(small, as_heap16);
+}
+
+#[test]
+fn ascii_twin_appends_stay_in_place_only_while_ascii_holds() {
+    // An Ascii append extends the twin in place: same variant, no reclassification, count still derived.
+    let mut s = PerlString::from_bytes(b"a".repeat(40)).unwrap();
+    assert_eq!(s.storage_type(), StorageType::Heap8Ascii);
+    s.push_str("bcd").unwrap();
+    assert_eq!(s.storage_type(), StorageType::Heap8Ascii);
+    assert_eq!(s.len(), 43);
+    assert_eq!(s.char_len(), Some(43));
+
+    // A non-Ascii append cannot ride the implied class: the fast path bails and the rebuild re-dispatches the
+    // variant by the joined content, settled per classify-on-copy.
+    let mut t = PerlString::from_bytes(b"a".repeat(40)).unwrap();
+    t.push_str("é").unwrap();
+    assert_eq!(t.storage_type(), StorageType::Heap8);
+    assert_eq!(t.scan_state(), scan::Utf8Latin1);
+    assert_eq!(t.char_len(), Some(41));
+
+    // COW discipline holds on the twins: a shared twin's append copies, the sharer untouched.
+    let a = PerlString::from_bytes(b"z".repeat(40)).unwrap();
+    let mut b = a.clone();
+    assert!(a.is_shared());
+    b.push_str("!").unwrap();
+    assert_eq!(a.len(), 40);
+    assert_eq!(b.len(), 41);
+    assert!(!a.is_shared());
+}
+
+#[test]
 fn static_strings_are_zero_allocation_with_facts_settled_at_birth() {
     const TEXT: &str = "héllo, wörld: a static string past the inline ceiling";
     let live = cow_buffer::live::count();
@@ -1183,7 +1234,7 @@ fn immortal_and_static_writes_copy_out_and_flags_ride_the_image() {
     let s = PerlString::from_static_str("the quick brown fox jumps over the lazy dog").unwrap();
     let mut w = s.clone();
     w.push_str(" again").unwrap();
-    assert!(matches!(w.storage_type(), StorageType::Heap8), "the write landed in a tier");
+    assert!(matches!(w.storage_type(), StorageType::Heap8Ascii), "the write landed in a tier, in the Ascii twin");
     assert_eq!(w.len(), s.len() + 6);
     assert_eq!(s.storage_type(), StorageType::Static, "the image and its other handles are untouched");
     assert_eq!(s.char_len(), Some(43));
@@ -1660,7 +1711,7 @@ fn compressed_payloads_and_the_nibble_scheme() {
     // Deterministic ladder: 16-30-byte ASCII goes packed where an alphabet fits and heap otherwise — never compressed,
     // sixteen characters not fitting fifteen payload bytes.
     assert_eq!(PerlString::from_bytes(b"1234567890123456").unwrap().storage_type(), StorageType::PackedNumeric);
-    assert_eq!(PerlString::from_bytes(b"abcdefghabcdefgh").unwrap().storage_type(), StorageType::Heap8);
+    assert_eq!(PerlString::from_bytes(b"abcdefghabcdefgh").unwrap().storage_type(), StorageType::Heap8Ascii);
 }
 
 #[test]
