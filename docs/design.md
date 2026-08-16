@@ -2076,7 +2076,10 @@ Container-verified contract (perl 5.38, all under `-w`):
   crate, aggregated by
   consumers through wrapper enums with `From` impls and
   delegating `Display`.  Every warning enum speaks the
-  `PerlWarning` trait: perl-exact `Display` of the body, and
+  `PerlWarning` trait: perl-exact `Display` of the body;
+  `deprecated()` and `experimental()` family predicates
+  defaulting to `false`, overridden by enums that own such
+  warnings [DECISION]; and
   `parts()` — an iterator of `(WarningCategory, Self)` pairs,
   the atomic warnings in emission order each beside the category
   that gates it — as the whole gating truth [DECISION].  There

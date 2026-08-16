@@ -676,6 +676,18 @@ pub trait PerlWarning: fmt::Display + Clone + Sized {
     /// The atomic warnings in emission order, each with its gating category.  Emission gates each pair by its category
     /// and renders the part; a whole-event pre-check is `parts().any(|(c, _)| enabled(c))`.
     fn parts(&self) -> impl Iterator<Item = (WarningCategory, Self)>;
+
+    /// Whether this warning belongs to perl's deprecation family.  Defaults to `false` — the overwhelmingly common
+    /// answer — and enums that own deprecation warnings override it.
+    fn deprecated(&self) -> bool {
+        false
+    }
+
+    /// Whether this warning belongs to perl's experimental family.  Defaults to `false`, overridden by enums that own
+    /// experimental-feature warnings.
+    fn experimental(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -92,4 +92,8 @@ fn warnings_yield_their_parts_with_gating_categories() {
     let enabled = |cat: WarningCategory| cat != WarningCategory::Digit;
     let emitted: Vec<_> = compound.parts().filter(|(cat, _)| enabled(*cat)).map(|(_, p)| format!("{p}")).collect();
     assert_eq!(emitted, vec!["Integer overflow in hexadecimal number".to_string()]);
+
+    // The family predicates default false: no numify warning is deprecation- or experiment-class.
+    assert!(!warn.deprecated() && !warn.experimental());
+    assert!(!compound.deprecated() && !compound.experimental());
 }
