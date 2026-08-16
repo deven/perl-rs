@@ -31,8 +31,18 @@ fn the_tree_matches_perl_bit_for_bit() {
 
     // Names are perl's spellings, subcategories included.
     assert_eq!(WarningCategory::Numeric.name(), "numeric");
-    assert_eq!(WarningCategory::DeprecatedDotInInc.name(), "deprecated::dot_in_inc");
-    assert_eq!(WarningCategory::ExperimentalReStrict.name(), "experimental::re_strict");
+    assert_eq!(WarningCategory::DotInInc.name(), "deprecated::dot_in_inc");
+    assert_eq!(WarningCategory::ReStrict.name(), "experimental::re_strict");
+
+    // The spelling map runs both directions: the parser's from_name inverts name over the whole vocabulary, and
+    // variants stay stable leaf identifiers while the spelling — prefix included — is data.
+    for bit in 0..WARNING_CATEGORY_COUNT as u8 {
+        let cat = WarningCategory::from_bit(bit).unwrap();
+        assert_eq!(WarningCategory::from_name(cat.name()), Some(cat));
+    }
+    assert_eq!(WarningCategory::from_name("deprecated::dot_in_inc"), Some(WarningCategory::DotInInc));
+    assert_eq!(WarningCategory::from_name("dot_in_inc"), None, "perl accepts only its exact spelling");
+    assert_eq!(WarningCategory::from_name("no_such_category"), None);
 
     // Round trip through the bit space, dense and total.
     for bit in 0..WARNING_CATEGORY_COUNT as u8 {
@@ -45,7 +55,7 @@ fn the_tree_matches_perl_bit_for_bit() {
     // The default-enabled set is $warnings::DEFAULT's 28, spot-checked at its edges: deprecated and its children on,
     // numeric and overflow off (overflow's default-on-ness in C is ckWARN_d at the call site, not the bit).
     assert!(WarningCategory::Deprecated.default_enabled());
-    assert!(WarningCategory::DeprecatedDotInInc.default_enabled());
+    assert!(WarningCategory::DotInInc.default_enabled());
     assert!(WarningCategory::Glob.default_enabled());
     assert!(WarningCategory::MissingImport.default_enabled());
     assert!(!WarningCategory::Numeric.default_enabled());

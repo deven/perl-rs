@@ -1,15 +1,16 @@
-// Perl's warning-category tree (§2.3.4): the vocabulary every warning enum's `category` speaks, and the index space
-// warning pragmas compile into.  Extracted from perl 5.44.0's `regen/warnings.pl` tree joined with
-// `%warnings::Offsets`, with the default-enabled set cross-checked against `$warnings::DEFAULT` — the discriminants are
-// perl's own bit numbers, so a pragma bit vector indexes by discriminant with no translation.
+// Perl's warning-category tree (§2.3.4): the vocabulary every warning enum's parts speak, and the index space warning
+// pragmas compile into.  Extracted from perl 5.44.0's `regen/warnings.pl` tree joined with `%warnings::Offsets`, with
+// the default-enabled set cross-checked against `$warnings::DEFAULT` — the discriminants are perl's own bit numbers,
+// so a pragma bit vector indexes by discriminant with no translation.
 
 use std::fmt;
 
-/// One of perl's 81 warning categories.  The discriminant is perl's bit number; [`WarningCategory::name`] is perl's
-/// spelling; [`WarningCategory::parent`] encodes the tree (`use warnings 'io'` enables the whole `io` subtree), with
-/// `all` at the root.  Categories are vocabulary, not messages: every warning enum pairs its atomic parts with
-/// their categories through [`PerlWarning::parts`], and the interpreter's pragma state is a bit vector indexed by
-/// these discriminants.
+/// One of perl's 81 warning categories.  The discriminant is perl's bit number; the variant is a *stable* leaf-derived
+/// identifier, while perl's spelling — parent path included — is data, living only in [`WarningCategory::name`] and
+/// [`WarningCategory::from_name`]: perl has both prefixed names when subcategorizing (`deprecated::*`) and unprefixed
+/// them when experiments graduate, and spelling drift should move one string table, not every use site.
+/// [`WarningCategory::parent`] encodes the tree (`use warnings 'io'` enables the whole `io` subtree), with `all` at the
+/// root.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum WarningCategory {
@@ -158,7 +159,7 @@ pub enum WarningCategory {
     Illegalproto = 47,
 
     /// `deprecated::unicode_property_name` — enabled by default (`ckWARN_d` semantics).
-    DeprecatedUnicodePropertyName = 48,
+    UnicodePropertyName = 48,
 
     /// `non_unicode`
     NonUnicode = 49,
@@ -173,16 +174,16 @@ pub enum WarningCategory {
     Experimental = 52,
 
     /// `experimental::regex_sets`
-    ExperimentalRegexSets = 53,
+    RegexSets = 53,
 
     /// `syscalls`
     Syscalls = 54,
 
     /// `experimental::re_strict` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalReStrict = 55,
+    ReStrict = 55,
 
     /// `experimental::refaliasing` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalRefaliasing = 56,
+    Refaliasing = 56,
 
     /// `locale` — enabled by default (`ckWARN_d` semantics).
     Locale = 57,
@@ -194,64 +195,64 @@ pub enum WarningCategory {
     Redundant = 59,
 
     /// `experimental::declared_refs` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalDeclaredRefs = 60,
+    DeclaredRefs = 60,
 
     /// `deprecated::dot_in_inc` — enabled by default (`ckWARN_d` semantics).
-    DeprecatedDotInInc = 61,
+    DotInInc = 61,
 
     /// `shadow`
     Shadow = 62,
 
     /// `experimental::private_use` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalPrivateUse = 63,
+    PrivateUse = 63,
 
     /// `experimental::uniprop_wildcards` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalUnipropWildcards = 64,
+    UnipropWildcards = 64,
 
     /// `experimental::vlb` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalVlb = 65,
+    Vlb = 65,
 
     /// `experimental::try` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalTry = 66,
+    Try = 66,
 
     /// `experimental::args_array_with_signatures` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalArgsArrayWithSignatures = 67,
+    ArgsArrayWithSignatures = 67,
 
     /// `experimental::builtin` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalBuiltin = 68,
+    Builtin = 68,
 
     /// `experimental::defer` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalDefer = 69,
+    Defer = 69,
 
     /// `experimental::extra_paired_delimiters` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalExtraPairedDelimiters = 70,
+    ExtraPairedDelimiters = 70,
 
     /// `scalar`
     Scalar = 71,
 
     /// `deprecated::version_downgrade` — enabled by default (`ckWARN_d` semantics).
-    DeprecatedVersionDowngrade = 72,
+    VersionDowngrade = 72,
 
     /// `deprecated::delimiter_will_be_paired` — enabled by default (`ckWARN_d` semantics).
-    DeprecatedDelimiterWillBePaired = 73,
+    DelimiterWillBePaired = 73,
 
     /// `experimental::class` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalClass = 74,
+    Class = 74,
 
     /// `deprecated::subsequent_use_version` — enabled by default (`ckWARN_d` semantics).
-    DeprecatedSubsequentUseVersion = 75,
+    SubsequentUseVersion = 75,
 
     /// `experimental::keyword_all` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalKeywordAll = 76,
+    KeywordAll = 76,
 
     /// `experimental::keyword_any` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalKeywordAny = 77,
+    KeywordAny = 77,
 
     /// `experimental::enhanced_xx` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalEnhancedXx = 78,
+    EnhancedXx = 78,
 
     /// `experimental::signature_named_parameters` — enabled by default (`ckWARN_d` semantics).
-    ExperimentalSignatureNamedParameters = 79,
+    SignatureNamedParameters = 79,
 
     /// `missing_import` — enabled by default (`ckWARN_d` semantics).
     MissingImport = 80,
@@ -261,7 +262,7 @@ pub enum WarningCategory {
 pub const WARNING_CATEGORY_COUNT: usize = 81;
 
 impl WarningCategory {
-    /// Perl's spelling, as `use warnings '...'` writes it.
+    /// Perl's spelling, as `use warnings '...'` writes it — parent path included for the subcategories.
     pub fn name(self) -> &'static str {
         match self {
             WarningCategory::All => "all",
@@ -312,39 +313,127 @@ impl WarningCategory {
             WarningCategory::Void => "void",
             WarningCategory::Imprecision => "imprecision",
             WarningCategory::Illegalproto => "illegalproto",
-            WarningCategory::DeprecatedUnicodePropertyName => "deprecated::unicode_property_name",
+            WarningCategory::UnicodePropertyName => "deprecated::unicode_property_name",
             WarningCategory::NonUnicode => "non_unicode",
             WarningCategory::Nonchar => "nonchar",
             WarningCategory::Surrogate => "surrogate",
             WarningCategory::Experimental => "experimental",
-            WarningCategory::ExperimentalRegexSets => "experimental::regex_sets",
+            WarningCategory::RegexSets => "experimental::regex_sets",
             WarningCategory::Syscalls => "syscalls",
-            WarningCategory::ExperimentalReStrict => "experimental::re_strict",
-            WarningCategory::ExperimentalRefaliasing => "experimental::refaliasing",
+            WarningCategory::ReStrict => "experimental::re_strict",
+            WarningCategory::Refaliasing => "experimental::refaliasing",
             WarningCategory::Locale => "locale",
             WarningCategory::Missing => "missing",
             WarningCategory::Redundant => "redundant",
-            WarningCategory::ExperimentalDeclaredRefs => "experimental::declared_refs",
-            WarningCategory::DeprecatedDotInInc => "deprecated::dot_in_inc",
+            WarningCategory::DeclaredRefs => "experimental::declared_refs",
+            WarningCategory::DotInInc => "deprecated::dot_in_inc",
             WarningCategory::Shadow => "shadow",
-            WarningCategory::ExperimentalPrivateUse => "experimental::private_use",
-            WarningCategory::ExperimentalUnipropWildcards => "experimental::uniprop_wildcards",
-            WarningCategory::ExperimentalVlb => "experimental::vlb",
-            WarningCategory::ExperimentalTry => "experimental::try",
-            WarningCategory::ExperimentalArgsArrayWithSignatures => "experimental::args_array_with_signatures",
-            WarningCategory::ExperimentalBuiltin => "experimental::builtin",
-            WarningCategory::ExperimentalDefer => "experimental::defer",
-            WarningCategory::ExperimentalExtraPairedDelimiters => "experimental::extra_paired_delimiters",
+            WarningCategory::PrivateUse => "experimental::private_use",
+            WarningCategory::UnipropWildcards => "experimental::uniprop_wildcards",
+            WarningCategory::Vlb => "experimental::vlb",
+            WarningCategory::Try => "experimental::try",
+            WarningCategory::ArgsArrayWithSignatures => "experimental::args_array_with_signatures",
+            WarningCategory::Builtin => "experimental::builtin",
+            WarningCategory::Defer => "experimental::defer",
+            WarningCategory::ExtraPairedDelimiters => "experimental::extra_paired_delimiters",
             WarningCategory::Scalar => "scalar",
-            WarningCategory::DeprecatedVersionDowngrade => "deprecated::version_downgrade",
-            WarningCategory::DeprecatedDelimiterWillBePaired => "deprecated::delimiter_will_be_paired",
-            WarningCategory::ExperimentalClass => "experimental::class",
-            WarningCategory::DeprecatedSubsequentUseVersion => "deprecated::subsequent_use_version",
-            WarningCategory::ExperimentalKeywordAll => "experimental::keyword_all",
-            WarningCategory::ExperimentalKeywordAny => "experimental::keyword_any",
-            WarningCategory::ExperimentalEnhancedXx => "experimental::enhanced_xx",
-            WarningCategory::ExperimentalSignatureNamedParameters => "experimental::signature_named_parameters",
+            WarningCategory::VersionDowngrade => "deprecated::version_downgrade",
+            WarningCategory::DelimiterWillBePaired => "deprecated::delimiter_will_be_paired",
+            WarningCategory::Class => "experimental::class",
+            WarningCategory::SubsequentUseVersion => "deprecated::subsequent_use_version",
+            WarningCategory::KeywordAll => "experimental::keyword_all",
+            WarningCategory::KeywordAny => "experimental::keyword_any",
+            WarningCategory::EnhancedXx => "experimental::enhanced_xx",
+            WarningCategory::SignatureNamedParameters => "experimental::signature_named_parameters",
             WarningCategory::MissingImport => "missing_import",
+        }
+    }
+
+    /// The category perl's spelling names — the parser's direction, `use warnings 'numeric'` to the bit.
+    pub fn from_name(name: &str) -> Option<WarningCategory> {
+        match name {
+            "all" => Some(WarningCategory::All),
+            "closure" => Some(WarningCategory::Closure),
+            "deprecated" => Some(WarningCategory::Deprecated),
+            "exiting" => Some(WarningCategory::Exiting),
+            "glob" => Some(WarningCategory::Glob),
+            "io" => Some(WarningCategory::Io),
+            "closed" => Some(WarningCategory::Closed),
+            "exec" => Some(WarningCategory::Exec),
+            "layer" => Some(WarningCategory::Layer),
+            "newline" => Some(WarningCategory::Newline),
+            "pipe" => Some(WarningCategory::Pipe),
+            "unopened" => Some(WarningCategory::Unopened),
+            "misc" => Some(WarningCategory::Misc),
+            "numeric" => Some(WarningCategory::Numeric),
+            "once" => Some(WarningCategory::Once),
+            "overflow" => Some(WarningCategory::Overflow),
+            "pack" => Some(WarningCategory::Pack),
+            "portable" => Some(WarningCategory::Portable),
+            "recursion" => Some(WarningCategory::Recursion),
+            "redefine" => Some(WarningCategory::Redefine),
+            "regexp" => Some(WarningCategory::Regexp),
+            "severe" => Some(WarningCategory::Severe),
+            "debugging" => Some(WarningCategory::Debugging),
+            "inplace" => Some(WarningCategory::Inplace),
+            "internal" => Some(WarningCategory::Internal),
+            "malloc" => Some(WarningCategory::Malloc),
+            "signal" => Some(WarningCategory::Signal),
+            "substr" => Some(WarningCategory::Substr),
+            "syntax" => Some(WarningCategory::Syntax),
+            "ambiguous" => Some(WarningCategory::Ambiguous),
+            "bareword" => Some(WarningCategory::Bareword),
+            "digit" => Some(WarningCategory::Digit),
+            "parenthesis" => Some(WarningCategory::Parenthesis),
+            "precedence" => Some(WarningCategory::Precedence),
+            "printf" => Some(WarningCategory::Printf),
+            "prototype" => Some(WarningCategory::Prototype),
+            "qw" => Some(WarningCategory::Qw),
+            "reserved" => Some(WarningCategory::Reserved),
+            "semicolon" => Some(WarningCategory::Semicolon),
+            "taint" => Some(WarningCategory::Taint),
+            "threads" => Some(WarningCategory::Threads),
+            "uninitialized" => Some(WarningCategory::Uninitialized),
+            "unpack" => Some(WarningCategory::Unpack),
+            "untie" => Some(WarningCategory::Untie),
+            "utf8" => Some(WarningCategory::Utf8),
+            "void" => Some(WarningCategory::Void),
+            "imprecision" => Some(WarningCategory::Imprecision),
+            "illegalproto" => Some(WarningCategory::Illegalproto),
+            "deprecated::unicode_property_name" => Some(WarningCategory::UnicodePropertyName),
+            "non_unicode" => Some(WarningCategory::NonUnicode),
+            "nonchar" => Some(WarningCategory::Nonchar),
+            "surrogate" => Some(WarningCategory::Surrogate),
+            "experimental" => Some(WarningCategory::Experimental),
+            "experimental::regex_sets" => Some(WarningCategory::RegexSets),
+            "syscalls" => Some(WarningCategory::Syscalls),
+            "experimental::re_strict" => Some(WarningCategory::ReStrict),
+            "experimental::refaliasing" => Some(WarningCategory::Refaliasing),
+            "locale" => Some(WarningCategory::Locale),
+            "missing" => Some(WarningCategory::Missing),
+            "redundant" => Some(WarningCategory::Redundant),
+            "experimental::declared_refs" => Some(WarningCategory::DeclaredRefs),
+            "deprecated::dot_in_inc" => Some(WarningCategory::DotInInc),
+            "shadow" => Some(WarningCategory::Shadow),
+            "experimental::private_use" => Some(WarningCategory::PrivateUse),
+            "experimental::uniprop_wildcards" => Some(WarningCategory::UnipropWildcards),
+            "experimental::vlb" => Some(WarningCategory::Vlb),
+            "experimental::try" => Some(WarningCategory::Try),
+            "experimental::args_array_with_signatures" => Some(WarningCategory::ArgsArrayWithSignatures),
+            "experimental::builtin" => Some(WarningCategory::Builtin),
+            "experimental::defer" => Some(WarningCategory::Defer),
+            "experimental::extra_paired_delimiters" => Some(WarningCategory::ExtraPairedDelimiters),
+            "scalar" => Some(WarningCategory::Scalar),
+            "deprecated::version_downgrade" => Some(WarningCategory::VersionDowngrade),
+            "deprecated::delimiter_will_be_paired" => Some(WarningCategory::DelimiterWillBePaired),
+            "experimental::class" => Some(WarningCategory::Class),
+            "deprecated::subsequent_use_version" => Some(WarningCategory::SubsequentUseVersion),
+            "experimental::keyword_all" => Some(WarningCategory::KeywordAll),
+            "experimental::keyword_any" => Some(WarningCategory::KeywordAny),
+            "experimental::enhanced_xx" => Some(WarningCategory::EnhancedXx),
+            "experimental::signature_named_parameters" => Some(WarningCategory::SignatureNamedParameters),
+            "missing_import" => Some(WarningCategory::MissingImport),
+            _ => None,
         }
     }
 
@@ -400,38 +489,38 @@ impl WarningCategory {
             WarningCategory::Void => Some(WarningCategory::All),
             WarningCategory::Imprecision => Some(WarningCategory::All),
             WarningCategory::Illegalproto => Some(WarningCategory::Syntax),
-            WarningCategory::DeprecatedUnicodePropertyName => Some(WarningCategory::Deprecated),
+            WarningCategory::UnicodePropertyName => Some(WarningCategory::Deprecated),
             WarningCategory::NonUnicode => Some(WarningCategory::Utf8),
             WarningCategory::Nonchar => Some(WarningCategory::Utf8),
             WarningCategory::Surrogate => Some(WarningCategory::Utf8),
             WarningCategory::Experimental => Some(WarningCategory::All),
-            WarningCategory::ExperimentalRegexSets => Some(WarningCategory::Experimental),
+            WarningCategory::RegexSets => Some(WarningCategory::Experimental),
             WarningCategory::Syscalls => Some(WarningCategory::Io),
-            WarningCategory::ExperimentalReStrict => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalRefaliasing => Some(WarningCategory::Experimental),
+            WarningCategory::ReStrict => Some(WarningCategory::Experimental),
+            WarningCategory::Refaliasing => Some(WarningCategory::Experimental),
             WarningCategory::Locale => Some(WarningCategory::All),
             WarningCategory::Missing => Some(WarningCategory::All),
             WarningCategory::Redundant => Some(WarningCategory::All),
-            WarningCategory::ExperimentalDeclaredRefs => Some(WarningCategory::Experimental),
-            WarningCategory::DeprecatedDotInInc => Some(WarningCategory::Deprecated),
+            WarningCategory::DeclaredRefs => Some(WarningCategory::Experimental),
+            WarningCategory::DotInInc => Some(WarningCategory::Deprecated),
             WarningCategory::Shadow => Some(WarningCategory::All),
-            WarningCategory::ExperimentalPrivateUse => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalUnipropWildcards => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalVlb => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalTry => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalArgsArrayWithSignatures => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalBuiltin => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalDefer => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalExtraPairedDelimiters => Some(WarningCategory::Experimental),
+            WarningCategory::PrivateUse => Some(WarningCategory::Experimental),
+            WarningCategory::UnipropWildcards => Some(WarningCategory::Experimental),
+            WarningCategory::Vlb => Some(WarningCategory::Experimental),
+            WarningCategory::Try => Some(WarningCategory::Experimental),
+            WarningCategory::ArgsArrayWithSignatures => Some(WarningCategory::Experimental),
+            WarningCategory::Builtin => Some(WarningCategory::Experimental),
+            WarningCategory::Defer => Some(WarningCategory::Experimental),
+            WarningCategory::ExtraPairedDelimiters => Some(WarningCategory::Experimental),
             WarningCategory::Scalar => Some(WarningCategory::All),
-            WarningCategory::DeprecatedVersionDowngrade => Some(WarningCategory::Deprecated),
-            WarningCategory::DeprecatedDelimiterWillBePaired => Some(WarningCategory::Deprecated),
-            WarningCategory::ExperimentalClass => Some(WarningCategory::Experimental),
-            WarningCategory::DeprecatedSubsequentUseVersion => Some(WarningCategory::Deprecated),
-            WarningCategory::ExperimentalKeywordAll => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalKeywordAny => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalEnhancedXx => Some(WarningCategory::Experimental),
-            WarningCategory::ExperimentalSignatureNamedParameters => Some(WarningCategory::Experimental),
+            WarningCategory::VersionDowngrade => Some(WarningCategory::Deprecated),
+            WarningCategory::DelimiterWillBePaired => Some(WarningCategory::Deprecated),
+            WarningCategory::Class => Some(WarningCategory::Experimental),
+            WarningCategory::SubsequentUseVersion => Some(WarningCategory::Deprecated),
+            WarningCategory::KeywordAll => Some(WarningCategory::Experimental),
+            WarningCategory::KeywordAny => Some(WarningCategory::Experimental),
+            WarningCategory::EnhancedXx => Some(WarningCategory::Experimental),
+            WarningCategory::SignatureNamedParameters => Some(WarningCategory::Experimental),
             WarningCategory::MissingImport => Some(WarningCategory::All),
         }
     }
@@ -460,28 +549,28 @@ impl WarningCategory {
                 | WarningCategory::Debugging
                 | WarningCategory::Inplace
                 | WarningCategory::Malloc
-                | WarningCategory::DeprecatedUnicodePropertyName
-                | WarningCategory::ExperimentalReStrict
-                | WarningCategory::ExperimentalRefaliasing
+                | WarningCategory::UnicodePropertyName
+                | WarningCategory::ReStrict
+                | WarningCategory::Refaliasing
                 | WarningCategory::Locale
-                | WarningCategory::ExperimentalDeclaredRefs
-                | WarningCategory::DeprecatedDotInInc
-                | WarningCategory::ExperimentalPrivateUse
-                | WarningCategory::ExperimentalUnipropWildcards
-                | WarningCategory::ExperimentalVlb
-                | WarningCategory::ExperimentalTry
-                | WarningCategory::ExperimentalArgsArrayWithSignatures
-                | WarningCategory::ExperimentalBuiltin
-                | WarningCategory::ExperimentalDefer
-                | WarningCategory::ExperimentalExtraPairedDelimiters
-                | WarningCategory::DeprecatedVersionDowngrade
-                | WarningCategory::DeprecatedDelimiterWillBePaired
-                | WarningCategory::ExperimentalClass
-                | WarningCategory::DeprecatedSubsequentUseVersion
-                | WarningCategory::ExperimentalKeywordAll
-                | WarningCategory::ExperimentalKeywordAny
-                | WarningCategory::ExperimentalEnhancedXx
-                | WarningCategory::ExperimentalSignatureNamedParameters
+                | WarningCategory::DeclaredRefs
+                | WarningCategory::DotInInc
+                | WarningCategory::PrivateUse
+                | WarningCategory::UnipropWildcards
+                | WarningCategory::Vlb
+                | WarningCategory::Try
+                | WarningCategory::ArgsArrayWithSignatures
+                | WarningCategory::Builtin
+                | WarningCategory::Defer
+                | WarningCategory::ExtraPairedDelimiters
+                | WarningCategory::VersionDowngrade
+                | WarningCategory::DelimiterWillBePaired
+                | WarningCategory::Class
+                | WarningCategory::SubsequentUseVersion
+                | WarningCategory::KeywordAll
+                | WarningCategory::KeywordAny
+                | WarningCategory::EnhancedXx
+                | WarningCategory::SignatureNamedParameters
                 | WarningCategory::MissingImport
         )
     }
@@ -537,38 +626,38 @@ impl WarningCategory {
             45 => Some(WarningCategory::Void),
             46 => Some(WarningCategory::Imprecision),
             47 => Some(WarningCategory::Illegalproto),
-            48 => Some(WarningCategory::DeprecatedUnicodePropertyName),
+            48 => Some(WarningCategory::UnicodePropertyName),
             49 => Some(WarningCategory::NonUnicode),
             50 => Some(WarningCategory::Nonchar),
             51 => Some(WarningCategory::Surrogate),
             52 => Some(WarningCategory::Experimental),
-            53 => Some(WarningCategory::ExperimentalRegexSets),
+            53 => Some(WarningCategory::RegexSets),
             54 => Some(WarningCategory::Syscalls),
-            55 => Some(WarningCategory::ExperimentalReStrict),
-            56 => Some(WarningCategory::ExperimentalRefaliasing),
+            55 => Some(WarningCategory::ReStrict),
+            56 => Some(WarningCategory::Refaliasing),
             57 => Some(WarningCategory::Locale),
             58 => Some(WarningCategory::Missing),
             59 => Some(WarningCategory::Redundant),
-            60 => Some(WarningCategory::ExperimentalDeclaredRefs),
-            61 => Some(WarningCategory::DeprecatedDotInInc),
+            60 => Some(WarningCategory::DeclaredRefs),
+            61 => Some(WarningCategory::DotInInc),
             62 => Some(WarningCategory::Shadow),
-            63 => Some(WarningCategory::ExperimentalPrivateUse),
-            64 => Some(WarningCategory::ExperimentalUnipropWildcards),
-            65 => Some(WarningCategory::ExperimentalVlb),
-            66 => Some(WarningCategory::ExperimentalTry),
-            67 => Some(WarningCategory::ExperimentalArgsArrayWithSignatures),
-            68 => Some(WarningCategory::ExperimentalBuiltin),
-            69 => Some(WarningCategory::ExperimentalDefer),
-            70 => Some(WarningCategory::ExperimentalExtraPairedDelimiters),
+            63 => Some(WarningCategory::PrivateUse),
+            64 => Some(WarningCategory::UnipropWildcards),
+            65 => Some(WarningCategory::Vlb),
+            66 => Some(WarningCategory::Try),
+            67 => Some(WarningCategory::ArgsArrayWithSignatures),
+            68 => Some(WarningCategory::Builtin),
+            69 => Some(WarningCategory::Defer),
+            70 => Some(WarningCategory::ExtraPairedDelimiters),
             71 => Some(WarningCategory::Scalar),
-            72 => Some(WarningCategory::DeprecatedVersionDowngrade),
-            73 => Some(WarningCategory::DeprecatedDelimiterWillBePaired),
-            74 => Some(WarningCategory::ExperimentalClass),
-            75 => Some(WarningCategory::DeprecatedSubsequentUseVersion),
-            76 => Some(WarningCategory::ExperimentalKeywordAll),
-            77 => Some(WarningCategory::ExperimentalKeywordAny),
-            78 => Some(WarningCategory::ExperimentalEnhancedXx),
-            79 => Some(WarningCategory::ExperimentalSignatureNamedParameters),
+            72 => Some(WarningCategory::VersionDowngrade),
+            73 => Some(WarningCategory::DelimiterWillBePaired),
+            74 => Some(WarningCategory::Class),
+            75 => Some(WarningCategory::SubsequentUseVersion),
+            76 => Some(WarningCategory::KeywordAll),
+            77 => Some(WarningCategory::KeywordAny),
+            78 => Some(WarningCategory::EnhancedXx),
+            79 => Some(WarningCategory::SignatureNamedParameters),
             80 => Some(WarningCategory::MissingImport),
             _ => None,
         }

@@ -2066,8 +2066,14 @@ Container-verified contract (perl 5.38, all under `-w`):
   discriminants perl's own bit numbers so pragma bit vectors
   index by discriminant, its 28-strong default-enabled set
   cross-checked against `$warnings::DEFAULT`, the tree walkable
-  through `parent` — while the *messages* live in the crate that
-  generates them, one warning enum per crate, aggregated by
+  through `parent`.  Variants are stable leaf-derived
+  identifiers; perl's spelling, parent path included, is data
+  living only in `name` and the parser-direction `from_name`
+  [DECISION], so spelling drift — perl prefixing when it
+  subcategorizes, unprefixing when experiments graduate — moves
+  one string table, never the use sites — while the *messages*
+  live in the crate that generates them, one warning enum per
+  crate, aggregated by
   consumers through wrapper enums with `From` impls and
   delegating `Display`.  Every warning enum speaks the
   `PerlWarning` trait: perl-exact `Display` of the body, and
