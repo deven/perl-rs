@@ -55,6 +55,9 @@ pub enum Token {
     /// Integer literal (decimal, hex, octal, binary).
     IntLit(i64),
 
+    /// An integer literal in `(i64::MAX, u64::MAX]` — the `Unsigned` value range (§2.3.2), split at the token.
+    UIntLit(u64),
+
     /// Float literal.
     FloatLit(f64),
 

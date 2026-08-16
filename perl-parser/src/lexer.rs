@@ -33,43 +33,54 @@ pub(crate) enum FrameRole {
     /// `format NAME = ... .` body — line-oriented (§5.5.5).
     #[allow(dead_code)] // Not yet wired: format uses `FormatState`, not a `LexContext`.
     Format,
+
     /// `sub name (...)` prototype — a raw character capture via `lex_body_str` (§5.9.3).
     Prototype,
+
     /// `sub name (...)` signature — bounded code.
     #[allow(dead_code)] // Not yet wired: signatures are not yet framed.
     Signature,
 
     /// `"..."`, `qq//`, `` `...` ``, `qx//` — interpolating string body.
     String,
+
     /// `'...'`, `q//` — soft literal: processes `\\` and `\<delim>`, leaves other backslashes intact; no interp.
     LiteralString,
+
     /// `qw//` — soft literal like `LiteralString`, then split on whitespace into words.
     QuoteWords,
 
     /// `<<TAG`, `<<"TAG"` — interpolating heredoc body.
     Heredoc,
+
     /// `<<'TAG'`, `<<\TAG` — hard-raw heredoc: every backslash literal.
     LiteralHeredoc,
 
     /// `m//`, `qr//` — regex body: interpolates, keeps backslashes for the engine, detects `(?{...})`.
     Regex,
+
     /// `m'...'`, `qr'...'` — non-interpolating regex; backslashes still kept for the engine.
     LiteralRegex,
+
     /// `s///` pattern (interpolating).
     SubstRegex,
+
     /// `s'...'...'` pattern (non-interpolating).
     LiteralSubstRegex,
 
     /// `s/.../.../` replacement — interpolating string body.
     SubstReplacement,
+
     /// `s'...'...'` replacement — non-interpolating; `\\` still paired.
     #[allow(dead_code)] // Not yet wired: the replacement push is unconditionally interpolating today.
     LiteralSubstReplacement,
+
     /// `s/.../.../e` replacement — bounded code; still captured raw via `lex_body` until the reparse is removed.
     EvalSubstReplacement,
 
     /// `tr/.../`, `y/.../` search list.
     TrSearchList,
+
     /// `tr/.../.../`, `y/.../.../` replacement list.
     TrReplacementList,
 }
@@ -1505,8 +1516,19 @@ impl Parser {
         }
     }
 
-    /// Finish a decimal-scanned digit run as an integer literal: a multi-digit run with a leading zero is octal
-    /// (with 8 and 9 fatal, matching perl's "Illegal octal digit"), anything else is decimal.
+    /// Route a magnitude to its literal token per the settled numeric design (§2.3.2): values through `i64::MAX` are
+    /// `Integer` territory, and the rest of the `u64` range is `Unsigned`'s — perl's IV/UV split, at the token.
+    /// Magnitudes past `u64::MAX` still error here where perl converts them to floats with a warning; that conversion
+    /// is a separate divergence, not resolved by this routing.
+    fn int_token(n: u64) -> Token {
+        match i64::try_from(n) {
+            Ok(i) => Token::IntLit(i),
+            Err(_) => Token::UIntLit(n),
+        }
+    }
+
+    /// Finish a decimal-scanned digit run as an integer literal: a multi-digit run with a leading zero is octal (with 8
+    /// and 9 fatal, matching perl's "Illegal octal digit"), anything else is decimal.
     fn finish_integer_literal(&mut self, start: usize) -> Result<Token, ParseError> {
         let s = self.line_slice_str(start)?;
         let s = s.replace('_', "");
@@ -1517,11 +1539,11 @@ impl Parser {
             if let Some(bad) = s.bytes().skip(1).find(|b| *b == b'8' || *b == b'9') {
                 return Err(ParseError::new(format!("Illegal octal digit '{}'", bad as char), self.span_from(start)));
             }
-            let n = i64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
-            Ok(Token::IntLit(n))
+            let n = u64::from_str_radix(&s[1..], 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
+            Ok(Self::int_token(n))
         } else {
-            let n: i64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", self.span_from(start)))?;
-            Ok(Token::IntLit(n))
+            let n: u64 = s.parse().map_err(|_| ParseError::new("invalid integer literal", self.span_from(start)))?;
+            Ok(Self::int_token(n))
         }
     }
 
@@ -1625,8 +1647,8 @@ impl Parser {
             return Ok(Token::FloatLit(val));
         }
 
-        let n = i64::from_str_radix(&int_str, 16).map_err(|_| ParseError::new("invalid hex literal", self.span_from(start)))?;
-        Ok(Token::IntLit(n))
+        let n = u64::from_str_radix(&int_str, 16).map_err(|_| ParseError::new("invalid hex literal", self.span_from(start)))?;
+        Ok(Self::int_token(n))
     }
 
     fn lex_binary(&mut self) -> Result<Token, ParseError> {
@@ -1671,8 +1693,8 @@ impl Parser {
             return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
         }
 
-        let n = i64::from_str_radix(&bin_str, 2).map_err(|_| ParseError::new("invalid binary literal", self.span_from(start)))?;
-        Ok(Token::IntLit(n))
+        let n = u64::from_str_radix(&bin_str, 2).map_err(|_| ParseError::new("invalid binary literal", self.span_from(start)))?;
+        Ok(Self::int_token(n))
     }
 
     fn lex_octal_explicit(&mut self) -> Result<Token, ParseError> {
@@ -1717,8 +1739,8 @@ impl Parser {
             return Ok(Token::FloatLit(int_val * 2f64.powi(exp)));
         }
 
-        let n = i64::from_str_radix(&oct_str, 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
-        Ok(Token::IntLit(n))
+        let n = u64::from_str_radix(&oct_str, 8).map_err(|_| ParseError::new("invalid octal literal", self.span_from(start)))?;
+        Ok(Self::int_token(n))
     }
 
     // ── Variables ($, @, %) ───────────────────────────────────

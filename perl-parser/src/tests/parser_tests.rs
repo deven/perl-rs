@@ -17254,11 +17254,20 @@ fn interp_special_variables_are_not_literal() {
 
 #[test]
 fn uv_range_integer_literals_parse() {
-    // Verified: perl accepts all three (printf %u round-trips them).  The values exceed i64, and the token model
-    // for UV-range integers is a pending design question — so this pins only that they lex and parse.
-    assert!(try_parse("my $x = 0xFFFFFFFFFFFFFFFF;").is_ok(), "UV_MAX hex literal is valid perl");
-    assert!(try_parse("my $x = 0x8000000000000000;").is_ok(), "IV_MAX + 1 hex literal is valid perl");
-    assert!(try_parse("my $x = 18446744073709551615;").is_ok(), "UV_MAX decimal literal is valid perl");
+    // Verified: perl accepts all three (printf %u round-trips them).  The token model is the settled numeric design
+    // (§2.3.2): magnitudes through i64::MAX are IntLit and the rest of the u64 range is UIntLit — perl's IV/UV split,
+    // decided at the token.
+    let rhs = first_assign_rhs(&parse("my $x = 0xFFFFFFFFFFFFFFFF;"));
+    assert!(matches!(rhs.kind, ExprKind::UIntLit(u64::MAX)), "UV_MAX hex is UIntLit, got {:?}", rhs.kind);
+
+    let rhs = first_assign_rhs(&parse("my $x = 0x8000000000000000;"));
+    assert!(matches!(rhs.kind, ExprKind::UIntLit(0x8000_0000_0000_0000)), "IV_MAX + 1 is UIntLit, got {:?}", rhs.kind);
+
+    let rhs = first_assign_rhs(&parse("my $x = 18446744073709551615;"));
+    assert!(matches!(rhs.kind, ExprKind::UIntLit(u64::MAX)), "UV_MAX decimal is UIntLit, got {:?}", rhs.kind);
+
+    let rhs = first_assign_rhs(&parse("my $x = 0x7FFFFFFFFFFFFFFF;"));
+    assert!(matches!(rhs.kind, ExprKind::IntLit(i64::MAX)), "IV_MAX stays IntLit, got {:?}", rhs.kind);
 }
 
 #[test]

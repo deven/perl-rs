@@ -377,6 +377,7 @@ impl Expr {
         match &mut self.kind {
             // ── Leaves: no children to recurse into. ──
             ExprKind::IntLit(_)
+            | ExprKind::UIntLit(_)
             | ExprKind::FloatLit(_)
             | ExprKind::StringLit(_)
             | ExprKind::VersionLit(_)
@@ -827,6 +828,9 @@ pub enum SubstReplacement {
 pub enum ExprKind {
     // ── Literals ──────────────────────────────────────────────
     IntLit(i64),
+
+    /// An integer literal in `(i64::MAX, u64::MAX]` — the `Unsigned` value range (§2.3.2), split at the token.
+    UIntLit(u64),
     FloatLit(f64),
     StringLit(String),
 

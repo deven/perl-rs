@@ -2359,6 +2359,7 @@ impl Parser {
         let consumed = self.next_token()?;
         match consumed.token {
             Token::IntLit(n) => Ok(Expr::new(ExprKind::IntLit(n), span)),
+            Token::UIntLit(n) => Ok(Expr::new(ExprKind::UIntLit(n), span)),
             Token::FloatLit(n) => Ok(Expr::new(ExprKind::FloatLit(n), span)),
             Token::StrLit(s) => Ok(Expr::new(ExprKind::StringLit(s), span)),
             Token::VersionLit(s) => Ok(Expr::new(ExprKind::VersionLit(s), span)),
@@ -3054,6 +3055,7 @@ impl Parser {
                 Token::QuoteSublexBegin(_, _)
                     | Token::StrLit(_)
                     | Token::IntLit(_)
+                    | Token::UIntLit(_)
                     | Token::FloatLit(_)
                     | Token::ScalarVar(_)
                     | Token::ArrayVar(_)
