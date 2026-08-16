@@ -1812,6 +1812,30 @@ impl PerlString {
         }
     }
 
+    /// Whether the bytes are shared with another handle — a heap tier holding more than one reference.  Inline and
+    /// packed values own their bytes in the envelope and are never shared.
+    pub fn is_shared(&self) -> bool {
+        match self.raw_parts() {
+            RawParts::Heap(view) => !view.is_unique(),
+            RawParts::Inline { .. } | RawParts::Packed(_) => false,
+        }
+    }
+
+    /// Break any sharing: after this call, the value's bytes live in storage this handle exclusively owns, retaining
+    /// nothing external.  This exists for lifetime control — a handle that must not pin an allocation other holders
+    /// keep alive — not for mutation, which makes its own arrangements.  Unique and envelope-owned storage is
+    /// untouched.  Shared storage is rebuilt by one copy, and classification rides the copy (§2.2.3), so a shared
+    /// buffer with an indeterminate scan state comes out settled: unsharing only improves knowledge.  The Perl utf8
+    /// flag and taint are preserved — this changes where the bytes live, never what the value means.
+    pub fn unshare(&mut self) -> Result<(), AllocError> {
+        let parts = match self.raw_parts() {
+            RawParts::Heap(view) if !view.is_unique() => heap_parts_transitioned(view.as_slice(), view.scan(), view.char_count())?,
+            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) => return Ok(()),
+        };
+        *self = PerlString::build_heap(self.is_utf8(), self.is_tainted(), parts);
+        Ok(())
+    }
+
     /// Whether the bytes are valid under perl's *extended* UTF-8 rules (§2.2.4) — the predicate character-level
     /// operations on flagged strings use.  Narrows the heap lattice.
     pub fn is_perl_utf8_valid(&self) -> bool {

@@ -1151,6 +1151,56 @@ fn char_count_shared_across_cow_sharers() {
 
 // ── COW behavior through the string layer ─────────────────────
 #[test]
+fn unshare_is_a_no_op_on_unique_and_envelope_storage() {
+    // Inline: the envelope owns the bytes; nothing is shared, nothing moves.
+    let mut inline = PerlString::new("hi").unwrap();
+    assert!(!inline.is_shared());
+    inline.unshare().unwrap();
+    assert_eq!(inline.as_bytes(&mut [0u8; DECODE_MAX]), b"hi");
+
+    // A uniquely-held heap buffer stays where it is: no allocation churn at all.
+    let mut unique = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    assert!(!unique.is_shared());
+    let live = cow_buffer::live::count();
+    unique.unshare().unwrap();
+    assert_eq!(cow_buffer::live::count(), live, "unique storage is untouched");
+    assert_eq!(unique.as_bytes(&mut [0u8; DECODE_MAX]), &[0xE9u8; 40][..]);
+}
+
+#[test]
+fn unshare_copies_out_of_shared_storage_and_preserves_meaning() {
+    let a = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    let mut b = a.clone();
+    assert!(a.is_shared() && b.is_shared());
+
+    let live = cow_buffer::live::count();
+    b.unshare().unwrap();
+    assert_eq!(cow_buffer::live::count(), live + 1, "the copy is a fresh allocation; the sharer keeps the old one");
+    assert!(!a.is_shared() && !b.is_shared());
+    assert_eq!(a, b, "content is meaning, and it did not change");
+
+    // The flags ride along: unsharing changes where the bytes live, never what the value means.
+    let mut f = PerlString::from_str(&"é".repeat(20)).unwrap(); // heap-tier, so the clone shares
+    f.set_utf8_for_test();
+    let mut f2 = f.clone();
+    f2.unshare().unwrap();
+    assert!(f2.is_utf8(), "the Perl utf8 flag survives the move");
+    assert!(!f2.is_tainted());
+}
+
+#[test]
+fn unshare_settles_an_indeterminate_shared_buffer() {
+    // Classification rides the copy, so unsharing an UNKNOWN buffer is also the moment it becomes settled — while
+    // the sharer, untouched, still holds the indeterminate state in the old allocation.
+    let mut u = lazy_heap(&[0xC3, 0xA9]);
+    let keep = u.clone();
+    u.unshare().unwrap();
+    assert_eq!(u.scan_state(), scan::Utf8Latin1, "the copy was already walking every byte");
+    assert_eq!(keep.scan_state(), scan::Unknown, "the sharer is untouched");
+    assert_eq!(u, keep);
+}
+
+#[test]
 fn clone_shares_heap_buffer_and_append_cow_breaks() {
     let a = PerlString::from_str(&"base".repeat(10)).unwrap(); // heap
     let mut b = a.clone();

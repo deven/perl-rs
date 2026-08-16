@@ -498,9 +498,8 @@ impl<'a> HeapView<'a> {
         self.count
     }
 
-    /// Whether this is the only handle on the allocation, which is what licenses writing through it.  Unused while
-    /// every mutation rebuilds: restoring in-place growth is what brings the COW break back (§2.2.3).
-    #[allow(dead_code)]
+    /// Whether this is the only handle on the allocation, which is what licenses writing through it: the in-place
+    /// transforms and the append fast path check here, and `unshare` asks it to decide whether a copy is owed.
     pub(crate) fn is_unique(&self) -> bool {
         // SAFETY: the view borrows a live allocation of its tier.
         unsafe {
