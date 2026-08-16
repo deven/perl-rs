@@ -2922,6 +2922,42 @@ impl PerlString {
         classify_numeric_noting_warning(self.as_bytes(&mut scratch))
     }
 
+    /// The bounded prefix a warning message quotes (§2.3.4): up to `max_chars` characters — bytes when unflagged,
+    /// perl-decoded characters when flagged, the cut always sequence-clean — plus whether the face extends beyond it.
+    /// Perl's renderer consumes source greedily while the rendered width is under its cap, so a bound of cap + 1
+    /// characters is sufficient for any conforming renderer; carrying more would pin content the message never uses.
+    /// When the whole face fits the bound, the clone is a refcount bump and nothing is copied.
+    pub(crate) fn message_prefix(&self, max_chars: usize) -> Result<(PerlString, bool), AllocError> {
+        let mut scratch = [0u8; DECODE_MAX];
+        let bytes = self.as_bytes(&mut scratch);
+
+        // Character-count the prefix: bytes are characters unless flagged, where a character is a perl-extended
+        // sequence — lead byte plus continuations — and the cut lands before a lead.
+        let cut = if !self.is_utf8() {
+            if bytes.len() <= max_chars { bytes.len() } else { max_chars }
+        } else {
+            let mut chars = 0usize;
+            let mut at = 0usize;
+            while at < bytes.len() && chars < max_chars {
+                at += 1;
+                while at < bytes.len() && bytes[at] & 0xC0 == 0x80 {
+                    at += 1;
+                }
+                chars += 1;
+            }
+            at
+        };
+
+        if cut == bytes.len() {
+            return Ok((self.clone(), false));
+        }
+
+        let mut snippet = PerlString::from_bytes(&bytes[..cut])?;
+        snippet.reinterpret_utf8(self.is_utf8());
+
+        Ok((snippet, true))
+    }
+
     /// Whether numifying this string would emit perl's `Argument isn't numeric` warning (§2.3.4).  A question about the
     /// content.  Whether the warning has *already* fired is not a property of the string: it is whether the value
     /// carries a cached numeric face, which lives on the payload (§2.3.4).

@@ -7,7 +7,7 @@
 //! fidelity; their real shapes are later design sections.
 
 use crate::cow_buffer::AllocError;
-use crate::string::PerlString;
+use crate::string::{DECODE_MAX, PerlString};
 use crate::value::{DualPayload, Numeric, ScalarPayload, Tainted};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
@@ -284,7 +284,7 @@ impl ScalarCell {
     /// payload with a `Dual`, so the write lock is required; perl needs mutable access here too, since `$arr[0] + 0`
     /// mutates the element's SV.  Copies then carry the face, which is why copy-after-numification is silent while
     /// copy-before warns on both (container-verified).
-    pub fn numify_noting_warning(&mut self) -> (Numeric, Option<NumifyWarning>) {
+    pub fn numify_noting_warning(&mut self) -> Result<(Numeric, Option<NumifyWarning>), AllocError> {
         let payload = match self {
             ScalarCell::Plain(p) => p,
             ScalarCell::Full(f) => &mut f.payload,
@@ -297,17 +297,18 @@ impl ScalarCell {
             other => (other.numify(), false),
         };
         if !warns {
-            return (n, None);
+            return Ok((n, None));
         }
 
         let taken = mem::replace(payload, ScalarPayload::Undef);
-        let face = match taken {
+        let (snippet, truncated) = match taken {
             ScalarPayload::String(s) => {
                 let tainted = s.is_tainted();
-                let face = s.clone();
+                let bound = if s.is_utf8() { WARN_SNIPPET_CHARS } else { WARN_SNIPPET_BYTES };
+                let snippet = s.message_prefix(bound)?;
                 let dual = HeapArc::new(DualPayload { string: s, numeric: n });
                 *payload = if tainted { ScalarPayload::DualTainted(dual) } else { ScalarPayload::Dual(dual) };
-                face
+                snippet
             }
             other => {
                 *payload = other;
@@ -318,7 +319,7 @@ impl ScalarCell {
             }
         };
 
-        (n, Some(NumifyWarning::NotNumeric { face }))
+        Ok((n, Some(NumifyWarning::NotNumeric { snippet, truncated })))
     }
 }
 
@@ -333,7 +334,7 @@ pub struct ConstScalar {
     int: i64,
     float: f64,
     string: PerlString,
-    numify_warned: Option<AtomicBool>,
+    numify_warned: Option<(AtomicBool, PerlString, bool)>,
 }
 
 impl Drop for ConstScalar {
@@ -359,8 +360,16 @@ impl ConstScalar {
         let float = payload.to_float();
         let string = payload.stringify()?;
 
-        let can_warn = matches!(&payload, ScalarPayload::String(s) if s.numify_noting_warning().1);
-        let numify_warned = can_warn.then(|| AtomicBool::new(false));
+        // The snippet is precomputed here, where materialization is already fallible, so the once-bit's gate stays
+        // free of allocation at note time.
+        let numify_warned = match &payload {
+            ScalarPayload::String(s) if s.numify_noting_warning().1 => {
+                let bound = if s.is_utf8() { WARN_SNIPPET_CHARS } else { WARN_SNIPPET_BYTES };
+                let (snippet, truncated) = s.message_prefix(bound)?;
+                Some((AtomicBool::new(false), snippet, truncated))
+            }
+            _ => None,
+        };
 
         Ok(ConstScalar { payload, int, float, string, numify_warned })
     }
@@ -390,26 +399,258 @@ impl ConstScalar {
     }
 
     /// Note a numification against the once-only warning state; `Some` carries the typed event exactly once, the first
-    /// time.  Statically-unwarnable payloads answer `None` with no atomic traffic; the face is the frozen cell's own
-    /// string image, whose string face never moves.
+    /// time.  Statically-unwarnable payloads answer `None` with no atomic traffic, and the snippet was precomputed at
+    /// materialization, so noting never allocates.
     pub fn note_numify_warning(&self) -> Option<NumifyWarning> {
         match &self.numify_warned {
-            Some(flag) if !flag.swap(true, Ordering::AcqRel) => Some(NumifyWarning::NotNumeric { face: self.string.clone() }),
+            Some((flag, snippet, truncated)) if !flag.swap(true, Ordering::AcqRel) => {
+                Some(NumifyWarning::NotNumeric { snippet: snippet.clone(), truncated: *truncated })
+            }
             Some(_) | None => None,
         }
     }
 }
 
 // ── NumifyWarning — the typed warning event (§2.3.4) ──────────────
-/// A warning a numify operation raises, as data: the variant names perl's warning, and the payload is the raw source
-/// snippet the message quotes — never a preformatted string, because composing the message (fragment truncation and
-/// caret-escaping, op name, location, warning-category bits, FATALization, `$SIG{__WARN__}` dispatch) is interpreter
-/// logic the crate does not own.  Variants grow as numify-adjacent operations land.
+/// A warning a numify operation raises, as data — the full inventory of perl 5.44's numification warnings, each variant
+/// carrying the raw payload its message needs and never more (a caller wanting the full value clones it before
+/// numifying).  `Display` *is* perl's standard formatting: the message body, rendered on demand from the raw payload
+/// per the two-regime fragment law (§2.3.4), compound variants emitting their bodies as emission-ordered lines.  The
+/// interpreter composes by suffixing — the op clause (`NotNumeric` only, per perl's `PL_op` behavior) and the location
+/// follow the body in every form — and owns category bits, FATALization, and `$SIG{__WARN__}` dispatch.
 #[derive(Debug)]
 pub enum NumifyWarning {
-    /// Perl's `Argument "%s" isn't numeric`: the string was not one complete numeric token (§2.3.4).  Carries the face
-    /// whole — the exact string the message quotes, cloned before the payload promoted to `Dual`.
-    NotNumeric { face: PerlString },
+    /// `Argument "%s" isn't numeric`: not one complete numeric token (§2.3.4).  The snippet is bounded by the rendering
+    /// law — [`WARN_SNIPPET_BYTES`] unflagged, [`WARN_SNIPPET_CHARS`] flagged, the cut sequence-clean, under the face's
+    /// own utf8 flag — and `truncated` says the face extended beyond it, which is what the trailing `...` reports when
+    /// rendering exhausts the snippet.
+    NotNumeric { snippet: PerlString, truncated: bool },
+
+    /// `Argument "%s" treated as 0 in increment (++)`: the magic string increment received content it cannot step.
+    /// Same snippet law as `NotNumeric`.  Constructed when the increment family lands.
+    NotIncrementable { snippet: PerlString, truncated: bool },
+
+    /// `Lost precision when incrementing %f by 1` (or decrementing): the float's integer neighbors are farther than one
+    /// apart.  Constructed when the increment family lands.
+    LostPrecision { value: f64, decrement: bool },
+
+    /// The radix-grok compound (§2.3.4): one `oct`/`hex`-style scan can emit up to two of these, in emission order
+    /// overflow → illegal digit → non-portable, with overflow and non-portable mutually exclusive by perl's own
+    /// suppression.  Base 10 is structurally excluded — it has never warned here.  Constructed when the grok operations
+    /// land.
+    RadixGrok { base: RadixBase, illegal_digit: Option<u8>, overflow: bool, non_portable: bool },
+
+    /// `Use of uninitialized value`: undef numified.  The variable-name diagnosis is interpreter machinery entire, so
+    /// the event is the bare fact.  Constructed when undef numification routes events.
+    Uninitialized,
+}
+
+/// The radix a grok warning names.  Decimal is absent by perl's law: base 10 has historically never warned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RadixBase {
+    Binary,
+    Octal,
+    Hexadecimal,
+}
+
+impl RadixBase {
+    /// The word perl's messages use.
+    fn name(self) -> &'static str {
+        match self {
+            RadixBase::Binary => "binary",
+            RadixBase::Octal => "octal",
+            RadixBase::Hexadecimal => "hexadecimal",
+        }
+    }
+
+    /// The threshold phrase of the non-portable message, which quotes the 32-bit ceiling in its own radix.
+    fn non_portable_threshold(self) -> &'static str {
+        match self {
+            RadixBase::Binary => "Binary number > 0b11111111111111111111111111111111",
+            RadixBase::Octal => "Octal number > 037777777777",
+            RadixBase::Hexadecimal => "Hexadecimal number > 0xffffffff",
+        }
+    }
+}
+
+/// The unflagged snippet bound (§2.3.4): the byte renderer consumes source while its output is under 56 columns and
+/// every byte renders at least one, so at most 56 bytes are consumed and the 57th's existence is the last fact the
+/// ellipsis needs.
+pub const WARN_SNIPPET_BYTES: usize = 57;
+
+/// The flagged snippet bound (§2.3.4): the character renderer's cap is 32 columns, so at most 32 characters are
+/// consumed, plus the 33rd for the ellipsis.
+pub const WARN_SNIPPET_CHARS: usize = 33;
+
+impl fmt::Display for NumifyWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NumifyWarning::NotNumeric { snippet, truncated } => {
+                write!(f, "Argument \"")?;
+                render_warn_fragment(snippet, *truncated, f)?;
+                write!(f, "\" isn't numeric")
+            }
+            NumifyWarning::NotIncrementable { snippet, truncated } => {
+                write!(f, "Argument \"")?;
+                render_warn_fragment(snippet, *truncated, f)?;
+                write!(f, "\" treated as 0 in increment (++)")
+            }
+            NumifyWarning::LostPrecision { value, decrement } => {
+                let verb = if *decrement { "decrementing" } else { "incrementing" };
+                write!(f, "Lost precision when {verb} {value} by 1")
+            }
+            NumifyWarning::RadixGrok { base, illegal_digit, overflow, non_portable } => {
+                // Emission order per §2.3.4: overflow, then the illegal digit, then non-portable; a newline joins
+                // the compound's lines, each line one perl warning body.
+                let mut first = true;
+                let mut line = |f: &mut fmt::Formatter<'_>| -> fmt::Result {
+                    if !first {
+                        writeln!(f)?;
+                    }
+                    first = false;
+                    Ok(())
+                };
+                if *overflow {
+                    line(f)?;
+                    write!(f, "Integer overflow in {} number", base.name())?;
+                }
+                if let Some(digit) = illegal_digit {
+                    line(f)?;
+                    write!(f, "Illegal {} digit '{}' ignored", base.name(), *digit as char)?;
+                }
+                if *non_portable {
+                    line(f)?;
+                    write!(f, "{} non-portable", base.non_portable_threshold())?;
+                }
+                Ok(())
+            }
+            NumifyWarning::Uninitialized => write!(f, "Use of uninitialized value"),
+        }
+    }
+}
+
+/// The two-regime fragment renderer (§2.3.4), exact to `S_sv_display` and the container probes.  Unflagged: output cap
+/// 56, checked before each byte with the last expansion free to overrun; `M-` meta notation re-dispatching the low
+/// seven bits through the same table; `\n \r \f \\ \0` backslash forms; other controls caret; printability pinned to
+/// the C locale.  Flagged: output cap 32; printable ASCII verbatim; backslash doubled; everything else — newline
+/// included — `\x{lowercase-hex}` per code point.  Both append three ASCII periods iff source remains, which is the
+/// snippet running out early or the face having extended past it.
+fn render_warn_fragment(snippet: &PerlString, truncated: bool, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut scratch = [0u8; DECODE_MAX];
+    let bytes = snippet.as_bytes(&mut scratch);
+    let mut columns = 0usize;
+    let mut remains = truncated;
+
+    if !snippet.is_utf8() {
+        let mut at = 0usize;
+        while at < bytes.len() {
+            if columns >= 56 {
+                remains = true;
+                break;
+            }
+
+            let mut ch = bytes[at];
+            at += 1;
+            if !(0x20..=0x7E).contains(&ch) && ch >= 0x80 {
+                write!(f, "M-")?;
+                columns += 2;
+                ch &= 0x7F;
+            }
+
+            match ch {
+                b'\n' => {
+                    write!(f, "\\n")?;
+                    columns += 2;
+                }
+                b'\r' => {
+                    write!(f, "\\r")?;
+                    columns += 2;
+                }
+                0x0C => {
+                    write!(f, "\\f")?;
+                    columns += 2;
+                }
+                b'\\' => {
+                    write!(f, "\\\\")?;
+                    columns += 2;
+                }
+                0 => {
+                    write!(f, "\\0")?;
+                    columns += 2;
+                }
+                0x20..=0x7E => {
+                    write!(f, "{}", ch as char)?;
+                    columns += 1;
+                }
+                other => {
+                    // Caret notation: control characters XOR 0x40 (DEL becomes `^?`).
+                    write!(f, "^{}", (other ^ 0x40) as char)?;
+                    columns += 2;
+                }
+            }
+        }
+    } else {
+        let mut at = 0usize;
+        while at < bytes.len() {
+            if columns >= 32 {
+                remains = true;
+                break;
+            }
+
+            // One perl-extended character: lead byte plus continuations; the decoded code point feeds the escape.
+            let start = at;
+            at += 1;
+            while at < bytes.len() && bytes[at] & 0xC0 == 0x80 {
+                at += 1;
+            }
+
+            let unit = &bytes[start..at];
+            if unit.len() == 1 && (0x20..=0x7E).contains(&unit[0]) && unit[0] != b'\\' {
+                write!(f, "{}", unit[0] as char)?;
+                columns += 1;
+            } else if unit == b"\\" {
+                write!(f, "\\\\")?;
+                columns += 2;
+            } else {
+                let cp = decode_extended_code_point(unit);
+                let rendered = format!("\\x{{{cp:x}}}");
+                columns += rendered.len();
+                write!(f, "{rendered}")?;
+            }
+        }
+    }
+
+    if remains {
+        write!(f, "...")?;
+    }
+
+    Ok(())
+}
+
+/// Decode one perl-extended UTF-8 unit to its code point, for the flagged fragment's `\x{{...}}` escape.  The snippet's
+/// cuts are sequence-clean by construction, so the unit is whole; a malformed unit inside flagged content renders as
+/// its first byte's value, which is perl's own display degradation rather than a crash.
+fn decode_extended_code_point(unit: &[u8]) -> u64 {
+    let lead = unit[0];
+    if lead < 0x80 {
+        return u64::from(lead);
+    }
+
+    let payload_bits = match lead {
+        0xC0..=0xDF => 5,
+        0xE0..=0xEF => 4,
+        0xF0..=0xF7 => 3,
+        0xF8..=0xFB => 2,
+        0xFC..=0xFD => 1,
+        _ => 0,
+    };
+
+    let mut cp = u64::from(lead & ((1 << payload_bits) - 1));
+    for &b in &unit[1..] {
+        cp = (cp << 6) | u64::from(b & 0x3F);
+    }
+
+    cp
 }
 
 // ── ScalarRef — shared identity (§2.3.1) ──────────────────────────

@@ -199,41 +199,94 @@ fn numify_warns_once_and_copies_carry_the_state() {
     // "abc" + 1 twice warns once, and the event carries the face — the exact string the message quotes, intact even
     // though the payload just promoted to Dual.
     let r = plain(str_payload("abc"));
-    let (n1, emit1) = r.write().unwrap().numify_noting_warning();
+    let (n1, emit1) = r.write().unwrap().numify_noting_warning().unwrap();
     assert_eq!(n1, Numeric::Float(0.0));
 
-    let Some(NumifyWarning::NotNumeric { face }) = emit1 else {
-        panic!("first numification warns, with the face");
+    let Some(NumifyWarning::NotNumeric { snippet, truncated }) = emit1 else {
+        panic!("first numification warns, with the snippet");
     };
-    assert_eq!(face.as_bytes(&mut [0u8; DECODE_MAX]), b"abc", "the event quotes the original string");
+    assert_eq!(snippet.as_bytes(&mut [0u8; DECODE_MAX]), b"abc", "a short face is carried whole");
+    assert!(!truncated);
 
-    let (_, emit2) = r.write().unwrap().numify_noting_warning();
+    let (_, emit2) = r.write().unwrap().numify_noting_warning().unwrap();
     assert!(emit2.is_none(), "second is silent — the cached face is the suppressor");
 
     // Copy AFTER first numification: the copy is silent (the face rides the payload).
     let copied = r.read().payload().clone();
     let r2 = plain(copied);
-    let (_, emit3) = r2.write().unwrap().numify_noting_warning();
+    let (_, emit3) = r2.write().unwrap().numify_noting_warning().unwrap();
     assert!(emit3.is_none(), "copy after first numification is silent (verified)");
 
     // Copy BEFORE: both warn.
     let a = plain(str_payload("12abc"));
     let b = plain(a.read().payload().clone());
-    assert!(a.write().unwrap().numify_noting_warning().1.is_some());
-    assert!(b.write().unwrap().numify_noting_warning().1.is_some(), "copy before numification warns independently");
+    assert!(a.write().unwrap().numify_noting_warning().unwrap().1.is_some());
+    assert!(b.write().unwrap().numify_noting_warning().unwrap().1.is_some(), "copy before numification warns independently");
 
     // Clean numerics never emit.
     let c = plain(str_payload("  12  "));
-    assert!(c.write().unwrap().numify_noting_warning().1.is_none());
+    assert!(c.write().unwrap().numify_noting_warning().unwrap().1.is_none());
+}
+
+#[test]
+fn numify_warning_display_is_perl_exact() {
+    // Every expectation below is the container's own perl 5.44 output, byte for byte, minus the op clause and location
+    // the interpreter suffixes.
+    let body = |content: &[u8]| {
+        let mut cell = ScalarCell::Plain(ScalarPayload::String(PerlString::from_bytes(content).unwrap()));
+        let (_, emit) = cell.numify_noting_warning().unwrap();
+        format!("{}", emit.expect("warn-worthy content"))
+    };
+
+    assert_eq!(body(b"abc"), "Argument \"abc\" isn't numeric");
+    assert_eq!(body(b"12abc"), "Argument \"12abc\" isn't numeric");
+    assert_eq!(body(&b"a".repeat(100)), format!("Argument \"{}...\" isn't numeric", "a".repeat(56)));
+    assert_eq!(body(&b"a".repeat(56)), format!("Argument \"{}\" isn't numeric", "a".repeat(56)));
+    assert_eq!(body(b"ab\x01cd"), "Argument \"ab^Acd\" isn't numeric");
+    assert_eq!(body(b"ab\tcd\nef"), "Argument \"ab^Icd\\nef\" isn't numeric");
+    assert_eq!(body(b"\xE9abc"), "Argument \"M-iabc\" isn't numeric");
+
+    // The last expansion may overrun the 56-column cap, exactly as S_sv_display's loop does: 55 columns plus a caret
+    // pair prints all 57 with no ellipsis; a second control is past the check and clips.
+    let mut edge = b"a".repeat(55);
+    edge.push(1);
+    assert_eq!(body(&edge), format!("Argument \"{}^A\" isn't numeric", "a".repeat(55)));
+    edge.push(1);
+    assert_eq!(body(&edge), format!("Argument \"{}^A...\" isn't numeric", "a".repeat(55)));
+
+    // The flagged regime: cap 32 output columns, backslash doubled, everything non-printable \x{lowercase-hex} --
+    // newline included, diverging from the byte regime's backslash-n.
+    let flagged_body = |content: &str| {
+        let mut s = PerlString::new(content).unwrap();
+        s.set_utf8_for_test();
+        let mut cell = ScalarCell::Plain(ScalarPayload::String(s));
+        let (_, emit) = cell.numify_noting_warning().unwrap();
+        format!("{}", emit.expect("warn-worthy content"))
+    };
+    assert_eq!(flagged_body("é\nz\\q"), "Argument \"\\x{e9}\\x{a}z\\\\q\" isn't numeric");
+    assert_eq!(flagged_body(&format!("é{}", "a".repeat(40))), format!("Argument \"\\x{{e9}}{}...\" isn't numeric", "a".repeat(26)));
+
+    // The rest of the ruled inventory renders its perl bodies; constructors arrive with their operations.
+    assert_eq!(format!("{}", NumifyWarning::LostPrecision { value: 1e17, decrement: false }), "Lost precision when incrementing 100000000000000000 by 1");
+    assert_eq!(
+        format!("{}", NumifyWarning::RadixGrok { base: RadixBase::Hexadecimal, illegal_digit: Some(b'G'), overflow: true, non_portable: false }),
+        "Integer overflow in hexadecimal number\nIllegal hexadecimal digit 'G' ignored"
+    );
+    assert_eq!(
+        format!("{}", NumifyWarning::RadixGrok { base: RadixBase::Octal, illegal_digit: Some(b'9'), overflow: false, non_portable: true }),
+        "Illegal octal digit '9' ignored\nOctal number > 037777777777 non-portable"
+    );
+    assert_eq!(format!("{}", NumifyWarning::Uninitialized), "Use of uninitialized value");
 }
 
 #[test]
 fn const_cell_warning_state() {
     let warns = ConstScalar::materialize(str_payload("abc")).unwrap();
-    let Some(NumifyWarning::NotNumeric { face }) = warns.note_numify_warning() else {
-        panic!("first note emits, with the face");
+    let Some(NumifyWarning::NotNumeric { snippet, truncated }) = warns.note_numify_warning() else {
+        panic!("first note emits, with the snippet");
     };
-    assert_eq!(face.as_bytes(&mut [0u8; DECODE_MAX]), b"abc");
+    assert_eq!(snippet.as_bytes(&mut [0u8; DECODE_MAX]), b"abc");
+    assert!(!truncated);
     assert!(warns.note_numify_warning().is_none(), "second is silent");
 
     // Statically-unwarnable payloads carry nothing (§2.3.4).
@@ -318,11 +371,11 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
     // warning from "12abc" numified three times.
     let mut cell = ScalarCell::Plain(str_payload("12abc"));
 
-    let (first, emit) = cell.numify_noting_warning();
+    let (first, emit) = cell.numify_noting_warning().unwrap();
     assert!(emit.is_some(), "the first numification of warn-worthy content emits");
     assert_eq!(first, Numeric::Integer(12), "and salvages what perl salvages");
 
-    let (second, emit) = cell.numify_noting_warning();
+    let (second, emit) = cell.numify_noting_warning().unwrap();
     assert!(emit.is_none(), "the second reads the cached face and stays silent");
     assert_eq!(second, Numeric::Integer(12));
 
@@ -352,7 +405,7 @@ fn cleanly_numeric_content_never_caches_a_face() {
     // avoids an allocation per numeric value (§2.3.4).
     let mut cell = ScalarCell::Plain(str_payload("42"));
     for _ in 0..3 {
-        let (n, emit) = cell.numify_noting_warning();
+        let (n, emit) = cell.numify_noting_warning().unwrap();
         assert_eq!(n, Numeric::Integer(42));
         assert!(emit.is_none(), "clean content never warns");
     }
@@ -365,7 +418,7 @@ fn taint_survives_the_face_installation() {
     tainted.taint();
     let mut cell = ScalarCell::Plain(ScalarPayload::String(tainted));
 
-    let (_, emit) = cell.numify_noting_warning();
+    let (_, emit) = cell.numify_noting_warning().unwrap();
     assert!(emit.is_some());
     assert!(matches!(cell, ScalarCell::Plain(ScalarPayload::DualTainted(_))), "the tainted twin is chosen");
     assert!(cell.is_tainted(), "and taint reads through the Dual");

@@ -1370,7 +1370,7 @@ fn clone_shares_heap_buffer_and_append_cow_breaks() {
 
 impl PerlString {
     /// Test-only: force the utf8 flag on (simulating `Encode::_utf8_on` / upgrade provenance).
-    pub(super) fn set_utf8_for_test(&mut self) {
+    pub(crate) fn set_utf8_for_test(&mut self) {
         self.rebuild_tag(|_u, t| (true, t));
     }
 }
