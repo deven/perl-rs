@@ -1151,6 +1151,71 @@ fn char_count_shared_across_cow_sharers() {
 
 // ── COW behavior through the string layer ─────────────────────
 #[test]
+fn static_strings_are_zero_allocation_with_facts_settled_at_birth() {
+    const TEXT: &str = "héllo, wörld: a static string past the inline ceiling";
+    let live = cow_buffer::live::count();
+    let s = PerlString::from_static_str(TEXT).unwrap();
+    assert_eq!(s.storage_type(), StorageType::Static);
+    assert_eq!(s.scan_state(), scan::Utf8Latin1, "terminal at construction");
+    assert_eq!(s.char_len(), Some(TEXT.chars().count()), "the count is settled, not deferred");
+    assert!(s.as_str(&mut [0u8; DECODE_MAX]).is_some());
+    assert!(!s.is_ascii() && !s.is_shared());
+
+    // Clones are bitwise and teardown touches nothing: across construction, clone, and drop, not one tier allocation
+    // moves.
+    let c = s.clone();
+    assert_eq!(c, s);
+    drop(c);
+    drop(s);
+    assert_eq!(cow_buffer::live::count(), live, "zero allocations, zero releases");
+
+    // Malformed static bytes are a legitimate image: terminal, count-free, honestly invalid to both readers.
+    let m = PerlString::from_static_bytes(b"a static image with a broken tail \xC0\x80").unwrap();
+    assert_eq!(m.scan_state(), scan::MalformedUtf8);
+    assert_eq!(m.char_len(), None);
+    assert!(m.as_str(&mut [0u8; DECODE_MAX]).is_none());
+    assert!(!m.is_perl_utf8_valid());
+}
+
+#[test]
+fn immortal_and_static_writes_copy_out_and_flags_ride_the_image() {
+    // Writing to an immortal form copies out to a mutable tier: the image is untouched and other handles still read it.
+    let s = PerlString::from_static_str("the quick brown fox jumps over the lazy dog").unwrap();
+    let mut w = s.clone();
+    w.push_str(" again").unwrap();
+    assert!(matches!(w.storage_type(), StorageType::Heap8), "the write landed in a tier");
+    assert_eq!(w.len(), s.len() + 6);
+    assert_eq!(s.storage_type(), StorageType::Static, "the image and its other handles are untouched");
+    assert_eq!(s.char_len(), Some(43));
+
+    // A flag flip rebuilds the envelope and stays in the form: the image never moves for a tag change.
+    let mut f = PerlString::from_static_str("étale cohomology, statically").unwrap();
+    f.set_utf8_for_test();
+    assert_eq!(f.storage_type(), StorageType::Static);
+    assert!(f.is_utf8());
+
+    // The unsafe immortal door, exercised through a leaked buffer standing in for the slab (§2.2.3).
+    let live = cow_buffer::live::count();
+    let image: &'static [u8] = Box::leak(b"immortal by leak: the slab arrives later".to_vec().into_boxed_slice());
+
+    // SAFETY: leaked memory outlives every handle and nothing writes it.
+    let im = unsafe { PerlString::from_immortal_bytes(image) }.unwrap();
+    assert_eq!(im.storage_type(), StorageType::Immortal);
+    assert_eq!(im.scan_state(), scan::Ascii);
+    assert!(im.is_ascii());
+
+    let c = im.clone();
+    drop(im);
+    drop(c);
+    assert_eq!(cow_buffer::live::count(), live, "immortal handles never touch the tier allocator");
+
+    // Content equality is representation-blind: a static, an immortal, and a tier holding the same bytes are equal.
+    let st = PerlString::from_static_str("the same forty-two bytes in every form!!!!").unwrap();
+    let heap = PerlString::from_bytes(b"the same forty-two bytes in every form!!!!").unwrap();
+    assert_eq!(st, heap);
+}
+
+#[test]
 fn unshare_is_a_no_op_on_unique_and_envelope_storage() {
     // Inline: the envelope owns the bytes; nothing is shared, nothing moves.
     let mut inline = PerlString::new("hi").unwrap();

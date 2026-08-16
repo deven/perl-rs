@@ -647,7 +647,7 @@ enum InlineClass {
     Bytes,
 }
 
-/// The storage type: the seventeen-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
+/// The storage type: the nineteen-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
 /// the discriminant is this type times the three flag bits.  Coarse questions are the projection methods.  Declaration
 /// order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able to represent
 /// the content — first-fit is the ladder — which is what the derived `Ord` means.
@@ -718,6 +718,14 @@ pub enum StorageType {
     /// Heap, content beyond 4 GiB.  Unreachable where pointers are 32 bits, and compiled there anyway so that
     /// discriminants match across targets.
     Heap,
+
+    /// An immortal image (§2.2.3): interpreter- or arena-lifetime bytes, envelope facts settled at construction, never
+    /// freed by teardown.  Constructed explicitly, never canonically selected.
+    Immortal,
+
+    /// A `'static` image (§2.2.3): the program's bytes, alive forever.  Constructed explicitly, never canonically
+    /// selected.
+    Static,
 }
 
 impl StorageType {
@@ -753,7 +761,9 @@ macro_rules! define_perl_string {
         heap8:  [ $( $heap8:ident  = ($heap8_utf8:literal,  $heap8_tainted:literal)  ),* $(,)? ],
         heap16: [ $( $heap16:ident = ($heap16_utf8:literal, $heap16_tainted:literal) ),* $(,)? ],
         heap32: [ $( $heap32:ident = ($heap32_utf8:literal, $heap32_tainted:literal) ),* $(,)? ],
-        heap:   [ $( $heap:ident  = ($heap_utf8:literal,  $heap_tainted:literal)  ),* $(,)? ]
+        heap:   [ $( $heap:ident  = ($heap_utf8:literal,  $heap_tainted:literal)  ),* $(,)? ],
+        immortal: [ $( $immortal:ident = ($immortal_utf8:literal, $immortal_tainted:literal) ),* $(,)? ],
+        statics:  [ $( $static:ident  = ($static_utf8:literal,  $static_tainted:literal)  ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
         /// behind this newtype: no variant is nameable outside the crate, so no payload can be forged or mutated around
@@ -782,6 +792,8 @@ macro_rules! define_perl_string {
             $( $heap16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
             $( $heap32 { ptr: Owned, len: u32 }, )*
             $( $heap  { ptr: Owned }, )*
+            $( $immortal { ptr: Image, len: [u8; 3], count: [u8; 3], scan: scan::Terminal }, )*
+            $( $static { ptr: Image, len: [u8; 3], count: [u8; 3], scan: scan::Terminal }, )*
         }
 
         impl Clone for Repr {
@@ -807,6 +819,13 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { ptr } => Repr::$heap {
                         ptr: unsafe { cow_buffer::heap::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                     }, )*
+
+                    // The immortal forms carry no refcount — the image outlives every handle by contract (§2.2.3) — so
+                    // a clone is the envelope, bitwise.
+                    $( Repr::$immortal { ptr, len, count, scan } =>
+                        Repr::$immortal { ptr: *ptr, len: *len, count: *count, scan: *scan }, )*
+                    $( Repr::$static { ptr, len, count, scan } =>
+                        Repr::$static { ptr: *ptr, len: *len, count: *count, scan: *scan }, )*
                 }
             }
         }
@@ -822,6 +841,11 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
                     $( Repr::$heap32 { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
                     $( Repr::$heap { ptr } => unsafe { cow_buffer::heap::release(ptr.claim()) }, )*
+
+                    // Teardown never touches an immortal image (§2.2.3): the slab's owner frees it, statics are the
+                    // program's.
+                    $( Repr::$immortal { .. } => {}, )*
+                    $( Repr::$static { .. } => {}, )*
                 }
             }
         }
@@ -836,6 +860,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16 { .. } => StorageType::Heap16, )*
                     $( Repr::$heap32 { .. } => StorageType::Heap32, )*
                     $( Repr::$heap { .. } => StorageType::Heap, )*
+                    $( Repr::$immortal { .. } => StorageType::Immortal, )*
+                    $( Repr::$static { .. } => StorageType::Static, )*
                 }
             }
 
@@ -848,6 +874,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16 { .. } => $heap16_utf8, )*
                     $( Repr::$heap32 { .. } => $heap32_utf8, )*
                     $( Repr::$heap { .. } => $heap_utf8, )*
+                    $( Repr::$immortal { .. } => $immortal_utf8, )*
+                    $( Repr::$static { .. } => $static_utf8, )*
                 }
             }
 
@@ -860,6 +888,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16 { .. } => $heap16_tainted, )*
                     $( Repr::$heap32 { .. } => $heap32_tainted, )*
                     $( Repr::$heap { .. } => $heap_tainted, )*
+                    $( Repr::$immortal { .. } => $immortal_tainted, )*
+                    $( Repr::$static { .. } => $static_tainted, )*
                 }
             }
 
@@ -868,6 +898,8 @@ macro_rules! define_perl_string {
             fn inline_class(&self) -> Option<InlineClass> {
                 match &self.0 {
                     $( Repr::$inline { .. } => Some(InlineClass::$inline_class), )*
+                    $( Repr::$immortal { .. } => None, )*
+                    $( Repr::$static { .. } => None, )*
 
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
                     $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
@@ -930,6 +962,19 @@ macro_rules! define_perl_string {
                     // SAFETY: a live allocation of this tier, whose header carries the metadata.
                     $( Repr::$heap32 { ptr, len } => RawParts::Heap(unsafe { HeapView::heap32(ptr, *len as usize) }), )*
                     $( Repr::$heap { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::Heap) }), )*
+
+                    // SAFETY (each immortal arm): the image outlives every handle by the forms' contract (§2.2.3), so a
+                    // borrow bounded by `&self` is always inside its life.
+                    $( Repr::$immortal { ptr, len, count, scan } => RawParts::Borrowed {
+                        bytes: unsafe { std::slice::from_raw_parts(ptr.0.as_ptr(), u24_get(len)) },
+                        count: u24_get(count),
+                        scan: *scan,
+                    }, )*
+                    $( Repr::$static { ptr, len, count, scan } => RawParts::Borrowed {
+                        bytes: unsafe { std::slice::from_raw_parts(ptr.0.as_ptr(), u24_get(len)) },
+                        count: u24_get(count),
+                        scan: *scan,
+                    }, )*
                 }
             }
 
@@ -939,6 +984,8 @@ macro_rules! define_perl_string {
                 match &mut self.0 {
                     $( Repr::$inline { buf } => Some(($inline_full, buf)), )*
                     $( Repr::$packed { .. } => None, )*
+                    $( Repr::$immortal { .. } => None, )*
+                    $( Repr::$static { .. } => None, )*
                     $( Repr::$heap8 { .. } => None, )*
                     $( Repr::$heap16 { .. } => None, )*
                     $( Repr::$heap32 { .. } => None, )*
@@ -1162,6 +1209,8 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => None, )*
                     $( Repr::$packed { .. } => None, )*
+                    $( Repr::$immortal { .. } => None, )*
+                    $( Repr::$static { .. } => None, )*
                     $( Repr::$heap8 { .. } => Some(Tier::Heap8), )*
                     $( Repr::$heap16 { .. } => Some(Tier::Heap16), )*
                     $( Repr::$heap32 { .. } => Some(Tier::Heap32), )*
@@ -1223,6 +1272,14 @@ macro_rules! define_perl_string {
                         ptr: unsafe { std::ptr::read(ptr) },
                         tier: Tier::Heap,
                     }, )*
+
+                    // The immortal forms own nothing to transfer: the envelope is `Copy` in all but name.
+                    $( Repr::$immortal { ptr, len, count, scan } => RawOwned::Borrowed {
+                        form: BorrowedForm::Immortal, ptr: ptr.0, len: u24_get(len), count: u24_get(count), scan: *scan,
+                    }, )*
+                    $( Repr::$static { ptr, len, count, scan } => RawOwned::Borrowed {
+                        form: BorrowedForm::Static, ptr: ptr.0, len: u24_get(len), count: u24_get(count), scan: *scan,
+                    }, )*
                 }
             }
 
@@ -1257,6 +1314,28 @@ macro_rules! define_perl_string {
                     Tier::Heap => match (utf8, tainted) {
                         $( ($heap_utf8, $heap_tainted) => PerlString(Repr::$heap { ptr }), )*
                     },
+                }
+            }
+
+            /// Rebuild an immortal value with the given tag dimensions (image untouched).
+            fn build_immortal(
+                utf8: bool, tainted: bool,
+                ptr: std::ptr::NonNull<u8>, len: usize, count: usize, scan: scan::Terminal,
+            ) -> PerlString {
+                match (utf8, tainted) {
+                    $( ($immortal_utf8, $immortal_tainted) =>
+                        PerlString(Repr::$immortal { ptr: Image(ptr), len: u24_new(len), count: u24_new(count), scan }), )*
+                }
+            }
+
+            /// Rebuild a static value with the given tag dimensions (image untouched).
+            fn build_static(
+                utf8: bool, tainted: bool,
+                ptr: std::ptr::NonNull<u8>, len: usize, count: usize, scan: scan::Terminal,
+            ) -> PerlString {
+                match (utf8, tainted) {
+                    $( ($static_utf8, $static_tainted) =>
+                        PerlString(Repr::$static { ptr: Image(ptr), len: u24_new(len), count: u24_new(count), scan }), )*
                 }
             }
         }
@@ -1355,6 +1434,18 @@ define_perl_string! {
         HeapFlagged              = (true, false),
         HeapTainted              = (false, true),
         HeapFlaggedTainted       = (true, true),
+    ],
+    immortal: [
+        Immortal                 = (false, false),
+        ImmortalFlagged          = (true, false),
+        ImmortalTainted          = (false, true),
+        ImmortalFlaggedTainted   = (true, true),
+    ],
+    statics: [
+        Static                   = (false, false),
+        StaticFlagged            = (true, false),
+        StaticTainted            = (false, true),
+        StaticFlaggedTainted     = (true, true),
     ]
 }
 
@@ -1577,6 +1668,48 @@ impl PerlString {
         }
     }
 
+    /// A string over `'static` UTF-8: zero-copy, zero-allocation, never freed (§2.2.3).  Classification is eager and
+    /// terminal at any size — the full walk rather than the cheaper ranging one, because facts settled once for content
+    /// that lives forever should include the character count the ranging walker forfeits.  Content past the compact
+    /// ceiling is copied into a tier instead, until the large immortal forms land.
+    pub fn from_static_str(s: &'static str) -> Result<PerlString, AllocError> {
+        PerlString::from_static_bytes(s.as_bytes())
+    }
+
+    /// A string over `'static` bytes: zero-copy, zero-allocation, never freed (§2.2.3).  Classification is eager and
+    /// terminal at any size, malformed content included — a static image can hold any bytes the program does.  Content
+    /// past the compact ceiling is copied into a tier instead, until the large immortal forms land.
+    pub fn from_static_bytes(bytes: &'static [u8]) -> Result<PerlString, AllocError> {
+        if bytes.len() > U24_MAX {
+            return PerlString::from_bytes(bytes);
+        }
+        let (scan, count) = classify_full(bytes);
+
+        // A slice pointer is never null, so the fallback arm is unreachable; it exists to keep this path panic-free,
+        // and a dangling pointer with length zero reads soundly anyway.
+        let ptr = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).unwrap_or(std::ptr::NonNull::dangling());
+        Ok(PerlString::build_static(false, false, ptr, bytes.len(), count, scan))
+    }
+
+    /// A string over an immortal image: bytes some owner keeps alive longer than every handle (§2.2.3) — the
+    /// interpreter's slab canonically; any arena or interner legitimately.  Zero-copy; classification is eager and
+    /// terminal.  `None` past the compact ceiling, until the large immortal forms land.
+    ///
+    /// # Safety
+    /// The caller warrants that the image outlives every handle, clones included; that it is never written while any
+    /// handle lives; and that its owner frees it only after the last handle is gone.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the §2.4 slab is the production caller; until it lands, tests are"))]
+    pub(crate) unsafe fn from_immortal_bytes(bytes: &[u8]) -> Option<PerlString> {
+        if bytes.len() > U24_MAX {
+            return None;
+        }
+        let (scan, count) = classify_full(bytes);
+
+        // See from_static_bytes: never null, never panics, sound at zero length.
+        let ptr = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).unwrap_or(std::ptr::NonNull::dangling());
+        Some(PerlString::build_immortal(false, false, ptr, bytes.len(), count, scan))
+    }
+
     /// The full tier ladder with every tag dimension supplied — the transforms' constructor, and `from_bytes` in
     /// spirit: compressed inline, verbatim inline, packed, heap, in the ruled order (§2.2.9).  Internal: public
     /// construction fixes the flags.
@@ -1646,6 +1779,7 @@ impl PerlString {
             RawParts::Inline { class, full, buf } => inline_internal_len(class, full, buf),
             RawParts::Packed(p) => p.len(),
             RawParts::Heap(cb) => cb.len(),
+            RawParts::Borrowed { bytes, .. } => bytes.len(),
         }
     }
 
@@ -1701,6 +1835,7 @@ impl PerlString {
                 &scratch[..len]
             }
             RawParts::Heap(cb) => cb.as_slice(),
+            RawParts::Borrowed { bytes, .. } => bytes,
         }
     }
 
@@ -1734,6 +1869,12 @@ impl PerlString {
                     InlineClass::Extended | InlineClass::Bytes => None,
                 }
             }
+            RawParts::Borrowed { bytes, scan, .. } => match scan.widen() {
+                // SAFETY: immortal facts are settled at construction and the image is readonly (§2.2.3), so the
+                // certification can never go stale.
+                st if scan::is_rust_valid(st) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
+                _ => None, // ExtendedUtf8 or MalformedUtf8: the only terminal states outside the Rust-valid set.
+            },
             RawParts::Heap(cb) => {
                 let bytes = cb.as_slice();
                 match cb.scan() {
@@ -1796,6 +1937,9 @@ impl PerlString {
                     ascii
                 }
             },
+
+            // Settled at construction: the terminal state answers, no probe and no narrowing.
+            RawParts::Borrowed { scan, .. } => scan == scan::Terminal::Ascii,
         }
     }
 
@@ -1809,6 +1953,7 @@ impl PerlString {
             },
             RawParts::Packed(_) => scan::Ascii,
             RawParts::Heap(cb) => cb.scan(),
+            RawParts::Borrowed { scan, .. } => scan.widen(),
         }
     }
 
@@ -1818,6 +1963,10 @@ impl PerlString {
         match self.raw_parts() {
             RawParts::Heap(view) => !view.is_unique(),
             RawParts::Inline { .. } | RawParts::Packed(_) => false,
+
+            // Bitwise clones do share the image, but with the owner that outlives them all (§2.2.3), not with each
+            // other in any sense `unshare` could dissolve: copying frees nothing that would otherwise be freed.
+            RawParts::Borrowed { .. } => false,
         }
     }
 
@@ -1830,7 +1979,7 @@ impl PerlString {
     pub fn unshare(&mut self) -> Result<(), AllocError> {
         let parts = match self.raw_parts() {
             RawParts::Heap(view) if !view.is_unique() => heap_parts_transitioned(view.as_slice(), view.scan(), view.char_count())?,
-            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) => return Ok(()),
+            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Borrowed { .. } => return Ok(()),
         };
         *self = PerlString::build_heap(self.is_utf8(), self.is_tainted(), parts);
         Ok(())
@@ -1842,6 +1991,7 @@ impl PerlString {
         match self.raw_parts() {
             RawParts::Inline { .. } => !matches!(self.inline_class(), Some(InlineClass::Bytes)),
             RawParts::Packed(_) => true, // ASCII is valid under every reading.
+            RawParts::Borrowed { scan, .. } => scan::is_perl_decodable(scan.widen()),
             RawParts::Heap(cb) => match cb.scan() {
                 st if scan::is_perl_decodable(st) => true,
                 scan::MalformedUtf8 => false,
@@ -1879,6 +2029,15 @@ impl PerlString {
 
                     // The verbatim valid classes carry their count in the aux nibble; the full family derives it.
                     InlineClass::NonLatin1 | InlineClass::Extended => Some(if full { classify_full(&buf[..stored]).1 } else { inline_aux(buf) }),
+                }
+            }
+
+            // Settled at construction: the count is always true, and only the malformed terminal has none.
+            RawParts::Borrowed { count, scan, .. } => {
+                if scan == scan::Terminal::MalformedUtf8 {
+                    None
+                } else {
+                    Some(count)
                 }
             }
             RawParts::Heap(cb) => match cb.scan() {
@@ -2020,6 +2179,18 @@ impl PerlString {
 
                 Ok(Some(s))
             }
+            RawParts::Borrowed { bytes, .. } => {
+                // The image is readonly, so the downgrade is a copy-out by nature: walk it like heap content.
+                let Some(out) = cow_buffer::downgraded_bytes(bytes)? else {
+                    return Ok(None); // A character past U+00FF, or no character at all.
+                };
+
+                if out.len() <= MAX_PACKED_LEN {
+                    return Ok(Some(PerlString::tiered(&out, false, t)?));
+                }
+
+                Ok(Some(PerlString::build_heap(false, t, heap_parts_classified(&out)?)))
+            }
             RawParts::Heap(cb) => {
                 // Walk the encoding: every character must sit in U+0000-U+00FF, emitted as its single byte.  The result
                 // re-runs the ladder — sixteen to thirty emitted octets can compress right back inline.
@@ -2100,6 +2271,8 @@ impl PerlString {
             }
             RawOwned::Packed(p) => PerlString::build_packed(p, u2, t2),
             RawOwned::Heap { ptr, len, cap, count, scan, tier } => PerlString::build_heap(u2, t2, HeapParts { ptr, len, cap, count, scan, tier }),
+            RawOwned::Borrowed { form: BorrowedForm::Immortal, ptr, len, count, scan } => PerlString::build_immortal(u2, t2, ptr, len, count, scan),
+            RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PerlString::build_static(u2, t2, ptr, len, count, scan),
         };
     }
 
@@ -2232,6 +2405,19 @@ impl PerlString {
                     PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
                 }
             }
+            RawOwned::Borrowed { form: _, ptr, len, count: _, scan } => {
+                // Copy-out on write (§2.2.3): the image is readonly, so an append is a rebuild seeded by the settled
+                // state — same shape as the packed tier's exit.
+                // SAFETY: the image outlives every handle by the forms' contract.
+                let old_bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) };
+                let new_len = len + bytes.len();
+                let mut joined = Vec::new();
+                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
+                joined.extend_from_slice(old_bytes);
+                joined.extend_from_slice(bytes);
+                let state = append_transition_heap(scan.widen(), kind);
+                PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+            }
             RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
                 // Reached only past the in-place fast path — shared, or over capacity — so the buffer is rebuilt:
                 // growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what `HeapParts::from_slice`
@@ -2274,6 +2460,37 @@ impl PerlString {
     }
 }
 
+/// Which immortal form a borrowed payload came from, so a tag rebuild can return to it.  Nothing else dispatches on
+/// this: the forms differ in who guarantees the image's life (§2.2.3), not in how it reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BorrowedForm {
+    Immortal,
+    Static,
+}
+
+/// An immortal image pointer (§2.2.3): a thin wrapper whose only job is the thread-safety assertion the raw pointer
+/// cannot make for itself.
+#[derive(Clone, Copy)]
+struct Image(std::ptr::NonNull<u8>);
+
+// SAFETY: the image is readonly for its entire life and outlives every handle by the forms' contract (§2.2.3), so
+// sharing references to it across threads is sharing immutable bytes; no operation writes through this pointer.
+unsafe impl Send for Image {}
+unsafe impl Sync for Image {}
+
+/// The immortal envelopes' 24-bit fields (§2.2.3): compact forms hold lengths and counts below 16 MiB.
+const U24_MAX: usize = 0xFF_FFFF;
+
+fn u24_new(value: usize) -> [u8; 3] {
+    debug_assert!(value <= U24_MAX, "a compact immortal field holds at most 16 MiB - 1");
+    let b = (value as u32).to_le_bytes();
+    [b[0], b[1], b[2]]
+}
+
+fn u24_get(bytes: &[u8; 3]) -> usize {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) as usize
+}
+
 enum RawParts<'a> {
     Inline {
         class: InlineClass,
@@ -2282,9 +2499,18 @@ enum RawParts<'a> {
     },
     Packed(Packed),
 
-    /// Whatever the tier, read through one view: the metadata is gathered at construction from wherever that tier
-    /// keeps it, so nothing below dispatches on it (§2.2.3).
+    /// Whatever the tier, read through one view: the metadata is gathered at construction from wherever that tier keeps
+    /// it, so nothing below dispatches on it (§2.2.3).
     Heap(HeapView<'a>),
+
+    /// An immortal image (§2.2.3): readonly bytes someone else keeps alive, with facts settled at construction.  There
+    /// is no refcount and no headroom, so every writer copies out and every clone is bitwise.  Which form is
+    /// [`RawOwned`]'s business — rebuilds need it, reads never dispatch on it.
+    Borrowed {
+        bytes: &'a [u8],
+        count: usize,
+        scan: scan::Terminal,
+    },
 }
 
 enum RawOwned {
@@ -2306,6 +2532,15 @@ enum RawOwned {
         count: usize,
         scan: scan::ScanState,
         tier: Tier,
+    },
+
+    /// An immortal image's envelope fields: nothing is owned, so nothing transfers but the facts.
+    Borrowed {
+        form: BorrowedForm,
+        ptr: std::ptr::NonNull<u8>,
+        len: usize,
+        count: usize,
+        scan: scan::Terminal,
     },
 }
 

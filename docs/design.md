@@ -1429,16 +1429,17 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   reclassifies (a lone `E9` stays bytes-class, now flagged).
 
   **The storage types are the normative vocabulary.**  The
-  seventeen base variants — `InlineAscii`, `InlineLatin1`,
+  nineteen base variants — `InlineAscii`, `InlineLatin1`,
   `InlineNonLatin1`, `InlineExtended`, `InlineBytes`,
   `PackedNumeric`, `PackedDateTimePlus`, and
-  `PackedDateTimeZulu`, each beside its `Full` family twin, and
-  `Heap`, alone without one — are reified as `StorageType`:
-  seventeen values dense from zero, which is the niche budget's
+  `PackedDateTimeZulu`, each beside its `Full` family twin;
+  `Heap`, alone without one; and the immortal pair `Immortal`
+  and `Static` (§2.2.3), constructed explicitly and never
+  canonically selected — are reified as `StorageType`: nineteen
+  values dense from zero, which is the niche budget's
   requirement (§2.2.3), with every coarse question a projection
-  on it.  The
-  declaration order is itself the selection [DECISION]: canonical
-  selection takes the first type, in this order, able to
+  on it.  The declaration order is itself the selection [DECISION]:
+  canonical selection takes the first type, in this order, able to
   represent the content — first-fit is the ladder — which is what
   the derived `Ord` means: fourteen ASCII bytes fit `InlineAscii`
   and take it; a fifteenth forces the `Full` twin; sixteen
