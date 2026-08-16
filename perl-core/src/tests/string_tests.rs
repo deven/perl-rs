@@ -1244,6 +1244,105 @@ fn ascii_twin_appends_stay_in_place_only_while_ascii_holds() {
 }
 
 #[test]
+fn the_meet_is_the_fact_union_canonicalized() {
+    use scan::meet;
+    let all = || (0..=10u8).map(scan::ScanState::from_u8);
+
+    // Idempotent everywhere; Unknown the identity everywhere; commutative over the compatible pairs below.
+    for s in all() {
+        assert_eq!(meet(s, s), s, "{s:?} idempotent");
+        assert_eq!(meet(s, scan::Unknown), s, "{s:?} vs Unknown");
+        assert_eq!(meet(scan::Unknown, s), s, "Unknown vs {s:?}");
+    }
+
+    // The ruled example, and its family: a probe's byte witness completes a Maybe state whose validity is already
+    // certified — the derivation RUST_VALID and HIGH_BIT yields the U+0080 witness.
+    assert_eq!(meet(scan::NonAscii, scan::MaybeUtf8Latin1), scan::Utf8Latin1);
+    assert_eq!(meet(scan::MaybeUtf8Latin1, scan::NonAscii), scan::Utf8Latin1);
+    assert_eq!(meet(scan::NonAscii, scan::ValidUtf8), scan::Utf8NonAscii);
+    assert_eq!(meet(scan::NonAscii, scan::Utf8NonAscii), scan::Utf8NonAscii);
+    assert_eq!(meet(scan::NonAscii, scan::Utf8NonLatin1), scan::Utf8NonLatin1);
+    assert_eq!(meet(scan::NonAscii, scan::ExtendedUtf8), scan::ExtendedUtf8);
+
+    // The one representable forfeiture: perl-decodability beside a byte witness has no state — the witness yields.
+    assert_eq!(meet(scan::NonAscii, scan::MaybeExtendedUtf8), scan::MaybeExtendedUtf8);
+
+    // Terminals absorb their compatible weaker facts; witness states refine the bare-validity states.
+    assert_eq!(meet(scan::ValidUtf8, scan::MaybeUtf8Latin1), scan::MaybeUtf8Latin1);
+    assert_eq!(meet(scan::Utf8NonAscii, scan::MaybeUtf8Latin1), scan::Utf8Latin1);
+    assert_eq!(meet(scan::ValidUtf8, scan::MaybeExtendedUtf8), scan::ValidUtf8);
+    assert_eq!(meet(scan::Utf8NonLatin1, scan::ValidUtf8), scan::Utf8NonLatin1);
+    assert_eq!(meet(scan::Ascii, scan::MaybeUtf8Latin1), scan::Ascii);
+
+    // Monotonic: over every compatible pair, the meet's facts contain each side's representable facts — checked here
+    // as: meeting the result with either input is the result again (absorption).
+    let compatible: &[(scan::ScanState, scan::ScanState)] = &[
+        (scan::NonAscii, scan::MaybeUtf8Latin1),
+        (scan::NonAscii, scan::ValidUtf8),
+        (scan::NonAscii, scan::Utf8NonAscii),
+        (scan::NonAscii, scan::Utf8NonLatin1),
+        (scan::NonAscii, scan::ExtendedUtf8),
+        (scan::ValidUtf8, scan::MaybeUtf8Latin1),
+        (scan::Utf8NonAscii, scan::MaybeUtf8Latin1),
+        (scan::ValidUtf8, scan::MaybeExtendedUtf8),
+        (scan::Utf8NonLatin1, scan::ValidUtf8),
+        (scan::Ascii, scan::MaybeUtf8Latin1),
+        (scan::Utf8Latin1, scan::MaybeUtf8Latin1),
+        (scan::ExtendedUtf8, scan::MaybeExtendedUtf8),
+    ];
+    for &(a, b) in compatible {
+        let m = meet(a, b);
+        assert_eq!(meet(a, b), meet(b, a), "{a:?}/{b:?} commutative");
+        assert_eq!(meet(m, a), m, "{a:?}/{b:?} absorbs a");
+        assert_eq!(meet(m, b), m, "{a:?}/{b:?} absorbs b");
+    }
+}
+
+#[test]
+fn racing_narrows_lose_no_information() {
+    use std::sync::Arc;
+
+    // A shared large-tier string of Latin-1 content: one honest probe truth is NonAscii, one honest classification
+    // truth is Utf8Latin1, and under the CAS meet the finer fact must survive any interleaving.
+    let mut content = b"pr\xC3\xA9cis ".repeat(10_000);
+    content.truncate(70_000);
+    while content.last().is_some_and(|b| b & 0xC0 == 0x80) || content.last() == Some(&0xC3) {
+        content.pop();
+    }
+    let s = Arc::new(PerlString::from_bytes(&content).unwrap());
+    assert_eq!(s.storage_type(), StorageType::Heap32, "large tier: the lazy, shared-header regime");
+
+    let narrow = |s: &PerlString, st: scan::ScanState| match s.raw_parts() {
+        RawParts::Heap(view) => view.narrow_scan(st),
+        _ => panic!("large tier expected"),
+    };
+
+    // Reset to Unknown through the exclusive door each round, then race mixed-precision narrows.
+    for _ in 0..200 {
+        match s.raw_parts() {
+            RawParts::Heap(view) => view.set_scan_for_test(scan::Unknown),
+            _ => unreachable!(),
+        }
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    if i % 2 == 0 {
+                        narrow(&s, scan::NonAscii);
+                    } else {
+                        narrow(&s, scan::Utf8Latin1);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(s.scan_state(), scan::Utf8Latin1, "the finer certification survived the race");
+    }
+}
+
+#[test]
 fn static_strings_are_zero_allocation_with_facts_settled_at_birth() {
     const TEXT: &str = "héllo, wörld: a static string past the inline ceiling";
     let live = cow_buffer::live::count();

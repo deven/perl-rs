@@ -796,6 +796,34 @@ and completes to `Utf8Latin1`; plus `Valid{NonLatin1}` becomes
 `Utf8NonLatin1`.  `MaybeExtendedUtf8` plus any `Valid` stays.
 Raw appends blanket to `Unknown` as everywhere.
 
+**Shared-path narrowing is a monotonic CAS meet loop
+[DECISION].**  Racing readers of one shared buffer store true
+facts of *different precision* — a cheap probe learns `NonAscii`
+where a full classification learns a terminal — and a plain
+last-writer store would let the coarser truth overwrite the
+finer, forfeiting information already paid for.  The meet is the
+fact-set union of two certifications of the same immutable
+bytes, canonicalized to the most precise representable state:
+each state is its §2.2.4 assertion set, the union is closed
+under derivation (Rust validity beside a high-bit byte yields
+the U+0080 code-point witness; the stronger witnesses imply the
+weaker), and exactly one union is unrepresentable — bare
+perl-decodability beside a byte witness — which forfeits the
+witness.  So `meet(NonAscii, MaybeUtf8Latin1) = Utf8Latin1`:
+the `Maybe` prefix means validity is certified and the non-ASCII
+witness is what a cut un-certified, and the probe's byte is that
+witness.  A union asserting a contradiction cannot arise from
+two truths and is the bomb family's in debug.  Widening (the
+reset to `Unknown`) stays reserved to exclusive `&mut` sites;
+`Relaxed` suffices throughout, the bytes having been published
+with the buffer pointer.  Measured before ruling: the probe and
+the blocked classifier are both DRAM-bound and within 3% on
+ASCII content at 256 MiB (11.5 vs 11.8 GB/s), so always-full
+classification would be free there — but on non-ASCII-dense
+content the probe's early exit wins by orders of magnitude over
+the 0.8 GB/s scalar decode, so mixed-precision narrows
+legitimately coexist and the meet earns its keep.
+
 **The numbering home is `ScanState` itself [DECISION]:** the
 variants carry the explicit discriminants; `Terminal` and
 `ValidRange` source theirs symbolically (`ScanState::Ascii as

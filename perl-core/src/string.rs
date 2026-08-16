@@ -281,6 +281,106 @@ pub mod scan {
     pub const fn is_known_beyond_latin1(state: ScanState) -> bool {
         matches!(state, Utf8NonLatin1 | ExtendedUtf8)
     }
+
+    // ── The narrowing meet (§2.2.4) ────────────────────────────────
+    // Each state is a set of certified facts about the bytes; two states stored by racing readers are both true of the
+    // same immutable content, so their conjunction is true, and the meet is that union canonicalized to the most
+    // precise representable state.  One union is not representable — perl-decodable plus a high-bit byte witness has no
+    // state — and forfeits the witness; every other combination lands exactly.
+
+    /// Rust-valid (which implies perl-decodable).
+    const RUST_VALID: u16 = 1 << 0;
+
+    /// Perl-decodable.
+    const PERL_VALID: u16 = 1 << 1;
+
+    /// Every code point at most U+00FF.
+    const ALL_LE_00FF: u16 = 1 << 2;
+
+    /// A code point at or above U+0080 exists.
+    const CONTAINS_GE_0080: u16 = 1 << 3;
+
+    /// A code point at or above U+0100 exists.
+    const CONTAINS_GE_0100: u16 = 1 << 4;
+
+    /// A Rust-invalid form exists: a surrogate, or a code point at or above U+110000.
+    const RUST_INVALID: u16 = 1 << 5;
+
+    /// Invalid to perl (and so to Rust).
+    const MALFORMED: u16 = 1 << 6;
+
+    /// A byte with the high bit set exists (the byte-level fact a probe learns).
+    const HIGH_BIT: u16 = 1 << 7;
+
+    /// Every byte is ASCII.
+    const ALL_ASCII: u16 = 1 << 8;
+
+    /// The assertion set of a state — exactly the §2.2.4 definitions.
+    fn facts(state: ScanState) -> u16 {
+        match state {
+            Unknown => 0,
+            Ascii => RUST_VALID | PERL_VALID | ALL_LE_00FF | ALL_ASCII,
+            Utf8Latin1 => RUST_VALID | PERL_VALID | ALL_LE_00FF | CONTAINS_GE_0080,
+            MaybeUtf8Latin1 => RUST_VALID | PERL_VALID | ALL_LE_00FF,
+            Utf8NonLatin1 => RUST_VALID | PERL_VALID | CONTAINS_GE_0100,
+            ValidUtf8 => RUST_VALID | PERL_VALID,
+            Utf8NonAscii => RUST_VALID | PERL_VALID | CONTAINS_GE_0080,
+            ExtendedUtf8 => PERL_VALID | RUST_INVALID,
+            MaybeExtendedUtf8 => PERL_VALID,
+            MalformedUtf8 => MALFORMED,
+            NonAscii => HIGH_BIT,
+        }
+    }
+
+    /// The meet of two true certifications of the same bytes: the union of their facts, closed under derivation,
+    /// canonicalized.  Monotonic — the result's facts contain each input's representable facts — commutative, and
+    /// idempotent, with `Unknown` the identity.  A union asserting a contradiction (an all-ASCII certificate beside a
+    /// high-bit witness, a validity claim beside malformedness) cannot arise from two truths; debug builds treat it as
+    /// the bomb family does, and release canonicalization proceeds malformed-first.
+    pub(crate) fn meet(a: ScanState, b: ScanState) -> ScanState {
+        let mut f = facts(a) | facts(b);
+
+        // Derivations: under Rust validity a high-bit byte is a code point at or above U+0080, and the stronger
+        // witness implies the weaker.
+        if f & RUST_VALID != 0 && f & HIGH_BIT != 0 {
+            f |= CONTAINS_GE_0080;
+        }
+        if f & (CONTAINS_GE_0100 | RUST_INVALID) != 0 {
+            f |= CONTAINS_GE_0080;
+        }
+
+        // Contradiction census, one clause per impossible pairing; a single expression would defeat the reading.
+        let contradiction = (f & MALFORMED != 0 && f & PERL_VALID != 0)
+            || (f & RUST_VALID != 0 && f & RUST_INVALID != 0)
+            || (f & ALL_ASCII != 0 && (f & HIGH_BIT != 0 || f & CONTAINS_GE_0080 != 0))
+            || (f & ALL_LE_00FF != 0 && f & CONTAINS_GE_0100 != 0);
+        debug_assert!(!contradiction, "the meet of two true certifications asserted a contradiction: {a:?} with {b:?}");
+
+        if f & MALFORMED != 0 {
+            MalformedUtf8
+        } else if f & RUST_INVALID != 0 {
+            ExtendedUtf8
+        } else if f & RUST_VALID != 0 {
+            if f & ALL_ASCII != 0 {
+                Ascii
+            } else if f & CONTAINS_GE_0100 != 0 {
+                Utf8NonLatin1
+            } else if f & ALL_LE_00FF != 0 {
+                if f & CONTAINS_GE_0080 != 0 { Utf8Latin1 } else { MaybeUtf8Latin1 }
+            } else if f & CONTAINS_GE_0080 != 0 {
+                Utf8NonAscii
+            } else {
+                ValidUtf8
+            }
+        } else if f & PERL_VALID != 0 {
+            // The one representable forfeiture: a high-bit witness beside bare perl-decodability has no state.
+            MaybeExtendedUtf8
+        } else if f & HIGH_BIT != 0 {
+            NonAscii
+        } else {
+            Unknown
+        }
+    }
 }
 
 /// Test-only instrumentation proving the §2.3.5 short-circuits actually fire (compiled out of non-test builds).

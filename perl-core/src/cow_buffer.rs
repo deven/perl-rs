@@ -515,9 +515,53 @@ impl<'a> HeapView<'a> {
     /// Record a discovered scan state, for the tiers that discover one.  A small tier's is settled at construction and
     /// lives in the envelope, so this is a no-op there rather than an error: the caller learns nothing the value does
     /// not already know.
+    ///
+    /// Narrowing is a monotonic CAS meet loop [DECISION]: racing readers store true facts of different precision — a
+    /// cheap probe learns `NonAscii` while a full classification learns a terminal — and a plain store would let the
+    /// coarser truth overwrite the finer, forfeiting information already paid for.  The meet (§2.2.4) is the fact-set
+    /// union of two certifications of the same immutable bytes, so the loop only ever narrows and always terminates:
+    /// each retry starts from a state someone just narrowed.
     pub(crate) fn narrow_scan(&self, state: ScanState) {
         // SAFETY: the view borrows a live allocation of its tier.  The storage byte is the type's projection, so a scan
         // slot can only ever hold a value `ScanState::from_u8` will accept back.
+        unsafe {
+            match self.tier {
+                Tier::Heap32 => {
+                    let mut current = heap32::scan(self.ptr);
+                    loop {
+                        let merged = crate::string::scan::meet(ScanState::from_u8(current), state).as_u8();
+                        if merged == current {
+                            break;
+                        }
+                        match heap32::cas_scan(self.ptr, current, merged) {
+                            Ok(_) => break,
+                            Err(seen) => current = seen,
+                        }
+                    }
+                }
+                Tier::Heap => {
+                    let mut current = heap::scan(self.ptr);
+                    loop {
+                        let merged = crate::string::scan::meet(ScanState::from_u8(current), state).as_u8();
+                        if merged == current {
+                            break;
+                        }
+                        match heap::cas_scan(self.ptr, current, merged) {
+                            Ok(_) => break,
+                            Err(seen) => current = seen,
+                        }
+                    }
+                }
+                Tier::Heap8 | Tier::Heap16 => {}
+            }
+        }
+    }
+
+    /// Test-only: the exclusive-site store through the view, for stress tests that reset a shared scan slot between
+    /// racing rounds.  Production widening goes through the owner's `&mut` paths.
+    #[cfg(test)]
+    pub(crate) fn set_scan_for_test(&self, state: ScanState) {
+        // SAFETY: the view borrows a live allocation of its tier.
         unsafe {
             match self.tier {
                 Tier::Heap32 => heap32::set_scan(self.ptr, state.as_u8()),
@@ -872,8 +916,10 @@ macro_rules! heap_tier {
                 unsafe { head(ptr) }.scan.load(Ordering::Relaxed)
             }
 
-            /// Record a scan state.  Relaxed suffices: the value is a deterministic fact about bytes that are immutable
-            /// while shared, so a racing writer can only store the same answer.
+            /// Record a scan state unconditionally — the exclusive-site store: births and `&mut` resets, where no
+            /// reader races.  Shared-path narrowing goes through [`HeapView::narrow_scan`]'s meet loop instead, since
+            /// racing readers store true facts of *different* precision.  Relaxed suffices either way: the bytes were
+            /// published with the buffer pointer, and the state adds no byte-writes to order (§2.2.4).
             ///
             /// # Safety
             /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
@@ -881,6 +927,16 @@ macro_rules! heap_tier {
             pub(crate) unsafe fn set_scan(ptr: NonNull<u8>, state: u8) {
                 // SAFETY: the caller vouches for a live allocation.
                 unsafe { head(ptr) }.scan.store(state, Ordering::Relaxed);
+            }
+
+            /// One compare-exchange step of the narrowing meet loop (§2.2.4).
+            ///
+            /// # Safety
+            /// `ptr` must be the data pointer of a live allocation made by [`allocate`].
+            #[inline]
+            pub(crate) unsafe fn cas_scan(ptr: NonNull<u8>, current: u8, new: u8) -> Result<u8, u8> {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.scan.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed)
             }
 
             /// The cached character count (§2.2.4); zero means none is cached.
@@ -1050,8 +1106,8 @@ macro_rules! heap_tier {
                 unsafe { head(ptr) }.scan.load(Ordering::Relaxed)
             }
 
-            /// Record a discovered scan state.  Relaxed store: every stored value is a true fact about content that is
-            /// immutable while shared, so a race can only replace a precise truth with a coarser one (§2.2.4).
+            /// Record a scan state unconditionally — the exclusive-site store: births and `&mut` resets, where no
+            /// reader races.  Shared-path narrowing goes through [`HeapView::narrow_scan`]'s meet loop (§2.2.4).
             ///
             /// # Safety
             /// As [`retain`].
@@ -1059,6 +1115,16 @@ macro_rules! heap_tier {
             pub(crate) unsafe fn set_scan(ptr: NonNull<u8>, state: u8) {
                 // SAFETY: the caller vouches for a live allocation.
                 unsafe { head(ptr) }.scan.store(state, Ordering::Relaxed);
+            }
+
+            /// One compare-exchange step of the narrowing meet loop (§2.2.4).
+            ///
+            /// # Safety
+            /// As [`retain`].
+            #[inline]
+            pub(crate) unsafe fn cas_scan(ptr: NonNull<u8>, current: u8, new: u8) -> Result<u8, u8> {
+                // SAFETY: the caller vouches for a live allocation.
+                unsafe { head(ptr) }.scan.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed)
             }
 
             /// # Safety
