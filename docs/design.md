@@ -2038,8 +2038,12 @@ Container-verified contract (perl 5.38, all under `-w`):
   *two* warnings — overflow mid-scan, then illegal-digit at the
   scan's end — while overflow suppresses non-portable, so the
   legal sequences are overflow→digit, digit→portable, or any
-  singleton, in emission order; the grok event is one compound
-  variant.
+  singleton, in emission order.  The variants are that law
+  [DECISION]: one variant per warning plus exactly two compound
+  variants for the legal pairs, order in the names, illegal
+  combinations unrepresentable.  Warning-capable operations
+  return the event as `Option` in a tuple after the value,
+  `None` for the silent case.
 
 - `NumifyWarning` carries raw data, never a preformatted string,
   and never more than the message uses [DECISION]: for the

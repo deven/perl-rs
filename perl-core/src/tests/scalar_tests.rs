@@ -268,12 +268,15 @@ fn numify_warning_display_is_perl_exact() {
 
     // The rest of the ruled inventory renders its perl bodies; constructors arrive with their operations.
     assert_eq!(format!("{}", NumifyWarning::LostPrecision { value: 1e17, decrement: false }), "Lost precision when incrementing 100000000000000000 by 1");
+    assert_eq!(format!("{}", NumifyWarning::IllegalDigit { base: RadixBase::Binary, digit: b'2' }), "Illegal binary digit '2' ignored");
+    assert_eq!(format!("{}", NumifyWarning::Overflow { base: RadixBase::Octal }), "Integer overflow in octal number");
+    assert_eq!(format!("{}", NumifyWarning::NonPortable { base: RadixBase::Hexadecimal }), "Hexadecimal number > 0xffffffff non-portable");
     assert_eq!(
-        format!("{}", NumifyWarning::RadixGrok { base: RadixBase::Hexadecimal, illegal_digit: Some(b'G'), overflow: true, non_portable: false }),
+        format!("{}", NumifyWarning::OverflowThenIllegalDigit { base: RadixBase::Hexadecimal, digit: b'G' }),
         "Integer overflow in hexadecimal number\nIllegal hexadecimal digit 'G' ignored"
     );
     assert_eq!(
-        format!("{}", NumifyWarning::RadixGrok { base: RadixBase::Octal, illegal_digit: Some(b'9'), overflow: false, non_portable: true }),
+        format!("{}", NumifyWarning::IllegalDigitThenNonPortable { base: RadixBase::Octal, digit: b'9' }),
         "Illegal octal digit '9' ignored\nOctal number > 037777777777 non-portable"
     );
     assert_eq!(format!("{}", NumifyWarning::Uninitialized), "Use of uninitialized value");

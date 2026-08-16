@@ -434,11 +434,25 @@ pub enum NumifyWarning {
     /// apart.  Constructed when the increment family lands.
     LostPrecision { value: f64, decrement: bool },
 
-    /// The radix-grok compound (§2.3.4): one `oct`/`hex`-style scan can emit up to two of these, in emission order
-    /// overflow → illegal digit → non-portable, with overflow and non-portable mutually exclusive by perl's own
-    /// suppression.  Base 10 is structurally excluded — it has never warned here.  Constructed when the grok operations
-    /// land.
-    RadixGrok { base: RadixBase, illegal_digit: Option<u8>, overflow: bool, non_portable: bool },
+    /// `Illegal %s digit '%c' ignored`: the radix scan stopped at a digit outside its base (§2.3.4) — never base 10,
+    /// octal only for the digits 8 and 9.  Constructed when the grok operations land, as are its four siblings.
+    IllegalDigit { base: RadixBase, digit: u8 },
+
+    /// `Integer overflow in %s number`: the magnitude passed `u64::MAX` mid-scan (§2.3.4).
+    Overflow { base: RadixBase },
+
+    /// `%s non-portable`: the value exceeded 32 bits (§2.3.4).  Perl's overflow path suppresses this, so overflow and
+    /// non-portable never co-fire — which the variant set makes unrepresentable rather than merely documented.
+    NonPortable { base: RadixBase },
+
+    /// The compound of a scan that overflowed and then stopped at an illegal digit — the one legal pair in that order
+    /// (§2.3.4): overflow fires mid-scan, scanning continues to find the number's end, and the finish block fires the
+    /// digit warning.
+    OverflowThenIllegalDigit { base: RadixBase, digit: u8 },
+
+    /// The compound of a scan that stopped at an illegal digit and whose value exceeded 32 bits — the other legal pair,
+    /// in that order (§2.3.4).
+    IllegalDigitThenNonPortable { base: RadixBase, digit: u8 },
 
     /// `Use of uninitialized value`: undef numified.  The variable-name diagnosis is interpreter machinery entire, so
     /// the event is the bare fact.  Constructed when undef numification routes events.
@@ -499,34 +513,35 @@ impl fmt::Display for NumifyWarning {
                 let verb = if *decrement { "decrementing" } else { "incrementing" };
                 write!(f, "Lost precision when {verb} {value} by 1")
             }
-            NumifyWarning::RadixGrok { base, illegal_digit, overflow, non_portable } => {
-                // Emission order per §2.3.4: overflow, then the illegal digit, then non-portable; a newline joins
-                // the compound's lines, each line one perl warning body.
-                let mut first = true;
-                let mut line = |f: &mut fmt::Formatter<'_>| -> fmt::Result {
-                    if !first {
-                        writeln!(f)?;
-                    }
-                    first = false;
-                    Ok(())
-                };
-                if *overflow {
-                    line(f)?;
-                    write!(f, "Integer overflow in {} number", base.name())?;
-                }
-                if let Some(digit) = illegal_digit {
-                    line(f)?;
-                    write!(f, "Illegal {} digit '{}' ignored", base.name(), *digit as char)?;
-                }
-                if *non_portable {
-                    line(f)?;
-                    write!(f, "{} non-portable", base.non_portable_threshold())?;
-                }
-                Ok(())
+            NumifyWarning::IllegalDigit { base, digit } => fmt_illegal_digit(f, *base, *digit),
+            NumifyWarning::Overflow { base } => fmt_overflow(f, *base),
+            NumifyWarning::NonPortable { base } => fmt_non_portable(f, *base),
+            NumifyWarning::OverflowThenIllegalDigit { base, digit } => {
+                // A compound's lines are its warnings in emission order (§2.3.4), one perl body each.
+                fmt_overflow(f, *base)?;
+                writeln!(f)?;
+                fmt_illegal_digit(f, *base, *digit)
+            }
+            NumifyWarning::IllegalDigitThenNonPortable { base, digit } => {
+                fmt_illegal_digit(f, *base, *digit)?;
+                writeln!(f)?;
+                fmt_non_portable(f, *base)
             }
             NumifyWarning::Uninitialized => write!(f, "Use of uninitialized value"),
         }
     }
+}
+
+fn fmt_illegal_digit(f: &mut fmt::Formatter<'_>, base: RadixBase, digit: u8) -> fmt::Result {
+    write!(f, "Illegal {} digit '{}' ignored", base.name(), digit as char)
+}
+
+fn fmt_overflow(f: &mut fmt::Formatter<'_>, base: RadixBase) -> fmt::Result {
+    write!(f, "Integer overflow in {} number", base.name())
+}
+
+fn fmt_non_portable(f: &mut fmt::Formatter<'_>, base: RadixBase) -> fmt::Result {
+    write!(f, "{} non-portable", base.non_portable_threshold())
 }
 
 /// The two-regime fragment renderer (§2.3.4), exact to `S_sv_display` and the container probes.  Unflagged: output cap
