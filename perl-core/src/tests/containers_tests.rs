@@ -358,3 +358,16 @@ fn handle_identity_and_traversal() {
     assert_eq!(h.read().values_iter().count(), 1);
     assert!(format!("{h:?}").starts_with("HashRef(0x"));
 }
+
+#[test]
+fn concurrency_foundation_send_sync() {
+    // The utility-crate contract: every shared-capable type crosses threads.
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PerlString>();
+    assert_send_sync::<Value>();
+    assert_send_sync::<PerlHash>();
+    assert_send_sync::<PerlArray>();
+    assert_send_sync::<ArrayRef>();
+    assert_send_sync::<HashRef>();
+    assert_send_sync::<crate::scalar::ScalarRef>();
+}
