@@ -135,7 +135,7 @@ inside the allocation (§2.3.2), never by replacing it.
 
 ```rust
 enum Value {
-    // Compact scalar payloads (identical to ScalarPayload variants).
+    // Compact scalar payloads (the same Value variants).
     // Every payload-bearing variant has a Tainted twin discriminant
     // (§2.2.9); the twins are elided here for readability, and
     // tainted undef is real — see below.
@@ -227,7 +227,21 @@ option's semantics (lexical scope, granularity) are an ops-layer
 design section; the container API split is its mechanism and is
 settled now.
 
-#### 2.2.2 `ScalarPayload` — the authoritative datum:
+#### 2.2.2 `Value` — the authoritative datum:
+
+**One value type [DECISION].**  `ScalarPayload` and `Value` began
+as positional twins — the cell's datum and the container slot's —
+and are unified as `Value` everywhere: the coercion macro stamped
+one body onto both, confessing total behavioral isomorphism; the
+promoted-alias variants (`ScalarMut`/`ScalarConst`) already carry
+defined transparent read-through in coercion, so a cell holding
+one is merely unproduced (every perl aliasing construct rebinds
+handles, never storing indirection in a cell) rather than
+illegal, and no invariant machinery is warranted; and the split
+foreclosed a real future win — carrying deferred-element lvalues
+inline in `@_` slots without a per-argument cell.  The
+`ScalarPayload` name is retired; the prose below describes the
+one type in its cell home.
 
 The single most important principle of the scalar model:
 
@@ -236,7 +250,7 @@ The single most important principle of the scalar model:
 > can never be consulted for anything the payload answers.**
 
 ```rust
-enum ScalarPayload {
+enum Value {
     Undef,
     UndefTainted,              // taint as discriminant twins (§2.3.6)
     Integer(IntegerPayload),   // i64 beside its digit cache
@@ -1330,7 +1344,7 @@ is deliberately deferred (§2.3.6).
 
 #### 2.2.9 The 16-byte envelope:
 
-**The envelope is 16 bytes** — `Value`, `ScalarPayload`, and
+**The envelope is 16 bytes** — `Value` and
 `Option` of each.  The load-bearing invariant a wider envelope
 would buy — default numeric stringifications inline (§2.2.3) — is
 delivered instead by the packed string tier below, so the choice
@@ -2145,12 +2159,12 @@ enum ScalarRef {
 
 ```rust
 enum ScalarCell {
-    Plain(ScalarPayload),      // the common promoted case: 16 bytes
+    Plain(Value),              // the common promoted case: 16 bytes
     Full(Box<FullScalar>),     // rare state; payload moves into the box
 }
 
 struct FullScalar {
-    payload: ScalarPayload,
+    payload: Value,
     // Derived caches (lazy):
     cached_int: ...,           // exact conversions may also be cached
     cached_float: ...,
@@ -2209,7 +2223,7 @@ same derived values.
 
 ```rust
 struct ConstScalar {
-    payload: ScalarPayload,
+    payload: Value,
 
     // All coercions materialized at construction — plain fields,
     // no interior mutability:
@@ -2232,8 +2246,8 @@ instance property is free (a unit variant *is* its single value).
 Their promoted forms are two immortal singletons
 (`static LazyLock<ScalarRef>`), constructed once as `Const` cells:
 
-- true: `ScalarPayload::True`, materialized as 1 / 1.0 / `"1"`.
-- false: `ScalarPayload::False`, the dualvar — numerically 0, string
+- true: `Value::True`, materialized as 1 / 1.0 / `"1"`.
+- false: `Value::False`, the dualvar — numerically 0, string
   `""` (not `"0"`).  Verified
   container 5.38: `(1==0)."" ` has length 0.
 - Sharing is observably correct, not just fast: `\(1==1)` twice in
@@ -2390,7 +2404,7 @@ string does; numifying a bare warn-worthy string emits the warning
 and installs the face.  That unifies with `dualvar` and `$!`, which
 are the same shape — a string face and a numeric face, both
 authoritative — and which likewise never warn on numification.  One
-representation, `ScalarPayload::Dual`, serves both, and the once-only
+representation, `Value::Dual`, serves both, and the once-only
 bit leaves the tag entirely.
 
 The payload is a `HeapArc<DualPayload>` holding a `PerlString` and a
@@ -2664,7 +2678,7 @@ and enforced at compile time:
 ```rust
 const _: () = assert!(size_of::<Value>() == 16);
 const _: () = assert!(size_of::<Option<Value>>() == 16);
-const _: () = assert!(size_of::<ScalarPayload>() == 16);
+const _: () = assert!(size_of::<Value>() == 16);
 const _: () = assert!(size_of::<ScalarCell>() == 16);
 const _: () = assert!(size_of::<Option<ScalarCell>>() == 16);
 const _: () = assert!(size_of::<PerlString>() == 16);  // layout-compatible with Value's string region
@@ -2827,7 +2841,7 @@ PerlString    a Perl string: bytes + utf8/warned/tainted in its tag
 CowBuffer     custom COW byte buffer: thin one-word handle;
               {refcount, len, capacity, scan} header
 Value         the universal 16-byte slot value
-ScalarPayload the authoritative datum of one scalar
+Value         the authoritative datum of one scalar and slot
 ArraySlot     Option<Value>: None = hole, Some(Undef) = undef element
 ScalarRef     shared identity of a promoted scalar (Mut | Const)
 ScalarCell    mutable cell interior (Plain | Full), upgraded in place
@@ -12328,7 +12342,7 @@ internal ordering follows the dependency structure of §2:
    (§2.3.5).  Container-verified equality tests for the mixed-flag
    cases; layout assertions from §2.3.6.
 
-3. `ScalarPayload` and `Value` — the variant sets, truthiness /
+3. `Value` — the variant set, truthiness /
    stringification / numification as single matches on the payload,
    coercion recompute semantics with the exactness rule (§2.2.2),
    `ArraySlot` hole semantics with the trailing-truncation rule
@@ -12358,7 +12372,7 @@ internal ordering follows the dependency structure of §2:
    variant migrates; raw `Arc` construction becomes private to the
    heap module; niche and envelope assertions re-verified.
 
-9. The 16-byte envelope (§2.2.9) — `Value`/`ScalarPayload` shrink
+9. The 16-byte envelope (§2.2.9) — `Value` shrinks
    to 16: taint becomes discriminant twins, the string tier splits
    raw/packed/heap with fused variants, `Typed` boxes thin, the
    packed-decimal numeric caches land, and the assertion battery
