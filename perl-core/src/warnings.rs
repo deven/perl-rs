@@ -672,8 +672,8 @@ impl WarningCategory {
 /// warning yields one pair (itself); a compound yields its parts, whose own `Display`s are the per-line bodies the
 /// whole's `Display` joins.
 ///
-/// [`parts`]: PerlWarning::parts
-pub trait PerlWarning: fmt::Display + Clone + Sized {
+/// [`parts`]: Warning::parts
+pub trait Warning: fmt::Display + Clone + Sized {
     /// The atomic warnings in emission order, each with its gating category.  Emission gates each pair by its category
     /// and renders the part; a whole-event pre-check is `parts().any(|(c, _)| enabled(c))`.
     fn parts(&self) -> impl Iterator<Item = (WarningCategory, Self)>;

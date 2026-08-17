@@ -1,4 +1,4 @@
-//! `PerlString` — a Perl string: octet sequence + per-string state (§2.2.3).
+//! `PString` — a Perl string: octet sequence + per-string state (§2.2.3).
 //!
 //! Two storage kinds and three per-value state dimensions fold into the enum discriminant:
 //!
@@ -901,7 +901,7 @@ macro_rules! define_perl_string {
         /// that destructured the tag and rebuilt it cost thirteen nanoseconds to copy sixteen bytes (measured).
         #[derive(Clone)]
         #[repr(transparent)]
-        pub struct PerlString(Repr);
+        pub struct PString(Repr);
 
         /// The sealed representation: the folded tag itself.  `repr(align(8))` sits here, on the inner enum, where it
         /// costs nothing — on a wrapper of the enclosing fusion it would defeat niche-filling (§2.3.6) — and the
@@ -995,7 +995,7 @@ macro_rules! define_perl_string {
             }
         }
 
-        impl PerlString {
+        impl PString {
             /// The storage type (§2.2.9's normative vocabulary).
             pub fn storage_type(&self) -> StorageType {
                 match &self.0 {
@@ -1076,7 +1076,7 @@ macro_rules! define_perl_string {
             /// compressed classes, the decoded character count for the verbatim valid classes, zero for Ascii and
             /// Bytes — stored beside `s` in the short family, implied and derived at full capacity.  Internal: tag
             /// transitions go through the public monotonic/setter methods.
-            fn build_inline(class: InlineClass, utf8: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PerlString {
+            fn build_inline(class: InlineClass, utf8: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PString {
                 debug_assert!(s <= INLINE_MAX);
                 debug_assert!(
                     match class {
@@ -1095,14 +1095,14 @@ macro_rules! define_perl_string {
                 }
 
                 match (class, s == INLINE_MAX, utf8, tainted) {
-                    $( (InlineClass::$inline_class, $inline_full, $inline_utf8, $inline_tainted) => PerlString(Repr::$inline { buf }), )*
+                    $( (InlineClass::$inline_class, $inline_full, $inline_utf8, $inline_tainted) => PString(Repr::$inline { buf }), )*
                 }
             }
 
             /// Build a packed value with the given alphabet, length family, and tag dimensions.
-            fn build_packed(packed: Packed, utf8: bool, tainted: bool) -> PerlString {
+            fn build_packed(packed: Packed, utf8: bool, tainted: bool) -> PString {
                 match (packed.alphabet, packed.full, utf8, tainted) {
-                    $( (PackedAlphabet::$packed_alphabet, $packed_full, $packed_utf8, $packed_tainted) => PerlString(Repr::$packed { nibbles: packed.nibbles }), )*
+                    $( (PackedAlphabet::$packed_alphabet, $packed_full, $packed_utf8, $packed_tainted) => PString(Repr::$packed { nibbles: packed.nibbles }), )*
                 }
             }
 
@@ -1504,7 +1504,7 @@ macro_rules! define_perl_string {
             }
 
             /// Rebuild a heap value with the given tag dimensions (buffer preserved).
-            fn build_heap(utf8: bool, tainted: bool, parts: HeapParts) -> PerlString {
+            fn build_heap(utf8: bool, tainted: bool, parts: HeapParts) -> PString {
                 // The one place the obligation leaves a `HeapParts` without releasing: the variant built below is its
                 // next owner.  `E0509` forbids the plain destructure now that `HeapParts` owns a `Drop`, which is the
                 // compiler confirming this transfer must be spelled out.
@@ -1519,32 +1519,32 @@ macro_rules! define_perl_string {
                     // The Ascii twins are the class-specific selection (§2.2.3): same tier, count and scan derivable,
                     // chosen whenever the settled state is Ascii.
                     Tier::Heap8 if scan == scan::Ascii => match (utf8, tainted) {
-                        $( ($heap8a_utf8, $heap8a_tainted) => PerlString(Repr::$heap8a {
+                        $( ($heap8a_utf8, $heap8a_tainted) => PString(Repr::$heap8a {
                             ptr, len: len as u8, cap: cap as u8,
                         }), )*
                     },
                     Tier::Heap16 if scan == scan::Ascii => match (utf8, tainted) {
-                        $( ($heap16a_utf8, $heap16a_tainted) => PerlString(Repr::$heap16a {
+                        $( ($heap16a_utf8, $heap16a_tainted) => PString(Repr::$heap16a {
                             ptr, len: len as u16, cap: cap as u16,
                         }), )*
                     },
                     Tier::Heap8 => match (utf8, tainted) {
-                        $( ($heap8_utf8, $heap8_tainted) => PerlString(Repr::$heap8 {
+                        $( ($heap8_utf8, $heap8_tainted) => PString(Repr::$heap8 {
                             ptr, len: len as u8, cap: cap as u8, count: count as u8,
                             scan: scan::Terminal::from_scan(scan),
                         }), )*
                     },
                     Tier::Heap16 => match (utf8, tainted) {
-                        $( ($heap16_utf8, $heap16_tainted) => PerlString(Repr::$heap16 {
+                        $( ($heap16_utf8, $heap16_tainted) => PString(Repr::$heap16 {
                             ptr, len: len as u16, cap: cap as u16, count: count as u16,
                             scan: scan::Terminal::from_scan(scan),
                         }), )*
                     },
                     Tier::Heap32 => match (utf8, tainted) {
-                        $( ($heap32_utf8, $heap32_tainted) => PerlString(Repr::$heap32 { ptr, len: len as u32 }), )*
+                        $( ($heap32_utf8, $heap32_tainted) => PString(Repr::$heap32 { ptr, len: len as u32 }), )*
                     },
                     Tier::Heap => match (utf8, tainted) {
-                        $( ($heap_utf8, $heap_tainted) => PerlString(Repr::$heap { ptr }), )*
+                        $( ($heap_utf8, $heap_tainted) => PString(Repr::$heap { ptr }), )*
                     },
                 }
             }
@@ -1553,24 +1553,24 @@ macro_rules! define_perl_string {
             fn build_immortal(
                 utf8: bool, tainted: bool,
                 ptr: std::ptr::NonNull<u8>, len: usize, count: usize, scan: scan::Terminal,
-            ) -> PerlString {
+            ) -> PString {
                 match (utf8, tainted) {
                     $( ($immortal_utf8, $immortal_tainted) =>
-                        PerlString(Repr::$immortal { ptr: Image(ptr), len: u24_new(len), count: u24_new(count), scan }), )*
+                        PString(Repr::$immortal { ptr: Image(ptr), len: u24_new(len), count: u24_new(count), scan }), )*
                 }
             }
 
             /// Rebuild a large immortal value with the given tag dimensions (header shared, image untouched).
-            fn build_large_immortal(utf8: bool, tainted: bool, head: &'static ImmortalHead) -> PerlString {
+            fn build_large_immortal(utf8: bool, tainted: bool, head: &'static ImmortalHead) -> PString {
                 match (utf8, tainted) {
-                    $( ($large_immortal_utf8, $large_immortal_tainted) => PerlString(Repr::$large_immortal { head }), )*
+                    $( ($large_immortal_utf8, $large_immortal_tainted) => PString(Repr::$large_immortal { head }), )*
                 }
             }
 
             /// Rebuild a large static value with the given tag dimensions (header shared, image untouched).
-            fn build_large_static(utf8: bool, tainted: bool, head: &'static ImmortalHead) -> PerlString {
+            fn build_large_static(utf8: bool, tainted: bool, head: &'static ImmortalHead) -> PString {
                 match (utf8, tainted) {
-                    $( ($large_static_utf8, $large_static_tainted) => PerlString(Repr::$large_static { head }), )*
+                    $( ($large_static_utf8, $large_static_tainted) => PString(Repr::$large_static { head }), )*
                 }
             }
 
@@ -1578,10 +1578,10 @@ macro_rules! define_perl_string {
             fn build_static(
                 utf8: bool, tainted: bool,
                 ptr: std::ptr::NonNull<u8>, len: usize, count: usize, scan: scan::Terminal,
-            ) -> PerlString {
+            ) -> PString {
                 match (utf8, tainted) {
                     $( ($static_utf8, $static_tainted) =>
-                        PerlString(Repr::$static { ptr: Image(ptr), len: u24_new(len), count: u24_new(count), scan }), )*
+                        PString(Repr::$static { ptr: Image(ptr), len: u24_new(len), count: u24_new(count), scan }), )*
                 }
             }
         }
@@ -1720,8 +1720,8 @@ define_perl_string! {
 }
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
-const _: () = assert!(size_of::<PerlString>() == 16);
-const _: () = assert!(size_of::<Option<PerlString>>() == 16);
+const _: () = assert!(size_of::<PString>() == 16);
+const _: () = assert!(size_of::<Option<PString>>() == 16);
 
 // ── Classification and construction ───────────────────────────────
 /// Where a short inline string keeps its length byte: the byte a fifteenth character would have occupied.  Two nibbles
@@ -1898,17 +1898,17 @@ fn inline_payload(bytes: &[u8]) -> [u8; INLINE_MAX] {
     buf
 }
 
-impl PerlString {
+impl PString {
     /// Construct from a Rust `&str`.  ASCII content is stored unflagged (the canonical downgraded form, §2.3.5);
     /// non-ASCII content is stored with the utf8 flag, its validity known from the type.  Allocation failure is the
     /// only error.
     ///
     /// Generic at the boundary so that embedders holding a `String`, a `Cow`, or one of the compact string types from
     /// the ecosystem need no conversion; the ladder beneath is monomorphic and instantiated once.
-    pub fn new(s: impl AsRef<str>) -> Result<PerlString, AllocError> {
+    pub fn new(s: impl AsRef<str>) -> Result<PString, AllocError> {
         let s = s.as_ref();
 
-        if let Some(inline) = PerlString::inline(s) {
+        if let Some(inline) = PString::inline(s) {
             Ok(inline)
         } else {
             let bytes = s.as_bytes();
@@ -1924,17 +1924,17 @@ impl PerlString {
             })?;
             let ascii = parts.scan == scan::Ascii;
 
-            Ok(PerlString::build_heap(!ascii, false, parts))
+            Ok(PString::build_heap(!ascii, false, parts))
         }
     }
 
     /// Construct from raw bytes (I/O, `Encode`, lexer literals).  Unflagged; inline content gets its eager terminal
     /// scan, heap content defers all scanning (`UNKNOWN`), per §2.2.7.
-    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<PerlString, AllocError> {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<PString, AllocError> {
         let bytes = bytes.as_ref();
-        match PerlString::inline_bytes(bytes) {
+        match PString::inline_bytes(bytes) {
             Some(inline) => Ok(inline),
-            None => Ok(PerlString::build_heap(false, false, heap_parts_classified(bytes)?)),
+            None => Ok(PString::build_heap(false, false, heap_parts_classified(bytes)?)),
         }
     }
 
@@ -1942,14 +1942,14 @@ impl PerlString {
     /// size — the full walk rather than the cheaper ranging one, because facts settled once for content that lives
     /// forever should include the character count the ranging walker forfeits.  Below the compact ceiling this
     /// allocates nothing; past it, the one allocation is the shared, deliberately leaked side header.
-    pub fn from_static_str(s: &'static str) -> Result<PerlString, AllocError> {
-        PerlString::from_static_bytes(s.as_bytes())
+    pub fn from_static_str(s: &'static str) -> Result<PString, AllocError> {
+        PString::from_static_bytes(s.as_bytes())
     }
 
     /// A string over `'static` bytes: zero-copy, never freed (§2.2.3).  Classification is eager and terminal at any
     /// size, malformed content included — a static image can hold any bytes the program does.  Below the compact
     /// ceiling this allocates nothing; past it, the one allocation is the shared, deliberately leaked side header.
-    pub fn from_static_bytes(bytes: &'static [u8]) -> Result<PerlString, AllocError> {
+    pub fn from_static_bytes(bytes: &'static [u8]) -> Result<PString, AllocError> {
         let (scan, count) = classify_full(bytes);
 
         // A slice pointer is never null, so the fallback arm is unreachable; it exists to keep this path panic-free,
@@ -1958,10 +1958,10 @@ impl PerlString {
 
         if bytes.len() > U24_MAX {
             let head = ImmortalHead::leaked(Image(ptr), bytes.len(), count, scan)?;
-            return Ok(PerlString::build_large_static(false, false, head));
+            return Ok(PString::build_large_static(false, false, head));
         }
 
-        Ok(PerlString::build_static(false, false, ptr, bytes.len(), count, scan))
+        Ok(PString::build_static(false, false, ptr, bytes.len(), count, scan))
     }
 
     /// A string over an immortal image: bytes some owner keeps alive longer than every handle (§2.2.3) — the
@@ -1972,7 +1972,7 @@ impl PerlString {
     /// The caller warrants that the image outlives every handle, clones included; that it is never written while any
     /// handle lives; and that its owner frees it only after the last handle is gone.
     #[cfg_attr(not(test), expect(dead_code, reason = "the §2.4 slab is the production caller; until it lands, tests are"))]
-    pub(crate) unsafe fn from_immortal_bytes(bytes: &[u8]) -> Result<PerlString, AllocError> {
+    pub(crate) unsafe fn from_immortal_bytes(bytes: &[u8]) -> Result<PString, AllocError> {
         let (scan, count) = classify_full(bytes);
 
         // See from_static_bytes: never null, never panics, sound at zero length.
@@ -1980,29 +1980,29 @@ impl PerlString {
 
         if bytes.len() > U24_MAX {
             let head = ImmortalHead::leaked(Image(ptr), bytes.len(), count, scan)?;
-            return Ok(PerlString::build_large_immortal(false, false, head));
+            return Ok(PString::build_large_immortal(false, false, head));
         }
 
-        Ok(PerlString::build_immortal(false, false, ptr, bytes.len(), count, scan))
+        Ok(PString::build_immortal(false, false, ptr, bytes.len(), count, scan))
     }
 
     /// The full tier ladder with every tag dimension supplied — the transforms' constructor, and `from_bytes` in
     /// spirit: compressed inline, verbatim inline, packed, heap, in the ruled order (§2.2.9).  Internal: public
     /// construction fixes the flags.
-    fn tiered(bytes: &[u8], utf8: bool, tainted: bool) -> Result<PerlString, AllocError> {
+    fn tiered(bytes: &[u8], utf8: bool, tainted: bool) -> Result<PString, AllocError> {
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
-            return Ok(PerlString::build_inline(class, utf8, tainted, stored, aux, buf));
+            return Ok(PString::build_inline(class, utf8, tainted, stored, aux, buf));
         }
         if let Some(p) = pack(bytes) {
-            return Ok(PerlString::build_packed(p, utf8, tainted));
+            return Ok(PString::build_packed(p, utf8, tainted));
         }
-        Ok(PerlString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
+        Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
     }
 
     /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
     /// payload needs no allocation — which is also what lets `Default` exist.
-    pub fn empty() -> PerlString {
-        PerlString::build_inline(InlineClass::Ascii, false, false, 0, 0, [0u8; INLINE_MAX])
+    pub fn empty() -> PString {
+        PString::build_inline(InlineClass::Ascii, false, false, 0, 0, [0u8; INLINE_MAX])
     }
 
     /// Construct from a Rust `&str` **without allocating**, or `None` if the content cannot be stored in the value
@@ -2010,9 +2010,9 @@ impl PerlString {
     ///
     /// The contract is the guarantee, not a byte count: `Some` means no heap allocation occurred, so the set of
     /// accepted content widens whenever the non-allocating storage forms do.  Callers who merely prefer inline storage
-    /// can write `PerlString::inline(s).unwrap_or_default()`; callers who need the content stored either way should use
+    /// can write `PString::inline(s).unwrap_or_default()`; callers who need the content stored either way should use
     /// the fallible constructors instead.
-    pub fn inline(s: impl AsRef<str>) -> Option<PerlString> {
+    pub fn inline(s: impl AsRef<str>) -> Option<PString> {
         let bytes = s.as_ref().as_bytes();
 
         // The inline rungs come first (§2.2.9's ladder), and they now reach 16-30-byte Latin-1-compressible content:
@@ -2020,7 +2020,7 @@ impl PerlString {
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
             // Ascii stores unflagged, non-ASCII flagged, following `FromStr`.  Bytes/Extended are impossible from a
             // `&str`, whose bytes are Rust-valid.
-            return Some(PerlString::build_inline(class, class != InlineClass::Ascii, false, stored, aux, buf));
+            return Some(PString::build_inline(class, class != InlineClass::Ascii, false, stored, aux, buf));
         }
 
         // The packed band holds 16-30-character alphabet content and allocates nothing either.  Past it, `None` starts
@@ -2029,23 +2029,23 @@ impl PerlString {
             return None;
         }
 
-        pack(bytes).map(|p| PerlString::build_packed(p, false, false))
+        pack(bytes).map(|p| PString::build_packed(p, false, false))
     }
 
     /// Construct from raw bytes **without allocating**, or `None` if the content cannot be stored in the value itself.
-    /// Unflagged, like [`PerlString::from_bytes`]; the same guarantee-not-a-count contract as [`PerlString::inline`].
-    pub fn inline_bytes(bytes: impl AsRef<[u8]>) -> Option<PerlString> {
+    /// Unflagged, like [`PString::from_bytes`]; the same guarantee-not-a-count contract as [`PString::inline`].
+    pub fn inline_bytes(bytes: impl AsRef<[u8]>) -> Option<PString> {
         let bytes = bytes.as_ref();
 
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
-            return Some(PerlString::build_inline(class, false, false, stored, aux, buf));
+            return Some(PString::build_inline(class, false, false, stored, aux, buf));
         }
 
         if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
             return None;
         }
 
-        pack(bytes).map(|p| PerlString::build_packed(p, false, false))
+        pack(bytes).map(|p| PString::build_packed(p, false, false))
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -2257,7 +2257,7 @@ impl PerlString {
             RawParts::Heap(view) if !view.is_unique() => heap_parts_transitioned(view.as_slice(), view.scan(), view.char_count())?,
             RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Borrowed { .. } => return Ok(()),
         };
-        *self = PerlString::build_heap(self.is_utf8(), self.is_tainted(), parts);
+        *self = PString::build_heap(self.is_utf8(), self.is_tainted(), parts);
         Ok(())
     }
 
@@ -2360,7 +2360,7 @@ impl PerlString {
     /// are not (upgrading flag-off `C3 A9` yields the two-character `Ã©`, not `é` — that reinterpretation is
     /// `_utf8_on`'s).  Past fifteen characters the result is heap: sixteen to thirty characters have no flagged
     /// non-heap form unless ASCII, and ASCII took the flip.
-    fn upgraded(&self) -> Result<PerlString, AllocError> {
+    fn upgraded(&self) -> Result<PString, AllocError> {
         if self.is_utf8() {
             return Ok(self.clone());
         }
@@ -2381,7 +2381,7 @@ impl PerlString {
             buf[..internal.len()].copy_from_slice(internal);
             let h = high_count(internal);
             debug_assert!(h > 0, "all-ASCII content took the flip above");
-            return Ok(PerlString::build_inline(InlineClass::Latin1, true, t, internal.len(), h, buf));
+            return Ok(PString::build_inline(InlineClass::Latin1, true, t, internal.len(), h, buf));
         }
 
         // Sixteen or more non-ASCII characters: heap.  The buffer owns the expansion — appending byte by byte would pay
@@ -2390,13 +2390,13 @@ impl PerlString {
         let upgraded = cow_buffer::upgraded_bytes(internal)?;
         let parts = HeapParts::from_slice(&upgraded, scan::Utf8Latin1, internal.len())?;
 
-        Ok(PerlString::build_heap(true, t, parts))
+        Ok(PString::build_heap(true, t, parts))
     }
 
-    /// The in-place form of [`PerlString::upgraded`]: the same characters, flagged, rewriting a unique heap buffer
-    /// rather than producing a fresh value — perl's `utf8::upgrade` shape, and the only form that can leave the
-    /// invariant prefix untouched.  The non-heap forms hold at most thirty bytes, so they rebuild through the copying
-    /// form; a shared heap buffer does too, its other holders keeping the unexpanded content.
+    /// The in-place form of [`PString::upgraded`]: the same characters, flagged, rewriting a unique heap buffer rather
+    /// than producing a fresh value — perl's `utf8::upgrade` shape, and the only form that can leave the invariant
+    /// prefix untouched.  The non-heap forms hold at most thirty bytes, so they rebuild through the copying form; a
+    /// shared heap buffer does too, its other holders keeping the unexpanded content.
     // `allow` rather than `expect`: gating the entry point marks it a live root, so its callees stop being reported and
     // an `expect` here would itself go unfulfilled.
     #[cfg_attr(not(test), allow(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
@@ -2410,8 +2410,8 @@ impl PerlString {
             return Ok(());
         }
 
-        // In place where the expansion fits the spare capacity and the buffer is unique; otherwise the copying
-        // form, which is what reallocating means and which picks the right tier on the way.
+        // In place where the expansion fits the spare capacity and the buffer is unique; otherwise the copying form,
+        // which is what reallocating means and which picks the right tier on the way.
         if self.upgrade_heap_in_place().is_none() {
             *self = self.upgraded()?;
             return Ok(());
@@ -2428,7 +2428,7 @@ impl PerlString {
     /// to Bytes, payload `E9` identical), re-compression where the octets happen to be valid Latin-1-range UTF-8.  The
     /// flagged verbatim classes cannot downgrade: NonLatin1 and Extended hold a character at or above U+0100 by their
     /// class, and the Bytes class flagged has no characters at all.
-    fn downgraded(&self) -> Result<Option<PerlString>, AllocError> {
+    fn downgraded(&self) -> Result<Option<PString>, AllocError> {
         if !self.is_utf8() {
             return Ok(Some(self.clone()));
         }
@@ -2444,7 +2444,7 @@ impl PerlString {
             RawParts::Inline { class: InlineClass::Latin1, full, buf } => {
                 let stored = inline_stored(full, buf);
 
-                Ok(Some(PerlString::tiered(&buf[..stored], false, t)?))
+                Ok(Some(PString::tiered(&buf[..stored], false, t)?))
             }
             RawParts::Inline { .. } => Ok(None),
             RawParts::Packed(_) => {
@@ -2462,10 +2462,10 @@ impl PerlString {
                 };
 
                 if out.len() <= MAX_PACKED_LEN {
-                    return Ok(Some(PerlString::tiered(&out, false, t)?));
+                    return Ok(Some(PString::tiered(&out, false, t)?));
                 }
 
-                Ok(Some(PerlString::build_heap(false, t, heap_parts_classified(&out)?)))
+                Ok(Some(PString::build_heap(false, t, heap_parts_classified(&out)?)))
             }
             RawParts::Heap(cb) => {
                 // Walk the encoding: every character must sit in U+0000-U+00FF, emitted as its single byte.  The result
@@ -2475,16 +2475,16 @@ impl PerlString {
                 };
 
                 if out.len() <= MAX_PACKED_LEN {
-                    return Ok(Some(PerlString::tiered(&out, false, t)?));
+                    return Ok(Some(PString::tiered(&out, false, t)?));
                 }
 
-                Ok(Some(PerlString::build_heap(false, t, heap_parts_classified(&out)?)))
+                Ok(Some(PString::build_heap(false, t, heap_parts_classified(&out)?)))
             }
         }
     }
 
-    /// The in-place form of [`PerlString::downgraded`]: the same characters, unflagged, contracting a unique heap
-    /// buffer rather than producing a fresh value.  `false` means the content refuses to downgrade — a character above
+    /// The in-place form of [`PString::downgraded`]: the same characters, unflagged, contracting a unique heap buffer
+    /// rather than producing a fresh value.  `false` means the content refuses to downgrade — a character above
     /// `U+00FF`, where perl's dies — and leaves this value untouched.  Contraction never grows, so unlike the upgrade
     /// it needs no reallocation; the invariant prefix is still left exactly where it is.
     #[cfg_attr(not(test), allow(dead_code))] // The ops layer is the caller-to-be; the tests keep it honest.
@@ -2512,8 +2512,8 @@ impl PerlString {
             },
         }
 
-        // Contracted octets can themselves be valid UTF-8, so the class is not derivable here; the caches were
-        // cleared and the next reader re-derives them.  Only the flag moves.
+        // Contracted octets can themselves be valid UTF-8, so the class is not derivable here; the caches were cleared
+        // and the next reader re-derives them.  Only the flag moves.
         self.reinterpret_utf8(false);
 
         Ok(true)
@@ -2543,14 +2543,14 @@ impl PerlString {
         *self = match old.into_raw() {
             RawOwned::Inline { class, full, buf } => {
                 let (s, aux) = (inline_stored(full, &buf), inline_derived_aux(class, full, &buf));
-                PerlString::build_inline(class, u2, t2, s, aux, buf)
+                PString::build_inline(class, u2, t2, s, aux, buf)
             }
-            RawOwned::Packed(p) => PerlString::build_packed(p, u2, t2),
-            RawOwned::Heap { ptr, len, cap, count, scan, tier } => PerlString::build_heap(u2, t2, HeapParts { ptr, len, cap, count, scan, tier }),
-            RawOwned::Borrowed { form: BorrowedForm::Immortal, ptr, len, count, scan } => PerlString::build_immortal(u2, t2, ptr, len, count, scan),
-            RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PerlString::build_static(u2, t2, ptr, len, count, scan),
-            RawOwned::BorrowedLarge { form: BorrowedForm::Immortal, head } => PerlString::build_large_immortal(u2, t2, head),
-            RawOwned::BorrowedLarge { form: BorrowedForm::Static, head } => PerlString::build_large_static(u2, t2, head),
+            RawOwned::Packed(p) => PString::build_packed(p, u2, t2),
+            RawOwned::Heap { ptr, len, cap, count, scan, tier } => PString::build_heap(u2, t2, HeapParts { ptr, len, cap, count, scan, tier }),
+            RawOwned::Borrowed { form: BorrowedForm::Immortal, ptr, len, count, scan } => PString::build_immortal(u2, t2, ptr, len, count, scan),
+            RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PString::build_static(u2, t2, ptr, len, count, scan),
+            RawOwned::BorrowedLarge { form: BorrowedForm::Immortal, head } => PString::build_large_immortal(u2, t2, head),
+            RawOwned::BorrowedLarge { form: BorrowedForm::Static, head } => PString::build_large_static(u2, t2, head),
         };
     }
 
@@ -2631,12 +2631,12 @@ impl PerlString {
                 combined[ilen..total].copy_from_slice(bytes);
 
                 if let Some((nc, ns, naux, nbuf)) = classify_inline(&combined[..total]) {
-                    *self = PerlString::build_inline(nc, u, t, ns, naux, nbuf);
+                    *self = PString::build_inline(nc, u, t, ns, naux, nbuf);
                     return Ok(());
                 }
 
                 if let Some(packed) = pack(&combined[..total]) {
-                    *self = PerlString::build_packed(packed, u, t);
+                    *self = PString::build_packed(packed, u, t);
                     return Ok(());
                 }
 
@@ -2648,7 +2648,7 @@ impl PerlString {
             joined.extend_from_slice(&internal[..ilen]);
             joined.extend_from_slice(bytes);
             let state = append_transition_heap(inline_scan_to_heap(class), kind);
-            *self = PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?);
+            *self = PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?);
 
             return Ok(());
         }
@@ -2668,7 +2668,7 @@ impl PerlString {
                 if let Some(packed) = p.push(bytes) {
                     // In place: the existing nibbles are kept, rather than the whole result being decoded and
                     // re-encoded on every append.
-                    PerlString::build_packed(packed, u, t)
+                    PString::build_packed(packed, u, t)
                 } else {
                     // Past the band, or no longer alphabet-conformant: decode once, on the way out of the tier.  Packed
                     // content is ASCII, so the heap state starts from there.
@@ -2680,7 +2680,7 @@ impl PerlString {
                     joined.extend_from_slice(old_bytes);
                     joined.extend_from_slice(bytes);
                     let state = append_transition_heap(scan::Ascii, kind);
-                    PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                    PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
                 }
             }
             RawOwned::Borrowed { form: _, ptr, len, count: _, scan } => {
@@ -2694,7 +2694,7 @@ impl PerlString {
                 joined.extend_from_slice(old_bytes);
                 joined.extend_from_slice(bytes);
                 let state = append_transition_heap(scan.widen(), kind);
-                PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
             }
             RawOwned::BorrowedLarge { form: _, head } => {
                 // Copy-out on write, at large size: the image is readonly, so the append is a rebuild seeded by the
@@ -2706,7 +2706,7 @@ impl PerlString {
                 joined.extend_from_slice(old_bytes);
                 joined.extend_from_slice(bytes);
                 let state = append_transition_heap(head.scan.widen(), kind);
-                PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
             }
             RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
                 // Reached only past the in-place fast path — shared, or over capacity — so the buffer is rebuilt:
@@ -2742,7 +2742,7 @@ impl PerlString {
                     _ => 0,
                 };
 
-                PerlString::build_heap(u, t, heap_parts_transitioned(&joined, state, chars)?)
+                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, chars)?)
             }
         };
 
@@ -2991,7 +2991,7 @@ fn flagged_chars(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     Chars { rest: bytes, raw_fallback: false }
 }
 
-impl PerlString {
+impl PString {
     // ── Numeric and boolean interpretation (§2.2.2, §2.3.4) ───────
     // These live here rather than at the call site because they are questions about a string's *content*, and the
     // representation that holds that content is this type's business.  A caller asking `s.to_int()` needs no view of
@@ -3023,10 +3023,10 @@ impl PerlString {
         classify_numeric(self.as_bytes(&mut scratch))
     }
 
-    /// [`PerlString::numify`] and [`PerlString::would_warn`] from the one walk the numification already pays (§2.3.4):
-    /// the parse surfaces its own consumption, and warn-worthiness is that consumption measured against the trimmed
-    /// token.  The sites that need both answers — payload numification, frozen-cell materialization — come here rather
-    /// than walking twice.
+    /// [`PString::numify`] and [`PString::would_warn`] from the one walk the numification already pays (§2.3.4): the
+    /// parse surfaces its own consumption, and warn-worthiness is that consumption measured against the trimmed token.
+    /// The sites that need both answers — payload numification, frozen-cell materialization — come here rather than
+    /// walking twice.
     pub fn numify_noting_warning(&self) -> (Numeric, bool) {
         let mut scratch = [0u8; DECODE_MAX];
         classify_numeric_noting_warning(self.as_bytes(&mut scratch))
@@ -3037,7 +3037,7 @@ impl PerlString {
     /// Perl's renderer consumes source greedily while the rendered width is under its cap, so a bound of cap + 1
     /// characters is sufficient for any conforming renderer; carrying more would pin content the message never uses.
     /// When the whole face fits the bound, the clone is a refcount bump and nothing is copied.
-    pub(crate) fn message_prefix(&self, max_chars: usize) -> Result<(PerlString, bool), AllocError> {
+    pub(crate) fn message_prefix(&self, max_chars: usize) -> Result<(PString, bool), AllocError> {
         let mut scratch = [0u8; DECODE_MAX];
         let bytes = self.as_bytes(&mut scratch);
 
@@ -3062,7 +3062,7 @@ impl PerlString {
             return Ok((self.clone(), false));
         }
 
-        let mut snippet = PerlString::from_bytes(&bytes[..cut])?;
+        let mut snippet = PString::from_bytes(&bytes[..cut])?;
         snippet.reinterpret_utf8(self.is_utf8());
 
         Ok((snippet, true))
@@ -3076,15 +3076,15 @@ impl PerlString {
     }
 }
 
-impl fmt::Write for PerlString {
+impl fmt::Write for PString {
     /// Append formatted text.  The only failure this can encounter is allocation, which `fmt::Error` cannot carry — use
-    /// [`PerlString::push_fmt`] where the distinction matters; this impl exists so that `write!` works.
+    /// [`PString::push_fmt`] where the distinction matters; this impl exists so that `write!` works.
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.push_str(s).map_err(|_| fmt::Error)
     }
 }
 
-impl PerlString {
+impl PString {
     /// Append formatted text, reporting allocation failure precisely: `write!(s, ...)` through the [`fmt::Write`] impl
     /// flattens that into `fmt::Error`, which carries nothing.
     ///
@@ -3093,7 +3093,7 @@ impl PerlString {
     pub fn push_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<(), AllocError> {
         // `fmt::Error` carries nothing, so the real error is captured on the way past.
         struct Sink<'a> {
-            target: &'a mut PerlString,
+            target: &'a mut PString,
             failure: Option<AllocError>,
         }
 
@@ -3117,19 +3117,19 @@ impl PerlString {
     }
 }
 
-impl Default for PerlString {
-    /// The empty string, per [`PerlString::empty`].
-    fn default() -> PerlString {
-        PerlString::empty()
+impl Default for PString {
+    /// The empty string, per [`PString::empty`].
+    fn default() -> PString {
+        PString::empty()
     }
 }
 
-impl FromStr for PerlString {
+impl FromStr for PString {
     type Err = AllocError;
 
-    /// The same construction as [`PerlString::new`], for generic contexts and `"...".parse()`.
-    fn from_str(s: &str) -> Result<PerlString, AllocError> {
-        PerlString::new(s)
+    /// The same construction as [`PString::new`], for generic contexts and `"...".parse()`.
+    fn from_str(s: &str) -> Result<PString, AllocError> {
+        PString::new(s)
     }
 }
 
@@ -3140,7 +3140,7 @@ macro_rules! grid_hit {
     };
 }
 
-impl PerlString {
+impl PString {
     /// Perl's `cmp`: **code-point ordering**, which is what the utf8 flag selects between.
     ///
     /// The flag says how to read the bytes, so it decides the comparison shape.  When both sides agree, byte order *is*
@@ -3156,7 +3156,7 @@ impl PerlString {
     /// on it, so ignoring the flag is the identity on an unflagged string and yields a *different value* for a flagged
     /// one — the same octets, read as Latin-1 characters.  The operands are projected and then compared by this
     /// ordering, like against like.
-    pub fn cmp_perl(&self, other: &PerlString) -> Ordering {
+    pub fn cmp_perl(&self, other: &PString) -> Ordering {
         if self.is_utf8() == other.is_utf8() {
             return self.cmp_raw_bytes(other);
         }
@@ -3167,8 +3167,8 @@ impl PerlString {
         if self.is_utf8() { ordering } else { ordering.reverse() }
     }
 
-    /// Compare the raw bytes, which is what [`PerlString::cmp_perl`] reduces to when both sides read theirs the same
-    /// way — unflagged octets being their own code points, and UTF-8 being order-preserving.
+    /// Compare the raw bytes, which is what [`PString::cmp_perl`] reduces to when both sides read theirs the same way —
+    /// unflagged octets being their own code points, and UTF-8 being order-preserving.
     ///
     /// Two packed strings of one alphabet compare as their nibbles do, the values being assigned in ASCII order, so
     /// neither side decodes.
@@ -3177,7 +3177,7 @@ impl PerlString {
     /// how it computes when neither side needs decoding.  It is *not* the `use bytes` comparison — that pragma changes
     /// which value is being compared, not how — and applied to operands whose flags differ it would report unlike
     /// things equal, which is why it cannot be the `Ord` impl.
-    fn cmp_raw_bytes(&self, other: &PerlString) -> Ordering {
+    fn cmp_raw_bytes(&self, other: &PString) -> Ordering {
         match (self.raw_parts(), other.raw_parts()) {
             (RawParts::Packed(a), RawParts::Packed(b)) if a.alphabet == b.alphabet => a.cmp_same_alphabet(&b),
             (RawParts::Packed(a), _) => a.cmp_bytes(other.as_bytes(&mut [0u8; DECODE_MAX])),
@@ -3198,7 +3198,7 @@ impl PerlString {
 /// Container-pinned: flag-off `FF` against flagged `E9` is `C3.BF` against `E9` — less — and flag-off `E9` against
 /// flagged `E9` is `C3.A9` against `E9`: unequal, the monster's cousin, identical payload bytes under different flags
 /// being different strings.
-fn cmp_cross_flag(flagged: &PerlString, plain: &PerlString) -> Ordering {
+fn cmp_cross_flag(flagged: &PString, plain: &PString) -> Ordering {
     let (mut fs, mut ps) = ([0u8; DECODE_MAX], [0u8; DECODE_MAX]);
     let fb = flagged.as_bytes(&mut fs);
     let pb = plain.as_bytes(&mut ps);
@@ -3220,10 +3220,10 @@ fn cmp_cross_flag(flagged: &PerlString, plain: &PerlString) -> Ordering {
     if i < fb.len() { Ordering::Greater } else { Ordering::Equal }
 }
 
-impl PartialEq for PerlString {
+impl PartialEq for PString {
     /// The §2.3.5 equality inference grid, then the single streaming dual-direction compare.  Consults existing scan
     /// knowledge only — never scans twice, never pre-scans.
-    fn eq(&self, other: &PerlString) -> bool {
+    fn eq(&self, other: &PString) -> bool {
         let (sa, sb) = (self.scan_state(), other.scan_state());
 
         if self.is_utf8() == other.is_utf8() {
@@ -3389,26 +3389,26 @@ impl PartialEq for PerlString {
         true
     }
 }
-impl Eq for PerlString {}
+impl Eq for PString {}
 
-impl Ord for PerlString {
+impl Ord for PString {
     /// Perl's `cmp`, which is the only ordering consistent with [`PartialEq`] and so the only one this trait can carry.
     ///
     /// A raw byte comparison is deliberately *not* this: two strings can share their internal bytes and still differ —
     /// an unflagged `"\xC3\xA9"` is two Latin-1 characters where a flagged one is `U+00E9` — so it would report them
     /// equal where equality reports them unequal, and `Ord` requires the two to agree.
-    fn cmp(&self, other: &PerlString) -> Ordering {
+    fn cmp(&self, other: &PString) -> Ordering {
         self.cmp_perl(other)
     }
 }
 
-impl PartialOrd for PerlString {
-    fn partial_cmp(&self, other: &PerlString) -> Option<Ordering> {
+impl PartialOrd for PString {
+    fn partial_cmp(&self, other: &PString) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Hash for PerlString {
+impl Hash for PString {
     /// Canonical downgraded-when-possible form (§2.3.5), routed through an internal 64-bit content digest: the `Hasher`
     /// API cannot fork mid-stream, and the single-fetch dual calculation (below) must run two candidate hashers and
     /// pick the winner at the end, so every string writes its digest — one `write_u64` — for cross-provenance
@@ -3418,7 +3418,7 @@ impl Hash for PerlString {
     }
 }
 
-impl PerlString {
+impl PString {
     /// The 64-bit content digest (§2.3.5): unflagged strings digest their bytes; flagged strings whose characters all
     /// fit 0–255 digest the downgraded bytes (colliding with their unflagged equals, as required); flagged strings with
     /// characters above 255 or with malformed content digest their raw bytes.
@@ -3609,13 +3609,13 @@ impl fmt::Debug for ByteLiteral<'_> {
     }
 }
 
-impl fmt::Debug for PerlString {
+impl fmt::Debug for PString {
     /// The representation, not the value: which tier holds the content, its length, the three per-value tag bits, and
     /// the bytes.  A developer printing one of these is nearly always asking where it landed, and this type's identity
     /// *is* its representation — how the content should render as text is a question for whatever layer knows the
     /// output encoding.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PerlString")
+        f.debug_struct("PString")
             .field("storage", &self.storage_type())
             .field("len", &self.len())
             .field("utf8", &self.is_utf8())
@@ -3696,8 +3696,8 @@ const PACKED_BYTES: usize = MAX_PACKED_LEN / 2;
 /// The nibble index holding the stored length, for content shorter than the capacity.
 const LENGTH_NIBBLE: usize = MAX_PACKED_LEN - 1;
 
-/// Which 16-symbol alphabet a packed string uses.  In `PerlString` this is not stored: it is folded into the tag, so
-/// each alphabet has its own variants and the payload is fifteen nibble bytes with nothing else.
+/// Which 16-symbol alphabet a packed string uses.  In `PString` this is not stored: it is folded into the tag, so each
+/// alphabet has its own variants and the payload is fifteen nibble bytes with nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PackedAlphabet {
     /// space `+` `-` `.` `0`-`9` `E` `e` — every numeric stringification, in either exponent spelling.
@@ -3714,9 +3714,9 @@ enum PackedAlphabet {
 
 /// A packed string: the alphabet, the length family, and the nibble array.
 ///
-/// This is the working form, used while encoding and decoding.  In `PerlString` the first two fields do not exist —
-/// they are folded into the tag, one variant per alphabet and length family — so a stored packed string is fifteen
-/// bytes of nibbles and nothing else.  The fields here stand in for that tag while the value is in hand.
+/// This is the working form, used while encoding and decoding.  In `PString` the first two fields do not exist — they
+/// are folded into the tag, one variant per alphabet and length family — so a stored packed string is fifteen bytes of
+/// nibbles and nothing else.  The fields here stand in for that tag while the value is in hand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Packed {
     alphabet: PackedAlphabet,

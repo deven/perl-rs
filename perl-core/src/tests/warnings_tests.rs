@@ -2,7 +2,7 @@
 // and cross-checked against %warnings::Offsets and $warnings::DEFAULT.
 
 use crate::scalar::{NumifyWarning, RadixBase};
-use crate::warnings::{PerlWarning, WARNING_CATEGORY_COUNT, WarningCategory};
+use crate::warnings::{WARNING_CATEGORY_COUNT, Warning, WarningCategory};
 
 #[test]
 fn the_tree_matches_perl_bit_for_bit() {

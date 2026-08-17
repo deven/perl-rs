@@ -25,7 +25,7 @@ fn transparent_layout() {
 }
 
 // ── The release worklist (§2.4.9) ─────────────────────────────────
-use crate::containers::{ArrayRef, HashRef, PerlArray, PerlHash};
+use crate::containers::{Array, ArrayRef, Hash, HashRef};
 use crate::value::{Tainted, Value};
 
 // Depths chosen well past the measured failure points: the scalar-ref chain overflowed at 20k in debug builds and the
@@ -43,9 +43,9 @@ fn deep_scalar_ref_chain_releases_iteratively() {
 
 #[test]
 fn deep_array_chain_releases_iteratively() {
-    let mut inner = ArrayRef::new(PerlArray::new());
+    let mut inner = ArrayRef::new(Array::new());
     for _ in 0..200_000 {
-        let outer = ArrayRef::new(PerlArray::new());
+        let outer = ArrayRef::new(Array::new());
         outer.write().push_value(Value::array_ref(inner, Tainted::CLEAN)).unwrap();
         inner = outer;
     }
@@ -55,9 +55,9 @@ fn deep_array_chain_releases_iteratively() {
 
 #[test]
 fn deep_hash_chain_releases_iteratively() {
-    let mut inner = HashRef::new(PerlHash::new());
+    let mut inner = HashRef::new(Hash::new());
     for _ in 0..100_000 {
-        let outer = HashRef::new(PerlHash::new());
+        let outer = HashRef::new(Hash::new());
         outer.write().store("next".parse().unwrap(), Value::hash_ref(inner, Tainted::CLEAN)).unwrap();
         inner = outer;
     }
@@ -73,7 +73,7 @@ fn deep_tainted_scalar_ref_chain_releases_iteratively() {
     let mut slot = Value::undef(Tainted::CLEAN);
     for _ in 0..200_000 {
         slot = match Value::take_ref(&mut slot) {
-            Value::ScalarRefMut(cell) => Value::ScalarRefMutTainted(cell),
+            Value::ScalarRef(cell) => Value::ScalarRefTainted(cell),
             other => other,
         };
     }
@@ -83,9 +83,9 @@ fn deep_tainted_scalar_ref_chain_releases_iteratively() {
 
 #[test]
 fn deep_tainted_array_chain_releases_iteratively() {
-    let mut inner = ArrayRef::new(PerlArray::new());
+    let mut inner = ArrayRef::new(Array::new());
     for _ in 0..200_000 {
-        let outer = ArrayRef::new(PerlArray::new());
+        let outer = ArrayRef::new(Array::new());
         outer.write().push_value(Value::array_ref(inner, Tainted::TAINTED)).unwrap();
         inner = outer;
     }
@@ -95,9 +95,9 @@ fn deep_tainted_array_chain_releases_iteratively() {
 
 #[test]
 fn deep_tainted_hash_chain_releases_iteratively() {
-    let mut inner = HashRef::new(PerlHash::new());
+    let mut inner = HashRef::new(Hash::new());
     for _ in 0..100_000 {
-        let outer = HashRef::new(PerlHash::new());
+        let outer = HashRef::new(Hash::new());
         outer.write().store("next".parse().unwrap(), Value::hash_ref(inner, Tainted::TAINTED)).unwrap();
         inner = outer;
     }
@@ -112,12 +112,12 @@ fn deep_mixed_chain_releases_iteratively() {
     for i in 0..50_000 {
         link = match i % 3 {
             0 => {
-                let a = ArrayRef::new(PerlArray::new());
+                let a = ArrayRef::new(Array::new());
                 a.write().push_value(link).unwrap();
                 Value::array_ref(a, Tainted::CLEAN)
             }
             1 => {
-                let h = HashRef::new(PerlHash::new());
+                let h = HashRef::new(Hash::new());
                 h.write().store("k".parse().unwrap(), link).unwrap();
                 Value::hash_ref(h, Tainted::CLEAN)
             }
@@ -135,7 +135,7 @@ fn deep_mixed_chain_releases_iteratively() {
 
 #[test]
 fn assignment_over_a_deep_chain_releases_iteratively() {
-    // The assign choke point: the old payload dies inside ScalarCell::assign, not a plain drop.
+    // The assign choke point: the old payload dies inside Scalar::assign, not a plain drop.
     let mut slot = Value::undef(Tainted::CLEAN);
     for _ in 0..100_000 {
         slot = Value::take_ref(&mut slot);
@@ -149,7 +149,7 @@ fn assignment_over_a_deep_chain_releases_iteratively() {
 
 #[test]
 fn container_clear_releases_iteratively() {
-    let a = ArrayRef::new(PerlArray::new());
+    let a = ArrayRef::new(Array::new());
     let mut chain = Value::undef(Tainted::CLEAN);
     for _ in 0..100_000 {
         chain = Value::take_ref(&mut chain);

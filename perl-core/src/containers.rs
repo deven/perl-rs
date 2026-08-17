@@ -1,5 +1,5 @@
-//! `PerlArray` and `PerlHash` — the containers (§2.2.1) — with their Arc-backed shared identities `ArrayRef` and
-//! `HashRef`.  The module name is temporary in the same sense as `payload.rs`.
+//! `Array` and `Hash` — the containers (§2.2.1) — with their Arc-backed shared identities `ArrayRef` and `HashRef`.
+//! The module name is temporary in the same sense as `payload.rs`.
 //!
 //! Container-verified semantics encoded here:
 //!
@@ -34,10 +34,10 @@ use crate::alloc_backend;
 use crate::cow_buffer::AllocError;
 use crate::heap::{HeapArc, release_value};
 use crate::scalar::ScalarError;
-use crate::string::PerlString;
+use crate::string::PString;
 use crate::value::{ArraySlot, Value};
 
-// ── PerlArray (§2.2.1, §2.2.12) ───────────────────────────────────
+// ── Array (§2.2.1, §2.2.12) ───────────────────────────────────
 /// The front-gap slot engine (§2.2.12), shaped on perl's AV: an allocation whose live window floats behind a gap, so
 /// `shift` is an O(1) window slide and `unshift` reclaims the gap before any element moves.  `None` = a hole
 /// (nonexistent element); `Some(Undef)` = an existing element holding undef.
@@ -46,8 +46,8 @@ use crate::value::{ArraySlot, Value};
 /// discriminant byte the §2.4.3 budget does not have.  Small arrays keep `ptr` as the buffer base with `u32` geometry;
 /// past `u32` the geometry spills to a boxed wide header and `ptr` holds that box (`FLAG_LARGE`), the `Heap32`/`Heap`
 /// philosophy applied to arrays.  Bits 8..32 of `stash_flags` are the reserved bless stash (u24).
-pub struct PerlArray {
-    /// Small: the buffer base (dangling when unallocated).  Large: the boxed [`RawParts`].
+pub struct Array {
+    /// Small: the buffer base (dangling when unallocated).  Large: the boxed [`Geometry`].
     ptr: NonNull<ArraySlot>,
     start: u32,
     len: u32,
@@ -55,7 +55,7 @@ pub struct PerlArray {
     stash_flags: u32,
 }
 
-const _: () = assert!(size_of::<PerlArray>() == 24);
+const _: () = assert!(size_of::<Array>() == 24);
 
 /// The dynamic readonly flag's bit.
 const FLAG_READONLY: u32 = 1;
@@ -65,23 +65,23 @@ const FLAG_LARGE: u32 = 2;
 
 // SAFETY: the raw pointer is exclusively owned storage of `Send + Sync` slots; sharing is external (§2.2.1: the
 // handle's lock).
-unsafe impl Send for PerlArray {}
+unsafe impl Send for Array {}
 
-// SAFETY: as above — `&PerlArray` exposes no interior mutability.
-unsafe impl Sync for PerlArray {}
+// SAFETY: as above — `&Array` exposes no interior mutability.
+unsafe impl Sync for Array {}
 
 /// The width-agnostic geometry the engine operates on: buffer base, gap size, live count, and usable slots from the
 /// gap's end.  Total allocation is `start + cap` slots, every one an initialized `ArraySlot` (gap and tail spare hold
 /// `None`), the live window `[start, start + len)`.  Small arrays pack this into `u32` fields; large ones box it whole.
-struct RawParts {
+struct Geometry {
     ptr: NonNull<ArraySlot>,
     start: usize,
     len: usize,
     cap: usize,
 }
 
-impl RawParts {
-    const EMPTY: RawParts = RawParts { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0 };
+impl Geometry {
+    const EMPTY: Geometry = Geometry { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0 };
 
     fn total(&self) -> usize {
         self.start + self.cap
@@ -102,7 +102,7 @@ impl RawParts {
             return &mut [];
         }
 
-        // SAFETY: as [`RawParts::live`], with exclusive access through `&mut self`.
+        // SAFETY: as [`Geometry::live`], with exclusive access through `&mut self`.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(self.start), self.len) }
     }
 
@@ -136,9 +136,9 @@ impl RawParts {
         };
 
         // SAFETY: `ptr` is the base of a live allocation of exactly `total` slots (the window invariant), made by
-        // [`RawParts::allocate_slots`] through the backend.
+        // [`Geometry::allocate_slots`] through the backend.
         unsafe { alloc_backend::release(self.ptr.cast(), layout) };
-        *self = RawParts::EMPTY;
+        *self = Geometry::EMPTY;
     }
 
     /// Perl's escalating growth (§2.2.12): slide the live window back over the gap, then — the size class having been
@@ -169,7 +169,7 @@ impl RawParts {
 
         // Move two: a new allocation on the ruled curve, class-harvested; live slots move, the old buffer goes.
         let requested = min_cap.checked_add(self.cap / 5).ok_or(AllocError { requested: min_cap * size_of::<ArraySlot>() })?;
-        let (new_ptr, granted) = RawParts::allocate_slots(requested)?;
+        let (new_ptr, granted) = Geometry::allocate_slots(requested)?;
 
         // SAFETY: distinct allocations; the source window is initialized; the destination was just initialized and the
         // overwritten `None`s need no drop.
@@ -182,19 +182,19 @@ impl RawParts {
 
         let len = self.len;
         self.release_buffer();
-        *self = RawParts { ptr: new_ptr, start: 0, len, cap: granted };
+        *self = Geometry { ptr: new_ptr, start: 0, len, cap: granted };
 
         Ok(())
     }
 }
 
-impl Default for PerlArray {
-    fn default() -> PerlArray {
-        PerlArray::new()
+impl Default for Array {
+    fn default() -> Array {
+        Array::new()
     }
 }
 
-impl Drop for PerlArray {
+impl Drop for Array {
     /// Iterative teardown (§2.4.9): drain elements through the release worklist rather than recursing through drop
     /// glue.  Destruction is not perl-visible mutation, so the readonly flag is deliberately not consulted.
     fn drop(&mut self) {
@@ -209,9 +209,9 @@ impl Drop for PerlArray {
     }
 }
 
-impl PerlArray {
-    pub fn new() -> PerlArray {
-        PerlArray { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0, stash_flags: 0 }
+impl Array {
+    pub fn new() -> Array {
+        Array { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0, stash_flags: 0 }
     }
 
     fn is_large(&self) -> bool {
@@ -219,21 +219,21 @@ impl PerlArray {
     }
 
     /// The geometry, whichever arm holds it.
-    fn parts(&self) -> RawParts {
+    fn parts(&self) -> Geometry {
         if self.is_large() {
             // SAFETY: `FLAG_LARGE` certifies `ptr` is the boxed wide geometry (`store_parts` is the only writer).
-            let wide = unsafe { &*self.ptr.cast::<RawParts>().as_ptr() };
-            RawParts { ptr: wide.ptr, start: wide.start, len: wide.len, cap: wide.cap }
+            let wide = unsafe { &*self.ptr.cast::<Geometry>().as_ptr() };
+            Geometry { ptr: wide.ptr, start: wide.start, len: wide.len, cap: wide.cap }
         } else {
-            RawParts { ptr: self.ptr, start: self.start as usize, len: self.len as usize, cap: self.cap as usize }
+            Geometry { ptr: self.ptr, start: self.start as usize, len: self.len as usize, cap: self.cap as usize }
         }
     }
 
     /// Take the geometry out, leaving the header empty (the teardown door).
-    fn take_parts(&mut self) -> RawParts {
+    fn take_parts(&mut self) -> Geometry {
         if self.is_large() {
-            // SAFETY: as [`PerlArray::parts`]; the box is reclaimed and the flag dropped, so ownership moves out.
-            let wide = unsafe { Box::from_raw(self.ptr.cast::<RawParts>().as_ptr()) };
+            // SAFETY: as [`Array::parts`]; the box is reclaimed and the flag dropped, so ownership moves out.
+            let wide = unsafe { Box::from_raw(self.ptr.cast::<Geometry>().as_ptr()) };
             self.stash_flags &= !FLAG_LARGE;
             self.ptr = NonNull::dangling();
             self.start = 0;
@@ -251,11 +251,11 @@ impl PerlArray {
     }
 
     /// Store the geometry, spilling to the wide arm when any field passes `u32` (§2.2.12) — a one-way door.
-    fn store_parts(&mut self, parts: RawParts) {
+    fn store_parts(&mut self, parts: Geometry) {
         let fits = parts.start <= u32::MAX as usize && parts.len <= u32::MAX as usize && parts.cap <= u32::MAX as usize;
         if self.is_large() {
-            // SAFETY: as [`PerlArray::parts`]; the box stays the owner, its contents replaced.
-            unsafe { *self.ptr.cast::<RawParts>().as_ptr() = parts };
+            // SAFETY: as [`Array::parts`]; the box stays the owner, its contents replaced.
+            unsafe { *self.ptr.cast::<Geometry>().as_ptr() = parts };
         } else if fits {
             self.ptr = parts.ptr;
             self.start = parts.start as u32;
@@ -269,7 +269,7 @@ impl PerlArray {
     }
 
     /// Run an operation over the geometry and store it back.
-    fn with_parts<R>(&mut self, op: impl FnOnce(&mut RawParts) -> R) -> R {
+    fn with_parts<R>(&mut self, op: impl FnOnce(&mut Geometry) -> R) -> R {
         let mut parts = self.parts();
         let result = op(&mut parts);
         self.store_parts(parts);
@@ -290,7 +290,7 @@ impl PerlArray {
     }
 
     /// Read access: never creates.  `None` for holes and out-of-range indices alike (the exists/defined distinction
-    /// goes through [`PerlArray::exists`]).
+    /// goes through [`Array::exists`]).
     pub fn get(&self, index: usize) -> Option<&Value> {
         let parts = self.parts();
         if index >= parts.len {
@@ -308,7 +308,7 @@ impl PerlArray {
 
     /// Ensure the live window reaches `index + 1`, growing on the ruled curve; intervening slots are already `None`
     /// holes by the window invariant.
-    fn extend_to(parts: &mut RawParts, index: usize) -> Result<(), AllocError> {
+    fn extend_to(parts: &mut Geometry, index: usize) -> Result<(), AllocError> {
         let needed = index.checked_add(1).ok_or(AllocError { requested: usize::MAX })?;
 
         if needed > parts.cap {
@@ -328,7 +328,7 @@ impl PerlArray {
         self.check_writable()?;
 
         self.with_parts(|parts| {
-            PerlArray::extend_to(parts, index)?;
+            Array::extend_to(parts, index)?;
             parts.live_mut()[index] = Some(value);
 
             Ok(())
@@ -342,7 +342,7 @@ impl PerlArray {
         self.check_writable()?;
 
         let mut parts = self.parts();
-        PerlArray::extend_to(&mut parts, index)?;
+        Array::extend_to(&mut parts, index)?;
         self.store_parts(parts);
         let parts = self.parts();
 
@@ -378,7 +378,7 @@ impl PerlArray {
 
         self.with_parts(|parts| {
             let index = parts.len;
-            PerlArray::extend_to(parts, index)?;
+            Array::extend_to(parts, index)?;
             parts.live_mut()[index] = Some(value);
 
             Ok(())
@@ -501,7 +501,7 @@ impl PerlArray {
     pub(crate) fn values_iter(&self) -> impl Iterator<Item = &Value> {
         let parts = self.parts();
 
-        // SAFETY: the live-window slice, tied to `&self` (as [`RawParts::live`], through the shared borrow).
+        // SAFETY: the live-window slice, tied to `&self` (as [`Geometry::live`], through the shared borrow).
         let live: &[ArraySlot] = if parts.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(parts.ptr.as_ptr().add(parts.start), parts.len) } };
 
         live.iter().filter_map(Option::as_ref)
@@ -531,11 +531,11 @@ impl PerlArray {
     }
 }
 
-// ── PerlHash (§2.2.1, §2.2.13) ────────────────────────────────────
+// ── Hash (§2.2.1, §2.2.13) ────────────────────────────────────
 /// The dual-engine hash (§2.2.13): a bucket engine on `hashbrown::HashTable` by default, and the insertion-ordered
 /// `IndexMap` engine on explicit request, fixed at construction.  Keys are laundered at storage (§2.6.2); the stored
 /// key is kept on re-store (equal keys: the first-stored spelling wins) under either engine.
-pub struct PerlHash {
+pub struct Hash {
     engine: HashEngine,
     readonly: bool,
 }
@@ -543,10 +543,10 @@ pub struct PerlHash {
 /// The engine, chosen at construction and never morphed (§2.2.13).
 enum HashEngine {
     /// The default: SwissTable buckets, per-hash SipHash keys, and the `each` cursor as a bucket index.
-    Buckets { table: HashTable<(PerlString, Value)>, hasher: RandomState, cursor: usize },
+    Buckets { table: HashTable<(PString, Value)>, hasher: RandomState, cursor: usize },
 
     /// The explicitly requested insertion-ordered mode (§2.2.10): the `each` cursor is an entry index.
-    Ordered { map: IndexMap<PerlString, Value>, cursor: usize },
+    Ordered { map: IndexMap<PString, Value>, cursor: usize },
 
     /// The feature-gated immutable mode (§2.2.13): a persistent HAMT; the `each` cursor is an owning iterator over an
     /// O(1) snapshot, yielding with live revalidation.
@@ -555,7 +555,7 @@ enum HashEngine {
 }
 
 #[cfg(feature = "imbl")]
-type ImblMap = imbl::HashMap<PerlString, Value>;
+type ImblMap = imbl::HashMap<PString, Value>;
 
 #[cfg(feature = "imbl")]
 type ImblIter = <ImblMap as IntoIterator>::IntoIter;
@@ -571,13 +571,13 @@ fn retire_iter(iter: &mut Option<ImblIter>) {
     }
 }
 
-impl Default for PerlHash {
-    fn default() -> PerlHash {
-        PerlHash::new()
+impl Default for Hash {
+    fn default() -> Hash {
+        Hash::new()
     }
 }
 
-impl Drop for PerlHash {
+impl Drop for Hash {
     /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
     fn drop(&mut self) {
         match &mut self.engine {
@@ -603,30 +603,30 @@ impl Drop for PerlHash {
     }
 }
 
-impl PerlHash {
+impl Hash {
     /// The default engine (§2.2.13): buckets, per-hash random iteration order.
-    pub fn new() -> PerlHash {
-        PerlHash { engine: HashEngine::Buckets { table: HashTable::new(), hasher: RandomState::new(), cursor: 0 }, readonly: false }
+    pub fn new() -> Hash {
+        Hash { engine: HashEngine::Buckets { table: HashTable::new(), hasher: RandomState::new(), cursor: 0 }, readonly: false }
     }
 
     /// The insertion-ordered mode (§2.2.13), on explicit request only; the perl-visible request surface is the runtime
     /// design's.
-    pub fn insertion_ordered() -> PerlHash {
-        PerlHash { engine: HashEngine::Ordered { map: IndexMap::new(), cursor: 0 }, readonly: false }
+    pub fn insertion_ordered() -> Hash {
+        Hash { engine: HashEngine::Ordered { map: IndexMap::new(), cursor: 0 }, readonly: false }
     }
 
-    /// The immutable mode (§2.2.13), on explicit request only: a persistent HAMT with O(1) [`PerlHash::snapshot`].
+    /// The immutable mode (§2.2.13), on explicit request only: a persistent HAMT with O(1) [`Hash::snapshot`].
     #[cfg(feature = "imbl")]
-    pub fn immutable() -> PerlHash {
-        PerlHash { engine: HashEngine::Immutable { map: ImblMap::new(), iter: None }, readonly: false }
+    pub fn immutable() -> Hash {
+        Hash { engine: HashEngine::Immutable { map: ImblMap::new(), iter: None }, readonly: false }
     }
 
     /// An O(1) detached, diverging copy of an immutable-engine hash (§2.2.13), with a fresh cursor and the readonly
     /// flag cleared; the other engines answer [`ScalarError::SnapshotUnsupported`], their copies being O(n).
-    pub fn snapshot(&self) -> Result<PerlHash, ScalarError> {
+    pub fn snapshot(&self) -> Result<Hash, ScalarError> {
         match &self.engine {
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => Ok(PerlHash { engine: HashEngine::Immutable { map: map.clone(), iter: None }, readonly: false }),
+            HashEngine::Immutable { map, .. } => Ok(Hash { engine: HashEngine::Immutable { map: map.clone(), iter: None }, readonly: false }),
             _ => Err(ScalarError::SnapshotUnsupported),
         }
     }
@@ -649,7 +649,7 @@ impl PerlHash {
         if self.readonly { Err(ScalarError::ReadOnly) } else { Ok(()) }
     }
 
-    fn launder(mut key: PerlString) -> PerlString {
+    fn launder(mut key: PString) -> PString {
         if key.is_tainted() {
             key.untaint_for_sanctioned_path();
         }
@@ -661,9 +661,9 @@ impl PerlHash {
     ///
     /// The cursor discipline (§2.2.13): an existing key updates in place and leaves the cursor alone — value updates
     /// during iteration are contract-specified safe — while a new key resets it, answering any rehash with a restart.
-    pub fn store(&mut self, key: PerlString, value: Value) -> Result<(), ScalarError> {
+    pub fn store(&mut self, key: PString, value: Value) -> Result<(), ScalarError> {
         self.check_writable()?;
-        let key = PerlHash::launder(key);
+        let key = Hash::launder(key);
         match &mut self.engine {
             HashEngine::Buckets { table, hasher, cursor } => {
                 let hash = hasher.hash_one(&key);
@@ -693,7 +693,7 @@ impl PerlHash {
     }
 
     /// Read access: never creates.
-    pub fn get(&self, key: &PerlString) -> Option<&Value> {
+    pub fn get(&self, key: &PString) -> Option<&Value> {
         match &self.engine {
             HashEngine::Buckets { table, hasher, .. } => table.find(hasher.hash_one(key), |(stored, _)| stored == key).map(|(_, value)| value),
             HashEngine::Ordered { map, .. } => map.get(key),
@@ -704,16 +704,16 @@ impl PerlHash {
     }
 
     /// `exists $h{$k}`: absence of the entry is nonexistence (§2.2.1 — no slot wrapper).
-    pub fn exists(&self, key: &PerlString) -> bool {
+    pub fn exists(&self, key: &PString) -> bool {
         self.get(key).is_some()
     }
 
     /// Lvalue access: vivify the undef entry (container-verified: `\$h{k}` creates an existing undef entry).  The
     /// `get`/`ensure` split is the autovivification-option mechanism (§2.2.1).  Vivification of an absent key is a
     /// new-key insertion and resets the cursor (§2.2.13); an existing key leaves it alone.
-    pub fn entry_or_undef(&mut self, key: PerlString) -> Result<&mut Value, ScalarError> {
+    pub fn entry_or_undef(&mut self, key: PString) -> Result<&mut Value, ScalarError> {
         self.check_writable()?;
-        let key = PerlHash::launder(key);
+        let key = Hash::launder(key);
         match &mut self.engine {
             HashEngine::Buckets { table, hasher, cursor } => {
                 let hash = hasher.hash_one(&key);
@@ -737,7 +737,7 @@ impl PerlHash {
     /// moves nothing, so every deletion is exact — delete-current is behind the cursor already, and a deleted unvisited
     /// entry is a slot the walk will skip.  (Ordered engine: `swap_remove` keeps delete O(1); the cursor adjustment
     /// makes delete-current exact, module header.)
-    pub fn delete(&mut self, key: &PerlString) -> Result<Value, ScalarError> {
+    pub fn delete(&mut self, key: &PString) -> Result<Value, ScalarError> {
         self.check_writable()?;
         match &mut self.engine {
             HashEngine::Buckets { table, hasher, .. } => match table.find_entry(hasher.hash_one(key), |(stored, _)| stored == key) {
@@ -751,7 +751,7 @@ impl PerlHash {
                 let Some(index) = map.get_index_of(key) else {
                     return Ok(Value::default());
                 };
-                let (_, value) = map.swap_remove_index(index).unwrap_or_else(|| (PerlString::empty(), Value::default()));
+                let (_, value) = map.swap_remove_index(index).unwrap_or_else(|| (PString::empty(), Value::default()));
                 if index < *cursor {
                     *cursor -= 1;
                 }
@@ -766,7 +766,7 @@ impl PerlHash {
 
     /// `each %h`: yield the next pair, or `None` once at exhaustion (then restart — container-verified).  The bucket
     /// engine walks `get_bucket` from the cursor to the next occupied slot (§2.2.13).
-    pub fn each(&mut self) -> Option<(PerlString, Value)> {
+    pub fn each(&mut self) -> Option<(PString, Value)> {
         match &mut self.engine {
             HashEngine::Buckets { table, cursor, .. } => {
                 let end = table.num_buckets();
@@ -808,7 +808,7 @@ impl PerlHash {
     }
 
     /// `keys %h`: resets the iterator (container-verified); shares `each`'s scan order (§2.2.13).
-    pub fn keys(&mut self) -> Vec<PerlString> {
+    pub fn keys(&mut self) -> Vec<PString> {
         match &mut self.engine {
             HashEngine::Buckets { table, cursor, .. } => {
                 *cursor = 0;
@@ -896,17 +896,17 @@ impl PerlHash {
     }
 }
 
-/// The engine-dispatched values walk behind [`PerlHash::values_iter`]: a hand-rolled two-arm iterator, keeping the cold
+/// The engine-dispatched values walk behind [`Hash::values_iter`]: a hand-rolled two-arm iterator, keeping the cold
 /// traversal hook vtable-free.
 pub(crate) enum HashValuesIter<'a> {
     Buckets {
-        table: &'a HashTable<(PerlString, Value)>,
+        table: &'a HashTable<(PString, Value)>,
         next: usize,
     },
-    Ordered(indexmap::map::Values<'a, PerlString, Value>),
+    Ordered(indexmap::map::Values<'a, PString, Value>),
 
     #[cfg(feature = "imbl")]
-    Immutable(imbl::hashmap::Values<'a, PerlString, Value, imbl::shared_ptr::DefaultSharedPtr>),
+    Immutable(imbl::hashmap::Values<'a, PString, Value, imbl::shared_ptr::DefaultSharedPtr>),
 }
 
 impl<'a> Iterator for HashValuesIter<'a> {
@@ -974,8 +974,8 @@ macro_rules! container_handle {
     };
 }
 
-container_handle!(ArrayRef, PerlArray, "The Arc-backed shared array identity (§2.2.1).");
-container_handle!(HashRef, PerlHash, "The Arc-backed shared hash identity (§2.2.1).");
+container_handle!(ArrayRef, Array, "The Arc-backed shared array identity (§2.2.1).");
+container_handle!(HashRef, Hash, "The Arc-backed shared hash identity (§2.2.1).");
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

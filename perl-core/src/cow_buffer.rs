@@ -64,7 +64,7 @@ pub struct AllocError {
 /// The data pointer of a live tiered allocation, and the obligation to release it exactly once.
 ///
 /// Deliberately **not** `Copy`.  Duplicating a data pointer without a matching `retain` is the bug this type exists to
-/// make impossible: because `PerlString`'s representation owns a `Drop`, a `Copy` pointer would let a `match` read the
+/// make impossible: because `PString`'s representation owns a `Drop`, a `Copy` pointer would let a `match` read the
 /// pointer out of a heap variant while the source still dropped — a double release the compiler would not diagnose,
 /// since `E0509` only fires for non-`Copy` fields.  With this newtype, every such site is a compile error naming the
 /// field.
@@ -219,7 +219,7 @@ impl Tier {
 ///
 /// Owns the release obligation: dropping a `HeapParts` releases the allocation, which is what makes every `?` on a path
 /// holding one leak-free without ceremony.  It holds exactly what release needs — the pointer, the capacity, the tier —
-/// so it is the natural owner, and [`PerlString`]'s `build_heap` is the one place that takes the obligation onward
+/// so it is the natural owner, and [`PString`]'s `build_heap` is the one place that takes the obligation onward
 /// instead, under `ManuallyDrop`.
 pub(crate) struct HeapParts {
     pub(crate) ptr: Owned,
@@ -603,7 +603,7 @@ fn refcount_overflow() -> ! {
 macro_rules! heap_tier {
     // ── Small tiers: the envelope is authoritative, so the allocation is a bare refcount ──
     ($tier:ident, width = $w:ty, meta = envelope) => {
-        // Staged migration: the tiers are exercised by tests until `PerlString`'s variants move over to them.
+        // Staged migration: the tiers are exercised by tests until `PString`'s variants move over to them.
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) mod $tier {
             use super::{AllocError, REFCOUNT_CEILING, refcount_overflow};

@@ -2,8 +2,8 @@ use super::*;
 use crate::string::DECODE_MAX;
 use crate::value::Value;
 
-fn plain(payload: Value) -> ScalarRef {
-    ScalarRef::new_mut(payload)
+fn plain(payload: Value) -> Referent {
+    Referent::new_mut(payload)
 }
 
 fn str_payload(text: &str) -> Value {
@@ -16,13 +16,13 @@ fn boolean_immortals_share_identity() {
     // Verified perl 5.38: \(1==1) yields the same address twice.
     let a = Value::True.upgrade_to_scalar().unwrap();
     let b = Value::True.upgrade_to_scalar().unwrap();
-    assert!(ScalarRef::ptr_eq(&a, &b));
-    assert!(matches!(a, ScalarRef::Const(_)));
+    assert!(Referent::ptr_eq(&a, &b));
+    assert!(matches!(a, Referent::Const(_)));
 
     let f1 = Value::False.upgrade_to_scalar().unwrap();
     let f2 = Value::False.upgrade_to_scalar().unwrap();
-    assert!(ScalarRef::ptr_eq(&f1, &f2));
-    assert!(!ScalarRef::ptr_eq(&a, &f1), "the two singletons are distinct");
+    assert!(Referent::ptr_eq(&f1, &f2));
+    assert!(!Referent::ptr_eq(&a, &f1), "the two singletons are distinct");
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn cross_thread_upgrades_still_ptr_eq() {
     let here = Value::True.upgrade_to_scalar().unwrap();
     let there = std::thread::spawn(|| Value::True.upgrade_to_scalar().unwrap());
     let there = there.join().unwrap_or_else(|_| Value::True.upgrade_to_scalar().unwrap());
-    assert!(ScalarRef::ptr_eq(&here, &there));
+    assert!(Referent::ptr_eq(&here, &there));
 }
 
 #[test]
@@ -70,14 +70,14 @@ fn is_bool_answers_from_the_variant() {
     assert!(!Value::String("".parse().unwrap()).is_bool());
 }
 
-// ── ScalarRef / guards ────────────────────────────────────────
+// ── Referent / guards ────────────────────────────────────────
 #[test]
 fn reference_identity_and_clone_share() {
     let r1 = plain(Value::integer(42, Tainted::CLEAN));
     let r2 = r1.clone();
-    assert!(ScalarRef::ptr_eq(&r1, &r2));
+    assert!(Referent::ptr_eq(&r1, &r2));
     let r3 = plain(Value::integer(42, Tainted::CLEAN));
-    assert!(!ScalarRef::ptr_eq(&r1, &r3), "equal payloads, distinct identities");
+    assert!(!Referent::ptr_eq(&r1, &r3), "equal payloads, distinct identities");
 
     // Writes through one handle are visible through the other: shared identity.
     r1.write().unwrap().assign(Value::integer(7, Tainted::CLEAN)).unwrap();
@@ -88,7 +88,7 @@ fn reference_identity_and_clone_share() {
 fn concurrent_const_reads_take_no_lock() {
     // Trivially concurrent: many threads reading the same Const cell simultaneously.
     let cell = ConstScalar::materialize(str_payload("3.7")).unwrap();
-    let r = ScalarRef::new_const(cell);
+    let r = Referent::new_const(cell);
     std::thread::scope(|s| {
         for _ in 0..4 {
             let r = &r;
@@ -102,7 +102,7 @@ fn concurrent_const_reads_take_no_lock() {
     });
 }
 
-// ── ScalarCell: payload authority, caches, upgrade ────────────
+// ── Scalar: payload authority, caches, upgrade ────────────
 #[test]
 fn payload_stays_authoritative_through_coercion() {
     // The §21.1 illustrative test: 3.7 used as an integer still stringifies as "3.7".
@@ -146,14 +146,14 @@ fn upgrade_preserves_identity_and_payload() {
 
     {
         let mut g = r.write().unwrap();
-        assert!(matches!(&*g, ScalarCell::Plain(_)));
+        assert!(matches!(&*g, Scalar::Plain(_)));
         g.upgrade_to_full();
         g.upgrade_to_full(); // idempotent
-        assert!(matches!(&*g, ScalarCell::Full(_)));
+        assert!(matches!(&*g, Scalar::Full(_)));
     }
 
     // The Arc address never changed: the outstanding alias still reaches the upgraded cell.
-    assert!(ScalarRef::ptr_eq(&r, &alias));
+    assert!(Referent::ptr_eq(&r, &alias));
     assert_eq!(alias.read().stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"hello");
 }
 
@@ -190,7 +190,7 @@ fn dynamic_readonly_is_toggleable() {
     // Clearing readonly on a Plain cell is a no-op that must not upgrade.
     let p = plain(Value::integer(1, Tainted::CLEAN));
     p.write().unwrap().set_readonly(false);
-    assert!(matches!(&*p.write().unwrap(), ScalarCell::Plain(_)));
+    assert!(matches!(&*p.write().unwrap(), Scalar::Plain(_)));
 }
 
 // ── Numification-warning state (§2.3.4, container-verified) ───
@@ -233,7 +233,7 @@ fn numify_warning_display_is_perl_exact() {
     // Every expectation below is the container's own perl 5.44 output, byte for byte, minus the op clause and location
     // the interpreter suffixes.
     let body = |content: &[u8]| {
-        let mut cell = ScalarCell::Plain(Value::String(PerlString::from_bytes(content).unwrap()));
+        let mut cell = Scalar::Plain(Value::String(PString::from_bytes(content).unwrap()));
         let (_, emit) = cell.numify_noting_warning().unwrap();
         format!("{}", emit.expect("warn-worthy content"))
     };
@@ -257,9 +257,9 @@ fn numify_warning_display_is_perl_exact() {
     // The flagged regime: cap 32 output columns, backslash doubled, everything non-printable \x{lowercase-hex} --
     // newline included, diverging from the byte regime's backslash-n.
     let flagged_body = |content: &str| {
-        let mut s = PerlString::new(content).unwrap();
+        let mut s = PString::new(content).unwrap();
         s.set_utf8_for_test();
-        let mut cell = ScalarCell::Plain(Value::String(s));
+        let mut cell = Scalar::Plain(Value::String(s));
         let (_, emit) = cell.numify_noting_warning().unwrap();
         format!("{}", emit.expect("warn-worthy content"))
     };
@@ -348,13 +348,13 @@ fn would_warn_boundary_table() {
     ];
 
     for form in warns {
-        let s: PerlString = form.parse().unwrap();
+        let s: PString = form.parse().unwrap();
         assert!(s.would_warn(), "{form:?} must warn (container-verified)");
         assert!(crate::value::string_would_warn(form.as_bytes()), "{form:?}: oracle disagrees with the byproduct");
     }
 
     for form in silent {
-        let s: PerlString = form.parse().unwrap();
+        let s: PString = form.parse().unwrap();
         assert!(!s.would_warn(), "{form:?} must be silent (container-verified)");
         assert!(!crate::value::string_would_warn(form.as_bytes()), "{form:?}: oracle disagrees with the byproduct");
     }
@@ -363,8 +363,8 @@ fn would_warn_boundary_table() {
 // ── Layout (§2.3.6) ───────────────────────────────────────────
 #[test]
 fn envelope_sizes() {
-    assert_eq!(size_of::<ScalarCell>(), 16, "Full threads the payload's niche (measured, §2.3.2)");
-    assert_eq!(size_of::<ScalarRef>(), 16);
+    assert_eq!(size_of::<Scalar>(), 16, "Full threads the payload's niche (measured, §2.3.2)");
+    assert_eq!(size_of::<Referent>(), 16);
 }
 
 #[test]
@@ -372,7 +372,7 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
     // §2.3.4: perl has no warned flag.  Numifying caches the salvaged number, and every later numification reads that
     // cache instead of re-parsing — so warning once is a consequence of caching, verified in the container as one
     // warning from "12abc" numified three times.
-    let mut cell = ScalarCell::Plain(str_payload("12abc"));
+    let mut cell = Scalar::Plain(str_payload("12abc"));
 
     let (first, emit) = cell.numify_noting_warning().unwrap();
     assert!(emit.is_some(), "the first numification of warn-worthy content emits");
@@ -384,7 +384,7 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
 
     // The face is what changed, not a flag: the payload is now a Dual whose string side is untouched.
     match &cell {
-        ScalarCell::Plain(Value::Dual(d)) => {
+        Scalar::Plain(Value::Dual(d)) => {
             assert_eq!(d.string.as_bytes(&mut [0u8; DECODE_MAX]), b"12abc", "the string face survives verbatim");
             assert_eq!(d.numeric, Numeric::Integer(12));
         }
@@ -397,7 +397,7 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
 
     // A dual's rendering is its string face, present by construction, so the digit-cache predicate answers yes:
     // a caller consulting it to skip formatting must skip for a dual.
-    if let ScalarCell::Plain(payload) = &cell {
+    if let Scalar::Plain(payload) = &cell {
         assert!(payload.has_cached_digits(), "the string face is the cached rendering");
     }
 }
@@ -406,23 +406,23 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
 fn cleanly_numeric_content_never_caches_a_face() {
     // Only warn-worthy content pays the allocation: a clean numeric string re-parses, which costs nanoseconds and
     // avoids an allocation per numeric value (§2.3.4).
-    let mut cell = ScalarCell::Plain(str_payload("42"));
+    let mut cell = Scalar::Plain(str_payload("42"));
     for _ in 0..3 {
         let (n, emit) = cell.numify_noting_warning().unwrap();
         assert_eq!(n, Numeric::Integer(42));
         assert!(emit.is_none(), "clean content never warns");
     }
-    assert!(matches!(cell, ScalarCell::Plain(Value::String(_))), "and stays a plain string");
+    assert!(matches!(cell, Scalar::Plain(Value::String(_))), "and stays a plain string");
 }
 
 #[test]
 fn taint_survives_the_face_installation() {
-    let mut tainted: PerlString = "12abc".parse().unwrap();
+    let mut tainted: PString = "12abc".parse().unwrap();
     tainted.taint();
-    let mut cell = ScalarCell::Plain(Value::String(tainted));
+    let mut cell = Scalar::Plain(Value::String(tainted));
 
     let (_, emit) = cell.numify_noting_warning().unwrap();
     assert!(emit.is_some());
-    assert!(matches!(cell, ScalarCell::Plain(Value::DualTainted(_))), "the tainted twin is chosen");
+    assert!(matches!(cell, Scalar::Plain(Value::DualTainted(_))), "the tainted twin is chosen");
     assert!(cell.is_tainted(), "and taint reads through the Dual");
 }

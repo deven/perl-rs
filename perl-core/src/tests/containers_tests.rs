@@ -4,12 +4,12 @@ use crate::value::{Tainted, Value};
 
 /// Both engines (§2.2.13): the container-verified semantics are engine-independent, so the shared batteries run against
 /// each.
-fn both_engines() -> Vec<PerlHash> {
+fn both_engines() -> Vec<Hash> {
     #[allow(unused_mut)]
-    let mut engines = vec![PerlHash::new(), PerlHash::insertion_ordered()];
+    let mut engines = vec![Hash::new(), Hash::insertion_ordered()];
 
     #[cfg(feature = "imbl")]
-    engines.push(PerlHash::immutable());
+    engines.push(Hash::immutable());
 
     engines
 }
@@ -18,7 +18,7 @@ fn int(n: i64) -> Value {
     Value::integer(n, Tainted::CLEAN)
 }
 
-fn key(text: &str) -> PerlString {
+fn key(text: &str) -> PString {
     text.parse().unwrap()
 }
 
@@ -26,7 +26,7 @@ fn key(text: &str) -> PerlString {
 #[test]
 fn array_holes_below_length() {
     // Container-verified: $a[5] = "x" on empty — length 6, 0–4 nonexistent, 5 exists.
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     a.set(5, int(1)).unwrap();
     assert_eq!(a.len(), 6);
     assert!(!a.exists(0));
@@ -39,7 +39,7 @@ fn array_holes_below_length() {
 #[test]
 fn array_ensure_element_vivifies_undef() {
     // Container-verified: \$a[3] on empty — length 4, element exists, undef.
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     let slot = a.ensure_element(3).unwrap();
     assert!(matches!(slot, Value::Undef | Value::UndefTainted));
     assert_eq!(a.len(), 4);
@@ -55,7 +55,7 @@ fn array_ensure_element_vivifies_undef() {
 #[test]
 fn array_delete_rules() {
     // Migrated §2.2.1 pins: delete-mid holes, delete-last truncates through trailing holes.
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     for i in 0..3 {
         a.set(i, int(i as i64 + 1)).unwrap();
     }
@@ -71,7 +71,7 @@ fn array_delete_rules() {
 
 #[test]
 fn array_push_pop_shift_unshift() {
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     a.push_value(int(1)).unwrap();
     a.push_value(int(2)).unwrap();
     a.unshift_value(int(0)).unwrap();
@@ -82,7 +82,7 @@ fn array_push_pop_shift_unshift() {
     assert!(matches!(a.pop_value().unwrap(), Value::Undef | Value::UndefTainted), "pop on empty is undef");
 
     // Pop after a sparse set: the value comes off; the holes remain (length 5, all holes).
-    let mut sparse = PerlArray::new();
+    let mut sparse = Array::new();
     sparse.set(5, int(9)).unwrap();
     assert_eq!(sparse.pop_value().unwrap().to_int(), 9);
     assert_eq!(sparse.len(), 5);
@@ -93,7 +93,7 @@ fn array_push_pop_shift_unshift() {
 
 #[test]
 fn array_readonly() {
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     a.set(0, int(1)).unwrap();
     a.set_readonly(true);
     assert_eq!(a.set(1, int(2)), Err(ScalarError::ReadOnly));
@@ -140,7 +140,7 @@ fn hash_keys_are_laundered_at_storage() {
         assert!(!stored[0].is_tainted(), "the §2.6.2 sanctioned laundering path");
 
         // Same through the lvalue path.
-        let mut h2 = PerlHash::new();
+        let mut h2 = Hash::new();
         let _ = h2.entry_or_undef(tainted_key).unwrap();
         assert!(!h2.keys()[0].is_tainted());
     }
@@ -253,7 +253,7 @@ fn hash_readonly() {
 // ── The §2.2.12 front-gap engine ──────────────────────────────
 #[test]
 fn shift_is_a_window_slide_and_unshift_reclaims_the_gap() {
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     for i in 0..8 {
         a.push_value(int(i)).unwrap();
     }
@@ -280,7 +280,7 @@ fn shift_is_a_window_slide_and_unshift_reclaims_the_gap() {
 fn shortfall_unshift_carves_the_fill_back_as_gap() {
     // §2.2.12 phase two: with no gap, the slide is need + fill, and the fill's worth returns as fresh gap — the
     // prepaid buffer equals the live count.
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     for i in 0..5 {
         a.push_value(int(i)).unwrap();
     }
@@ -307,7 +307,7 @@ fn shortfall_unshift_carves_the_fill_back_as_gap() {
 fn growth_follows_the_ruled_curve() {
     // §2.2.12: growth requests at least min_cap + cap/5, then harvests the allocator's class — so the landed
     // capacity is bounded below by the curve, never mere fit.
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     a.set(9, int(1)).unwrap();
     let (_, _, cap_before, _) = a.probe_geometry();
     a.set(cap_before, int(2)).unwrap();
@@ -317,7 +317,7 @@ fn growth_follows_the_ruled_curve() {
 
 #[test]
 fn empty_shift_and_pop_return_undef() {
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     assert!(matches!(a.shift_value().unwrap(), Value::Undef));
     assert!(matches!(a.pop_value().unwrap(), Value::Undef));
 }
@@ -326,7 +326,7 @@ fn empty_shift_and_pop_return_undef() {
 fn the_wide_arm_runs_the_same_battery() {
     // §2.2.12 spill parity: the boxed wide geometry serves the identical surface — the u32 overflow trigger being
     // untestable at 64 GiB, the arm is forced and exercised whole.
-    let mut a = PerlArray::new();
+    let mut a = Array::new();
     a.push_value(int(0)).unwrap();
     a.force_large_for_test();
     assert!(a.probe_geometry().3, "the arm is wide");
@@ -355,7 +355,7 @@ fn the_wide_arm_runs_the_same_battery() {
 #[test]
 fn ordered_mode_iterates_in_insertion_order() {
     // The mode's reason to exist: a pinned, predictable order on explicit request.
-    let mut h = PerlHash::insertion_ordered();
+    let mut h = Hash::insertion_ordered();
     for k in ["delta", "alpha", "omega", "beta"] {
         h.store(key(k), int(1)).unwrap();
     }
@@ -386,7 +386,7 @@ fn value_update_does_not_disturb_each() {
 fn new_key_insertion_restarts_the_bucket_walk() {
     // §2.2.13: a rehash may scramble positions, so a new key resets the cursor — the post-insert pass is complete:
     // every current key appears, none twice.
-    let mut h = PerlHash::new();
+    let mut h = Hash::new();
     for i in 0..8 {
         h.store(key(&format!("k{i}")), int(i)).unwrap();
     }
@@ -406,7 +406,7 @@ fn bucket_delete_exactness_canary() {
     // The §2.2.13 canary: bucket-index stability across deletion is mechanically certain but contractually silent in
     // hashbrown's public docs.  Interleaved deletions at scale must leave the visit set exact — every surviving key
     // visited exactly once, every pre-visit-deleted key never visited.  A hashbrown behavior change fails this loudly.
-    let mut h = PerlHash::new();
+    let mut h = Hash::new();
     let n = 300;
     for i in 0..n {
         h.store(key(&format!("k{i:03}")), int(i)).unwrap();
@@ -448,14 +448,14 @@ fn bucket_delete_exactness_canary() {
 // ── The §2.2.13 immutable engine ──────────────────────────────
 #[test]
 fn snapshot_is_supported_only_on_the_immutable_engine() {
-    assert_eq!(PerlHash::new().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
-    assert_eq!(PerlHash::insertion_ordered().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+    assert_eq!(Hash::new().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+    assert_eq!(Hash::insertion_ordered().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
 }
 
 #[cfg(feature = "imbl")]
 #[test]
 fn snapshots_are_detached_diverging_copies() {
-    let mut h = PerlHash::immutable();
+    let mut h = Hash::immutable();
     for k in ["a", "b", "c"] {
         h.store(key(k), int(1)).unwrap();
     }
@@ -477,7 +477,7 @@ fn snapshots_are_detached_diverging_copies() {
 fn immutable_each_revalidates_live() {
     // §2.2.13: the parked snapshot walk skips keys deleted since, reads values live, and holds new keys for the restart
     // — with no reset forced by any mutation.
-    let mut h = PerlHash::immutable();
+    let mut h = Hash::immutable();
     for i in 0..6 {
         h.store(key(&format!("k{i}")), int(i)).unwrap();
     }
@@ -530,10 +530,10 @@ fn immutable_each_revalidates_live() {
 // ── Handles ───────────────────────────────────────────────────
 #[test]
 fn handle_identity_and_traversal() {
-    let a = ArrayRef::new(PerlArray::new());
+    let a = ArrayRef::new(Array::new());
     let a2 = a.clone();
     assert!(ArrayRef::ptr_eq(&a, &a2));
-    let b = ArrayRef::new(PerlArray::new());
+    let b = ArrayRef::new(Array::new());
     assert!(!ArrayRef::ptr_eq(&a, &b));
     assert_ne!(a.addr(), 0);
 
@@ -542,7 +542,7 @@ fn handle_identity_and_traversal() {
     assert_eq!(a2.read().len(), 2, "writes visible through the clone: shared identity");
     assert_eq!(a.read().values_iter().map(Value::to_int).sum::<i64>(), 3, "collector hook");
 
-    let h = HashRef::new(PerlHash::new());
+    let h = HashRef::new(Hash::new());
     h.write().store(key("k"), int(5)).unwrap();
     assert_eq!(h.read().values_iter().count(), 1);
     assert!(format!("{h:?}").starts_with("HashRef(0x"));
@@ -552,15 +552,15 @@ fn handle_identity_and_traversal() {
 fn concurrency_foundation_send_sync() {
     // The utility-crate contract: every shared-capable type crosses threads.
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<PerlString>();
+    assert_send_sync::<PString>();
     assert_send_sync::<Value>();
-    assert_send_sync::<PerlHash>();
-    assert_send_sync::<PerlArray>();
+    assert_send_sync::<Hash>();
+    assert_send_sync::<Array>();
     assert_send_sync::<ArrayRef>();
     assert_send_sync::<HashRef>();
-    assert_send_sync::<crate::scalar::ScalarRef>();
+    assert_send_sync::<crate::scalar::Referent>();
 
     // The immutable engine's map and parked iterator must cross threads with the rest.
     #[cfg(feature = "imbl")]
-    assert_send_sync::<imbl::HashMap<PerlString, Value>>();
+    assert_send_sync::<imbl::HashMap<PString, Value>>();
 }

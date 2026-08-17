@@ -4,13 +4,13 @@
 //! the digits of the value's default stringification, which is otherwise recomputed on every print, hash-key use, and
 //! interpolation.
 //!
-//! # Why these are `repr(packed)`, and why `PerlString` is `repr(align(8))`
+//! # Why these are `repr(packed)`, and why `PString` is `repr(align(8))`
 //!
-//! The discriminant is not a byte the layout sets aside: it lives in the niche of [`PerlString`](crate::string)'s own
-//! tag, which uses 96 of its 256 values.  Niche-filling requires every other variant's data to avoid that byte, and
-//! Rust lays a variant out as a self-contained struct *before* placing it — so a field wanting eight-byte alignment
-//! lands at offset 8 and fills the payload, leaving nowhere for a cache.  Adding even one cache byte beside a bare
-//! `i64` costs eight, for the same reason a taint byte did before taint moved into the discriminant.
+//! The discriminant is not a byte the layout sets aside: it lives in the niche of [`PString`](crate::string)'s own tag,
+//! which uses 96 of its 256 values.  Niche-filling requires every other variant's data to avoid that byte, and Rust
+//! lays a variant out as a self-contained struct *before* placing it — so a field wanting eight-byte alignment lands at
+//! offset 8 and fills the payload, leaving nowhere for a cache.  Adding even one cache byte beside a bare `i64` costs
+//! eight, for the same reason a taint byte did before taint moved into the discriminant.
 //!
 //! What does work, measured against what does not:
 //!
@@ -21,13 +21,13 @@
 //! | `Integer([u8; 7], i64)` — cache first                        |   24   |
 //! | `Integer(SomeReprCStruct)` — the pair as a struct            |   24   |
 //! | `#[repr(align(8))]` on the *enclosing* enum                  |   24   |
-//! | **`repr(packed)` payload, `repr(align(8))` on `PerlString`** | **16** |
+//! | **`repr(packed)` payload, `repr(align(8))` on `PString`** | **16** |
 //!
 //! `repr(packed)` gives these structs alignment 1, so the whole struct sits at offset 1 and the datum lands at envelope
 //! offset 8 — with seven bytes ahead of it for the cache.  The eight-byte alignment that makes offset 8 a real boundary
-//! comes from `PerlString` carrying `repr(align(8))`: applied *there* it is free, that type being sixteen bytes
-//! already, and the enclosing enums inherit alignment from their largest variant.  Applied to `Value` directly it
-//! defeats niche-filling and costs eight bytes, which is the arrangement that does not work.
+//! comes from `PString` carrying `repr(align(8))`: applied *there* it is free, that type being sixteen bytes already,
+//! and the enclosing enums inherit alignment from their largest variant.  Applied to `Value` directly it defeats
+//! niche-filling and costs eight bytes, which is the arrangement that does not work.
 //!
 //! So every datum access is an ordinary aligned load.  `repr(packed)` buys the layout here, not unaligned reads.
 //!
@@ -45,7 +45,7 @@
 use std::fmt;
 
 use crate::cow_buffer::AllocError;
-use crate::string::PerlString;
+use crate::string::PString;
 use crate::value::{float_digits, format_float_into, format_int_into, present_float};
 
 /// Cache bytes available beside an eight-byte datum: the envelope's fifteen, less the datum's eight.
@@ -199,7 +199,7 @@ numeric_payload!(FloatPayload, f64, FloatCache, "A float and the digits of its `
 
 impl IntegerPayload {
     /// Render, from the cached digits when they are there.
-    pub(crate) fn render(self, out: &mut PerlString) -> Result<(), AllocError> {
+    pub(crate) fn render(self, out: &mut PString) -> Result<(), AllocError> {
         match self.cache.count() {
             Some(count) => emit_digits(self.cache.digits(count), count, self.value() < 0, out),
             None => format_int_into(self.value(), out),
@@ -216,7 +216,7 @@ impl IntegerPayload {
 
 impl UnsignedPayload {
     /// Render, from the cached digits when they are there.
-    pub(crate) fn render(self, out: &mut PerlString) -> Result<(), AllocError> {
+    pub(crate) fn render(self, out: &mut PString) -> Result<(), AllocError> {
         match self.cache.count() {
             Some(count) => emit_digits(self.cache.digits(count), count, false, out),
             None => out.push_fmt(format_args!("{}", self.value())),
@@ -234,7 +234,7 @@ impl FloatPayload {
     ///
     /// The cache holds what the expensive half of float formatting produces — the significant digits and the decimal
     /// exponent — so a cached render is only `%g`'s presentation step.  Specials never cache: they have no digits.
-    pub(crate) fn render(self, out: &mut PerlString) -> Result<(), AllocError> {
+    pub(crate) fn render(self, out: &mut PString) -> Result<(), AllocError> {
         match self.cache.count() {
             Some(count) => {
                 let digits = self.cache.digits(count);
@@ -274,7 +274,7 @@ fn decimal_cache(magnitude: u64) -> IntegerCache {
 }
 
 /// Write a sign and a run of decimal digits.
-fn emit_digits(digits: [u8; MAX_DIGITS], count: usize, negative: bool, out: &mut PerlString) -> Result<(), AllocError> {
+fn emit_digits(digits: [u8; MAX_DIGITS], count: usize, negative: bool, out: &mut PString) -> Result<(), AllocError> {
     let mut buf = [0u8; MAX_DIGITS + 1];
     let mut len = 0;
 

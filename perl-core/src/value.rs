@@ -6,11 +6,10 @@
 //! numification are each one `match` on the payload, written once.  The stale-cache bug class of the flag-matrix model
 //! is unrepresentable here.
 //!
-//! This module carries the §21.1 step-3 subset: the scalar payload variants.  The reference variants
-//! (`ScalarRef`/`ArrayRef`/`HashRef`/`CodeRef`/`RegexRef`), the `Scalar` aliasing variant, and `Typed` land with their
-//! own steps (§21.1 steps 4–6), which introduce the referent types; the enums are laid out so those additions preserve
-//! the 16-byte envelope (§2.3.6).  The module name is temporary in the same sense as `string.rs`: the final names
-//! arrive when the superseded flag-matrix modules are deleted.
+//! This module carries the §21.1 step-3 subset plus the landed reference and aliasing variants; `CodeRef`, `RegexRef`,
+//! and `Typed` land with their own steps (§21.1 steps 4–6), which introduce the remaining referent types; the enum is
+//! laid out so those additions preserve the 16-byte envelope (§2.3.6).  The module name is temporary in the same sense
+//! as `string.rs`: the final names arrive when the superseded flag-matrix modules are deleted.
 //!
 //! Numeric contracts are container-verified against perl 5.38 and pin the **i64-visible** behavior only — the value
 //! this crate exposes as an `i64`, which is what perl's own integer context yields for everything in range.  Unsigned
@@ -40,8 +39,8 @@ use crate::containers::{ArrayRef, HashRef};
 use crate::cow_buffer::AllocError;
 use crate::heap::HeapArc;
 use crate::numeric::{FloatPayload, IntegerPayload, UnsignedPayload};
-use crate::scalar::{ConstScalar, FALSE_SCALAR, ScalarCell, ScalarRef, TRUE_SCALAR};
-use crate::string::{DECODE_MAX, PerlString};
+use crate::scalar::{ConstScalar, FALSE_SCALAR, Referent, Scalar, TRUE_SCALAR};
+use crate::string::{DECODE_MAX, PString};
 
 // ── Tainted (§2.6.1, §2.6.3) ──────────────────────────────────────
 /// The per-value taint bit: a monotonic bool newtype.  Constructors are explicit (`CLEAN` / `TAINTED` — sources that
@@ -114,20 +113,20 @@ pub enum Value {
     FloatTainted(FloatPayload),
 
     /// Clean: a reference to a mutable scalar (§2.2.1, flattened per mutability).
-    ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
+    ScalarRef(HeapArc<RwLock<Scalar>>),
 
     /// Tainted (§2.6): a reference to a mutable scalar (§2.2.1, flattened per mutability).  The taint dimension is a
     /// discriminant twin rather than a field, because a taint byte beside an eight-byte datum cannot fit the envelope's
     /// niche-supplied tag (measured).
-    ScalarRefMutTainted(HeapArc<RwLock<ScalarCell>>),
+    ScalarRefTainted(HeapArc<RwLock<Scalar>>),
 
     /// Clean: a reference to a frozen scalar (§2.3.1 `Const`).
-    ScalarRefConst(HeapArc<ConstScalar>),
+    ConstScalarRef(HeapArc<ConstScalar>),
 
     /// Tainted (§2.6): a reference to a frozen scalar (§2.3.1 `Const`).  The taint dimension is a discriminant twin
     /// rather than a field, because a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied
     /// tag (measured).
-    ScalarRefConstTainted(HeapArc<ConstScalar>),
+    ConstScalarRefTainted(HeapArc<ConstScalar>),
 
     /// Clean: a reference to an array.
     ArrayRef(ArrayRef),
@@ -144,7 +143,7 @@ pub enum Value {
     HashRefTainted(HashRef),
 
     /// A string, whose taint rides its own tag (§2.2.3).
-    String(PerlString),
+    String(PString),
 
     /// Both faces real (§2.3.4): a dualvar, `$!`, or a string that has numified once.  Carrying a numeric face is what
     /// suppresses the repeat warning, so no tag bit records it.
@@ -156,10 +155,10 @@ pub enum Value {
     False,
 
     /// An aliasing slot naming a promoted mutable scalar; taint belongs to the referent, not the alias.
-    ScalarMut(HeapArc<RwLock<ScalarCell>>),
+    AliasMut(HeapArc<RwLock<Scalar>>),
 
     /// An aliasing slot naming a frozen scalar.
-    ScalarConst(HeapArc<ConstScalar>),
+    AliasConst(HeapArc<ConstScalar>),
 }
 
 impl Value {
@@ -197,14 +196,14 @@ impl Value {
         if taint.is_tainted() { Value::FloatTainted(p) } else { Value::Float(p) }
     }
 
-    /// A `ScalarRefMut`, clean or tainted as `taint` says.
-    pub fn scalar_ref_mut(value: HeapArc<RwLock<ScalarCell>>, taint: Tainted) -> Value {
-        if taint.is_tainted() { Value::ScalarRefMutTainted(value) } else { Value::ScalarRefMut(value) }
+    /// A `ScalarRef`, clean or tainted as `taint` says.
+    pub fn scalar_ref(value: HeapArc<RwLock<Scalar>>, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::ScalarRefTainted(value) } else { Value::ScalarRef(value) }
     }
 
-    /// A `ScalarRefConst`, clean or tainted as `taint` says.
-    pub fn scalar_ref_const(value: HeapArc<ConstScalar>, taint: Tainted) -> Value {
-        if taint.is_tainted() { Value::ScalarRefConstTainted(value) } else { Value::ScalarRefConst(value) }
+    /// A `ConstScalarRef`, clean or tainted as `taint` says.
+    pub fn const_scalar_ref(value: HeapArc<ConstScalar>, taint: Tainted) -> Value {
+        if taint.is_tainted() { Value::ConstScalarRefTainted(value) } else { Value::ConstScalarRef(value) }
     }
 
     /// A `ArrayRef`, clean or tainted as `taint` says.
@@ -262,7 +261,7 @@ impl Numeric {
 pub struct DualPayload {
     /// What stringification yields, and what decides truth — perl tests the string face, so `dualvar(5, "0")` is false
     /// and `dualvar(0, "00")` is true (container-verified).
-    pub string: PerlString,
+    pub string: PString,
 
     /// What numification yields, without re-parsing and therefore without warning again.
     pub numeric: Numeric,
@@ -283,8 +282,8 @@ pub enum Numeric {
 }
 
 impl Value {
-    /// Perl truthiness, one match on the payload.  Container-verified: NaN is true, `-0.0` is false, `""` and
-    /// `"0"` are the only false strings.
+    /// Perl truthiness, one match on the payload.  Container-verified: NaN is true, `-0.0` is false, `""` and `"0"` are
+    /// the only false strings.
     pub fn to_bool(&self) -> bool {
         match self {
             Value::Undef | Value::UndefTainted => false,
@@ -297,22 +296,22 @@ impl Value {
             Value::Dual(d) | Value::DualTainted(d) => d.string.to_bool(),
             Value::True => true,
             Value::False => false,
-            Value::ScalarRefMut(..)
-            | Value::ScalarRefMutTainted(..)
-            | Value::ScalarRefConst(..)
-            | Value::ScalarRefConstTainted(..)
+            Value::ScalarRef(..)
+            | Value::ScalarRefTainted(..)
+            | Value::ConstScalarRef(..)
+            | Value::ConstScalarRefTainted(..)
             | Value::ArrayRef(..)
             | Value::ArrayRefTainted(..)
             | Value::HashRef(..)
             | Value::HashRefTainted(..) => true, // References are always true (verified).
-            Value::ScalarMut(c) => c.read().to_bool(),
-            Value::ScalarConst(c) => c.to_bool(),
+            Value::AliasMut(c) => c.read().to_bool(),
+            Value::AliasConst(c) => c.to_bool(),
         }
     }
 
-    /// The u64-visible integer coercion: the same 64 bits `to_int` yields, read unsigned — which is what perl's
-    /// `%u` renders (container-verified across the range, including the wrapping and clamping cases).  Exact
-    /// arithmetic on `Unsigned` values needs this reading; nothing else about it differs.
+    /// The u64-visible integer coercion: the same 64 bits `to_int` yields, read unsigned — which is what perl's `%u`
+    /// renders (container-verified across the range, including the wrapping and clamping cases).  Exact arithmetic on
+    /// `Unsigned` values needs this reading; nothing else about it differs.
     pub fn to_unsigned(&self) -> u64 {
         self.to_int() as u64
     }
@@ -328,12 +327,12 @@ impl Value {
             Value::Dual(d) | Value::DualTainted(d) => d.numeric.to_int(),
             Value::True => 1,
             Value::False => 0,
-            Value::ScalarRefMut(c) | Value::ScalarRefMutTainted(c) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
-            Value::ScalarRefConst(c) | Value::ScalarRefConstTainted(c) => HeapArc::as_ptr(c) as usize as i64,
+            Value::ScalarRef(c) | Value::ScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
+            Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as i64,
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => r.addr() as i64,
             Value::HashRef(r) | Value::HashRefTainted(r) => r.addr() as i64,
-            Value::ScalarMut(c) => c.read().to_int(),
-            Value::ScalarConst(c) => c.to_int(),
+            Value::AliasMut(c) => c.read().to_int(),
+            Value::AliasConst(c) => c.to_int(),
         }
     }
 
@@ -348,17 +347,17 @@ impl Value {
             Value::Dual(d) | Value::DualTainted(d) => d.numeric.to_float(),
             Value::True => 1.0,
             Value::False => 0.0,
-            Value::ScalarRefMut(c) | Value::ScalarRefMutTainted(c) => HeapArc::as_ptr(c) as usize as f64,
-            Value::ScalarRefConst(c) | Value::ScalarRefConstTainted(c) => HeapArc::as_ptr(c) as usize as f64,
+            Value::ScalarRef(c) | Value::ScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as f64,
+            Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as f64,
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => r.addr() as f64,
             Value::HashRef(r) | Value::HashRefTainted(r) => r.addr() as f64,
-            Value::ScalarMut(c) => c.read().to_float(),
-            Value::ScalarConst(c) => c.to_float(),
+            Value::AliasMut(c) => c.read().to_float(),
+            Value::AliasConst(c) => c.to_float(),
         }
     }
 
-    /// Numification with perl's int-vs-float classification: integer payloads and exactly-integral string
-    /// tokens in i64 range numify as integers; everything else as floats.
+    /// Numification with perl's int-vs-float classification: integer payloads and exactly-integral string tokens in i64
+    /// range numify as integers; everything else as floats.
     pub fn numify(&self) -> Numeric {
         match self {
             Value::Undef | Value::UndefTainted => Numeric::Integer(0),
@@ -369,53 +368,53 @@ impl Value {
             Value::Dual(d) | Value::DualTainted(d) => d.numeric,
             Value::True => Numeric::Integer(1),
             Value::False => Numeric::Integer(0),
-            Value::ScalarRefMut(c) | Value::ScalarRefMutTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
-            Value::ScalarRefConst(c) | Value::ScalarRefConstTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
+            Value::ScalarRef(c) | Value::ScalarRefTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
+            Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => Numeric::Integer(r.addr() as i64),
             Value::HashRef(r) | Value::HashRefTainted(r) => Numeric::Integer(r.addr() as i64),
-            Value::ScalarMut(c) => c.read().payload().numify(),
-            Value::ScalarConst(c) => c.payload().numify(),
+            Value::AliasMut(c) => c.read().payload().numify(),
+            Value::AliasConst(c) => c.payload().numify(),
         }
     }
 
-    /// Stringification, one match on the payload, producing a `PerlString` with the operand's taint propagated
-    /// (string payloads carry theirs in the tag already; `True` is `"1"`, `False` is `""`, both clean — the
-    /// immortal-boolean rule).  Numeric renderings are at most 24 ASCII bytes, hence inline; the `Result` is
-    /// the honest allocation contract, not an expected path.
-    pub fn stringify(&self) -> Result<PerlString, AllocError> {
-        // Each arm renders into the `PerlString` itself: a scratch buffer would only be copied from and
-        // dropped, and the value can usually hold the result without allocating at all.
-        let (out, taint): (PerlString, Tainted) = match self {
-            Value::Undef | Value::UndefTainted => (PerlString::empty(), self.taint()),
+    /// Stringification, one match on the payload, producing a `PString` with the operand's taint propagated (string
+    /// payloads carry theirs in the tag already; `True` is `"1"`, `False` is `""`, both clean — the immortal-boolean
+    /// rule).  Numeric renderings are at most 24 ASCII bytes, hence inline; the `Result` is the honest allocation
+    /// contract, not an expected path.
+    pub fn stringify(&self) -> Result<PString, AllocError> {
+        // Each arm renders into the `PString` itself: a scratch buffer would only be copied from and dropped, and the
+        // value can usually hold the result without allocating at all.
+        let (out, taint): (PString, Tainted) = match self {
+            Value::Undef | Value::UndefTainted => (PString::empty(), self.taint()),
             Value::Integer(n) | Value::IntegerTainted(n) => {
                 // Through the payload, so cached digits are used when present.
-                let mut rendered = PerlString::empty();
+                let mut rendered = PString::empty();
                 n.render(&mut rendered)?;
                 (rendered, self.taint())
             }
             Value::Unsigned(u) | Value::UnsignedTainted(u) => {
                 // Exact digits: at most twenty characters, so the packed numeric alphabet holds them.
-                let mut rendered = PerlString::empty();
+                let mut rendered = PString::empty();
                 u.render(&mut rendered)?;
                 (rendered, self.taint())
             }
             Value::Float(f) | Value::FloatTainted(f) => {
-                let mut rendered = PerlString::empty();
+                let mut rendered = PString::empty();
                 f.render(&mut rendered)?;
                 (rendered, self.taint())
             }
             Value::String(s) => return Ok(s.clone()),
             Value::Dual(d) | Value::DualTainted(d) => return Ok(d.string.clone()),
-            Value::True => (PerlString::from_bytes(b"1")?, Tainted::CLEAN),
-            Value::False => (PerlString::empty(), Tainted::CLEAN),
+            Value::True => (PString::from_bytes(b"1")?, Tainted::CLEAN),
+            Value::False => (PString::empty(), Tainted::CLEAN),
 
             // Container-verified form: SCALAR(0x...) with lowercase hex.
-            Value::ScalarRefMut(c) | Value::ScalarRefMutTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
-            Value::ScalarRefConst(c) | Value::ScalarRefConstTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
+            Value::ScalarRef(c) | Value::ScalarRefTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
+            Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => (ref_repr("ARRAY", r.addr())?, self.taint()),
             Value::HashRef(r) | Value::HashRefTainted(r) => (ref_repr("HASH", r.addr())?, self.taint()),
-            Value::ScalarMut(c) => return c.read().stringify(),
-            Value::ScalarConst(c) => return Ok(c.stringify().clone()),
+            Value::AliasMut(c) => return c.read().stringify(),
+            Value::AliasConst(c) => return Ok(c.stringify().clone()),
         };
 
         let mut out = out;
@@ -426,18 +425,18 @@ impl Value {
         Ok(out)
     }
 
-    /// Whether the value is tainted, read through the payload (string payloads carry it in the tag).  Named
-    /// parallel to `PerlString::is_tainted`; `PerlString::taint` is the tag *setter*.
+    /// Whether the value is tainted, read through the payload (string payloads carry it in the tag).  Named parallel to
+    /// `PString::is_tainted`; `PString::taint` is the tag *setter*.
     pub fn is_tainted(&self) -> bool {
-        // Exhaustive rather than a catch-all: the aliasing slots answer through their referent, and a wildcard
-        // would silently claim any future variant is clean.
+        // Exhaustive rather than a catch-all: the aliasing slots answer through their referent, and a wildcard would
+        // silently claim any future variant is clean.
         match self {
             Value::UndefTainted
             | Value::IntegerTainted(_)
             | Value::UnsignedTainted(_)
             | Value::FloatTainted(_)
-            | Value::ScalarRefMutTainted(_)
-            | Value::ScalarRefConstTainted(_)
+            | Value::ScalarRefTainted(_)
+            | Value::ConstScalarRefTainted(_)
             | Value::ArrayRefTainted(_)
             | Value::HashRefTainted(_) => true,
 
@@ -445,8 +444,8 @@ impl Value {
             | Value::Integer(_)
             | Value::Unsigned(_)
             | Value::Float(_)
-            | Value::ScalarRefMut(_)
-            | Value::ScalarRefConst(_)
+            | Value::ScalarRef(_)
+            | Value::ConstScalarRef(_)
             | Value::ArrayRef(_)
             | Value::HashRef(_)
             | Value::True
@@ -455,20 +454,20 @@ impl Value {
             Value::String(s) => s.is_tainted(),
             Value::Dual(_) => false,
             Value::DualTainted(_) => true,
-            Value::ScalarMut(c) => c.read().is_tainted(),
-            Value::ScalarConst(c) => c.is_tainted(),
+            Value::AliasMut(c) => c.read().is_tainted(),
+            Value::AliasConst(c) => c.is_tainted(),
         }
     }
 
     /// A copy whose numeric rendering is cached, when its digits fit the seven bytes beside the datum.
     ///
-    /// Rendering a number is the expensive part of stringifying one, and the digits are the same every time,
-    /// so a value that will be printed, interpolated, or used as a hash key more than once should carry them.
-    /// Non-numeric values are returned unchanged: they have no digits.
+    /// Rendering a number is the expensive part of stringifying one, and the digits are the same every time, so a value
+    /// that will be printed, interpolated, or used as a hash key more than once should carry them.  Non-numeric values
+    /// are returned unchanged: they have no digits.
     ///
-    /// Who calls this is not yet settled (§2.2.9): filling through a shared reference needs atomic cache bytes,
-    /// while filling only where a caller holds the value mutably — as here — misses values read through shared
-    /// containers.  This is the mutable path; the shared one awaits that ruling.
+    /// Who calls this is not yet settled (§2.2.9): filling through a shared reference needs atomic cache bytes, while
+    /// filling only where a caller holds the value mutably — as here — misses values read through shared containers.
+    /// This is the mutable path; the shared one awaits that ruling.
     pub fn with_cached_digits(self) -> Value {
         match self {
             Value::Integer(n) => Value::Integer(n.filled()),
@@ -478,8 +477,8 @@ impl Value {
             Value::Float(f) => Value::Float(f.filled()),
             Value::FloatTainted(f) => Value::FloatTainted(f.filled()),
 
-            // Nothing else renders from digits.  A later numeric kind would want an arm here; missing one
-            // costs the optimization, never correctness.
+            // Nothing else renders from digits.  A later numeric kind would want an arm here; missing one costs the
+            // optimization, never correctness.
             other => other,
         }
     }
@@ -491,12 +490,12 @@ impl Value {
             Value::Unsigned(u) | Value::UnsignedTainted(u) => u.is_cached(),
             Value::Float(f) | Value::FloatTainted(f) => f.is_cached(),
 
-            // A dual's rendering is its string face, present by construction — no digits ever need formatting,
-            // which is exactly what this predicate promises to its caller.
+            // A dual's rendering is its string face, present by construction — no digits ever need formatting, which is
+            // exactly what this predicate promises to its caller.
             Value::Dual(_) | Value::DualTainted(_) => true,
 
-            // Everything else renders from no digit cache; a later numeric kind falling here costs the
-            // optimization, never correctness (as with `filled` above).
+            // Everything else renders from no digit cache; a later numeric kind falling here costs the optimization,
+            // never correctness (as with `filled` above).
             _ => false,
         }
     }
@@ -517,7 +516,7 @@ impl Value {
     /// (§2.3.3: `\(1==1)` twice yields the same address — but a boolean held in a *variable* promotes to its own cell
     /// via [`Value::take_ref`]; container-verified distinct).  Other temporaries answer `None`: non-slot temporaries
     /// reach references through the ops layer's temp materialization.
-    pub fn upgrade_to_scalar(&self) -> Option<ScalarRef> {
+    pub fn upgrade_to_scalar(&self) -> Option<Referent> {
         match self {
             Value::True => Some(TRUE_SCALAR.clone()),
             Value::False => Some(FALSE_SCALAR.clone()),
@@ -525,13 +524,13 @@ impl Value {
         }
     }
 
-    /// `\$x` — the taking-a-reference upgrade trigger (§2.2.8): promote the slot in place through the `Scalar` variant
-    /// (a stable identity the slot now aliases) and return the reference value.  Idempotent on identity: taking twice
-    /// yields `ptr_eq` references.  The reference value itself is clean — taint belongs to the referent.
+    /// `\$x` — the taking-a-reference upgrade trigger (§2.2.8): promote the slot in place through the `AliasMut`
+    /// variant (a stable identity the slot now aliases) and return the reference value.  Idempotent on identity: taking
+    /// twice yields `ptr_eq` references.  The reference value itself is clean — taint belongs to the referent.
     pub fn take_ref(slot: &mut Value) -> Value {
         match slot {
-            Value::ScalarMut(c) => return Value::scalar_ref_mut(c.clone(), Tainted::CLEAN),
-            Value::ScalarConst(c) => return Value::scalar_ref_const(c.clone(), Tainted::CLEAN),
+            Value::AliasMut(c) => return Value::scalar_ref(c.clone(), Tainted::CLEAN),
+            Value::AliasConst(c) => return Value::const_scalar_ref(c.clone(), Tainted::CLEAN),
             _ => {}
         }
 
@@ -544,10 +543,10 @@ impl Value {
             Value::UnsignedTainted(u) => Value::UnsignedTainted(u),
             Value::Float(f) => Value::Float(f),
             Value::FloatTainted(f) => Value::FloatTainted(f),
-            Value::ScalarRefMut(c) => Value::ScalarRefMut(c),
-            Value::ScalarRefMutTainted(c) => Value::ScalarRefMutTainted(c),
-            Value::ScalarRefConst(c) => Value::ScalarRefConst(c),
-            Value::ScalarRefConstTainted(c) => Value::ScalarRefConstTainted(c),
+            Value::ScalarRef(c) => Value::ScalarRef(c),
+            Value::ScalarRefTainted(c) => Value::ScalarRefTainted(c),
+            Value::ConstScalarRef(c) => Value::ConstScalarRef(c),
+            Value::ConstScalarRefTainted(c) => Value::ConstScalarRefTainted(c),
             Value::ArrayRef(r) => Value::ArrayRef(r),
             Value::ArrayRefTainted(r) => Value::ArrayRefTainted(r),
             Value::HashRef(r) => Value::HashRef(r),
@@ -557,21 +556,21 @@ impl Value {
             Value::DualTainted(d) => Value::DualTainted(d),
             Value::True => Value::True,
             Value::False => Value::False,
-            Value::ScalarMut(c) => {
+            Value::AliasMut(c) => {
                 // Unreachable (handled above); restore and share rather than panic.
-                *slot = Value::ScalarMut(c.clone());
-                return Value::scalar_ref_mut(c, Tainted::CLEAN);
+                *slot = Value::AliasMut(c.clone());
+                return Value::scalar_ref(c, Tainted::CLEAN);
             }
-            Value::ScalarConst(c) => {
-                *slot = Value::ScalarConst(c.clone());
-                return Value::scalar_ref_const(c, Tainted::CLEAN);
+            Value::AliasConst(c) => {
+                *slot = Value::AliasConst(c.clone());
+                return Value::const_scalar_ref(c, Tainted::CLEAN);
             }
         };
 
-        let cell = HeapArc::new(RwLock::new(ScalarCell::Plain(payload)));
-        *slot = Value::ScalarMut(cell.clone());
+        let cell = HeapArc::new(RwLock::new(Scalar::Plain(payload)));
+        *slot = Value::AliasMut(cell.clone());
 
-        Value::scalar_ref_mut(cell, Tainted::CLEAN)
+        Value::scalar_ref(cell, Tainted::CLEAN)
     }
 
     /// Whether this value holds a strong graph edge (§2.4.9): the reference and aliasing variants.  Non-edge values
@@ -580,16 +579,16 @@ impl Value {
         // Exhaustive on purpose — no wildcard, no bare list.  A wildcard here is how the tainted twins went missing
         // from the teardown classification: adding a variant must break this match, never silently classify as leaf.
         match self {
-            Value::ScalarRefMut(..)
-            | Value::ScalarRefMutTainted(..)
-            | Value::ScalarRefConst(..)
-            | Value::ScalarRefConstTainted(..)
+            Value::ScalarRef(..)
+            | Value::ScalarRefTainted(..)
+            | Value::ConstScalarRef(..)
+            | Value::ConstScalarRefTainted(..)
             | Value::ArrayRef(..)
             | Value::ArrayRefTainted(..)
             | Value::HashRef(..)
             | Value::HashRefTainted(..)
-            | Value::ScalarMut(_)
-            | Value::ScalarConst(_) => true,
+            | Value::AliasMut(_)
+            | Value::AliasConst(_) => true,
             Value::Undef
             | Value::UndefTainted
             | Value::Integer(..)
@@ -618,8 +617,8 @@ impl Value {
 
         match self {
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => Some(r.clone()),
-            Value::ScalarMut(cell) => from_payload(cell.read().payload()),
-            Value::ScalarConst(cs) => from_payload(cs.payload()),
+            Value::AliasMut(cell) => from_payload(cell.read().payload()),
+            Value::AliasConst(cs) => from_payload(cs.payload()),
             _ => None,
         }
     }
@@ -635,28 +634,28 @@ impl Value {
 
         match self {
             Value::HashRef(r) | Value::HashRefTainted(r) => Some(r.clone()),
-            Value::ScalarMut(cell) => from_payload(cell.read().payload()),
-            Value::ScalarConst(cs) => from_payload(cs.payload()),
+            Value::AliasMut(cell) => from_payload(cell.read().payload()),
+            Value::AliasConst(cs) => from_payload(cs.payload()),
             _ => None,
         }
     }
 
     /// `$$r` — scalar dereference: the identity behind a reference value (through the aliasing variant if the slot is
     /// promoted).  `None` for non-references; the "Not a SCALAR reference" error is ops-layer.
-    pub fn deref_scalar(&self) -> Option<ScalarRef> {
-        fn from_payload(p: &Value) -> Option<ScalarRef> {
+    pub fn deref_scalar(&self) -> Option<Referent> {
+        fn from_payload(p: &Value) -> Option<Referent> {
             match p {
-                Value::ScalarRefMut(c) | Value::ScalarRefMutTainted(c) => Some(ScalarRef::Mut(c.clone())),
-                Value::ScalarRefConst(c) | Value::ScalarRefConstTainted(c) => Some(ScalarRef::Const(c.clone())),
+                Value::ScalarRef(c) | Value::ScalarRefTainted(c) => Some(Referent::Mut(c.clone())),
+                Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => Some(Referent::Const(c.clone())),
                 _ => None,
             }
         }
 
         match self {
-            Value::ScalarRefMut(c) | Value::ScalarRefMutTainted(c) => Some(ScalarRef::Mut(c.clone())),
-            Value::ScalarRefConst(c) | Value::ScalarRefConstTainted(c) => Some(ScalarRef::Const(c.clone())),
-            Value::ScalarMut(cell) => from_payload(cell.read().payload()),
-            Value::ScalarConst(cs) => from_payload(cs.payload()),
+            Value::ScalarRef(c) | Value::ScalarRefTainted(c) => Some(Referent::Mut(c.clone())),
+            Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => Some(Referent::Const(c.clone())),
+            Value::AliasMut(cell) => from_payload(cell.read().payload()),
+            Value::AliasConst(cs) => from_payload(cs.payload()),
             _ => None,
         }
     }
@@ -787,7 +786,7 @@ pub(crate) const FLOAT_DIGIT_MAX: usize = 16;
 
 /// Render digits and a decimal exponent as `%g` presents them: fixed notation within its range, exponent notation
 /// outside it.  The cheap half, and the one a cached rendering reuses.
-pub(crate) fn present_float(digits: &[u8], exp: i32, negative: bool, out: &mut PerlString) -> Result<(), AllocError> {
+pub(crate) fn present_float(digits: &[u8], exp: i32, negative: bool, out: &mut PString) -> Result<(), AllocError> {
     if negative {
         out.push_str("-")?;
     }
@@ -843,7 +842,7 @@ pub(crate) fn present_float(digits: &[u8], exp: i32, negative: bool, out: &mut P
 ///
 /// Explicit `sprintf`/`printf` with a precision is a different operation with unbounded output (§2.2.3); this covers
 /// only the implicit conversion.
-pub(crate) fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), AllocError> {
+pub(crate) fn format_float_into(n: f64, out: &mut PString) -> Result<(), AllocError> {
     if n.is_nan() {
         return out.push_str("NaN");
     }
@@ -863,7 +862,7 @@ pub(crate) fn format_float_into(n: f64, out: &mut PerlString) -> Result<(), Allo
 }
 
 /// Append a run of `'0'`, the one repetition `%g`'s presentation needs.
-fn push_zeros(out: &mut PerlString, count: usize) -> Result<(), AllocError> {
+fn push_zeros(out: &mut PString, count: usize) -> Result<(), AllocError> {
     const ZEROS: &[u8; 24] = b"000000000000000000000000";
 
     let mut left = count;
@@ -877,9 +876,9 @@ fn push_zeros(out: &mut PerlString, count: usize) -> Result<(), AllocError> {
 }
 
 /// Perl's default float stringification as an owned `String`, for callers that want Rust text.  Paths that build a
-/// `PerlString` render into the stack buffer instead and never allocate.
+/// `PString` render into the stack buffer instead and never allocate.
 pub fn format_float(n: f64) -> String {
-    let mut out = PerlString::empty();
+    let mut out = PString::empty();
     match format_float_into(n, &mut out) {
         // Every rendering fits without allocating (§2.2.3), so the error arm is unreachable in practice.
         Ok(()) => String::from_utf8_lossy(out.as_bytes(&mut [0u8; DECODE_MAX])).into_owned(),
@@ -888,16 +887,16 @@ pub fn format_float(n: f64) -> String {
 }
 
 /// Perl's integer stringification, rendered without allocating.
-pub(crate) fn format_int_into(n: i64, out: &mut PerlString) -> Result<(), AllocError> {
+pub(crate) fn format_int_into(n: i64, out: &mut PString) -> Result<(), AllocError> {
     out.push_fmt(format_args!("{n}"))
 }
 
 /// A reference's stringification: `PREFIX(0xADDR)` with lowercase hex, perl's container-verified form.  Rendered
 /// through the stack buffer like the numeric forms; the result exceeds the inline capacity, so this one does allocate.
-fn ref_repr(prefix: &str, addr: usize) -> Result<PerlString, AllocError> {
+fn ref_repr(prefix: &str, addr: usize) -> Result<PString, AllocError> {
     let mut out = ScientificBuf::new();
     let _ = write!(out, "{prefix}(0x{addr:x})");
-    PerlString::from_bytes(out.as_bytes())
+    PString::from_bytes(out.as_bytes())
 }
 
 /// All eight bytes are ASCII digits.  Masking to nibbles first keeps the comparison free of cross-byte carries: the

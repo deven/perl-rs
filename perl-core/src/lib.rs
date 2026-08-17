@@ -2,9 +2,9 @@
 //!
 //! - [`value`] — `Value`, the one datum type (§2.2.2): container slots and promoted scalars alike carry its compact
 //!   cases inline and hold references to shared nodes through it.
-//! - [`scalar`] — `ScalarCell`, a promoted scalar: the payload plus the identity-level state that survives assignment.
-//! - [`containers`] — `PerlArray` and `PerlHash`.
-//! - [`string`] — `PerlString`, an octet sequence with its per-string state: the utf8 flag as a semantic claim, the
+//! - [`scalar`] — `Scalar`, a promoted scalar: the payload plus the identity-level state that survives assignment.
+//! - [`containers`] — `Array` and `Hash`.
+//! - [`string`] — `PString`, an octet sequence with its per-string state: the utf8 flag as a semantic claim, the
 //!   numification-warning bit, taint, and the scan cache recording what is known about Rust-level validity.
 //! - [`cow_buffer`] — the reference-counted copy-on-write buffer behind heap strings.
 //! - [`heap`] — `HeapArc`/`HeapWeak`, the façade over shared ownership that the slab backend will replace.
@@ -17,7 +17,7 @@
 //! A few words recur throughout these modules with a specific meaning:
 //!
 //! - **Envelope** — the sixteen bytes a value occupies: one discriminant byte and fifteen of payload.  `Value`,
-//!   `ScalarCell`, and `PerlString` are all exactly this size, and assertions enforce it.
+//!   `Scalar`, and `PString` are all exactly this size, and assertions enforce it.
 //! - **Tag** — the discriminant byte.  It carries more than which variant is present: the utf8 flag, the
 //!   numification-warning bit, taint, the storage form, and (for strings) what is known about validity are all folded
 //!   into *which variant* a value is, rather than stored as fields.  That folding is why a taint bit costs nothing:

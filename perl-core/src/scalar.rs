@@ -1,4 +1,4 @@
-//! The promoted-scalar layer (§2.3.1–§2.3.4): `ScalarRef` shared identity over the Mut/Const split, `ScalarCell` with
+//! The promoted-scalar layer (§2.3.1–§2.3.4): `Referent` shared identity over the Mut/Const split, `Scalar` with
 //! in-place `Plain`→`Full` upgrade, `ConstScalar` with coercions materialized at birth, the boolean immortal
 //! singletons, the structural readonly error path, and numification-warning state.
 //!
@@ -7,9 +7,9 @@
 //! fidelity; their real shapes are later design sections.
 
 use crate::cow_buffer::AllocError;
-use crate::string::{DECODE_MAX, PerlString};
+use crate::string::{DECODE_MAX, PString};
 use crate::value::{DualPayload, Numeric, Tainted, Value};
-use crate::warnings::{PerlWarning, WarningCategory};
+use crate::warnings::{Warning, WarningCategory};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
 use std::mem;
@@ -66,8 +66,8 @@ impl fmt::Display for ScalarError {
 /// **Cache mechanism (ruled §2.3.2):** the numeric slots are plain atomics — while any reader holds the read lock the
 /// payload is frozen (writes require the write lock and clear the caches under it), so racing fillers compute the
 /// identical value and the race is benign; value stores are `Relaxed` paired with a `Release` validity store and
-/// `Acquire` validity load.  The string slot is `OnceLock<PerlString>` (a `PerlString` cannot be an atomic): the value
-/// sits inline in the slot, and invalidation is `take()` through the write guard's `&mut`.
+/// `Acquire` validity load.  The string slot is `OnceLock<PString>` (a `PString` cannot be an atomic): the value sits
+/// inline in the slot, and invalidation is `take()` through the write guard's `&mut`.
 pub struct FullScalar {
     payload: Value,
 
@@ -76,7 +76,7 @@ pub struct FullScalar {
     cached_int_valid: AtomicBool,
     cached_float_bits: AtomicU64,
     cached_float_valid: AtomicBool,
-    cached_string: OnceLock<PerlString>,
+    cached_string: OnceLock<PString>,
 
     // Rare identity state.
     magic: Option<Box<MagicChain>>,
@@ -109,22 +109,22 @@ impl FullScalar {
     }
 }
 
-// ── ScalarCell — the mutable interior (§2.3.2) ────────────────────
+// ── Scalar — the mutable interior (§2.3.2) ────────────────────
 /// `Plain` is the common promoted case; `Full` is a single pointer threading the payload's spare niche encodings,
 /// keeping the cell at 24 bytes (§2.3.6).  Upgrade happens in place under the write lock: the `Arc` address never
 /// changes, preserving every outstanding reference — perl's `sv_upgrade` identity guarantee with a different mechanism.
-pub enum ScalarCell {
+pub enum Scalar {
     Plain(Value),
     Full(Box<FullScalar>),
 }
 
-impl Drop for ScalarCell {
+impl Drop for Scalar {
     /// Iterative teardown (§2.4.9): a dying cell hands its payload to the release worklist instead of letting drop glue
     /// recurse through a chain of referents.
     fn drop(&mut self) {
         let payload = match self {
-            ScalarCell::Plain(p) => mem::replace(p, Value::undef(Tainted::CLEAN)),
-            ScalarCell::Full(f) => mem::replace(&mut f.payload, Value::undef(Tainted::CLEAN)),
+            Scalar::Plain(p) => mem::replace(p, Value::undef(Tainted::CLEAN)),
+            Scalar::Full(f) => mem::replace(&mut f.payload, Value::undef(Tainted::CLEAN)),
         };
         if payload.carries_strong_edge() {
             release_payload(payload);
@@ -132,21 +132,21 @@ impl Drop for ScalarCell {
     }
 }
 
-impl fmt::Debug for ScalarCell {
+impl fmt::Debug for Scalar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ScalarCell::Plain(p) => f.debug_tuple("Plain").field(p).finish(),
-            ScalarCell::Full(full) => f.debug_struct("Full").field("payload", &full.payload).finish_non_exhaustive(),
+            Scalar::Plain(p) => f.debug_tuple("Plain").field(p).finish(),
+            Scalar::Full(full) => f.debug_struct("Full").field("payload", &full.payload).finish_non_exhaustive(),
         }
     }
 }
 
-impl ScalarCell {
+impl Scalar {
     /// The authoritative payload (§2.2.2).
     pub fn payload(&self) -> &Value {
         match self {
-            ScalarCell::Plain(p) => p,
-            ScalarCell::Full(f) => &f.payload,
+            Scalar::Plain(p) => p,
+            Scalar::Full(f) => &f.payload,
         }
     }
 
@@ -157,8 +157,8 @@ impl ScalarCell {
     /// The integer coercion; `Full` cells memoize through the atomic pair (mechanism in [`FullScalar`]).
     pub fn to_int(&self) -> i64 {
         match self {
-            ScalarCell::Plain(p) => p.to_int(),
-            ScalarCell::Full(f) => {
+            Scalar::Plain(p) => p.to_int(),
+            Scalar::Full(f) => {
                 if f.cached_int_valid.load(Ordering::Acquire) {
                     return f.cached_int.load(Ordering::Relaxed);
                 }
@@ -175,8 +175,8 @@ impl ScalarCell {
     /// The float coercion; `Full` cells memoize as bits through the atomic pair.
     pub fn to_float(&self) -> f64 {
         match self {
-            ScalarCell::Plain(p) => p.to_float(),
-            ScalarCell::Full(f) => {
+            Scalar::Plain(p) => p.to_float(),
+            Scalar::Full(f) => {
                 if f.cached_float_valid.load(Ordering::Acquire) {
                     return f64::from_bits(f.cached_float_bits.load(Ordering::Relaxed));
                 }
@@ -196,10 +196,10 @@ impl ScalarCell {
 
     /// Stringification; `Full` cells memoize in the `OnceLock` slot.  The set-then-get shape (rather than
     /// `get_or_init`) threads the allocation `Result` out; a racing loser's identical value is dropped.
-    pub fn stringify(&self) -> Result<PerlString, AllocError> {
+    pub fn stringify(&self) -> Result<PString, AllocError> {
         match self {
-            ScalarCell::Plain(p) => p.stringify(),
-            ScalarCell::Full(f) => {
+            Scalar::Plain(p) => p.stringify(),
+            Scalar::Full(f) => {
                 if let Some(s) = f.cached_string.get() {
                     return Ok(s.clone());
                 }
@@ -218,18 +218,18 @@ impl ScalarCell {
 
     /// Whether the dynamic readonly flag is set (`Plain` cells never carry it).
     pub fn is_readonly(&self) -> bool {
-        matches!(self, ScalarCell::Full(f) if f.readonly)
+        matches!(self, Scalar::Full(f) if f.readonly)
     }
 
     /// Replace the payload — the single choke point (§2.2.2): derived state drops here.  Fails structurally on the
     /// dynamic readonly flag.
     pub fn assign(&mut self, payload: Value) -> Result<(), ScalarError> {
         match self {
-            ScalarCell::Plain(p) => {
+            Scalar::Plain(p) => {
                 *p = payload;
                 Ok(())
             }
-            ScalarCell::Full(f) => {
+            Scalar::Full(f) => {
                 if f.readonly {
                     return Err(ScalarError::ReadOnly);
                 }
@@ -245,14 +245,14 @@ impl ScalarCell {
     /// In-place `Plain`→`Full` upgrade (§2.3.2); idempotent.  Callers hold the write lock, so the `Arc` address — the
     /// identity — never changes.
     pub fn upgrade_to_full(&mut self) -> &mut FullScalar {
-        if let ScalarCell::Plain(p) = self {
+        if let Scalar::Plain(p) = self {
             let payload = mem::replace(p, Value::undef(Tainted::CLEAN));
-            *self = ScalarCell::Full(FullScalar::new(payload));
+            *self = Scalar::Full(FullScalar::new(payload));
         }
 
         match self {
-            ScalarCell::Full(f) => f,
-            ScalarCell::Plain(_) => unreachable!("upgraded above"),
+            Scalar::Full(f) => f,
+            Scalar::Plain(_) => unreachable!("upgraded above"),
         }
     }
 
@@ -261,8 +261,8 @@ impl ScalarCell {
     pub fn set_readonly(&mut self, readonly: bool) {
         match self {
             // Clearing a flag a `Plain` cell cannot carry: nothing to do, and no reason to promote it.
-            ScalarCell::Plain(_) if !readonly => {}
-            ScalarCell::Plain(_) | ScalarCell::Full(_) => self.upgrade_to_full().readonly = readonly,
+            Scalar::Plain(_) if !readonly => {}
+            Scalar::Plain(_) | Scalar::Full(_) => self.upgrade_to_full().readonly = readonly,
         }
     }
 
@@ -273,7 +273,7 @@ impl ScalarCell {
     }
 
     pub fn has_magic(&self) -> bool {
-        matches!(self, ScalarCell::Full(f) if f.magic.is_some())
+        matches!(self, Scalar::Full(f) if f.magic.is_some())
     }
 
     /// Bless into a stash (upgrades to `Full`).
@@ -291,8 +291,8 @@ impl ScalarCell {
     /// copy-before warns on both (container-verified).
     pub fn numify_noting_warning(&mut self) -> Result<(Numeric, Option<NumifyWarning>), AllocError> {
         let payload = match self {
-            ScalarCell::Plain(p) => p,
-            ScalarCell::Full(f) => &mut f.payload,
+            Scalar::Plain(p) => p,
+            Scalar::Full(f) => &mut f.payload,
         };
 
         // Only a bare string can warn: a `Dual` already holds the face, and every other payload is numeric already.
@@ -328,7 +328,7 @@ impl ScalarCell {
     }
 }
 
-const _: () = assert!(size_of::<ScalarCell>() == 16);
+const _: () = assert!(size_of::<Scalar>() == 16);
 
 // ── ConstScalar — frozen at birth (§2.3.3) ────────────────────────
 /// The lockless immutable cell: every coercion materialized at construction, reads are plain field access, trivially
@@ -338,8 +338,8 @@ pub struct ConstScalar {
     payload: Value,
     int: i64,
     float: f64,
-    string: PerlString,
-    numify_warned: Option<(AtomicBool, PerlString, bool)>,
+    string: PString,
+    numify_warned: Option<(AtomicBool, PString, bool)>,
 }
 
 impl Drop for ConstScalar {
@@ -395,7 +395,7 @@ impl ConstScalar {
         self.float
     }
 
-    pub fn stringify(&self) -> &PerlString {
+    pub fn stringify(&self) -> &PString {
         &self.string
     }
 
@@ -429,11 +429,11 @@ pub enum NumifyWarning {
     /// law — [`WARN_SNIPPET_BYTES`] unflagged, [`WARN_SNIPPET_CHARS`] flagged, the cut sequence-clean, under the face's
     /// own utf8 flag — and `truncated` says the face extended beyond it, which is what the trailing `...` reports when
     /// rendering exhausts the snippet.
-    NotNumeric { snippet: PerlString, truncated: bool },
+    NotNumeric { snippet: PString, truncated: bool },
 
     /// `Argument "%s" treated as 0 in increment (++)`: the magic string increment received content it cannot step.
     /// Same snippet law as `NotNumeric`.  Constructed when the increment family lands.
-    NotIncrementable { snippet: PerlString, truncated: bool },
+    NotIncrementable { snippet: PString, truncated: bool },
 
     /// `Lost precision when incrementing %f by 1` (or decrementing): the float's integer neighbors are farther than one
     /// apart.  Constructed when the increment family lands.
@@ -537,7 +537,7 @@ impl fmt::Display for NumifyWarning {
     }
 }
 
-impl PerlWarning for NumifyWarning {
+impl Warning for NumifyWarning {
     fn parts(&self) -> impl Iterator<Item = (WarningCategory, NumifyWarning)> {
         use NumifyWarning::*;
         use WarningCategory as Cat;
@@ -577,7 +577,7 @@ fn fmt_non_portable(f: &mut fmt::Formatter<'_>, base: RadixBase) -> fmt::Result 
 /// the C locale.  Flagged: output cap 32; printable ASCII verbatim; backslash doubled; everything else — newline
 /// included — `\x{lowercase-hex}` per code point.  Both append three ASCII periods iff source remains, which is the
 /// snippet running out early or the face having extended past it.
-fn render_warn_fragment(snippet: &PerlString, truncated: bool, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+fn render_warn_fragment(snippet: &PString, truncated: bool, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let mut scratch = [0u8; DECODE_MAX];
     let bytes = snippet.as_bytes(&mut scratch);
     let mut columns = 0usize;
@@ -695,67 +695,67 @@ fn decode_extended_code_point(unit: &[u8]) -> u64 {
     cp
 }
 
-// ── ScalarRef — shared identity (§2.3.1) ──────────────────────────
+// ── Referent — shared identity (§2.3.1) ──────────────────────────
 /// The Mut/Const split.  Reference identity is `Arc::ptr_eq`; `Const` reads take no lock; `write()` on a `Const` has no
 /// lock to hand out — the mutation failure is structural.
 #[derive(Clone)]
-pub enum ScalarRef {
-    Mut(HeapArc<RwLock<ScalarCell>>),
+pub enum Referent {
+    Mut(HeapArc<RwLock<Scalar>>),
     Const(HeapArc<ConstScalar>),
 }
 
-impl fmt::Debug for ScalarRef {
+impl fmt::Debug for Referent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
-            ScalarRef::Mut(_) => "Mut",
-            ScalarRef::Const(_) => "Const",
+            Referent::Mut(_) => "Mut",
+            Referent::Const(_) => "Const",
         };
-        write!(f, "ScalarRef::{kind}(0x{:x})", self.addr())
+        write!(f, "Referent::{kind}(0x{:x})", self.addr())
     }
 }
 
-impl ScalarRef {
-    pub fn new_mut(payload: Value) -> ScalarRef {
-        ScalarRef::Mut(HeapArc::new(RwLock::new(ScalarCell::Plain(payload))))
+impl Referent {
+    pub fn new_mut(payload: Value) -> Referent {
+        Referent::Mut(HeapArc::new(RwLock::new(Scalar::Plain(payload))))
     }
 
-    pub fn new_const(cell: ConstScalar) -> ScalarRef {
-        ScalarRef::Const(HeapArc::new(cell))
+    pub fn new_const(cell: ConstScalar) -> Referent {
+        Referent::Const(HeapArc::new(cell))
     }
 
     /// The cell address — the value perl exposes when a reference is numified or stringified (`SCALAR(0x...)`); stable
     /// for the identity's lifetime, shared by clones.
     pub fn addr(&self) -> usize {
         match self {
-            ScalarRef::Mut(c) => HeapArc::as_ptr(c) as usize,
-            ScalarRef::Const(c) => HeapArc::as_ptr(c) as usize,
+            Referent::Mut(c) => HeapArc::as_ptr(c) as usize,
+            Referent::Const(c) => HeapArc::as_ptr(c) as usize,
         }
     }
 
     /// Reference identity (§2.3.1): what `==` on Perl references compares.
-    pub fn ptr_eq(a: &ScalarRef, b: &ScalarRef) -> bool {
+    pub fn ptr_eq(a: &Referent, b: &Referent) -> bool {
         // Exhaustive over the pairs: a wildcard here would report that a reference of some future kind is not equal to
         // itself, which is the one answer this function must never give.
         match (a, b) {
-            (ScalarRef::Mut(x), ScalarRef::Mut(y)) => HeapArc::ptr_eq(x, y),
-            (ScalarRef::Const(x), ScalarRef::Const(y)) => HeapArc::ptr_eq(x, y),
-            (ScalarRef::Mut(_), ScalarRef::Const(_)) | (ScalarRef::Const(_), ScalarRef::Mut(_)) => false,
+            (Referent::Mut(x), Referent::Mut(y)) => HeapArc::ptr_eq(x, y),
+            (Referent::Const(x), Referent::Const(y)) => HeapArc::ptr_eq(x, y),
+            (Referent::Mut(_), Referent::Const(_)) | (Referent::Const(_), Referent::Mut(_)) => false,
         }
     }
 
     /// The unified read accessor (§2.3.1): a guard viewing the cell either way.  `Const` reads take no lock.
     pub fn read(&self) -> ScalarReadGuard<'_> {
         match self {
-            ScalarRef::Mut(cell) => ScalarReadGuard::Mut(cell.read()),
-            ScalarRef::Const(cell) => ScalarReadGuard::Const(cell),
+            Referent::Mut(cell) => ScalarReadGuard::Mut(cell.read()),
+            Referent::Const(cell) => ScalarReadGuard::Const(cell),
         }
     }
 
     /// The write accessor: `Const` has no lock to hand out — `ReadOnly` is structural, before any lock talk.
     pub fn write(&self) -> Result<ScalarWriteGuard<'_>, ScalarError> {
         match self {
-            ScalarRef::Mut(cell) => Ok(ScalarWriteGuard(cell.write())),
-            ScalarRef::Const(_) => Err(ScalarError::ReadOnly),
+            Referent::Mut(cell) => Ok(ScalarWriteGuard(cell.write())),
+            Referent::Const(_) => Err(ScalarError::ReadOnly),
         }
     }
 }
@@ -763,7 +763,7 @@ impl ScalarRef {
 /// The read view over either cell kind.  Coercion reads on `Mut` go through the cell's caches; on `Const` they are the
 /// materialized fields.
 pub enum ScalarReadGuard<'a> {
-    Mut(RwLockReadGuard<'a, ScalarCell>),
+    Mut(RwLockReadGuard<'a, Scalar>),
     Const(&'a ConstScalar),
 }
 
@@ -796,7 +796,7 @@ impl ScalarReadGuard<'_> {
         }
     }
 
-    pub fn stringify(&self) -> Result<PerlString, AllocError> {
+    pub fn stringify(&self) -> Result<PString, AllocError> {
         match self {
             ScalarReadGuard::Mut(g) => g.stringify(),
             ScalarReadGuard::Const(c) => Ok(c.stringify().clone()),
@@ -813,18 +813,18 @@ impl ScalarReadGuard<'_> {
 
 /// The write view (only `Mut` cells reach here).  The dynamic readonly flag is checked at the mutation (`assign`), not
 /// at guard acquisition — acquiring a write guard to *toggle* readonly must remain possible.
-pub struct ScalarWriteGuard<'a>(RwLockWriteGuard<'a, ScalarCell>);
+pub struct ScalarWriteGuard<'a>(RwLockWriteGuard<'a, Scalar>);
 
 impl Deref for ScalarWriteGuard<'_> {
-    type Target = ScalarCell;
+    type Target = Scalar;
 
-    fn deref(&self) -> &ScalarCell {
+    fn deref(&self) -> &Scalar {
         &self.0
     }
 }
 
 impl DerefMut for ScalarWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut ScalarCell {
+    fn deref_mut(&mut self) -> &mut Scalar {
         &mut self.0
     }
 }
@@ -833,23 +833,23 @@ impl DerefMut for ScalarWriteGuard<'_> {
 /// Fallback-free materialization for the immortals: the payloads' renderings are tiny ASCII, so the inline path cannot
 /// allocate; the unreachable error arm degrades to an unmaterialized-string cell rather than panicking (no-panic
 /// policy).
-fn immortal(payload: Value) -> ScalarRef {
+fn immortal(payload: Value) -> Referent {
     let cell = ConstScalar::materialize(payload.clone()).unwrap_or_else(|_| ConstScalar {
         payload,
         int: 0,
         float: 0.0,
-        string: PerlString::empty(),
+        string: PString::empty(),
         numify_warned: None,
     });
 
-    ScalarRef::Const(HeapArc::new(cell))
+    Referent::Const(HeapArc::new(cell))
 }
 
 /// The true immortal: `Value::True`, materialized as 1 / 1.0 / `"1"` (§2.3.3, as amended).
-pub static TRUE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(Value::True));
+pub static TRUE_SCALAR: LazyLock<Referent> = LazyLock::new(|| immortal(Value::True));
 
 /// The false immortal: `Value::False`, the dualvar — numerically 0, string `""` (§2.3.3).
-pub static FALSE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(Value::False));
+pub static FALSE_SCALAR: LazyLock<Referent> = LazyLock::new(|| immortal(Value::False));
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

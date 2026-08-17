@@ -2,7 +2,7 @@ use super::*;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-fn hash_of(s: &PerlString) -> u64 {
+fn hash_of(s: &PString) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
@@ -15,31 +15,31 @@ fn hash_of(s: &PerlString) -> u64 {
 fn the_tier_ladder_places_content_by_length_and_alphabet() {
     // Fifteen payload bytes inline; sixteen to thirty packed when the content is alphabet-conformant; the heap for
     // everything else.  The bands are contiguous, so the packed tier begins exactly where the inline payload ends.
-    let inline = PerlString::from_str(&"a".repeat(15)).unwrap();
+    let inline = PString::from_str(&"a".repeat(15)).unwrap();
     assert!(inline.storage_type().is_inline());
 
     // Letters belong to no packed alphabet, so past the inline payload they go to the heap.
-    let lettered = PerlString::from_str(&"a".repeat(16)).unwrap();
+    let lettered = PString::from_str(&"a".repeat(16)).unwrap();
     assert!(lettered.storage_type().is_heap());
     assert_eq!(lettered.len(), 16);
 
     // Digit-dense content of the same length does not.
     for text in ["1234567890123456", "2.2250738585072e-308", "2026-07-28T14:33:07Z", "192.168.100.200 1.2"] {
-        let packed = PerlString::from_str(text).unwrap();
+        let packed = PString::from_str(text).unwrap();
         assert!(packed.storage_type().is_packed(), "{text} should pack");
         assert_eq!(packed.len(), text.len());
         assert_eq!(packed.as_bytes(&mut [0u8; DECODE_MAX]), text.as_bytes());
     }
 
     // Past the packed capacity there is no non-allocating form left.
-    let long = PerlString::from_str(&"1".repeat(31)).unwrap();
+    let long = PString::from_str(&"1".repeat(31)).unwrap();
     assert!(long.storage_type().is_heap());
     assert_eq!(long.len(), 31);
 }
 
 #[test]
 fn ascii_from_str_is_unflagged_canonical() {
-    let s = PerlString::from_str("hello").unwrap();
+    let s = PString::from_str("hello").unwrap();
     assert!(!s.is_utf8(), "ASCII stores in canonical downgraded form");
     assert_eq!(s.inline_class(), Some(InlineClass::Ascii));
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("hello"));
@@ -47,7 +47,7 @@ fn ascii_from_str_is_unflagged_canonical() {
 
 #[test]
 fn non_ascii_from_str_is_flagged() {
-    let s = PerlString::from_str("héllo").unwrap();
+    let s = PString::from_str("héllo").unwrap();
     assert!(s.is_utf8());
     assert_eq!(s.inline_class(), Some(InlineClass::Latin1)); // é is U+00E9: Latin-1 range
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("héllo"));
@@ -55,7 +55,7 @@ fn non_ascii_from_str_is_flagged() {
 
 #[test]
 fn invalid_bytes_inline_scan_terminal() {
-    let s = PerlString::from_bytes([0xFF, 0xFE]).unwrap();
+    let s = PString::from_bytes([0xFF, 0xFE]).unwrap();
     assert_eq!(s.inline_class(), Some(InlineClass::Bytes));
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), None);
     assert!(!s.is_ascii());
@@ -65,7 +65,7 @@ fn invalid_bytes_inline_scan_terminal() {
 #[test]
 fn heap_from_bytes_defers_scanning() {
     let bytes = vec![b'x'; 40];
-    let s = PerlString::from_bytes(&bytes).unwrap();
+    let s = PString::from_bytes(&bytes).unwrap();
     assert!(s.storage_type().is_heap());
 
     // as_str triggers the lazy scan and narrows.
@@ -76,34 +76,34 @@ fn heap_from_bytes_defers_scanning() {
 // ── Character-sequence equality (container-verified cases) ────
 #[test]
 fn eq_same_flags_is_byte_equality() {
-    let a = PerlString::from_str("hello").unwrap();
-    let b = PerlString::from_bytes(b"hello").unwrap();
+    let a = PString::from_str("hello").unwrap();
+    let b = PString::from_bytes(b"hello").unwrap();
     assert_eq!(a, b); // both unflagged ASCII
 }
 
 #[test]
 fn eq_cross_flag_same_bytes_can_differ() {
     // Verified perl 5.38: unflagged C3 A9 is the two characters "\xc3\xa9"; flagged it is "é" — not eq.
-    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut flagged = PString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let unflagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let unflagged = PString::from_bytes([0xC3, 0xA9]).unwrap();
     assert_ne!(flagged, unflagged);
 }
 
 #[test]
 fn eq_cross_flag_different_bytes_can_match() {
     // Verified perl 5.38: unflagged E9 (latin-1 é) eq flagged C3 A9 (UTF-8 é).
-    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut flagged = PString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let latin1 = PerlString::from_bytes([0xE9]).unwrap();
+    let latin1 = PString::from_bytes([0xE9]).unwrap();
     assert_eq!(flagged, latin1);
     assert_eq!(latin1, flagged);
 }
 
 #[test]
 fn eq_ignores_tainted() {
-    let a = PerlString::from_str("same").unwrap();
-    let mut b = PerlString::from_str("same").unwrap();
+    let a = PString::from_str("same").unwrap();
+    let mut b = PString::from_str("same").unwrap();
     b.taint();
     assert_eq!(a, b);
     assert_eq!(hash_of(&a), hash_of(&b));
@@ -113,11 +113,11 @@ fn eq_ignores_tainted() {
 #[test]
 fn hash_key_flag_insensitive() {
     // Verified perl 5.38: utf8::upgrade/downgrade variants of a key are ONE key.
-    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut flagged = PString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let latin1 = PerlString::from_bytes([0xE9]).unwrap();
+    let latin1 = PString::from_bytes([0xE9]).unwrap();
     assert_eq!(hash_of(&flagged), hash_of(&latin1), "equal strings must hash equal");
-    let mut h: HashMap<PerlString, i32> = HashMap::new();
+    let mut h: HashMap<PString, i32> = HashMap::new();
     h.insert(flagged, 1);
     h.insert(latin1, 2);
     assert_eq!(h.len(), 1, "Perl hash keys are flag-insensitive");
@@ -126,7 +126,7 @@ fn hash_key_flag_insensitive() {
 // ── Tag transitions ───────────────────────────────────────────
 #[test]
 fn taint_round_trip_via_sanctioned_path() {
-    let mut s = PerlString::from_str("data").unwrap();
+    let mut s = PString::from_str("data").unwrap();
     s.taint();
     assert!(s.is_tainted());
     s.untaint_for_sanctioned_path();
@@ -136,7 +136,7 @@ fn taint_round_trip_via_sanctioned_path() {
 // ── Append transitions (§2.2.5) ───────────────────────────────
 #[test]
 fn ascii_append_preserves_state() {
-    let mut s = PerlString::from_str("abc").unwrap();
+    let mut s = PString::from_str("abc").unwrap();
     s.push_str("def").unwrap();
     assert_eq!(s.inline_class(), Some(InlineClass::Ascii));
     assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"abcdef");
@@ -144,7 +144,7 @@ fn ascii_append_preserves_state() {
 
 #[test]
 fn valid_utf8_append_to_ascii_goes_non_ascii() {
-    let mut s = PerlString::from_str("abc").unwrap();
+    let mut s = PString::from_str("abc").unwrap();
     s.push_str("é").unwrap();
     assert_eq!(s.inline_class(), Some(InlineClass::Latin1)); // ASCII + é joins to Latin-1 range
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("abcé"));
@@ -152,7 +152,7 @@ fn valid_utf8_append_to_ascii_goes_non_ascii() {
 
 #[test]
 fn inline_overflow_promotes_to_heap_one_way() {
-    let mut s = PerlString::from_str(&"a".repeat(20)).unwrap();
+    let mut s = PString::from_str(&"a".repeat(20)).unwrap();
     s.push_str("bcdef").unwrap(); // 25 bytes
     assert!(s.storage_type().is_heap());
     assert_eq!(s.len(), 25);
@@ -163,20 +163,20 @@ fn inline_overflow_promotes_to_heap_one_way() {
 
 #[test]
 fn heap_append_transitions() {
-    let mut s = PerlString::from_str(&"a".repeat(30)).unwrap(); // Heap, ASCII known
+    let mut s = PString::from_str(&"a".repeat(30)).unwrap(); // Heap, ASCII known
     s.push_str("é").unwrap();
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]).map(|v| v.len()), Some(32));
 
     // The transition raised the range without a rescan; below 64 KiB the answer is terminal by type.
     assert!(!s.is_ascii());
-    let mut raw = PerlString::from_bytes([0x80u8; 30]).unwrap(); // small tier: terminal (malformed) at construction
+    let mut raw = PString::from_bytes([0x80u8; 30]).unwrap(); // small tier: terminal (malformed) at construction
     raw.push_bytes(&[0x81]).unwrap(); // indeterminate transition → the funnel reclassifies (§2.2.3)
     assert_eq!(raw.as_str(&mut [0u8; DECODE_MAX]), None); // answered from the recorded state
 }
 
 #[test]
 fn flag_and_bits_survive_promotion() {
-    let mut s = PerlString::from_str(&"é".repeat(15)).unwrap(); // Fifteen stored bytes: full-capacity inline, flagged.
+    let mut s = PString::from_str(&"é".repeat(15)).unwrap(); // Fifteen stored bytes: full-capacity inline, flagged.
     s.taint();
     assert!(s.storage_type().is_inline(), "thirty encoded bytes compress to a full payload (§2.2.9)");
     s.push_str("é").unwrap(); // A sixteenth character: past every non-heap form — non-ASCII cannot pack.
@@ -191,7 +191,7 @@ fn flag_and_bits_survive_promotion() {
 fn extended_taxonomy_inline() {
     // Perl-decodable, Rust-invalid: surrogate, supra-Unicode, minimal FE form.
     for bytes in [&[0xED, 0xA0, 0x80][..], &[0xF4, 0x90, 0x80, 0x80], &[0xFE, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80]] {
-        let s = PerlString::from_bytes(bytes).unwrap();
+        let s = PString::from_bytes(bytes).unwrap();
         assert_eq!(s.inline_class(), Some(InlineClass::Extended), "{bytes:02X?}");
         assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), None, "Rust view must reject extended");
         assert!(s.is_perl_utf8_valid(), "perl view must accept extended");
@@ -201,7 +201,7 @@ fn extended_taxonomy_inline() {
     // Malformed for perl too: overlong, bare continuation, truncated, overlong FF form.
     let overlong_ff: Vec<u8> = std::iter::once(0xFFu8).chain(std::iter::repeat_n(0x80u8, 12)).collect();
     for bytes in [&[0xC0, 0x80][..], &[0x80], &[0xC3], &overlong_ff] {
-        let s = PerlString::from_bytes(bytes).unwrap();
+        let s = PString::from_bytes(bytes).unwrap();
         assert_eq!(s.inline_class(), Some(InlineClass::Bytes), "{bytes:02X?}");
         assert!(!s.is_perl_utf8_valid());
     }
@@ -212,7 +212,7 @@ fn extended_taxonomy_heap_lazy() {
     // Heap string ending in an extended sequence: lazy classification narrows to EXTENDED_UTF8.
     let mut bytes = vec![b'a'; 30];
     bytes.extend_from_slice(&[0xF4, 0x90, 0x80, 0x80]);
-    let s = PerlString::from_bytes(&bytes).unwrap();
+    let s = PString::from_bytes(&bytes).unwrap();
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), None);
     assert!(s.is_perl_utf8_valid());
 
@@ -220,7 +220,7 @@ fn extended_taxonomy_heap_lazy() {
     let mut bad = vec![b'a'; 30];
     bad.push(0xC0);
     bad.push(0x80);
-    let t = PerlString::from_bytes(&bad).unwrap();
+    let t = PString::from_bytes(&bad).unwrap();
     assert!(!t.is_perl_utf8_valid());
     assert_eq!(t.as_str(&mut [0u8; DECODE_MAX]), None);
 }
@@ -238,7 +238,7 @@ fn ff_form_boundary() {
 
     let mut seq = vec![0xFFu8];
     seq.extend_from_slice(&conts);
-    let s = PerlString::from_bytes(&seq).unwrap();
+    let s = PString::from_bytes(&seq).unwrap();
     assert_eq!(s.inline_class(), Some(InlineClass::Extended), "minimal FF form is perl-valid");
 
     // One less than the boundary is overlong for FF.
@@ -251,13 +251,13 @@ fn ff_form_boundary() {
 
     let mut seq2 = vec![0xFFu8];
     seq2.extend_from_slice(&c2);
-    let t = PerlString::from_bytes(&seq2).unwrap();
+    let t = PString::from_bytes(&seq2).unwrap();
     assert_eq!(t.inline_class(), Some(InlineClass::Bytes), "FF encoding a FE-range value is overlong");
 }
 
 #[test]
 fn extended_append_transitions() {
-    let mut s = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let mut s = PString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     s.push_str("abc").unwrap();
     assert_eq!(s.inline_class(), Some(InlineClass::Extended), "valid append preserves extended");
     assert!(s.is_perl_utf8_valid());
@@ -266,48 +266,48 @@ fn extended_append_transitions() {
 #[test]
 fn extended_eq_and_hash_behavior() {
     // A flagged extended string equals no unflagged string (chars above 0xFF) and byte-identical flagged self.
-    let mut a = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let mut a = PString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     a.set_utf8_for_test();
-    let mut b = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let mut b = PString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     b.set_utf8_for_test();
     assert_eq!(a, b);
     assert_eq!(hash_of(&a), hash_of(&b));
-    let plain = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let plain = PString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     assert_ne!(a, plain, "flag changes the character sequence");
 }
 
 // ── Range-tuned lattice (§2.2.4) ──────────────────────────────
 #[test]
 fn latin1_vs_non_latin1_terminals() {
-    let e = PerlString::from_str("é").unwrap(); // U+00E9
+    let e = PString::from_str("é").unwrap(); // U+00E9
     assert_eq!(e.inline_class(), Some(InlineClass::Latin1));
-    let cjk = PerlString::from_str("字").unwrap(); // U+5B57
+    let cjk = PString::from_str("字").unwrap(); // U+5B57
     assert_eq!(cjk.inline_class(), Some(InlineClass::NonLatin1));
-    let mixed = PerlString::from_str("é字").unwrap();
+    let mixed = PString::from_str("é字").unwrap();
     assert_eq!(mixed.inline_class(), Some(InlineClass::NonLatin1), "range joins upward");
 }
 
 #[test]
 fn unknown_range_classifies_on_ascii_probe() {
-    let s = PerlString::from_str(&"é".repeat(20)).unwrap(); // 40 bytes: small tier, settled Utf8Latin1 at birth
+    let s = PString::from_str(&"é".repeat(20)).unwrap(); // 40 bytes: small tier, settled Utf8Latin1 at birth
     assert!(s.storage_type().is_heap());
     assert!(!s.is_ascii(), "the ASCII question is a state read on a settled birth");
 
     // The classification left terminal Latin-1 knowledge behind: cross-flag equality against the downgraded form
     // succeeds (and would fast-negative if the state had wrongly become NON_LATIN1).
-    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
+    let plain = PString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(s, plain);
 }
 
 #[test]
 fn eq_grid_same_flag_length_mismatch() {
     // Same flags + different byte lengths ⇒ ne, at both flag settings.
-    let a = PerlString::from_bytes(b"abc").unwrap();
-    let b = PerlString::from_bytes(b"abcd").unwrap();
+    let a = PString::from_bytes(b"abc").unwrap();
+    let b = PString::from_bytes(b"abcd").unwrap();
     assert_ne!(a, b);
-    let mut fa = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut fa = PString::from_bytes([0xC3, 0xA9]).unwrap();
     fa.set_utf8_for_test();
-    let mut fb = PerlString::from_bytes([0xC3, 0xA9, 0x41]).unwrap();
+    let mut fb = PString::from_bytes([0xC3, 0xA9, 0x41]).unwrap();
     fb.set_utf8_for_test();
     assert_ne!(fa, fb);
 }
@@ -315,37 +315,37 @@ fn eq_grid_same_flag_length_mismatch() {
 #[test]
 fn eq_cross_flag_flagged_longer_positive_and_negative() {
     // Flagged longer CAN match (char count < byte count): é as C3 A9 vs E9 — the positive case.
-    let mut f = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut f = PString::from_bytes([0xC3, 0xA9]).unwrap();
     f.set_utf8_for_test();
-    assert_eq!(f, PerlString::from_bytes([0xE9]).unwrap());
+    assert_eq!(f, PString::from_bytes([0xE9]).unwrap());
 
     // Flagged longer, mismatch mid-walk.
-    assert_ne!(f, PerlString::from_bytes([0xEA]).unwrap());
+    assert_ne!(f, PString::from_bytes([0xEA]).unwrap());
 
     // Flagged longer, plain exhausted with flagged characters remaining: "é" + "a" vs just é.
-    let mut f2 = PerlString::from_bytes([0xC3, 0xA9, b'a']).unwrap();
+    let mut f2 = PString::from_bytes([0xC3, 0xA9, b'a']).unwrap();
     f2.set_utf8_for_test();
-    assert_ne!(f2, PerlString::from_bytes([0xE9]).unwrap());
+    assert_ne!(f2, PString::from_bytes([0xE9]).unwrap());
 
     // And the fully-matching longer-flagged multi-char case.
-    assert_eq!(f2, PerlString::from_bytes([0xE9, b'a']).unwrap());
+    assert_eq!(f2, PString::from_bytes([0xE9, b'a']).unwrap());
 }
 
 #[test]
 fn eq_cross_flag_equal_length_ascii_can_match() {
     // Equal byte lengths must NOT be decided-false when the flagged side has no multi-byte sequence.
-    let mut f = PerlString::from_bytes(b"ab").unwrap();
+    let mut f = PString::from_bytes(b"ab").unwrap();
     f.set_utf8_for_test();
-    assert_eq!(f, PerlString::from_bytes(b"ab").unwrap());
-    assert_ne!(f, PerlString::from_bytes(b"ba").unwrap());
+    assert_eq!(f, PString::from_bytes(b"ab").unwrap());
+    assert_ne!(f, PString::from_bytes(b"ba").unwrap());
 }
 
 #[test]
 fn eq_grid_both_flagged_terminal_mismatch() {
     // The flagged twin of the exclusivity row.
-    let mut latin1 = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut latin1 = PString::from_bytes([0xC3, 0xA9]).unwrap();
     latin1.set_utf8_for_test();
-    let mut mal = PerlString::from_bytes([0xC0, 0x80]).unwrap();
+    let mut mal = PString::from_bytes([0xC0, 0x80]).unwrap();
     mal.set_utf8_for_test();
     assert_ne!(latin1, mal);
 }
@@ -354,8 +354,8 @@ fn eq_grid_both_flagged_terminal_mismatch() {
 fn eq_grid_valid_vs_invalid_same_flag() {
     // Flagged terminal Rust-invalid vs flagged known-Rust-valid (small tier, settled Utf8Latin1 at birth): valid bytes
     // never equal invalid bytes.
-    let flagged_valid = PerlString::from_str(&"é".repeat(20)).unwrap();
-    let mut ext = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
+    let flagged_valid = PString::from_str(&"é".repeat(20)).unwrap();
+    let mut ext = PString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     ext.set_utf8_for_test();
     assert_ne!(flagged_valid, ext);
     assert_ne!(ext, flagged_valid);
@@ -364,40 +364,40 @@ fn eq_grid_valid_vs_invalid_same_flag() {
 #[test]
 fn eq_grid_ascii_vs_non_ascii_both_orientations() {
     // Flagged-ASCII vs unflagged known-non-ASCII.
-    let mut fa = PerlString::from_bytes(b"abc").unwrap();
+    let mut fa = PString::from_bytes(b"abc").unwrap();
     fa.set_utf8_for_test();
-    assert_ne!(fa, PerlString::from_bytes([0x80, 0x81, 0x82]).unwrap());
+    assert_ne!(fa, PString::from_bytes([0x80, 0x81, 0x82]).unwrap());
 
     // Unflagged-ASCII vs flagged known-non-ASCII (Latin-1).
-    let mut fl = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut fl = PString::from_bytes([0xC3, 0xA9]).unwrap();
     fl.set_utf8_for_test();
-    assert_ne!(PerlString::from_bytes(b"ab").unwrap(), fl);
+    assert_ne!(PString::from_bytes(b"ab").unwrap(), fl);
 }
 
 #[test]
 fn eq_grid_same_flag_terminal_mismatch() {
     // Differing terminals, both unflagged: decided without memcmp (exclusivity law).
-    let latin1 = PerlString::from_bytes([0xC3, 0xA9]).unwrap(); // valid, Latin-1-range... as bytes: classified
-    let malformed = PerlString::from_bytes([0xC0, 0x80]).unwrap();
+    let latin1 = PString::from_bytes([0xC3, 0xA9]).unwrap(); // valid, Latin-1-range... as bytes: classified
+    let malformed = PString::from_bytes([0xC0, 0x80]).unwrap();
     assert_ne!(latin1, malformed);
-    let ascii = PerlString::from_bytes(b"ab").unwrap();
+    let ascii = PString::from_bytes(b"ab").unwrap();
     assert_ne!(ascii, latin1);
 }
 
 #[test]
 fn eq_grid_flagged_malformed_vs_unflagged_is_false() {
-    let mut mal = PerlString::from_bytes([0x80]).unwrap();
+    let mut mal = PString::from_bytes([0x80]).unwrap();
     mal.set_utf8_for_test(); // flagged malformed
-    let plain = PerlString::from_bytes([0x80]).unwrap();
+    let plain = PString::from_bytes([0x80]).unwrap();
     assert_ne!(mal, plain, "upgrade of unflagged is valid; never matches malformed bytes");
 }
 
 #[test]
 fn eq_reverse_malformed_orientation_can_match() {
     // Unflagged MALFORMED-classified bytes are just bytes: \x80 as a character equals flagged C2 80.
-    let plain = PerlString::from_bytes([0x80]).unwrap();
+    let plain = PString::from_bytes([0x80]).unwrap();
     assert_eq!(plain.inline_class(), Some(InlineClass::Bytes));
-    let mut flagged = PerlString::from_bytes([0xC2, 0x80]).unwrap();
+    let mut flagged = PString::from_bytes([0xC2, 0x80]).unwrap();
     flagged.set_utf8_for_test();
     assert_eq!(flagged, plain, "the grid must not shortcut this orientation");
 }
@@ -405,13 +405,13 @@ fn eq_reverse_malformed_orientation_can_match() {
 #[test]
 fn eq_grid_length_rows() {
     // plain longer than flagged: impossible.
-    let mut flagged = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let mut flagged = PString::from_bytes([0xC3, 0xA9]).unwrap();
     flagged.set_utf8_for_test();
-    let plain3 = PerlString::from_bytes([0xE9, 0xE9, 0xE9]).unwrap();
+    let plain3 = PString::from_bytes([0xE9, 0xE9, 0xE9]).unwrap();
     assert_ne!(flagged, plain3);
 
     // flagged known Latin-1 (has a 2-byte char) with equal byte lengths: impossible.
-    let plain2 = PerlString::from_bytes([0xC3, 0xA9]).unwrap();
+    let plain2 = PString::from_bytes([0xC3, 0xA9]).unwrap();
     assert_ne!(flagged, plain2);
 }
 
@@ -419,8 +419,8 @@ fn eq_grid_length_rows() {
 fn streaming_compare_narrows_on_completed_walk() {
     // Heap flagged Utf8Latin1 (settled at birth) vs matching latin1 bytes: cross-flag content equality resolved by the
     // single walk.
-    let flagged = PerlString::from_str(&"é".repeat(20)).unwrap();
-    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
+    let flagged = PString::from_str(&"é".repeat(20)).unwrap();
+    let plain = PString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(flagged, plain);
 
     // The completed walk narrowed the flagged side to Utf8Latin1: is_ascii is now a state read.
@@ -430,37 +430,37 @@ fn streaming_compare_narrows_on_completed_walk() {
 
 #[test]
 fn cheap_probe_defers_range() {
-    let s = PerlString::from_str(&"é".repeat(20)).unwrap(); // small tier, settled Utf8Latin1 at birth
+    let s = PString::from_str(&"é".repeat(20)).unwrap(); // small tier, settled Utf8Latin1 at birth
     assert!(!s.is_ascii()); // a state read: nothing left to defer on a settled birth
 
     // Equality resolves range on demand and still matches the downgraded form.
-    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
+    let plain = PString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(s, plain);
 
     // And a wide heap string resolved through the same path fast-negatives.
-    let wide = PerlString::from_str(&"字".repeat(14)).unwrap(); // 42 bytes heap
+    let wide = PString::from_str(&"字".repeat(14)).unwrap(); // 42 bytes heap
     assert!(!wide.is_ascii());
-    let wide_plain = PerlString::from_bytes(wide.as_bytes(&mut [0u8; DECODE_MAX])).unwrap();
+    let wide_plain = PString::from_bytes(wide.as_bytes(&mut [0u8; DECODE_MAX])).unwrap();
     assert_ne!(wide, wide_plain);
 }
 
 #[test]
 fn eq_fast_negative_for_beyond_latin1() {
     // A flagged string containing U+0100+ equals no unflagged string, regardless of bytes.
-    let wide = PerlString::from_str("abc字").unwrap();
+    let wide = PString::from_str("abc字").unwrap();
     assert!(wide.is_utf8());
-    let plain = PerlString::from_bytes(wide.as_bytes(&mut [0u8; DECODE_MAX])).unwrap();
+    let plain = PString::from_bytes(wide.as_bytes(&mut [0u8; DECODE_MAX])).unwrap();
     assert_ne!(wide, plain);
 
     // And the é (Latin-1) case still compares by character as before.
-    let e_flagged = PerlString::from_str("é").unwrap();
-    let e_latin1 = PerlString::from_bytes([0xE9]).unwrap();
+    let e_flagged = PString::from_str("é").unwrap();
+    let e_latin1 = PString::from_bytes([0xE9]).unwrap();
     assert_eq!(e_flagged, e_latin1);
 }
 
 #[test]
 fn append_range_join_semantics() {
-    let mut s = PerlString::from_str("abc").unwrap(); // Ascii
+    let mut s = PString::from_str("abc").unwrap(); // Ascii
     s.push_str("é").unwrap();
     assert_eq!(s.inline_class(), Some(InlineClass::Latin1));
     s.push_str("字").unwrap();
@@ -475,11 +475,11 @@ fn append_range_join_semantics() {
 
 #[test]
 fn heap_append_range_join() {
-    let mut s = PerlString::from_bytes(b"a".repeat(30)).unwrap();
+    let mut s = PString::from_bytes(b"a".repeat(30)).unwrap();
     assert!(s.is_ascii()); // narrows heap state to ASCII
     s.push_str("é").unwrap(); // ASCII join Latin-1 = Latin-1, no rescan
     let latin1_equiv: Vec<u8> = b"a".repeat(30).iter().copied().chain([0xE9u8]).collect();
-    let plain = PerlString::from_bytes(&latin1_equiv).unwrap();
+    let plain = PString::from_bytes(&latin1_equiv).unwrap();
     let mut flagged = s;
     flagged.set_utf8_for_test();
     assert_eq!(flagged, plain, "Latin-1-range heap string equals its downgraded form");
@@ -487,8 +487,8 @@ fn heap_append_range_join() {
 
 // ── Exhaustive grid verification (§2.3.5) ─────────────────────
 /// Ground truth: pure character-sequence comparison with no grid and no state consultation.
-fn reference_eq(a: &PerlString, b: &PerlString) -> bool {
-    fn chars_of(s: &PerlString) -> Vec<u32> {
+fn reference_eq(a: &PString, b: &PString) -> bool {
+    fn chars_of(s: &PString) -> Vec<u32> {
         if s.is_utf8() {
             flagged_chars(s.as_bytes(&mut [0u8; DECODE_MAX])).collect()
         } else {
@@ -500,7 +500,7 @@ fn reference_eq(a: &PerlString, b: &PerlString) -> bool {
 }
 
 /// The design's decided-false table (§2.3.5 rows 1–4), transcribed independently of the implementation.
-fn design_decides_false(a: &PerlString, sa: scan::ScanState, b: &PerlString, sb: scan::ScanState) -> bool {
+fn design_decides_false(a: &PString, sa: scan::ScanState, b: &PString, sb: scan::ScanState) -> bool {
     if a.is_utf8() == b.is_utf8() {
         return a.len() != b.len()
             || (scan::is_terminal(sa) && scan::is_terminal(sb) && sa != sb)
@@ -525,7 +525,7 @@ fn design_decides_false(a: &PerlString, sa: scan::ScanState, b: &PerlString, sb:
 /// helper manufactures it: the content is built with the final `pattern` repetition withheld and appended raw,
 /// resetting the state per the blanket rule (§2.2.5) while leaving the bytes identical to a one-shot build.  Requires a
 /// pattern with a non-ASCII byte, since a pure-ASCII suffix carries knowledge and would not reset.
-fn lazy_heap(pattern: &[u8]) -> PerlString {
+fn lazy_heap(pattern: &[u8]) -> PString {
     assert!(pattern.iter().any(|b| !b.is_ascii()), "an ASCII suffix cannot reset the state");
 
     let mut bytes = Vec::with_capacity(LAZY_MIN + pattern.len());
@@ -534,7 +534,7 @@ fn lazy_heap(pattern: &[u8]) -> PerlString {
     }
 
     let split = bytes.len() - pattern.len();
-    let mut s = PerlString::from_bytes(&bytes[..split]).unwrap();
+    let mut s = PString::from_bytes(&bytes[..split]).unwrap();
     s.push_bytes(&bytes[split..]).unwrap();
     assert!(!s.storage_type().is_small_heap_tier(), "the lazy tiers begin above 64 KiB");
     assert_eq!(s.scan_state(), scan::Unknown, "the raw append is what makes the state indeterminate");
@@ -562,20 +562,20 @@ fn grid_witness_count() -> usize {
 /// silently degrade indeterminate-state coverage into terminal-state coverage — but building all of them to keep one
 /// made the cost quadratic in witness size, and the indeterminate states now live above 64 KiB where only the lazy
 /// tiers still hold them (§2.2.3).
-fn grid_witness(index: usize) -> (String, PerlString) {
+fn grid_witness(index: usize) -> (String, PString) {
     grid_witnesses_range(index, index).0.pop().expect("index within the witness set")
 }
 
 /// Build the witnesses whose indices fall in `lo..=hi`, and report how many exist.  A range that selects none still
 /// walks the list, so the count is available without paying for a single allocation.
-fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PerlString)>, usize) {
-    let mut out: Vec<(String, PerlString)> = Vec::new();
+fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PString)>, usize) {
+    let mut out: Vec<(String, PString)> = Vec::new();
     let mut seen = 0usize;
 
     // The witness is passed as a thunk, not a value, so asking for one does not build the other eighteen.  That
     // mattered little when every witness was a couple of dozen bytes; the indeterminate states now live above 64 KiB,
     // because only the lazy tiers still hold them (§2.2.3), and the grid asks for a fresh witness per comparison.
-    let mut push = |name: &str, build: &dyn Fn() -> PerlString, want: scan::ScanState| {
+    let mut push = |name: &str, build: &dyn Fn() -> PString, want: scan::ScanState| {
         let index = seen;
         seen += 1;
         if index < lo || index > hi {
@@ -587,20 +587,20 @@ fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PerlString)>, usi
     };
 
     // Inline terminals.
-    push("inl-ascii", &|| PerlString::from_bytes(b"ab").unwrap(), scan::Ascii);
-    push("inl-latin1", &|| PerlString::from_bytes([0xC3, 0xA9]).unwrap(), scan::Utf8Latin1);
-    push("inl-nonlatin1", &|| PerlString::from_str("字").unwrap(), scan::Utf8NonLatin1);
-    push("inl-extended", &|| PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap(), scan::ExtendedUtf8);
-    push("inl-malformed", &|| PerlString::from_bytes([0x80]).unwrap(), scan::MalformedUtf8);
+    push("inl-ascii", &|| PString::from_bytes(b"ab").unwrap(), scan::Ascii);
+    push("inl-latin1", &|| PString::from_bytes([0xC3, 0xA9]).unwrap(), scan::Utf8Latin1);
+    push("inl-nonlatin1", &|| PString::from_str("字").unwrap(), scan::Utf8NonLatin1);
+    push("inl-extended", &|| PString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap(), scan::ExtendedUtf8);
+    push("inl-malformed", &|| PString::from_bytes([0x80]).unwrap(), scan::MalformedUtf8);
 
     // Heap terminals.  Below 64 KiB these are classified at construction, so no probe is needed to reach the state.
-    push("heap-ascii", &|| PerlString::from_bytes(b"a".repeat(24)).unwrap(), scan::Ascii);
-    push("heap-latin1", &|| PerlString::from_str(&"é".repeat(16)).unwrap(), scan::Utf8Latin1);
-    push("heap-nonlatin1", &|| PerlString::from_str(&"字".repeat(8)).unwrap(), scan::Utf8NonLatin1);
+    push("heap-ascii", &|| PString::from_bytes(b"a".repeat(24)).unwrap(), scan::Ascii);
+    push("heap-latin1", &|| PString::from_str(&"é".repeat(16)).unwrap(), scan::Utf8Latin1);
+    push("heap-nonlatin1", &|| PString::from_str(&"字".repeat(8)).unwrap(), scan::Utf8NonLatin1);
     push(
         "heap-extended",
         &|| {
-            let s = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
+            let s = PString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
             assert!(s.is_perl_utf8_valid());
             s
         },
@@ -609,7 +609,7 @@ fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PerlString)>, usi
     push(
         "heap-malformed",
         &|| {
-            let s = PerlString::from_bytes([0x80; 24]).unwrap();
+            let s = PString::from_bytes([0x80; 24]).unwrap();
             assert!(!s.is_perl_utf8_valid());
             s
         },
@@ -629,7 +629,7 @@ fn grid_witnesses_range(lo: usize, hi: usize) -> (Vec<(String, PerlString)>, usi
     // return when a constructor without a copy exists.
 
     // The probe-narrowed states need a probe with something left to narrow, which again is the lazy tiers alone.
-    let narrowed = |s: PerlString| {
+    let narrowed = |s: PString| {
         assert!(!s.is_ascii());
         s
     };
@@ -662,7 +662,7 @@ fn cheap_probe_bails_at_first_high_bit() {
     // The ninth state's raison d'être (§2.2.4): the ASCII probe examines O(first-high-bit) bytes.
     let mut bytes = vec![0x80u8];
     bytes.extend_from_slice(&b"a".repeat(LAZY_MIN));
-    let mut s = PerlString::from_bytes(&bytes).unwrap(); // born settled: copying births classify (§2.2.3)
+    let mut s = PString::from_bytes(&bytes).unwrap(); // born settled: copying births classify (§2.2.3)
     s.push_bytes(&[0x80]).unwrap(); // the raw append is what resets to UNKNOWN
     eq_probe::reset();
     assert!(!s.is_ascii());
@@ -672,7 +672,7 @@ fn cheap_probe_bails_at_first_high_bit() {
 
     // The validity-known side has no probe to bail: a `&str` birth is settled at its exact range during the copy
     // (§2.2.3), so the ASCII question is a state read and the probe never runs at all.
-    let f = PerlString::from_str(&format!("é{}", "a".repeat(LAZY_MIN))).unwrap();
+    let f = PString::from_str(&format!("é{}", "a".repeat(LAZY_MIN))).unwrap();
     eq_probe::reset();
     assert!(!f.is_ascii());
     let (_, pb2) = eq_probe::scans();
@@ -686,10 +686,10 @@ fn eq_short_circuits_at_first_mismatch_depth() {
     let big = 10_000;
 
     // Mismatch at position 0: flagged é-string vs plain starting with a different byte.
-    let flagged = PerlString::from_str(&"é".repeat(big)).unwrap();
+    let flagged = PString::from_str(&"é".repeat(big)).unwrap();
     let mut plain_bytes = vec![0xE9u8; big];
     plain_bytes[0] = 0xAA;
-    let plain = PerlString::from_bytes(&plain_bytes).unwrap();
+    let plain = PString::from_bytes(&plain_bytes).unwrap();
     eq_probe::reset();
     assert_ne!(flagged, plain);
     let (_, entries, chars) = eq_probe::snapshot();
@@ -699,16 +699,16 @@ fn eq_short_circuits_at_first_mismatch_depth() {
     // Mismatch at position 100.
     let mut plain_bytes2 = vec![0xE9u8; big];
     plain_bytes2[100] = 0xAA;
-    let plain2 = PerlString::from_bytes(&plain_bytes2).unwrap();
-    let flagged2 = PerlString::from_str(&"é".repeat(big)).unwrap();
+    let plain2 = PString::from_bytes(&plain_bytes2).unwrap();
+    let flagged2 = PString::from_str(&"é".repeat(big)).unwrap();
     eq_probe::reset();
     assert_ne!(flagged2, plain2);
     let (_, _, chars2) = eq_probe::snapshot();
     assert!((100..=102).contains(&chars2), "mismatch at 100 must consume ~101 characters, consumed {chars2}");
 
     // Full equality consumes everything exactly once.
-    let flagged3 = PerlString::from_str(&"é".repeat(big)).unwrap();
-    let plain3 = PerlString::from_bytes(vec![0xE9u8; big]).unwrap();
+    let flagged3 = PString::from_str(&"é".repeat(big)).unwrap();
+    let plain3 = PString::from_bytes(vec![0xE9u8; big]).unwrap();
     eq_probe::reset();
     assert_eq!(flagged3, plain3);
     let (_, _, chars3) = eq_probe::snapshot();
@@ -719,7 +719,7 @@ fn eq_short_circuits_at_first_mismatch_depth() {
 fn eq_grid_decided_pairs_perform_no_scan() {
     // Observable-state companion: a grid-decided comparison must leave an indeterminate operand's state untouched (no
     // scan happened on it).
-    let wide = PerlString::from_str("字").unwrap(); // inline NL1, flagged
+    let wide = PString::from_str("字").unwrap(); // inline NL1, flagged
     assert!(wide.is_utf8()); // from_str of non-ASCII is flagged already
     let unknown = lazy_heap(&[0x90u8]); // only the lazy tiers still hold UNKNOWN
     assert_eq!(unknown.scan_state(), scan::Unknown);
@@ -736,7 +736,7 @@ fn eq_grid_exhaustive_over_all_state_flag_combinations() {
     // narrows scan states as a side effect and heap clones share buffer state, so reused witnesses would silently
     // degrade indeterminate-state coverage into terminal-state coverage.
     let n = grid_witness_count();
-    let fresh = |i: usize, flagged: bool| -> (String, PerlString) {
+    let fresh = |i: usize, flagged: bool| -> (String, PString) {
         let (name, mut w) = grid_witness(i);
         if flagged {
             let st = w.scan_state();
@@ -800,31 +800,31 @@ fn blocked_walk_gated_spans_and_ladder_straddle() {
 
     src.push('é'); // bytes 63..65: straddles the 64 boundary
     src.push_str(&"b".repeat(200));
-    let f = PerlString::from_str(&src).unwrap();
+    let f = PString::from_str(&src).unwrap();
     let mut twin = vec![b'a'; 63];
     twin.push(0xE9);
     twin.extend_from_slice(&b"b".repeat(200));
-    let p = PerlString::from_bytes(&twin).unwrap();
+    let p = PString::from_bytes(&twin).unwrap();
     assert_eq!(f, p);
 
     // Long pure-ASCII cross-flag pair: decided entirely by gated memcmp spans, late mismatch caught.
-    let mut fa = PerlString::from_bytes(b"a".repeat(9000)).unwrap();
+    let mut fa = PString::from_bytes(b"a".repeat(9000)).unwrap();
     fa.set_utf8_for_test();
     let _ = fa.is_ascii(); // ASCII state on the flagged side would grid-decide vs known-non-ASCII only
     let mut good = b"a".repeat(9000);
-    let eq_twin = PerlString::from_bytes(&good).unwrap();
+    let eq_twin = PString::from_bytes(&good).unwrap();
     assert_eq!(fa, eq_twin);
     good[8999] = b'b';
-    let ne_twin = PerlString::from_bytes(&good).unwrap();
+    let ne_twin = PString::from_bytes(&good).unwrap();
     eq_probe::reset();
     assert_ne!(fa, ne_twin);
     let (_, _, consumed) = eq_probe::snapshot();
     assert!(consumed >= 8192, "the walk must have streamed the long equal prefix, consumed {consumed}");
 
     // Mismatch inside the FIRST ladder block of a long string: consumption bounded by one cache line.
-    let flagged_long = PerlString::from_str(&"é".repeat(10_000)).unwrap();
+    let flagged_long = PString::from_str(&"é".repeat(10_000)).unwrap();
     let bad = vec![0xAAu8; 10_000];
-    let plain_bad = PerlString::from_bytes(&bad).unwrap();
+    let plain_bad = PString::from_bytes(&bad).unwrap();
     eq_probe::reset();
     assert_ne!(flagged_long, plain_bad);
     let (_, _, chars0) = eq_probe::snapshot();
@@ -832,14 +832,14 @@ fn blocked_walk_gated_spans_and_ladder_straddle() {
 }
 
 // ── Dual-calculation hashing (§2.3.5) ─────────────────────────
-fn digest_of(s: &PerlString) -> u64 {
+fn digest_of(s: &PString) -> u64 {
     s.content_digest()
 }
 
 #[test]
 fn hash_dual_calculation_is_single_fetch_and_keeps_knowledge() {
     // Unresolved flagged heap string: ONE fused pass computes both candidates, decides, and classifies.
-    let s = PerlString::from_str(&"é".repeat(20)).unwrap(); // small tier, flagged, settled at birth
+    let s = PString::from_str(&"é".repeat(20)).unwrap(); // small tier, flagged, settled at birth
     eq_probe::reset();
     let d = digest_of(&s);
     assert_eq!(eq_probe::scans(), (1, 0), "dual calculation is one fetch, no probes");
@@ -849,7 +849,7 @@ fn hash_dual_calculation_is_single_fetch_and_keeps_knowledge() {
     assert_eq!(eq_probe::scans(), (0, 0));
 
     // The downgraded digest matches the unflagged equal (the HashMap-key requirement).
-    let plain = PerlString::from_bytes([0xE9u8; 20]).unwrap();
+    let plain = PString::from_bytes([0xE9u8; 20]).unwrap();
     assert_eq!(d, digest_of(&plain));
 
     // A repeat hash uses the known-Latin-1 single-emission path: still exactly one fetch.
@@ -861,8 +861,8 @@ fn hash_dual_calculation_is_single_fetch_and_keeps_knowledge() {
 #[test]
 fn hash_dual_calculation_wide_and_malformed_outcomes() {
     // Wide content: the raw candidate wins; byte-identical flagged strings agree.
-    let a = PerlString::from_str(&"字".repeat(14)).unwrap(); // a small heap tier: classified at construction
-    let b = PerlString::from_str(&"字".repeat(14)).unwrap();
+    let a = PString::from_str(&"字".repeat(14)).unwrap(); // a small heap tier: classified at construction
+    let b = PString::from_str(&"字".repeat(14)).unwrap();
     assert_eq!(a.scan_state(), scan::Utf8NonLatin1, "the construction pass settled the wide outcome");
     eq_probe::reset();
     let da = digest_of(&a);
@@ -877,7 +877,7 @@ fn hash_dual_calculation_wide_and_malformed_outcomes() {
     bad_bytes.push(0xC0);
     bad_bytes.push(0x80);
 
-    let mut m1 = PerlString::from_bytes(&bad_bytes[..LAZY_MIN + 1]).unwrap();
+    let mut m1 = PString::from_bytes(&bad_bytes[..LAZY_MIN + 1]).unwrap();
     m1.push_bytes(&bad_bytes[LAZY_MIN + 1..]).unwrap(); // the raw 0x80 suffix resets to UNKNOWN
     m1.set_utf8_for_test();
     assert_eq!(m1.scan_state(), scan::Unknown);
@@ -887,7 +887,7 @@ fn hash_dual_calculation_wide_and_malformed_outcomes() {
     assert_eq!(eq_probe::scans().0, 1);
     assert_eq!(m1.scan_state(), scan::MalformedUtf8);
 
-    let mut m2 = PerlString::from_bytes(&bad_bytes).unwrap();
+    let mut m2 = PString::from_bytes(&bad_bytes).unwrap();
     m2.set_utf8_for_test();
     assert!(!m2.is_perl_utf8_valid()); // known-malformed from its settled birth: takes the known-malformed digest path
     assert_eq!(dm, digest_of(&m2), "dual-discovered and pre-known malformed digests agree");
@@ -904,12 +904,12 @@ fn hash_dual_calculation_across_block_boundary() {
 
     flagged_src.push('é');
     flagged_src.push_str("tail");
-    let f = PerlString::from_str(&flagged_src).unwrap(); // flagged, settled at birth
+    let f = PString::from_str(&flagged_src).unwrap(); // flagged, settled at birth
 
     let mut twin = vec![b'a'; CLASSIFY_BLOCK - 1];
     twin.push(0xE9);
     twin.extend_from_slice(b"tail");
-    let p = PerlString::from_bytes(&twin).unwrap();
+    let p = PString::from_bytes(&twin).unwrap();
 
     assert_eq!(digest_of(&f), digest_of(&p));
     assert_eq!(f.scan_state(), scan::Utf8Latin1);
@@ -1071,7 +1071,7 @@ fn blocked_known_valid_boundaries() {
 #[test]
 fn char_len_semantics_and_caching() {
     // ASCII: chars == bytes, no scan at all when state is known.
-    let a = PerlString::from_bytes(b"ab".repeat(15)).unwrap();
+    let a = PString::from_bytes(b"ab".repeat(15)).unwrap();
     assert!(a.is_ascii());
     eq_probe::reset();
     assert_eq!(a.char_len(), Some(30));
@@ -1079,7 +1079,7 @@ fn char_len_semantics_and_caching() {
 
     // Latin-1 inline: the transcoded units are the flagged-side characters, so the count is the stored nibble — no scan
     // at all, where the raw-byte tier paid a recount.
-    let li = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
+    let li = PString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
     assert!(li.storage_type().is_inline(), "24 compressible bytes live inline now (§2.2.9)");
     eq_probe::reset();
     assert_eq!(li.char_len(), Some(12));
@@ -1087,7 +1087,7 @@ fn char_len_semantics_and_caching() {
 
     // Latin-1 in a small heap tier: classified at construction (§2.2.3), so every read is a state read — the stronger
     // property the eager tiers buy, where the lazy tiers pay one fused pass at first read instead.
-    let l = PerlString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap();
+    let l = PString::from_bytes([0xC3, 0xA9].repeat(16)).unwrap();
     assert!(l.storage_type().is_small_heap_tier());
     eq_probe::reset();
     assert_eq!(l.char_len(), Some(16));
@@ -1104,33 +1104,33 @@ fn char_len_semantics_and_caching() {
     assert_eq!(eq_probe::scans().0, 0, "count and state both cached from the one pass");
 
     // Extended: counted (a 4-byte and a 13-byte character are one character each).
-    let e = PerlString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
+    let e = PString::from_bytes([0xF4, 0x90, 0x80, 0x80].repeat(6)).unwrap();
     assert_eq!(e.char_len(), Some(6));
 
     // Surrogates count one character per encoded sequence; perl never merges pairs.  Container-verified:
     // length(chr 0xD800) == 1; a CESU-style pair decodes to TWO characters (D800, DC00), length 2, distinct from the
     // one-character astral U+10000.
-    let lone = PerlString::from_bytes([0xED, 0xA0, 0x80]).unwrap();
+    let lone = PString::from_bytes([0xED, 0xA0, 0x80]).unwrap();
     assert_eq!(lone.inline_class(), Some(InlineClass::Extended));
     assert_eq!(lone.char_len(), Some(1));
-    let cesu_pair = PerlString::from_bytes([0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80]).unwrap();
+    let cesu_pair = PString::from_bytes([0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80]).unwrap();
     assert_eq!(cesu_pair.char_len(), Some(2), "pairs are two characters, never merged");
-    let astral = PerlString::from_str("\u{10000}").unwrap();
+    let astral = PString::from_str("\u{10000}").unwrap();
     assert_eq!(astral.char_len(), Some(1));
 
     // Malformed: None (ops layer owns perl's warning behavior).
-    let m = PerlString::from_bytes([0x80; 24]).unwrap();
+    let m = PString::from_bytes([0x80; 24]).unwrap();
     assert_eq!(m.char_len(), None);
 
     // Inline recount, all classes.
-    assert_eq!(PerlString::from_str("héllo").unwrap().char_len(), Some(5));
-    assert_eq!(PerlString::from_str("字").unwrap().char_len(), Some(1));
-    assert_eq!(PerlString::from_bytes([0x80]).unwrap().char_len(), None);
+    assert_eq!(PString::from_str("héllo").unwrap().char_len(), Some(5));
+    assert_eq!(PString::from_str("字").unwrap().char_len(), Some(1));
+    assert_eq!(PString::from_bytes([0x80]).unwrap().char_len(), None);
 }
 
 #[test]
 fn char_len_maintained_through_append() {
-    let mut s = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap(); // heap
+    let mut s = PString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap(); // heap
     assert_eq!(s.char_len(), Some(12)); // classify + count: one pass
     eq_probe::reset();
     s.push_str("abc").unwrap(); // classification of the ADDED bytes only
@@ -1141,7 +1141,7 @@ fn char_len_maintained_through_append() {
 
 #[test]
 fn char_count_shared_across_cow_sharers() {
-    let a = PerlString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
+    let a = PString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
     let b = a.clone(); // shares the buffer
     assert_eq!(a.char_len(), Some(12)); // pays the pass
     eq_probe::reset();
@@ -1156,7 +1156,7 @@ fn large_immortal_forms_share_a_leaked_header_and_read_zero_copy() {
     // itself leaked — the test standing in for a program's large embedded literal.
     let big: &'static [u8] = Box::leak(b"z".repeat(U24_TEST_CEILING + 3).into_boxed_slice());
     let live = cow_buffer::live::count();
-    let s = PerlString::from_static_bytes(big).unwrap();
+    let s = PString::from_static_bytes(big).unwrap();
     assert_eq!(s.storage_type(), StorageType::LargeStatic);
     assert_eq!(s.scan_state(), scan::Ascii);
     assert_eq!(s.len(), big.len());
@@ -1180,7 +1180,7 @@ fn large_immortal_forms_share_a_leaked_header_and_read_zero_copy() {
     // The unsafe immortal door at large size, and copy-out on write: the append lands in a tier, the image and its
     // other handles untouched.
     // SAFETY: leaked memory outlives every handle and nothing writes it.
-    let im = unsafe { PerlString::from_immortal_bytes(big) }.unwrap();
+    let im = unsafe { PString::from_immortal_bytes(big) }.unwrap();
     assert_eq!(im.storage_type(), StorageType::LargeImmortal);
     let mut w = im.clone();
     w.push_str("!").unwrap();
@@ -1196,29 +1196,29 @@ const U24_TEST_CEILING: usize = 0xFF_FFFF;
 fn ascii_twins_are_the_class_specific_selection_with_derived_facts() {
     // Both tiers route settled-Ascii births to their twin, whose omitted count and scan are derived: every byte a
     // character, the class in the variant.
-    let small = PerlString::from_bytes(b"x".repeat(40)).unwrap();
+    let small = PString::from_bytes(b"x".repeat(40)).unwrap();
     assert_eq!(small.storage_type(), StorageType::Heap8Ascii);
     assert_eq!(small.scan_state(), scan::Ascii);
     assert!(small.is_ascii());
     assert_eq!(small.char_len(), Some(40));
 
-    let mid = PerlString::from_bytes(b"y".repeat(300)).unwrap();
+    let mid = PString::from_bytes(b"y".repeat(300)).unwrap();
     assert_eq!(mid.storage_type(), StorageType::Heap16Ascii);
     assert_eq!(mid.char_len(), Some(300));
 
     // Non-Ascii small heap content stays on the plain variant.
-    let plain = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    let plain = PString::from_bytes([0xE9u8; 40]).unwrap();
     assert_eq!(plain.storage_type(), StorageType::Heap8);
 
     // A twin and a plain tier holding the same bytes are equal: the twin is a selection, not a meaning.
-    let as_heap16 = PerlString::from_bytes(b"x".repeat(40)).unwrap();
+    let as_heap16 = PString::from_bytes(b"x".repeat(40)).unwrap();
     assert_eq!(small, as_heap16);
 }
 
 #[test]
 fn ascii_twin_appends_stay_in_place_only_while_ascii_holds() {
     // An Ascii append extends the twin in place: same variant, no reclassification, count still derived.
-    let mut s = PerlString::from_bytes(b"a".repeat(40)).unwrap();
+    let mut s = PString::from_bytes(b"a".repeat(40)).unwrap();
     assert_eq!(s.storage_type(), StorageType::Heap8Ascii);
     s.push_str("bcd").unwrap();
     assert_eq!(s.storage_type(), StorageType::Heap8Ascii);
@@ -1227,14 +1227,14 @@ fn ascii_twin_appends_stay_in_place_only_while_ascii_holds() {
 
     // A non-Ascii append cannot ride the implied class: the fast path bails and the rebuild re-dispatches the
     // variant by the joined content, settled per classify-on-copy.
-    let mut t = PerlString::from_bytes(b"a".repeat(40)).unwrap();
+    let mut t = PString::from_bytes(b"a".repeat(40)).unwrap();
     t.push_str("é").unwrap();
     assert_eq!(t.storage_type(), StorageType::Heap8);
     assert_eq!(t.scan_state(), scan::Utf8Latin1);
     assert_eq!(t.char_len(), Some(41));
 
     // COW discipline holds on the twins: a shared twin's append copies, the sharer untouched.
-    let a = PerlString::from_bytes(b"z".repeat(40)).unwrap();
+    let a = PString::from_bytes(b"z".repeat(40)).unwrap();
     let mut b = a.clone();
     assert!(a.is_shared());
     b.push_str("!").unwrap();
@@ -1327,10 +1327,10 @@ fn racing_narrows_lose_no_information() {
     while content.last().is_some_and(|b| b & 0xC0 == 0x80) || content.last() == Some(&0xC3) {
         content.pop();
     }
-    let s = Arc::new(PerlString::from_bytes(&content).unwrap());
+    let s = Arc::new(PString::from_bytes(&content).unwrap());
     assert_eq!(s.storage_type(), StorageType::Heap32, "large tier: the lazy, shared-header regime");
 
-    let narrow = |s: &PerlString, st: scan::ScanState| match s.raw_parts() {
+    let narrow = |s: &PString, st: scan::ScanState| match s.raw_parts() {
         RawParts::Heap(view) => view.narrow_scan(st),
         _ => panic!("large tier expected"),
     };
@@ -1364,7 +1364,7 @@ fn racing_narrows_lose_no_information() {
 fn static_strings_are_zero_allocation_with_facts_settled_at_birth() {
     const TEXT: &str = "héllo, wörld: a static string past the inline ceiling";
     let live = cow_buffer::live::count();
-    let s = PerlString::from_static_str(TEXT).unwrap();
+    let s = PString::from_static_str(TEXT).unwrap();
     assert_eq!(s.storage_type(), StorageType::Static);
     assert_eq!(s.scan_state(), scan::Utf8Latin1, "terminal at construction");
     assert_eq!(s.char_len(), Some(TEXT.chars().count()), "the count is settled, not deferred");
@@ -1380,7 +1380,7 @@ fn static_strings_are_zero_allocation_with_facts_settled_at_birth() {
     assert_eq!(cow_buffer::live::count(), live, "zero allocations, zero releases");
 
     // Malformed static bytes are a legitimate image: terminal, count-free, honestly invalid to both readers.
-    let m = PerlString::from_static_bytes(b"a static image with a broken tail \xC0\x80").unwrap();
+    let m = PString::from_static_bytes(b"a static image with a broken tail \xC0\x80").unwrap();
     assert_eq!(m.scan_state(), scan::MalformedUtf8);
     assert_eq!(m.char_len(), None);
     assert!(m.as_str(&mut [0u8; DECODE_MAX]).is_none());
@@ -1390,7 +1390,7 @@ fn static_strings_are_zero_allocation_with_facts_settled_at_birth() {
 #[test]
 fn immortal_and_static_writes_copy_out_and_flags_ride_the_image() {
     // Writing to an immortal form copies out to a mutable tier: the image is untouched and other handles still read it.
-    let s = PerlString::from_static_str("the quick brown fox jumps over the lazy dog").unwrap();
+    let s = PString::from_static_str("the quick brown fox jumps over the lazy dog").unwrap();
     let mut w = s.clone();
     w.push_str(" again").unwrap();
     assert!(matches!(w.storage_type(), StorageType::Heap8Ascii), "the write landed in a tier, in the Ascii twin");
@@ -1399,7 +1399,7 @@ fn immortal_and_static_writes_copy_out_and_flags_ride_the_image() {
     assert_eq!(s.char_len(), Some(43));
 
     // A flag flip rebuilds the envelope and stays in the form: the image never moves for a tag change.
-    let mut f = PerlString::from_static_str("étale cohomology, statically").unwrap();
+    let mut f = PString::from_static_str("étale cohomology, statically").unwrap();
     f.set_utf8_for_test();
     assert_eq!(f.storage_type(), StorageType::Static);
     assert!(f.is_utf8());
@@ -1409,7 +1409,7 @@ fn immortal_and_static_writes_copy_out_and_flags_ride_the_image() {
     let image: &'static [u8] = Box::leak(b"immortal by leak: the slab arrives later".to_vec().into_boxed_slice());
 
     // SAFETY: leaked memory outlives every handle and nothing writes it.
-    let im = unsafe { PerlString::from_immortal_bytes(image) }.unwrap();
+    let im = unsafe { PString::from_immortal_bytes(image) }.unwrap();
     assert_eq!(im.storage_type(), StorageType::Immortal);
     assert_eq!(im.scan_state(), scan::Ascii);
     assert!(im.is_ascii());
@@ -1420,21 +1420,21 @@ fn immortal_and_static_writes_copy_out_and_flags_ride_the_image() {
     assert_eq!(cow_buffer::live::count(), live, "immortal handles never touch the tier allocator");
 
     // Content equality is representation-blind: a static, an immortal, and a tier holding the same bytes are equal.
-    let st = PerlString::from_static_str("the same forty-two bytes in every form!!!!").unwrap();
-    let heap = PerlString::from_bytes(b"the same forty-two bytes in every form!!!!").unwrap();
+    let st = PString::from_static_str("the same forty-two bytes in every form!!!!").unwrap();
+    let heap = PString::from_bytes(b"the same forty-two bytes in every form!!!!").unwrap();
     assert_eq!(st, heap);
 }
 
 #[test]
 fn unshare_is_a_no_op_on_unique_and_envelope_storage() {
     // Inline: the envelope owns the bytes; nothing is shared, nothing moves.
-    let mut inline = PerlString::new("hi").unwrap();
+    let mut inline = PString::new("hi").unwrap();
     assert!(!inline.is_shared());
     inline.unshare().unwrap();
     assert_eq!(inline.as_bytes(&mut [0u8; DECODE_MAX]), b"hi");
 
     // A uniquely-held heap buffer stays where it is: no allocation churn at all.
-    let mut unique = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    let mut unique = PString::from_bytes([0xE9u8; 40]).unwrap();
     assert!(!unique.is_shared());
     let live = cow_buffer::live::count();
     unique.unshare().unwrap();
@@ -1444,7 +1444,7 @@ fn unshare_is_a_no_op_on_unique_and_envelope_storage() {
 
 #[test]
 fn unshare_copies_out_of_shared_storage_and_preserves_meaning() {
-    let a = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    let a = PString::from_bytes([0xE9u8; 40]).unwrap();
     let mut b = a.clone();
     assert!(a.is_shared() && b.is_shared());
 
@@ -1455,7 +1455,7 @@ fn unshare_copies_out_of_shared_storage_and_preserves_meaning() {
     assert_eq!(a, b, "content is meaning, and it did not change");
 
     // The flags ride along: unsharing changes where the bytes live, never what the value means.
-    let mut f = PerlString::from_str(&"é".repeat(20)).unwrap(); // heap-tier, so the clone shares
+    let mut f = PString::from_str(&"é".repeat(20)).unwrap(); // heap-tier, so the clone shares
     f.set_utf8_for_test();
     let mut f2 = f.clone();
     f2.unshare().unwrap();
@@ -1477,7 +1477,7 @@ fn unshare_settles_an_indeterminate_shared_buffer() {
 
 #[test]
 fn clone_shares_heap_buffer_and_append_cow_breaks() {
-    let a = PerlString::from_str(&"base".repeat(10)).unwrap(); // heap
+    let a = PString::from_str(&"base".repeat(10)).unwrap(); // heap
     let mut b = a.clone();
     b.push_str("+more").unwrap();
     assert_eq!(a.len(), 40);
@@ -1485,7 +1485,7 @@ fn clone_shares_heap_buffer_and_append_cow_breaks() {
     assert!(a.as_str(&mut [0u8; DECODE_MAX]).is_some());
 }
 
-impl PerlString {
+impl PString {
     /// Test-only: force the utf8 flag on (simulating `Encode::_utf8_on` / upgrade provenance).
     pub(crate) fn set_utf8_for_test(&mut self) {
         self.rebuild_tag(|_u, t| (true, t));
@@ -1496,24 +1496,24 @@ impl PerlString {
 
 #[test]
 fn inline_accepts_up_to_the_capacity_and_refuses_beyond() {
-    assert!(PerlString::inline("a".repeat(INLINE_MAX)).is_some());
-    assert_eq!(PerlString::inline("a".repeat(INLINE_MAX + 1)), None);
-    assert!(PerlString::inline_bytes(vec![0xFFu8; INLINE_MAX]).is_some());
-    assert_eq!(PerlString::inline_bytes(vec![0xFFu8; INLINE_MAX + 1]), None);
+    assert!(PString::inline("a".repeat(INLINE_MAX)).is_some());
+    assert_eq!(PString::inline("a".repeat(INLINE_MAX + 1)), None);
+    assert!(PString::inline_bytes(vec![0xFFu8; INLINE_MAX]).is_some());
+    assert_eq!(PString::inline_bytes(vec![0xFFu8; INLINE_MAX + 1]), None);
 }
 
 #[test]
 fn inline_agrees_with_the_fallible_constructors() {
     // Same content, same result: the fallible paths delegate here, so the representations must match exactly.
     for text in ["", "hello", "héllo", "0", "a longer ascii string"] {
-        if let Some(inline) = PerlString::inline(text) {
-            assert_eq!(inline, text.parse::<PerlString>().unwrap(), "{text:?}");
+        if let Some(inline) = PString::inline(text) {
+            assert_eq!(inline, text.parse::<PString>().unwrap(), "{text:?}");
         }
     }
 
     for bytes in [&b""[..], b"hello", b"\xFF\xFE", b"\xC3\xA9"] {
-        if let Some(inline) = PerlString::inline_bytes(bytes) {
-            assert_eq!(inline, PerlString::from_bytes(bytes).unwrap(), "{bytes:?}");
+        if let Some(inline) = PString::inline_bytes(bytes) {
+            assert_eq!(inline, PString::from_bytes(bytes).unwrap(), "{bytes:?}");
         }
     }
 }
@@ -1521,31 +1521,31 @@ fn inline_agrees_with_the_fallible_constructors() {
 #[test]
 fn inline_flags_follow_the_source_type() {
     // From &str: ASCII unflagged (canonical downgraded form), non-ASCII flagged.
-    assert!(!PerlString::inline("hello").unwrap().is_utf8());
-    assert!(PerlString::inline("héllo").unwrap().is_utf8());
+    assert!(!PString::inline("hello").unwrap().is_utf8());
+    assert!(PString::inline("héllo").unwrap().is_utf8());
 
     // From bytes: never flagged, even when the content happens to be valid UTF-8.
-    assert!(!PerlString::inline_bytes(b"h\xC3\xA9llo").unwrap().is_utf8());
+    assert!(!PString::inline_bytes(b"h\xC3\xA9llo").unwrap().is_utf8());
 }
 
 #[test]
 fn inline_composes_with_unwrap_or_default() {
     // The discard-the-detail path: callers who merely prefer inline storage need one combinator.
-    assert_eq!(PerlString::inline("hi").unwrap_or_default().as_bytes(&mut [0u8; DECODE_MAX]), b"hi");
-    assert_eq!(PerlString::inline("a".repeat(INLINE_MAX + 1)).unwrap_or_default(), PerlString::empty());
+    assert_eq!(PString::inline("hi").unwrap_or_default().as_bytes(&mut [0u8; DECODE_MAX]), b"hi");
+    assert_eq!(PString::inline("a".repeat(INLINE_MAX + 1)).unwrap_or_default(), PString::empty());
 }
 
 #[test]
 fn inline_accepts_every_asref_shape() {
     let owned = String::from("owned");
-    assert!(PerlString::inline(&owned).is_some());
-    assert!(PerlString::inline(owned.clone()).is_some());
-    assert!(PerlString::inline(owned.as_str()).is_some());
+    assert!(PString::inline(&owned).is_some());
+    assert!(PString::inline(owned.clone()).is_some());
+    assert!(PString::inline(owned.as_str()).is_some());
 
     let bytes = vec![1u8, 2, 3];
-    assert!(PerlString::inline_bytes(&bytes).is_some());
-    assert!(PerlString::inline_bytes(bytes.clone()).is_some());
-    assert!(PerlString::inline_bytes(&bytes[..]).is_some());
+    assert!(PString::inline_bytes(&bytes).is_some());
+    assert!(PString::inline_bytes(bytes.clone()).is_some());
+    assert!(PString::inline_bytes(&bytes[..]).is_some());
 }
 
 // ── Formatting into the string ────────────────────────────────────
@@ -1553,7 +1553,7 @@ fn inline_accepts_every_asref_shape() {
 #[test]
 fn write_macro_appends_through_fmt_write() {
     use std::fmt::Write;
-    let mut s = PerlString::empty();
+    let mut s = PString::empty();
     write!(s, "{}-tail", 42).unwrap();
     write!(s, " {:.2}", 1.5).unwrap();
     assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"42-tail 1.50");
@@ -1562,7 +1562,7 @@ fn write_macro_appends_through_fmt_write() {
 #[test]
 fn push_fmt_reports_allocation_precisely() {
     // The trait impl flattens failure into fmt::Error, which carries nothing; push_fmt keeps the real error.
-    let mut s = PerlString::empty();
+    let mut s = PString::empty();
     s.push_fmt(format_args!("{}", 12345)).unwrap();
     s.push_fmt(format_args!("{:>8}", "x")).unwrap();
     assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"12345       x");
@@ -1573,7 +1573,7 @@ fn formatting_into_a_string_grows_it_across_tiers() {
     use std::fmt::Write;
 
     // Crossing the inline capacity mid-format must promote and keep every byte.
-    let mut s = PerlString::empty();
+    let mut s = PString::empty();
     for i in 0..10 {
         write!(s, "{i:04}").unwrap();
     }
@@ -1588,19 +1588,19 @@ fn formatting_into_a_string_grows_it_across_tiers() {
 fn interpretation_methods_answer_from_the_string() {
     // The operations that used to reach for the bytes at the call site.  Asking the string means the caller neither
     // sees nor decides which storage form holds the content.
-    let s: PerlString = "42abc".parse().unwrap();
+    let s: PString = "42abc".parse().unwrap();
     assert_eq!(s.to_int(), 42, "leading numeric prefix");
     assert!(s.to_bool());
     assert!(s.would_warn(), "a trailing non-numeric tail warns");
 
-    let f: PerlString = "3.75".parse().unwrap();
+    let f: PString = "3.75".parse().unwrap();
     assert_eq!(f.to_float(), 3.75);
     assert_eq!(f.to_int(), 3, "truncating toward zero");
     assert!(!f.would_warn());
 
     // Perl truthiness: only "" and "0" are false, so "0.0" and "00" are true.
     for (text, truth) in [("", false), ("0", false), ("0.0", true), ("00", true), (" ", true), ("0E0", true)] {
-        let v: PerlString = text.parse().unwrap();
+        let v: PString = text.parse().unwrap();
         assert_eq!(v.to_bool(), truth, "truthiness of {text:?}");
     }
 }
@@ -1609,8 +1609,8 @@ fn interpretation_methods_answer_from_the_string() {
 fn interpretation_agrees_across_storage_forms() {
     // The same content held inline and on the heap must answer identically — the property that lets storage forms
     // multiply without consumers noticing.
-    let short: PerlString = "17".parse().unwrap();
-    let padded: PerlString = "17                                        ".parse().unwrap();
+    let short: PString = "17".parse().unwrap();
+    let padded: PString = "17                                        ".parse().unwrap();
     assert_ne!(short.storage_type(), padded.storage_type(), "the two must actually differ in storage");
     assert_eq!(short.to_int(), 17);
     assert_eq!(padded.to_int(), 17, "trailing space does not change the numeric prefix");
@@ -1619,17 +1619,17 @@ fn interpretation_agrees_across_storage_forms() {
 
 #[test]
 fn debug_shows_the_representation_with_readable_bytes() {
-    let packed: PerlString = "2026-07-28T14:33:07Z".parse().unwrap();
+    let packed: PString = "2026-07-28T14:33:07Z".parse().unwrap();
     let shown = format!("{packed:?}");
     assert!(shown.contains("storage: Packed"), "the tier is the first thing a developer wants: {shown}");
     assert!(shown.contains(r#"bytes: b"2026-07-28T14:33:07Z""#), "byte-string syntax, not integers: {shown}");
 
     // Bytes that are not text render escaped rather than lossily, since a perl string's content need not be UTF-8.
-    let raw = PerlString::from_bytes([0xFF, 0xFE, b'h', b'i']).unwrap();
+    let raw = PString::from_bytes([0xFF, 0xFE, b'h', b'i']).unwrap();
     assert!(format!("{raw:?}").contains(r#"b"\xFF\xFEhi""#));
 
     // The usual escapes, so a newline does not break the line.
-    let escaped: PerlString = "a\tb\nc".parse().unwrap();
+    let escaped: PString = "a\tb\nc".parse().unwrap();
     assert!(format!("{escaped:?}").contains(r#"b"a\tb\nc""#));
 }
 
@@ -1638,19 +1638,19 @@ fn the_constructors_accept_every_asref_shape() {
     // Generic at the boundary: an embedder holding a String, a Cow, or a compact string type from the ecosystem needs
     // no conversion, and the ladder beneath is monomorphic.
     let owned = String::from("owned content");
-    assert_eq!(PerlString::new(&owned).unwrap().len(), 13);
-    assert_eq!(PerlString::new(owned.clone()).unwrap().len(), 13);
-    assert_eq!(PerlString::new(owned.as_str()).unwrap().len(), 13);
-    assert_eq!(PerlString::new(std::borrow::Cow::Borrowed("borrowed")).unwrap().len(), 8);
+    assert_eq!(PString::new(&owned).unwrap().len(), 13);
+    assert_eq!(PString::new(owned.clone()).unwrap().len(), 13);
+    assert_eq!(PString::new(owned.as_str()).unwrap().len(), 13);
+    assert_eq!(PString::new(std::borrow::Cow::Borrowed("borrowed")).unwrap().len(), 8);
 
     let bytes = vec![1u8, 2, 3];
-    assert_eq!(PerlString::from_bytes(&bytes).unwrap().len(), 3);
-    assert_eq!(PerlString::from_bytes(bytes.clone()).unwrap().len(), 3);
-    assert_eq!(PerlString::from_bytes(&bytes[..]).unwrap().len(), 3);
-    assert_eq!(PerlString::from_bytes([7u8; 4]).unwrap().len(), 4);
+    assert_eq!(PString::from_bytes(&bytes).unwrap().len(), 3);
+    assert_eq!(PString::from_bytes(bytes.clone()).unwrap().len(), 3);
+    assert_eq!(PString::from_bytes(&bytes[..]).unwrap().len(), 3);
+    assert_eq!(PString::from_bytes([7u8; 4]).unwrap().len(), 4);
 
     // FromStr forwards to new, so parse() and new() agree exactly.
-    assert_eq!(PerlString::new("2026-07-28T14:33:07Z").unwrap(), "2026-07-28T14:33:07Z".parse().unwrap());
+    assert_eq!(PString::new("2026-07-28T14:33:07Z").unwrap(), "2026-07-28T14:33:07Z".parse().unwrap());
 }
 
 #[test]
@@ -1669,11 +1669,11 @@ fn appending_yields_what_constructing_whole_would() {
     ];
 
     for (head, tail) in cases {
-        let mut built: PerlString = head.parse().unwrap();
+        let mut built: PString = head.parse().unwrap();
         assert!(built.storage_type().is_packed(), "{head} should start packed");
         built.push_str(tail).unwrap();
 
-        let whole: PerlString = format!("{head}{tail}").parse().unwrap();
+        let whole: PString = format!("{head}{tail}").parse().unwrap();
         assert_eq!(built.storage_type(), whole.storage_type(), "{head}+{tail}: same tier");
         assert_eq!(built.as_bytes(&mut [0u8; DECODE_MAX]), whole.as_bytes(&mut [0u8; DECODE_MAX]), "{head}+{tail}: same content");
         assert_eq!(built, whole, "{head}+{tail}: equal strings");
@@ -1683,19 +1683,19 @@ fn appending_yields_what_constructing_whole_would() {
 #[test]
 fn appending_leaves_the_tier_when_it_must() {
     // A character in no alphabet, and content past the capacity: both go to the heap, carrying their bytes intact.
-    let mut lettered: PerlString = "2026-07-28T14:33".parse().unwrap();
+    let mut lettered: PString = "2026-07-28T14:33".parse().unwrap();
     lettered.push_str("x").unwrap();
     assert!(lettered.storage_type().is_heap());
     assert_eq!(lettered.as_bytes(&mut [0u8; DECODE_MAX]), b"2026-07-28T14:33x");
 
-    let mut overflowing: PerlString = "123456789012345678901234567890".parse().unwrap();
+    let mut overflowing: PString = "123456789012345678901234567890".parse().unwrap();
     assert!(overflowing.storage_type().is_packed(), "thirty characters is the capacity");
     overflowing.push_str("1").unwrap();
     assert!(overflowing.storage_type().is_heap());
     assert_eq!(overflowing.len(), 31);
 
     // A '+' offset meeting a 'Z': the two spellings are mutually exclusive, so this leaves the tier too.
-    let mut offset: PerlString = "14:33+01:00 14:33".parse().unwrap();
+    let mut offset: PString = "14:33+01:00 14:33".parse().unwrap();
     offset.push_str("Z").unwrap();
     assert!(offset.storage_type().is_heap());
 }
@@ -1705,7 +1705,7 @@ fn incremental_building_reaches_the_packed_tier() {
     // The case the length families exist for: a string that passes through a trailing space on its way to something
     // longer, built one piece at a time through fmt::Write.
     use std::fmt::Write;
-    let mut s = PerlString::empty();
+    let mut s = PString::empty();
     write!(s, "2026-07-28").unwrap();
     write!(s, " ").unwrap();
     assert_eq!(s.len(), 11, "a trailing space mid-build");
@@ -1721,7 +1721,7 @@ fn the_terminator_is_found_at_every_position() {
     // where the first word ends, and 15, where a full payload has no terminator at all.
     for len in 0..=INLINE_MAX {
         let content: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
-        let s = PerlString::from_bytes(&content).unwrap();
+        let s = PString::from_bytes(&content).unwrap();
         assert_eq!(s.len(), len, "length of {len} bytes of content");
         assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &content[..], "content of {len} bytes");
     }
@@ -1730,7 +1730,7 @@ fn the_terminator_is_found_at_every_position() {
     for filler in [0x80u8, 0xFF, 0x01, 0x7F] {
         for len in 1..=INLINE_MAX {
             let content = vec![filler; len];
-            let s = PerlString::from_bytes(&content).unwrap();
+            let s = PString::from_bytes(&content).unwrap();
             assert_eq!(s.len(), len, "{len} bytes of {filler:#04x}");
         }
     }
@@ -1742,7 +1742,7 @@ fn the_terminator_is_found_at_every_length() {
     // payload, which has no terminator at all — needs pinning.
     for len in 0..=INLINE_MAX {
         let content = vec![b'x'; len];
-        let s = PerlString::from_bytes(&content).unwrap();
+        let s = PString::from_bytes(&content).unwrap();
         assert_eq!(s.len(), len, "length {len}");
         assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &content[..], "content at length {len}");
     }
@@ -1752,7 +1752,7 @@ fn the_terminator_is_found_at_every_length() {
     for len in 1..=INLINE_MAX {
         let mut content = vec![0xFFu8; len];
         content[len - 1] = 0x80;
-        let s = PerlString::from_bytes(&content).unwrap();
+        let s = PString::from_bytes(&content).unwrap();
         assert_eq!(s.len(), len, "high-bit content at length {len}");
     }
 }
@@ -1762,14 +1762,14 @@ fn nul_bearing_content_lives_inline_now() {
     // An explicit length admits what a terminator could not: a NUL is content like any other byte, and needs no special
     // case in construction, in appending, or in the tier ladder.
     for content in [&b"\0"[..], b"a\0b", b"\0\0\0", b"ab\0", b"\0abcdefghijklm", b"abcdefghijklmn\0"] {
-        let s = PerlString::from_bytes(content).unwrap();
+        let s = PString::from_bytes(content).unwrap();
         assert!(s.storage_type().is_inline(), "{content:?} should be inline");
         assert_eq!(s.len(), content.len());
         assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), content);
     }
 
     // And appending one keeps the string inline.
-    let mut s = PerlString::from_bytes(b"ab").unwrap();
+    let mut s = PString::from_bytes(b"ab").unwrap();
     s.push_bytes(b"\0cd").unwrap();
     assert!(s.storage_type().is_inline());
     assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"ab\0cd");
@@ -1781,14 +1781,14 @@ fn the_length_families_split_at_capacity() {
     // a fifteenth character would have used.
     for len in 0..=INLINE_MAX {
         let content = vec![b'x'; len];
-        let s = PerlString::from_bytes(&content).unwrap();
+        let s = PString::from_bytes(&content).unwrap();
         assert_eq!(s.len(), len, "length {len}");
         assert!(s.storage_type().is_inline());
         assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &content[..]);
     }
 
     // Growing across the boundary by appending, one byte at a time.
-    let mut s = PerlString::empty();
+    let mut s = PString::empty();
     for i in 0..INLINE_MAX {
         s.push_bytes(b"y").unwrap();
         assert_eq!(s.len(), i + 1, "after {} appends", i + 1);
@@ -1805,13 +1805,13 @@ fn the_length_families_split_at_capacity() {
 fn equal_content_has_equal_bytes_whatever_its_history() {
     // Padding past the length is canonically zero, so a string built by appending is byte-identical to the same content
     // constructed whole — which is what lets representation stand in for content.
-    let whole = PerlString::from_bytes(b"abcde").unwrap();
-    let mut built = PerlString::from_bytes(b"abc").unwrap();
+    let whole = PString::from_bytes(b"abcde").unwrap();
+    let mut built = PString::from_bytes(b"abc").unwrap();
     built.push_bytes(b"de").unwrap();
     assert_eq!(whole, built);
 
     // The same content reached through the full-capacity family and back down.
-    let mut long = PerlString::from_bytes(b"abc").unwrap();
+    let mut long = PString::from_bytes(b"abc").unwrap();
     long.push_bytes(b"de").unwrap();
     assert_eq!(whole, long);
 }
@@ -1821,7 +1821,7 @@ fn compressed_payloads_and_the_nibble_scheme() {
     // The Latin-1 class stores the Latin-1 transcoding of the internal bytes — each one- or two-byte UTF-8 sequence as
     // its single-byte equivalent — with the length byte split into the two nibbles (§2.2.9): low `s`, high `h`.  The E9
     // monster's two strings at the representation level.
-    let two_char = PerlString::from_bytes([0xC3, 0xA9]).unwrap(); // The octet string C3.A9.
+    let two_char = PString::from_bytes([0xC3, 0xA9]).unwrap(); // The octet string C3.A9.
     assert_eq!(two_char.storage_type(), StorageType::InlineLatin1);
     match two_char.raw_parts() {
         RawParts::Inline { buf, .. } => {
@@ -1834,21 +1834,21 @@ fn compressed_payloads_and_the_nibble_scheme() {
     assert_eq!(two_char.char_len(), Some(1));
     assert_eq!(two_char.as_bytes(&mut [0u8; DECODE_MAX]), [0xC3, 0xA9], "as_bytes expands the compression");
 
-    let one_char = PerlString::from_bytes([0xE9]).unwrap(); // The one-octet string é: the Bytes residual.
+    let one_char = PString::from_bytes([0xE9]).unwrap(); // The one-octet string é: the Bytes residual.
     assert_eq!(one_char.storage_type(), StorageType::InlineBytes);
     assert_eq!(one_char.len(), 1);
     assert_ne!(two_char, one_char, "different strings, distinguished by the class axis alone");
 
     // Sixteen to thirty compressible bytes are the new inline intake: fifteen stored high bytes span thirty internal
     // bytes, report length 30 (container-verified: ord returns the lead C3), and fill the payload — the full family.
-    let wide = PerlString::from_bytes([0xC3, 0xA9].repeat(15)).unwrap();
+    let wide = PString::from_bytes([0xC3, 0xA9].repeat(15)).unwrap();
     assert_eq!(wide.storage_type(), StorageType::InlineLatin1Full);
     assert_eq!(wide.len(), 30, "length is the expansion sum, never the payload count");
     assert_eq!(wide.char_len(), Some(15));
     assert_eq!(wide.as_bytes(&mut [0u8; DECODE_MAX]), [0xC3, 0xA9].repeat(15));
 
     // The verbatim valid classes carry their character count in the aux nibble: O(1), no decode.
-    let euro = PerlString::from_str("€€").unwrap(); // Six bytes, two characters, beyond Latin-1.
+    let euro = PString::from_str("€€").unwrap(); // Six bytes, two characters, beyond Latin-1.
     assert_eq!(euro.storage_type(), StorageType::InlineNonLatin1);
     match euro.raw_parts() {
         RawParts::Inline { buf, .. } => assert_eq!(buf[LENGTH_BYTE], 0x26, "six stored, two characters: nibbles 2/6"),
@@ -1857,20 +1857,20 @@ fn compressed_payloads_and_the_nibble_scheme() {
     assert_eq!(euro.char_len(), Some(2));
 
     // Ascii and Bytes keep a zero aux nibble, making their short-family payloads bit-identical to the raw-byte tier.
-    let plain = PerlString::from_bytes(b"abcd").unwrap();
+    let plain = PString::from_bytes(b"abcd").unwrap();
     match plain.raw_parts() {
         RawParts::Inline { buf, .. } => assert_eq!(buf[LENGTH_BYTE], 0x04),
         _ => panic!("expected inline storage"),
     }
 
     // Overlong NUL never compresses; canonical NUL does — in every spelling (§2.2.9).
-    assert_eq!(PerlString::from_bytes([0xC0, 0x80]).unwrap().storage_type(), StorageType::InlineBytes);
-    assert_eq!(PerlString::from_bytes(b"a\0b").unwrap().storage_type(), StorageType::InlineAscii);
+    assert_eq!(PString::from_bytes([0xC0, 0x80]).unwrap().storage_type(), StorageType::InlineBytes);
+    assert_eq!(PString::from_bytes(b"a\0b").unwrap().storage_type(), StorageType::InlineAscii);
 
     // Deterministic ladder: 16-30-byte ASCII goes packed where an alphabet fits and heap otherwise — never compressed,
     // sixteen characters not fitting fifteen payload bytes.
-    assert_eq!(PerlString::from_bytes(b"1234567890123456").unwrap().storage_type(), StorageType::PackedNumeric);
-    assert_eq!(PerlString::from_bytes(b"abcdefghabcdefgh").unwrap().storage_type(), StorageType::Heap8Ascii);
+    assert_eq!(PString::from_bytes(b"1234567890123456").unwrap().storage_type(), StorageType::PackedNumeric);
+    assert_eq!(PString::from_bytes(b"abcdefghabcdefgh").unwrap().storage_type(), StorageType::Heap8Ascii);
 }
 
 #[test]
@@ -1880,7 +1880,7 @@ fn rebuilding_zeroes_everything_past_the_content() {
     // and representation would stop standing in for content.
     let mut dirty = [0xEEu8; INLINE_MAX];
     dirty[..4].copy_from_slice(b"abcd");
-    let s = PerlString::build_inline(InlineClass::Ascii, false, false, 4, 0, dirty);
+    let s = PString::build_inline(InlineClass::Ascii, false, false, 4, 0, dirty);
 
     match s.raw_parts() {
         RawParts::Inline { full, buf, .. } => {
@@ -1892,15 +1892,15 @@ fn rebuilding_zeroes_everything_past_the_content() {
         _ => panic!("expected inline storage"),
     }
 
-    assert_eq!(s, PerlString::from_bytes(b"abcd").unwrap());
+    assert_eq!(s, PString::from_bytes(b"abcd").unwrap());
 }
 
 #[test]
 fn packed_equality_compares_nibbles_directly() {
     // Equal content in one alphabet has equal nibbles, so no decoding is needed — the encoding is injective and the
     // padding canonical.  These pin the answers rather than the mechanism, but a wrong fast path would break them.
-    let a: PerlString = "2026-07-28T14:33:07Z".parse().unwrap();
-    let b: PerlString = "2026-07-28T14:33:07Z".parse().unwrap();
+    let a: PString = "2026-07-28T14:33:07Z".parse().unwrap();
+    let b: PString = "2026-07-28T14:33:07Z".parse().unwrap();
     assert_eq!(a, b);
     assert!(a.storage_type().is_packed());
 
@@ -1909,32 +1909,32 @@ fn packed_equality_compares_nibbles_directly() {
     assert_ne!(a, "3026-07-28T14:33:07Z".parse().unwrap());
 
     // Different lengths within the same alphabet, including the two length families.
-    assert_ne!(a, "2026-07-28T14:33:07.5Z".parse::<PerlString>().unwrap());
-    let full: PerlString = "2026-07-29T17:23:45.123456789Z".parse().unwrap();
+    assert_ne!(a, "2026-07-28T14:33:07.5Z".parse::<PString>().unwrap());
+    let full: PString = "2026-07-29T17:23:45.123456789Z".parse().unwrap();
     assert_eq!(full, "2026-07-29T17:23:45.123456789Z".parse().unwrap());
     assert_ne!(full, "2026-07-29T17:23:45.12345678Z".parse().unwrap());
 
     // Different alphabets cannot hold equal content, so the mismatch is decisive.
-    let numeric: PerlString = "192.168.100.200 1.2".parse().unwrap();
+    let numeric: PString = "192.168.100.200 1.2".parse().unwrap();
     assert_ne!(a, numeric);
 
     // Packed against the other tiers, both directions.
-    let heaped: PerlString = "2026-07-28T14:33:07Z and then some more".parse().unwrap();
+    let heaped: PString = "2026-07-28T14:33:07Z and then some more".parse().unwrap();
     assert_ne!(a, heaped);
     assert_ne!(heaped, a);
 
-    let short: PerlString = "2026-07-28".parse().unwrap();
+    let short: PString = "2026-07-28".parse().unwrap();
     assert_ne!(a, short);
     assert_ne!(short, a);
 
     // A packed string equals the same content held on the heap, which is the case the one-sided path serves.
-    let long_numeric: PerlString = "1234567890123456789012345".parse().unwrap();
+    let long_numeric: PString = "1234567890123456789012345".parse().unwrap();
     assert!(long_numeric.storage_type().is_packed());
 
     let same_on_heap = {
-        let mut s: PerlString = "1234567890123456789012345 tail".parse().unwrap();
+        let mut s: PString = "1234567890123456789012345 tail".parse().unwrap();
         assert!(s.storage_type().is_heap());
-        s = PerlString::from_bytes(&s.as_bytes(&mut [0u8; DECODE_MAX])[..25]).unwrap();
+        s = PString::from_bytes(&s.as_bytes(&mut [0u8; DECODE_MAX])[..25]).unwrap();
         s
     };
     assert_eq!(long_numeric, same_on_heap, "same content, different tiers");
@@ -1944,22 +1944,22 @@ fn packed_equality_compares_nibbles_directly() {
 
 /// Rebuild a string from the internal bytes and flag the probe recorded, forcing the flag rather than letting the tier
 /// ladder choose it — flagged ASCII is representable but no constructor produces it, ASCII being canonically unflagged.
-fn from_hex(hex: &str, flagged: bool) -> PerlString {
+fn from_hex(hex: &str, flagged: bool) -> PString {
     let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
 
     if bytes.len() <= INLINE_MAX {
         let (class, stored, aux, buf) = classify_inline(&bytes).expect("fifteen bytes always classify");
-        return PerlString::build_inline(class, flagged, false, stored, aux, buf);
+        return PString::build_inline(class, flagged, false, stored, aux, buf);
     }
 
     if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
         && let Some(p) = pack(&bytes)
     {
-        return PerlString::build_packed(p, flagged, false);
+        return PString::build_packed(p, flagged, false);
     }
 
     let parts = heap_parts_classified(&bytes).unwrap();
-    PerlString::build_heap(flagged, false, parts)
+    PString::build_heap(flagged, false, parts)
 }
 
 #[test]
@@ -4193,7 +4193,7 @@ fn the_two_upgrade_forms_agree() {
         vec![0xE9],
         Vec::new(),
     ] {
-        let src = PerlString::from_bytes(&bytes).unwrap();
+        let src = PString::from_bytes(&bytes).unwrap();
         let copied = src.upgraded().unwrap();
         let mut in_place = src.clone();
         in_place.upgrade_in_place().unwrap();
@@ -4210,7 +4210,7 @@ fn the_two_upgrade_forms_agree() {
 fn upgrading_in_place_leaves_a_sharer_untouched() {
     // A shared buffer cannot be rewritten under its other holders, so the in-place form falls back to copying.
     let bytes = [b"an invariant prefix ".to_vec(), vec![0xE9; 40]].concat();
-    let sharer = PerlString::from_bytes(&bytes).unwrap();
+    let sharer = PString::from_bytes(&bytes).unwrap();
     let mut upgraded = sharer.clone();
     upgraded.upgrade_in_place().unwrap();
 
@@ -4221,7 +4221,7 @@ fn upgrading_in_place_leaves_a_sharer_untouched() {
     assert_eq!(sharer.as_bytes(&mut [0u8; DECODE_MAX]), &bytes[..]);
 
     // The unique path rewrites the buffer it already owns and must reach the same answer.
-    let mut unique = PerlString::from_bytes(&bytes).unwrap();
+    let mut unique = PString::from_bytes(&bytes).unwrap();
     unique.upgrade_in_place().unwrap();
     assert_eq!(unique, upgraded);
 }
@@ -4237,7 +4237,7 @@ fn the_two_downgrade_forms_agree() {
         b"short".to_vec(),
         Vec::new(),
     ] {
-        let src = PerlString::from_bytes(&bytes).unwrap().upgraded().unwrap();
+        let src = PString::from_bytes(&bytes).unwrap().upgraded().unwrap();
         let copied = src.downgraded().unwrap().expect("Latin-1-range content downgrades");
         let mut in_place = src.clone();
         assert!(in_place.downgrade_in_place().unwrap(), "and so does the in-place form");
@@ -4247,14 +4247,14 @@ fn the_two_downgrade_forms_agree() {
     }
 
     // Beyond U+00FF refuses, and the refusal leaves the value untouched rather than half-contracted.
-    let mut wide = PerlString::from_str(&"€".repeat(40)).unwrap();
+    let mut wide = PString::from_str(&"€".repeat(40)).unwrap();
     let before = wide.clone();
     assert!(!wide.downgrade_in_place().unwrap(), "a character past U+00FF must refuse");
     assert_eq!(wide, before, "a refused downgrade changes nothing");
     assert_eq!(wide.downgraded().unwrap(), None, "and the copying form refuses alike");
 
     // A shared buffer takes the copying route; the sharer keeps its encoding.
-    let shared = PerlString::from_bytes([0xC3u8, 0xA9].repeat(40)).unwrap().upgraded().unwrap();
+    let shared = PString::from_bytes([0xC3u8, 0xA9].repeat(40)).unwrap().upgraded().unwrap();
     let sharer = shared.clone();
     let mut contracted = shared.clone();
     assert!(contracted.downgrade_in_place().unwrap());
@@ -4343,12 +4343,12 @@ fn char_count_zero_is_dual_purposed_by_the_byte_length() {
     // The §2.2.4 ruling: zero means "no cached count", and the byte length disambiguates — zero bytes hold zero
     // characters by definition, so the field is never consulted there; nonempty decodable content counts at least one;
     // malformed content keeps zero permanently, the scan byte saying which case holds.
-    let mut s = PerlString::from_bytes(b"heap content that is long enough to stay heap").unwrap();
+    let mut s = PString::from_bytes(b"heap content that is long enough to stay heap").unwrap();
     s.push_bytes(b"").unwrap();
     assert_eq!(s.char_len(), Some(45));
 
     // Truncation to empty through the mutable escape: the count answer is 0 without any recount possible or needed.
-    let empty = PerlString::from_bytes(vec![]).unwrap();
+    let empty = PString::from_bytes(vec![]).unwrap();
     assert_eq!(empty.char_len(), Some(0));
 
     // Malformed heap content: no clean answer, and the count field stays at zero behind the scan byte's verdict.
@@ -4368,7 +4368,7 @@ fn char_count_zero_is_dual_purposed_by_the_byte_length() {
 // ── In-place transforms (§2.2.3) ──────────────────────────────
 
 /// The address of a heap string's data, for proving a rewrite stayed where it was.
-fn heap_addr(s: &PerlString) -> Option<usize> {
+fn heap_addr(s: &PString) -> Option<usize> {
     match s.raw_parts() {
         RawParts::Heap(view) => Some(view.as_slice().as_ptr() as usize),
         _ => None,
@@ -4380,7 +4380,7 @@ fn upgrade_moves_when_the_expansion_does_not_fit() {
     // A buffer born sized exactly to its content has no room for an upgrade that doubles the length, so this one must
     // move.  Nothing in the public API reveals whether a rewrite reallocated, so the allocation's address is the
     // witness.
-    let mut s = PerlString::from_bytes([0xE9u8; 40]).unwrap();
+    let mut s = PString::from_bytes([0xE9u8; 40]).unwrap();
     assert!(s.storage_type().is_small_heap_tier());
     let before = heap_addr(&s).expect("heap-resident");
     let cap_before = match s.raw_parts() {
@@ -4402,7 +4402,7 @@ fn upgrade_rewrites_in_place_when_the_expansion_fits() {
     // A contraction leaves its spare capacity behind — §2.2.3 defers trimming deliberately — so a downgraded buffer
     // holds exactly the headroom its own re-upgrade needs.  The round trip is therefore both the natural test and the
     // case where in-place rewriting is reachable at all, birth allocation being exact.
-    let mut s = PerlString::from_str(&"é".repeat(40)).unwrap();
+    let mut s = PString::from_str(&"é".repeat(40)).unwrap();
     assert!(s.downgrade_in_place().unwrap());
     assert_eq!(s.len(), 40);
 
@@ -4424,7 +4424,7 @@ fn upgrade_rewrites_in_place_when_the_expansion_fits() {
 #[test]
 fn downgrade_rewrites_in_place_and_never_reallocates() {
     // Contraction only shrinks, so it always fits: the buffer must be the same one afterwards, whatever its tier.
-    let mut s = PerlString::from_str(&"é".repeat(40)).unwrap();
+    let mut s = PString::from_str(&"é".repeat(40)).unwrap();
     assert!(s.is_utf8());
     let before = heap_addr(&s).expect("heap-resident");
 
@@ -4438,7 +4438,7 @@ fn downgrade_rewrites_in_place_and_never_reallocates() {
 #[test]
 fn a_shared_buffer_forces_the_copying_form() {
     // Neither rewrite may touch bytes another handle can see, so sharing sends both down the copying path.
-    let original = PerlString::from_str(&"é".repeat(40)).unwrap();
+    let original = PString::from_str(&"é".repeat(40)).unwrap();
     let mut copy = original.clone();
     let shared_addr = heap_addr(&original).expect("heap-resident");
     assert_eq!(heap_addr(&copy), Some(shared_addr), "the clone shares the allocation");
@@ -4451,7 +4451,7 @@ fn a_shared_buffer_forces_the_copying_form() {
 
 #[test]
 fn downgrade_refuses_content_past_the_latin1_range() {
-    let mut wide = PerlString::from_str(&"字".repeat(20)).unwrap();
+    let mut wide = PString::from_str(&"字".repeat(20)).unwrap();
     let before = heap_addr(&wide).expect("heap-resident");
     assert!(!wide.downgrade_in_place().unwrap(), "a character past U+00FF cannot contract");
     assert_eq!(heap_addr(&wide), Some(before), "and the refusal leaves the buffer alone");
@@ -4462,7 +4462,7 @@ fn downgrade_refuses_content_past_the_latin1_range() {
 fn raw_append_onto_a_small_tier_is_classified_not_left_unknown() {
     // A raw-byte append transitions to UNKNOWN in the lattice, and a small tier cannot hold that — the transition
     // funnel must pay the construction-grade pass instead of recording an indeterminate state (§2.2.3).
-    let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();
+    let mut s = PString::from_bytes(b"a".repeat(24)).unwrap();
     assert!(s.storage_type().is_small_heap_tier());
     s.push_bytes(&[0x81, 0x82]).unwrap(); // AppendKind::Unknown: nothing known about these bytes
 
@@ -4475,7 +4475,7 @@ fn raw_append_onto_a_small_tier_is_classified_not_left_unknown() {
     // Oracle: the append's classification must be exactly construction's on the same bytes.
     let mut buf = [0u8; DECODE_MAX];
     let bytes = s.as_bytes(&mut buf).to_vec();
-    let fresh = PerlString::from_bytes(&bytes).unwrap();
+    let fresh = PString::from_bytes(&bytes).unwrap();
     assert_eq!(s.scan_state(), fresh.scan_state(), "the transition funnel agrees with construction");
     assert_eq!(s.char_len(), fresh.char_len(), "and on the cached count");
 }
@@ -4485,7 +4485,7 @@ fn downgraded_small_tier_is_classified_not_left_unknown() {
     // An in-place downgrade that left a small tier's envelope UNKNOWN would re-derive on every subsequent validity
     // question, since narrow_scan is deliberately a no-op there — (1, 1) scans across two reads where (1, 0) is the
     // invariant.  The rule is the same one construction follows: below 64 KiB the state is settled now or never.
-    let mut s = PerlString::from_str(&"é".repeat(20)).unwrap();
+    let mut s = PString::from_str(&"é".repeat(20)).unwrap();
     assert!(s.storage_type().is_small_heap_tier());
     assert!(s.downgrade_in_place().unwrap());
 
@@ -4499,7 +4499,7 @@ fn downgraded_small_tier_is_classified_not_left_unknown() {
     // Oracle: the recorded state and count must be exactly what constructing from the same bytes records.
     let mut buf = [0u8; DECODE_MAX];
     let bytes = s.as_bytes(&mut buf).to_vec();
-    let fresh = PerlString::from_bytes(&bytes).unwrap();
+    let fresh = PString::from_bytes(&bytes).unwrap();
     assert_eq!(s.scan_state(), fresh.scan_state(), "in-place downgrade agrees with construction");
     assert_eq!(s.char_len(), fresh.char_len(), "and on the cached count");
 }
@@ -4510,7 +4510,7 @@ fn small_tier_str_construction_is_one_pass() {
     // the ASCII question through the terminal state, so a small tier pays one pass and no probe bytes.
     eq_probe::reset();
 
-    let s = PerlString::from_str(&"a".repeat(40)).unwrap();
+    let s = PString::from_str(&"a".repeat(40)).unwrap();
     assert!(s.storage_type().is_small_heap_tier());
 
     let (full, probe) = eq_probe::scans();
@@ -4523,7 +4523,7 @@ fn large_tier_append_preserves_known_scan_state() {
     // The take that feeds an append reads the large tier's header rather than discarding its facts: an append onto a
     // buffer whose state a reader already narrowed must transition from that state, not from UNKNOWN — otherwise every
     // rebuild forgets what a scan already paid to learn.
-    let mut s = PerlString::from_bytes(b"a".repeat(100_000)).unwrap();
+    let mut s = PString::from_bytes(b"a".repeat(100_000)).unwrap();
     assert!(!s.storage_type().is_small_heap_tier());
     assert!(s.is_ascii(), "the probe narrows the shared scan slot");
     let narrowed = s.scan_state();
@@ -4537,7 +4537,7 @@ fn large_tier_append_preserves_known_scan_state() {
 fn append_within_class_headroom_extends_in_place() {
     // The fast path the class headroom exists for (§2.2.3): a unique buffer whose spare capacity holds the result
     // extends in place — no allocation, same buffer, facts maintained.
-    let mut s = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let mut s = PString::from_str(&"x".repeat(40)).unwrap();
     let mut buf = [0u8; DECODE_MAX];
     let live = cow_buffer::live::count();
     let addr = s.as_bytes(&mut buf).as_ptr() as usize;
@@ -4553,7 +4553,7 @@ fn append_within_class_headroom_extends_in_place() {
 fn append_past_capacity_rebuilds_through_the_constructor() {
     // Over capacity there is nothing to extend into: the rebuild releases the old buffer (net zero live) and the
     // tier-choosing constructor establishes the result's facts.
-    let mut s = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let mut s = PString::from_str(&"x".repeat(40)).unwrap();
     let mut buf = [0u8; DECODE_MAX];
     let live = cow_buffer::live::count();
     let addr = s.as_bytes(&mut buf).as_ptr() as usize;
@@ -4569,7 +4569,7 @@ fn append_past_capacity_rebuilds_through_the_constructor() {
 fn append_onto_a_shared_buffer_rebuilds_and_leaves_the_sharer() {
     // Shared means no in-place anything: the appender rebuilds into its own allocation and the sharer keeps the
     // original untouched — append is where COW pays its copy.
-    let a = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let a = PString::from_str(&"x".repeat(40)).unwrap();
     let mut b = a.clone();
     let live = cow_buffer::live::count();
 
@@ -4585,7 +4585,7 @@ fn append_onto_a_shared_buffer_rebuilds_and_leaves_the_sharer() {
 fn raw_append_in_place_settles_a_small_tier() {
     // A raw append transitions to UNKNOWN, which a small tier cannot hold: the in-place path classifies the joined
     // content — one pass, still no allocation — so the envelope ends settled exactly as construction leaves it.
-    let mut s = PerlString::from_str(&"x".repeat(40)).unwrap();
+    let mut s = PString::from_str(&"x".repeat(40)).unwrap();
     let live = cow_buffer::live::count();
 
     s.push_bytes(&[0xC3, 0xA9]).unwrap();
@@ -4605,7 +4605,7 @@ fn heap_append_releases_the_buffer_it_replaces() {
     // touches an `Owned`.
     let before = crate::cow_buffer::live::count();
     {
-        let mut s = PerlString::from_bytes(b"a".repeat(24)).unwrap();
+        let mut s = PString::from_bytes(b"a".repeat(24)).unwrap();
         assert!(s.storage_type().is_small_heap_tier());
 
         for _ in 0..8 {
@@ -4621,7 +4621,7 @@ fn heap_append_releases_the_buffer_it_replaces() {
 fn construction_and_transform_round_trips_balance_allocations() {
     let before = crate::cow_buffer::live::count();
     {
-        let mut s = PerlString::from_str(&"é".repeat(40)).unwrap();
+        let mut s = PString::from_str(&"é".repeat(40)).unwrap();
         assert!(s.downgrade_in_place().unwrap());
         s.upgrade_in_place().unwrap();
         let _clone = s.clone();

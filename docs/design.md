@@ -113,8 +113,8 @@ Every Perl value lives in one of two tiers:
   directly in its slot (pad entry, array element, hash entry).  No heap allocation, no
   reference count, no lock.  A compact value has no address identity:
   assignment copies it.
-- **Promoted tier.**  A `ScalarRef` — a shared, stably addressed,
-  reference-counted identity holding a `ScalarCell`.  A value is
+- **Promoted tier.**  A `Referent` — a shared, stably addressed,
+  reference-counted identity holding a `Scalar`.  A value is
   promoted the moment something requires identity: taking `\$x`,
   aliasing through `@_` or `foreach`, `tie`, `bless \$x`, weakening.
 
@@ -148,7 +148,7 @@ enum Value {
     // field.  A taint byte beside an eight-byte datum cannot fit
     // beneath the niche-supplied tag (measured: 24 with a field,
     // 16 with twins, and no field ordering recovers it), and the
-    // niche is PerlString's — 136 of its 256 tag values are used,
+    // niche is PString's — 136 of its 256 tag values are used,
     // so Value's discriminant lives in the other 120.
 
     Float(f64),                // + packed-decimal digit cache (§2.2.9)
@@ -163,16 +163,16 @@ enum Value {
     StrHeap(..),               // thin pointer; §2.2.3 buffer model
     True,                      // canonical boolean true  (see 2.3.3)
     False,                     // canonical boolean false (see 2.3.3)
-    ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
-    ScalarRefConst(HeapArc<ConstScalar>),
+    ScalarRef(HeapArc<RwLock<Scalar>>),
+    ConstScalarRef(HeapArc<ConstScalar>),
     ArrayRef(ArrayRef),
     HashRef(HashRef),
     CodeRef(CodeRef),
     RegexRef(RegexRef),
 
     // A promoted scalar occupying this slot (the slot aliases it)
-    ScalarMut(HeapArc<RwLock<ScalarCell>>),
-    ScalarConst(HeapArc<ConstScalar>),
+    AliasMut(HeapArc<RwLock<Scalar>>),
+    AliasConst(HeapArc<ConstScalar>),
 
     // Typed value (see 14), boxed thin: the trait object lives
     // behind a sized header so the envelope holds one pointer.
@@ -186,16 +186,16 @@ enforced by compile-time assertions (§2.3.6).  Reference variants are flattened
 `ref()`, dereference ops, and `ARRAY(0x...)`-style stringification all
 branch on referent kind first; the flattened arms sit where the code
 wants to branch.  The scalar arms flatten one level further — per
-*mutability*, mirroring `ScalarRef`'s Mut/Const split — because the
+*mutability*, mirroring `Referent`'s Mut/Const split — because the
 nested identity enum carries its own tag that rustc cannot relocate,
 measurably defeating the niche-folding that keeps the envelope at 16
 bytes (nested: 24; flattened: 16 — measured, and the write path
 branches on mutability exactly as deref branches on kind).
-`cell::ScalarRef` remains the API view type, reconstructed by `Arc`
+`cell::Referent` remains the API view type, reconstructed by `Arc`
 clone at the boundary.  Remaining reference kinds adopt the same
 flattening if their identity types measure the same way when built.
 Aliased slots carry both mutabilities: `foreach` over a literal list
-aliases the loop variable to readonly elements, so `ScalarConst`
+aliases the loop variable to readonly elements, so `AliasConst`
 slots are real.
 
 **Array slots.**  Arrays store `ArraySlot = Option<Value>`:
@@ -233,7 +233,7 @@ settled now.
 as positional twins — the cell's datum and the container slot's —
 and are unified as `Value` everywhere: the coercion macro stamped
 one body onto both, confessing total behavioral isomorphism; the
-promoted-alias variants (`ScalarMut`/`ScalarConst`) already carry
+promoted-alias variants (`AliasMut`/`AliasConst`) already carry
 defined transparent read-through in coercion, so a cell holding
 one is merely unproduced (every perl aliasing construct rebinds
 handles, never storing indirection in a cell) rather than
@@ -259,15 +259,15 @@ enum Value {
     UnsignedTainted(UnsignedPayload),
     Float(FloatPayload),
     FloatTainted(FloatPayload),
-    ScalarRefMut(HeapArc<RwLock<ScalarCell>>),
-    ScalarRefMutTainted(HeapArc<RwLock<ScalarCell>>),
-    ScalarRefConst(HeapArc<ConstScalar>),
-    ScalarRefConstTainted(HeapArc<ConstScalar>),
+    ScalarRef(HeapArc<RwLock<Scalar>>),
+    ScalarRefTainted(HeapArc<RwLock<Scalar>>),
+    ConstScalarRef(HeapArc<ConstScalar>),
+    ConstScalarRefTainted(HeapArc<ConstScalar>),
     ArrayRef(ArrayRef),
     ArrayRefTainted(ArrayRef),
     HashRef(HashRef),
     HashRefTainted(HashRef),
-    String(PerlString),              // taint in the PerlString tag
+    String(PString),              // taint in the PString tag
     Dual(HeapArc<DualPayload>),      // both faces real (§2.3.4)
     DualTainted(HeapArc<DualPayload>),
     True,
@@ -277,7 +277,7 @@ enum Value {
 ```
 
 Taint state appears in the listings above as the discriminant twins
-and the `PerlString` tag bit; its placement rules, semantics,
+and the `PString` tag bit; its placement rules, semantics,
 laundering contract, and authoring API are §2.6.
 
 Truthiness, stringification, and numification are each answered by one
@@ -332,7 +332,7 @@ and NaN cache into perl's *unsigned* slot — is noted and deferred: UV
 semantics are a separate design section; this section pins only the
 i64-visible behavior.)
 
-#### 2.2.3 `PerlString` — the string type:
+#### 2.2.3 `PString` — the string type:
 
 A Perl string is an octet sequence plus per-string state.  Two
 storage kinds:
@@ -342,7 +342,7 @@ storage kinds:
 // state dimensions below into the tag byte and is macro-generated
 // behind accessors (storage_kind(), is_utf8(),
 // is_tainted(), scan-state and tag-transition methods).
-enum PerlString {
+enum PString {
     // Each format below is two length families (§2.2.9): content of
     // 14 bytes or fewer stores its length in the byte a fifteenth
     // would have used, and content of exactly 15 implies it.
@@ -894,7 +894,7 @@ suppressed by a cached numeric face rather than a tag bit
 (§2.3.4): a third flag axis would double the string count past
 200 before the non-string residents, which is the whole budget.
 That plus the non-string residents still leaves the enclosing
-`Value`/`ScalarCell` layouts (§2.3.6) most of the discriminant
+`Value`/`Scalar` layouts (§2.3.6) most of the discriminant
 space.
 
 **The Perl flag and the scan cache must never be conflated.**
@@ -909,7 +909,7 @@ without contradiction, and no code path may derive
 makes the distinction structural rather than a discipline: there is
 no single field to confuse.
 
-How `PerlString` represents perl-extended sequences that Rust `str`
+How `PString` represents perl-extended sequences that Rust `str`
 cannot hold (code points above U+10FFFF, surrogates) — and the
 consequences for `length`, `substr`, `ord`, and iteration — is an
 open subsection to be designed; byte-level storage with
@@ -1323,8 +1323,8 @@ testing against zero.
 
 #### 2.2.8 Upgrade triggers:
 
-A compact value is promoted to the `Scalar(ScalarRef)` form when any
-of these occur:
+A compact value is promoted to the aliasing form
+(`AliasMut`/`AliasConst`) when any of these occur:
 
 - **Taking a reference.**  `\$x` needs a stable identity.
 - **Aliasing.**  `@_`, `foreach` loop variables, `local`, symbol-table
@@ -1332,7 +1332,7 @@ of these occur:
 - **Magic, blessing, tie, weakening.**  These attach state to an
   identity.
 - **First numification warning** on an unshared non-numeric string —
-  see §2.3.4; the warn-once bit is carried in the `PerlString` tag,
+  see §2.3.4; the warn-once bit is carried in the `PString` tag,
   so this trigger applies only where the tag route is unavailable.
 
 Multi-representation caching is *not* an upgrade trigger (it was in
@@ -1677,7 +1677,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   buffer architecture (single-fetch, scan header, COW) carries
   forward unchanged.
 
-The standalone `PerlString` is 16 bytes too — the tag budget
+The standalone `PString` is 16 bytes too — the tag budget
 closes in one byte, the discriminant being the storage type times
 the three flag bits (§2.2.9) — leaving 15 payload bytes: the five
 inline classes and the packed tier at the fused variants'
@@ -1699,7 +1699,7 @@ heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PerlString`'s own tag, which uses 136 of its
+occupies the niche in `PString`'s own tag, which uses 136 of its
 256 values.  Rust's niche-filling requires every other variant's
 data to avoid that byte, and it lays a variant out as a
 self-contained struct *before* placing it — so a field wanting
@@ -1715,12 +1715,12 @@ before taint became a discriminant twin.  Measured:
 | `Integer([u8; 7], i64)` — cache first    |   24   |
 | the pair as a `repr(C)` struct           |   24   |
 | `repr(align(8))` on the enclosing enum   |   24   |
-| **packed payload, aligned `PerlString`** | **16** |
+| **packed payload, aligned `PString`**    | **16** |
 
 The arrangement that works gives the payload struct alignment 1, so
 it sits at envelope offset 1 — clear of the discriminant — with the
 datum at offset 8 and seven bytes ahead of it for the cache.  The
-alignment making offset 8 a real boundary comes from `PerlString`
+alignment making offset 8 a real boundary comes from `PString`
 carrying `repr(align(8))`, which is free there because that type is
 already sixteen bytes; the enclosing enums inherit alignment from
 their largest variant.  Applying the attribute to `Value` instead
@@ -1823,7 +1823,7 @@ share comes back large, the mitigations are in-envelope (heap-form
 prefix cache in the spare bytes, interning tier), not a return
 to 24.
 
-Knock-on layout targets, measured at implementation: `ScalarCell`
+Knock-on layout targets, measured at implementation: `Scalar`
 folds to 16 (the `Plain` payload's spare discriminant encodings
 absorb the cell's own tag, as `Option<Value>` does); the §2.3.6
 assertion battery rebases to 16 wholesale.
@@ -1894,10 +1894,10 @@ so a WASM host on Arm emulates it.
 
 #### 2.2.10 Containers: the ordered map [DECISION]:
 
-`PerlArray` is a dense run of slots (`Option<Value>`: a hole is
+`Array` is a dense run of slots (`Option<Value>`: a hole is
 not `undef`, §21.1) behind the §2.2.12 front-gap engine.
-`PerlHash`'s map is an
-`IndexMap<PerlString, Value>`.  Perl's `each` contract needs a
+`Hash`'s map is an
+`IndexMap<PString, Value>`.  Perl's `each` contract needs a
 cursor that survives inserts and deletes with no guard object,
 and an index into insertion order is exactly that: the `each`
 cursor is a plain integer.  Deletes use `swap_remove` — O(1),
@@ -1912,9 +1912,9 @@ as the normative home; §2.2.13 later rules this engine to the
 explicitly requested insertion-ordered mode, with the bucket
 engine as the default.
 
-#### 2.2.12 `PerlArray`: the front-gap engine [DECISION]:
+#### 2.2.12 `Array`: the front-gap engine [DECISION]:
 
-`PerlArray`'s slot storage is a front-gap engine shaped on perl's
+`Array`'s slot storage is a front-gap engine shaped on perl's
 own AV (`xav_alloc`/`svu_array`/`xav_fill`/`xav_max`: an
 allocation pointer, a separate live-start, and gap-relative fill
 and capacity), replacing the step-6 `Vec`.  The motive is
@@ -1951,7 +1951,7 @@ elements, a 64 GiB buffer) makes the spill arm cold and every
 load naturally aligned.  The 24-bit width goes where it is
 harmless: the stash id, per the §2.2.9 u24 precedent.
 
-**The spill arm [DECISION]:** `PerlArray`'s representation is a
+**The spill arm [DECISION]:** `Array`'s representation is a
 two-arm repr — the 24-byte small form above, and
 `Large(Box<WideHeader>)` with `usize` fields plus the same
 stash and flags — promoted on the increment that would overflow
@@ -1999,9 +1999,9 @@ safety net for the engine swap — the public surface (`len`,
   and in synergy with the slack probe that absorbs repeat
   growth.
 
-#### 2.2.13 `PerlHash`: the dual-engine ruling [DECISION]:
+#### 2.2.13 `Hash`: the dual-engine ruling [DECISION]:
 
-`PerlHash` carries one of two engines, fixed at construction.
+`Hash` carries one of two engines, fixed at construction.
 The default is a bucket engine on `hashbrown::HashTable` — the
 safe SwissTable with public bucket addressing (`num_buckets`,
 `get_bucket`, `find_entry`, added in hashbrown 0.16.1) — and the
@@ -2010,12 +2010,12 @@ requested insertion-ordered mode: perl code has real uses for a
 predictable order (`Hash::Ordered`-shaped work), but it must ask
 for it, and the surface through which perl code asks is deferred
 to the runtime design [DECISION].  Construction is
-`PerlHash::new` for the default and
-`PerlHash::insertion_ordered` for the mode; the handle, the
+`Hash::new` for the default and
+`Hash::insertion_ordered` for the mode; the handle, the
 public method surface, and the container-verified semantics are
 identical across engines.
 
-**The bucket engine.**  Entries are `(PerlString, Value)` pairs
+**The bucket engine.**  Entries are `(PString, Value)` pairs
 in the table's own slots; hashing is a per-hash `RandomState`
 (SipHash), which buys the DoS resistance perl's seeded hashing
 buys and, as a per-hash byproduct, an iteration order that is
@@ -2073,11 +2073,11 @@ access, so a parked cursor cannot resume.
 
 **The immutable engine [DECISION]:** a third arm behind the
 `imbl` feature (the optional dependency is the feature),
-constructed by `PerlHash::immutable()`: a persistent HAMT
+constructed by `Hash::immutable()`: a persistent HAMT
 (`imbl::HashMap`, Arc-backed) whose clones are O(1) root shares
 and whose mutations path-copy O(log32 n) nodes.  `snapshot()`
-exists on every `PerlHash` and returns
-`Result<PerlHash, ScalarError>`: on this engine an O(1) clone —
+exists on every `Hash` and returns
+`Result<Hash, ScalarError>`: on this engine an O(1) clone —
 a detached, diverging hash with a fresh cursor — and
 `ScalarError::SnapshotUnsupported` on the others [DECISION].
 This is the redemption of the rejected copy-on-write iteration:
@@ -2118,11 +2118,11 @@ review.
 
 ### 2.3 Promoted Scalars
 
-#### 2.3.1 `ScalarRef` — shared identity:
+#### 2.3.1 `Referent` — shared identity:
 
 ```rust
-enum ScalarRef {
-    Mut(Arc<RwLock<ScalarCell>>),   // ordinary mutable scalar
+enum Referent {
+    Mut(Arc<RwLock<Scalar>>),   // ordinary mutable scalar
     Const(Arc<ConstScalar>),        // truly immutable; no lock
 }
 ```
@@ -2155,10 +2155,10 @@ enum ScalarRef {
   accessor API is written against the guard abstraction, not
   `RwLock`'s guards.
 
-#### 2.3.2 `ScalarCell` — the mutable interior:
+#### 2.3.2 `Scalar` — the mutable interior:
 
 ```rust
-enum ScalarCell {
+enum Scalar {
     Plain(Value),              // the common promoted case: 16 bytes
     Full(Box<FullScalar>),     // rare state; payload moves into the box
 }
@@ -2176,7 +2176,7 @@ struct FullScalar {
 }
 ```
 
-`ScalarCell` is 16 bytes (§2.2.9): the `Full` variant is a single pointer that
+`Scalar` is 16 bytes (§2.2.9): the `Full` variant is a single pointer that
 threads through the payload's spare niche encodings (measured;
 §2.3.6).  Upgrade from `Plain` to `Full` happens **in place under the
 write lock** — the `Arc` address never changes, preserving every
@@ -2199,7 +2199,7 @@ Full:   32 + one extension allocation; payload and rare state
 ```
 
 The 32-byte cell — §2.4's combined `rc_state` word, the lock
-word, and the 16-byte `ScalarCell` — compares against perl 5
+word, and the 16-byte `Scalar` — compares against perl 5
 (head 24 + body ladder + separate string buffers + 8-byte slot
 pointers; figures re-derived from the 5.42.2 reference sources):
 compact numbers beat perl's 32-bytes-plus-a-dereference array
@@ -2229,7 +2229,7 @@ struct ConstScalar {
     // no interior mutability:
     int: i64,
     float: f64,
-    string: PerlString,
+    string: PString,
 
     // The single exception (only present when the payload can warn):
     numify_warned: AtomicBool,
@@ -2244,7 +2244,7 @@ type is trivially `Sync`.
 **`Value::True` / `Value::False`** are unit variants — the canonical
 instance property is free (a unit variant *is* its single value).
 Their promoted forms are two immortal singletons
-(`static LazyLock<ScalarRef>`), constructed once as `Const` cells:
+(`static LazyLock<Referent>`), constructed once as `Const` cells:
 
 - true: `Value::True`, materialized as 1 / 1.0 / `"1"`.
 - false: `Value::False`, the dualvar — numerically 0, string
@@ -2355,7 +2355,7 @@ Container-verified contract (perl 5.38, all under `-w`):
   crate, aggregated by
   consumers through wrapper enums with `From` impls and
   delegating `Display`.  Every warning enum speaks the
-  `PerlWarning` trait: perl-exact `Display` of the body;
+  `Warning` trait: perl-exact `Display` of the body;
   `deprecated()` and `experimental()` family predicates
   defaulting to `false`, overridden by enums that own such
   warnings [DECISION]; and
@@ -2407,7 +2407,7 @@ authoritative — and which likewise never warn on numification.  One
 representation, `Value::Dual`, serves both, and the once-only
 bit leaves the tag entirely.
 
-The payload is a `HeapArc<DualPayload>` holding a `PerlString` and a
+The payload is a `HeapArc<DualPayload>` holding a `PString` and a
 `Numeric` [DECISION].  It never mutates after construction, so
 sharing is free and unobservable, and copying a `Dual` is a refcount
 bump rather than the deep copy a `Box` would force on `$!` and on
@@ -2451,7 +2451,7 @@ byte-to-character mapping, so:
   `é`) and flagged `C3 A9` (UTF-8 `é`) — `eq`.
 
 Therefore neither derived struct equality (flag-sensitive) nor
-flag-blind byte comparison is correct.  `PerlString` implements
+flag-blind byte comparison is correct.  `PString` implements
 `Eq`/`Hash` manually with perl's own rule (`sv_eq`): flags equal →
 byte compare; flags differ → upgrade the unflagged side and compare;
 both-ASCII fast path compares bytes directly.  `Hash` uses the
@@ -2679,9 +2679,9 @@ and enforced at compile time:
 const _: () = assert!(size_of::<Value>() == 16);
 const _: () = assert!(size_of::<Option<Value>>() == 16);
 const _: () = assert!(size_of::<Value>() == 16);
-const _: () = assert!(size_of::<ScalarCell>() == 16);
-const _: () = assert!(size_of::<Option<ScalarCell>>() == 16);
-const _: () = assert!(size_of::<PerlString>() == 16);  // layout-compatible with Value's string region
+const _: () = assert!(size_of::<Scalar>() == 16);
+const _: () = assert!(size_of::<Option<Scalar>>() == 16);
+const _: () = assert!(size_of::<PString>() == 16);  // layout-compatible with Value's string region
 ```
 
 The load-bearing layout facts:
@@ -2707,10 +2707,10 @@ The load-bearing layout facts:
   discriminant twins per §2.2.9);
   maximal variants (strings) must fold flags into the *inner*
   type's discriminant —
-  adding outer `Value` variants that carry `PerlString` defeats the
+  adding outer `Value` variants that carry `PString` defeats the
   niche and costs 8 bytes globally (measured: even two such variants
   regress 24 → 32-class layouts).  Hence utf8/warned/tainted live in
-  the `PerlString` tag.
+  the `PString` tag.
 - **The `Full` variant threads the niche** because its payload is one
   pointer; a two-field `Full(payload, ptr)` is irreducibly 32
   (measured both ways).
@@ -2820,7 +2820,7 @@ Considered and rejected (recorded so the questions stay settled):
   exactly `ecow` and the custom buffer.  UTF-8-only types,
   immutable-only types, fat-handle `bytes` wrappers, and interners
   all fail structurally; `hipstr` independently converges on our
-  inline-over-Arc shape but is a whole-`PerlString` competitor, not
+  inline-over-Arc shape but is a whole-`PString` competitor, not
   a buffer.  Adjacent keeps: `memchr` for SIMD scans; `bstr`-style
   algorithms at the ops layer; interners (`lasso`/`ustr`) as a
   future candidate for stash and symbol-table keys only.
@@ -2837,18 +2837,18 @@ Cryptic perl-internals names (SV, IV, PV, IOK) are not reproduced;
 behavior is matched, vocabulary is not.  The type roster:
 
 ```text
-PerlString    a Perl string: bytes + utf8/warned/tainted in its tag
+PString    a Perl string: bytes + utf8/warned/tainted in its tag
 CowBuffer     custom COW byte buffer: thin one-word handle;
               {refcount, len, capacity, scan} header
 Value         the universal 16-byte slot value
 Value         the authoritative datum of one scalar and slot
 ArraySlot     Option<Value>: None = hole, Some(Undef) = undef element
-ScalarRef     shared identity of a promoted scalar (Mut | Const)
-ScalarCell    mutable cell interior (Plain | Full), upgraded in place
+Referent     shared identity of a promoted scalar (Mut | Const)
+Scalar    mutable cell interior (Plain | Full), upgraded in place
 FullScalar    boxed rare state: payload + caches + magic + stash
 ConstScalar   lockless immutable cell, coercions materialized at birth
-PerlArray     front-gap slot engine + array-level state (§2.2.12)
-PerlHash      IndexMap<PerlString, Value> + iterator state (§2.2.10)
+Array     front-gap slot engine + array-level state (§2.2.12)
+Hash      IndexMap<PString, Value> + iterator state (§2.2.10)
 ArrayRef, HashRef, CodeRef, RegexRef
               Arc-backed shared identities of the container/code types
 MagicChain, Stash
@@ -2864,8 +2864,8 @@ Str           RESERVED: borrowed string-view type (lvalue substr,
 
 Deleted from the previous design: `ScalarFlags` (no flag matrix
 exists), the `Sv`/`Av`/`Hv` aliases, `SmallString` and
-`PerlStringSlot` (subsumed by `PerlString::Inline`), and the
-standalone small-string maximum (now the `PerlString` inline
+`PerlStringSlot` (subsumed by `PString::Inline`), and the
+standalone small-string maximum (now the `PString` inline
 constant).
 
 Open items awaiting rulings or container work, marked here rather
@@ -2936,7 +2936,7 @@ hold; `get_mut` is not provided (a blessed node is never
 hold-free); `try_unwrap` is internal-only, restricted to an
 unblessed, live, really-uniquely-owned node.  `HeapArc` itself is
 never public API: the public contract is the checked handle types
-(`ScalarRef`, `ArrayRef`, `HashRef`, ...), whose operations
+(`Referent`, `ArrayRef`, `HashRef`, ...), whose operations
 consult node and domain state — an escaped handle after logical
 destruction observes a tombstoned node through checked operations,
 not a raw `Deref` into demolished storage.  Types that need none of the heap's obligations
@@ -2972,7 +2972,7 @@ base = `addr & !0xFFF`, extent base = `addr & !(2 MiB − 1)`,
 descriptor = extent base + page index; no global table sits on the
 hot path.  The slot ordinal is `offset / stride` with the stride
 from the descriptor (a division, not a bitfield — strides vary by
-node class; `ScalarCell` at 32-byte slots yields 128 per page).
+node class; `Scalar` at 32-byte slots yields 128 per page).
 Startup asserts the platform geometry (system page size a multiple
 of 4 KiB); commitment follows demand; reclamation is tiered with
 hysteresis — slot → page free-bitmap → extent free-page set →
@@ -3028,7 +3028,7 @@ structural**:
   thereafter the §2.4.4 publication order is unchanged — install
   the hold, then Release-store the array element; an Acquire load
   of a nonzero element implies a visible hold, and a null array
-  pointer *is* the unblessed answer.  `ScalarCell` pages in
+  pointer *is* the unblessed answer.  `Scalar` pages in
   object-oriented code essentially never see `bless`; blessed-hash
   pages pay four bytes per slot — exactly the nodes doing method
   dispatch.  Semantics are unchanged from the inline word: stash
@@ -3078,9 +3078,9 @@ implementation, compared against perl 5.42 fixed structures):
 
 ```text
 node               slot control  lock  payload  total   perl
-ScalarCell                    8     8       16     32   PVMG 72
-PerlArray                     8     8       24     40   AV   64
-PerlHash                      8     8     ~48+   ~64+   HV   56
+Scalar                    8     8       16     32   PVMG 72
+Array                     8     8       24     40   AV   64
+Hash                      8     8     ~48+   ~64+   HV   56
 ```
 
 The hash header is the one concession, repaid within a few entries
@@ -3094,7 +3094,7 @@ table — stride, slots/page, measured `size_of::<PageMeta>()`,
 descriptor-region loss, bytes/slot — not asserted in prose.  The measured endgame, ledgered:
 folding the lock into `rc_state` flag bits (`parking_lot_core`
 parking keyed on the slot address) reaches a 24-byte total
-`ScalarCell` node — perl's bodyless SV head, payload included —
+`Scalar` node — perl's bodyless SV head, payload included —
 at the price of a hand-rolled lock model and count/lock contention
 coupling on one word.
 
@@ -3772,9 +3772,9 @@ never migrates.
 
 A type allocates from the typed slabs when it can be blessed, can
 hold strong Perl graph edges, needs level-1 demolition, or
-participates in domain accounting/enumeration.  `ScalarCell`,
-`PerlArray`, `PerlHash`, and `ConstScalar` (its payload can carry
-graph edges) qualify, as will closures, globs, and IO.  `PerlString`
+participates in domain accounting/enumeration.  `Scalar`,
+`Array`, `Hash`, and `ConstScalar` (its payload can carry
+graph edges) qualify, as will closures, globs, and IO.  `PString`
 buffers, compiled regexes, and code metadata stay on ordinary
 allocation / `std::sync::Arc` unless they acquire one of those
 obligations.
@@ -3838,9 +3838,9 @@ clears its pending bit, its class and weak array elements, and
 bumps the debug serial — reuse begins from a provably clean
 slate.
 
-The first slab migration is `PerlArray` (the simplest graph-bearing
+The first slab migration is `Array` (the simplest graph-bearing
 node), validating layout, pinning, reuse, finalization queueing,
-and cross-thread races before `ScalarCell` — the most semantically
+and cross-thread races before `Scalar` — the most semantically
 loaded type — moves.
 
 #### 2.4.11 The extension-mode ledger and open items
@@ -3921,10 +3921,10 @@ Model this as an optional chain of trait objects attached to a scalar:
 
 ```rust
 trait Magic: Send + Sync {
-    fn mg_get(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
-    fn mg_set(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
-    fn mg_clear(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
-    fn mg_free(&self, interp: &mut Interpreter, sv: &ScalarRef) -> Result<()>;
+    fn mg_get(&self, interp: &mut Interpreter, sv: &Referent) -> Result<()>;
+    fn mg_set(&self, interp: &mut Interpreter, sv: &Referent) -> Result<()>;
+    fn mg_clear(&self, interp: &mut Interpreter, sv: &Referent) -> Result<()>;
+    fn mg_free(&self, interp: &mut Interpreter, sv: &Referent) -> Result<()>;
     fn mg_type(&self) -> MagicType;
 }
 ```
@@ -3945,7 +3945,7 @@ lock is held.
 
 **Taint placement.**  Taint is per-value, copied on assignment, and
 lives in the discriminant: twin variants for the non-string
-payloads (§2.3.6), the `PerlString` tag for strings (§2.2.3), the
+payloads (§2.3.6), the `PString` tag for strings (§2.2.3), the
 cell's payload for promoted scalars.  Every payload
 kind can carry taint **including `Undef`**: readline at EOF returns
 a *tainted undef* (container-verified: `PVMG` with taint magic and
@@ -3992,7 +3992,7 @@ design enforces the contract structurally: `Tainted` has explicit
 construction, no `Default`, OR-combination for propagation, and
 **no public clearing method**.  The clean-from-tainted construction
 exists as a non-public capability with exactly two consumers — the
-regex engine's capture-materialization path (§11) and `PerlHash`'s
+regex engine's capture-materialization path (§11) and `Hash`'s
 key-canonicalization path (§2.3.5) — so accidental untainting is
 not a tested-against bug class but uncompilable code.  Assignment
 needs no clearing: it replaces the value, taint bit included.  This
@@ -4011,7 +4011,7 @@ is explicit, clearing is impossible.
   Its two sanctioned consumers (§2.6.2) reach it through perl-core
   APIs: the regex engine hands match extents to a perl-core
   capture-materialization function (which untaints, hint-conditional
-  on `use locale`), and `PerlHash` key canonicalization untaints
+  on `use locale`), and `Hash` key canonicalization untaints
   in-crate.  Laundering is not a reviewed-against bug class; it is
   uncompilable code.
 - Semantic dispatch over values is authored through `taint_match!`,
@@ -4118,7 +4118,7 @@ prefix is therefore `try_`, following `try_reserve`.
 `Hash::hash` is the sharpest case: hashing a tied `Value` needs a
 `FETCH`, which can die, and the unwind happens inside `HashMap`'s
 probe sequence.  It never affects us internally, since perl's hashes
-key on strings and `PerlHash` is keyed by `PerlString`, which cannot
+key on strings and `Hash` is keyed by `PString`, which cannot
 be magical; `Value: Hash` exists for Rust callers building their own
 maps, and its documentation says so.
 
@@ -4325,15 +4325,15 @@ bytes — into something the type system calls a failure.
 
 #### 2.7.6 Layering:
 
-`PerlString` is content, and content cannot run user code.  Its
+`PString` is content, and content cannot run user code.  Its
 string comparisons numify nothing and cannot warn, so they return
 directly rather than through a `Result`.  Its numification reports
 warn-worthiness as a byproduct rather than emitting, so it cannot
 raise either.
 
 **Numeric comparison is therefore a `Value`-level operation**, not a
-`PerlString` one: comparing two strings numerically must numify, and
-numifying is where a fatal warning can die.  A `PerlString::num_cmp`
+`PString` one: comparing two strings numerically must numify, and
+numifying is where a fatal warning can die.  A `PString::num_cmp`
 would be either unfaithful or fallible, and an unfaithful primitive
 that looks authoritative is the worse of the two.
 
@@ -4341,8 +4341,8 @@ The `try_` prefix consequently marks exactly the boundary where perl
 code can run, which makes it informative rather than decoration.
 
 A public trait abstracting the numeric methods was considered and
-dropped.  Over `Value` and `ScalarCell` an associated error type
-distinguishes nothing, both being `PerlError`; `PerlString` does not
+dropped.  Over `Value` and `Scalar` an associated error type
+distinguishes nothing, both being `PerlError`; `PString` does not
 belong in it at all, per the layering above; and its only concrete
 consumer would have been the context wrappers' `Ord`, which two
 concrete impls cover in a few lines.  The wrappers are generic over
@@ -5272,7 +5272,7 @@ flow from source to runtime without copying.  A string literal like
 `'hello world'` exists once in the source buffer.  The lexer
 produces a `Bytes` slice via `line.slice_since(start)`, which flows
 through the token and AST as a refcount bump at each stage, and
-ultimately initializes the runtime `PerlString` with the same
+ultimately initializes the runtime `PString` with the same
 underlying allocation.  This applies to all literals that need no
 escape processing: single-quoted strings, `qw()` words,
 `ConstSegment` parts of interpolated strings, heredoc body segments,
@@ -8026,7 +8026,7 @@ typeglob containing slots for scalar, array, hash, code, IO, and format:
 
 ```rust
 struct Glob {
-    scalar: Option<ScalarRef>,
+    scalar: Option<Referent>,
     array: Option<ArrayRef>,
     hash: Option<HashRef>,
     code: Option<Arc<Code>>,
@@ -9618,7 +9618,7 @@ solve.
 
 ### 14.1 Motivation
 
-The default Perl scalar is a `PerlString`-backed container with
+The default Perl scalar is a `PString`-backed container with
 int/num/string coercion flags, magic chains, and `Arc`-refcounted heap
 allocation.
 This is necessary for Perl 5 compatibility, but it imposes costs:
@@ -10280,7 +10280,7 @@ The exception type unifies Perl's various `die` forms:
 
 ```rust
 enum PerlException {
-    Str(PerlString),     // die "message"
+    Str(PString),     // die "message"
     Object(Value),       // die $object
 }
 ```
@@ -10523,7 +10523,7 @@ coercion rules apply:
 
 ```perl
 let s: String = "hello";
-my $x = s;                 # $x becomes a PerlString with UTF-8 flag set
+my $x = s;                 # $x becomes a PString with UTF-8 flag set
 
 let n: i64 = 42;
 my $y = n;                 # $y becomes a full scalar with INT_VALID flag set
@@ -10537,7 +10537,7 @@ These conversions are always valid and cheap.
 #### 14.10.2 Untyped → typed (may fail):
 
 ```perl
-my $raw = read_file("data.bin");       # PerlString, may not be valid UTF-8
+my $raw = read_file("data.bin");       # PString, may not be valid UTF-8
 let text: String = $raw;               # RUNTIME ERROR if not valid UTF-8
 let maybe: Option<String> = $raw;      # RUNTIME ERROR if not UTF-8 and not undef
 ```
@@ -10548,11 +10548,11 @@ The compiler should warn statically about potentially-failing coercions.
 
 | From                                 | To                        | Cost                  |
 |--------------------------------------|---------------------------|-----------------------|
-| `String` → `PerlString`              | Wrap as Bytes, set flags  | Cheap (refcount)      |
-| `PerlString` (Rust-valid) → `String` | Take bytes, no validation | Cheap (flag check)    |
-| `PerlString` (unknown) → `String`    | Full UTF-8 validation     | O(n), may fail        |
-| `PerlString` → `Bytes`               | Access inner `buf`        | Zero-cost             |
-| `Bytes` → `PerlString`               | Wrap with flags           | Cheap (refcount bump) |
+| `String` → `PString`                 | Wrap as Bytes, set flags  | Cheap (refcount)      |
+| `PString` (Rust-valid) → `String`    | Take bytes, no validation | Cheap (flag check)    |
+| `PString` (unknown) → `String`       | Full UTF-8 validation     | O(n), may fail        |
+| `PString` → `Bytes`                  | Access inner `buf`        | Zero-cost             |
+| `Bytes` → `PString`                  | Wrap with flags           | Cheap (refcount bump) |
 | `String` → `&str`                    | Pointer cast              | Zero-cost             |
 | `Arc<str>` → `&str`                  | Deref                     | Zero-cost             |
 
@@ -10569,7 +10569,7 @@ let c: i64 = a + b;        # emits: IrOp::AddI64 — one machine instruction
 
 ```perl
 let mut msg: String = "Hello";
-msg .= ", world!";         # emits: String::push_str — no PerlString alloc
+msg .= ", world!";         # emits: String::push_str — no PString alloc
 ```
 
 ```perl
@@ -12090,7 +12090,7 @@ Foo: new, value, label, to_string
   ISA: Base: serialize, deserialize
 
 perl> :inspect $obj
-payload: ScalarRef -> Full cell
+payload: Referent -> Full cell
   blessed into: Foo
   magic: TIEDSCALAR
 
@@ -12336,7 +12336,7 @@ internal ordering follows the dependency structure of §2:
    boundary tests, refcount concurrency tests) and no other module
    proceeds until they pass.
 
-2. `PerlString` — the two storage kinds over `CowBuffer`, the tag
+2. `PString` — the two storage kinds over `CowBuffer`, the tag
    with its folded state dimensions, the scan-state lattice and
    transition rules (§2.2.4-§2.2.7), character-sequence `Eq`/`Hash`
    (§2.3.5).  Container-verified equality tests for the mixed-flag
@@ -12348,16 +12348,16 @@ internal ordering follows the dependency structure of §2:
    `ArraySlot` hole semantics with the trailing-truncation rule
    (§2.2.1).
 
-4. `ScalarRef`, `ScalarCell`, `FullScalar`, `ConstScalar` — the
+4. `Referent`, `Scalar`, `FullScalar`, `ConstScalar` — the
    Mut/Const split, in-place `Plain`→`Full` upgrade, the readonly
    error path, the boolean immortal singletons with their full
    pinned contract (§2.3.1-§2.3.3), numification-warning state and
    copy semantics (§2.3.4).
 
 5. Reference creation and dereference — `\$x` promotion returning
-   `ScalarRef` clones, `ptr_eq` identity, upgrade triggers (§2.2.8).
+   `Referent` clones, `ptr_eq` identity, upgrade triggers (§2.2.8).
 
-6. Containers — `PerlArray`/`PerlHash` with their handle types
+6. Containers — `Array`/`Hash` with their handle types
    (the ordered-map ruling is recorded in §2.2.10, and the
    scanning kernels `char_len` needs in §2.2.11),
    exists/delete semantics against the slot model.
@@ -12392,11 +12392,11 @@ internal ordering follows the dependency structure of §2:
     races, and drain-owner token; differential, reuse, and
     destructor-accounting test layers.
 
-12. `PerlArray` slab migration — the first node class through the
+12. `Array` slab migration — the first node class through the
     new backend, validating layout, pinning, reuse, finalization
     queueing, and cross-thread races.
 
-13. Remaining node classes (`PerlHash`, `ScalarCell`,
+13. Remaining node classes (`Hash`, `Scalar`,
     `ConstScalar`) once step 12's matrix passes.
 
 14. Mortal stack — `Vec<Value>` per interpreter, scope-entry marks,
@@ -12417,7 +12417,7 @@ assertions (§2.3.6).  Illustrative tests in the §2 vocabulary:
 fn payload_stays_authoritative_through_coercion() {
     // Verified perl 5.38: my $x = 3.7 used as an integer still
     // stringifies as "3.7" (FLAGS = NOK,pIOK — private cache only).
-    let mut cell = ScalarCell::from_float(3.7);
+    let mut cell = Scalar::from_float(3.7);
     assert_eq!(cell.to_int(), 3);          // truncating coercion
     assert_eq!(cell.stringify(), "3.7");   // payload answers
 }
@@ -12427,8 +12427,8 @@ fn boolean_immortals_share_identity() {
     // Verified perl 5.38: \(1==1) yields the same address twice.
     let a = Value::True.upgrade_to_scalar();
     let b = Value::True.upgrade_to_scalar();
-    assert!(ScalarRef::ptr_eq(&a, &b));
-    assert!(matches!(a, ScalarRef::Const(_)));
+    assert!(Referent::ptr_eq(&a, &b));
+    assert!(matches!(a, Referent::Const(_)));
 }
 
 #[test]
@@ -12436,7 +12436,7 @@ fn reference_identity() {
     let mut val = Value::integer(42, Tainted::CLEAN);
     let r1 = val.take_ref();   // promotes in place
     let r2 = val.take_ref();   // same identity
-    assert!(ScalarRef::ptr_eq(&r1, &r2));
+    assert!(Referent::ptr_eq(&r1, &r2));
 }
 ```
 
@@ -12780,7 +12780,7 @@ The following are real concerns but are deliberately deferred:
   require an emulation layer.  Low priority given the superior
   native concurrency model.
 
-- **Unicode edge cases.**  The `PerlString` type and UTF-8 flag model
+- **Unicode edge cases.**  The `PString` type and UTF-8 flag model
   covers the architecture; full Unicode compliance (grapheme clusters,
   normalization, case folding tables) is an incremental effort.
 
@@ -12799,7 +12799,7 @@ The following are real concerns but are deliberately deferred:
 The key architectural decisions in this design:
 
 1. **`Arc<RwLock<T>>`-based value representation.**  Self-managing
-   reference-counted values, no centralized arena.  `PerlString` as
+   reference-counted values, no centralized arena.  `PString` as
    a distinct type (octet vec + UTF-8 flag), not Rust `String`.
    Small values (integers, floats, short strings) inline in `Value`
    enum; heap-allocated values (scalars with magic, arrays, hashes)

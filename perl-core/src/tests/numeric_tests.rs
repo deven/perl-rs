@@ -62,7 +62,7 @@ fn a_filled_payload_renders_identically() {
     // produce exactly what recomputing produces, or the cache is a formatting divergence waiting to happen.
     for n in [0i64, 1, -1, 42, -42, 999_999_999_999, -999_999_999_999, 7_000_000] {
         let (bare, filled) = (IntegerPayload::new(n), IntegerPayload::new(n).filled());
-        let (mut a, mut b) = (PerlString::empty(), PerlString::empty());
+        let (mut a, mut b) = (PString::empty(), PString::empty());
         bare.render(&mut a).unwrap();
         filled.render(&mut b).unwrap();
         assert_eq!(a, b, "rendering of {n} must not depend on the cache");
@@ -74,7 +74,7 @@ fn a_filled_payload_renders_identically() {
 fn floats_render_identically_from_the_cache() {
     for f in [0.1f64, 3.7, -2.5, 100.0, 0.0001, 1e15, 1e-5, 1.5e15, 0.3333333333, -0.5] {
         let (bare, filled) = (FloatPayload::new(f), FloatPayload::new(f).filled());
-        let (mut a, mut b) = (PerlString::empty(), PerlString::empty());
+        let (mut a, mut b) = (PString::empty(), PString::empty());
         bare.render(&mut a).unwrap();
         filled.render(&mut b).unwrap();
         assert_eq!(a, b, "rendering of {f} must not depend on the cache");
@@ -90,7 +90,7 @@ fn long_renderings_are_not_cached_at_all() {
         assert!(!filled.is_cached(), "{f} renders past the capacity and must cache nothing");
 
         // And it still renders correctly, by recomputing.
-        let (mut a, mut b) = (PerlString::empty(), PerlString::empty());
+        let (mut a, mut b) = (PString::empty(), PString::empty());
         FloatPayload::new(f).render(&mut a).unwrap();
         filled.render(&mut b).unwrap();
         assert_eq!(a, b);
@@ -107,7 +107,7 @@ fn specials_and_zero_cache_nothing() {
     for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0] {
         let filled = FloatPayload::new(f).filled();
         assert!(!filled.is_cached());
-        let (mut a, mut b) = (PerlString::empty(), PerlString::empty());
+        let (mut a, mut b) = (PString::empty(), PString::empty());
         FloatPayload::new(f).render(&mut a).unwrap();
         filled.render(&mut b).unwrap();
         assert_eq!(a, b, "{f} must render the same either way");
@@ -118,7 +118,7 @@ fn specials_and_zero_cache_nothing() {
 fn unsigned_fills_across_its_range() {
     for u in [0u64, 1, 999_999_999_999, u64::MAX] {
         let (bare, filled) = (UnsignedPayload::new(u), UnsignedPayload::new(u).filled());
-        let (mut a, mut b) = (PerlString::empty(), PerlString::empty());
+        let (mut a, mut b) = (PString::empty(), PString::empty());
         bare.render(&mut a).unwrap();
         filled.render(&mut b).unwrap();
         assert_eq!(a, b, "rendering of {u} must not depend on the cache");

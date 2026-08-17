@@ -177,7 +177,7 @@ fn taint_is_monotonic_and_placed_per_variant() {
     assert!(!Value::True.is_tainted());
 
     // String taint lives in the tag and survives stringification (a clone).
-    let mut ps: PerlString = "secret".parse().unwrap();
+    let mut ps: PString = "secret".parse().unwrap();
     ps.taint();
     let v = Value::String(ps);
     assert!(v.is_tainted());
@@ -228,7 +228,7 @@ fn take_ref_identity_is_idempotent_and_distinct_per_slot() {
     let r1 = Value::take_ref(&mut slot);
     let r2 = Value::take_ref(&mut slot);
     assert_eq!(r1.to_int(), r2.to_int(), "same slot, same identity (address)");
-    assert!(crate::scalar::ScalarRef::ptr_eq(&r1.deref_scalar().unwrap(), &r2.deref_scalar().unwrap()));
+    assert!(crate::scalar::Referent::ptr_eq(&r1.deref_scalar().unwrap(), &r2.deref_scalar().unwrap()));
 
     let mut other = s("hello");
     let r3 = Value::take_ref(&mut other);
@@ -241,7 +241,7 @@ fn aliasing_transparency_and_write_through() {
     let r = Value::take_ref(&mut slot);
 
     // The promoted slot still answers as the payload: aliasing transparency.
-    assert!(matches!(slot, Value::ScalarMut(_)));
+    assert!(matches!(slot, Value::AliasMut(_)));
     assert_eq!(slot.to_int(), 5);
     assert!(slot.to_bool());
     assert_eq!(slot.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"5");
@@ -262,7 +262,7 @@ fn boolean_slots_promote_to_their_own_cells() {
     assert_ne!(rx.to_int(), ry.to_int(), "distinct cells per variable");
 
     let immortal = Value::True.upgrade_to_scalar().unwrap();
-    assert!(!crate::scalar::ScalarRef::ptr_eq(&rx.deref_scalar().unwrap(), &immortal));
+    assert!(!crate::scalar::Referent::ptr_eq(&rx.deref_scalar().unwrap(), &immortal));
 
     // The promoted boolean keeps is_bool through the variant payload.
     let view = rx.deref_scalar().unwrap();
@@ -307,7 +307,7 @@ fn ref_of_ref_chains() {
 
 #[test]
 fn reference_taint_belongs_to_the_referent() {
-    let mut ps: PerlString = "secret".parse().unwrap();
+    let mut ps: PString = "secret".parse().unwrap();
     ps.taint();
     let mut slot = Value::String(ps);
 
@@ -320,13 +320,13 @@ fn reference_taint_belongs_to_the_referent() {
 #[test]
 fn const_slots_alias_frozen_cells() {
     let cs = crate::scalar::ConstScalar::materialize(Value::float(3.7, Tainted::CLEAN)).unwrap();
-    let mut slot = Value::ScalarConst(HeapArc::new(cs));
+    let mut slot = Value::AliasConst(HeapArc::new(cs));
 
     assert_eq!(slot.to_int(), 3);
     assert_eq!(slot.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"3.7");
 
     let r = Value::take_ref(&mut slot);
-    assert!(matches!(r, Value::ScalarRefConst(..)));
+    assert!(matches!(r, Value::ConstScalarRef(..)));
     let view = r.deref_scalar().unwrap();
     assert!(matches!(view.write(), Err(crate::scalar::ScalarError::ReadOnly)), "frozen through the ref");
 }
@@ -414,11 +414,11 @@ fn numeric_stringification_does_not_allocate() {
     // exceeds the non-allocating capacity this fails rather than silently allocating on constant-traffic paths.
     for value in [0.0_f64, 3.7, -2.5, 1e15, 1e-5, f64::MIN_POSITIVE, f64::MAX, -f64::MAX, f64::NAN] {
         let rendered = format_float(value);
-        assert!(PerlString::inline(&rendered).is_some(), "{rendered} should need no allocation");
+        assert!(PString::inline(&rendered).is_some(), "{rendered} should need no allocation");
     }
 
     for value in [0_i64, -1, i64::MAX, i64::MIN] {
-        assert!(PerlString::inline(value.to_string()).is_some(), "{value} should need no allocation");
+        assert!(PString::inline(value.to_string()).is_some(), "{value} should need no allocation");
     }
 }
 
