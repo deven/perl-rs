@@ -17,9 +17,13 @@
 //! 1 }`, which makes delete-current *exact*: the moved tail entry lands at the decremented cursor and is yielded next,
 //! so every remaining key is visited.
 
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry;
 use indexmap::IndexMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::BuildHasher;
 
 use crate::heap::{HeapArc, release_value};
 use crate::scalar::ScalarError;
@@ -175,38 +179,69 @@ impl PerlArray {
     }
 }
 
-// ── PerlHash (§2.2.1) ─────────────────────────────────────────────
-/// `IndexMap<PerlString, Value>` plus iterator state.  Keys are laundered at storage (§2.6.2); the stored key is kept
-/// on re-store (equal keys: the first-stored spelling wins, matching map semantics).
-#[derive(Default)]
+// ── PerlHash (§2.2.1, §2.2.13) ────────────────────────────────────
+/// The dual-engine hash (§2.2.13): a bucket engine on `hashbrown::HashTable` by default, and the insertion-ordered
+/// `IndexMap` engine on explicit request, fixed at construction.  Keys are laundered at storage (§2.6.2); the stored
+/// key is kept on re-store (equal keys: the first-stored spelling wins) under either engine.
 pub struct PerlHash {
-    map: IndexMap<PerlString, Value>,
-
-    /// The `each` cursor: the next index to yield.
-    cursor: usize,
+    engine: HashEngine,
     readonly: bool,
+}
+
+/// The engine, chosen at construction and never morphed (§2.2.13).
+enum HashEngine {
+    /// The default: SwissTable buckets, per-hash SipHash keys, and the `each` cursor as a bucket index.
+    Buckets { table: HashTable<(PerlString, Value)>, hasher: RandomState, cursor: usize },
+
+    /// The explicitly requested insertion-ordered mode (§2.2.10): the `each` cursor is an entry index.
+    Ordered { map: IndexMap<PerlString, Value>, cursor: usize },
+}
+
+impl Default for PerlHash {
+    fn default() -> PerlHash {
+        PerlHash::new()
+    }
 }
 
 impl Drop for PerlHash {
     /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
     fn drop(&mut self) {
-        for (_key, v) in self.map.drain(..) {
-            release_value(v);
+        match &mut self.engine {
+            HashEngine::Buckets { table, .. } => {
+                for (_key, v) in table.drain() {
+                    release_value(v);
+                }
+            }
+            HashEngine::Ordered { map, .. } => {
+                for (_key, v) in map.drain(..) {
+                    release_value(v);
+                }
+            }
         }
     }
 }
 
 impl PerlHash {
+    /// The default engine (§2.2.13): buckets, per-hash random iteration order.
     pub fn new() -> PerlHash {
-        PerlHash::default()
+        PerlHash { engine: HashEngine::Buckets { table: HashTable::new(), hasher: RandomState::new(), cursor: 0 }, readonly: false }
+    }
+
+    /// The insertion-ordered mode (§2.2.13), on explicit request only; the perl-visible request surface is the runtime
+    /// design's.
+    pub fn insertion_ordered() -> PerlHash {
+        PerlHash { engine: HashEngine::Ordered { map: IndexMap::new(), cursor: 0 }, readonly: false }
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        match &self.engine {
+            HashEngine::Buckets { table, .. } => table.len(),
+            HashEngine::Ordered { map, .. } => map.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
 
     fn check_writable(&self) -> Result<(), ScalarError> {
@@ -217,85 +252,170 @@ impl PerlHash {
         if key.is_tainted() {
             key.untaint_for_sanctioned_path();
         }
-
         key
     }
 
     /// `$h{$k} = $v`, laundering the key (§2.6.2: hash-key canonicalization is a sanctioned untaint path —
     /// container-verified: a tainted key stores clean).
+    ///
+    /// The cursor discipline (§2.2.13): an existing key updates in place and leaves the cursor alone — value updates
+    /// during iteration are contract-specified safe — while a new key resets it, answering any rehash with a restart.
     pub fn store(&mut self, key: PerlString, value: Value) -> Result<(), ScalarError> {
         self.check_writable()?;
-        self.map.insert(PerlHash::launder(key), value);
-
+        let key = PerlHash::launder(key);
+        match &mut self.engine {
+            HashEngine::Buckets { table, hasher, cursor } => {
+                let hash = hasher.hash_one(&key);
+                if let Some(pair) = table.find_mut(hash, |(stored, _)| stored == &key) {
+                    pair.1 = value;
+                } else {
+                    *cursor = 0;
+                    table.insert_unique(hash, (key, value), |(stored, _)| hasher.hash_one(stored));
+                }
+            }
+            HashEngine::Ordered { map, .. } => {
+                map.insert(key, value);
+            }
+        }
         Ok(())
     }
 
     /// Read access: never creates.
     pub fn get(&self, key: &PerlString) -> Option<&Value> {
-        self.map.get(key)
+        match &self.engine {
+            HashEngine::Buckets { table, hasher, .. } => table.find(hasher.hash_one(key), |(stored, _)| stored == key).map(|(_, value)| value),
+            HashEngine::Ordered { map, .. } => map.get(key),
+        }
     }
 
     /// `exists $h{$k}`: absence of the entry is nonexistence (§2.2.1 — no slot wrapper).
     pub fn exists(&self, key: &PerlString) -> bool {
-        self.map.contains_key(key)
+        self.get(key).is_some()
     }
 
     /// Lvalue access: vivify the undef entry (container-verified: `\$h{k}` creates an existing undef entry).  The
-    /// `get`/`ensure` split is the autovivification-option mechanism (§2.2.1).
+    /// `get`/`ensure` split is the autovivification-option mechanism (§2.2.1).  Vivification of an absent key is a
+    /// new-key insertion and resets the cursor (§2.2.13); an existing key leaves it alone.
     pub fn entry_or_undef(&mut self, key: PerlString) -> Result<&mut Value, ScalarError> {
         self.check_writable()?;
-
-        Ok(self.map.entry(PerlHash::launder(key)).or_default())
+        let key = PerlHash::launder(key);
+        match &mut self.engine {
+            HashEngine::Buckets { table, hasher, cursor } => {
+                let hash = hasher.hash_one(&key);
+                let entry = match table.entry(hash, |(stored, _)| stored == &key, |(stored, _)| hasher.hash_one(stored)) {
+                    Entry::Occupied(occupied) => occupied,
+                    Entry::Vacant(vacant) => {
+                        *cursor = 0;
+                        vacant.insert((key, Value::default()))
+                    }
+                };
+                Ok(&mut entry.into_mut().1)
+            }
+            HashEngine::Ordered { map, .. } => Ok(map.entry(key).or_default()),
+        }
     }
 
-    /// `delete $h{$k}`, returning the value (undef for absent keys).  `swap_remove` keeps delete O(1); the cursor
-    /// adjustment makes delete-current exact (module header).
+    /// `delete $h{$k}`, returning the value (undef for absent keys).  The cursor is never touched (§2.2.13): erasure
+    /// moves nothing, so every deletion is exact — delete-current is behind the cursor already, and a deleted unvisited
+    /// entry is a slot the walk will skip.  (Ordered engine: `swap_remove` keeps delete O(1); the cursor adjustment
+    /// makes delete-current exact, module header.)
     pub fn delete(&mut self, key: &PerlString) -> Result<Value, ScalarError> {
         self.check_writable()?;
-        let Some(index) = self.map.get_index_of(key) else {
-            return Ok(Value::default());
-        };
-        let (_, value) = self.map.swap_remove_index(index).unwrap_or_else(|| (PerlString::empty(), Value::default()));
-
-        if index < self.cursor {
-            self.cursor -= 1;
+        match &mut self.engine {
+            HashEngine::Buckets { table, hasher, .. } => match table.find_entry(hasher.hash_one(key), |(stored, _)| stored == key) {
+                Ok(occupied) => {
+                    let ((_key, value), _) = occupied.remove();
+                    Ok(value)
+                }
+                Err(_) => Ok(Value::default()),
+            },
+            HashEngine::Ordered { map, cursor } => {
+                let Some(index) = map.get_index_of(key) else {
+                    return Ok(Value::default());
+                };
+                let (_, value) = map.swap_remove_index(index).unwrap_or_else(|| (PerlString::empty(), Value::default()));
+                if index < *cursor {
+                    *cursor -= 1;
+                }
+                Ok(value)
+            }
         }
-
-        Ok(value)
     }
 
-    /// `each %h`: yield the next pair, or `None` once at exhaustion (then restart — container-verified).
+    /// `each %h`: yield the next pair, or `None` once at exhaustion (then restart — container-verified).  The bucket
+    /// engine walks `get_bucket` from the cursor to the next occupied slot (§2.2.13).
     pub fn each(&mut self) -> Option<(PerlString, Value)> {
-        match self.map.get_index(self.cursor) {
-            Some((k, v)) => {
-                self.cursor += 1;
-                Some((k.clone(), v.clone()))
-            }
-            None => {
-                self.cursor = 0;
+        match &mut self.engine {
+            HashEngine::Buckets { table, cursor, .. } => {
+                let end = table.num_buckets();
+                while *cursor < end {
+                    let bucket = *cursor;
+                    *cursor += 1;
+                    if let Some((key, value)) = table.get_bucket(bucket) {
+                        return Some((key.clone(), value.clone()));
+                    }
+                }
+                *cursor = 0;
                 None
             }
+            HashEngine::Ordered { map, cursor } => match map.get_index(*cursor) {
+                Some((k, v)) => {
+                    *cursor += 1;
+                    Some((k.clone(), v.clone()))
+                }
+                None => {
+                    *cursor = 0;
+                    None
+                }
+            },
         }
     }
 
-    /// `keys %h`: resets the iterator (container-verified).
+    /// `keys %h`: resets the iterator (container-verified); shares `each`'s scan order (§2.2.13).
     pub fn keys(&mut self) -> Vec<PerlString> {
-        self.cursor = 0;
-        self.map.keys().cloned().collect()
+        match &mut self.engine {
+            HashEngine::Buckets { table, cursor, .. } => {
+                *cursor = 0;
+                (0..table.num_buckets()).filter_map(|bucket| table.get_bucket(bucket)).map(|(k, _)| k.clone()).collect()
+            }
+            HashEngine::Ordered { map, cursor } => {
+                *cursor = 0;
+                map.keys().cloned().collect()
+            }
+        }
     }
 
     /// `values %h`: resets the iterator; corresponds to `keys` order (container-verified).
     pub fn values(&mut self) -> Vec<Value> {
-        self.cursor = 0;
-        self.map.values().cloned().collect()
+        match &mut self.engine {
+            HashEngine::Buckets { table, cursor, .. } => {
+                *cursor = 0;
+                (0..table.num_buckets()).filter_map(|bucket| table.get_bucket(bucket)).map(|(_, v)| v.clone()).collect()
+            }
+            HashEngine::Ordered { map, cursor } => {
+                *cursor = 0;
+                map.values().cloned().collect()
+            }
+        }
     }
 
     /// `%h = ()`.
     pub fn clear(&mut self) -> Result<(), ScalarError> {
         self.check_writable()?;
-        self.map.clear();
-        self.cursor = 0;
-
+        match &mut self.engine {
+            HashEngine::Buckets { table, cursor, .. } => {
+                for (_key, v) in table.drain() {
+                    release_value(v);
+                }
+                *cursor = 0;
+            }
+            HashEngine::Ordered { map, cursor } => {
+                for (_key, v) in map.drain(..) {
+                    release_value(v);
+                }
+                *cursor = 0;
+            }
+        }
         Ok(())
     }
 
@@ -309,8 +429,39 @@ impl PerlHash {
 
     /// The graph traversal hook (§2.4.6 demolition, §2.4.11 cycle detection).
     #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
-    pub(crate) fn values_iter(&self) -> impl Iterator<Item = &Value> {
-        self.map.values()
+    pub(crate) fn values_iter(&self) -> HashValuesIter<'_> {
+        match &self.engine {
+            HashEngine::Buckets { table, .. } => HashValuesIter::Buckets { table, next: 0 },
+            HashEngine::Ordered { map, .. } => HashValuesIter::Ordered(map.values()),
+        }
+    }
+}
+
+/// The engine-dispatched values walk behind [`PerlHash::values_iter`]: a hand-rolled two-arm iterator, keeping the cold
+/// traversal hook vtable-free.
+pub(crate) enum HashValuesIter<'a> {
+    Buckets { table: &'a HashTable<(PerlString, Value)>, next: usize },
+    Ordered(indexmap::map::Values<'a, PerlString, Value>),
+}
+
+impl<'a> Iterator for HashValuesIter<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<&'a Value> {
+        match self {
+            HashValuesIter::Buckets { table, next } => {
+                let end = table.num_buckets();
+                while *next < end {
+                    let bucket = *next;
+                    *next += 1;
+                    if let Some((_, value)) = table.get_bucket(bucket) {
+                        return Some(value);
+                    }
+                }
+                None
+            }
+            HashValuesIter::Ordered(values) => values.next(),
+        }
     }
 }
 

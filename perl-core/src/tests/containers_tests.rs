@@ -2,6 +2,12 @@ use super::*;
 use crate::string::DECODE_MAX;
 use crate::value::{ScalarPayload, Tainted};
 
+/// Both engines (§2.2.13): the container-verified semantics are engine-independent, so the shared batteries run against
+/// each.
+fn both_engines() -> [PerlHash; 2] {
+    [PerlHash::new(), PerlHash::insertion_ordered()]
+}
+
 fn int(n: i64) -> Value {
     Value::integer(n, Tainted::CLEAN)
 }
@@ -97,135 +103,239 @@ fn array_readonly() {
 // ── Hashes ────────────────────────────────────────────────────
 #[test]
 fn hash_store_get_exists_delete() {
-    let mut h = PerlHash::new();
-    h.store(key("a"), int(1)).unwrap();
-    h.store(key("b"), int(2)).unwrap();
-    assert_eq!(h.len(), 2);
-    assert!(h.exists(&key("a")));
-    assert!(!h.exists(&key("z")));
-    assert_eq!(h.get(&key("b")).unwrap().to_int(), 2);
-    assert_eq!(h.delete(&key("b")).unwrap().to_int(), 2, "delete returns the value (verified)");
-    assert!(!h.exists(&key("b")));
-    assert!(matches!(h.delete(&key("z")).unwrap(), Value::Undef | Value::UndefTainted));
-    h.store(key("a"), int(9)).unwrap();
-    assert_eq!(h.get(&key("a")).unwrap().to_int(), 9, "re-store replaces the value");
-    assert_eq!(h.len(), 1);
+    for mut h in both_engines() {
+        h.store(key("a"), int(1)).unwrap();
+        h.store(key("b"), int(2)).unwrap();
+        assert_eq!(h.len(), 2);
+        assert!(h.exists(&key("a")));
+        assert!(!h.exists(&key("z")));
+        assert_eq!(h.get(&key("b")).unwrap().to_int(), 2);
+        assert_eq!(h.delete(&key("b")).unwrap().to_int(), 2, "delete returns the value (verified)");
+        assert!(!h.exists(&key("b")));
+        assert!(matches!(h.delete(&key("z")).unwrap(), Value::Undef | Value::UndefTainted));
+
+        h.store(key("a"), int(9)).unwrap();
+        assert_eq!(h.get(&key("a")).unwrap().to_int(), 9, "re-store replaces the value");
+        assert_eq!(h.len(), 1);
+    }
 }
 
 #[test]
 fn hash_keys_are_laundered_at_storage() {
-    // Container-verified under -T: a tainted key stores clean; keys returns clean strings.
-    let mut tainted_key = key("secret");
-    tainted_key.taint();
-    assert!(tainted_key.is_tainted());
+    for mut h in both_engines() {
+        // Container-verified under -T: a tainted key stores clean; keys returns clean strings.
+        let mut tainted_key = key("secret");
+        tainted_key.taint();
+        assert!(tainted_key.is_tainted());
 
-    let mut h = PerlHash::new();
-    h.store(tainted_key.clone(), int(1)).unwrap();
-    let stored = h.keys();
-    assert_eq!(stored.len(), 1);
-    assert!(!stored[0].is_tainted(), "the §2.6.2 sanctioned laundering path");
+        h.store(tainted_key.clone(), int(1)).unwrap();
+        let stored = h.keys();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].is_tainted(), "the §2.6.2 sanctioned laundering path");
 
-    // Same through the lvalue path.
-    let mut h2 = PerlHash::new();
-    let _ = h2.entry_or_undef(tainted_key).unwrap();
-    assert!(!h2.keys()[0].is_tainted());
+        // Same through the lvalue path.
+        let mut h2 = PerlHash::new();
+        let _ = h2.entry_or_undef(tainted_key).unwrap();
+        assert!(!h2.keys()[0].is_tainted());
+    }
 }
 
 #[test]
 fn hash_entry_or_undef_vivifies() {
-    // Container-verified: \$h{k} — the entry exists, undef.
-    let mut h = PerlHash::new();
-    let slot = h.entry_or_undef(key("k")).unwrap();
-    assert!(matches!(slot, Value::Undef | Value::UndefTainted));
-    assert!(h.exists(&key("k")));
+    for mut h in both_engines() {
+        // Container-verified: \$h{k} — the entry exists, undef.
+        let slot = h.entry_or_undef(key("k")).unwrap();
+        assert!(matches!(slot, Value::Undef | Value::UndefTainted));
+        assert!(h.exists(&key("k")));
 
-    let r = Value::take_ref(h.entry_or_undef(key("k")).unwrap());
-    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::integer(7, Tainted::CLEAN)).unwrap();
-    assert_eq!(h.get(&key("k")).unwrap().to_int(), 7);
+        let r = Value::take_ref(h.entry_or_undef(key("k")).unwrap());
+        r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::integer(7, Tainted::CLEAN)).unwrap();
+        assert_eq!(h.get(&key("k")).unwrap().to_int(), 7);
+    }
 }
 
 #[test]
 fn each_visits_all_when_deleting_current() {
-    // Container-verified: deleting the current item mid-each still visits all 4 keys.
-    let mut h = PerlHash::new();
-    for k in ["a", "b", "c", "d"] {
-        h.store(key(k), int(1)).unwrap();
-    }
-
-    let mut visited = Vec::new();
-    while let Some((k, _)) = h.each() {
-        let is_b = k.as_bytes(&mut [0u8; DECODE_MAX]) == b"b";
-        visited.push(k.clone());
-        if is_b {
-            h.delete(&k).unwrap();
+    for mut h in both_engines() {
+        // Container-verified: deleting the current item mid-each still visits all 4 keys.
+        for k in ["a", "b", "c", "d"] {
+            h.store(key(k), int(1)).unwrap();
         }
-    }
 
-    assert_eq!(visited.len(), 4, "all keys visited despite delete-current (verified)");
-    assert_eq!(h.len(), 3);
+        let mut visited = Vec::new();
+        while let Some((k, _)) = h.each() {
+            let is_b = k.as_bytes(&mut [0u8; DECODE_MAX]) == b"b";
+            visited.push(k.clone());
+            if is_b {
+                h.delete(&k).unwrap();
+            }
+        }
+
+        assert_eq!(visited.len(), 4, "all keys visited despite delete-current (verified)");
+        assert_eq!(h.len(), 3);
+    }
 }
 
 #[test]
 fn each_exhausts_restarts_and_keys_resets() {
-    let mut h = PerlHash::new();
-    h.store(key("x"), int(1)).unwrap();
-    h.store(key("y"), int(2)).unwrap();
+    for mut h in both_engines() {
+        h.store(key("x"), int(1)).unwrap();
+        h.store(key("y"), int(2)).unwrap();
 
-    // Exhaust: two yields, one None, then a restart (container-verified).
-    assert!(h.each().is_some());
-    assert!(h.each().is_some());
-    assert!(h.each().is_none());
-    assert!(h.each().is_some(), "the iterator restarts after exhaustion");
-
-    // keys() resets mid-iteration (container-verified).
-    let mut g = PerlHash::new();
-    g.store(key("x"), int(1)).unwrap();
-    g.store(key("y"), int(2)).unwrap();
-    let _ = g.each();
-    let _ = g.keys();
-    let mut count = 0;
-
-    while g.each().is_some() {
-        count += 1;
+        // Exhaust: two yields, one None, then a restart (container-verified).
+        assert!(h.each().is_some());
+        assert!(h.each().is_some());
+        assert!(h.each().is_none());
+        assert!(h.each().is_some(), "the iterator restarts after exhaustion");
     }
 
-    assert_eq!(count, 2, "full pass after the reset");
+    // keys() resets mid-iteration (container-verified).
+    for mut g in both_engines() {
+        g.store(key("x"), int(1)).unwrap();
+        g.store(key("y"), int(2)).unwrap();
+        let _ = g.each();
+        let _ = g.keys();
+        let mut count = 0;
+
+        while g.each().is_some() {
+            count += 1;
+        }
+
+        assert_eq!(count, 2, "full pass after the reset");
+    }
 }
 
 #[test]
 fn keys_values_stable_and_corresponding() {
-    // Container-verified: stable without mutation; keys/values correspond.
-    let mut h = PerlHash::new();
-    for (i, k) in ["a", "b", "c"].iter().enumerate() {
-        h.store(key(k), int(i as i64)).unwrap();
-    }
+    // Container-verified: stable without mutation; keys/values correspond.  Engine-shared: order is per-engine,
+    // stability and correspondence are not.
+    for mut h in both_engines() {
+        for (i, k) in ["a", "b", "c"].iter().enumerate() {
+            h.store(key(k), int(i as i64)).unwrap();
+        }
 
-    let k1 = h.keys();
-    let k2 = h.keys();
-    assert_eq!(
-        k1.iter().map(|k| k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()).collect::<Vec<_>>(),
-        k2.iter().map(|k| k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()).collect::<Vec<_>>()
-    );
+        let k1 = h.keys();
+        let k2 = h.keys();
+        assert_eq!(
+            k1.iter().map(|k| k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()).collect::<Vec<_>>(),
+            k2.iter().map(|k| k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()).collect::<Vec<_>>()
+        );
 
-    let vals = h.values();
-    for (k, v) in k1.iter().zip(vals.iter()) {
-        assert_eq!(h.get(k).unwrap().to_int(), v.to_int());
+        let vals = h.values();
+        for (k, v) in k1.iter().zip(vals.iter()) {
+            assert_eq!(h.get(k).unwrap().to_int(), v.to_int());
+        }
     }
 }
 
 #[test]
 fn hash_readonly() {
+    for mut h in both_engines() {
+        h.store(key("a"), int(1)).unwrap();
+        h.set_readonly(true);
+        assert_eq!(h.store(key("b"), int(2)), Err(ScalarError::ReadOnly));
+        assert_eq!(h.delete(&key("a")).map(|_| ()), Err(ScalarError::ReadOnly));
+        assert_eq!(h.entry_or_undef(key("c")).map(|_| ()), Err(ScalarError::ReadOnly));
+        assert_eq!(h.clear(), Err(ScalarError::ReadOnly));
+        assert_eq!(h.get(&key("a")).unwrap().to_int(), 1);
+        assert_eq!(h.keys().len(), 1, "reads and iteration stay legal");
+        h.set_readonly(false);
+        h.store(key("b"), int(2)).unwrap();
+    }
+}
+
+// ── The §2.2.13 bucket-engine discipline ──────────────────────
+#[test]
+fn ordered_mode_iterates_in_insertion_order() {
+    // The mode's reason to exist: a pinned, predictable order on explicit request.
+    let mut h = PerlHash::insertion_ordered();
+    for k in ["delta", "alpha", "omega", "beta"] {
+        h.store(key(k), int(1)).unwrap();
+    }
+    let spelled: Vec<Vec<u8>> = h.keys().iter().map(|k| k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()).collect();
+    assert_eq!(spelled, vec![b"delta".to_vec(), b"alpha".to_vec(), b"omega".to_vec(), b"beta".to_vec()]);
+}
+
+#[test]
+fn value_update_does_not_disturb_each() {
+    // Contract-specified safe: updating an existing key's value during iteration; the cursor must not reset (§2.2.13:
+    // the find-first store path).
+    for mut h in both_engines() {
+        for k in ["a", "b", "c"] {
+            h.store(key(k), int(1)).unwrap();
+        }
+        let first = h.each().expect("one of three");
+        h.store(first.0.clone(), int(99)).unwrap();
+        let mut rest = 0;
+        while h.each().is_some() {
+            rest += 1;
+        }
+        assert_eq!(rest, 2, "the update neither restarted nor truncated the pass");
+        assert_eq!(h.get(&first.0).unwrap().to_int(), 99);
+    }
+}
+
+#[test]
+fn new_key_insertion_restarts_the_bucket_walk() {
+    // §2.2.13: a rehash may scramble positions, so a new key resets the cursor — the post-insert pass is complete:
+    // every current key appears, none twice.
     let mut h = PerlHash::new();
-    h.store(key("a"), int(1)).unwrap();
-    h.set_readonly(true);
-    assert_eq!(h.store(key("b"), int(2)), Err(ScalarError::ReadOnly));
-    assert_eq!(h.delete(&key("a")).map(|_| ()), Err(ScalarError::ReadOnly));
-    assert_eq!(h.entry_or_undef(key("c")).map(|_| ()), Err(ScalarError::ReadOnly));
-    assert_eq!(h.clear(), Err(ScalarError::ReadOnly));
-    assert_eq!(h.get(&key("a")).unwrap().to_int(), 1);
-    assert_eq!(h.keys().len(), 1, "reads and iteration stay legal");
-    h.set_readonly(false);
-    h.store(key("b"), int(2)).unwrap();
+    for i in 0..8 {
+        h.store(key(&format!("k{i}")), int(i)).unwrap();
+    }
+    let _ = h.each();
+    let _ = h.each();
+    h.store(key("fresh"), int(100)).unwrap();
+
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((k, _)) = h.each() {
+        assert!(seen.insert(k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec()), "no duplicates within the pass");
+    }
+    assert_eq!(seen.len(), 9, "the restarted pass covers every current key");
+}
+
+#[test]
+fn bucket_delete_exactness_canary() {
+    // The §2.2.13 canary: bucket-index stability across deletion is mechanically certain but contractually silent in
+    // hashbrown's public docs.  Interleaved deletions at scale must leave the visit set exact — every surviving key
+    // visited exactly once, every pre-visit-deleted key never visited.  A hashbrown behavior change fails this loudly.
+    let mut h = PerlHash::new();
+    let n = 300;
+    for i in 0..n {
+        h.store(key(&format!("k{i:03}")), int(i)).unwrap();
+    }
+
+    let mut visited = std::collections::BTreeSet::new();
+    let mut deleted_unvisited = std::collections::BTreeSet::new();
+    let mut step = 0;
+    while let Some((k, _)) = h.each() {
+        let spelled = k.as_bytes(&mut [0u8; DECODE_MAX]).to_vec();
+        assert!(!deleted_unvisited.contains(&spelled), "a tombstoned unvisited entry must never be yielded");
+        assert!(visited.insert(spelled), "no entry yields twice under delete-only interleaving");
+
+        step += 1;
+
+        if step % 3 == 0 {
+            // Delete the current entry (the blessed idiom)...
+            h.delete(&k).unwrap();
+        }
+
+        if step % 7 == 0 {
+            // ...and an arbitrary not-yet-visited entry, when one exists.
+            let target = (0..n).map(|i| format!("k{i:03}")).find(|s| {
+                let ks = key(s);
+                !visited.contains(s.as_bytes()) && h.exists(&ks)
+            });
+            if let Some(s) = target {
+                h.delete(&key(&s)).unwrap();
+                deleted_unvisited.insert(s.into_bytes());
+            }
+        }
+    }
+
+    let survivors: usize = (0..n).filter(|i| h.exists(&key(&format!("k{i:03}")))).count();
+    assert_eq!(visited.len() + deleted_unvisited.len(), n as usize, "every key visited or deleted-unvisited");
+    assert_eq!(h.len(), survivors);
 }
 
 // ── Handles ───────────────────────────────────────────────────
