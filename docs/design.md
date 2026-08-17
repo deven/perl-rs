@@ -1880,8 +1880,9 @@ so a WASM host on Arm emulates it.
 
 #### 2.2.10 Containers: the ordered map [DECISION]:
 
-`PerlArray` is a dense `Vec` of slots (`Option<Value>`: a hole is
-not `undef`, §21.1).  `PerlHash`'s map is an
+`PerlArray` is a dense run of slots (`Option<Value>`: a hole is
+not `undef`, §21.1) behind the §2.2.12 front-gap engine.
+`PerlHash`'s map is an
 `IndexMap<PerlString, Value>`.  Perl's `each` contract needs a
 cursor that survives inserts and deletes with no guard object,
 and an index into insertion order is exactly that: the `each`
@@ -1895,6 +1896,93 @@ dense at 16 + 16 = 32 bytes, two per cache line, which the
 The dependency is `indexmap` (§22.1); the standard `HashMap`
 cannot host the cursor without a generation guard.  Ruled during
 §21.1 step 6 and recorded here as the normative home.
+
+#### 2.2.12 `PerlArray`: the front-gap engine [DECISION]:
+
+`PerlArray`'s slot storage is a front-gap engine shaped on perl's
+own AV (`xav_alloc`/`svu_array`/`xav_fill`/`xav_max`: an
+allocation pointer, a separate live-start, and gap-relative fill
+and capacity), replacing the step-6 `Vec`.  The motive is
+threefold: `shift` becomes an O(1) window slide where the `Vec`
+form pays an O(n) memmove — a semantic-performance divergence on
+idiomatic perl (`shift @_` in every sub prologue); the header
+narrows to 24 bytes, restoring the §2.4.3 budget the `Vec` form
+exceeds and keeping the whole identity allocation in the 48-byte
+class today (16-byte `Arc` header + 8-byte lock + 24); and the
+adjunct family — readonly, the bless stash, future flags — rides
+the header with zero waste, resolving the measured
+eight-bytes-for-one-bit padding of the `Vec` form.
+
+**The header, 24 bytes exactly [DECISION]:**
+
+```text
+alloc:  *mut ArraySlot   8   allocation base (free/realloc here)
+start:  u32              4   gap in slots; live = alloc + start
+len:    u32              4   live element count (fill + 1: the
+                             -1-empty sentinel biased away)
+cap:    u32              4   usable slots from start
+stash:  u24              3   bless package id; 0 = unblessed
+flags:  u8               1   readonly bit; weak/magic bits spare
+```
+
+Total allocation is `start + cap` slots; every invariant is
+integer-assertable with no pointer casts (`len <= cap`; the
+offset form was chosen over a second pointer for exactly this,
+and for the bit headroom narrow fields buy).  Indices are `u32`,
+not 24-bit: a u24 bound (16M elements, a 256 MiB buffer) is warm
+enough for real workloads to hit, and 3-byte fields cost mask
+arithmetic on the hottest path arrays have, while u32 (4G
+elements, a 64 GiB buffer) makes the spill arm cold and every
+load naturally aligned.  The 24-bit width goes where it is
+harmless: the stash id, per the §2.2.9 u24 precedent.
+
+**The spill arm [DECISION]:** `PerlArray`'s representation is a
+two-arm repr — the 24-byte small form above, and
+`Large(Box<WideHeader>)` with `usize` fields plus the same
+stash and flags — promoted on the increment that would overflow
+`u32`, under the write lock the mutation already holds.  The
+arm swap is invisible through `ArrayRef`: the identity is the
+allocation, not the arm — the `Heap32`/`Heap` philosophy
+applied to arrays.  Both arms are contiguous [DECISION]:
+chunked storage for the large arm was considered and rejected —
+it taxes every index with a second dereference and complicates
+the internal API into runs for a wall (64 GiB of slots) nothing
+real approaches; revisit only on a demonstrated workload.
+
+**Slots are unchanged:** contiguous `ArraySlot` (`Option<Value>`,
+16 bytes, the hole niched), the step-6 hole/exists/delete
+semantics carried verbatim, and the step-6 batteries as the
+safety net for the engine swap — the public surface (`len`,
+`exists`, `delete`, `store`, `fetch`) does not move.
+
+**Operations, matching `av.c`:**
+
+- `shift`: read the slot at `start`, leave `None` behind,
+  `start += 1`, `cap -= 1`, `len -= 1`.  O(1); the element
+  leaves by the window sliding past it.  Empty shift returns
+  `undef` (pinned; perl returns `&PL_sv_undef`).
+- `unshift(n)`: perl's exact two-phase strategy [DECISION].
+  Phase one reclaims from the gap only what the unshift needs —
+  `take = min(start, n)`; `start -= take`; `cap += take`;
+  `len += take`; `n -= take` — no element movement, surplus gap
+  preserved.  Phase two, only on a shortfall, slides the live
+  elements right by `n + slide` where `slide` is the pre-slide
+  fill (`len - 1`, zero when fewer than two elements live),
+  zeroes the opened slots, then carves the `slide` slots back
+  off as fresh front gap: the prepaid buffer equals the array's
+  live count — front-gap geometric growth, `push` doubling's
+  analog aimed forward, matching `av_unshift` line for line.
+- `push`/`pop`: `len` against `cap`; growth on collision.
+- growth: perl's three escalating moves — slide the live
+  elements back to `alloc` reclaiming the gap; probe the
+  allocator's actual grant (`malloc_usable_size`, the §2.2.3
+  harvest precedent) and grow by bookkeeping when the bucket's
+  slack covers it; only then realloc, which may move.  The
+  growth curve is perl's [DECISION]: overallocate by
+  `requested + max/5`, not `Vec`-style doubling — gentler on
+  large-array memory, the footprint perl-tuned programs assume,
+  and in synergy with the slack probe that absorbs repeat
+  growth.
 
 ### 2.3 Promoted Scalars
 
@@ -2627,7 +2715,7 @@ ScalarRef     shared identity of a promoted scalar (Mut | Const)
 ScalarCell    mutable cell interior (Plain | Full), upgraded in place
 FullScalar    boxed rare state: payload + caches + magic + stash
 ConstScalar   lockless immutable cell, coercions materialized at birth
-PerlArray     Vec<ArraySlot> + array-level state
+PerlArray     front-gap slot engine + array-level state (§2.2.12)
 PerlHash      IndexMap<PerlString, Value> + iterator state (§2.2.10)
 ArrayRef, HashRef, CodeRef, RegexRef
               Arc-backed shared identities of the container/code types
