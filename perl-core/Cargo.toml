@@ -13,6 +13,7 @@ jemalloc = ["dep:tikv-jemalloc-sys"]
 
 [dependencies]
 hashbrown         = { workspace = true }
+imbl              = { workspace = true, optional = true }
 indexmap          = { workspace = true }
 parking_lot       = { workspace = true }
 tikv-jemalloc-sys = { workspace = true, optional = true }

@@ -2057,8 +2057,48 @@ revisited only if short-key hashing (perl's SBOX32) ever
 profiles.  `std::HashMap` remains excluded: no positional
 access, so a parked cursor cannot resume.
 
-The graph-traversal hook and teardown drain both engines; keys
-launder at storage in both; the readonly flag and the future
+**The immutable engine [DECISION]:** a third arm behind the
+`imbl` feature (the optional dependency is the feature),
+constructed by `PerlHash::immutable()`: a persistent HAMT
+(`imbl::HashMap`, Arc-backed) whose clones are O(1) root shares
+and whose mutations path-copy O(log32 n) nodes.  `snapshot()`
+exists on every `PerlHash` and returns
+`Result<PerlHash, ScalarError>`: on this engine an O(1) clone —
+a detached, diverging hash with a fresh cursor — and
+`ScalarError::SnapshotUnsupported` on the others [DECISION].
+This is the redemption of the rejected copy-on-write iteration:
+the multi-gigabyte objection was the O(n) clone, and structural
+sharing removes it, so the Rust-facing pattern becomes
+brief-lock, O(1) snapshot out, unbounded lock-free reads with
+nothing held across suspension.
+
+Its `each` is the parked-iterator design made legitimate: the
+cursor is an *owning* consuming iterator over an O(1) snapshot —
+no borrow, no self-reference, no reallocation hazard — yielding
+with live revalidation: a key deleted since the snapshot is
+skipped (the walk never yields what `exists` denies), the value
+is read live (value updates during iteration are
+contract-specified visible), and keys inserted since are
+invisible until restart, a skip inside the unspecified clause.
+No mutation forces a reset — the snapshot walk is rehash-immune
+— so the only resets are the contractual ones: `keys`, `values`,
+exhaustion.  Delete-current is exact by construction.
+
+Teardown keeps full §2.4.9 routing across structural sharing:
+dropping or clearing drains the map and retires any parked
+iterator through the release worklist; a co-owner's drain nets
+zero on shared values (clone, then release), and the final
+owner's drain moves them out — every value reaches the worklist
+through some owner.  Costs, recorded: point operations trail
+SwissTable (log32 probes, allocation on write) and per-entry
+memory is heavier, which is why this is a mode and never the
+default.  Provenance: `imbl` is the maintained fork of the
+unmaintained `im` (last released 2022; the `sized-chunks`
+soundness advisory RUSTSEC-2020-0041 sits in its lineage),
+pinned at major 7.
+
+The graph-traversal hook and teardown drain every engine; keys
+launder at storage in all; the readonly flag and the future
 stash and flags ride the struct as measured in the padding
 review.
 
@@ -12508,7 +12548,7 @@ three independent leaf crates that have no cross-dependencies:
 
 | Crate           | Type | Dependencies                                              | Contents                                                                                                                           |
 |-----------------|------|-----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
-| `perl-core`     | lib  | `hashbrown`, `indexmap`, `parking_lot`                                 | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
+| `perl-core`     | lib  | `hashbrown`, `indexmap`, `parking_lot`                    | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
 | `perl-parser`   | lib  | `bytes`, `memchr`, `unicode-xid`, `unicode-normalization` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters  |
 | `perl-regex`    | lib  | none                                                      | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11)                    |
 | `perl-compiler` | lib  | `perl-core`, `perl-parser`                                | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
@@ -12525,12 +12565,13 @@ cross-dependencies.  Each is independently useful as a library:
 carries its own `CowBuffer` (§2.2.3) for copy-on-write byte
 buffers, with `hashbrown` for the default hash engine
 (§2.2.13), `indexmap` for the insertion-ordered mode (§2.2.10,
-§2.2.13), and
-`parking_lot` for cell locks (§2.3.1).  `perl-parser` depends on
-`bytes` (source slicing), `memchr` (SIMD-optimized scanning and
-delimiter lookup), `unicode-xid` (Unicode identifier validation),
-and `unicode-normalization` (NFC normalization).  `perl-regex`
-remains dependency-free, operating on `&[u8]` and `&str` slices.
+§2.2.13), feature-gated `imbl` for the immutable engine
+(§2.2.13), and `parking_lot` for cell locks (§2.3.1).  `perl-parser`
+depends on `bytes` (source slicing), `memchr` (SIMD-optimized
+scanning and delimiter lookup), `unicode-xid` (Unicode identifier
+validation), and `unicode-normalization` (NFC normalization).
+`perl-regex` remains dependency-free, operating on `&[u8]` and `&str`
+slices.
 
 `perl-compiler` contains the compilation pipeline: AST → HIR → IR →
 optimize.  It depends on `perl-parser` (for AST input) and
