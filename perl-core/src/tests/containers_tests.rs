@@ -4,8 +4,14 @@ use crate::value::{ScalarPayload, Tainted};
 
 /// Both engines (§2.2.13): the container-verified semantics are engine-independent, so the shared batteries run against
 /// each.
-fn both_engines() -> [PerlHash; 2] {
-    [PerlHash::new(), PerlHash::insertion_ordered()]
+fn both_engines() -> Vec<PerlHash> {
+    #[allow(unused_mut)]
+    let mut engines = vec![PerlHash::new(), PerlHash::insertion_ordered()];
+
+    #[cfg(feature = "imbl")]
+    engines.push(PerlHash::immutable());
+
+    engines
 }
 
 fn int(n: i64) -> Value {
@@ -338,6 +344,88 @@ fn bucket_delete_exactness_canary() {
     assert_eq!(h.len(), survivors);
 }
 
+// ── The §2.2.13 immutable engine ──────────────────────────────
+#[test]
+fn snapshot_is_supported_only_on_the_immutable_engine() {
+    assert_eq!(PerlHash::new().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+    assert_eq!(PerlHash::insertion_ordered().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+}
+
+#[cfg(feature = "imbl")]
+#[test]
+fn snapshots_are_detached_diverging_copies() {
+    let mut h = PerlHash::immutable();
+    for k in ["a", "b", "c"] {
+        h.store(key(k), int(1)).unwrap();
+    }
+
+    let mut snap = h.snapshot().unwrap();
+    h.store(key("d"), int(4)).unwrap();
+    h.delete(&key("a")).unwrap();
+    snap.store(key("z"), int(26)).unwrap();
+
+    // The snapshot holds the moment: untouched by the original's divergence, diverging on its own.
+    assert_eq!(snap.len(), 4);
+    assert!(snap.exists(&key("a")) && snap.exists(&key("z")) && !snap.exists(&key("d")));
+    assert_eq!(h.len(), 3);
+    assert!(!h.exists(&key("a")) && h.exists(&key("d")) && !h.exists(&key("z")));
+}
+
+#[cfg(feature = "imbl")]
+#[test]
+fn immutable_each_revalidates_live() {
+    // §2.2.13: the parked snapshot walk skips keys deleted since, reads values live, and holds new keys for the restart
+    // — with no reset forced by any mutation.
+    let mut h = PerlHash::immutable();
+    for i in 0..6 {
+        h.store(key(&format!("k{i}")), int(i)).unwrap();
+    }
+
+    let first = h.each().expect("six live");
+
+    // Update the first-yielded key's value: a later pass reads live, and this pass is undisturbed.
+    h.store(first.0.clone(), int(100)).unwrap();
+
+    // Delete an unvisited key and insert a fresh one mid-walk.
+    let mut deleted = None;
+    let mut inserted_seen = false;
+    let mut yielded = vec![first.0.clone()];
+    while let Some((k, v)) = h.each() {
+        if deleted.is_none() {
+            // Choose a victim the walk has not yielded yet, if any remains.
+            let victim = (0..6).map(|i| format!("k{i}")).find(|s| {
+                let ks = key(s);
+                ks.as_bytes(&mut [0u8; DECODE_MAX]) != k.as_bytes(&mut [0u8; DECODE_MAX])
+                    && !yielded.iter().any(|y| y.as_bytes(&mut [0u8; DECODE_MAX]) == s.as_bytes())
+                    && h.exists(&ks)
+            });
+
+            if let Some(s) = victim {
+                h.delete(&key(&s)).unwrap();
+                h.store(key("fresh"), int(7)).unwrap();
+                deleted = Some(s);
+            }
+        }
+        assert!(v.to_int() < 200, "values read live, never stale");
+        if k.as_bytes(&mut [0u8; DECODE_MAX]) == b"fresh" {
+            inserted_seen = true;
+        }
+        yielded.push(k);
+    }
+
+    let deleted = deleted.expect("a victim existed");
+    assert!(!yielded.iter().any(|y| y.as_bytes(&mut [0u8; DECODE_MAX]) == deleted.as_bytes()), "deleted key skipped");
+    assert!(!inserted_seen, "the inserted key waits for the restart");
+
+    // The restart sees the live truth: five originals minus the deletion, plus the insertion.
+    let mut restart = 0;
+    while h.each().is_some() {
+        restart += 1;
+    }
+
+    assert_eq!(restart, 6, "post-restart pass covers the live set");
+}
+
 // ── Handles ───────────────────────────────────────────────────
 #[test]
 fn handle_identity_and_traversal() {
@@ -370,4 +458,8 @@ fn concurrency_foundation_send_sync() {
     assert_send_sync::<ArrayRef>();
     assert_send_sync::<HashRef>();
     assert_send_sync::<crate::scalar::ScalarRef>();
+
+    // The immutable engine's map and parked iterator must cross threads with the rest.
+    #[cfg(feature = "imbl")]
+    assert_send_sync::<imbl::HashMap<PerlString, Value>>();
 }

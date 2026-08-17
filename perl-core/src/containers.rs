@@ -25,6 +25,9 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::BuildHasher;
 
+#[cfg(feature = "imbl")]
+use imbl;
+
 use crate::heap::{HeapArc, release_value};
 use crate::scalar::ScalarError;
 use crate::string::PerlString;
@@ -195,6 +198,28 @@ enum HashEngine {
 
     /// The explicitly requested insertion-ordered mode (§2.2.10): the `each` cursor is an entry index.
     Ordered { map: IndexMap<PerlString, Value>, cursor: usize },
+
+    /// The feature-gated immutable mode (§2.2.13): a persistent HAMT; the `each` cursor is an owning iterator over an
+    /// O(1) snapshot, yielding with live revalidation.
+    #[cfg(feature = "imbl")]
+    Immutable { map: ImblMap, iter: Option<ImblIter> },
+}
+
+#[cfg(feature = "imbl")]
+type ImblMap = imbl::HashMap<PerlString, Value>;
+
+#[cfg(feature = "imbl")]
+type ImblIter = <ImblMap as IntoIterator>::IntoIter;
+
+/// Retire a parked snapshot iterator (§2.2.13): its remaining values route through the release worklist — a co-owner's
+/// release nets zero on shared values; the final owner's moves them out.
+#[cfg(feature = "imbl")]
+fn retire_iter(iter: &mut Option<ImblIter>) {
+    if let Some(rest) = iter.take() {
+        for (_key, v) in rest {
+            release_value(v);
+        }
+    }
 }
 
 impl Default for PerlHash {
@@ -217,6 +242,14 @@ impl Drop for PerlHash {
                     release_value(v);
                 }
             }
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, iter } => {
+                retire_iter(iter);
+                for (_key, v) in std::mem::take(map) {
+                    release_value(v);
+                }
+            }
         }
     }
 }
@@ -233,10 +266,29 @@ impl PerlHash {
         PerlHash { engine: HashEngine::Ordered { map: IndexMap::new(), cursor: 0 }, readonly: false }
     }
 
+    /// The immutable mode (§2.2.13), on explicit request only: a persistent HAMT with O(1) [`PerlHash::snapshot`].
+    #[cfg(feature = "imbl")]
+    pub fn immutable() -> PerlHash {
+        PerlHash { engine: HashEngine::Immutable { map: ImblMap::new(), iter: None }, readonly: false }
+    }
+
+    /// An O(1) detached, diverging copy of an immutable-engine hash (§2.2.13), with a fresh cursor and the readonly
+    /// flag cleared; the other engines answer [`ScalarError::SnapshotUnsupported`], their copies being O(n).
+    pub fn snapshot(&self) -> Result<PerlHash, ScalarError> {
+        match &self.engine {
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, .. } => Ok(PerlHash { engine: HashEngine::Immutable { map: map.clone(), iter: None }, readonly: false }),
+            _ => Err(ScalarError::SnapshotUnsupported),
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.engine {
             HashEngine::Buckets { table, .. } => table.len(),
             HashEngine::Ordered { map, .. } => map.len(),
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, .. } => map.len(),
         }
     }
 
@@ -276,6 +328,17 @@ impl PerlHash {
             HashEngine::Ordered { map, .. } => {
                 map.insert(key, value);
             }
+
+            // No reset in any case (§2.2.13): the snapshot walk is rehash-immune, and the stored key spelling of an
+            // existing entry is preserved by the update-in-place branch.
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, .. } => {
+                if let Some(slot) = map.get_mut(&key) {
+                    *slot = value;
+                } else {
+                    map.insert(key, value);
+                }
+            }
         }
         Ok(())
     }
@@ -285,6 +348,9 @@ impl PerlHash {
         match &self.engine {
             HashEngine::Buckets { table, hasher, .. } => table.find(hasher.hash_one(key), |(stored, _)| stored == key).map(|(_, value)| value),
             HashEngine::Ordered { map, .. } => map.get(key),
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, .. } => map.get(key),
         }
     }
 
@@ -312,6 +378,9 @@ impl PerlHash {
                 Ok(&mut entry.into_mut().1)
             }
             HashEngine::Ordered { map, .. } => Ok(map.entry(key).or_default()),
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, .. } => Ok(map.entry(key).or_insert_with(Value::default)),
         }
     }
 
@@ -339,6 +408,10 @@ impl PerlHash {
                 }
                 Ok(value)
             }
+
+            // The parked walk revalidates live, so the sharing-safe removal needs no cursor bookkeeping either.
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, .. } => Ok(map.remove(key).unwrap_or_default()),
         }
     }
 
@@ -368,6 +441,20 @@ impl PerlHash {
                     None
                 }
             },
+
+            // §2.2.13: walk an O(1) snapshot through an owning iterator, revalidating live — deleted keys are skipped,
+            // values are read live (specified-visible updates), inserted keys wait for the restart.
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, iter } => {
+                let walk = iter.get_or_insert_with(|| map.clone().into_iter());
+                for (key, _snapshot_value) in walk {
+                    if let Some(live) = map.get(&key) {
+                        return Some((key, live.clone()));
+                    }
+                }
+                *iter = None;
+                None
+            }
         }
     }
 
@@ -382,6 +469,12 @@ impl PerlHash {
                 *cursor = 0;
                 map.keys().cloned().collect()
             }
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, iter } => {
+                retire_iter(iter);
+                map.keys().cloned().collect()
+            }
         }
     }
 
@@ -394,6 +487,12 @@ impl PerlHash {
             }
             HashEngine::Ordered { map, cursor } => {
                 *cursor = 0;
+                map.values().cloned().collect()
+            }
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, iter } => {
+                retire_iter(iter);
                 map.values().cloned().collect()
             }
         }
@@ -415,6 +514,14 @@ impl PerlHash {
                 }
                 *cursor = 0;
             }
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, iter } => {
+                retire_iter(iter);
+                for (_key, v) in std::mem::take(map) {
+                    release_value(v);
+                }
+            }
         }
         Ok(())
     }
@@ -433,6 +540,9 @@ impl PerlHash {
         match &self.engine {
             HashEngine::Buckets { table, .. } => HashValuesIter::Buckets { table, next: 0 },
             HashEngine::Ordered { map, .. } => HashValuesIter::Ordered(map.values()),
+
+            #[cfg(feature = "imbl")]
+            HashEngine::Immutable { map, .. } => HashValuesIter::Immutable(map.values()),
         }
     }
 }
@@ -440,8 +550,14 @@ impl PerlHash {
 /// The engine-dispatched values walk behind [`PerlHash::values_iter`]: a hand-rolled two-arm iterator, keeping the cold
 /// traversal hook vtable-free.
 pub(crate) enum HashValuesIter<'a> {
-    Buckets { table: &'a HashTable<(PerlString, Value)>, next: usize },
+    Buckets {
+        table: &'a HashTable<(PerlString, Value)>,
+        next: usize,
+    },
     Ordered(indexmap::map::Values<'a, PerlString, Value>),
+
+    #[cfg(feature = "imbl")]
+    Immutable(imbl::hashmap::Values<'a, PerlString, Value, imbl::shared_ptr::DefaultSharedPtr>),
 }
 
 impl<'a> Iterator for HashValuesIter<'a> {
@@ -461,6 +577,9 @@ impl<'a> Iterator for HashValuesIter<'a> {
                 None
             }
             HashValuesIter::Ordered(values) => values.next(),
+
+            #[cfg(feature = "imbl")]
+            HashValuesIter::Immutable(values) => values.next(),
         }
     }
 }

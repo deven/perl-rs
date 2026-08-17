@@ -38,6 +38,9 @@ pub enum ScalarError {
     /// Modification of a read-only value attempted (§2.3.1): structural for `Const` cells, the dynamic readonly flag
     /// for `Mut` cells.
     ReadOnly,
+
+    /// `snapshot` on a hash engine without O(1) snapshots (§2.2.13): only the immutable engine supports it.
+    SnapshotUnsupported,
     Alloc(AllocError),
 }
 
@@ -51,6 +54,7 @@ impl fmt::Display for ScalarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ScalarError::ReadOnly => f.write_str("Modification of a read-only value attempted"),
+            ScalarError::SnapshotUnsupported => f.write_str("snapshot requires an immutable hash"),
             ScalarError::Alloc(_) => f.write_str("Out of memory!"),
         }
     }
