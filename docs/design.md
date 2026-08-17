@@ -1893,9 +1893,10 @@ makes delete-during-iteration *exact*, including the
 delete-current idiom perl documents as safe.  Entry pairs are
 dense at 16 + 16 = 32 bytes, two per cache line, which the
 §2.2.9 key economics and the §2.4.3 size budget both lean on.
-The dependency is `indexmap` (§22.1); the standard `HashMap`
-cannot host the cursor without a generation guard.  Ruled during
-§21.1 step 6 and recorded here as the normative home.
+The dependency is `indexmap` (§22.1).  Ruled during §21.1 step 6
+as the normative home; §2.2.13 later rules this engine to the
+explicitly requested insertion-ordered mode, with the bucket
+engine as the default.
 
 #### 2.2.12 `PerlArray`: the front-gap engine [DECISION]:
 
@@ -1983,6 +1984,83 @@ safety net for the engine swap — the public surface (`len`,
   large-array memory, the footprint perl-tuned programs assume,
   and in synergy with the slack probe that absorbs repeat
   growth.
+
+#### 2.2.13 `PerlHash`: the dual-engine ruling [DECISION]:
+
+`PerlHash` carries one of two engines, fixed at construction.
+The default is a bucket engine on `hashbrown::HashTable` — the
+safe SwissTable with public bucket addressing (`num_buckets`,
+`get_bucket`, `find_entry`, added in hashbrown 0.16.1) — and the
+§2.2.10 `IndexMap` engine is retained as the explicitly
+requested insertion-ordered mode: perl code has real uses for a
+predictable order (`Hash::Ordered`-shaped work), but it must ask
+for it, and the surface through which perl code asks is deferred
+to the runtime design [DECISION].  Construction is
+`PerlHash::new` for the default and
+`PerlHash::insertion_ordered` for the mode; the handle, the
+public method surface, and the container-verified semantics are
+identical across engines.
+
+**The bucket engine.**  Entries are `(PerlString, Value)` pairs
+in the table's own slots; hashing is a per-hash `RandomState`
+(SipHash), which buys the DoS resistance perl's seeded hashing
+buys and, as a per-hash byproduct, an iteration order that is
+random per hash — observably closer to perl than insertion
+order.  The `each` cursor is the plain integer the pod's
+guardless contract needs: a bucket index held in the hash,
+walked forward over `get_bucket` until the next occupied slot,
+reset to zero at exhaustion (yield `None` once, then restart).
+`keys` and `values` reset it and share the bucket-order scan, so
+the three iterators correspond as the contract requires.
+
+**The mutation discipline [DECISION]:**
+
+- Store to an existing key updates the value in place through
+  `find_mut` and does not touch the cursor: value updates during
+  iteration are contract-specified safe, and the first-stored
+  key spelling wins as before.
+- A new-key insertion resets the cursor to zero.  Growth may
+  rehash and relocate every bucket, so the stale position is
+  answered by restarting: duplicates are possible, skips are
+  not, both inside the pod's unspecified-effects clause.
+- Deletion never touches the cursor.  Erasure writes a control
+  byte and moves nothing, so every deletion is semantically
+  *exact*, not merely tolerated: delete-current is safe because
+  the cursor already passed the yielded bucket, and deleting an
+  unvisited entry tombstones a slot the walk will skip — every
+  remaining entry is visited exactly once under any
+  interleaving.  The delete-during-`each` batteries keep their
+  full strength across the engine swap.
+
+**The recorded dependency assumption:** bucket-index stability
+across deletion is mechanically guaranteed by the SwissTable
+design but contractually silent in hashbrown's public
+documentation.  The design leans on it deliberately, pinned by
+a canary battery (visit-set exactness across interleaved
+deletions at scale) that fails loudly if the invariant ever
+shifts; resetting on delete instead would make perl's blessed
+`while (each) { delete }` idiom quadratic and is rejected.
+
+**Considered and rejected**, recorded from the review: parking a
+live iterator in the hash (a self-referential borrow in safe
+Rust, and at the raw layer a use-after-free the moment an insert
+rehashes — the pod's skipped-or-duplicated latitude licenses
+wrong answers, never unsafety); `Arc` around the map or the
+iterator (pins the header allocation, not the bucket array the
+iterator's pointers enter); copy-on-write snapshot iteration
+(an abandoned mid-way cursor — normal per the pod — turns the
+next insert into an O(n) clone and a transient doubling of a
+possibly multi-gigabyte hash); an owned key snapshot per pass
+(same objection at smaller scale); and an owned flat table,
+dominated by `HashTable` now that bucket addressing is public,
+revisited only if short-key hashing (perl's SBOX32) ever
+profiles.  `std::HashMap` remains excluded: no positional
+access, so a parked cursor cannot resume.
+
+The graph-traversal hook and teardown drain both engines; keys
+launder at storage in both; the readonly flag and the future
+stash and flags ride the struct as measured in the padding
+review.
 
 ### 2.3 Promoted Scalars
 
@@ -12430,7 +12508,7 @@ three independent leaf crates that have no cross-dependencies:
 
 | Crate           | Type | Dependencies                                              | Contents                                                                                                                           |
 |-----------------|------|-----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
-| `perl-core`     | lib  | `indexmap`, `parking_lot`                                 | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
+| `perl-core`     | lib  | `hashbrown`, `indexmap`, `parking_lot`                                 | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
 | `perl-parser`   | lib  | `bytes`, `memchr`, `unicode-xid`, `unicode-normalization` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters  |
 | `perl-regex`    | lib  | none                                                      | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11)                    |
 | `perl-compiler` | lib  | `perl-core`, `perl-parser`                                | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
@@ -12445,7 +12523,9 @@ cross-dependencies.  Each is independently useful as a library:
 `perl-regex` for Rust programs that want Perl-compatible regex, and
 `perl-core` for extensions that need the value types.  `perl-core`
 carries its own `CowBuffer` (§2.2.3) for copy-on-write byte
-buffers, with `indexmap` for the ordered map (§2.2.10) and
+buffers, with `hashbrown` for the default hash engine
+(§2.2.13), `indexmap` for the insertion-ordered mode (§2.2.10,
+§2.2.13), and
 `parking_lot` for cell locks (§2.3.1).  `perl-parser` depends on
 `bytes` (source slicing), `memchr` (SIMD-optimized scanning and
 delimiter lookup), `unicode-xid` (Unicode identifier validation),
