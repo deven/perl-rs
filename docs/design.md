@@ -3546,12 +3546,12 @@ std-façade `Drop` implementations already implement exactly this
 split; the slab backend keeps it as typed operations.)
 
 Pages are domain-dedicated (one logical domain per page until
-every slot frees), and the lease targets the `DomainCore` — which
+every slot frees), and the lease targets the `Domain` — which
 physically outlives every slot on the page, tombstoned or not —
 so a context-free drop can always reach its queue head, phase, and
 stash table.  The ownership direction is one-way: the
 process-global pool owns extents and pages, each page owns its
-`DomainLease`, and `DomainCore` holds only non-owning page
+`DomainLease`, and `Domain` holds only non-owning page
 references — a domain that strongly owned pages holding strong
 leases back on it could never physically die.  When a page's last
 slot goes physically free (allocation bitmap empty, every weak
@@ -4454,7 +4454,7 @@ not.
 > where they conflict, §2 is normative — in particular, §2.4.1's
 > arena enumeration supersedes the self-contained-`Arc` framing
 > below, and the mortal stack holds `Value`s.  Connecting
-> `SharedRuntime`/`Interpreter` to `DomainCore` and the domain
+> `SharedRuntime`/`Interpreter` to `Domain` and the domain
 > lease is unwritten design, not a substitution.
 
 ### 3.1 Shared Runtime State
