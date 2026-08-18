@@ -3248,6 +3248,8 @@ pack into `rc_state`:
 
 ```text
 bless:            under the write lock: check READONLY (croak);
+                  check that the node's page routes to the *active*
+                  domain (§2.4.5 — otherwise error, see below);
                   CAS rc_state installing HAS_FINALIZER_HOLD and
                   the hidden unit; THEN Release-store class_id.
                   Invariant: an Acquire load observing nonzero
@@ -3558,12 +3560,49 @@ phase transitions against context-free producers (§2.4.6):
 publish, wait for the active-producer count to drain to zero,
 then null and free.
 
-A producer Acquire-loads the pointer: non-null routes normally,
-and **null is the dead-domain answer** — no `Domain` is consulted
-because none is needed, since a tombstoned domain requires no
-Perl finalization and the release cleans up mechanically
-(§2.4.6).  One word carries both the route and the liveness bit,
-and no domain-referencing type outlives teardown.  The ownership
+The word has **three states [DECISION]**, which is what a pointer
+already provides: a live `Domain`; *null*, meaning the page never
+had one — the standalone-crate case, where nodes are permanently
+domainless, cleanup is mechanical, and checked handle operations
+must keep *succeeding*; and a reserved `TOMBSTONE` sentinel
+(address 1, unrepresentable as a real `Domain` since its
+alignment clears the low bits), meaning the domain was torn down
+— cleanup is mechanical and checked operations must be
+*rejected*.  Conflating the last two would make a crate user's
+live hash indistinguishable from a dead interpreter's tombstoned
+one.  A producer Acquire-loads the word and branches on the three
+cases; only the live arm dereferences, so the sentinel introduces
+no `unsafe` beyond what routing already required
+(`ptr::without_provenance_mut(1)` builds it in safe, strict-
+provenance-clean code).  No domain-referencing type outlives
+teardown.
+
+**`bless` requires the active domain [DECISION].**  Blessing
+installs a finalizer hold and therefore needs somewhere to route
+`DESTROY`, so it is an error to bless a node whose page is
+domainless or belongs to a different domain — an embedding-API
+error, not a Perl one, since pure Perl code allocates within its
+own interpreter's domain and can never reach it.  Adoption of
+floating values is deliberately *not* attempted pending a
+coherent design; the shapes considered and why each fails are
+recorded so the question can be re-entered rather than
+rediscovered.  Migration is closed by identity (a node's address
+*is* its identity; moving it breaks every outstanding handle).
+Copying is closed by Perl semantics: `bless` is strictly in place
+— container-verified that the referent's address is unchanged,
+that `bless` returns the reference it was given, and that a
+reference taken *before* the bless observes the class afterward —
+so a copy would silently split the object in two, and a container
+referent would need an unbounded deep copy besides.  A per-slot
+domain word is closed by the §2.4.3 budget (eight bytes on every
+node to serve a rare embedding case).  What remains viable is a
+**lazily allocated per-page parallel array** of domain pointers,
+exactly the `class_id` shape: the page word gains a fourth
+"heterogeneous" state, the array is installed on first adoption,
+homogeneous pages keep the fast path and pay nothing, and
+per-node entries avoid the collateral tombstoning that
+page-granularity adoption would inflict on unrelated crate-user
+values sharing the page.  The ownership
 direction stays one-way: the process-global pool owns extents and
 pages, and the domain holds only non-owning page references.
 When a page's last slot goes physically free (allocation bitmap
@@ -3970,7 +4009,10 @@ strict fidelity.
 Open items, marked here: the stash-table lookup structure and
 tombstone dispatch rules; residual false-sharing layout questions (page identification
 itself is resolved: masking and extent-derived descriptors are
-normative, §2.4.2); process-continuation semantics after the
+normative, §2.4.2); adoption of domainless or
+cross-domain values by `bless` (§2.4.5 records the shapes
+considered; the lazy per-page domain array is the surviving
+candidate); process-continuation semantics after the
 `DESTROY created new reference` croak; which pure-Perl shapes
 reach the forced sweep rather than the checked pass, and whether
 perl's finite pass sequence achieves fixed-point coverage for
