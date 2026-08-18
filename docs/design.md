@@ -1999,6 +1999,28 @@ safety net for the engine swap — the public surface (`len`,
   and in synergy with the slack probe that absorbs repeat
   growth.
 
+**Per-engine identities for `Array` [DECISION]:** `Array` takes
+the §2.2.13 shape: the public enum of per-engine shared
+identities, each arm an `HeapArc<RwLock<…>>` over its own engine,
+itself the cheap-clone handle — `ArrayRef` dissolves into it and
+the handle macro dies with its last user.  The default engine is
+`GapArray`, the front-gap header above, in its own exactly-sized
+allocation; behind the `imbl` feature, `ImmutableArray` is an
+`imbl::Vector` of the same slots — an RRB tree with O(1) clones,
+O(1) amortized operations at *both* ends (`shift` and `unshift`
+match the gap engine's headline), and O(log32) indexing as the
+recorded tradeoff that keeps it a mode.  `snapshot()` mirrors the
+hash's: an O(1) detached diverging copy on this engine,
+`SnapshotUnsupported` on the gap engine.  `Value` hoists the
+engine tag per the same ruling — `GapArrayRef`,
+`ImmutableArrayRef`, taint twins, qualifier on the referent first
+— and construction-finality, internal locking, clone-out reads,
+and the closure-shaped lvalue path all apply as ruled there.
+Hole semantics carry unchanged: the slots are `ArraySlot` under
+either engine, and the immutable engine needs no parked cursor
+(arrays have no `each` state at this layer), so its lock guards
+only the root swap and the readonly flag.
+
 #### 2.2.13 `Hash`: the engine ruling [DECISION]:
 
 **Per-engine identities [DECISION].**  `Hash` is the public enum
