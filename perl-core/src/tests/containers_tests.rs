@@ -1,6 +1,6 @@
 use super::*;
 use crate::string::DECODE_MAX;
-use crate::value::{ScalarPayload, Tainted};
+use crate::value::{Tainted, Value};
 
 /// Both engines (§2.2.13): the container-verified semantics are engine-independent, so the shared batteries run against
 /// each.
@@ -48,7 +48,7 @@ fn array_ensure_element_vivifies_undef() {
 
     // Write-through: take a ref of the vivified slot, assign, observe (the \$a[3] round trip).
     let r = Value::take_ref(a.ensure_element(3).unwrap());
-    r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::integer(5, Tainted::CLEAN)).unwrap();
+    r.deref_scalar().unwrap().write().unwrap().assign(Value::integer(5, Tainted::CLEAN)).unwrap();
     assert_eq!(a.get(3).unwrap().to_int(), 5, "$$r = 5 lands in the array");
 }
 
@@ -155,7 +155,7 @@ fn hash_entry_or_undef_vivifies() {
         assert!(h.exists(&key("k")));
 
         let r = Value::take_ref(h.entry_or_undef(key("k")).unwrap());
-        r.deref_scalar().unwrap().write().unwrap().assign(ScalarPayload::integer(7, Tainted::CLEAN)).unwrap();
+        r.deref_scalar().unwrap().write().unwrap().assign(Value::integer(7, Tainted::CLEAN)).unwrap();
         assert_eq!(h.get(&key("k")).unwrap().to_int(), 7);
     }
 }

@@ -26,7 +26,7 @@ fn transparent_layout() {
 
 // ── The release worklist (§2.4.9) ─────────────────────────────────
 use crate::containers::{ArrayRef, HashRef, PerlArray, PerlHash};
-use crate::value::{ScalarPayload, Tainted, Value};
+use crate::value::{Tainted, Value};
 
 // Depths chosen well past the measured failure points: the scalar-ref chain overflowed at 20k in debug builds and the
 // array chain at 200k in release builds before §2.4.9.
@@ -143,7 +143,7 @@ fn assignment_over_a_deep_chain_releases_iteratively() {
 
     let r = Value::take_ref(&mut slot);
     let view = r.deref_scalar().unwrap();
-    view.write().unwrap().assign(ScalarPayload::integer(1, Tainted::CLEAN)).unwrap();
+    view.write().unwrap().assign(Value::integer(1, Tainted::CLEAN)).unwrap();
     assert_eq!(slot.to_int(), 1, "the chain died; the slot lives on with the new payload");
 }
 

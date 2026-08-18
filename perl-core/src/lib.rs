@@ -1,7 +1,7 @@
 //! Perl core types: the value representation and the heap that owns it.
 //!
-//! - [`value`] — `Value`, the universal slot value, and `ScalarPayload`, the payload of a promoted scalar.  Both carry
-//!   compact scalar cases inline and hold references to shared nodes.
+//! - [`value`] — `Value`, the one datum type (§2.2.2): container slots and promoted scalars alike carry its compact
+//!   cases inline and hold references to shared nodes through it.
 //! - [`scalar`] — `ScalarCell`, a promoted scalar: the payload plus the identity-level state that survives assignment.
 //! - [`containers`] — `PerlArray` and `PerlHash`.
 //! - [`string`] — `PerlString`, an octet sequence with its per-string state: the utf8 flag as a semantic claim, the
@@ -17,7 +17,7 @@
 //! A few words recur throughout these modules with a specific meaning:
 //!
 //! - **Envelope** — the sixteen bytes a value occupies: one discriminant byte and fifteen of payload.  `Value`,
-//!   `ScalarPayload`, `ScalarCell`, and `PerlString` are all exactly this size, and assertions enforce it.
+//!   `ScalarCell`, and `PerlString` are all exactly this size, and assertions enforce it.
 //! - **Tag** — the discriminant byte.  It carries more than which variant is present: the utf8 flag, the
 //!   numification-warning bit, taint, the storage form, and (for strings) what is known about validity are all folded
 //!   into *which variant* a value is, rather than stored as fields.  That folding is why a taint bit costs nothing:

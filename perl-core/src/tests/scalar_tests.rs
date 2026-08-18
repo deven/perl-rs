@@ -2,12 +2,12 @@ use super::*;
 use crate::string::DECODE_MAX;
 use crate::value::Value;
 
-fn plain(payload: ScalarPayload) -> ScalarRef {
+fn plain(payload: Value) -> ScalarRef {
     ScalarRef::new_mut(payload)
 }
 
-fn str_payload(text: &str) -> ScalarPayload {
-    ScalarPayload::String(text.parse().unwrap())
+fn str_payload(text: &str) -> Value {
+    Value::String(text.parse().unwrap())
 }
 
 // ── The §2.3.3 singleton contract, pinned ─────────────────────
@@ -28,7 +28,7 @@ fn boolean_immortals_share_identity() {
 #[test]
 fn immortals_prematerialized_values() {
     let t = TRUE_SCALAR.read();
-    assert!(matches!(t.payload(), ScalarPayload::True));
+    assert!(matches!(t.payload(), Value::True));
     assert_eq!(t.to_int(), 1);
     assert_eq!(t.to_float(), 1.0);
     assert_eq!(t.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"1");
@@ -36,7 +36,7 @@ fn immortals_prematerialized_values() {
 
     // The dualvar: numerically 0, string "" (not "0") — verified: (1==0)."" has length 0.
     let f = FALSE_SCALAR.read();
-    assert!(matches!(f.payload(), ScalarPayload::False));
+    assert!(matches!(f.payload(), Value::False));
     assert_eq!(f.to_int(), 0);
     assert_eq!(f.to_float(), 0.0);
     assert_eq!(f.stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"");
@@ -73,14 +73,14 @@ fn is_bool_answers_from_the_variant() {
 // ── ScalarRef / guards ────────────────────────────────────────
 #[test]
 fn reference_identity_and_clone_share() {
-    let r1 = plain(ScalarPayload::integer(42, Tainted::CLEAN));
+    let r1 = plain(Value::integer(42, Tainted::CLEAN));
     let r2 = r1.clone();
     assert!(ScalarRef::ptr_eq(&r1, &r2));
-    let r3 = plain(ScalarPayload::integer(42, Tainted::CLEAN));
+    let r3 = plain(Value::integer(42, Tainted::CLEAN));
     assert!(!ScalarRef::ptr_eq(&r1, &r3), "equal payloads, distinct identities");
 
     // Writes through one handle are visible through the other: shared identity.
-    r1.write().unwrap().assign(ScalarPayload::integer(7, Tainted::CLEAN)).unwrap();
+    r1.write().unwrap().assign(Value::integer(7, Tainted::CLEAN)).unwrap();
     assert_eq!(r2.read().to_int(), 7);
 }
 
@@ -106,14 +106,14 @@ fn concurrent_const_reads_take_no_lock() {
 #[test]
 fn payload_stays_authoritative_through_coercion() {
     // The §21.1 illustrative test: 3.7 used as an integer still stringifies as "3.7".
-    let r = plain(ScalarPayload::float(3.7, Tainted::CLEAN));
+    let r = plain(Value::float(3.7, Tainted::CLEAN));
     assert_eq!(r.read().to_int(), 3);
     assert_eq!(r.read().stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"3.7");
 }
 
 #[test]
 fn full_cell_caches_and_invalidation() {
-    let r = plain(ScalarPayload::float(3.7, Tainted::CLEAN));
+    let r = plain(Value::float(3.7, Tainted::CLEAN));
     r.write().unwrap().upgrade_to_full();
 
     // Repeated coercions agree through the caches (fill under concurrent read guards).
@@ -132,7 +132,7 @@ fn full_cell_caches_and_invalidation() {
     });
 
     // Assignment is the single choke point: caches drop with the payload.
-    r.write().unwrap().assign(ScalarPayload::integer(9, Tainted::CLEAN)).unwrap();
+    r.write().unwrap().assign(Value::integer(9, Tainted::CLEAN)).unwrap();
     let g = r.read();
     assert_eq!(g.to_int(), 9);
     assert_eq!(g.to_float(), 9.0);
@@ -159,7 +159,7 @@ fn upgrade_preserves_identity_and_payload() {
 
 #[test]
 fn magic_and_bless_attach_in_place() {
-    let r = plain(ScalarPayload::integer(1, Tainted::CLEAN));
+    let r = plain(Value::integer(1, Tainted::CLEAN));
 
     {
         let mut g = r.write().unwrap();
@@ -175,20 +175,20 @@ fn magic_and_bless_attach_in_place() {
 // ── The readonly error path ───────────────────────────────────
 #[test]
 fn dynamic_readonly_is_toggleable() {
-    let r = plain(ScalarPayload::integer(5, Tainted::CLEAN));
+    let r = plain(Value::integer(5, Tainted::CLEAN));
 
     r.write().unwrap().set_readonly(true);
     assert!(r.write().unwrap().is_readonly(), "the flag is set; acquiring the guard stays legal");
-    assert_eq!(r.write().unwrap().assign(ScalarPayload::integer(6, Tainted::CLEAN)), Err(ScalarError::ReadOnly));
+    assert_eq!(r.write().unwrap().assign(Value::integer(6, Tainted::CLEAN)), Err(ScalarError::ReadOnly));
     assert_eq!(r.read().to_int(), 5, "the failed assignment changed nothing");
 
     // Internals::SvREADONLY is toggleable: clear and assign.
     r.write().unwrap().set_readonly(false);
-    r.write().unwrap().assign(ScalarPayload::integer(6, Tainted::CLEAN)).unwrap();
+    r.write().unwrap().assign(Value::integer(6, Tainted::CLEAN)).unwrap();
     assert_eq!(r.read().to_int(), 6);
 
     // Clearing readonly on a Plain cell is a no-op that must not upgrade.
-    let p = plain(ScalarPayload::integer(1, Tainted::CLEAN));
+    let p = plain(Value::integer(1, Tainted::CLEAN));
     p.write().unwrap().set_readonly(false);
     assert!(matches!(&*p.write().unwrap(), ScalarCell::Plain(_)));
 }
@@ -233,7 +233,7 @@ fn numify_warning_display_is_perl_exact() {
     // Every expectation below is the container's own perl 5.44 output, byte for byte, minus the op clause and location
     // the interpreter suffixes.
     let body = |content: &[u8]| {
-        let mut cell = ScalarCell::Plain(ScalarPayload::String(PerlString::from_bytes(content).unwrap()));
+        let mut cell = ScalarCell::Plain(Value::String(PerlString::from_bytes(content).unwrap()));
         let (_, emit) = cell.numify_noting_warning().unwrap();
         format!("{}", emit.expect("warn-worthy content"))
     };
@@ -259,7 +259,7 @@ fn numify_warning_display_is_perl_exact() {
     let flagged_body = |content: &str| {
         let mut s = PerlString::new(content).unwrap();
         s.set_utf8_for_test();
-        let mut cell = ScalarCell::Plain(ScalarPayload::String(s));
+        let mut cell = ScalarCell::Plain(Value::String(s));
         let (_, emit) = cell.numify_noting_warning().unwrap();
         format!("{}", emit.expect("warn-worthy content"))
     };
@@ -293,7 +293,7 @@ fn const_cell_warning_state() {
     assert!(warns.note_numify_warning().is_none(), "second is silent");
 
     // Statically-unwarnable payloads carry nothing (§2.3.4).
-    let silent = ConstScalar::materialize(ScalarPayload::integer(5, Tainted::CLEAN)).unwrap();
+    let silent = ConstScalar::materialize(Value::integer(5, Tainted::CLEAN)).unwrap();
     assert!(silent.numify_warned.is_none());
     assert!(silent.note_numify_warning().is_none());
 
@@ -384,7 +384,7 @@ fn the_cached_numeric_face_is_what_suppresses_the_repeat_warning() {
 
     // The face is what changed, not a flag: the payload is now a Dual whose string side is untouched.
     match &cell {
-        ScalarCell::Plain(ScalarPayload::Dual(d)) => {
+        ScalarCell::Plain(Value::Dual(d)) => {
             assert_eq!(d.string.as_bytes(&mut [0u8; DECODE_MAX]), b"12abc", "the string face survives verbatim");
             assert_eq!(d.numeric, Numeric::Integer(12));
         }
@@ -412,17 +412,17 @@ fn cleanly_numeric_content_never_caches_a_face() {
         assert_eq!(n, Numeric::Integer(42));
         assert!(emit.is_none(), "clean content never warns");
     }
-    assert!(matches!(cell, ScalarCell::Plain(ScalarPayload::String(_))), "and stays a plain string");
+    assert!(matches!(cell, ScalarCell::Plain(Value::String(_))), "and stays a plain string");
 }
 
 #[test]
 fn taint_survives_the_face_installation() {
     let mut tainted: PerlString = "12abc".parse().unwrap();
     tainted.taint();
-    let mut cell = ScalarCell::Plain(ScalarPayload::String(tainted));
+    let mut cell = ScalarCell::Plain(Value::String(tainted));
 
     let (_, emit) = cell.numify_noting_warning().unwrap();
     assert!(emit.is_some());
-    assert!(matches!(cell, ScalarCell::Plain(ScalarPayload::DualTainted(_))), "the tainted twin is chosen");
+    assert!(matches!(cell, ScalarCell::Plain(Value::DualTainted(_))), "the tainted twin is chosen");
     assert!(cell.is_tainted(), "and taint reads through the Dual");
 }

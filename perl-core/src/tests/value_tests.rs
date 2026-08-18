@@ -248,7 +248,7 @@ fn aliasing_transparency_and_write_through() {
 
     // Writes through the dereferenced identity are visible through the slot.
     let view = r.deref_scalar().unwrap();
-    view.write().unwrap().assign(ScalarPayload::integer(9, Tainted::CLEAN)).unwrap();
+    view.write().unwrap().assign(Value::integer(9, Tainted::CLEAN)).unwrap();
     assert_eq!(slot.to_int(), 9, "$$r = 9 observed via $x");
 }
 
@@ -266,7 +266,7 @@ fn boolean_slots_promote_to_their_own_cells() {
 
     // The promoted boolean keeps is_bool through the variant payload.
     let view = rx.deref_scalar().unwrap();
-    assert!(matches!(view.read().payload(), ScalarPayload::True));
+    assert!(matches!(view.read().payload(), Value::True));
 }
 
 #[test]
@@ -297,12 +297,11 @@ fn ref_of_ref_chains() {
     // $$$rr reaches the base cell: two derefs, then the payload.
     let mid = r2.deref_scalar().unwrap();
     let inner = mid.read().payload().clone();
-    let inner = Value::from_payload(inner);
     let base_view = inner.deref_scalar().unwrap();
     assert_eq!(base_view.read().stringify().unwrap().as_bytes(&mut [0u8; DECODE_MAX]), b"x");
 
     // And writing through the chain is visible via the original slot.
-    base_view.write().unwrap().assign(ScalarPayload::integer(7, Tainted::CLEAN)).unwrap();
+    base_view.write().unwrap().assign(Value::integer(7, Tainted::CLEAN)).unwrap();
     assert_eq!(base.to_int(), 7);
 }
 
@@ -320,7 +319,7 @@ fn reference_taint_belongs_to_the_referent() {
 
 #[test]
 fn const_slots_alias_frozen_cells() {
-    let cs = crate::scalar::ConstScalar::materialize(ScalarPayload::float(3.7, Tainted::CLEAN)).unwrap();
+    let cs = crate::scalar::ConstScalar::materialize(Value::float(3.7, Tainted::CLEAN)).unwrap();
     let mut slot = Value::ScalarConst(HeapArc::new(cs));
 
     assert_eq!(slot.to_int(), 3);
@@ -335,7 +334,7 @@ fn const_slots_alias_frozen_cells() {
 // ── Layout (§2.3.6) ───────────────────────────────────────────
 #[test]
 fn envelope_sizes() {
-    assert_eq!(size_of::<ScalarPayload>(), 16);
+    assert_eq!(size_of::<Value>(), 16);
     assert_eq!(size_of::<Value>(), 16);
     assert_eq!(size_of::<Option<Value>>(), 16);
     assert_eq!(size_of::<ArraySlot>(), 16);
@@ -533,8 +532,8 @@ fn unsigned_constructors_canonicalize_to_integer() {
     assert!(matches!(Value::unsigned(u64::MAX, Tainted::TAINTED), Value::UnsignedTainted(_)));
 
     // And the payload-level constructor agrees with the value-level one.
-    assert!(matches!(ScalarPayload::unsigned(42, Tainted::CLEAN), ScalarPayload::Integer(_)));
-    assert!(matches!(ScalarPayload::unsigned(u64::MAX, Tainted::CLEAN), ScalarPayload::Unsigned(_)));
+    assert!(matches!(Value::unsigned(42, Tainted::CLEAN), Value::Integer(_)));
+    assert!(matches!(Value::unsigned(u64::MAX, Tainted::CLEAN), Value::Unsigned(_)));
 }
 
 #[test]

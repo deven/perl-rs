@@ -106,7 +106,7 @@ impl<T> Clone for HeapWeak<T> {
 // ── The release worklist (§2.4.9) ─────────────────────────────────
 use parking_lot::Mutex;
 
-use crate::value::{ScalarPayload, Value};
+use crate::value::Value;
 
 struct ReleaseState {
     /// True while this thread's drain loop is running: nested releases append and return.
@@ -159,8 +159,8 @@ pub(crate) fn release_value(value: Value) {
 }
 
 /// Release a payload extracted from a dying cell: the payload→slot-value mapping, then the worklist.
-pub(crate) fn release_payload(payload: ScalarPayload) {
-    release_value(Value::from_payload(payload));
+pub(crate) fn release_payload(payload: Value) {
+    release_value(payload);
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 
 use crate::cow_buffer::AllocError;
 use crate::string::{DECODE_MAX, PerlString};
-use crate::value::{DualPayload, Numeric, ScalarPayload, Tainted};
+use crate::value::{DualPayload, Numeric, Tainted, Value};
 use crate::warnings::{PerlWarning, WarningCategory};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt;
@@ -69,7 +69,7 @@ impl fmt::Display for ScalarError {
 /// `Acquire` validity load.  The string slot is `OnceLock<PerlString>` (a `PerlString` cannot be an atomic): the value
 /// sits inline in the slot, and invalidation is `take()` through the write guard's `&mut`.
 pub struct FullScalar {
-    payload: ScalarPayload,
+    payload: Value,
 
     // Derived caches (lazy; §2.2.2: derived state, never consulted for anything the payload answers).
     cached_int: AtomicI64,
@@ -88,7 +88,7 @@ pub struct FullScalar {
 }
 
 impl FullScalar {
-    fn new(payload: ScalarPayload) -> Box<FullScalar> {
+    fn new(payload: Value) -> Box<FullScalar> {
         Box::new(FullScalar {
             payload,
             cached_int: AtomicI64::new(0),
@@ -114,7 +114,7 @@ impl FullScalar {
 /// keeping the cell at 24 bytes (§2.3.6).  Upgrade happens in place under the write lock: the `Arc` address never
 /// changes, preserving every outstanding reference — perl's `sv_upgrade` identity guarantee with a different mechanism.
 pub enum ScalarCell {
-    Plain(ScalarPayload),
+    Plain(Value),
     Full(Box<FullScalar>),
 }
 
@@ -123,10 +123,10 @@ impl Drop for ScalarCell {
     /// recurse through a chain of referents.
     fn drop(&mut self) {
         let payload = match self {
-            ScalarCell::Plain(p) => mem::replace(p, ScalarPayload::undef(Tainted::CLEAN)),
-            ScalarCell::Full(f) => mem::replace(&mut f.payload, ScalarPayload::undef(Tainted::CLEAN)),
+            ScalarCell::Plain(p) => mem::replace(p, Value::undef(Tainted::CLEAN)),
+            ScalarCell::Full(f) => mem::replace(&mut f.payload, Value::undef(Tainted::CLEAN)),
         };
-        if crate::value::Value::payload_carries_strong_edge(&payload) {
+        if payload.carries_strong_edge() {
             release_payload(payload);
         }
     }
@@ -143,7 +143,7 @@ impl fmt::Debug for ScalarCell {
 
 impl ScalarCell {
     /// The authoritative payload (§2.2.2).
-    pub fn payload(&self) -> &ScalarPayload {
+    pub fn payload(&self) -> &Value {
         match self {
             ScalarCell::Plain(p) => p,
             ScalarCell::Full(f) => &f.payload,
@@ -223,7 +223,7 @@ impl ScalarCell {
 
     /// Replace the payload — the single choke point (§2.2.2): derived state drops here.  Fails structurally on the
     /// dynamic readonly flag.
-    pub fn assign(&mut self, payload: ScalarPayload) -> Result<(), ScalarError> {
+    pub fn assign(&mut self, payload: Value) -> Result<(), ScalarError> {
         match self {
             ScalarCell::Plain(p) => {
                 *p = payload;
@@ -246,7 +246,7 @@ impl ScalarCell {
     /// identity — never changes.
     pub fn upgrade_to_full(&mut self) -> &mut FullScalar {
         if let ScalarCell::Plain(p) = self {
-            let payload = mem::replace(p, ScalarPayload::undef(Tainted::CLEAN));
+            let payload = mem::replace(p, Value::undef(Tainted::CLEAN));
             *self = ScalarCell::Full(FullScalar::new(payload));
         }
 
@@ -298,21 +298,21 @@ impl ScalarCell {
         // Only a bare string can warn: a `Dual` already holds the face, and every other payload is numeric already.
         // For the string the value and the verdict come from the one walk (§2.3.4).
         let (n, warns) = match &*payload {
-            ScalarPayload::String(s) => s.numify_noting_warning(),
+            Value::String(s) => s.numify_noting_warning(),
             other => (other.numify(), false),
         };
         if !warns {
             return Ok((n, None));
         }
 
-        let taken = mem::replace(payload, ScalarPayload::Undef);
+        let taken = mem::replace(payload, Value::Undef);
         let (snippet, truncated) = match taken {
-            ScalarPayload::String(s) => {
+            Value::String(s) => {
                 let tainted = s.is_tainted();
                 let bound = if s.is_utf8() { WARN_SNIPPET_CHARS } else { WARN_SNIPPET_BYTES };
                 let snippet = s.message_prefix(bound)?;
                 let dual = HeapArc::new(DualPayload { string: s, numeric: n });
-                *payload = if tainted { ScalarPayload::DualTainted(dual) } else { ScalarPayload::Dual(dual) };
+                *payload = if tainted { Value::DualTainted(dual) } else { Value::Dual(dual) };
                 snippet
             }
             other => {
@@ -335,7 +335,7 @@ const _: () = assert!(size_of::<ScalarCell>() == 16);
 /// `Sync`.  The single mutable exception is the numification-warning once-bit, present only when the payload can warn
 /// (`None` makes "cannot warn" structural — eager knowledge, lazy surfacing, §2.3.4).
 pub struct ConstScalar {
-    payload: ScalarPayload,
+    payload: Value,
     int: i64,
     float: f64,
     string: PerlString,
@@ -345,8 +345,8 @@ pub struct ConstScalar {
 impl Drop for ConstScalar {
     /// Iterative teardown (§2.4.9): frozen payloads can carry graph edges too (§2.4.10).
     fn drop(&mut self) {
-        let payload = mem::replace(&mut self.payload, ScalarPayload::undef(Tainted::CLEAN));
-        if crate::value::Value::payload_carries_strong_edge(&payload) {
+        let payload = mem::replace(&mut self.payload, Value::undef(Tainted::CLEAN));
+        if payload.carries_strong_edge() {
             release_payload(payload);
         }
     }
@@ -360,7 +360,7 @@ impl fmt::Debug for ConstScalar {
 
 impl ConstScalar {
     /// Materialize a payload into a frozen cell (at most two short strings and two numbers, §2.3.3).
-    pub fn materialize(payload: ScalarPayload) -> Result<ConstScalar, AllocError> {
+    pub fn materialize(payload: Value) -> Result<ConstScalar, AllocError> {
         let int = payload.to_int();
         let float = payload.to_float();
         let string = payload.stringify()?;
@@ -368,7 +368,7 @@ impl ConstScalar {
         // The snippet is precomputed here, where materialization is already fallible, so the once-bit's gate stays
         // free of allocation at note time.
         let numify_warned = match &payload {
-            ScalarPayload::String(s) if s.numify_noting_warning().1 => {
+            Value::String(s) if s.numify_noting_warning().1 => {
                 let bound = if s.is_utf8() { WARN_SNIPPET_CHARS } else { WARN_SNIPPET_BYTES };
                 let (snippet, truncated) = s.message_prefix(bound)?;
                 Some((AtomicBool::new(false), snippet, truncated))
@@ -379,7 +379,7 @@ impl ConstScalar {
         Ok(ConstScalar { payload, int, float, string, numify_warned })
     }
 
-    pub fn payload(&self) -> &ScalarPayload {
+    pub fn payload(&self) -> &Value {
         &self.payload
     }
 
@@ -715,7 +715,7 @@ impl fmt::Debug for ScalarRef {
 }
 
 impl ScalarRef {
-    pub fn new_mut(payload: ScalarPayload) -> ScalarRef {
+    pub fn new_mut(payload: Value) -> ScalarRef {
         ScalarRef::Mut(HeapArc::new(RwLock::new(ScalarCell::Plain(payload))))
     }
 
@@ -768,7 +768,7 @@ pub enum ScalarReadGuard<'a> {
 }
 
 impl ScalarReadGuard<'_> {
-    pub fn payload(&self) -> &ScalarPayload {
+    pub fn payload(&self) -> &Value {
         match self {
             ScalarReadGuard::Mut(g) => g.payload(),
             ScalarReadGuard::Const(c) => c.payload(),
@@ -833,7 +833,7 @@ impl DerefMut for ScalarWriteGuard<'_> {
 /// Fallback-free materialization for the immortals: the payloads' renderings are tiny ASCII, so the inline path cannot
 /// allocate; the unreachable error arm degrades to an unmaterialized-string cell rather than panicking (no-panic
 /// policy).
-fn immortal(payload: ScalarPayload) -> ScalarRef {
+fn immortal(payload: Value) -> ScalarRef {
     let cell = ConstScalar::materialize(payload.clone()).unwrap_or_else(|_| ConstScalar {
         payload,
         int: 0,
@@ -845,11 +845,11 @@ fn immortal(payload: ScalarPayload) -> ScalarRef {
     ScalarRef::Const(HeapArc::new(cell))
 }
 
-/// The true immortal: `ScalarPayload::True`, materialized as 1 / 1.0 / `"1"` (§2.3.3, as amended).
-pub static TRUE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(ScalarPayload::True));
+/// The true immortal: `Value::True`, materialized as 1 / 1.0 / `"1"` (§2.3.3, as amended).
+pub static TRUE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(Value::True));
 
-/// The false immortal: `ScalarPayload::False`, the dualvar — numerically 0, string `""` (§2.3.3).
-pub static FALSE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(ScalarPayload::False));
+/// The false immortal: `Value::False`, the dualvar — numerically 0, string `""` (§2.3.3).
+pub static FALSE_SCALAR: LazyLock<ScalarRef> = LazyLock::new(|| immortal(Value::False));
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
