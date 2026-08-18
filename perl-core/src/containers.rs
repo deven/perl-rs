@@ -1,5 +1,5 @@
-//! `Array` and `Hash` — the containers (§2.2.1) — with their Arc-backed shared identities `ArrayRef` and `HashRef`.
-//! The module name is temporary in the same sense as `payload.rs`.
+//! `Array` and `Hash` — the containers (§2.2.1) — `Array` behind its Arc-backed `ArrayRef`, `Hash` as its own enum of
+//! per-engine shared identities (§2.2.13).
 //!
 //! Container-verified semantics encoded here:
 //!
@@ -19,7 +19,6 @@
 
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
-use indexmap::IndexMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::alloc::Layout;
 use std::collections::hash_map::RandomState;
@@ -27,15 +26,18 @@ use std::fmt;
 use std::hash::BuildHasher;
 use std::ptr::NonNull;
 
-#[cfg(feature = "imbl")]
-use imbl;
-
 use crate::alloc_backend;
 use crate::cow_buffer::AllocError;
 use crate::heap::{HeapArc, release_value};
 use crate::scalar::ScalarError;
 use crate::string::PString;
 use crate::value::{ArraySlot, Value};
+
+#[cfg(feature = "imbl")]
+use imbl;
+
+#[cfg(feature = "indexmap")]
+use indexmap::IndexMap;
 
 // ── Array (§2.2.1, §2.2.12) ───────────────────────────────────
 /// The front-gap slot engine (§2.2.12), shaped on perl's AV: an allocation whose live window floats behind a gap, so
@@ -532,33 +534,54 @@ impl Array {
 }
 
 // ── Hash (§2.2.1, §2.2.13) ────────────────────────────────────
-/// The dual-engine hash (§2.2.13): a bucket engine on `hashbrown::HashTable` by default, and the insertion-ordered
-/// `IndexMap` engine on explicit request, fixed at construction.  Keys are laundered at storage (§2.6.2); the stored
-/// key is kept on re-store (equal keys: the first-stored spelling wins) under either engine.
-pub struct Hash {
-    engine: HashEngine,
+/// The per-engine hash (§2.2.13): `Hash` is the public enum of per-engine shared identities — each arm an
+/// `HeapArc<RwLock<…>>` over its own exactly-sized engine — and is itself the cheap-clone handle.  The engine is fixed
+/// at construction (construction-final, §2.2.13: no in-place morph, matching perl, enforced by the representation).
+/// Keys are laundered at storage (§2.6.2); the stored key is kept on re-store (equal keys: the first-stored spelling
+/// wins) under every engine.  Locks are internal: reads clone out, lvalue access is closure-shaped.
+#[derive(Clone)]
+pub enum Hash {
+    /// The default: SwissTable buckets, per-hash SipHash keys, and the `each` cursor as a bucket index.
+    Bucket(HeapArc<RwLock<BucketHash>>),
+
+    /// The explicitly requested insertion-ordered mode (§2.2.10): the `each` cursor is an entry index.
+    #[cfg(feature = "indexmap")]
+    Ordered(HeapArc<RwLock<OrderedHash>>),
+
+    /// The explicitly requested immutable mode (§2.2.13): a persistent HAMT with O(1) [`Hash::snapshot`].
+    #[cfg(feature = "imbl")]
+    Immutable(HeapArc<RwLock<ImmutableHash>>),
+}
+
+/// The default bucket engine (§2.2.13).
+pub struct BucketHash {
+    table: HashTable<(PString, Value)>,
+    hasher: RandomState,
+    cursor: usize,
     readonly: bool,
 }
 
-/// The engine, chosen at construction and never morphed (§2.2.13).
-enum HashEngine {
-    /// The default: SwissTable buckets, per-hash SipHash keys, and the `each` cursor as a bucket index.
-    Buckets { table: HashTable<(PString, Value)>, hasher: RandomState, cursor: usize },
+/// The insertion-ordered engine (§2.2.10, §2.2.13).
+#[cfg(feature = "indexmap")]
+pub struct OrderedHash {
+    map: IndexMap<PString, Value>,
+    cursor: usize,
+    readonly: bool,
+}
 
-    /// The explicitly requested insertion-ordered mode (§2.2.10): the `each` cursor is an entry index.
-    Ordered { map: IndexMap<PString, Value>, cursor: usize },
-
-    /// The feature-gated immutable mode (§2.2.13): a persistent HAMT; the `each` cursor is an owning iterator over an
-    /// O(1) snapshot, yielding with live revalidation.
-    #[cfg(feature = "imbl")]
-    Immutable { map: ImblMap, iter: Option<Box<ImblIter>> },
+/// The immutable engine (§2.2.13): the `each` cursor is an owning iterator over an O(1) snapshot, yielding with live
+/// revalidation, boxed so an idle hash does not carry the cursor's hundred-byte chunk stack.
+#[cfg(feature = "imbl")]
+pub struct ImmutableHash {
+    map: ImblMap,
+    iter: Option<Box<ImblIter>>,
+    readonly: bool,
 }
 
 #[cfg(feature = "imbl")]
 type ImblMap = imbl::HashMap<PString, Value>;
-
 #[cfg(feature = "imbl")]
-type ImblIter = <ImblMap as IntoIterator>::IntoIter;
+pub(crate) type ImblIter = <ImblMap as IntoIterator>::IntoIter;
 
 /// Retire a parked snapshot iterator (§2.2.13): its remaining values route through the release worklist — a co-owner's
 /// release nets zero on shared values; the final owner's moves them out.
@@ -571,73 +594,76 @@ fn retire_iter(iter: &mut Option<Box<ImblIter>>) {
     }
 }
 
+fn launder(mut key: PString) -> PString {
+    if key.is_tainted() {
+        key.untaint_for_sanctioned_path();
+    }
+    key
+}
+
+fn check_writable(readonly: bool) -> Result<(), ScalarError> {
+    if readonly { Err(ScalarError::ReadOnly) } else { Ok(()) }
+}
+
 impl Default for Hash {
     fn default() -> Hash {
         Hash::new()
     }
 }
 
-impl Drop for Hash {
-    /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
-    fn drop(&mut self) {
-        match &mut self.engine {
-            HashEngine::Buckets { table, .. } => {
-                for (_key, v) in table.drain() {
-                    release_value(v);
-                }
-            }
-            HashEngine::Ordered { map, .. } => {
-                for (_key, v) in map.drain(..) {
-                    release_value(v);
-                }
-            }
-
-            #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, iter } => {
-                retire_iter(iter);
-                for (_key, v) in std::mem::take(map) {
-                    release_value(v);
-                }
-            }
-        }
-    }
-}
-
 impl Hash {
     /// The default engine (§2.2.13): buckets, per-hash random iteration order.
     pub fn new() -> Hash {
-        Hash { engine: HashEngine::Buckets { table: HashTable::new(), hasher: RandomState::new(), cursor: 0 }, readonly: false }
+        Hash::Bucket(HeapArc::new(RwLock::new(BucketHash { table: HashTable::new(), hasher: RandomState::new(), cursor: 0, readonly: false })))
     }
 
     /// The insertion-ordered mode (§2.2.13), on explicit request only; the perl-visible request surface is the runtime
     /// design's.
+    #[cfg(feature = "indexmap")]
     pub fn insertion_ordered() -> Hash {
-        Hash { engine: HashEngine::Ordered { map: IndexMap::new(), cursor: 0 }, readonly: false }
+        Hash::Ordered(HeapArc::new(RwLock::new(OrderedHash { map: IndexMap::new(), cursor: 0, readonly: false })))
     }
 
     /// The immutable mode (§2.2.13), on explicit request only: a persistent HAMT with O(1) [`Hash::snapshot`].
     #[cfg(feature = "imbl")]
     pub fn immutable() -> Hash {
-        Hash { engine: HashEngine::Immutable { map: ImblMap::new(), iter: None }, readonly: false }
+        Hash::Immutable(HeapArc::new(RwLock::new(ImmutableHash { map: ImblMap::new(), iter: None, readonly: false })))
     }
 
-    /// An O(1) detached, diverging copy of an immutable-engine hash (§2.2.13), with a fresh cursor and the readonly
-    /// flag cleared; the other engines answer [`ScalarError::SnapshotUnsupported`], their copies being O(n).
-    pub fn snapshot(&self) -> Result<Hash, ScalarError> {
-        match &self.engine {
+    /// Identity comparison: the same shared allocation (engines never compare equal across kinds).
+    pub fn ptr_eq(a: &Hash, b: &Hash) -> bool {
+        match (a, b) {
+            (Hash::Bucket(x), Hash::Bucket(y)) => HeapArc::ptr_eq(x, y),
+            #[cfg(feature = "indexmap")]
+            (Hash::Ordered(x), Hash::Ordered(y)) => HeapArc::ptr_eq(x, y),
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => Ok(Hash { engine: HashEngine::Immutable { map: map.clone(), iter: None }, readonly: false }),
-            _ => Err(ScalarError::SnapshotUnsupported),
+            (Hash::Immutable(x), Hash::Immutable(y)) => HeapArc::ptr_eq(x, y),
+            #[cfg_attr(
+                not(any(feature = "indexmap", feature = "imbl")),
+                expect(unreachable_patterns, reason = "with one engine the bucket arm is the whole match")
+            )]
+            _ => false,
+        }
+    }
+
+    /// The address perl exposes when the reference is numified or stringified.
+    pub fn addr(&self) -> usize {
+        match self {
+            Hash::Bucket(a) => HeapArc::as_ptr(a) as usize,
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(a) => HeapArc::as_ptr(a) as usize,
+            #[cfg(feature = "imbl")]
+            Hash::Immutable(a) => HeapArc::as_ptr(a) as usize,
         }
     }
 
     pub fn len(&self) -> usize {
-        match &self.engine {
-            HashEngine::Buckets { table, .. } => table.len(),
-            HashEngine::Ordered { map, .. } => map.len(),
-
+        match self {
+            Hash::Bucket(a) => a.read().table.len(),
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(a) => a.read().map.len(),
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => map.len(),
+            Hash::Immutable(a) => a.read().map.len(),
         }
     }
 
@@ -645,229 +671,273 @@ impl Hash {
         self.len() == 0
     }
 
-    fn check_writable(&self) -> Result<(), ScalarError> {
-        if self.readonly { Err(ScalarError::ReadOnly) } else { Ok(()) }
-    }
-
-    fn launder(mut key: PString) -> PString {
-        if key.is_tainted() {
-            key.untaint_for_sanctioned_path();
-        }
-        key
-    }
-
     /// `$h{$k} = $v`, laundering the key (§2.6.2: hash-key canonicalization is a sanctioned untaint path —
     /// container-verified: a tainted key stores clean).
     ///
     /// The cursor discipline (§2.2.13): an existing key updates in place and leaves the cursor alone — value updates
-    /// during iteration are contract-specified safe — while a new key resets it, answering any rehash with a restart.
-    pub fn store(&mut self, key: PString, value: Value) -> Result<(), ScalarError> {
-        self.check_writable()?;
-        let key = Hash::launder(key);
-        match &mut self.engine {
-            HashEngine::Buckets { table, hasher, cursor } => {
-                let hash = hasher.hash_one(&key);
-                if let Some(pair) = table.find_mut(hash, |(stored, _)| stored == &key) {
+    /// during iteration are contract-specified safe — while a new key resets the bucket cursor, answering any rehash
+    /// with a restart (the snapshot walk is rehash-immune and needs no reset).
+    pub fn store(&self, key: PString, value: Value) -> Result<(), ScalarError> {
+        let key = launder(key);
+        match self {
+            Hash::Bucket(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                let hash = e.hasher.hash_one(&key);
+                let e = &mut *e;
+                if let Some(pair) = e.table.find_mut(hash, |(stored, _)| stored == &key) {
                     pair.1 = value;
                 } else {
-                    *cursor = 0;
-                    table.insert_unique(hash, (key, value), |(stored, _)| hasher.hash_one(stored));
+                    e.cursor = 0;
+                    e.table.insert_unique(hash, (key, value), |(stored, _)| e.hasher.hash_one(stored));
                 }
             }
-            HashEngine::Ordered { map, .. } => {
-                map.insert(key, value);
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                e.map.insert(key, value);
             }
-
-            // No reset in any case (§2.2.13): the snapshot walk is rehash-immune, and the stored key spelling of an
-            // existing entry is preserved by the update-in-place branch.
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => {
-                if let Some(slot) = map.get_mut(&key) {
+            Hash::Immutable(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                if let Some(slot) = e.map.get_mut(&key) {
                     *slot = value;
                 } else {
-                    map.insert(key, value);
+                    e.map.insert(key, value);
                 }
             }
         }
         Ok(())
     }
 
-    /// Read access: never creates.
-    pub fn get(&self, key: &PString) -> Option<&Value> {
-        match &self.engine {
-            HashEngine::Buckets { table, hasher, .. } => table.find(hasher.hash_one(key), |(stored, _)| stored == key).map(|(_, value)| value),
-            HashEngine::Ordered { map, .. } => map.get(key),
-
+    /// Read access: never creates.  Clones out (§2.2.13: no borrow escapes the internal lock) — a refcount bump for
+    /// shared values.
+    pub fn get(&self, key: &PString) -> Option<Value> {
+        match self {
+            Hash::Bucket(arc) => {
+                let e = arc.read();
+                e.table.find(e.hasher.hash_one(key), |(stored, _)| stored == key).map(|(_, value)| value.clone())
+            }
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => arc.read().map.get(key).cloned(),
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => map.get(key),
+            Hash::Immutable(arc) => arc.read().map.get(key).cloned(),
         }
     }
 
     /// `exists $h{$k}`: absence of the entry is nonexistence (§2.2.1 — no slot wrapper).
     pub fn exists(&self, key: &PString) -> bool {
-        self.get(key).is_some()
+        match self {
+            Hash::Bucket(arc) => {
+                let e = arc.read();
+                e.table.find(e.hasher.hash_one(key), |(stored, _)| stored == key).is_some()
+            }
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => arc.read().map.contains_key(key),
+            #[cfg(feature = "imbl")]
+            Hash::Immutable(arc) => arc.read().map.contains_key(key),
+        }
     }
 
-    /// Lvalue access: vivify the undef entry (container-verified: `\$h{k}` creates an existing undef entry).  The
-    /// `get`/`ensure` split is the autovivification-option mechanism (§2.2.1).  Vivification of an absent key is a
-    /// new-key insertion and resets the cursor (§2.2.13); an existing key leaves it alone.
-    pub fn entry_or_undef(&mut self, key: PString) -> Result<&mut Value, ScalarError> {
-        self.check_writable()?;
-        let key = Hash::launder(key);
-        match &mut self.engine {
-            HashEngine::Buckets { table, hasher, cursor } => {
-                let hash = hasher.hash_one(&key);
-                let entry = match table.entry(hash, |(stored, _)| stored == &key, |(stored, _)| hasher.hash_one(stored)) {
+    /// Lvalue access, closure-shaped (§2.2.13: the guard cannot escape): vivify the undef entry and run `f` on the
+    /// slot's value (container-verified: `\$h{k}` creates an existing undef entry).  Vivification of an absent key is a
+    /// new-key insertion and resets the bucket cursor; an existing key leaves it alone.
+    pub fn entry_or_undef<R>(&self, key: PString, f: impl FnOnce(&mut Value) -> R) -> Result<R, ScalarError> {
+        let key = launder(key);
+        match self {
+            Hash::Bucket(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                let hash = e.hasher.hash_one(&key);
+                let e = &mut *e;
+                let entry = match e.table.entry(hash, |(stored, _)| stored == &key, |(stored, _)| e.hasher.hash_one(stored)) {
                     Entry::Occupied(occupied) => occupied,
                     Entry::Vacant(vacant) => {
-                        *cursor = 0;
+                        e.cursor = 0;
                         vacant.insert((key, Value::default()))
                     }
                 };
-                Ok(&mut entry.into_mut().1)
+                Ok(f(&mut entry.into_mut().1))
             }
-            HashEngine::Ordered { map, .. } => Ok(map.entry(key).or_default()),
-
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                Ok(f(e.map.entry(key).or_default()))
+            }
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => Ok(map.entry(key).or_insert_with(Value::default)),
+            Hash::Immutable(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                Ok(f(e.map.entry(key).or_insert_with(Value::default)))
+            }
         }
     }
 
     /// `delete $h{$k}`, returning the value (undef for absent keys).  The cursor is never touched (§2.2.13): erasure
     /// moves nothing, so every deletion is exact — delete-current is behind the cursor already, and a deleted unvisited
     /// entry is a slot the walk will skip.  (Ordered engine: `swap_remove` keeps delete O(1); the cursor adjustment
-    /// makes delete-current exact, module header.)
-    pub fn delete(&mut self, key: &PString) -> Result<Value, ScalarError> {
-        self.check_writable()?;
-        match &mut self.engine {
-            HashEngine::Buckets { table, hasher, .. } => match table.find_entry(hasher.hash_one(key), |(stored, _)| stored == key) {
-                Ok(occupied) => {
-                    let ((_key, value), _) = occupied.remove();
-                    Ok(value)
+    /// makes delete-current exact.  Immutable engine: the parked walk revalidates live.)
+    pub fn delete(&self, key: &PString) -> Result<Value, ScalarError> {
+        match self {
+            Hash::Bucket(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                let hash = e.hasher.hash_one(key);
+                match e.table.find_entry(hash, |(stored, _)| stored == key) {
+                    Ok(occupied) => {
+                        let ((_key, value), _) = occupied.remove();
+                        Ok(value)
+                    }
+                    Err(_) => Ok(Value::default()),
                 }
-                Err(_) => Ok(Value::default()),
-            },
-            HashEngine::Ordered { map, cursor } => {
-                let Some(index) = map.get_index_of(key) else {
+            }
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                let Some(index) = e.map.get_index_of(key) else {
                     return Ok(Value::default());
                 };
-                let (_, value) = map.swap_remove_index(index).unwrap_or_else(|| (PString::empty(), Value::default()));
-                if index < *cursor {
-                    *cursor -= 1;
+                let (_, value) = e.map.swap_remove_index(index).unwrap_or_else(|| (PString::empty(), Value::default()));
+                if index < e.cursor {
+                    e.cursor -= 1;
                 }
                 Ok(value)
             }
-
-            // The parked walk revalidates live, so the sharing-safe removal needs no cursor bookkeeping either.
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => Ok(map.remove(key).unwrap_or_default()),
+            Hash::Immutable(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                Ok(e.map.remove(key).unwrap_or_default())
+            }
         }
     }
 
-    /// `each %h`: yield the next pair, or `None` once at exhaustion (then restart — container-verified).  The bucket
-    /// engine walks `get_bucket` from the cursor to the next occupied slot (§2.2.13).
-    pub fn each(&mut self) -> Option<(PString, Value)> {
-        match &mut self.engine {
-            HashEngine::Buckets { table, cursor, .. } => {
-                let end = table.num_buckets();
-                while *cursor < end {
-                    let bucket = *cursor;
-                    *cursor += 1;
-                    if let Some((key, value)) = table.get_bucket(bucket) {
+    /// `each %h`: yield the next pair, or `None` once at exhaustion (then restart — container-verified).
+    pub fn each(&self) -> Option<(PString, Value)> {
+        match self {
+            Hash::Bucket(arc) => {
+                let mut e = arc.write();
+                let e = &mut *e;
+                let end = e.table.num_buckets();
+                while e.cursor < end {
+                    let bucket = e.cursor;
+                    e.cursor += 1;
+                    if let Some((key, value)) = e.table.get_bucket(bucket) {
                         return Some((key.clone(), value.clone()));
                     }
                 }
-                *cursor = 0;
+                e.cursor = 0;
                 None
             }
-            HashEngine::Ordered { map, cursor } => match map.get_index(*cursor) {
-                Some((k, v)) => {
-                    *cursor += 1;
-                    Some((k.clone(), v.clone()))
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                let mut e = arc.write();
+                match e.map.get_index(e.cursor) {
+                    Some((k, v)) => {
+                        let pair = (k.clone(), v.clone());
+                        e.cursor += 1;
+                        Some(pair)
+                    }
+                    None => {
+                        e.cursor = 0;
+                        None
+                    }
                 }
-                None => {
-                    *cursor = 0;
-                    None
-                }
-            },
-
-            // §2.2.13: walk an O(1) snapshot through an owning iterator, revalidating live — deleted keys are skipped,
-            // values are read live (specified-visible updates), inserted keys wait for the restart.
+            }
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, iter } => {
-                let walk = iter.get_or_insert_with(|| Box::new(map.clone().into_iter()));
+            Hash::Immutable(arc) => {
+                // §2.2.13: walk an O(1) snapshot through an owning iterator, revalidating live — deleted keys are
+                // skipped, values are read live (specified-visible updates), inserted keys wait for restart.
+                let mut e = arc.write();
+                let e = &mut *e;
+                let walk = e.iter.get_or_insert_with(|| Box::new(e.map.clone().into_iter()));
                 for (key, _snapshot_value) in walk.by_ref() {
-                    if let Some(live) = map.get(&key) {
+                    if let Some(live) = e.map.get(&key) {
                         return Some((key, live.clone()));
                     }
                 }
-                *iter = None;
+                e.iter = None;
                 None
             }
         }
     }
 
     /// `keys %h`: resets the iterator (container-verified); shares `each`'s scan order (§2.2.13).
-    pub fn keys(&mut self) -> Vec<PString> {
-        match &mut self.engine {
-            HashEngine::Buckets { table, cursor, .. } => {
-                *cursor = 0;
-                (0..table.num_buckets()).filter_map(|bucket| table.get_bucket(bucket)).map(|(k, _)| k.clone()).collect()
+    pub fn keys(&self) -> Vec<PString> {
+        match self {
+            Hash::Bucket(arc) => {
+                let mut e = arc.write();
+                e.cursor = 0;
+                (0..e.table.num_buckets()).filter_map(|b| e.table.get_bucket(b)).map(|(k, _)| k.clone()).collect()
             }
-            HashEngine::Ordered { map, cursor } => {
-                *cursor = 0;
-                map.keys().cloned().collect()
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                let mut e = arc.write();
+                e.cursor = 0;
+                e.map.keys().cloned().collect()
             }
-
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, iter } => {
-                retire_iter(iter);
-                map.keys().cloned().collect()
+            Hash::Immutable(arc) => {
+                let mut e = arc.write();
+                retire_iter(&mut e.iter);
+                e.map.keys().cloned().collect()
             }
         }
     }
 
     /// `values %h`: resets the iterator; corresponds to `keys` order (container-verified).
-    pub fn values(&mut self) -> Vec<Value> {
-        match &mut self.engine {
-            HashEngine::Buckets { table, cursor, .. } => {
-                *cursor = 0;
-                (0..table.num_buckets()).filter_map(|bucket| table.get_bucket(bucket)).map(|(_, v)| v.clone()).collect()
+    pub fn values(&self) -> Vec<Value> {
+        match self {
+            Hash::Bucket(arc) => {
+                let mut e = arc.write();
+                e.cursor = 0;
+                (0..e.table.num_buckets()).filter_map(|b| e.table.get_bucket(b)).map(|(_, v)| v.clone()).collect()
             }
-            HashEngine::Ordered { map, cursor } => {
-                *cursor = 0;
-                map.values().cloned().collect()
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                let mut e = arc.write();
+                e.cursor = 0;
+                e.map.values().cloned().collect()
             }
-
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, iter } => {
-                retire_iter(iter);
-                map.values().cloned().collect()
+            Hash::Immutable(arc) => {
+                let mut e = arc.write();
+                retire_iter(&mut e.iter);
+                e.map.values().cloned().collect()
             }
         }
     }
 
     /// `%h = ()`.
-    pub fn clear(&mut self) -> Result<(), ScalarError> {
-        self.check_writable()?;
-        match &mut self.engine {
-            HashEngine::Buckets { table, cursor, .. } => {
-                for (_key, v) in table.drain() {
+    pub fn clear(&self) -> Result<(), ScalarError> {
+        match self {
+            Hash::Bucket(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                e.cursor = 0;
+                for (_key, v) in e.table.drain() {
                     release_value(v);
                 }
-                *cursor = 0;
             }
-            HashEngine::Ordered { map, cursor } => {
-                for (_key, v) in map.drain(..) {
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                e.cursor = 0;
+                for (_key, v) in e.map.drain(..) {
                     release_value(v);
                 }
-                *cursor = 0;
             }
-
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, iter } => {
-                retire_iter(iter);
-                for (_key, v) in std::mem::take(map) {
+            Hash::Immutable(arc) => {
+                let mut e = arc.write();
+                check_writable(e.readonly)?;
+                retire_iter(&mut e.iter);
+                for (_key, v) in std::mem::take(&mut e.map) {
                     release_value(v);
                 }
             }
@@ -875,60 +945,115 @@ impl Hash {
         Ok(())
     }
 
-    pub fn set_readonly(&mut self, readonly: bool) {
-        self.readonly = readonly;
+    pub fn set_readonly(&self, readonly: bool) {
+        match self {
+            Hash::Bucket(arc) => arc.write().readonly = readonly,
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => arc.write().readonly = readonly,
+            #[cfg(feature = "imbl")]
+            Hash::Immutable(arc) => arc.write().readonly = readonly,
+        }
     }
 
     pub fn is_readonly(&self) -> bool {
-        self.readonly
+        match self {
+            Hash::Bucket(arc) => arc.read().readonly,
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => arc.read().readonly,
+            #[cfg(feature = "imbl")]
+            Hash::Immutable(arc) => arc.read().readonly,
+        }
     }
 
-    /// The graph traversal hook (§2.4.6 demolition, §2.4.11 cycle detection).
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
-    pub(crate) fn values_iter(&self) -> HashValuesIter<'_> {
-        match &self.engine {
-            HashEngine::Buckets { table, .. } => HashValuesIter::Buckets { table, next: 0 },
-            HashEngine::Ordered { map, .. } => HashValuesIter::Ordered(map.values()),
-
+    /// An O(1) detached, diverging copy of an immutable-engine hash (§2.2.13), with a fresh cursor and the readonly
+    /// flag cleared; the other engines answer [`ScalarError::SnapshotUnsupported`], their copies being O(n).
+    pub fn snapshot(&self) -> Result<Hash, ScalarError> {
+        match self {
             #[cfg(feature = "imbl")]
-            HashEngine::Immutable { map, .. } => HashValuesIter::Immutable(map.values()),
+            Hash::Immutable(arc) => {
+                let map = arc.read().map.clone();
+                Ok(Hash::Immutable(HeapArc::new(RwLock::new(ImmutableHash { map, iter: None, readonly: false }))))
+            }
+            _ => Err(ScalarError::SnapshotUnsupported),
+        }
+    }
+
+    /// The graph traversal hook (§2.4.6 demolition, §2.4.11 cycle detection): existing values only, visited under the
+    /// read lock (§2.2.13: no borrow escapes it).
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
+    pub(crate) fn for_each_value(&self, mut f: impl FnMut(&Value)) {
+        match self {
+            Hash::Bucket(arc) => {
+                let e = arc.read();
+                for b in 0..e.table.num_buckets() {
+                    if let Some((_, v)) = e.table.get_bucket(b) {
+                        f(v);
+                    }
+                }
+            }
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(arc) => {
+                for v in arc.read().map.values() {
+                    f(v);
+                }
+            }
+            #[cfg(feature = "imbl")]
+            Hash::Immutable(arc) => {
+                for v in arc.read().map.values() {
+                    f(v);
+                }
+            }
         }
     }
 }
 
-/// The engine-dispatched values walk behind [`Hash::values_iter`]: a hand-rolled two-arm iterator, keeping the cold
-/// traversal hook vtable-free.
-pub(crate) enum HashValuesIter<'a> {
-    Buckets {
-        table: &'a HashTable<(PString, Value)>,
-        next: usize,
-    },
-    Ordered(indexmap::map::Values<'a, PString, Value>),
-
-    #[cfg(feature = "imbl")]
-    Immutable(imbl::hashmap::Values<'a, PString, Value, imbl::shared_ptr::DefaultSharedPtr>),
+impl fmt::Debug for BucketHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BucketHash").field("len", &self.table.len()).finish_non_exhaustive()
+    }
 }
 
-impl<'a> Iterator for HashValuesIter<'a> {
-    type Item = &'a Value;
+#[cfg(feature = "indexmap")]
+impl fmt::Debug for OrderedHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrderedHash").field("len", &self.map.len()).finish_non_exhaustive()
+    }
+}
 
-    fn next(&mut self) -> Option<&'a Value> {
-        match self {
-            HashValuesIter::Buckets { table, next } => {
-                let end = table.num_buckets();
-                while *next < end {
-                    let bucket = *next;
-                    *next += 1;
-                    if let Some((_, value)) = table.get_bucket(bucket) {
-                        return Some(value);
-                    }
-                }
-                None
-            }
-            HashValuesIter::Ordered(values) => values.next(),
+#[cfg(feature = "imbl")]
+impl fmt::Debug for ImmutableHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImmutableHash").field("len", &self.map.len()).finish_non_exhaustive()
+    }
+}
 
-            #[cfg(feature = "imbl")]
-            HashValuesIter::Immutable(values) => values.next(),
+impl Drop for BucketHash {
+    /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
+    fn drop(&mut self) {
+        for (_key, v) in self.table.drain() {
+            release_value(v);
+        }
+    }
+}
+
+#[cfg(feature = "indexmap")]
+impl Drop for OrderedHash {
+    /// Iterative teardown (§2.4.9), as [`BucketHash`]'s.
+    fn drop(&mut self) {
+        for (_key, v) in self.map.drain(..) {
+            release_value(v);
+        }
+    }
+}
+
+#[cfg(feature = "imbl")]
+impl Drop for ImmutableHash {
+    /// Iterative teardown (§2.4.9): the parked iterator retires first, then the map drains — co-owner drains net zero
+    /// on shared values; the final owner's moves them out.
+    fn drop(&mut self) {
+        retire_iter(&mut self.iter);
+        for (_key, v) in std::mem::take(&mut self.map) {
+            release_value(v);
         }
     }
 }
@@ -975,7 +1100,6 @@ macro_rules! container_handle {
 }
 
 container_handle!(ArrayRef, Array, "The Arc-backed shared array identity (§2.2.1).");
-container_handle!(HashRef, Hash, "The Arc-backed shared hash identity (§2.2.1).");
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

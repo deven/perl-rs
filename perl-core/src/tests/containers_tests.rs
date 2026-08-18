@@ -6,7 +6,10 @@ use crate::value::{Tainted, Value};
 /// each.
 fn both_engines() -> Vec<Hash> {
     #[allow(unused_mut)]
-    let mut engines = vec![Hash::new(), Hash::insertion_ordered()];
+    let mut engines = vec![Hash::new()];
+
+    #[cfg(feature = "indexmap")]
+    engines.push(Hash::insertion_ordered());
 
     #[cfg(feature = "imbl")]
     engines.push(Hash::immutable());
@@ -109,7 +112,7 @@ fn array_readonly() {
 // ── Hashes ────────────────────────────────────────────────────
 #[test]
 fn hash_store_get_exists_delete() {
-    for mut h in both_engines() {
+    for h in both_engines() {
         h.store(key("a"), int(1)).unwrap();
         h.store(key("b"), int(2)).unwrap();
         assert_eq!(h.len(), 2);
@@ -128,7 +131,7 @@ fn hash_store_get_exists_delete() {
 
 #[test]
 fn hash_keys_are_laundered_at_storage() {
-    for mut h in both_engines() {
+    for h in both_engines() {
         // Container-verified under -T: a tainted key stores clean; keys returns clean strings.
         let mut tainted_key = key("secret");
         tainted_key.taint();
@@ -140,21 +143,23 @@ fn hash_keys_are_laundered_at_storage() {
         assert!(!stored[0].is_tainted(), "the §2.6.2 sanctioned laundering path");
 
         // Same through the lvalue path.
-        let mut h2 = Hash::new();
-        let _ = h2.entry_or_undef(tainted_key).unwrap();
+        let h2 = Hash::new();
+        h2.entry_or_undef(tainted_key, |_| ()).unwrap();
         assert!(!h2.keys()[0].is_tainted());
     }
 }
 
 #[test]
 fn hash_entry_or_undef_vivifies() {
-    for mut h in both_engines() {
-        // Container-verified: \$h{k} — the entry exists, undef.
-        let slot = h.entry_or_undef(key("k")).unwrap();
-        assert!(matches!(slot, Value::Undef | Value::UndefTainted));
+    for h in both_engines() {
+        // Container-verified: \$h{k} — the entry exists, undef.  The lvalue path is closure-shaped (§2.2.13).
+        h.entry_or_undef(key("k"), |slot| {
+            assert!(matches!(slot, Value::Undef | Value::UndefTainted));
+        })
+        .unwrap();
         assert!(h.exists(&key("k")));
 
-        let r = Value::take_ref(h.entry_or_undef(key("k")).unwrap());
+        let r = h.entry_or_undef(key("k"), Value::take_ref).unwrap();
         r.deref_scalar().unwrap().write().unwrap().assign(Value::integer(7, Tainted::CLEAN)).unwrap();
         assert_eq!(h.get(&key("k")).unwrap().to_int(), 7);
     }
@@ -162,7 +167,7 @@ fn hash_entry_or_undef_vivifies() {
 
 #[test]
 fn each_visits_all_when_deleting_current() {
-    for mut h in both_engines() {
+    for h in both_engines() {
         // Container-verified: deleting the current item mid-each still visits all 4 keys.
         for k in ["a", "b", "c", "d"] {
             h.store(key(k), int(1)).unwrap();
@@ -184,7 +189,7 @@ fn each_visits_all_when_deleting_current() {
 
 #[test]
 fn each_exhausts_restarts_and_keys_resets() {
-    for mut h in both_engines() {
+    for h in both_engines() {
         h.store(key("x"), int(1)).unwrap();
         h.store(key("y"), int(2)).unwrap();
 
@@ -196,7 +201,7 @@ fn each_exhausts_restarts_and_keys_resets() {
     }
 
     // keys() resets mid-iteration (container-verified).
-    for mut g in both_engines() {
+    for g in both_engines() {
         g.store(key("x"), int(1)).unwrap();
         g.store(key("y"), int(2)).unwrap();
         let _ = g.each();
@@ -215,7 +220,7 @@ fn each_exhausts_restarts_and_keys_resets() {
 fn keys_values_stable_and_corresponding() {
     // Container-verified: stable without mutation; keys/values correspond.  Engine-shared: order is per-engine,
     // stability and correspondence are not.
-    for mut h in both_engines() {
+    for h in both_engines() {
         for (i, k) in ["a", "b", "c"].iter().enumerate() {
             h.store(key(k), int(i as i64)).unwrap();
         }
@@ -236,12 +241,12 @@ fn keys_values_stable_and_corresponding() {
 
 #[test]
 fn hash_readonly() {
-    for mut h in both_engines() {
+    for h in both_engines() {
         h.store(key("a"), int(1)).unwrap();
         h.set_readonly(true);
         assert_eq!(h.store(key("b"), int(2)), Err(ScalarError::ReadOnly));
         assert_eq!(h.delete(&key("a")).map(|_| ()), Err(ScalarError::ReadOnly));
-        assert_eq!(h.entry_or_undef(key("c")).map(|_| ()), Err(ScalarError::ReadOnly));
+        assert_eq!(h.entry_or_undef(key("c"), |_| ()), Err(ScalarError::ReadOnly));
         assert_eq!(h.clear(), Err(ScalarError::ReadOnly));
         assert_eq!(h.get(&key("a")).unwrap().to_int(), 1);
         assert_eq!(h.keys().len(), 1, "reads and iteration stay legal");
@@ -278,12 +283,13 @@ fn shift_is_a_window_slide_and_unshift_reclaims_the_gap() {
 
 #[test]
 fn shortfall_unshift_carves_the_fill_back_as_gap() {
-    // §2.2.12 phase two: with no gap, the slide is need + fill, and the fill's worth returns as fresh gap — the
-    // prepaid buffer equals the live count.
+    // §2.2.12 phase two: with no gap, the slide is need + fill, and the fill's worth returns as fresh gap — the prepaid
+    // buffer equals the live count.
     let mut a = Array::new();
     for i in 0..5 {
         a.push_value(int(i)).unwrap();
     }
+
     let (start, _, _, _) = a.probe_geometry();
     assert_eq!(start, 0, "no gap yet");
 
@@ -305,8 +311,8 @@ fn shortfall_unshift_carves_the_fill_back_as_gap() {
 
 #[test]
 fn growth_follows_the_ruled_curve() {
-    // §2.2.12: growth requests at least min_cap + cap/5, then harvests the allocator's class — so the landed
-    // capacity is bounded below by the curve, never mere fit.
+    // §2.2.12: growth requests at least min_cap + cap/5, then harvests the allocator's class — so the landed capacity
+    // is bounded below by the curve, never mere fit.
     let mut a = Array::new();
     a.set(9, int(1)).unwrap();
     let (_, _, cap_before, _) = a.probe_geometry();
@@ -352,10 +358,11 @@ fn the_wide_arm_runs_the_same_battery() {
 }
 
 // ── The §2.2.13 bucket-engine discipline ──────────────────────
+#[cfg(feature = "indexmap")]
 #[test]
 fn ordered_mode_iterates_in_insertion_order() {
     // The mode's reason to exist: a pinned, predictable order on explicit request.
-    let mut h = Hash::insertion_ordered();
+    let h = Hash::insertion_ordered();
     for k in ["delta", "alpha", "omega", "beta"] {
         h.store(key(k), int(1)).unwrap();
     }
@@ -367,7 +374,7 @@ fn ordered_mode_iterates_in_insertion_order() {
 fn value_update_does_not_disturb_each() {
     // Contract-specified safe: updating an existing key's value during iteration; the cursor must not reset (§2.2.13:
     // the find-first store path).
-    for mut h in both_engines() {
+    for h in both_engines() {
         for k in ["a", "b", "c"] {
             h.store(key(k), int(1)).unwrap();
         }
@@ -386,7 +393,7 @@ fn value_update_does_not_disturb_each() {
 fn new_key_insertion_restarts_the_bucket_walk() {
     // §2.2.13: a rehash may scramble positions, so a new key resets the cursor — the post-insert pass is complete:
     // every current key appears, none twice.
-    let mut h = Hash::new();
+    let h = Hash::new();
     for i in 0..8 {
         h.store(key(&format!("k{i}")), int(i)).unwrap();
     }
@@ -406,7 +413,7 @@ fn bucket_delete_exactness_canary() {
     // The §2.2.13 canary: bucket-index stability across deletion is mechanically certain but contractually silent in
     // hashbrown's public docs.  Interleaved deletions at scale must leave the visit set exact — every surviving key
     // visited exactly once, every pre-visit-deleted key never visited.  A hashbrown behavior change fails this loudly.
-    let mut h = Hash::new();
+    let h = Hash::new();
     let n = 300;
     for i in 0..n {
         h.store(key(&format!("k{i:03}")), int(i)).unwrap();
@@ -449,18 +456,19 @@ fn bucket_delete_exactness_canary() {
 #[test]
 fn snapshot_is_supported_only_on_the_immutable_engine() {
     assert_eq!(Hash::new().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+    #[cfg(feature = "indexmap")]
     assert_eq!(Hash::insertion_ordered().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
 }
 
 #[cfg(feature = "imbl")]
 #[test]
 fn snapshots_are_detached_diverging_copies() {
-    let mut h = Hash::immutable();
+    let h = Hash::immutable();
     for k in ["a", "b", "c"] {
         h.store(key(k), int(1)).unwrap();
     }
 
-    let mut snap = h.snapshot().unwrap();
+    let snap = h.snapshot().unwrap();
     h.store(key("d"), int(4)).unwrap();
     h.delete(&key("a")).unwrap();
     snap.store(key("z"), int(26)).unwrap();
@@ -477,7 +485,7 @@ fn snapshots_are_detached_diverging_copies() {
 fn immutable_each_revalidates_live() {
     // §2.2.13: the parked snapshot walk skips keys deleted since, reads values live, and holds new keys for the restart
     // — with no reset forced by any mutation.
-    let mut h = Hash::immutable();
+    let h = Hash::immutable();
     for i in 0..6 {
         h.store(key(&format!("k{i}")), int(i)).unwrap();
     }
@@ -542,10 +550,16 @@ fn handle_identity_and_traversal() {
     assert_eq!(a2.read().len(), 2, "writes visible through the clone: shared identity");
     assert_eq!(a.read().values_iter().map(Value::to_int).sum::<i64>(), 3, "collector hook");
 
-    let h = HashRef::new(Hash::new());
-    h.write().store(key("k"), int(5)).unwrap();
-    assert_eq!(h.read().values_iter().count(), 1);
-    assert!(format!("{h:?}").starts_with("HashRef(0x"));
+    // Hash is its own handle (§2.2.13): clones share the identity, locks are internal.
+    let h = Hash::new();
+    let h2 = h.clone();
+    h.store(key("k"), int(5)).unwrap();
+    assert_eq!(h2.len(), 1, "writes visible through the clone: shared identity");
+    assert!(Hash::ptr_eq(&h, &h2));
+    assert_ne!(h.addr(), 0);
+    let mut seen = 0;
+    h.for_each_value(|_| seen += 1);
+    assert_eq!(seen, 1);
 }
 
 #[test]
@@ -557,7 +571,6 @@ fn concurrency_foundation_send_sync() {
     assert_send_sync::<Hash>();
     assert_send_sync::<Array>();
     assert_send_sync::<ArrayRef>();
-    assert_send_sync::<HashRef>();
     assert_send_sync::<crate::scalar::Referent>();
 
     // The immutable engine's map and parked iterator must cross threads with the rest.

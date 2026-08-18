@@ -8,7 +8,7 @@
 //! trusting it.
 //!
 //! These types are runtime-internal, not embedder API (§2.4.2): the public contract is the checked handle types
-//! (`Referent`, `ArrayRef`, `HashRef`, ...).  The API surface is deliberately the restricted set the eventual custom
+//! (`Referent`, `ArrayRef`, `Hash`, ...).  The API surface is deliberately the restricted set the eventual custom
 //! implementation will provide — no `get_mut`, no `try_unwrap`, no DSTs (§2.4.2's amended contracts).
 //!
 //! # The release worklist

@@ -35,12 +35,19 @@ use std::fmt::Write as _;
 use std::mem;
 use std::str;
 
-use crate::containers::{ArrayRef, HashRef};
+use crate::containers::BucketHash;
+use crate::containers::{ArrayRef, Hash};
 use crate::cow_buffer::AllocError;
 use crate::heap::HeapArc;
 use crate::numeric::{FloatPayload, IntegerPayload, UnsignedPayload};
 use crate::scalar::{ConstScalar, FALSE_SCALAR, Referent, Scalar, TRUE_SCALAR};
 use crate::string::{DECODE_MAX, PString};
+
+#[cfg(feature = "imbl")]
+use crate::containers::ImmutableHash;
+
+#[cfg(feature = "indexmap")]
+use crate::containers::OrderedHash;
 
 // ── Tainted (§2.6.1, §2.6.3) ──────────────────────────────────────
 /// The per-value taint bit: a monotonic bool newtype.  Constructors are explicit (`CLEAN` / `TAINTED` — sources that
@@ -136,11 +143,19 @@ pub enum Value {
     ArrayRefTainted(ArrayRef),
 
     /// Clean: a reference to a hash.
-    HashRef(HashRef),
+    BucketHashRef(HeapArc<RwLock<BucketHash>>),
+    #[cfg(feature = "indexmap")]
+    OrderedHashRef(HeapArc<RwLock<OrderedHash>>),
+    #[cfg(feature = "imbl")]
+    ImmutableHashRef(HeapArc<RwLock<ImmutableHash>>),
 
     /// Tainted (§2.6): a reference to a hash.  The taint dimension is a discriminant twin rather than a field, because
     /// a taint byte beside an eight-byte datum cannot fit the envelope's niche-supplied tag (measured).
-    HashRefTainted(HashRef),
+    BucketHashRefTainted(HeapArc<RwLock<BucketHash>>),
+    #[cfg(feature = "indexmap")]
+    OrderedHashRefTainted(HeapArc<RwLock<OrderedHash>>),
+    #[cfg(feature = "imbl")]
+    ImmutableHashRefTainted(HeapArc<RwLock<ImmutableHash>>),
 
     /// A string, whose taint rides its own tag (§2.2.3).
     String(PString),
@@ -211,9 +226,35 @@ impl Value {
         if taint.is_tainted() { Value::ArrayRefTainted(value) } else { Value::ArrayRef(value) }
     }
 
-    /// A `HashRef`, clean or tainted as `taint` says.
-    pub fn hash_ref(value: HashRef, taint: Tainted) -> Value {
-        if taint.is_tainted() { Value::HashRefTainted(value) } else { Value::HashRef(value) }
+    /// A hash reference, clean or tainted as `taint` says: the engine tag hoists into the discriminant (§2.2.13), the
+    /// same arc wearing two tags.
+    pub fn hash_ref(value: Hash, taint: Tainted) -> Value {
+        let t = taint.is_tainted();
+        match value {
+            Hash::Bucket(a) => {
+                if t {
+                    Value::BucketHashRefTainted(a)
+                } else {
+                    Value::BucketHashRef(a)
+                }
+            }
+            #[cfg(feature = "indexmap")]
+            Hash::Ordered(a) => {
+                if t {
+                    Value::OrderedHashRefTainted(a)
+                } else {
+                    Value::OrderedHashRef(a)
+                }
+            }
+            #[cfg(feature = "imbl")]
+            Hash::Immutable(a) => {
+                if t {
+                    Value::ImmutableHashRefTainted(a)
+                } else {
+                    Value::ImmutableHashRef(a)
+                }
+            }
+        }
     }
 }
 
@@ -302,8 +343,12 @@ impl Value {
             | Value::ConstScalarRefTainted(..)
             | Value::ArrayRef(..)
             | Value::ArrayRefTainted(..)
-            | Value::HashRef(..)
-            | Value::HashRefTainted(..) => true, // References are always true (verified).
+            | Value::BucketHashRef(..)
+            | Value::BucketHashRefTainted(..) => true, // References are always true (verified).
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(..) | Value::OrderedHashRefTainted(..) => true,
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(..) | Value::ImmutableHashRefTainted(..) => true,
             Value::AliasMut(c) => c.read().to_bool(),
             Value::AliasConst(c) => c.to_bool(),
         }
@@ -330,7 +375,11 @@ impl Value {
             Value::ScalarRef(c) | Value::ScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as i64, // the address (verified)
             Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as i64,
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => r.addr() as i64,
-            Value::HashRef(r) | Value::HashRefTainted(r) => r.addr() as i64,
+            Value::BucketHashRef(r) | Value::BucketHashRefTainted(r) => HeapArc::as_ptr(r) as usize as i64,
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(r) | Value::OrderedHashRefTainted(r) => HeapArc::as_ptr(r) as usize as i64,
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(r) | Value::ImmutableHashRefTainted(r) => HeapArc::as_ptr(r) as usize as i64,
             Value::AliasMut(c) => c.read().to_int(),
             Value::AliasConst(c) => c.to_int(),
         }
@@ -350,7 +399,11 @@ impl Value {
             Value::ScalarRef(c) | Value::ScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as f64,
             Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => HeapArc::as_ptr(c) as usize as f64,
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => r.addr() as f64,
-            Value::HashRef(r) | Value::HashRefTainted(r) => r.addr() as f64,
+            Value::BucketHashRef(r) | Value::BucketHashRefTainted(r) => HeapArc::as_ptr(r) as usize as f64,
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(r) | Value::OrderedHashRefTainted(r) => HeapArc::as_ptr(r) as usize as f64,
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(r) | Value::ImmutableHashRefTainted(r) => HeapArc::as_ptr(r) as usize as f64,
             Value::AliasMut(c) => c.read().to_float(),
             Value::AliasConst(c) => c.to_float(),
         }
@@ -371,7 +424,11 @@ impl Value {
             Value::ScalarRef(c) | Value::ScalarRefTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
             Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => Numeric::Integer(HeapArc::as_ptr(c) as usize as i64),
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => Numeric::Integer(r.addr() as i64),
-            Value::HashRef(r) | Value::HashRefTainted(r) => Numeric::Integer(r.addr() as i64),
+            Value::BucketHashRef(r) | Value::BucketHashRefTainted(r) => Numeric::Integer(HeapArc::as_ptr(r) as usize as i64),
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(r) | Value::OrderedHashRefTainted(r) => Numeric::Integer(HeapArc::as_ptr(r) as usize as i64),
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(r) | Value::ImmutableHashRefTainted(r) => Numeric::Integer(HeapArc::as_ptr(r) as usize as i64),
             Value::AliasMut(c) => c.read().payload().numify(),
             Value::AliasConst(c) => c.payload().numify(),
         }
@@ -412,7 +469,11 @@ impl Value {
             Value::ScalarRef(c) | Value::ScalarRefTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
             Value::ConstScalarRef(c) | Value::ConstScalarRefTainted(c) => (ref_repr("SCALAR", HeapArc::as_ptr(c) as usize)?, self.taint()),
             Value::ArrayRef(r) | Value::ArrayRefTainted(r) => (ref_repr("ARRAY", r.addr())?, self.taint()),
-            Value::HashRef(r) | Value::HashRefTainted(r) => (ref_repr("HASH", r.addr())?, self.taint()),
+            Value::BucketHashRef(r) | Value::BucketHashRefTainted(r) => (ref_repr("HASH", HeapArc::as_ptr(r) as usize)?, self.taint()),
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(r) | Value::OrderedHashRefTainted(r) => (ref_repr("HASH", HeapArc::as_ptr(r) as usize)?, self.taint()),
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(r) | Value::ImmutableHashRefTainted(r) => (ref_repr("HASH", HeapArc::as_ptr(r) as usize)?, self.taint()),
             Value::AliasMut(c) => return c.read().stringify(),
             Value::AliasConst(c) => return Ok(c.stringify().clone()),
         };
@@ -438,7 +499,15 @@ impl Value {
             | Value::ScalarRefTainted(_)
             | Value::ConstScalarRefTainted(_)
             | Value::ArrayRefTainted(_)
-            | Value::HashRefTainted(_) => true,
+            | Value::BucketHashRefTainted(_) => true,
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRefTainted(_) => true,
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRefTainted(_) => true,
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(_) => false,
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(_) => false,
 
             Value::Undef
             | Value::Integer(_)
@@ -447,7 +516,7 @@ impl Value {
             | Value::ScalarRef(_)
             | Value::ConstScalarRef(_)
             | Value::ArrayRef(_)
-            | Value::HashRef(_)
+            | Value::BucketHashRef(_)
             | Value::True
             | Value::False => false,
 
@@ -549,8 +618,16 @@ impl Value {
             Value::ConstScalarRefTainted(c) => Value::ConstScalarRefTainted(c),
             Value::ArrayRef(r) => Value::ArrayRef(r),
             Value::ArrayRefTainted(r) => Value::ArrayRefTainted(r),
-            Value::HashRef(r) => Value::HashRef(r),
-            Value::HashRefTainted(r) => Value::HashRefTainted(r),
+            Value::BucketHashRef(r) => Value::BucketHashRef(r),
+            Value::BucketHashRefTainted(r) => Value::BucketHashRefTainted(r),
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(r) => Value::OrderedHashRef(r),
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRefTainted(r) => Value::OrderedHashRefTainted(r),
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(r) => Value::ImmutableHashRef(r),
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRefTainted(r) => Value::ImmutableHashRefTainted(r),
             Value::String(s) => Value::String(s),
             Value::Dual(d) => Value::Dual(d),
             Value::DualTainted(d) => Value::DualTainted(d),
@@ -585,10 +662,14 @@ impl Value {
             | Value::ConstScalarRefTainted(..)
             | Value::ArrayRef(..)
             | Value::ArrayRefTainted(..)
-            | Value::HashRef(..)
-            | Value::HashRefTainted(..)
+            | Value::BucketHashRef(..)
+            | Value::BucketHashRefTainted(..)
             | Value::AliasMut(_)
             | Value::AliasConst(_) => true,
+            #[cfg(feature = "indexmap")]
+            Value::OrderedHashRef(..) | Value::OrderedHashRefTainted(..) => true,
+            #[cfg(feature = "imbl")]
+            Value::ImmutableHashRef(..) | Value::ImmutableHashRefTainted(..) => true,
             Value::Undef
             | Value::UndefTainted
             | Value::Integer(..)
@@ -623,20 +704,24 @@ impl Value {
         }
     }
 
-    /// `%$r` — hash dereference.
-    pub fn deref_hash(&self) -> Option<HashRef> {
-        fn from_payload(p: &Value) -> Option<HashRef> {
+    /// `%$r` — hash dereference: the engine tag lowers back out of the discriminant into the one public `Hash`
+    /// (§2.2.13), the same arc wearing its other tag.
+    pub fn deref_hash(&self) -> Option<Hash> {
+        fn from_payload(p: &Value) -> Option<Hash> {
             match p {
-                Value::HashRef(r) | Value::HashRefTainted(r) => Some(r.clone()),
+                Value::BucketHashRef(r) | Value::BucketHashRefTainted(r) => Some(Hash::Bucket(r.clone())),
+                #[cfg(feature = "indexmap")]
+                Value::OrderedHashRef(r) | Value::OrderedHashRefTainted(r) => Some(Hash::Ordered(r.clone())),
+                #[cfg(feature = "imbl")]
+                Value::ImmutableHashRef(r) | Value::ImmutableHashRefTainted(r) => Some(Hash::Immutable(r.clone())),
                 _ => None,
             }
         }
 
         match self {
-            Value::HashRef(r) | Value::HashRefTainted(r) => Some(r.clone()),
             Value::AliasMut(cell) => from_payload(cell.read().payload()),
             Value::AliasConst(cs) => from_payload(cs.payload()),
-            _ => None,
+            direct => from_payload(direct),
         }
     }
 

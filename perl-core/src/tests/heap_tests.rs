@@ -25,7 +25,7 @@ fn transparent_layout() {
 }
 
 // ── The release worklist (§2.4.9) ─────────────────────────────────
-use crate::containers::{Array, ArrayRef, Hash, HashRef};
+use crate::containers::{Array, ArrayRef, Hash};
 use crate::value::{Tainted, Value};
 
 // Depths chosen well past the measured failure points: the scalar-ref chain overflowed at 20k in debug builds and the
@@ -55,10 +55,10 @@ fn deep_array_chain_releases_iteratively() {
 
 #[test]
 fn deep_hash_chain_releases_iteratively() {
-    let mut inner = HashRef::new(Hash::new());
+    let mut inner = Hash::new();
     for _ in 0..100_000 {
-        let outer = HashRef::new(Hash::new());
-        outer.write().store("next".parse().unwrap(), Value::hash_ref(inner, Tainted::CLEAN)).unwrap();
+        let outer = Hash::new();
+        outer.store("next".parse().unwrap(), Value::hash_ref(inner, Tainted::CLEAN)).unwrap();
         inner = outer;
     }
 
@@ -95,10 +95,10 @@ fn deep_tainted_array_chain_releases_iteratively() {
 
 #[test]
 fn deep_tainted_hash_chain_releases_iteratively() {
-    let mut inner = HashRef::new(Hash::new());
+    let mut inner = Hash::new();
     for _ in 0..100_000 {
-        let outer = HashRef::new(Hash::new());
-        outer.write().store("next".parse().unwrap(), Value::hash_ref(inner, Tainted::TAINTED)).unwrap();
+        let outer = Hash::new();
+        outer.store("next".parse().unwrap(), Value::hash_ref(inner, Tainted::TAINTED)).unwrap();
         inner = outer;
     }
 
@@ -117,8 +117,8 @@ fn deep_mixed_chain_releases_iteratively() {
                 Value::array_ref(a, Tainted::CLEAN)
             }
             1 => {
-                let h = HashRef::new(Hash::new());
-                h.write().store("k".parse().unwrap(), link).unwrap();
+                let h = Hash::new();
+                h.store("k".parse().unwrap(), link).unwrap();
                 Value::hash_ref(h, Tainted::CLEAN)
             }
             _ => {
