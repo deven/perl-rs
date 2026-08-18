@@ -3180,11 +3180,11 @@ Hash                      8     8     ~48+   ~64+   HV   56
 
 The hash header is the one concession, repaid within a few entries
 (32-byte key+value pairs against perl's 24-byte `HE` + key + a
-24-byte value SV).  Amortized page metadata — bitmaps, queue state, lease, ops,
+24-byte value SV).  Amortized page metadata — bitmaps, queue state, domain, ops,
 stride, lazy-array headers, descriptors — targets **at most one
 byte per slot**, with half a byte the aspirational bound after
 field packing (per-class sharing of the ops/stride words, a
-compact lease); the claim is settled by the mandatory per-class
+compact domain word); the claim is settled by the mandatory per-class
 table — stride, slots/page, measured `size_of::<PageMeta>()`,
 descriptor-region loss, bytes/slot — not asserted in prose.  The measured endgame, ledgered:
 folding the lock into `rc_state` flag bits (`parking_lot_core`
@@ -3521,7 +3521,7 @@ header, no per-slot type tag):
 
 ```text
 PageMeta (in the extent descriptor region)
-    domain: DomainLease        (valid until every slot is free)
+    domain: AtomicPtr<Domain>  (null once the domain is torn down)
     ops: &'static NodeOps
         visit_strong_slots     (every strong Value field — §2.4.6)
         begin_destroy          (takes the DestroyMode)
@@ -3546,18 +3546,31 @@ std-façade `Drop` implementations already implement exactly this
 split; the slab backend keeps it as typed operations.)
 
 Pages are domain-dedicated (one logical domain per page until
-every slot frees), and the lease targets the `Domain` — which
-physically outlives every slot on the page, tombstoned or not —
-so a context-free drop can always reach its queue head, phase, and
-stash table.  The ownership direction is one-way: the
-process-global pool owns extents and pages, each page owns its
-`DomainLease`, and `Domain` holds only non-owning page
-references — a domain that strongly owned pages holding strong
-leases back on it could never physically die.  When a page's last
-slot goes physically free (allocation bitmap empty, every weak
-array element zero): remove the page from the domain's non-owning
-index, release the `DomainLease`, reset stride/type/routing state
-and the lazy arrays — only then may the pool reassign the page.
+every slot frees), and the header's `domain` pointer is how a
+context-free drop reaches its queue head, phase, and stash table.
+**Teardown frees the `Domain` itself [DECISION]**: nothing about
+a dead domain is worth retaining, and only the heap-allocated
+node storage outlives it — and that only while an escaped handle
+holds it (§2.4.2).  Teardown therefore walks its page index and
+null-stores each `domain` pointer before freeing the `Domain`,
+inside the same producer-publication window that already orders
+phase transitions against context-free producers (§2.4.6):
+publish, wait for the active-producer count to drain to zero,
+then null and free.
+
+A producer Acquire-loads the pointer: non-null routes normally,
+and **null is the dead-domain answer** — no `Domain` is consulted
+because none is needed, since a tombstoned domain requires no
+Perl finalization and the release cleans up mechanically
+(§2.4.6).  One word carries both the route and the liveness bit,
+and no domain-referencing type outlives teardown.  The ownership
+direction stays one-way: the process-global pool owns extents and
+pages, and the domain holds only non-owning page references.
+When a page's last slot goes physically free (allocation bitmap
+empty, every weak array element zero): remove the page from the
+domain's index if the domain is still alive, reset stride/type/
+routing state and the lazy arrays — only then may the pool
+reassign the page.
 
 The two timing rules are distinct and both binding — boundary
 polling never substitutes for the synchronous rule:
@@ -3899,8 +3912,8 @@ racing concurrent `bless`/`weaken`; the incremental forced sweep
 racing another object's last drop; slot enumeration racing an
 unblessed payload's context-free drop (the most important
 addition); final weak-array release racing page enumeration; slot
-reuse after final weak release; page reassignment after the final
-domain lease; fatal checked resurrection retaining its ownership
+reuse after final weak release; page reassignment after
+domain teardown; fatal checked resurrection retaining its ownership
 obligations; owner-recursive nested finalization; drain-owner
 acquisition by competing threads; wake notification racing park;
 physical-phase publication and reuse; and reduced-width count
