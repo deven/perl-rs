@@ -1999,9 +1999,83 @@ safety net for the engine swap — the public surface (`len`,
   and in synergy with the slack probe that absorbs repeat
   growth.
 
-#### 2.2.13 `Hash`: the dual-engine ruling [DECISION]:
+#### 2.2.13 `Hash`: the engine ruling [DECISION]:
 
-`Hash` carries one of two engines, fixed at construction.
+**Per-engine identities [DECISION].**  `Hash` is the public enum
+of per-engine shared identities — each arm an
+`HeapArc<RwLock<Engine>>` over its own exactly-sized engine
+struct:
+
+```rust
+pub enum Hash {
+    Bucket(HeapArc<RwLock<BucketHash>>),
+    Ordered(HeapArc<RwLock<OrderedHash>>),      // indexmap
+    Immutable(HeapArc<RwLock<ImmutableHash>>),  // imbl
+}
+```
+
+The lock sits inside each arm, so `Hash` is itself the cheap-clone
+handle (the former `HashRef` dissolves into it) and every hash's
+identity allocation holds only its own engine — the max-arm tax
+of the engine-enum-inside-one-lock shape is dissolved
+structurally, and the transitional boxed-`IndexMap` consideration
+with it (the boxed parked iterator stays: an idle immutable hash
+should not carry a hundred-byte cursor).  A 16-byte enum cannot
+ride `Value`'s 15-byte payload, so `Value` hoists the engine tag
+into its own discriminant — `BucketHashRef`, `OrderedHashRef`,
+`ImmutableHashRef`, with taint twins — and the enum is rebuilt
+from the variant at the boundary for free: the same 8-byte arc
+wearing two tags.  Ops code thus matches `Value` once and jumps
+fused into monomorphic engine code; Rust consumers and the deref
+path see the one `Hash` type.  Internal locking makes the access
+discipline explicit: reads clone out (`get` returns an owned
+`Value`, a refcount bump), and lvalue access is closure-shaped
+(`entry_or_undef` runs the caller's closure under the guard)
+until the ops layer holds guards natively.
+
+**Engines are construction-final [DECISION].**  No operation
+changes a hash's engine in place, ever — the request surface is
+construction, and changing modes is a code change.  This is
+perl's own shape: `threads::shared::share(%h)` documentedly
+*clears* the hash rather than promoting its contents, and `tie`
+shadows at the magic layer without converting storage.  The
+per-engine-identity representation enforces the law in the type
+system: the engine is chosen by which allocation exists, so
+in-place morph is not forbidden but inexpressible.
+
+**Both non-default engines are feature-gated, off by default
+[DECISION]** — the optional dependency is the feature
+(`indexmap`, `imbl`) — so a bare `perl-core` build carries
+exactly the default engine and the binary crate turns the others
+on; with a feature off, its constructor and variants simply do
+not exist, a compile-time absence.
+
+**The lock stays on every engine — including the immutable
+one.**  The imbl mode is a perl-mutable hash whose *structure*
+is persistent: `store` and `delete` swap the root, and `each`,
+`keys`, and `values` mutate the parked cursor, so the `RwLock`
+is load-bearing; what persistence buys is that readers hold it
+only long enough to O(1)-clone the root.  A genuinely lock-free
+hash would be a *frozen* one — no mutation, no cursor, a bare
+`HeapArc` of the map, `ConstScalar`'s analog, mapping to
+`Hash::Util::lock_hash` — recorded as a future option awaiting a
+ruling.  `Array` may later adopt the per-engine-identity shape
+for symmetry (single-engine, so no variants); also a future
+ruling.
+
+**Considered along the way**, recorded from the review: `dyn`
+behind the identity (a pointer chase and virtual call on every
+operation of every engine, and open extension is a non-goal);
+bare generics `Hash<E>` (the engine bakes into every downstream
+signature and every distributed reference); `impl Trait` in the
+slot (a compile-time existential — one hidden concrete type, not
+a runtime choice; E0562 besides); and the engine enum inside one
+lock (the landed predecessor: uniform references, but max-arm
+sizing taxed every hash for the largest engine).  The per-engine
+identity keeps the closed-set discriminant, fuses it into
+`Value`'s match, and sizes every allocation exactly.
+
+`Hash` carries one of three engines, fixed at construction.
 The default is a bucket engine on `hashbrown::HashTable` — the
 safe SwissTable with public bucket addressing (`num_buckets`,
 `get_bucket`, `find_entry`, added in hashbrown 0.16.1) — and the
@@ -12562,7 +12636,7 @@ three independent leaf crates that have no cross-dependencies:
 
 | Crate           | Type | Dependencies                                              | Contents                                                                                                                           |
 |-----------------|------|-----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
-| `perl-core`     | lib  | `hashbrown`, `indexmap`, `parking_lot`                    | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
+| `perl-core`     | lib  | `hashbrown`, `parking_lot`; opt-in `indexmap`, `imbl`     | Strings, values, scalars, flags, typed value trait, extension API                                                                  |
 | `perl-parser`   | lib  | `bytes`, `memchr`, `unicode-xid`, `unicode-normalization` | Lexer + Pratt parser + AST.  Uses raw Rust types for literals — independently useful for linters, formatters, syntax highlighters  |
 | `perl-regex`    | lib  | none                                                      | Standalone Perl-compatible regex engine.  Pure Rust API on `&str`/`&[u8]` — independently publishable (see §11)                    |
 | `perl-compiler` | lib  | `perl-core`, `perl-parser`                                | HIR, IR, lowering, optimization passes, `Executor` trait.  Future home for JIT (Cranelift) and AOT (Rust source emission) backends |
