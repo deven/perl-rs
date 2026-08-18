@@ -250,6 +250,107 @@ fn hash_readonly() {
     }
 }
 
+// ── The §2.2.12 front-gap engine ──────────────────────────────
+#[test]
+fn shift_is_a_window_slide_and_unshift_reclaims_the_gap() {
+    let mut a = PerlArray::new();
+    for i in 0..8 {
+        a.push_value(int(i)).unwrap();
+    }
+    let base = a.probe_base();
+
+    // Three shifts: the window slides, the buffer stays put, the gap opens.
+    for expect in 0..3 {
+        assert_eq!(a.shift_value().unwrap().to_int(), expect);
+    }
+    let (start, len, _cap, large) = a.probe_geometry();
+    assert_eq!((start, len, large), (3, 5, false));
+    assert_eq!(a.probe_base(), base, "shift moved no memory");
+
+    // Phase-one unshift: reclaim exactly one slot of the gap — surplus preserved, no element movement.
+    a.unshift_value(int(100)).unwrap();
+    let (start, len, _cap, _) = a.probe_geometry();
+    assert_eq!((start, len), (2, 6), "take = min(start, n): one reclaimed, two remain");
+    assert_eq!(a.probe_base(), base, "gap reclaim moved no memory");
+    assert_eq!(a.get(0).unwrap().to_int(), 100);
+    assert_eq!(a.get(5).unwrap().to_int(), 7);
+}
+
+#[test]
+fn shortfall_unshift_carves_the_fill_back_as_gap() {
+    // §2.2.12 phase two: with no gap, the slide is need + fill, and the fill's worth returns as fresh gap — the
+    // prepaid buffer equals the live count.
+    let mut a = PerlArray::new();
+    for i in 0..5 {
+        a.push_value(int(i)).unwrap();
+    }
+    let (start, _, _, _) = a.probe_geometry();
+    assert_eq!(start, 0, "no gap yet");
+
+    a.unshift_value(int(100)).unwrap();
+    let (start, len, _, _) = a.probe_geometry();
+    assert_eq!(len, 6);
+    assert_eq!(start, 4, "the carved gap equals the pre-slide fill (five live, fill four)");
+    assert_eq!(a.get(0).unwrap().to_int(), 100);
+    assert_eq!(a.get(5).unwrap().to_int(), 4);
+
+    // The prepaid gap makes the next four unshifts pure phase-one.
+    let base = a.probe_base();
+    for v in [101, 102, 103, 104] {
+        a.unshift_value(int(v)).unwrap();
+    }
+    assert_eq!(a.probe_base(), base, "four prepaid unshifts moved no memory");
+    assert_eq!(a.probe_geometry().0, 0, "the prepaid gap is spent");
+}
+
+#[test]
+fn growth_follows_the_ruled_curve() {
+    // §2.2.12: growth requests at least min_cap + cap/5, then harvests the allocator's class — so the landed
+    // capacity is bounded below by the curve, never mere fit.
+    let mut a = PerlArray::new();
+    a.set(9, int(1)).unwrap();
+    let (_, _, cap_before, _) = a.probe_geometry();
+    a.set(cap_before, int(2)).unwrap();
+    let (_, _, cap_after, _) = a.probe_geometry();
+    assert!(cap_after >= cap_before + 1 + cap_before / 5, "curve lower bound: {cap_after} >= {cap_before} + 1 + {}", cap_before / 5);
+}
+
+#[test]
+fn empty_shift_and_pop_return_undef() {
+    let mut a = PerlArray::new();
+    assert!(matches!(a.shift_value().unwrap(), Value::Undef));
+    assert!(matches!(a.pop_value().unwrap(), Value::Undef));
+}
+
+#[test]
+fn the_wide_arm_runs_the_same_battery() {
+    // §2.2.12 spill parity: the boxed wide geometry serves the identical surface — the u32 overflow trigger being
+    // untestable at 64 GiB, the arm is forced and exercised whole.
+    let mut a = PerlArray::new();
+    a.push_value(int(0)).unwrap();
+    a.force_large_for_test();
+    assert!(a.probe_geometry().3, "the arm is wide");
+
+    for i in 1..40 {
+        a.push_value(int(i)).unwrap();
+    }
+    for expect in 0..5 {
+        assert_eq!(a.shift_value().unwrap().to_int(), expect);
+    }
+    a.unshift_value(int(100)).unwrap();
+    a.set(50, int(50)).unwrap();
+    assert_eq!(a.len(), 51);
+    assert!(!a.exists(49) && a.exists(50));
+    assert_eq!(a.get(0).unwrap().to_int(), 100);
+    assert_eq!(a.delete(50).unwrap().to_int(), 50);
+    assert_eq!(a.len(), 36, "trailing-hole truncation under the wide arm");
+    assert_eq!(a.pop_value().unwrap().to_int(), 39);
+    let visited: usize = a.values_iter().count();
+    assert_eq!(visited, 35);
+    a.clear().unwrap();
+    assert!(a.is_empty());
+}
+
 // ── The §2.2.13 bucket-engine discipline ──────────────────────
 #[test]
 fn ordered_mode_iterates_in_insertion_order() {
