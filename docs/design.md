@@ -2012,7 +2012,7 @@ match the gap engine's headline), and O(log32) indexing as the
 recorded tradeoff that keeps it a mode.  `snapshot()` mirrors the
 hash's: an O(1) detached diverging copy on this engine,
 `SnapshotUnsupported` on the gap engine.  `Value` hoists the
-engine tag per the same ruling — `GapArrayRef`,
+engine tag per the same ruling — `ArrayRef`,
 `ImmutableArrayRef`, taint twins, qualifier on the referent first
 — and construction-finality, internal locking, clone-out reads,
 and the closure-shaped lvalue path all apply as ruled there.
@@ -2044,7 +2044,7 @@ structurally, and the transitional boxed-`IndexMap` consideration
 with it (the boxed parked iterator stays: an idle immutable hash
 should not carry a hundred-byte cursor).  A 16-byte enum cannot
 ride `Value`'s 15-byte payload, so `Value` hoists the engine tag
-into its own discriminant — `BucketHashRef`, `OrderedHashRef`,
+into its own discriminant — `HashRef`, `OrderedHashRef`,
 `ImmutableHashRef`, with taint twins — and the enum is rebuilt
 from the variant at the boundary for free: the same 8-byte arc
 wearing two tags.  Ops code thus matches `Value` once and jumps
