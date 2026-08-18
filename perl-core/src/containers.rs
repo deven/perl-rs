@@ -551,7 +551,7 @@ enum HashEngine {
     /// The feature-gated immutable mode (§2.2.13): a persistent HAMT; the `each` cursor is an owning iterator over an
     /// O(1) snapshot, yielding with live revalidation.
     #[cfg(feature = "imbl")]
-    Immutable { map: ImblMap, iter: Option<ImblIter> },
+    Immutable { map: ImblMap, iter: Option<Box<ImblIter>> },
 }
 
 #[cfg(feature = "imbl")]
@@ -563,9 +563,9 @@ type ImblIter = <ImblMap as IntoIterator>::IntoIter;
 /// Retire a parked snapshot iterator (§2.2.13): its remaining values route through the release worklist — a co-owner's
 /// release nets zero on shared values; the final owner's moves them out.
 #[cfg(feature = "imbl")]
-fn retire_iter(iter: &mut Option<ImblIter>) {
+fn retire_iter(iter: &mut Option<Box<ImblIter>>) {
     if let Some(rest) = iter.take() {
-        for (_key, v) in rest {
+        for (_key, v) in *rest {
             release_value(v);
         }
     }
@@ -795,8 +795,8 @@ impl Hash {
             // values are read live (specified-visible updates), inserted keys wait for the restart.
             #[cfg(feature = "imbl")]
             HashEngine::Immutable { map, iter } => {
-                let walk = iter.get_or_insert_with(|| map.clone().into_iter());
-                for (key, _snapshot_value) in walk {
+                let walk = iter.get_or_insert_with(|| Box::new(map.clone().into_iter()));
+                for (key, _snapshot_value) in walk.by_ref() {
                     if let Some(live) = map.get(&key) {
                         return Some((key, live.clone()));
                     }
