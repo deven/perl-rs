@@ -662,6 +662,7 @@ macro_rules! heap_tier {
                 let Some(base) = alloc_backend::allocate(layout) else {
                     return Err(AllocError { requested: capacity });
                 };
+
                 #[cfg(test)]
                 super::live::allocated();
 

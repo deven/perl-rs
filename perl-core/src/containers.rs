@@ -1,5 +1,5 @@
 //! `Array` and `Hash` — the containers (§2.2.1) — each the public enum of its per-engine shared identities (§2.2.13):
-//! `Array` over `GapArray` and `ImmutableArray`, `Hash` over its three.
+//! `Array` over `PerlArray` and `ImmutableArray`, `Hash` over its three.
 //!
 //! Container-verified semantics encoded here:
 //!
@@ -48,7 +48,7 @@ use indexmap::IndexMap;
 /// discriminant byte the §2.4.3 budget does not have.  Small arrays keep `ptr` as the buffer base with `u32` geometry;
 /// past `u32` the geometry spills to a boxed wide header and `ptr` holds that box (`FLAG_LARGE`), the `Heap32`/`Heap`
 /// philosophy applied to arrays.  Bits 8..32 of `stash_flags` are the reserved bless stash (u24).
-pub struct GapArray {
+pub struct PerlArray {
     /// Small: the buffer base (dangling when unallocated).  Large: the boxed [`Geometry`].
     ptr: NonNull<ArraySlot>,
     start: u32,
@@ -57,7 +57,7 @@ pub struct GapArray {
     stash_flags: u32,
 }
 
-const _: () = assert!(size_of::<GapArray>() == 24);
+const _: () = assert!(size_of::<PerlArray>() == 24);
 
 /// The dynamic readonly flag's bit.
 const FLAG_READONLY: u32 = 1;
@@ -67,10 +67,10 @@ const FLAG_LARGE: u32 = 2;
 
 // SAFETY: the raw pointer is exclusively owned storage of `Send + Sync` slots; sharing is external (§2.2.1: the
 // handle's lock).
-unsafe impl Send for GapArray {}
+unsafe impl Send for PerlArray {}
 
-// SAFETY: as above — `&GapArray` exposes no interior mutability.
-unsafe impl Sync for GapArray {}
+// SAFETY: as above — `&PerlArray` exposes no interior mutability.
+unsafe impl Sync for PerlArray {}
 
 /// The width-agnostic geometry the engine operates on: buffer base, gap size, live count, and usable slots from the
 /// gap's end.  Total allocation is `start + cap` slots, every one an initialized `ArraySlot` (gap and tail spare hold
@@ -190,15 +190,15 @@ impl Geometry {
     }
 }
 
-impl Default for GapArray {
-    fn default() -> GapArray {
-        GapArray::new()
+impl Default for PerlArray {
+    fn default() -> PerlArray {
+        PerlArray::new()
     }
 }
 
-impl fmt::Debug for GapArray {
+impl fmt::Debug for PerlArray {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GapArray").field("len", &self.len()).finish_non_exhaustive()
+        f.debug_struct("PerlArray").field("len", &self.len()).finish_non_exhaustive()
     }
 }
 
@@ -209,7 +209,7 @@ impl fmt::Debug for ImmutableArray {
     }
 }
 
-impl Drop for GapArray {
+impl Drop for PerlArray {
     /// Iterative teardown (§2.4.9): drain elements through the release worklist rather than recursing through drop
     /// glue.  Destruction is not perl-visible mutation, so the readonly flag is deliberately not consulted.
     fn drop(&mut self) {
@@ -224,9 +224,9 @@ impl Drop for GapArray {
     }
 }
 
-impl GapArray {
-    pub fn new() -> GapArray {
-        GapArray { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0, stash_flags: 0 }
+impl PerlArray {
+    pub fn new() -> PerlArray {
+        PerlArray { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0, stash_flags: 0 }
     }
 
     fn is_large(&self) -> bool {
@@ -247,7 +247,7 @@ impl GapArray {
     /// Take the geometry out, leaving the header empty (the teardown door).
     fn take_parts(&mut self) -> Geometry {
         if self.is_large() {
-            // SAFETY: as [`GapArray::parts`]; the box is reclaimed and the flag dropped, so ownership moves out.
+            // SAFETY: as [`PerlArray::parts`]; the box is reclaimed and the flag dropped, so ownership moves out.
             let wide = unsafe { Box::from_raw(self.ptr.cast::<Geometry>().as_ptr()) };
             self.stash_flags &= !FLAG_LARGE;
             self.ptr = NonNull::dangling();
@@ -269,7 +269,7 @@ impl GapArray {
     fn store_parts(&mut self, parts: Geometry) {
         let fits = parts.start <= u32::MAX as usize && parts.len <= u32::MAX as usize && parts.cap <= u32::MAX as usize;
         if self.is_large() {
-            // SAFETY: as [`GapArray::parts`]; the box stays the owner, its contents replaced.
+            // SAFETY: as [`PerlArray::parts`]; the box stays the owner, its contents replaced.
             unsafe { *self.ptr.cast::<Geometry>().as_ptr() = parts };
         } else if fits {
             self.ptr = parts.ptr;
@@ -305,7 +305,7 @@ impl GapArray {
     }
 
     /// Read access: never creates.  `None` for holes and out-of-range indices alike (the exists/defined distinction
-    /// goes through [`GapArray::exists`]).
+    /// goes through [`PerlArray::exists`]).
     pub fn get(&self, index: usize) -> Option<&Value> {
         let parts = self.parts();
         if index >= parts.len {
@@ -343,7 +343,7 @@ impl GapArray {
         self.check_writable()?;
 
         self.with_parts(|parts| {
-            GapArray::extend_to(parts, index)?;
+            PerlArray::extend_to(parts, index)?;
             parts.live_mut()[index] = Some(value);
 
             Ok(())
@@ -357,7 +357,7 @@ impl GapArray {
         self.check_writable()?;
 
         let mut parts = self.parts();
-        GapArray::extend_to(&mut parts, index)?;
+        PerlArray::extend_to(&mut parts, index)?;
         self.store_parts(parts);
         let parts = self.parts();
 
@@ -393,7 +393,7 @@ impl GapArray {
 
         self.with_parts(|parts| {
             let index = parts.len;
-            GapArray::extend_to(parts, index)?;
+            PerlArray::extend_to(parts, index)?;
             parts.live_mut()[index] = Some(value);
 
             Ok(())
@@ -580,8 +580,8 @@ impl Drop for ImmutableArray {
 /// closure-shaped.
 #[derive(Clone)]
 pub enum Array {
-    /// The default: the front-gap engine (§2.2.12).
-    Gap(HeapArc<RwLock<GapArray>>),
+    /// The default: the front-gap engine (§2.2.12), perl's own AV shape.
+    Perl(HeapArc<RwLock<PerlArray>>),
 
     /// The explicitly requested immutable mode (§2.2.12 amendment): O(1) snapshots, O(1) both-end operations.
     #[cfg(feature = "imbl")]
@@ -597,7 +597,7 @@ impl Default for Array {
 impl Array {
     /// The default engine (§2.2.12): the front-gap header in its own exactly-sized allocation.
     pub fn new() -> Array {
-        Array::Gap(HeapArc::new(RwLock::new(GapArray::new())))
+        Array::Perl(HeapArc::new(RwLock::new(PerlArray::new())))
     }
 
     /// The immutable mode (§2.2.12 amendment), on explicit request only.
@@ -609,9 +609,11 @@ impl Array {
     /// Identity comparison: the same shared allocation.
     pub fn ptr_eq(a: &Array, b: &Array) -> bool {
         match (a, b) {
-            (Array::Gap(x), Array::Gap(y)) => HeapArc::ptr_eq(x, y),
+            (Array::Perl(x), Array::Perl(y)) => HeapArc::ptr_eq(x, y),
+
             #[cfg(feature = "imbl")]
             (Array::Immutable(x), Array::Immutable(y)) => HeapArc::ptr_eq(x, y),
+
             #[cfg_attr(not(feature = "imbl"), expect(unreachable_patterns, reason = "with one engine the gap arm is the whole match"))]
             _ => false,
         }
@@ -620,7 +622,8 @@ impl Array {
     /// The address perl exposes when the reference is numified or stringified.
     pub fn addr(&self) -> usize {
         match self {
-            Array::Gap(a) => HeapArc::as_ptr(a) as usize,
+            Array::Perl(a) => HeapArc::as_ptr(a) as usize,
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => HeapArc::as_ptr(a) as usize,
         }
@@ -628,7 +631,8 @@ impl Array {
 
     pub fn len(&self) -> usize {
         match self {
-            Array::Gap(a) => a.read().len(),
+            Array::Perl(a) => a.read().len(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => a.read().vec.len(),
         }
@@ -642,7 +646,8 @@ impl Array {
     /// indices alike.
     pub fn get(&self, index: usize) -> Option<Value> {
         match self {
-            Array::Gap(a) => a.read().get(index).cloned(),
+            Array::Perl(a) => a.read().get(index).cloned(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => a.read().vec.get(index).and_then(|slot| slot.clone()),
         }
@@ -656,7 +661,8 @@ impl Array {
     /// `$a[$i] = $v`: extends with holes below (container-verified).
     pub fn set(&self, index: usize, value: Value) -> Result<(), ScalarError> {
         match self {
-            Array::Gap(a) => a.write().set(index, value),
+            Array::Perl(a) => a.write().set(index, value),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -672,7 +678,8 @@ impl Array {
     /// (container-verified: `\$a[3]` on empty yields length 4 with an existing undef element).
     pub fn ensure_element<R>(&self, index: usize, f: impl FnOnce(&mut Value) -> R) -> Result<R, ScalarError> {
         match self {
-            Array::Gap(a) => Ok(f(a.write().ensure_element(index)?)),
+            Array::Perl(a) => Ok(f(a.write().ensure_element(index)?)),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -690,7 +697,8 @@ impl Array {
     /// truncates through trailing holes.
     pub fn delete(&self, index: usize) -> Result<Value, ScalarError> {
         match self {
-            Array::Gap(a) => a.write().delete(index),
+            Array::Perl(a) => a.write().delete(index),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -710,7 +718,8 @@ impl Array {
     /// `push @a, $v` (single element; list forms loop at the ops layer).
     pub fn push_value(&self, value: Value) -> Result<(), ScalarError> {
         match self {
-            Array::Gap(a) => a.write().push_value(value),
+            Array::Perl(a) => a.write().push_value(value),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -724,7 +733,8 @@ impl Array {
     /// `pop @a`: undef for an empty array or a trailing hole; shortens by one.
     pub fn pop_value(&self) -> Result<Value, ScalarError> {
         match self {
-            Array::Gap(a) => a.write().pop_value(),
+            Array::Perl(a) => a.write().pop_value(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -738,7 +748,8 @@ impl Array {
     /// `pop_front`.
     pub fn shift_value(&self) -> Result<Value, ScalarError> {
         match self {
-            Array::Gap(a) => a.write().shift_value(),
+            Array::Perl(a) => a.write().shift_value(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -751,7 +762,8 @@ impl Array {
     /// `unshift @a, $v`: the gap engine's two-phase strategy (§2.2.12), the RRB tree's `push_front`.
     pub fn unshift_value(&self, value: Value) -> Result<(), ScalarError> {
         match self {
-            Array::Gap(a) => a.write().unshift_value(value),
+            Array::Perl(a) => a.write().unshift_value(value),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -765,7 +777,8 @@ impl Array {
     /// `@a = ()`.
     pub fn clear(&self) -> Result<(), ScalarError> {
         match self {
-            Array::Gap(a) => a.write().clear(),
+            Array::Perl(a) => a.write().clear(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 let mut e = a.write();
@@ -780,7 +793,8 @@ impl Array {
 
     pub fn set_readonly(&self, readonly: bool) {
         match self {
-            Array::Gap(a) => a.write().set_readonly(readonly),
+            Array::Perl(a) => a.write().set_readonly(readonly),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => a.write().readonly = readonly,
         }
@@ -788,7 +802,8 @@ impl Array {
 
     pub fn is_readonly(&self) -> bool {
         match self {
-            Array::Gap(a) => a.read().is_readonly(),
+            Array::Perl(a) => a.read().is_readonly(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => a.read().readonly,
         }
@@ -812,11 +827,12 @@ impl Array {
     #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
     pub(crate) fn for_each_value(&self, mut f: impl FnMut(&Value)) {
         match self {
-            Array::Gap(a) => {
+            Array::Perl(a) => {
                 for v in a.read().values_iter() {
                     f(v);
                 }
             }
+
             #[cfg(feature = "imbl")]
             Array::Immutable(a) => {
                 for v in a.read().vec.iter().flatten() {
@@ -830,7 +846,8 @@ impl Array {
     #[cfg(test)]
     pub(crate) fn probe_geometry(&self) -> (usize, usize, usize, bool) {
         match self {
-            Array::Gap(a) => a.read().probe_geometry(),
+            Array::Perl(a) => a.read().probe_geometry(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(_) => (0, self.len(), 0, false),
         }
@@ -839,7 +856,8 @@ impl Array {
     #[cfg(test)]
     pub(crate) fn probe_base(&self) -> *const ArraySlot {
         match self {
-            Array::Gap(a) => a.read().probe_base(),
+            Array::Perl(a) => a.read().probe_base(),
+
             #[cfg(feature = "imbl")]
             Array::Immutable(_) => std::ptr::null(),
         }
@@ -848,7 +866,7 @@ impl Array {
     #[cfg(test)]
     pub(crate) fn force_large_for_test(&self) {
         #[cfg_attr(not(feature = "imbl"), expect(irrefutable_let_patterns, reason = "one engine without imbl"))]
-        if let Array::Gap(a) = self {
+        if let Array::Perl(a) = self {
             a.write().force_large_for_test();
         }
     }
@@ -862,8 +880,9 @@ impl Array {
 /// wins) under every engine.  Locks are internal: reads clone out, lvalue access is closure-shaped.
 #[derive(Clone)]
 pub enum Hash {
-    /// The default: SwissTable buckets, per-hash SipHash keys, and the `each` cursor as a bucket index.
-    Bucket(HeapArc<RwLock<BucketHash>>),
+    /// The default: SwissTable buckets, per-hash SipHash keys, and the `each` cursor as a bucket index — stock
+    /// perl hash semantics.
+    Perl(HeapArc<RwLock<PerlHash>>),
 
     /// The explicitly requested insertion-ordered mode (§2.2.10): the `each` cursor is an entry index.
     #[cfg(feature = "indexmap")]
@@ -875,7 +894,7 @@ pub enum Hash {
 }
 
 /// The default bucket engine (§2.2.13).
-pub struct BucketHash {
+pub struct PerlHash {
     table: HashTable<(PString, Value)>,
     hasher: RandomState,
     cursor: usize,
@@ -901,6 +920,7 @@ pub struct ImmutableHash {
 
 #[cfg(feature = "imbl")]
 type ImblMap = imbl::HashMap<PString, Value>;
+
 #[cfg(feature = "imbl")]
 pub(crate) type ImblIter = <ImblMap as IntoIterator>::IntoIter;
 
@@ -935,13 +955,13 @@ impl Default for Hash {
 impl Hash {
     /// The default engine (§2.2.13): buckets, per-hash random iteration order.
     pub fn new() -> Hash {
-        Hash::Bucket(HeapArc::new(RwLock::new(BucketHash { table: HashTable::new(), hasher: RandomState::new(), cursor: 0, readonly: false })))
+        Hash::Perl(HeapArc::new(RwLock::new(PerlHash { table: HashTable::new(), hasher: RandomState::new(), cursor: 0, readonly: false })))
     }
 
     /// The insertion-ordered mode (§2.2.13), on explicit request only; the perl-visible request surface is the runtime
     /// design's.
     #[cfg(feature = "indexmap")]
-    pub fn insertion_ordered() -> Hash {
+    pub fn ordered() -> Hash {
         Hash::Ordered(HeapArc::new(RwLock::new(OrderedHash { map: IndexMap::new(), cursor: 0, readonly: false })))
     }
 
@@ -954,11 +974,14 @@ impl Hash {
     /// Identity comparison: the same shared allocation (engines never compare equal across kinds).
     pub fn ptr_eq(a: &Hash, b: &Hash) -> bool {
         match (a, b) {
-            (Hash::Bucket(x), Hash::Bucket(y)) => HeapArc::ptr_eq(x, y),
+            (Hash::Perl(x), Hash::Perl(y)) => HeapArc::ptr_eq(x, y),
+
             #[cfg(feature = "indexmap")]
             (Hash::Ordered(x), Hash::Ordered(y)) => HeapArc::ptr_eq(x, y),
+
             #[cfg(feature = "imbl")]
             (Hash::Immutable(x), Hash::Immutable(y)) => HeapArc::ptr_eq(x, y),
+
             #[cfg_attr(
                 not(any(feature = "indexmap", feature = "imbl")),
                 expect(unreachable_patterns, reason = "with one engine the bucket arm is the whole match")
@@ -970,9 +993,11 @@ impl Hash {
     /// The address perl exposes when the reference is numified or stringified.
     pub fn addr(&self) -> usize {
         match self {
-            Hash::Bucket(a) => HeapArc::as_ptr(a) as usize,
+            Hash::Perl(a) => HeapArc::as_ptr(a) as usize,
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(a) => HeapArc::as_ptr(a) as usize,
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(a) => HeapArc::as_ptr(a) as usize,
         }
@@ -980,9 +1005,11 @@ impl Hash {
 
     pub fn len(&self) -> usize {
         match self {
-            Hash::Bucket(a) => a.read().table.len(),
+            Hash::Perl(a) => a.read().table.len(),
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(a) => a.read().map.len(),
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(a) => a.read().map.len(),
         }
@@ -1001,7 +1028,7 @@ impl Hash {
     pub fn store(&self, key: PString, value: Value) -> Result<(), ScalarError> {
         let key = launder(key);
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let mut e = arc.write();
                 check_writable(e.readonly)?;
                 let hash = e.hasher.hash_one(&key);
@@ -1013,12 +1040,14 @@ impl Hash {
                     e.table.insert_unique(hash, (key, value), |(stored, _)| e.hasher.hash_one(stored));
                 }
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 let mut e = arc.write();
                 check_writable(e.readonly)?;
                 e.map.insert(key, value);
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 let mut e = arc.write();
@@ -1037,12 +1066,14 @@ impl Hash {
     /// shared values.
     pub fn get(&self, key: &PString) -> Option<Value> {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let e = arc.read();
                 e.table.find(e.hasher.hash_one(key), |(stored, _)| stored == key).map(|(_, value)| value.clone())
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => arc.read().map.get(key).cloned(),
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => arc.read().map.get(key).cloned(),
         }
@@ -1051,12 +1082,14 @@ impl Hash {
     /// `exists $h{$k}`: absence of the entry is nonexistence (§2.2.1 — no slot wrapper).
     pub fn exists(&self, key: &PString) -> bool {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let e = arc.read();
                 e.table.find(e.hasher.hash_one(key), |(stored, _)| stored == key).is_some()
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => arc.read().map.contains_key(key),
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => arc.read().map.contains_key(key),
         }
@@ -1068,7 +1101,7 @@ impl Hash {
     pub fn entry_or_undef<R>(&self, key: PString, f: impl FnOnce(&mut Value) -> R) -> Result<R, ScalarError> {
         let key = launder(key);
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let mut e = arc.write();
                 check_writable(e.readonly)?;
                 let hash = e.hasher.hash_one(&key);
@@ -1082,12 +1115,14 @@ impl Hash {
                 };
                 Ok(f(&mut entry.into_mut().1))
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 let mut e = arc.write();
                 check_writable(e.readonly)?;
                 Ok(f(e.map.entry(key).or_default()))
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 let mut e = arc.write();
@@ -1103,7 +1138,7 @@ impl Hash {
     /// makes delete-current exact.  Immutable engine: the parked walk revalidates live.)
     pub fn delete(&self, key: &PString) -> Result<Value, ScalarError> {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let mut e = arc.write();
                 check_writable(e.readonly)?;
                 let hash = e.hasher.hash_one(key);
@@ -1115,6 +1150,7 @@ impl Hash {
                     Err(_) => Ok(Value::default()),
                 }
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 let mut e = arc.write();
@@ -1128,6 +1164,7 @@ impl Hash {
                 }
                 Ok(value)
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 let mut e = arc.write();
@@ -1140,7 +1177,7 @@ impl Hash {
     /// `each %h`: yield the next pair, or `None` once at exhaustion (then restart — container-verified).
     pub fn each(&self) -> Option<(PString, Value)> {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let mut e = arc.write();
                 let e = &mut *e;
                 let end = e.table.num_buckets();
@@ -1154,6 +1191,7 @@ impl Hash {
                 e.cursor = 0;
                 None
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 let mut e = arc.write();
@@ -1169,6 +1207,7 @@ impl Hash {
                     }
                 }
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 // §2.2.13: walk an O(1) snapshot through an owning iterator, revalidating live — deleted keys are
@@ -1190,17 +1229,19 @@ impl Hash {
     /// `keys %h`: resets the iterator (container-verified); shares `each`'s scan order (§2.2.13).
     pub fn keys(&self) -> Vec<PString> {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let mut e = arc.write();
                 e.cursor = 0;
                 (0..e.table.num_buckets()).filter_map(|b| e.table.get_bucket(b)).map(|(k, _)| k.clone()).collect()
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 let mut e = arc.write();
                 e.cursor = 0;
                 e.map.keys().cloned().collect()
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 let mut e = arc.write();
@@ -1213,17 +1254,19 @@ impl Hash {
     /// `values %h`: resets the iterator; corresponds to `keys` order (container-verified).
     pub fn values(&self) -> Vec<Value> {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let mut e = arc.write();
                 e.cursor = 0;
                 (0..e.table.num_buckets()).filter_map(|b| e.table.get_bucket(b)).map(|(_, v)| v.clone()).collect()
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 let mut e = arc.write();
                 e.cursor = 0;
                 e.map.values().cloned().collect()
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 let mut e = arc.write();
@@ -1236,7 +1279,7 @@ impl Hash {
     /// `%h = ()`.
     pub fn clear(&self) -> Result<(), ScalarError> {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let mut e = arc.write();
                 check_writable(e.readonly)?;
                 e.cursor = 0;
@@ -1244,6 +1287,7 @@ impl Hash {
                     release_value(v);
                 }
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 let mut e = arc.write();
@@ -1253,6 +1297,7 @@ impl Hash {
                     release_value(v);
                 }
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 let mut e = arc.write();
@@ -1268,9 +1313,11 @@ impl Hash {
 
     pub fn set_readonly(&self, readonly: bool) {
         match self {
-            Hash::Bucket(arc) => arc.write().readonly = readonly,
+            Hash::Perl(arc) => arc.write().readonly = readonly,
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => arc.write().readonly = readonly,
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => arc.write().readonly = readonly,
         }
@@ -1278,9 +1325,11 @@ impl Hash {
 
     pub fn is_readonly(&self) -> bool {
         match self {
-            Hash::Bucket(arc) => arc.read().readonly,
+            Hash::Perl(arc) => arc.read().readonly,
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => arc.read().readonly,
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => arc.read().readonly,
         }
@@ -1304,7 +1353,7 @@ impl Hash {
     #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
     pub(crate) fn for_each_value(&self, mut f: impl FnMut(&Value)) {
         match self {
-            Hash::Bucket(arc) => {
+            Hash::Perl(arc) => {
                 let e = arc.read();
                 for b in 0..e.table.num_buckets() {
                     if let Some((_, v)) = e.table.get_bucket(b) {
@@ -1312,12 +1361,14 @@ impl Hash {
                     }
                 }
             }
+
             #[cfg(feature = "indexmap")]
             Hash::Ordered(arc) => {
                 for v in arc.read().map.values() {
                     f(v);
                 }
             }
+
             #[cfg(feature = "imbl")]
             Hash::Immutable(arc) => {
                 for v in arc.read().map.values() {
@@ -1328,9 +1379,9 @@ impl Hash {
     }
 }
 
-impl fmt::Debug for BucketHash {
+impl fmt::Debug for PerlHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BucketHash").field("len", &self.table.len()).finish_non_exhaustive()
+        f.debug_struct("PerlHash").field("len", &self.table.len()).finish_non_exhaustive()
     }
 }
 
@@ -1348,7 +1399,7 @@ impl fmt::Debug for ImmutableHash {
     }
 }
 
-impl Drop for BucketHash {
+impl Drop for PerlHash {
     /// Iterative teardown (§2.4.9): values route through the release worklist; keys are strings and cannot recurse.
     fn drop(&mut self) {
         for (_key, v) in self.table.drain() {
@@ -1359,7 +1410,7 @@ impl Drop for BucketHash {
 
 #[cfg(feature = "indexmap")]
 impl Drop for OrderedHash {
-    /// Iterative teardown (§2.4.9), as [`BucketHash`]'s.
+    /// Iterative teardown (§2.4.9), as [`PerlHash`]'s.
     fn drop(&mut self) {
         for (_key, v) in self.map.drain(..) {
             release_value(v);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::scalar::Referent;
 use crate::string::DECODE_MAX;
 use crate::value::{Tainted, Value};
 
@@ -9,7 +10,7 @@ fn both_engines() -> Vec<Hash> {
     let mut engines = vec![Hash::new()];
 
     #[cfg(feature = "indexmap")]
-    engines.push(Hash::insertion_ordered());
+    engines.push(Hash::ordered());
 
     #[cfg(feature = "imbl")]
     engines.push(Hash::immutable());
@@ -423,7 +424,7 @@ fn immutable_array_snapshots_are_detached_diverging_copies() {
 #[test]
 fn ordered_mode_iterates_in_insertion_order() {
     // The mode's reason to exist: a pinned, predictable order on explicit request.
-    let h = Hash::insertion_ordered();
+    let h = Hash::ordered();
     for k in ["delta", "alpha", "omega", "beta"] {
         h.store(key(k), int(1)).unwrap();
     }
@@ -517,8 +518,9 @@ fn bucket_delete_exactness_canary() {
 #[test]
 fn snapshot_is_supported_only_on_the_immutable_engine() {
     assert_eq!(Hash::new().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+
     #[cfg(feature = "indexmap")]
-    assert_eq!(Hash::insertion_ordered().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+    assert_eq!(Hash::ordered().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
 }
 
 #[cfg(feature = "imbl")]
@@ -634,11 +636,12 @@ fn concurrency_foundation_send_sync() {
     assert_send_sync::<Value>();
     assert_send_sync::<Hash>();
     assert_send_sync::<Array>();
-    assert_send_sync::<crate::scalar::Referent>();
+    assert_send_sync::<Referent>();
 
     // The immutable engine's map and parked iterator must cross threads with the rest.
     #[cfg(feature = "imbl")]
     assert_send_sync::<imbl::HashMap<PString, Value>>();
+
     #[cfg(feature = "imbl")]
     assert_send_sync::<imbl::Vector<ArraySlot>>();
 }

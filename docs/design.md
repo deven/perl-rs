@@ -2004,7 +2004,7 @@ the §2.2.13 shape: the public enum of per-engine shared
 identities, each arm an `HeapArc<RwLock<…>>` over its own engine,
 itself the cheap-clone handle — `ArrayRef` dissolves into it and
 the handle macro dies with its last user.  The default engine is
-`GapArray`, the front-gap header above, in its own exactly-sized
+`PerlArray`, the front-gap header above, in its own exactly-sized
 allocation; behind the `imbl` feature, `ImmutableArray` is an
 `imbl::Vector` of the same slots — an RRB tree with O(1) clones,
 O(1) amortized operations at *both* ends (`shift` and `unshift`
@@ -2030,7 +2030,7 @@ struct:
 
 ```rust
 pub enum Hash {
-    Bucket(HeapArc<RwLock<BucketHash>>),
+    Perl(HeapArc<RwLock<PerlHash>>),            // default
     Ordered(HeapArc<RwLock<OrderedHash>>),      // indexmap
     Immutable(HeapArc<RwLock<ImmutableHash>>),  // imbl
 }
@@ -2105,9 +2105,8 @@ safe SwissTable with public bucket addressing (`num_buckets`,
 requested insertion-ordered mode: perl code has real uses for a
 predictable order (`Hash::Ordered`-shaped work), but it must ask
 for it, and the surface through which perl code asks is deferred
-to the runtime design [DECISION].  Construction is
-`Hash::new` for the default and
-`Hash::insertion_ordered` for the mode; the handle, the
+to the runtime design [DECISION].  Construction is `Hash::new`
+for the default and `Hash::ordered` for the mode; the handle, the
 public method surface, and the container-verified semantics are
 identical across engines.
 

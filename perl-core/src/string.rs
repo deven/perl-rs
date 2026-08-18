@@ -3326,6 +3326,7 @@ impl PartialEq for PString {
             let hi = fb[i..end].iter().fold(0u8, |a, &b| a | b) & 0x80 != 0;
             if !hi {
                 let n = end - i;
+
                 #[cfg(test)]
                 eq_probe::WALK_CHARS.with(|w| w.set(w.get() + n));
 
