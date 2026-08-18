@@ -1,5 +1,5 @@
-//! `Array` and `Hash` — the containers (§2.2.1) — `Array` behind its Arc-backed `ArrayRef`, `Hash` as its own enum of
-//! per-engine shared identities (§2.2.13).
+//! `Array` and `Hash` — the containers (§2.2.1) — each the public enum of its per-engine shared identities (§2.2.13):
+//! `Array` over `GapArray` and `ImmutableArray`, `Hash` over its three.
 //!
 //! Container-verified semantics encoded here:
 //!
@@ -19,7 +19,7 @@
 
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::RwLock;
 use std::alloc::Layout;
 use std::collections::hash_map::RandomState;
 use std::fmt;
@@ -39,7 +39,7 @@ use imbl;
 #[cfg(feature = "indexmap")]
 use indexmap::IndexMap;
 
-// ── Array (§2.2.1, §2.2.12) ───────────────────────────────────
+// ── Array (§2.2.1, §2.2.12, §2.2.13) ─────────────────────────────
 /// The front-gap slot engine (§2.2.12), shaped on perl's AV: an allocation whose live window floats behind a gap, so
 /// `shift` is an O(1) window slide and `unshift` reclaims the gap before any element moves.  `None` = a hole
 /// (nonexistent element); `Some(Undef)` = an existing element holding undef.
@@ -48,7 +48,7 @@ use indexmap::IndexMap;
 /// discriminant byte the §2.4.3 budget does not have.  Small arrays keep `ptr` as the buffer base with `u32` geometry;
 /// past `u32` the geometry spills to a boxed wide header and `ptr` holds that box (`FLAG_LARGE`), the `Heap32`/`Heap`
 /// philosophy applied to arrays.  Bits 8..32 of `stash_flags` are the reserved bless stash (u24).
-pub struct Array {
+pub struct GapArray {
     /// Small: the buffer base (dangling when unallocated).  Large: the boxed [`Geometry`].
     ptr: NonNull<ArraySlot>,
     start: u32,
@@ -57,7 +57,7 @@ pub struct Array {
     stash_flags: u32,
 }
 
-const _: () = assert!(size_of::<Array>() == 24);
+const _: () = assert!(size_of::<GapArray>() == 24);
 
 /// The dynamic readonly flag's bit.
 const FLAG_READONLY: u32 = 1;
@@ -67,10 +67,10 @@ const FLAG_LARGE: u32 = 2;
 
 // SAFETY: the raw pointer is exclusively owned storage of `Send + Sync` slots; sharing is external (§2.2.1: the
 // handle's lock).
-unsafe impl Send for Array {}
+unsafe impl Send for GapArray {}
 
-// SAFETY: as above — `&Array` exposes no interior mutability.
-unsafe impl Sync for Array {}
+// SAFETY: as above — `&GapArray` exposes no interior mutability.
+unsafe impl Sync for GapArray {}
 
 /// The width-agnostic geometry the engine operates on: buffer base, gap size, live count, and usable slots from the
 /// gap's end.  Total allocation is `start + cap` slots, every one an initialized `ArraySlot` (gap and tail spare hold
@@ -190,13 +190,26 @@ impl Geometry {
     }
 }
 
-impl Default for Array {
-    fn default() -> Array {
-        Array::new()
+impl Default for GapArray {
+    fn default() -> GapArray {
+        GapArray::new()
     }
 }
 
-impl Drop for Array {
+impl fmt::Debug for GapArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GapArray").field("len", &self.len()).finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "imbl")]
+impl fmt::Debug for ImmutableArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImmutableArray").field("len", &self.vec.len()).finish_non_exhaustive()
+    }
+}
+
+impl Drop for GapArray {
     /// Iterative teardown (§2.4.9): drain elements through the release worklist rather than recursing through drop
     /// glue.  Destruction is not perl-visible mutation, so the readonly flag is deliberately not consulted.
     fn drop(&mut self) {
@@ -211,9 +224,9 @@ impl Drop for Array {
     }
 }
 
-impl Array {
-    pub fn new() -> Array {
-        Array { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0, stash_flags: 0 }
+impl GapArray {
+    pub fn new() -> GapArray {
+        GapArray { ptr: NonNull::dangling(), start: 0, len: 0, cap: 0, stash_flags: 0 }
     }
 
     fn is_large(&self) -> bool {
@@ -234,7 +247,7 @@ impl Array {
     /// Take the geometry out, leaving the header empty (the teardown door).
     fn take_parts(&mut self) -> Geometry {
         if self.is_large() {
-            // SAFETY: as [`Array::parts`]; the box is reclaimed and the flag dropped, so ownership moves out.
+            // SAFETY: as [`GapArray::parts`]; the box is reclaimed and the flag dropped, so ownership moves out.
             let wide = unsafe { Box::from_raw(self.ptr.cast::<Geometry>().as_ptr()) };
             self.stash_flags &= !FLAG_LARGE;
             self.ptr = NonNull::dangling();
@@ -256,7 +269,7 @@ impl Array {
     fn store_parts(&mut self, parts: Geometry) {
         let fits = parts.start <= u32::MAX as usize && parts.len <= u32::MAX as usize && parts.cap <= u32::MAX as usize;
         if self.is_large() {
-            // SAFETY: as [`Array::parts`]; the box stays the owner, its contents replaced.
+            // SAFETY: as [`GapArray::parts`]; the box stays the owner, its contents replaced.
             unsafe { *self.ptr.cast::<Geometry>().as_ptr() = parts };
         } else if fits {
             self.ptr = parts.ptr;
@@ -292,7 +305,7 @@ impl Array {
     }
 
     /// Read access: never creates.  `None` for holes and out-of-range indices alike (the exists/defined distinction
-    /// goes through [`Array::exists`]).
+    /// goes through [`GapArray::exists`]).
     pub fn get(&self, index: usize) -> Option<&Value> {
         let parts = self.parts();
         if index >= parts.len {
@@ -330,7 +343,7 @@ impl Array {
         self.check_writable()?;
 
         self.with_parts(|parts| {
-            Array::extend_to(parts, index)?;
+            GapArray::extend_to(parts, index)?;
             parts.live_mut()[index] = Some(value);
 
             Ok(())
@@ -344,7 +357,7 @@ impl Array {
         self.check_writable()?;
 
         let mut parts = self.parts();
-        Array::extend_to(&mut parts, index)?;
+        GapArray::extend_to(&mut parts, index)?;
         self.store_parts(parts);
         let parts = self.parts();
 
@@ -380,7 +393,7 @@ impl Array {
 
         self.with_parts(|parts| {
             let index = parts.len;
-            Array::extend_to(parts, index)?;
+            GapArray::extend_to(parts, index)?;
             parts.live_mut()[index] = Some(value);
 
             Ok(())
@@ -498,8 +511,7 @@ impl Array {
         self.stash_flags & FLAG_READONLY != 0
     }
 
-    /// The graph traversal hook (§2.4.6 demolition, §2.4.11 cycle detection): existing elements only.
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
+    /// The graph traversal walk over the live window, consumed by [`Array::for_each_value`].
     pub(crate) fn values_iter(&self) -> impl Iterator<Item = &Value> {
         let parts = self.parts();
 
@@ -529,6 +541,315 @@ impl Array {
             let boxed = Box::new(parts);
             self.ptr = NonNull::from(Box::leak(boxed)).cast();
             self.stash_flags |= FLAG_LARGE;
+        }
+    }
+}
+
+// ── Array: the per-engine identities (§2.2.12, §2.2.13) ──────────
+/// The immutable array engine (§2.2.12 amendment): an RRB tree over the same slots — O(1) clones and O(1)
+/// amortized operations at both ends, O(log32) indexing as the recorded tradeoff.  No cursor state exists at this
+/// layer, so the lock guards only the root swap and the readonly flag.
+#[cfg(feature = "imbl")]
+pub struct ImmutableArray {
+    vec: imbl::Vector<ArraySlot>,
+    readonly: bool,
+}
+
+#[cfg(feature = "imbl")]
+impl ImmutableArray {
+    fn extend_to(&mut self, index: usize) {
+        while self.vec.len() <= index {
+            self.vec.push_back(None);
+        }
+    }
+}
+
+#[cfg(feature = "imbl")]
+impl Drop for ImmutableArray {
+    /// Iterative teardown (§2.4.9): values route through the release worklist; a co-owner's drain nets zero on
+    /// shared values, the final owner's moves them out.
+    fn drop(&mut self) {
+        for v in std::mem::take(&mut self.vec).into_iter().flatten() {
+            release_value(v);
+        }
+    }
+}
+
+/// The per-engine array (§2.2.12, §2.2.13): the public enum of shared identities, itself the cheap-clone handle,
+/// fixed at construction (construction-final, §2.2.13).  Locks are internal: reads clone out, lvalue access is
+/// closure-shaped.
+#[derive(Clone)]
+pub enum Array {
+    /// The default: the front-gap engine (§2.2.12).
+    Gap(HeapArc<RwLock<GapArray>>),
+
+    /// The explicitly requested immutable mode (§2.2.12 amendment): O(1) snapshots, O(1) both-end operations.
+    #[cfg(feature = "imbl")]
+    Immutable(HeapArc<RwLock<ImmutableArray>>),
+}
+
+impl Default for Array {
+    fn default() -> Array {
+        Array::new()
+    }
+}
+
+impl Array {
+    /// The default engine (§2.2.12): the front-gap header in its own exactly-sized allocation.
+    pub fn new() -> Array {
+        Array::Gap(HeapArc::new(RwLock::new(GapArray::new())))
+    }
+
+    /// The immutable mode (§2.2.12 amendment), on explicit request only.
+    #[cfg(feature = "imbl")]
+    pub fn immutable() -> Array {
+        Array::Immutable(HeapArc::new(RwLock::new(ImmutableArray { vec: imbl::Vector::new(), readonly: false })))
+    }
+
+    /// Identity comparison: the same shared allocation.
+    pub fn ptr_eq(a: &Array, b: &Array) -> bool {
+        match (a, b) {
+            (Array::Gap(x), Array::Gap(y)) => HeapArc::ptr_eq(x, y),
+            #[cfg(feature = "imbl")]
+            (Array::Immutable(x), Array::Immutable(y)) => HeapArc::ptr_eq(x, y),
+            #[cfg_attr(not(feature = "imbl"), expect(unreachable_patterns, reason = "with one engine the gap arm is the whole match"))]
+            _ => false,
+        }
+    }
+
+    /// The address perl exposes when the reference is numified or stringified.
+    pub fn addr(&self) -> usize {
+        match self {
+            Array::Gap(a) => HeapArc::as_ptr(a) as usize,
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => HeapArc::as_ptr(a) as usize,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Array::Gap(a) => a.read().len(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => a.read().vec.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read access, cloned out (§2.2.13: no borrow escapes the internal lock): `None` for holes and out-of-range
+    /// indices alike.
+    pub fn get(&self, index: usize) -> Option<Value> {
+        match self {
+            Array::Gap(a) => a.read().get(index).cloned(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => a.read().vec.get(index).and_then(|slot| slot.clone()),
+        }
+    }
+
+    /// `exists $a[$i]`: present and occupied.
+    pub fn exists(&self, index: usize) -> bool {
+        self.get(index).is_some()
+    }
+
+    /// `$a[$i] = $v`: extends with holes below (container-verified).
+    pub fn set(&self, index: usize, value: Value) -> Result<(), ScalarError> {
+        match self {
+            Array::Gap(a) => a.write().set(index, value),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                e.extend_to(index);
+                e.vec.set(index, Some(value));
+                Ok(())
+            }
+        }
+    }
+
+    /// Lvalue access, closure-shaped (§2.2.13): vivify the undef element and run `f` on the slot's value
+    /// (container-verified: `\$a[3]` on empty yields length 4 with an existing undef element).
+    pub fn ensure_element<R>(&self, index: usize, f: impl FnOnce(&mut Value) -> R) -> Result<R, ScalarError> {
+        match self {
+            Array::Gap(a) => Ok(f(a.write().ensure_element(index)?)),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                e.extend_to(index);
+                let Some(slot) = e.vec.get_mut(index) else {
+                    return Err(ScalarError::ReadOnly);
+                };
+                Ok(f(slot.get_or_insert_with(Value::default)))
+            }
+        }
+    }
+
+    /// `delete $a[$i]` (§2.2.1, container-verified): returns the deleted value; deleting the last element
+    /// truncates through trailing holes.
+    pub fn delete(&self, index: usize) -> Result<Value, ScalarError> {
+        match self {
+            Array::Gap(a) => a.write().delete(index),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                if index >= e.vec.len() {
+                    return Ok(Value::default());
+                }
+                let deleted = e.vec.get_mut(index).and_then(Option::take).unwrap_or_default();
+                while e.vec.last().is_some_and(Option::is_none) {
+                    e.vec.pop_back();
+                }
+                Ok(deleted)
+            }
+        }
+    }
+
+    /// `push @a, $v` (single element; list forms loop at the ops layer).
+    pub fn push_value(&self, value: Value) -> Result<(), ScalarError> {
+        match self {
+            Array::Gap(a) => a.write().push_value(value),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                e.vec.push_back(Some(value));
+                Ok(())
+            }
+        }
+    }
+
+    /// `pop @a`: undef for an empty array or a trailing hole; shortens by one.
+    pub fn pop_value(&self) -> Result<Value, ScalarError> {
+        match self {
+            Array::Gap(a) => a.write().pop_value(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                Ok(e.vec.pop_back().flatten().unwrap_or_default())
+            }
+        }
+    }
+
+    /// `shift @a`: O(1) under either engine — the gap engine's window slide (§2.2.12), the RRB tree's
+    /// `pop_front`.
+    pub fn shift_value(&self) -> Result<Value, ScalarError> {
+        match self {
+            Array::Gap(a) => a.write().shift_value(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                Ok(e.vec.pop_front().flatten().unwrap_or_default())
+            }
+        }
+    }
+
+    /// `unshift @a, $v`: the gap engine's two-phase strategy (§2.2.12), the RRB tree's `push_front`.
+    pub fn unshift_value(&self, value: Value) -> Result<(), ScalarError> {
+        match self {
+            Array::Gap(a) => a.write().unshift_value(value),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                e.vec.push_front(Some(value));
+                Ok(())
+            }
+        }
+    }
+
+    /// `@a = ()`.
+    pub fn clear(&self) -> Result<(), ScalarError> {
+        match self {
+            Array::Gap(a) => a.write().clear(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let mut e = a.write();
+                check_writable(e.readonly)?;
+                for v in std::mem::take(&mut e.vec).into_iter().flatten() {
+                    release_value(v);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn set_readonly(&self, readonly: bool) {
+        match self {
+            Array::Gap(a) => a.write().set_readonly(readonly),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => a.write().readonly = readonly,
+        }
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        match self {
+            Array::Gap(a) => a.read().is_readonly(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => a.read().readonly,
+        }
+    }
+
+    /// An O(1) detached, diverging copy of an immutable-engine array (§2.2.12 amendment), readonly cleared; the
+    /// gap engine answers [`ScalarError::SnapshotUnsupported`], its copy being O(n).
+    pub fn snapshot(&self) -> Result<Array, ScalarError> {
+        match self {
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                let vec = a.read().vec.clone();
+                Ok(Array::Immutable(HeapArc::new(RwLock::new(ImmutableArray { vec, readonly: false }))))
+            }
+            _ => Err(ScalarError::SnapshotUnsupported),
+        }
+    }
+
+    /// The graph traversal hook (§2.4.6 demolition, §2.4.11 cycle detection): existing elements only, visited
+    /// under the read lock.
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumers are §2.4.6 demolition and the on-demand cycle detector"))]
+    pub(crate) fn for_each_value(&self, mut f: impl FnMut(&Value)) {
+        match self {
+            Array::Gap(a) => {
+                for v in a.read().values_iter() {
+                    f(v);
+                }
+            }
+            #[cfg(feature = "imbl")]
+            Array::Immutable(a) => {
+                for v in a.read().vec.iter().flatten() {
+                    f(v);
+                }
+            }
+        }
+    }
+
+    /// Test doors (§2.2.12 batteries), gap-engine geometry only.
+    #[cfg(test)]
+    pub(crate) fn probe_geometry(&self) -> (usize, usize, usize, bool) {
+        match self {
+            Array::Gap(a) => a.read().probe_geometry(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(_) => (0, self.len(), 0, false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_base(&self) -> *const ArraySlot {
+        match self {
+            Array::Gap(a) => a.read().probe_base(),
+            #[cfg(feature = "imbl")]
+            Array::Immutable(_) => std::ptr::null(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_large_for_test(&self) {
+        #[cfg_attr(not(feature = "imbl"), expect(irrefutable_let_patterns, reason = "one engine without imbl"))]
+        if let Array::Gap(a) = self {
+            a.write().force_large_for_test();
         }
     }
 }
@@ -1057,49 +1378,6 @@ impl Drop for ImmutableHash {
         }
     }
 }
-
-// ── The shared identities (§2.2.1: Arc-backed) ────────────────────
-macro_rules! container_handle {
-    ($handle:ident, $container:ident, $doc:literal) => {
-        #[doc = $doc]
-        #[derive(Clone)]
-        pub struct $handle(HeapArc<RwLock<$container>>);
-
-        impl $handle {
-            pub fn new(container: $container) -> $handle {
-                $handle(HeapArc::new(RwLock::new(container)))
-            }
-
-            /// Reference identity: what `==` on Perl references compares.
-            pub fn ptr_eq(a: &$handle, b: &$handle) -> bool {
-                HeapArc::ptr_eq(&a.0, &b.0)
-            }
-
-            /// The address perl exposes when the reference is numified or stringified.
-            pub fn addr(&self) -> usize {
-                HeapArc::as_ptr(&self.0) as usize
-            }
-
-            pub fn read(&self) -> RwLockReadGuard<'_, $container> {
-                self.0.read()
-            }
-
-            /// Container mutation goes through the lock; the dynamic readonly flag is checked per operation inside the
-            /// container (matching the cell model: acquiring the guard stays legal).
-            pub fn write(&self) -> RwLockWriteGuard<'_, $container> {
-                self.0.write()
-            }
-        }
-
-        impl fmt::Debug for $handle {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, concat!(stringify!($handle), "(0x{:x})"), self.addr())
-            }
-        }
-    };
-}
-
-container_handle!(ArrayRef, Array, "The Arc-backed shared array identity (§2.2.1).");
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

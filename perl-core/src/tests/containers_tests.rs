@@ -29,7 +29,7 @@ fn key(text: &str) -> PString {
 #[test]
 fn array_holes_below_length() {
     // Container-verified: $a[5] = "x" on empty — length 6, 0–4 nonexistent, 5 exists.
-    let mut a = Array::new();
+    let a = Array::new();
     a.set(5, int(1)).unwrap();
     assert_eq!(a.len(), 6);
     assert!(!a.exists(0));
@@ -42,15 +42,17 @@ fn array_holes_below_length() {
 #[test]
 fn array_ensure_element_vivifies_undef() {
     // Container-verified: \$a[3] on empty — length 4, element exists, undef.
-    let mut a = Array::new();
-    let slot = a.ensure_element(3).unwrap();
-    assert!(matches!(slot, Value::Undef | Value::UndefTainted));
+    let a = Array::new();
+    a.ensure_element(3, |slot| {
+        assert!(matches!(slot, Value::Undef | Value::UndefTainted));
+    })
+    .unwrap();
     assert_eq!(a.len(), 4);
     assert!(a.exists(3));
     assert!(!a.exists(0), "the get/ensure split: indices below stay holes");
 
     // Write-through: take a ref of the vivified slot, assign, observe (the \$a[3] round trip).
-    let r = Value::take_ref(a.ensure_element(3).unwrap());
+    let r = a.ensure_element(3, Value::take_ref).unwrap();
     r.deref_scalar().unwrap().write().unwrap().assign(Value::integer(5, Tainted::CLEAN)).unwrap();
     assert_eq!(a.get(3).unwrap().to_int(), 5, "$$r = 5 lands in the array");
 }
@@ -58,7 +60,7 @@ fn array_ensure_element_vivifies_undef() {
 #[test]
 fn array_delete_rules() {
     // Migrated §2.2.1 pins: delete-mid holes, delete-last truncates through trailing holes.
-    let mut a = Array::new();
+    let a = Array::new();
     for i in 0..3 {
         a.set(i, int(i as i64 + 1)).unwrap();
     }
@@ -74,7 +76,7 @@ fn array_delete_rules() {
 
 #[test]
 fn array_push_pop_shift_unshift() {
-    let mut a = Array::new();
+    let a = Array::new();
     a.push_value(int(1)).unwrap();
     a.push_value(int(2)).unwrap();
     a.unshift_value(int(0)).unwrap();
@@ -85,7 +87,7 @@ fn array_push_pop_shift_unshift() {
     assert!(matches!(a.pop_value().unwrap(), Value::Undef | Value::UndefTainted), "pop on empty is undef");
 
     // Pop after a sparse set: the value comes off; the holes remain (length 5, all holes).
-    let mut sparse = Array::new();
+    let sparse = Array::new();
     sparse.set(5, int(9)).unwrap();
     assert_eq!(sparse.pop_value().unwrap().to_int(), 9);
     assert_eq!(sparse.len(), 5);
@@ -96,13 +98,13 @@ fn array_push_pop_shift_unshift() {
 
 #[test]
 fn array_readonly() {
-    let mut a = Array::new();
+    let a = Array::new();
     a.set(0, int(1)).unwrap();
     a.set_readonly(true);
     assert_eq!(a.set(1, int(2)), Err(ScalarError::ReadOnly));
     assert_eq!(a.delete(0).map(|_| ()), Err(ScalarError::ReadOnly));
     assert_eq!(a.push_value(int(2)), Err(ScalarError::ReadOnly));
-    assert_eq!(a.ensure_element(3).map(|_| ()), Err(ScalarError::ReadOnly));
+    assert_eq!(a.ensure_element(3, |_| ()), Err(ScalarError::ReadOnly));
     assert_eq!(a.clear(), Err(ScalarError::ReadOnly));
     assert_eq!(a.get(0).unwrap().to_int(), 1, "reads stay legal");
     a.set_readonly(false);
@@ -258,7 +260,7 @@ fn hash_readonly() {
 // ── The §2.2.12 front-gap engine ──────────────────────────────
 #[test]
 fn shift_is_a_window_slide_and_unshift_reclaims_the_gap() {
-    let mut a = Array::new();
+    let a = Array::new();
     for i in 0..8 {
         a.push_value(int(i)).unwrap();
     }
@@ -285,7 +287,7 @@ fn shift_is_a_window_slide_and_unshift_reclaims_the_gap() {
 fn shortfall_unshift_carves_the_fill_back_as_gap() {
     // §2.2.12 phase two: with no gap, the slide is need + fill, and the fill's worth returns as fresh gap — the prepaid
     // buffer equals the live count.
-    let mut a = Array::new();
+    let a = Array::new();
     for i in 0..5 {
         a.push_value(int(i)).unwrap();
     }
@@ -313,7 +315,7 @@ fn shortfall_unshift_carves_the_fill_back_as_gap() {
 fn growth_follows_the_ruled_curve() {
     // §2.2.12: growth requests at least min_cap + cap/5, then harvests the allocator's class — so the landed capacity
     // is bounded below by the curve, never mere fit.
-    let mut a = Array::new();
+    let a = Array::new();
     a.set(9, int(1)).unwrap();
     let (_, _, cap_before, _) = a.probe_geometry();
     a.set(cap_before, int(2)).unwrap();
@@ -323,7 +325,7 @@ fn growth_follows_the_ruled_curve() {
 
 #[test]
 fn empty_shift_and_pop_return_undef() {
-    let mut a = Array::new();
+    let a = Array::new();
     assert!(matches!(a.shift_value().unwrap(), Value::Undef));
     assert!(matches!(a.pop_value().unwrap(), Value::Undef));
 }
@@ -332,7 +334,7 @@ fn empty_shift_and_pop_return_undef() {
 fn the_wide_arm_runs_the_same_battery() {
     // §2.2.12 spill parity: the boxed wide geometry serves the identical surface — the u32 overflow trigger being
     // untestable at 64 GiB, the arm is forced and exercised whole.
-    let mut a = Array::new();
+    let a = Array::new();
     a.push_value(int(0)).unwrap();
     a.force_large_for_test();
     assert!(a.probe_geometry().3, "the arm is wide");
@@ -351,10 +353,69 @@ fn the_wide_arm_runs_the_same_battery() {
     assert_eq!(a.delete(50).unwrap().to_int(), 50);
     assert_eq!(a.len(), 36, "trailing-hole truncation under the wide arm");
     assert_eq!(a.pop_value().unwrap().to_int(), 39);
-    let visited: usize = a.values_iter().count();
+    let mut visited = 0;
+    a.for_each_value(|_| visited += 1);
     assert_eq!(visited, 35);
     a.clear().unwrap();
     assert!(a.is_empty());
+}
+
+// ── The §2.2.12 immutable array engine ────────────────────────
+#[test]
+fn array_snapshot_is_supported_only_on_the_immutable_engine() {
+    assert_eq!(Array::new().snapshot().map(|_| ()), Err(ScalarError::SnapshotUnsupported));
+}
+
+#[cfg(feature = "imbl")]
+#[test]
+fn immutable_array_runs_the_semantic_battery() {
+    // The container-verified semantics are engine-independent: holes, vivification, truncation, both-end
+    // operations, and readonly all hold on the RRB engine.
+    let a = Array::immutable();
+    a.set(3, int(3)).unwrap();
+    assert_eq!(a.len(), 4);
+    assert!(!a.exists(0) && a.exists(3), "indices below a sparse set stay holes");
+    a.ensure_element(0, |slot| {
+        assert!(matches!(slot, Value::Undef | Value::UndefTainted));
+    })
+    .unwrap();
+    assert!(a.exists(0), "vivified undef exists");
+
+    a.unshift_value(int(100)).unwrap();
+    a.push_value(int(9)).unwrap();
+    assert_eq!(a.len(), 6);
+    assert_eq!(a.shift_value().unwrap().to_int(), 100);
+    assert_eq!(a.pop_value().unwrap().to_int(), 9);
+
+    assert_eq!(a.delete(3).unwrap().to_int(), 3, "deleting the last element…");
+    assert!(a.len() < 4, "…truncates through trailing holes");
+
+    a.set_readonly(true);
+    assert_eq!(a.push_value(int(1)), Err(ScalarError::ReadOnly));
+    a.set_readonly(false);
+    a.clear().unwrap();
+    assert!(a.is_empty());
+}
+
+#[cfg(feature = "imbl")]
+#[test]
+fn immutable_array_snapshots_are_detached_diverging_copies() {
+    let a = Array::immutable();
+    for i in 0..4 {
+        a.push_value(int(i)).unwrap();
+    }
+
+    let snap = a.snapshot().unwrap();
+    a.push_value(int(4)).unwrap();
+    a.shift_value().unwrap();
+    snap.push_value(int(99)).unwrap();
+
+    // The snapshot holds the moment: untouched by the original's divergence, diverging on its own.
+    assert_eq!(snap.len(), 5);
+    assert_eq!(snap.get(0).unwrap().to_int(), 0);
+    assert_eq!(snap.get(4).unwrap().to_int(), 99);
+    assert_eq!(a.len(), 4);
+    assert_eq!(a.get(0).unwrap().to_int(), 1);
 }
 
 // ── The §2.2.13 bucket-engine discipline ──────────────────────
@@ -538,17 +599,20 @@ fn immutable_each_revalidates_live() {
 // ── Handles ───────────────────────────────────────────────────
 #[test]
 fn handle_identity_and_traversal() {
-    let a = ArrayRef::new(Array::new());
+    // Array is its own handle (§2.2.13): clones share the identity, locks are internal.
+    let a = Array::new();
     let a2 = a.clone();
-    assert!(ArrayRef::ptr_eq(&a, &a2));
-    let b = ArrayRef::new(Array::new());
-    assert!(!ArrayRef::ptr_eq(&a, &b));
+    assert!(Array::ptr_eq(&a, &a2));
+    let b = Array::new();
+    assert!(!Array::ptr_eq(&a, &b));
     assert_ne!(a.addr(), 0);
 
-    a.write().push_value(int(1)).unwrap();
-    a.write().push_value(int(2)).unwrap();
-    assert_eq!(a2.read().len(), 2, "writes visible through the clone: shared identity");
-    assert_eq!(a.read().values_iter().map(Value::to_int).sum::<i64>(), 3, "collector hook");
+    a.push_value(int(1)).unwrap();
+    a.push_value(int(2)).unwrap();
+    assert_eq!(a2.len(), 2, "writes visible through the clone: shared identity");
+    let mut sum = 0;
+    a.for_each_value(|v| sum += v.to_int());
+    assert_eq!(sum, 3, "collector hook");
 
     // Hash is its own handle (§2.2.13): clones share the identity, locks are internal.
     let h = Hash::new();
@@ -570,10 +634,11 @@ fn concurrency_foundation_send_sync() {
     assert_send_sync::<Value>();
     assert_send_sync::<Hash>();
     assert_send_sync::<Array>();
-    assert_send_sync::<ArrayRef>();
     assert_send_sync::<crate::scalar::Referent>();
 
     // The immutable engine's map and parked iterator must cross threads with the rest.
     #[cfg(feature = "imbl")]
     assert_send_sync::<imbl::HashMap<PString, Value>>();
+    #[cfg(feature = "imbl")]
+    assert_send_sync::<imbl::Vector<ArraySlot>>();
 }

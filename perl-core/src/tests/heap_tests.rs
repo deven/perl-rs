@@ -25,7 +25,7 @@ fn transparent_layout() {
 }
 
 // ── The release worklist (§2.4.9) ─────────────────────────────────
-use crate::containers::{Array, ArrayRef, Hash};
+use crate::containers::{Array, Hash};
 use crate::value::{Tainted, Value};
 
 // Depths chosen well past the measured failure points: the scalar-ref chain overflowed at 20k in debug builds and the
@@ -43,10 +43,10 @@ fn deep_scalar_ref_chain_releases_iteratively() {
 
 #[test]
 fn deep_array_chain_releases_iteratively() {
-    let mut inner = ArrayRef::new(Array::new());
+    let mut inner = Array::new();
     for _ in 0..200_000 {
-        let outer = ArrayRef::new(Array::new());
-        outer.write().push_value(Value::array_ref(inner, Tainted::CLEAN)).unwrap();
+        let outer = Array::new();
+        outer.push_value(Value::array_ref(inner, Tainted::CLEAN)).unwrap();
         inner = outer;
     }
 
@@ -83,10 +83,10 @@ fn deep_tainted_scalar_ref_chain_releases_iteratively() {
 
 #[test]
 fn deep_tainted_array_chain_releases_iteratively() {
-    let mut inner = ArrayRef::new(Array::new());
+    let mut inner = Array::new();
     for _ in 0..200_000 {
-        let outer = ArrayRef::new(Array::new());
-        outer.write().push_value(Value::array_ref(inner, Tainted::TAINTED)).unwrap();
+        let outer = Array::new();
+        outer.push_value(Value::array_ref(inner, Tainted::TAINTED)).unwrap();
         inner = outer;
     }
 
@@ -112,8 +112,8 @@ fn deep_mixed_chain_releases_iteratively() {
     for i in 0..50_000 {
         link = match i % 3 {
             0 => {
-                let a = ArrayRef::new(Array::new());
-                a.write().push_value(link).unwrap();
+                let a = Array::new();
+                a.push_value(link).unwrap();
                 Value::array_ref(a, Tainted::CLEAN)
             }
             1 => {
@@ -149,13 +149,13 @@ fn assignment_over_a_deep_chain_releases_iteratively() {
 
 #[test]
 fn container_clear_releases_iteratively() {
-    let a = ArrayRef::new(Array::new());
+    let a = Array::new();
     let mut chain = Value::undef(Tainted::CLEAN);
     for _ in 0..100_000 {
         chain = Value::take_ref(&mut chain);
     }
 
-    a.write().push_value(chain).unwrap();
-    a.write().clear().unwrap();
-    assert!(a.read().is_empty());
+    a.push_value(chain).unwrap();
+    a.clear().unwrap();
+    assert!(a.is_empty());
 }
