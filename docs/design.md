@@ -12843,44 +12843,112 @@ tests/
 
 ---
 
-## 23. What This Design Omits (Intentionally)
+## 23. Scope [DECISION]
 
-The following are real concerns but are deliberately deferred:
+**The only hard goal is compatibility with Perl 5** — as close to
+100% as can be achieved, judged against the behavior of the C
+implementation (§1.1).  Everything in this document that leaves
+the realm of compatibility is a *speculative extension*: at best
+a possible future roadmap, subject to abandonment or radical
+change.  Such a roadmap may legitimately *inform* a design
+decision — where several compatible designs are available, their
+consequences for a possible future are worth weighing — but it
+may never *block* one.  The speculative roadmap is not permitted
+to become a blocker for the compatibility roadmap, and where an
+extension surface and a compatibility requirement conflict,
+compatibility wins.
 
-- **Raku front end.**  Build it when the Perl 5 implementation is solid.
-  Share the IR/runtime layer where possible, but do not compromise the
-  Perl 5 design for speculative Raku compatibility.
+### 23.1 In scope, and not negotiable
 
-- **Full AOT compilation of untyped Perl.**  The AOT compiler emits
-  Rust source code (§14.14), which works well for typed code (`fn`,
-  `struct`, `extern fn`).  Fully untyped code (`my`/`sub` with
-  `eval STRING` and `BEGIN`-time execution) requires the runtime and
-  is a harder target.  The gradual path — compile typed hot modules
-  to Rust, leave the rest interpreted — is practical now.  Full
-  untyped AOT is a future project.
+Three items were previously listed here as deferred, wrongly:
 
-- **Full XS compatibility.**  The thin shim approach is practical; full
-  ABI emulation is an enormous project of its own.
+- **`ithreads` compatibility.**  In scope for the initial
+  compatibility goals.  `threads` and `threads::shared` are perl
+  behavior like any other, and the §2.4 domain model exists in
+  large part to support them: a domain is the teardown
+  enumeration unit, and an emulated thread needs its own — thread
+  exit runs the same leaked-cycle sweep process exit does
+  (container-verified: cyclic objects receive `DESTROY` in the
+  spawning thread before `join` returns).  Domains plus teardown
+  substantially deliver this.
 
-- **Full debugger implementation.**  The goals and architecture are
-  described in §19.4 (DAP support, REPL introspection, profiling
-  hooks).  The detailed implementation can wait until the runtime is
-  stable, but the structural commitments (stack traces by default,
-  built-in `dd()`, IR instrumentation points) should be in place from
-  early development.
+- **Unicode.**  Matching perl's Unicode behavior is in scope, not
+  an incremental nicety.  Substantial machinery already exists in
+  both crates: the encoding-knowledge lattice and storage classes
+  in `perl-core`, and NFC normalization, `\N{...}` name lookup,
+  XID identifier classification, and UTF-16 source handling in
+  the parser.  The last of those is deliberately as crude as
+  perl's: BOM or heuristic detection followed by transcoding the
+  whole source to UTF-8 before the lexer runs (perl's
+  `swallow_bom`/`utf16_to_utf8` in `toke.c`), keeping the
+  common case zero-copy.  A parser that handled UTF-16 natively
+  would be nicer and is more work; it is not required for
+  compatibility, so it is not in scope.
 
-- **Perl 5 `ithreads` compatibility.**  The shared heap model is
-  fundamentally different from Perl 5's clone-everything `ithreads`.
-  Compatibility with `threads.pm` and `threads::shared` would
-  require an emulation layer.  Low priority given the superior
-  native concurrency model.
+- **Formats.**  `format`/`write` are in scope and as required as
+  any other feature; rarity in modern code is not a criterion.
+  Most of the work is parsing, and most of that exists —
+  `FormatLine`/`FormatField`, the picture-line lexer, and
+  `parse_format` — needing refactoring and integration rather
+  than invention.  The output mechanics after parsing are
+  comparatively straightforward.
 
-- **Unicode edge cases.**  The `PString` type and UTF-8 flag model
-  covers the architecture; full Unicode compliance (grapheme clusters,
-  normalization, case folding tables) is an incremental effort.
+### 23.2 Aspirational, off the table for now
 
-- **Formats (`format`/`write`).**  Rare in modern Perl.  Add when a test
-  demands it.
+Genuine goals, deliberately not pursued while Perl 5
+compatibility is the focus.  Their consequences may inform a
+choice between compatible designs; none may hold one up:
+
+- **Raku front end.**  Running Raku would be welcome eventually.
+  Off the table for now, and the Perl 5 design is never
+  compromised for it (§1.3).
+
+- **AOT compilation to binary executables.**  Plausible in the
+  long run — `perl-core` is built to stand alone as a crate —
+  and wanted, but off the table while compatibility is the
+  focus.
+
+- **A new debugger infrastructure.**  Perl's own debugger should
+  simply work once compatibility is met, save where it reaches
+  into interpreter internals; whatever it needs there is a
+  compatibility question, not a tooling one.  Building better
+  debugging infrastructure is aspirational and on the back
+  burner.
+
+### 23.3 XS: the hardest question, deliberately unresolved
+
+XS is compatibility with perl's *implementation* rather than its
+language, and it is the one place where those diverge: this
+design replicates perl's internals only as far as behavioral
+compatibility requires, while XS is written against those
+internals directly — `SvPV` handing back a writable `char*` into
+an SV's buffer, `AvARRAY` handing back `SV**`, struct-field
+macros, `PL_*` globals, and the argument and mortal stacks.
+Whether that gap can be bridged is genuinely unknown, and the
+question is left open rather than answered by assumption.
+
+What is settled is the priority and the decomposition.  XS
+compatibility takes a back seat to compatibility at the Perl
+level; it may become a phase-2 goal, and it may ultimately be
+ruled out of scope.  Meanwhile most of what looks like an XS
+problem is not one: the ~59 XS-backed modules of the standard
+library (`POSIX`, `Socket`, `List::Util`, `Encode`, `Storable`,
+`Digest::*`, `PerlIO::*`, ...) are the standard library, and are
+implemented natively here regardless.  A second group —
+`B`, `Opcode`, `Devel::Peek` — introspects perl's op tree and SV
+guts and cannot port to *any* reimplementation; those are rebuilt
+against this design's own IR, and their output is not expected to
+match.  Of third-party XS, C-library wrappers are FFI-shaped and
+computational modules are reimplementable; what remains hard are
+the modules that manipulate perl's guts on purpose.
+
+If XS proves infeasible, the intended answer is a cleaner
+extension mechanism, with reimplementation of significant XS
+modules as the path forward — and, so that porting is worth doing
+on its own merits, an extension API designed to be implementable
+on legacy perl as well, so one extension can serve both
+implementations.  Losing XS wholesale would be a staggering blow,
+and this design says so rather than waving it away.
 
 ---
 
