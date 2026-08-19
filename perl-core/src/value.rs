@@ -1092,6 +1092,7 @@ fn digit_run_avx2(bytes: &[u8]) -> usize {
     // test as `i + 32`, forcing a second induction instruction every iteration.
     let limit = bytes.len() & !31;
     let mut i = 0;
+    debug_assert!(limit <= bytes.len() && limit.is_multiple_of(32), "the vector bound must be a whole number of blocks");
 
     while i < limit {
         // SAFETY: `i < limit`, and `limit` is a multiple of thirty-two no greater than the length, so the thirty-two
@@ -1125,6 +1126,7 @@ fn digit_run_avx512vl(bytes: &[u8]) -> usize {
     let nine = _mm256_set1_epi8(9);
     let limit = bytes.len() & !31;
     let mut i = 0;
+    debug_assert!(limit <= bytes.len() && limit.is_multiple_of(32), "the vector bound must be a whole number of blocks");
 
     while i < limit {
         // SAFETY: `i < limit`, and `limit` is a multiple of thirty-two no greater than the length, so the thirty-two
@@ -1159,6 +1161,7 @@ fn digit_run_neon(bytes: &[u8]) -> usize {
     let nine = vdupq_n_u8(9);
     let limit = bytes.len() & !15;
     let mut i = 0;
+    debug_assert!(limit <= bytes.len() && limit.is_multiple_of(16), "the vector bound must be a whole number of blocks");
 
     while i < limit {
         // SAFETY: `i < limit`, and `limit` is a multiple of sixteen no greater than the length, so the sixteen byte
