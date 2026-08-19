@@ -1146,7 +1146,12 @@ fn digit_run_avx512vl(bytes: &[u8]) -> usize {
 /// shift-and-narrow: reinterpreting the sixteen `0x00`/`0xFF` lanes as eight `u16`s and narrowing them with a four-bit
 /// shift leaves four bits per original byte in a general register, whence `trailing_zeros() / 4` is the lane index.
 /// Measured on an M1 Pro at 34.1 B/ns against 12.8 for the word loop below.
+///
+/// The `neon` feature is listed even though it is baseline on aarch64: enabling a feature in the build configuration
+/// does not by itself let the compiler treat the intrinsics as safe to call, and declaring it is what puts this kernel
+/// on the same footing as the x86 ones.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 fn digit_run_neon(bytes: &[u8]) -> usize {
     use std::arch::aarch64::*;
 
