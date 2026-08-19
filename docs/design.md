@@ -1364,6 +1364,9 @@ A compact value is promoted to the aliasing form
   aliasing: two names must observe one storage.
 - **Magic, blessing, tie, weakening.**  These attach state to an
   identity.
+- **`:shared`.**  The flag has nowhere to live on a compact value
+  and nothing to mean there (§2.2.14): sharing a scalar is two
+  threads naming one storage, which is identity.
 - **First numification warning** on an unshared non-numeric string —
   see §2.3.4; the warn-once bit is carried in the `PString` tag,
   so this trigger applies only where the tag route is unavailable.
@@ -2243,6 +2246,59 @@ The graph-traversal hook and teardown drain every engine; keys
 launder at storage in all; the readonly flag and the future
 stash and flags ride the struct as measured in the padding
 review.
+
+#### 2.2.14 Variable attributes [DECISION]:
+
+Perl does not store attributes on variables.
+`MODIFY_<reftype>_ATTRIBUTES` is called at *compile time* with the
+attribute list and core retains nothing — verified: after a
+handler runs, `attributes::get` on the variable returns an empty
+list, and it returns empty for the built-in `:shared` too, since
+retrieval likewise dispatches to a user-supplied
+`FETCH_<reftype>_ATTRIBUTES` that does not exist by default.  A
+package that wants to remember its own attributes keeps its own
+record, exactly as it must under perl.
+
+So there is no general attribute storage to design, and none of
+this reaches `FullScalar`.  Attributes are a front-end mechanism:
+the parser collects them, the compiler applies the built-in ones
+and dispatches the rest, and nothing is retained on the value.
+Sub attributes are the separate case already designed — `Code`
+holds them (§10) because `:lvalue`, `:method`, and prototypes must
+persist on the code object.
+
+The built-in set for *variables* is one entry, `shared`, and it is
+the only attribute needing runtime representation.  **It gets a
+reserved flag bit, populated by the front end [DECISION]**, beside
+the readonly bit that already exists in each place: the flags word
+of the array header (§2.2.12), the hash engines' flag field
+(§2.2.13), and an `rc_state` state bit for a promoted scalar
+(§2.4.4).  The value layers only store and report it; deciding
+that a variable is shared belongs to whatever sees the attribute.
+Two consumers read it: `is_shared`, and the `threads->create` copy
+walk, for which the bit means *stop descending* — which is what
+makes sharing transitive without marking elements, matching perl,
+where an element of a shared array reports shared without being
+marked itself.
+
+For a promoted scalar the bit rides `rc_state`, which is the
+slot's control word beside the payload rather than inside it, so
+the sixteen-byte `Scalar` is untouched.  A bare `Value` is a
+different matter: **`Value` is unshared by definition
+[DECISION]**.  The envelope has no room, but the deeper reason is
+that a `Value` in a pad slot has no identity — there is nothing
+for two threads to *name* — so `shared` is not an unset bit but an
+inapplicable question.  Sharing a scalar therefore requires
+identity, which is to say a cell.
+
+**Applying `:shared` therefore upgrades the value to a `Scalar`
+that can hold the flag [DECISION]**, exactly as taking a
+reference does, and it joins the §2.2.8 trigger list on the same
+grounds: the attribute asks for something only an identity can
+provide.  Promotion happens where the attribute is applied, so
+the flag is set once, at declaration, by the front end — no pad-
+side mark to inherit later, and no path by which a shared
+variable is ever observed unpromoted.
 
 ### 2.3 Promoted Scalars
 
