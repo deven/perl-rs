@@ -56,6 +56,20 @@ works here and fails there is a trap sprung late.  A divergence is
 therefore easiest to justify where it can be *detected* at the point it
 becomes load-bearing and reported, rather than taking effect silently.
 
+One rule holds whatever the default turns out to be
+**[DECISION]**: when the interpreter is invoked under a name that
+means `perl`, it operates in strict compatibility mode.  A program
+whose shebang line reads `#!/usr/bin/perl` is asking for `perl`, and
+the request is honored — which also means the whole existing corpus
+selects strict compatibility without being modified.  What exactly
+constitutes such a name is open to bikeshedding and will certainly
+include `perl` and `perl5`; the versioned forms `perl` installs
+itself under (`perl5.44.0`, and the arch-suffixed variants
+distributions add) belong in the set too.  An explicit pragma or
+switch must be able to override the inferred mode in both
+directions, and an embedded interpreter — which has no meaningful
+`argv[0]` — takes its mode from its host rather than by inference.
+
 Each deliberate divergence is recorded where it is designed, so the set
 is enumerable when the default is settled.
 
@@ -12960,6 +12974,18 @@ Three items were previously listed here as deferred, wrongly:
   (container-verified: cyclic objects receive `DESTROY` in the
   spawning thread before `join` returns).  Domains plus teardown
   substantially deliver this.
+
+  **`ithreads` defaults to strict compatibility [DECISION]**,
+  whatever the global default becomes (§1.1).  Two reasons, and the
+  first is the stronger: `ithreads` is a legacy compatibility
+  surface rather than the concurrency model this design would
+  recommend, so improving it would subsidize the model we would
+  rather people leave.  And the population running `ithreads` code
+  is almost entirely people maintaining applications that must keep
+  working under `perl`; for them a nicety that silently works here
+  and fails there is a portability trap sprung late.  Deviations
+  remain available, but by explicit request only — the PerlOxide
+  interpreter name or a pragma — never by default.
 
 - **Unicode.**  Matching perl's Unicode behavior is in scope, not
   an incremental nicety.  Substantial machinery already exists in
