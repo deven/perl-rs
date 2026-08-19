@@ -37,8 +37,27 @@ behavior of the C implementation, primarily as documented by:
 - `sv.c`, `av.c`, `hv.c` (value model)
 - the upstream `t/` test suite
 
-When in doubt, match what `perl` does.  Deliberate divergences are allowed
-only in a clearly marked "modern" mode and should be documented as such.
+When in doubt, match what `perl` does.
+
+The design does diverge deliberately in a few places — NFC
+normalization of identifiers and heredoc tags (§5.8.2) is the landed
+example — and **bug-for-bug compatibility with `perl` is intended to be
+available** for programs that need it.  Which of the two is the
+*default*, and how a program or its environment selects the other, are
+open questions on which no ruling has been made.
+
+The tension is that divergence is hazardous in both directions but for
+different reasons.  Matching `perl` reproduces behavior that is
+sometimes a bug rather than a decision.  Diverging is worse than it
+first appears, because the population that matters is not people
+writing new code against PerlOxide: it is people maintaining programs
+that must keep running under `perl`, for whom anything that silently
+works here and fails there is a trap sprung late.  A divergence is
+therefore easiest to justify where it can be *detected* at the point it
+becomes load-bearing and reported, rather than taking effect silently.
+
+Each deliberate divergence is recorded where it is designed, so the set
+is enumerable when the default is settled.
 
 ### 1.2 Design the Hard Parts First
 
@@ -6417,10 +6436,25 @@ represent the same text.  PerlOxide normalizes both sides because
 the byte-exact behavior is a source of subtle bugs when editors or
 version control systems silently renormalize Unicode text.
 
-NFC normalization is one of several usability-motivated deviations
-from strict Perl compatibility.  A PerlOxide-specific pragma (name
-TBD) will be provided to disable such deviations for programs that
-require strict byte-for-byte Perl compatibility.
+NFC normalization is a usability-motivated deviation from strict
+Perl compatibility, and bug-for-bug compatibility is intended to be
+available for programs that need it (§1.1); which is the default is
+not yet ruled.
+
+Normalizing a *consistent* spelling changes nothing observable: a
+file whose every mention of an identifier is decomposed behaves the
+same either way.  The deviation only becomes load-bearing when two
+spellings collide — two distinct source forms reaching one
+identifier, or a heredoc terminator matching only after
+normalization — and those cases are detectable exactly where they
+occur.  `perl`'s own behavior there is not a considered design:
+under `use strict` the mixed identifier is already a compile error
+whose message renders both spellings identically, and without it
+`perl` silently creates two variables; a mismatched heredoc tag
+never terminates.  Reporting the collision is therefore more
+informative than either silently normalizing or silently not.
+Whether the report is fatal or a warning, and in which of the two
+cases, awaits the same ruling.
 
 #### 5.8.3 `effective_utf8` fast path:
 
