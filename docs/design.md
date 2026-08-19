@@ -12027,6 +12027,39 @@ values, basic SV manipulation (get/set string/int/float), and hash/array
 access.  It would not cover: direct SV pointer manipulation, custom magic
 installation via XS, or AV/HV internals access.
 
+### 17.4 Embedding: our own API is the one that is designed [DECISION]
+
+Embedding is §17.1 in reverse — a host application driving an
+interpreter rather than an extension called from one — and the design
+answers it with a Rust-native API, with a C ABI wrapper so that C and
+C++ hosts can adopt it without going through Perl's.  Under the §2.4
+model an embedded interpreter is a `Domain` plus an execution context,
+which is what the host holds; the rule that `bless` requires the active
+domain (§2.4.5) is already an embedding ruling, and the standalone-crate
+case — values allocated with no interpreter at all — is already a
+supported state rather than an afterthought.
+
+Perl's own embedding API (`perl_alloc`, `perl_parse`, `perl_run`,
+`perl_destruct`, `eval_pv`, `call_argv`, `get_sv`) belongs with XS in
+§23.3: compatibility with Perl's implementation rather than its
+language, feasibility unresolved, and ranked behind compatibility at the
+Perl level.  Two things distinguish it from XS and are worth recording
+rather than rediscovering.
+
+Its *narrow core* is separable and cheap.  Constructing an interpreter,
+parsing, running, evaluating a string, calling a named sub, and tearing
+down — with results marshalled as strings and numbers — touches no
+struct layout at all.  It is the parts that hand back an `SV *` for the
+host to poke with `SvIV`/`SvPV` that hit XS's wall, and a host confined
+to `eval_pv` and `call_argv` never reaches them.
+
+It is also worth *less* than that cheapness suggests, until XS resolves.
+The applications that embed Perl — `mod_perl`, `vim`, `irssi`, `plperl`,
+Nagios — do not run isolated scripts; they run Perl that loads CPAN, and
+much of CPAN is XS.  A shim for the entry point leaves the code inside
+still failing.  So the narrow core may become feasible earlier than XS
+while remaining worth little before it.
+
 ---
 
 ## 18. Source Filters
@@ -13056,6 +13089,11 @@ against this design's own IR, and their output is not expected to
 match.  Of third-party XS, C-library wrappers are FFI-shaped and
 computational modules are reimplementable; what remains hard are
 the modules that manipulate perl's guts on purpose.
+
+Perl's native embedding API sits in this same category, and
+§17.4 records what distinguishes it: a separable narrow core
+that touches no struct layout, worth less than its cheapness
+suggests until XS resolves.
 
 If XS proves infeasible, the intended answer is a cleaner
 extension mechanism, with reimplementation of significant XS
