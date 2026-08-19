@@ -537,6 +537,22 @@ fn unsigned_constructors_canonicalize_to_integer() {
 }
 
 #[test]
+fn digit_run_stops_at_the_slice_end() {
+    // A kernel whose bound mask disagrees with its block width reads past the slice, and the behavior tests above
+    // cannot see it: the bytes beyond usually answer the same way, so the result comes out right and only the memory
+    // access is wrong.  Here the buffer is built so the answers differ.  Each subslice is followed by more digits and
+    // then a non-digit, so a kernel that reads beyond the end reports the planted boundary instead of the slice's own
+    // length, while a correct one stops where the slice does.
+    for len in 0..96usize {
+        for beyond in 1..=4usize {
+            let mut buf = vec![b'7'; 256];
+            buf[len + beyond] = b'x';
+            assert_eq!(digit_run(&buf[..len]), len, "digit_run read past the end of a {len}-byte slice (non-digit planted {beyond} bytes beyond)");
+        }
+    }
+}
+
+#[test]
 fn digit_run_matches_the_scalar_scan() {
     // The vectorized scan must agree with a byte-at-a-time one on every shape, including the block boundaries where an
     // AVX2 lane or a SWAR word could straddle the end of the run.
