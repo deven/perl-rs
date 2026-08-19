@@ -3636,9 +3636,23 @@ drop a payload whose remaining destructor is shallow.  (The
 std-façade `Drop` implementations already implement exactly this
 split; the slab backend keeps it as typed operations.)
 
+**What a `Domain` is [DECISION].**  A `Domain` is the
+allocation-related portion of what Perl calls an interpreter, and
+nothing more: the heap arenas, the lifecycle phase machine, and the
+finalization queue — the unit of teardown enumeration, and the only
+part of an interpreter `perl-core` knows.  The rest of an
+interpreter — symbol tables, the module registry, globals — belongs
+to the runtime, which owns a `Domain` rather than being one.  Core
+therefore never learns what a stash is: a node carries a
+`class_id`, core enqueues its finalization, and resolving that id
+to a class and running `DESTROY` is the runtime's work (§2.4.5).
+The split is what lets `perl-core` stand alone: a consumer with no
+interpreter still allocates, still tears down, and never meets a
+symbol table.
+
 Pages are domain-dedicated (one logical domain per page until
 every slot frees), and the header's `domain` pointer is how a
-context-free drop reaches its queue head, phase, and stash table.
+context-free drop reaches its queue head and phase.
 **Teardown frees the `Domain` itself [DECISION]**: nothing about
 a dead domain is worth retaining, and only the heap-allocated
 node storage outlives it — and that only while an escaped handle
@@ -4716,9 +4730,12 @@ not.
 > two-tier value model (§2.3) and the §2.4 memory architecture;
 > where they conflict, §2 is normative — in particular, §2.4.1's
 > arena enumeration supersedes the self-contained-`Arc` framing
-> below, and the mortal stack holds `Value`s.  Connecting
-> `SharedRuntime`/`Interpreter` to `Domain` and the domain
-> lease is unwritten design, not a substitution.
+> below, and the mortal stack holds `Value`s.  §2.4.5 now rules what
+> a `Domain` is — the allocation-related portion of an interpreter,
+> owned by the runtime rather than equal to it — so `SharedRuntime`
+> folds into the runtime's interpreter type and this section's use
+> of `Interpreter` for the *per-task* execution context is the
+> naming this rewrite must correct.
 
 ### 3.1 Shared Runtime State
 
