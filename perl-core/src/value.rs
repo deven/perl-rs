@@ -1081,30 +1081,35 @@ fn word_all_digits(word: u64) -> bool {
 /// leaves a nonzero lane exactly where the run ends.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn digit_run_avx2(bytes: &[u8]) -> usize {
+fn digit_run_avx2(bytes: &[u8]) -> usize {
     use std::arch::x86_64::*;
+
+    let zero = _mm256_set1_epi8(b'0' as i8);
+    let nine = _mm256_set1_epi8(9);
+    let null = _mm256_setzero_si256();
+
+    // The bound is hoisted rather than written `i + 32 <= len`: recomputing it would need the address as `i` and the
+    // test as `i + 32`, forcing a second induction instruction every iteration.
+    let limit = bytes.len() & !31;
     let mut i = 0;
 
-    unsafe {
-        let zero = _mm256_set1_epi8(b'0' as i8);
-        let nine = _mm256_set1_epi8(9);
-        let null = _mm256_setzero_si256();
-        while i + 32 <= bytes.len() {
-            let block = _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i);
-            let over = _mm256_subs_epu8(_mm256_sub_epi8(block, zero), nine);
+    while i < limit {
+        // SAFETY: `i < limit`, and `limit` is a multiple of thirty-two no greater than the length, so the thirty-two
+        // byte read lies within `bytes`.
+        let block = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i) };
+        let over = _mm256_subs_epu8(_mm256_sub_epi8(block, zero), nine);
 
-            // `movemask` locates the boundary exactly where `testz` only detects one, so a mismatching block is
-            // answered here instead of being handed whole to the word scan and read a second time.
-            let digits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(over, null)) as u32;
-            if digits != u32::MAX {
-                return i + (!digits).trailing_zeros() as usize;
-            }
-
-            i += 32;
+        // `movemask` locates the boundary exactly where `testz` only detects one, so a mismatching block is answered
+        // here instead of being handed whole to the word scan and read a second time.
+        let digits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(over, null)) as u32;
+        if digits != u32::MAX {
+            return i + (!digits).trailing_zeros() as usize;
         }
+
+        i += 32;
     }
 
-    i + digit_run_words(&bytes[i..])
+    limit + digit_run_words(&bytes[limit..])
 }
 
 /// AVX-512VL at 256-bit width.  The mask register locates the first non-digit exactly, so a partial block needs no
@@ -1113,24 +1118,27 @@ unsafe fn digit_run_avx2(bytes: &[u8]) -> usize {
 /// keep running unchanged on later hardware.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vl")]
-unsafe fn digit_run_avx512vl(bytes: &[u8]) -> usize {
+fn digit_run_avx512vl(bytes: &[u8]) -> usize {
     use std::arch::x86_64::*;
+
+    let zero = _mm256_set1_epi8(b'0' as i8);
+    let nine = _mm256_set1_epi8(9);
+    let limit = bytes.len() & !31;
     let mut i = 0;
 
-    unsafe {
-        let zero = _mm256_set1_epi8(b'0' as i8);
-        let nine = _mm256_set1_epi8(9);
-        while i + 32 <= bytes.len() {
-            let block = _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i);
-            let digits = _mm256_cmple_epu8_mask(_mm256_sub_epi8(block, zero), nine);
-            if digits != u32::MAX {
-                return i + (!digits).trailing_zeros() as usize;
-            }
-            i += 32;
+    while i < limit {
+        // SAFETY: `i < limit`, and `limit` is a multiple of thirty-two no greater than the length, so the thirty-two
+        // byte read lies within `bytes`.
+        let block = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i) };
+        let digits = _mm256_cmple_epu8_mask(_mm256_sub_epi8(block, zero), nine);
+        if digits != u32::MAX {
+            return i + (!digits).trailing_zeros() as usize;
         }
+
+        i += 32;
     }
 
-    i + digit_run_words(&bytes[i..])
+    limit + digit_run_words(&bytes[limit..])
 }
 
 /// NEON, which is baseline on aarch64 and so needs no feature check.  The comparison is the same as the x86 paths —
@@ -1139,25 +1147,28 @@ unsafe fn digit_run_avx512vl(bytes: &[u8]) -> usize {
 /// shift leaves four bits per original byte in a general register, whence `trailing_zeros() / 4` is the lane index.
 /// Measured on an M1 Pro at 34.1 B/ns against 12.8 for the word loop below.
 #[cfg(target_arch = "aarch64")]
-unsafe fn digit_run_neon(bytes: &[u8]) -> usize {
+fn digit_run_neon(bytes: &[u8]) -> usize {
     use std::arch::aarch64::*;
+
+    let zero = vdupq_n_u8(b'0');
+    let nine = vdupq_n_u8(9);
+    let limit = bytes.len() & !15;
     let mut i = 0;
 
-    unsafe {
-        let zero = vdupq_n_u8(b'0');
-        let nine = vdupq_n_u8(9);
-        while i + 16 <= bytes.len() {
-            let block = vld1q_u8(bytes.as_ptr().add(i));
-            let ends_run = vcgtq_u8(vsubq_u8(block, zero), nine);
-            let nibbles = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(ends_run))));
-            if nibbles != 0 {
-                return i + nibbles.trailing_zeros() as usize / 4;
-            }
-            i += 16;
+    while i < limit {
+        // SAFETY: `i < limit`, and `limit` is a multiple of sixteen no greater than the length, so the sixteen byte
+        // read lies within `bytes`.
+        let block = unsafe { vld1q_u8(bytes.as_ptr().add(i)) };
+        let ends_run = vcgtq_u8(vsubq_u8(block, zero), nine);
+        let nibbles = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(ends_run))));
+        if nibbles != 0 {
+            return i + nibbles.trailing_zeros() as usize / 4;
         }
+
+        i += 16;
     }
 
-    i + digit_run_words(&bytes[i..])
+    limit + digit_run_words(&bytes[limit..])
 }
 
 /// The vector block size each architecture's path consumes, and so the length below which dispatching to it loses: a
