@@ -4419,7 +4419,126 @@ rather than a guaranteed ABI, so a `const _: () = assert!(...)`
 beside the §2.3.6 size laws pins it: if a future compiler stops, the
 build says so.
 
-#### 2.7.3 Comparison:
+**The error type is eight bytes, always [DECISION].**  That is the
+rule, and the escape hatch when a future `E` needs more shapes than
+two is **low-bit tagging**: `Raised` is at least eight-byte aligned,
+so the low three bits of the pointer are unrepresentable and can
+carry a tag, masked to zero before any dereference.  Seven tag
+values are available, each usable with a null payload (an
+allocation-free variant) or with a real pointer (a payload-carrying
+one).  An `Err` is an exceptional return that mostly does not
+happen and terminates the enclosing construct when it does, so the
+mask costs nothing anywhere it matters.  Two invariants ride with
+it: a compile-time assertion that `align_of::<Raised>() >= 8`,
+since the whole scheme rests on it and a field reordering could
+silently break it, and a private raw word with the constructors and
+accessors as the only way in and out, since the word owns a `Box`
+in some encodings and nothing in others.
+
+The rule is worth stating as *size*, not niche: measured, an
+eight-byte `E` with no niche of its own — a plain `usize` wrapper —
+keeps the `Result` at 16 just as `NonZeroUsize` does, because it is
+`Value`'s spare discriminants that mark `Err`.  And the property
+composes further than it needs to.  `Result<Option<Value>, E>` is
+16, which matters because that is the honest signature for a
+fallible container read, where `Ok(None)` is a hole or a missing
+key and `Err` is a die from magic; `Option<Result<Option<Value>,
+E>>` is 16; and nesting measured to five alternating layers is
+still 16, each layer spending one of the ~126 spare encodings.  The
+ops layer can therefore give a function the signature its outcomes
+actually have, at no cost over a bare `Value`.
+
+**One channel carries loop control [DECISION].**  `next`, `last`,
+`redo`, and `return` propagate as `E` variants beside `die` rather
+than as a separate mechanism, because they must cross frames the
+same way: perl permits `last` inside a sub called from a loop body
+(warning as it goes), so the signal has to travel through
+intervening Rust frames, which is exactly what `?` on the error
+channel does.  A loop intercepts the ones whose label is its own or
+unlabeled and re-propagates the rest; a sub intercepts `return`; an
+`eval` intercepts `die`.  Because nothing unwinds through a panic,
+lock guards release normally at every frame as the signal travels —
+which is what makes the call-scoped-guard discipline hold under
+`die` and `last` rather than being a rule a panic could violate.
+Unlabeled control flow wants a null-payload tag so the hot
+`next if ...` costs no allocation; labeled forms and `return` carry
+their payload behind the pointer.
+
+#### 2.7.3 `PerlResult` — the outcome channel [DECISION]:
+
+**The governing rule: an outcome type stays 16 bytes if `Ok(Value)`
+is its only 16-byte variant.**  Everything else must fit in fifteen
+bytes or be boxed.  Measured, against the real niche-packed `Value`:
+thirty variants — five of them carrying `u64` payloads — still
+total 16, because each tag spends one of `Value`'s ~126 spare
+discriminants (§2.2.9) rather than an envelope byte.  Only a
+*second* 16-byte payload breaks it, since no niche can distinguish
+two full-width `Value`s.  The same budget nests: `Option<...>`,
+`Result<Option<Value>, E>`, and five levels of alternating
+`Option`/`Result` are all 16 bytes.  A `const _: () =
+assert!(size_of::<PerlResult>() == 16)` pins it beside the §2.3.6
+size laws, since this is rustc's niche optimization rather than
+guaranteed ABI.
+
+Two corollaries were measured and are worth stating, because both
+correct a plausible wrong guess.  **Nesting inside the error type
+does not work** — `Result<Alloc, Result<Next, Result<Last, ...>>>`
+inflates to 16 bytes and pushes the outer result to 24, because a
+pointer supplies exactly one niche (null) and nesting consumes
+niches rather than creating them; the plentiful niches belong to
+`Value`, so tags must be *its* variants.  And **a 15-byte payload
+rides along** if it is `#[repr(C, packed)]`, sitting at offset 1
+while the tag takes byte 0 — the recipe already proven for the
+envelope itself.  Fourteen bytes needs no packing; fifteen does.
+
+That budget makes the loop controls allocation-free in practice.
+Each takes **a pair of variants [DECISION]**: an inline form
+carrying the label in fifteen NUL-padded bytes, and a pointer form
+for anything ineligible.  Eligibility is *representability*, not
+correctness: a label longer than fifteen bytes, or one containing a
+NUL, simply takes the pointer path, exactly as `PString` spills to
+the heap when content will not fit the envelope.  Perl labels are
+barewords in every realistic program, so the NUL clause never
+fires and the fifteenth byte is free capacity; a label *can*
+contain a NUL — `next "AB\0"` is a distinct label that perl
+refuses to match against loop `AB`, container-verified — and the
+pointer variant keeps that case correct.  Labels must be matched
+by name rather than by a lexically assigned id, because `next`
+crosses sub boundaries into dynamically enclosing frames, and
+because perl accepts computed labels (`next $lbl`, verified), so
+an interner would have to hash at the raising site where the
+inline comparison is free.
+
+**Open, pending the ops layer.**  Whether the channel is needed at
+all: §10.1's interpreter is a flat walker over an explicit
+`call_stack`, so `next`, `last`, `redo`, and `return` can move the
+instruction pointer and pop frames without travelling through Rust
+return values.  What must cross the Rust boundary is the case
+where Perl is invoked *from* Rust and the Rust frame has to unwind
+— `die` through a `sort` comparator, a tie's `FETCH` inside a hash
+probe, an overload handler under a coercion — which is a real but
+bounded set.  If the channel is built, `Return` has three shapes:
+payload-free with the value in the frame's return slot (no
+allocation, needs a frame), `Return(Box<Value>)` (self-contained,
+one allocation per return, works with no frame), or
+`Return(HeapArc<Value>)` (shared ownership, atomics, and the
+identity machinery a transient return value does not need).
+
+**The name is `PerlResult` [DECISION]**, spelled out rather than
+abbreviated to `PResult` on `PString`'s pattern.  The one-letter
+form is borrowed there rather than invented — `CString`, `OsString`
+and `BString` make a single letter on a *string* type instantly
+decodable — and no such convention exists for result types, so the
+rule is "prefix as the surrounding convention does," which leaves
+the two lengths principled rather than arbitrary.  `PResult` also
+misreads as a Result with something prepended, which is precisely
+backwards for a superset.  And the type is not renamed to
+something like `Outcome`: it *is* a result, with outcomes beyond
+the standard two, and a signature returning `PerlResult` is
+immediately legible to any Rust reader in a way that a novel noun
+would not be.
+
+#### 2.7.4 Comparison:
 
 **`Ord` on `Value` is `cmp`, perl's string comparison [DECISION]** —
 the precedent being perl's own default `sort`, which orders by
@@ -4462,7 +4581,7 @@ otherwise it converts, so `9007199254740993 <=> 9007199254740992.0`
 is **0** (container-verified).  An exact mixed comparison would be a
 *divergence*, not an improvement.
 
-#### 2.7.4 Context wrappers:
+#### 2.7.5 Context wrappers:
 
 Perl's numeric and string coercions are reified as types whose
 **construction performs the coercion**:
@@ -4530,7 +4649,7 @@ say it, the coercion half over containers is where `ScalarContext<T>`
 would fit; it is recorded here so the two mechanisms are not later
 unified under one name.
 
-#### 2.7.5 Warnings:
+#### 2.7.6 Warnings:
 
 `perl-core` can supply exactly one thing about a warning: **that this
 operation on this content is warn-worthy, now**.  It cannot format
@@ -4562,7 +4681,7 @@ through the cold path and an allocation.  And it would turn
 warn-worthiness — a pure content property, decidable from the
 bytes — into something the type system calls a failure.
 
-#### 2.7.6 Layering:
+#### 2.7.7 Layering:
 
 `PString` is content, and content cannot run user code.  Its
 string comparisons numify nothing and cannot warn, so they return
