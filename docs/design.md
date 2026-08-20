@@ -4724,6 +4724,86 @@ trait later is backward-compatible; reshaping a published one is
 not.
 
 
+#### 2.7.8 `Display` and `Debug`:
+
+`Display` is not perl's `print`.  Printing is stringification
+followed by an IO layer, and it is the IO layer that downgrades to
+bytes and warns about wide characters; `Display` corresponds to the
+stringification half, where perl's model is characters.  But a
+`Formatter` accepts only `&str`, and a `PString` can hold code
+points Rust cannot represent — supra-Unicode, surrogates — as well
+as byte sequences that decode to no code point at all.  Nothing
+`Display` writes for that content can be faithful, so the trait is
+a Rust-facing convenience rather than a perl semantic.  The
+byte-faithful surface belongs to the output path, over PerlIO.
+
+**`Display` is lossy, `Debug` is lossless [DECISION].**  A lossless
+rendering needs escapes, and an escape scheme is lossless only if
+it escapes its own escape character: writing `U+110000` as
+`\x{110000}` while passing a real backslash through unchanged
+leaves the escape ambiguous with content that spells it out.
+Closing that hole means doubling backslashes, which would mangle
+every path and every pattern the trait touches.  Escapes are
+therefore available only where doubled backslashes are already
+expected, which is `Debug`, and `Display` takes the replacement
+character instead.  Anyone diagnosing content reaches for `{:?}`.
+
+**One replacement per decode step [DECISION].**  The unit is the
+step the decoder takes, not the bytes it takes it over:
+
+- A string with the UTF-8 flag off holds one code point per byte,
+  every one of them in `U+0000`–`U+00FF`.  It renders as those
+  characters and never produces a replacement.
+- Flagged content that Rust can represent is written through
+  unchanged.
+- A code point Rust cannot represent renders as one replacement
+  character, whether it is supra-Unicode or a surrogate, and
+  whether or not the rest of the string is well formed.
+- Malformed bytes render as one replacement per rejected sequence:
+  a lead byte together with the continuation bytes that follow it,
+  or a maximal run of continuation bytes with no lead.
+
+The grouping applies to the run the decoder rejected, not as a
+separate scan over the string.  `c2 80 80` is `U+0080` followed by
+one replacement, not one replacement spanning all three bytes.
+
+This diverges from `String::from_utf8_lossy`, which renders
+`f4 90 80 80` as four replacements where this renders one.  That
+rule is defined against Unicode's UTF-8, whose lead-byte space
+excludes `C0`, `C1`, and `F5`–`FF`; perl's extension uses leads
+through `FF`, so adopting it would import a table this decoder does
+not otherwise consult, and would make the rendered length disagree
+with `length`.
+
+**Both `PString` and `Value` carry `Display` [DECISION].**
+`PString`'s is total: it allocates nothing, consults no magic, and
+runs no user code, so it needs no `try_` twin — the same totality
+its `Ord` already has, and for the same reasons.  `Value`'s
+stringification can numify or run an overload, so it keeps the twin
+and the bargain of §2.7.1 governs it.
+
+**Width, precision, and fill are honored [DECISION].**
+`Formatter::pad` takes the whole rendering at once, which an impl
+writing in pieces does not have, so honoring them means emitting
+the fill directly — and that requires the character count before
+the first character is written.  The cached count is that count: it
+is true for every terminal but the malformed one, and the lossy
+rendering does not change how many characters emerge, a replacement
+standing for exactly one code point.  Malformed content, having no
+cached count, takes a counting pass first.  That pass is a second
+decode, allocates nothing, and runs only on content that is already
+broken.  A `Display` that silently ignored `{:>10}` would be the
+worse trade.
+
+The common paths need no vector work of their own.  Flagged
+Rust-valid content and unflagged ASCII are a scan-state test and a
+direct write, the classifier having already done the scanning.  The
+one transform that remains — widening unflagged high bytes to UTF-8
+— is scalar, and vectorizing it is motivated by `utf8::upgrade`,
+where it is hot.  This trait would inherit that work rather than
+justify it.
+
+
 ## 3. Memory Management Details
 
 > **Stale stratum (rewrite pending).**  This section predates the
