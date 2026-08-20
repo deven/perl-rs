@@ -4642,3 +4642,129 @@ fn the_bomb_detonates_on_an_abandoned_obligation() {
     // SAFETY: freshly allocated with one reference, which this `Owned` takes on — and then abandons.
     let _armed = unsafe { crate::cow_buffer::Owned::from_raw(ptr) };
 }
+
+// ── Malformed-span reporting (§2.7.8) ─────────────────────────
+/// Walk to the end of `bytes`, collecting decoded code points and rejected spans in the order they occur.
+fn lossy_walk(bytes: &[u8]) -> (Vec<u64>, Vec<Vec<u8>>, Option<usize>) {
+    let mut facts = ScanFacts::default();
+    let (mut points, mut spans) = (Vec::new(), Vec::new());
+    let stop = scalar_decode_span_reporting(
+        bytes,
+        0,
+        bytes.len(),
+        &mut facts,
+        |v| points.push(v),
+        |span| {
+            spans.push(span.to_vec());
+            ControlFlow::Continue(())
+        },
+    );
+
+    (points, spans, stop)
+}
+
+#[test]
+fn breaking_on_the_first_rejection_reproduces_the_classifying_walk() {
+    // The plain decoder is the reporting one with a breaking closure, so the two must agree byte for byte on inputs
+    // that are malformed as well as on inputs that are not.
+    let cases: [&[u8]; 7] = [
+        b"plain ascii",
+        &[0xC3, 0xA9],             // well-formed two-byte
+        &[0xF4, 0x90, 0x80, 0x80], // supra-Unicode, well formed under perl
+        &[0x80],                   // stray continuation
+        &[0xE4, 0xB8],             // truncated
+        &[0xC0, 0xAF],             // overlong
+        &[b'a', 0x80, b'b'],       // rejection with content on both sides
+    ];
+
+    for bytes in cases {
+        let (mut plain_facts, mut break_facts) = (ScanFacts::default(), ScanFacts::default());
+        let plain = scalar_decode_span(bytes, 0, bytes.len(), &mut plain_facts, |_| {});
+        let broken = scalar_decode_span_reporting(bytes, 0, bytes.len(), &mut break_facts, |_| {}, |_| ControlFlow::Break(()));
+
+        assert_eq!(plain, broken, "stop position differs for {bytes:02X?}");
+        assert_eq!(plain_facts.state(), break_facts.state(), "state differs for {bytes:02X?}");
+        assert_eq!(plain_facts.chars, break_facts.chars, "count differs for {bytes:02X?}");
+    }
+}
+
+#[test]
+fn a_rejected_span_covers_its_lead_and_the_continuations_that_follow() {
+    // One replacement per rejected sequence, not per byte: a lead byte claims the continuation bytes after it, whatever
+    // made the sequence unacceptable.
+    for bytes in [[0xE4u8, 0xB8].as_slice(), &[0xC0, 0xAF], &[0xF0, 0x80, 0x80, 0x80]] {
+        let (points, spans, stop) = lossy_walk(bytes);
+
+        assert_eq!(points, Vec::<u64>::new());
+        assert_eq!(spans, vec![bytes.to_vec()], "span differs for {bytes:02X?}");
+        assert_eq!(stop, Some(bytes.len()));
+    }
+}
+
+#[test]
+fn stray_continuations_group_into_one_maximal_run() {
+    let (points, spans, stop) = lossy_walk(&[0x80, 0x80, 0x80]);
+
+    assert_eq!(points, Vec::<u64>::new());
+    assert_eq!(spans, vec![vec![0x80, 0x80, 0x80]]);
+    assert_eq!(stop, Some(3));
+}
+
+#[test]
+fn grouping_covers_only_the_bytes_the_decoder_rejected() {
+    // The span is the run the decode failed on, not a greedy sweep of every continuation in sight: the first two bytes
+    // decode cleanly and only the third is stray.
+    let (points, spans, stop) = lossy_walk(&[0xC2, 0x80, 0x80]);
+
+    assert_eq!(points, vec![0x80]);
+    assert_eq!(spans, vec![vec![0x80]]);
+    assert_eq!(stop, Some(3));
+}
+
+#[test]
+fn a_non_continuation_after_a_lead_ends_the_span_and_decodes_on_its_own() {
+    // `C2` claims nothing, `A` being no continuation, so the letter survives as itself rather than joining the span.
+    let (points, spans, stop) = lossy_walk(&[0xC2, b'A']);
+
+    assert_eq!(points, vec![u64::from(b'A')]);
+    assert_eq!(spans, vec![vec![0xC2]]);
+    assert_eq!(stop, Some(2));
+}
+
+#[test]
+fn walking_on_resumes_decoding_after_each_rejected_span() {
+    let (points, spans, stop) = lossy_walk(&[b'a', 0x80, 0xC3, 0xA9, 0xE4, 0xB8]);
+
+    assert_eq!(points, vec![u64::from(b'a'), 0xE9]);
+    assert_eq!(spans, vec![vec![0x80], vec![0xE4, 0xB8]]);
+    assert_eq!(stop, Some(6));
+}
+
+#[test]
+fn classification_facts_do_not_move_across_a_rejected_span() {
+    // Content holding such a span is malformed whatever surrounds it, so a walk that continues is rendering or counting
+    // rather than classifying, and reads the spans from the closure instead.
+    let mut facts = ScanFacts::default();
+    let stop = scalar_decode_span_reporting(&[0x80, 0x80], 0, 2, &mut facts, |_| {}, |_| ControlFlow::Continue(()));
+
+    assert_eq!(stop, Some(2));
+    assert_eq!(facts.chars, 0);
+    assert_eq!(facts.state(), scan::Terminal::Ascii);
+}
+
+#[test]
+fn well_formed_content_reports_nothing_and_still_carries_its_facts() {
+    // The supra-Unicode case is the one that must not be mistaken for malformed: perl decodes it to a single code
+    // point, and only Rust cannot hold it.
+    let (points, spans, stop) = lossy_walk(&[0xF4, 0x90, 0x80, 0x80]);
+
+    assert_eq!(points, vec![0x11_0000]);
+    assert!(spans.is_empty());
+    assert_eq!(stop, Some(4));
+
+    let mut facts = ScanFacts::default();
+    scalar_decode_span(&[0xF4, 0x90, 0x80, 0x80], 0, 4, &mut facts, |_| {});
+
+    assert_eq!(facts.state(), scan::Terminal::ExtendedUtf8);
+    assert_eq!(facts.chars, 1);
+}

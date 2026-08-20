@@ -30,6 +30,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::mem;
+use std::ops::ControlFlow;
 use std::str::{self, FromStr};
 
 /// Maximum inline payload: chosen so every numeric stringification stays allocation-free (§2.2.3).
@@ -589,7 +590,17 @@ impl ScanFacts {
 /// The scalar fused extended decoder over `bytes[start..]`, decoding whole sequences until the position reaches
 /// `soft_end` (a sequence beginning before `soft_end` completes past it; truncation is judged against the full slice).
 /// Returns the position where decoding stopped, or `None` on malformed content.
-fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut ScanFacts, mut emit: impl FnMut(u64)) -> Option<usize> {
+fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut ScanFacts, emit: impl FnMut(u64)) -> Option<usize> {
+    scalar_decode_span_reporting(bytes, start, soft_end, facts, emit, |_| ControlFlow::Break(()))
+}
+
+/// Decode one sequence at `bytes[at]`, returning its length and code point.
+///
+/// `None` covers every way a sequence can be rejected — a bare continuation byte, truncation against the full slice, a
+/// non-continuation where a continuation belongs, an accumulator that would overflow, and a value either overlong for
+/// its form or beyond `IV_MAX` — because the caller treats them alike.  Which one it was changes nothing downstream:
+/// the byte at `at` is not the start of a decodable character either way.
+fn decode_one(bytes: &[u8], at: usize) -> Option<(usize, u64)> {
     /// Minimum code-point value for each sequence length (minimal-length / anti-overlong rule).
     fn min_for_len(len: usize) -> u64 {
         match len {
@@ -605,51 +616,97 @@ fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut S
         }
     }
 
+    let lead = bytes[at];
+
+    let (len, mut value): (usize, u64) = match lead {
+        0x00..=0x7F => return Some((1, lead as u64)),
+        0xC0..=0xDF => (2, (lead & 0x1F) as u64),
+        0xE0..=0xEF => (3, (lead & 0x0F) as u64),
+        0xF0..=0xF7 => (4, (lead & 0x07) as u64),
+        0xF8..=0xFB => (5, (lead & 0x03) as u64),
+        0xFC..=0xFD => (6, (lead & 0x01) as u64),
+        0xFE => (7, 0),
+        0xFF => (13, 0),
+        _ => return None, // bare continuation byte
+    };
+
+    if at + len > bytes.len() {
+        return None; // truncated (judged against the full slice, not the block)
+    }
+
+    for &b in &bytes[at + 1..at + len] {
+        if !is_continuation(b) {
+            return None; // malformed continuation
+        }
+
+        // 12 continuations x 6 bits = 72 bits could overflow u64, but any value needing the high bits exceeds IV_MAX
+        // and is rejected; checked arithmetic keeps the reasoning airtight.
+        value = value.checked_mul(64)? | (b & 0x3F) as u64;
+    }
+
+    if value < min_for_len(len) || value > 0x7FFF_FFFF_FFFF_FFFF {
+        return None; // overlong for its form, or beyond IV_MAX
+    }
+
+    Some((len, value))
+}
+
+/// A continuation byte carries `10` in its top two bits, and can therefore never begin a sequence.
+const fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
+}
+
+/// The span of bytes a rejected sequence covers: the byte at `at` together with every continuation byte that follows
+/// it, running to the end of the slice rather than to a block boundary because truncation is judged the same way.
+///
+/// One rule serves both shapes the rejection can take.  Where `at` holds a lead byte the span is that lead and the
+/// continuations belonging to it; where `at` holds a stray continuation the span is the maximal run of them.  Nothing
+/// decodable is ever swallowed, since a continuation byte cannot begin a sequence.
+fn malformed_run(bytes: &[u8], at: usize) -> usize {
+    let mut end = at + 1;
+    while end < bytes.len() && is_continuation(bytes[end]) {
+        end += 1;
+    }
+
+    end - at
+}
+
+/// The decoder above, with malformed spans reported rather than merely fatal.
+///
+/// `on_malformed` receives each rejected span (see [`malformed_run`]) and decides whether the walk goes on.  Breaking
+/// reproduces the classifying behavior exactly — the first rejection ends the walk and the span position is discarded —
+/// while continuing lets a caller render or count the whole string, malformed regions included.
+///
+/// `facts` is untouched across a rejected span.  It accumulates classification, and content holding such a span is
+/// already `MalformedUtf8` regardless of what surrounds it; a caller that walks on is rendering or counting, not
+/// classifying, and reads the span from the closure instead.
+fn scalar_decode_span_reporting(
+    bytes: &[u8],
+    start: usize,
+    soft_end: usize,
+    facts: &mut ScanFacts,
+    mut emit: impl FnMut(u64),
+    mut on_malformed: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> Option<usize> {
     let mut i = start;
     while i < soft_end {
-        let lead = bytes[i];
-
-        let (len, mut value): (usize, u64) = match lead {
-            0x00..=0x7F => {
-                facts.chars += 1;
-                emit(lead as u64);
-                i += 1;
-                continue;
+        let Some((len, value)) = decode_one(bytes, i) else {
+            let run = malformed_run(bytes, i);
+            if on_malformed(&bytes[i..i + run]).is_break() {
+                return None;
             }
-            0xC0..=0xDF => (2, (lead & 0x1F) as u64),
-            0xE0..=0xEF => (3, (lead & 0x0F) as u64),
-            0xF0..=0xF7 => (4, (lead & 0x07) as u64),
-            0xF8..=0xFB => (5, (lead & 0x03) as u64),
-            0xFC..=0xFD => (6, (lead & 0x01) as u64),
-            0xFE => (7, 0),
-            0xFF => (13, 0),
-            _ => return None, // bare continuation byte
+
+            i += run;
+            continue;
         };
 
-        if i + len > bytes.len() {
-            return None; // truncated (judged against the full slice, not the block)
+        // A single byte is ASCII by construction, so none of the multibyte facts can move.
+        if len > 1 {
+            facts.saw_multibyte = true;
+            facts.saw_beyond_latin1 |= value > 0xFF;
+            facts.saw_rust_rejected |= len > 4 || value > 0x10_FFFF || (0xD800..=0xDFFF).contains(&value);
         }
 
-        for &b in &bytes[i + 1..i + len] {
-            if b & 0xC0 != 0x80 {
-                return None; // malformed continuation
-            }
-
-            // 12 continuations x 6 bits = 72 bits could overflow u64, but any value needing the high bits exceeds
-            // IV_MAX and is rejected; checked arithmetic keeps the reasoning airtight.
-            value = match value.checked_mul(64) {
-                Some(v) => v | (b & 0x3F) as u64,
-                None => return None,
-            };
-        }
-
-        if value < min_for_len(len) || value > 0x7FFF_FFFF_FFFF_FFFF {
-            return None; // overlong for its form, or beyond IV_MAX
-        }
-
-        facts.saw_multibyte = true;
-        facts.saw_beyond_latin1 |= value > 0xFF;
-        facts.saw_rust_rejected |= len > 4 || value > 0x10_FFFF || (0xD800..=0xDFFF).contains(&value);
         facts.chars += 1;
         emit(value);
         i += len;
@@ -758,8 +815,8 @@ enum InlineClass {
 
 /// The storage type: the twenty-three-value normative vocabulary (§2.2.9), one value per base variant of the folded
 /// tag — the discriminant is this type times the three flag bits.  Coarse questions are the projection methods.
-/// Declaration order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able to
-/// represent the content — first-fit is the ladder — which is what the derived `Ord` means.
+/// Declaration order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able
+/// to represent the content — first-fit is the ladder — which is what the derived `Ord` means.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum StorageType {
     /// Inline, ≤ [`INLINE_MAX`] payload bytes, no allocation: the five content classes, each beside its full-capacity
