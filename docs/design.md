@@ -4478,7 +4478,7 @@ Unlabeled control flow wants a null-payload tag so the hot
 `next if ...` costs no allocation; labeled forms and `return` carry
 their payload behind the pointer.
 
-#### 2.7.3 `PerlResult` — the outcome channel [DECISION]:
+#### 2.7.3 `PerlResult` — the outcome channel:
 
 **The governing rule: an outcome type stays 16 bytes if `Ok(Value)`
 is its only 16-byte variant.**  Everything else must fit in fifteen
