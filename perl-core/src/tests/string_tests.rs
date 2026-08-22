@@ -4768,3 +4768,161 @@ fn well_formed_content_reports_nothing_and_still_carries_its_facts() {
     assert_eq!(facts.state(), scan::Terminal::ExtendedUtf8);
     assert_eq!(facts.chars, 1);
 }
+
+#[test]
+fn random_content_round_trips_through_the_reporting_decoder() {
+    use std::cell::RefCell;
+
+    /// Deterministic splitmix64, so a failure names its input and reproduces exactly.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Encode `v` in its minimal perl-extended form — the exact inverse of `decode_one`, which rejects non-minimal
+    /// forms, so every decoded value re-encodes to the bytes it came from.
+    fn encode_extended(v: u64, out: &mut Vec<u8>) {
+        let len: usize = match v {
+            0..=0x7F => 1,
+            0x80..=0x7FF => 2,
+            0x800..=0xFFFF => 3,
+            0x1_0000..=0x1F_FFFF => 4,
+            0x20_0000..=0x3FF_FFFF => 5,
+            0x400_0000..=0x7FFF_FFFF => 6,
+            0x8000_0000..=0xF_FFFF_FFFF => 7,
+            _ => 13,
+        };
+        if len == 1 {
+            out.push(v as u8);
+            return;
+        }
+
+        let cont = len - 1;
+        out.push(match len {
+            2 => 0xC0 | (v >> 6) as u8,
+            3 => 0xE0 | (v >> 12) as u8,
+            4 => 0xF0 | (v >> 18) as u8,
+            5 => 0xF8 | (v >> 24) as u8,
+            6 => 0xFC | (v >> 30) as u8,
+            7 => 0xFE,
+            _ => 0xFF,
+        });
+        for k in (0..cont).rev() {
+            // The FF form's twelve continuations span 72 bits; every accepted value fits u64, so the groups above bit
+            // 63 are zero and must not be reached by a real shift.
+            let group = if 6 * k < 64 { (v >> (6 * k)) & 0x3F } else { 0 };
+            out.push(0x80 | group as u8);
+        }
+    }
+
+    enum Ev {
+        Point(u64),
+        Span(Vec<u8>),
+    }
+
+    let mut seed = 0x0DDB_1A5E_5BAD_5EEDu64;
+    for iteration in 0..2000u32 {
+        // Concatenate pieces that interleave well-formed and rejected material densely: ASCII runs, minimal encodings
+        // from every form length (surrogates and supra-Unicode included — well formed under perl), raw bytes, stray
+        // continuations, truncated sequences, overlong leads, and an FF form past IV_MAX.
+        let mut bytes = Vec::new();
+        for _ in 0..=(next(&mut seed) % 8) {
+            match next(&mut seed) % 8 {
+                0 => {
+                    for _ in 0..(next(&mut seed) % 6) {
+                        bytes.push((next(&mut seed) % 0x80) as u8);
+                    }
+                }
+                1 | 2 => {
+                    let v = match next(&mut seed) % 8 {
+                        0 => next(&mut seed) % 0x80,
+                        1 => 0x80 + next(&mut seed) % 0x780,
+                        2 => 0x800 + next(&mut seed) % 0xF800,
+                        3 => 0x1_0000 + next(&mut seed) % 0x1F_0000,
+                        4 => 0xD800 + next(&mut seed) % 0x800,
+                        5 => 0x20_0000 + next(&mut seed) % 0x100_0000,
+                        6 => 0x8000_0000 + next(&mut seed) % 0x1_0000_0000,
+                        _ => 0x10_0000_0000 + next(&mut seed) % 0x1000_0000_0000,
+                    };
+                    encode_extended(v, &mut bytes);
+                }
+                3 => {
+                    for _ in 0..=(next(&mut seed) % 4) {
+                        bytes.push((next(&mut seed) & 0xFF) as u8);
+                    }
+                }
+                4 => {
+                    for _ in 0..=(next(&mut seed) % 4) {
+                        bytes.push(0x80 | (next(&mut seed) % 0x40) as u8);
+                    }
+                }
+                5 => {
+                    let mut t = Vec::new();
+                    encode_extended(0x800 + next(&mut seed) % 0xF800, &mut t);
+                    t.truncate(1 + (next(&mut seed) as usize % (t.len() - 1)));
+                    bytes.extend_from_slice(&t);
+                }
+                6 => {
+                    bytes.push(if next(&mut seed).is_multiple_of(2) { 0xC0 } else { 0xC1 });
+                    bytes.push(0x80 | (next(&mut seed) % 0x40) as u8);
+                }
+                _ => {
+                    bytes.push(0xFF);
+                    bytes.extend_from_slice(&[0xBF; 12]);
+                }
+            }
+        }
+
+        // The plain decoder and the breaking closure must agree exactly, malformed input or not.
+        let mut plain_facts = ScanFacts::default();
+        let mut plain_emits = 0usize;
+        let plain = scalar_decode_span(&bytes, 0, bytes.len(), &mut plain_facts, |_| plain_emits += 1);
+
+        let mut break_facts = ScanFacts::default();
+        let mut break_emits = 0usize;
+        let broke = scalar_decode_span_reporting(&bytes, 0, bytes.len(), &mut break_facts, |_| break_emits += 1, |_| ControlFlow::Break(()));
+
+        assert_eq!(plain, broke, "[{iteration}] stop position differs for {bytes:02X?}");
+        assert_eq!(
+            (plain_facts.state(), plain_facts.chars, plain_emits),
+            (break_facts.state(), break_facts.chars, break_emits),
+            "[{iteration}] classification differs for {bytes:02X?}"
+        );
+
+        // Walking on must cover every byte exactly once: re-encoding the emitted code points and splicing the reported
+        // spans back in, in order, must reproduce the input bit for bit.
+        let events = RefCell::new(Vec::<Ev>::new());
+        let mut walk_facts = ScanFacts::default();
+        let stop = scalar_decode_span_reporting(
+            &bytes,
+            0,
+            bytes.len(),
+            &mut walk_facts,
+            |v| events.borrow_mut().push(Ev::Point(v)),
+            |span| {
+                events.borrow_mut().push(Ev::Span(span.to_vec()));
+                ControlFlow::Continue(())
+            },
+        );
+
+        assert_eq!(stop, Some(bytes.len()), "[{iteration}] the continuing walk fell short for {bytes:02X?}");
+
+        let mut rebuilt = Vec::new();
+        let mut saw_span = false;
+        for ev in events.into_inner() {
+            match ev {
+                Ev::Point(v) => encode_extended(v, &mut rebuilt),
+                Ev::Span(span) => {
+                    saw_span = true;
+                    rebuilt.extend_from_slice(&span);
+                }
+            }
+        }
+
+        assert_eq!(rebuilt, bytes, "[{iteration}] round trip differs");
+        assert_eq!(plain.is_some(), !saw_span, "[{iteration}] the plain decoder and the spans disagree on malformedness");
+    }
+}
