@@ -4748,6 +4748,18 @@ therefore available only where doubled backslashes are already
 expected, which is `Debug`, and `Display` takes the replacement
 character instead.  Anyone diagnosing content reaches for `{:?}`.
 
+**Open: the `Debug` escape format.**  Lossless is ruled; the syntax
+is not.  Two constraints bound it.  The escape character escapes
+itself, since that is what lossless required above.  And at the
+malformed terminal the format must show the UTF-8 flag: those
+bytes decode to no characters, so `Debug` falls back to byte
+escapes there, and flagged and unflagged content with identical
+bytes would otherwise render identically — the one place the flag
+cannot be read off the rendered characters.  Perl's own diagnostic
+surface separates the cases the same way, rendering an unflagged
+high byte as `"\351"` and a flagged code point as `"\x{4e2d}"`
+(`Data::Dumper` under `Useqq`, verified).
+
 **One replacement per decode step [DECISION].**  The unit is the
 step the decoder takes, not the bytes it takes it over:
 
@@ -4793,7 +4805,10 @@ standing for exactly one code point.  Malformed content, having no
 cached count, takes a counting pass first.  That pass is a second
 decode, allocates nothing, and runs only on content that is already
 broken.  A `Display` that silently ignored `{:>10}` would be the
-worse trade.
+worse trade.  Honored means `Formatter::pad`'s semantics exactly:
+precision truncates the rendering first, and width fills what
+remains, so the two interact in std's order rather than an order
+of ours.
 
 The common paths need no vector work of their own.  Flagged
 Rust-valid content and unflagged ASCII are a scan-state test and a
