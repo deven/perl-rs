@@ -600,6 +600,7 @@ fn scalar_decode_span(bytes: &[u8], start: usize, soft_end: usize, facts: &mut S
 /// non-continuation where a continuation belongs, an accumulator that would overflow, and a value either overlong for
 /// its form or beyond `IV_MAX` — because the caller treats them alike.  Which one it was changes nothing downstream:
 /// the byte at `at` is not the start of a decodable character either way.
+#[inline(always)]
 fn decode_one(bytes: &[u8], at: usize) -> Option<(usize, u64)> {
     /// Minimum code-point value for each sequence length (minimal-length / anti-overlong rule).
     fn min_for_len(len: usize) -> u64 {
