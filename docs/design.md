@@ -2788,7 +2788,7 @@ flags, against code points from ASCII to beyond the BMP, zero
 disagreements.  It resolves both inversions — a flagged `E9`
 against `U+00E9` is `Equal` where bytes said `Greater`, and against
 `U+0100` is `Less` where bytes said `Greater` — and the same
-payload unflagged is `Less` against `U+00E9` while equalling
+payload unflagged is `Less` against `U+00E9` while equaling
 `U+00C3, U+00A9`, which is what two characters means.
 
 **So the direct path is gated on a positive fact, never on
@@ -4526,7 +4526,7 @@ inline comparison is free.
 **Open, pending the ops layer.**  Whether the channel is needed at
 all: §10.1's interpreter is a flat walker over an explicit
 `call_stack`, so `next`, `last`, `redo`, and `return` can move the
-instruction pointer and pop frames without travelling through Rust
+instruction pointer and pop frames without traveling through Rust
 return values.  What must cross the Rust boundary is the case
 where Perl is invoked *from* Rust and the Rust frame has to unwind
 — `die` through a `sort` comparator, a tie's `FETCH` inside a hash
@@ -12320,7 +12320,7 @@ rather than rediscovering.
 
 Its *narrow core* is separable and cheap.  Constructing an interpreter,
 parsing, running, evaluating a string, calling a named sub, and tearing
-down — with results marshalled as strings and numbers — touches no
+down — with results marshaled as strings and numbers — touches no
 struct layout at all.  It is the parts that hand back an `SV *` for the
 host to poke with `SvIV`/`SvPV` that hit XS's wall, and a host confined
 to `eval_pv` and `call_argv` never reaches them.
