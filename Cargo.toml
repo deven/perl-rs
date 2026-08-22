@@ -12,6 +12,10 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
+
+# The 1.89 floor is set by _mm256_cmple_epu8_mask in the AVX-512 digit-run kernel, stable since 1.89.0.  The other
+# ceilings beneath it: safe computation intrinsics inside #[target_feature] need 1.87, slice::as_chunks needs 1.88,
+# and edition 2024 needs 1.85.  Raise this only when something demands it, and record what did.
 rust-version = "1.89"
 
 [workspace.dependencies]
