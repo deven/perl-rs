@@ -445,7 +445,7 @@ Details:
 - **Eager below 64 KiB, lazy above [DECISION].**  Classifying
   content at construction costs one vectorized pass, which for
   `Heap8` is at most ~117 ns and for ASCII content of any size is
-  cheaper than the copy that just happened (§2.2.11).  Paying it
+  cheaper than the copy that just happened (§2.2.10).  Paying it
   eagerly lets the class and count live in the envelope, which
   removes the shared cache entirely: `Heap8` and `Heap16` headers
   hold **the refcount and nothing else**.  No atomics beyond the
@@ -1864,7 +1864,7 @@ folds to 16 (the `Plain` payload's spare discriminant encodings
 absorb the cell's own tag, as `Option<Value>` does); the §2.3.6
 assertion battery rebases to 16 wholesale.
 
-#### 2.2.11 Scanning kernels [DECISION]:
+#### 2.2.10 Scanning kernels [DECISION]:
 
 Two scans run over string bytes often enough to be worth writing
 by hand: finding where a leading digit run ends, which numeric
@@ -1928,7 +1928,7 @@ fallback where no hand-written path exists.
 there — that instruction is an x86 idiom with no Arm equivalent,
 so a WASM host on Arm emulates it.
 
-#### 2.2.10 Containers: the ordered map [DECISION]:
+#### 2.2.11 Containers: the ordered map [DECISION]:
 
 `Array` is a dense run of slots (`Option<Value>`: a hole is
 not `undef`, §21.1) behind the §2.2.12 front-gap engine.
@@ -2137,7 +2137,7 @@ identity keeps the closed-set discriminant, fuses it into
 The default is a bucket engine on `hashbrown::HashTable` — the
 safe SwissTable with public bucket addressing (`num_buckets`,
 `get_bucket`, `find_entry`, added in hashbrown 0.16.1) — and the
-§2.2.10 `IndexMap` engine is retained as the explicitly
+§2.2.11 `IndexMap` engine is retained as the explicitly
 requested insertion-ordered mode: perl code has real uses for a
 predictable order (`Hash::Ordered`-shaped work), but it must ask
 for it, and the surface through which perl code asks is deferred
@@ -3032,7 +3032,7 @@ Scalar    mutable cell interior (Plain | Full), upgraded in place
 FullScalar    boxed rare state: payload + caches + magic + stash
 ConstScalar   lockless immutable cell, coercions materialized at birth
 Array     front-gap slot engine + array-level state (§2.2.12)
-Hash      IndexMap<PString, Value> + iterator state (§2.2.10)
+Hash      IndexMap<PString, Value> + iterator state (§2.2.11)
 ArrayRef, HashRef, CodeRef, RegexRef
               Arc-backed shared identities of the container/code types
 MagicChain, Stash
@@ -12876,8 +12876,8 @@ internal ordering follows the dependency structure of §2:
    `Referent` clones, `ptr_eq` identity, upgrade triggers (§2.2.8).
 
 6. Containers — `Array`/`Hash` with their handle types
-   (the ordered-map ruling is recorded in §2.2.10, and the
-   scanning kernels `char_len` needs in §2.2.11),
+   (the ordered-map ruling is recorded in §2.2.11, and the
+   scanning kernels `char_len` needs in §2.2.10),
    exists/delete semantics against the slot model.
 
 7. Iterative teardown — the runtime-owned mechanical release
@@ -13096,7 +13096,7 @@ cross-dependencies.  Each is independently useful as a library:
 `perl-core` for extensions that need the value types.  `perl-core`
 carries its own `CowBuffer` (§2.2.3) for copy-on-write byte
 buffers, with `hashbrown` for the default hash engine
-(§2.2.13), `indexmap` for the insertion-ordered mode (§2.2.10,
+(§2.2.13), `indexmap` for the insertion-ordered mode (§2.2.11,
 §2.2.13), feature-gated `imbl` for the immutable engine
 (§2.2.13), and `parking_lot` for cell locks (§2.3.1).  `perl-parser`
 depends on `bytes` (source slicing), `memchr` (SIMD-optimized
