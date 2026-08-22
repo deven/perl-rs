@@ -4524,10 +4524,10 @@ an interner would have to hash at the raising site where the
 inline comparison is free.
 
 **Open, pending the ops layer.**  Whether the channel is needed at
-all: §10.1's interpreter is a flat walker over an explicit
-`call_stack`, so `next`, `last`, `redo`, and `return` can move the
-instruction pointer and pop frames without traveling through Rust
-return values.  What must cross the Rust boundary is the case
+all: §10.1's interpreter is a loop over IR operations with an
+explicit `call_stack`, so `next`, `last`, `redo`, and `return` can
+move the instruction pointer and pop frames without traveling
+through Rust return values.  What must cross the Rust boundary is the case
 where Perl is invoked *from* Rust and the Rust frame has to unwind
 — `die` through a `sort` comparator, a tie's `FETCH` inside a hash
 probe, an overload handler under a coercion — which is a real but
