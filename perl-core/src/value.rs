@@ -1524,6 +1524,26 @@ pub(crate) fn classify_numeric_noting_warning(bytes: &[u8]) -> (Numeric, bool) {
     (Numeric::Float(value), consumed != rest.len() || rest.is_empty())
 }
 
+impl fmt::Display for Value {
+    /// Stringification under §2.7.8's lossy rendering, through the payload's `stringify`.  String and dual payloads
+    /// delegate to the carried `PString` without allocating; every other payload renders one, so this impl takes
+    /// §2.7.1's bargain: a fixed signature may panic on allocation failure only, and the fallible twin the ops layer
+    /// calls instead is `stringify` itself.  Stringifying may one day run overloads; the hazard rides here, never in
+    /// the twin.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::String(s) => s.fmt(f),
+            Value::Dual(d) | Value::DualTainted(d) => d.string.fmt(f),
+            other => match other.stringify() {
+                Ok(s) => s.fmt(f),
+
+                // The §2.7.1 bargain's panic arm: allocation failure only.
+                Err(e) => panic!("Display for Value: allocation of {} bytes failed while rendering", e.requested),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests/value_tests.rs"]

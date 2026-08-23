@@ -4926,3 +4926,108 @@ fn random_content_round_trips_through_the_reporting_decoder() {
         assert_eq!(plain.is_some(), !saw_span, "[{iteration}] the plain decoder and the spans disagree on malformedness");
     }
 }
+
+// ── Display (§2.7.8) ──────────────────────────────────────────
+/// A flagged string with the given payload bytes, however the classifier judges them.
+fn flagged(bytes: &[u8]) -> PString {
+    let mut s = PString::from_bytes(bytes).unwrap();
+    s.set_utf8_for_test();
+    s
+}
+
+#[test]
+fn display_matches_std_formatting_wherever_std_can_render_the_content() {
+    // Where the content is representable as a `&str`, our padding machinery must be indistinguishable from
+    // `Formatter::pad` across width, precision, fill, and every alignment — including the sign-aware-zero quirk,
+    // whatever std does with it, since both sides read the same spec accessors.
+    macro_rules! check {
+        ($spec:literal, $s:expr) => {{
+            let oracle: &str = $s;
+            let ours = flagged(oracle.as_bytes());
+            assert_eq!(format!($spec, ours), format!($spec, oracle), "spec {} on flagged", $spec);
+
+            if oracle.is_ascii() {
+                let plain = PString::from_bytes(oracle.as_bytes()).unwrap();
+                assert_eq!(format!($spec, plain), format!($spec, oracle), "spec {} on unflagged", $spec);
+            }
+        }};
+    }
+
+    for s in ["", "a", "hello", "héllo wörld", "aé中\u{1F600}tail"] {
+        check!("{}", s);
+        check!("{:10}", s);
+        check!("{:<10}", s);
+        check!("{:>10}", s);
+        check!("{:^10}", s);
+        check!("{:^11}", s);
+        check!("{:*^11}", s);
+        check!("{:.3}", s);
+        check!("{:.0}", s);
+        check!("{:>10.3}", s);
+        check!("{:*<7.2}", s);
+        check!("{:08}", s);
+        check!("{:2}", s);
+    }
+}
+
+#[test]
+fn unflagged_high_bytes_render_as_latin_1_characters_and_never_replace() {
+    // Unflagged `C3 A9` is two Latin-1 characters, not `é` — the flag decides the character model, and the byte
+    // string's rendering must say so.
+    assert_eq!(format!("{}", PString::from_bytes([0xC3, 0xA9]).unwrap()), "Ã©");
+    assert_eq!(format!("{}", PString::from_bytes([0xE9]).unwrap()), "é");
+    assert_eq!(format!("{}", PString::from_bytes([0x00, 0xFF]).unwrap()), "\u{0}ÿ");
+
+    // Padding counts characters, not bytes: one high byte is one column.
+    assert_eq!(format!("{:>4}", PString::from_bytes([0xE9]).unwrap()), "   é");
+    assert_eq!(format!("{:.2}", PString::from_bytes([0xE9, 0xE8, 0xE7]).unwrap()), "éè");
+}
+
+#[test]
+fn unrepresentable_code_points_render_as_one_replacement_each() {
+    // Supra-Unicode and surrogates are well formed under perl and single characters; Rust merely cannot hold them, so
+    // each is exactly one U+FFFD — where `from_utf8_lossy` would emit four and three.
+    assert_eq!(format!("{}", flagged(&[0xF4, 0x90, 0x80, 0x80])), "\u{FFFD}");
+    assert_eq!(format!("{}", flagged(&[0xED, 0xA0, 0x80])), "\u{FFFD}");
+    assert_eq!(format!("{:>3}", flagged(&[0xF4, 0x90, 0x80, 0x80])), "  \u{FFFD}");
+    assert_eq!(format!("{}", flagged(b"a\xF4\x90\x80\x80b")), "a\u{FFFD}b");
+}
+
+#[test]
+fn malformed_content_renders_one_replacement_per_rejected_sequence() {
+    // The §2.7.8 grouping table, rendered: a lead claims its continuations, stray continuations run maximally, and the
+    // span is what the decoder rejected rather than a greedy sweep.
+    let table: [(&[u8], &str); 6] = [
+        (&[0x80], "\u{FFFD}"),
+        (&[0x80, 0x80, 0x80], "\u{FFFD}"),
+        (&[0xE4, 0xB8], "\u{FFFD}"),
+        (&[0xC0, 0xAF], "\u{FFFD}"),
+        (&[0xC2, 0x80, 0x80], "\u{80}\u{FFFD}"),
+        (&[0xC2, b'A'], "\u{FFFD}A"),
+    ];
+    for (bytes, expected) in table {
+        assert_eq!(format!("{}", flagged(bytes)), expected, "for {bytes:02X?}");
+    }
+}
+
+#[test]
+fn malformed_content_pads_and_truncates_by_rendered_glyphs() {
+    // The malformed terminal has no cached count, so the counting walk supplies one — and it must agree with what the
+    // render emits, or the fill arithmetic would drift.
+    let s = flagged(b"a\x80b");
+
+    assert_eq!(format!("{}", s), "a\u{FFFD}b");
+    assert_eq!(format!("{:^5}", s), " a\u{FFFD}b ");
+    assert_eq!(format!("{:.1}", s), "a");
+    assert_eq!(format!("{:.2}", s), "a\u{FFFD}");
+    assert_eq!(format!("{:>4.2}", s), "  a\u{FFFD}");
+}
+
+#[test]
+fn precision_cuts_flagged_valid_content_on_character_boundaries() {
+    let s = flagged("aé中tail".as_bytes());
+
+    assert_eq!(format!("{:.1}", s), "a");
+    assert_eq!(format!("{:.2}", s), "aé");
+    assert_eq!(format!("{:.3}", s), "aé中");
+}

@@ -609,3 +609,26 @@ fn the_overflow_shortcut_agrees_with_the_general_parser() {
     assert!(parse_float(fractional.as_bytes()).is_infinite());
     assert!(fractional.parse::<f64>().unwrap().is_infinite());
 }
+
+// ── Display (§2.7.8) ──────────────────────────────────────────
+#[test]
+fn display_renders_the_stringification() {
+    assert_eq!(format!("{}", Value::integer(42, Tainted::CLEAN)), "42");
+    assert_eq!(format!("{}", Value::integer(-7, Tainted::CLEAN)), "-7");
+    assert_eq!(format!("{}", Value::True), "1");
+    assert_eq!(format!("{}", Value::False), "");
+    assert_eq!(format!("{}", Value::Undef), "");
+
+    let s = Value::String(PString::from_bytes(b"hello").unwrap());
+    assert_eq!(format!("{}", s), "hello");
+}
+
+#[test]
+fn display_padding_is_string_padding_even_for_numeric_payloads() {
+    // A Value renders as its stringification, and the rendering pads as a string does: default alignment left, where a
+    // bare i64's Display would right-align.  The divergence is deliberate — "$x" is a string.
+    assert_eq!(format!("{:5}", Value::integer(42, Tainted::CLEAN)), "42   ");
+    assert_eq!(format!("{:>5}", Value::integer(42, Tainted::CLEAN)), "   42");
+    assert_eq!(format!("{:^6}", Value::String(PString::from_bytes(b"ab").unwrap())), "  ab  ");
+    assert_eq!(format!("{:.1}", Value::integer(42, Tainted::CLEAN)), "4");
+}

@@ -4091,6 +4091,144 @@ impl Packed {
     }
 }
 
+// ─── Display (§2.7.8) ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What `Formatter::pad` would compute from the format spec, reproduced because `pad` takes a `&str` this content
+/// cannot always be: the character count after precision truncation, and the fill split per alignment — default left
+/// for strings, center putting its odd column on the right, matching std.
+fn pad_plan(f: &fmt::Formatter<'_>, count: usize) -> (usize, usize, usize) {
+    let effective = match f.precision() {
+        Some(p) if p < count => p,
+        _ => count,
+    };
+
+    let (mut left, mut right) = (0, 0);
+    if let Some(width) = f.width()
+        && width > effective
+    {
+        let pad = width - effective;
+        match f.align() {
+            Some(fmt::Alignment::Right) => left = pad,
+            Some(fmt::Alignment::Center) => {
+                left = pad / 2;
+                right = pad - pad / 2;
+            }
+            _ => right = pad,
+        }
+    }
+
+    (effective, left, right)
+}
+
+fn write_fill(f: &mut fmt::Formatter<'_>, n: usize) -> fmt::Result {
+    let fill = f.fill();
+    for _ in 0..n {
+        f.write_char(fill)?;
+    }
+
+    Ok(())
+}
+
+/// The flagged lossy body (§2.7.8): one glyph per decode step — the character where Rust can hold it, `U+FFFD` where it
+/// cannot or where the decoder rejected a sequence — stopping after `limit` steps.  The loop is the reporting
+/// decoder's, restated here because the formatter must thread a write error out of the walk, and stops early both on
+/// the limit and on the sink's first refusal.
+fn fmt_flagged_lossy(bytes: &[u8], limit: usize, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut i = 0;
+    let mut left = limit;
+    while i < bytes.len() && left > 0 {
+        match decode_one(bytes, i) {
+            Some((len, v)) => {
+                let c = u32::try_from(v).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
+                f.write_char(c)?;
+                i += len;
+            }
+            None => {
+                f.write_char('\u{FFFD}')?;
+                i += malformed_run(bytes, i);
+            }
+        }
+
+        left -= 1;
+    }
+
+    Ok(())
+}
+
+/// The rendered glyph count of flagged content with no cached character count — the malformed terminal, whose rendering
+/// is one glyph per decode step, replacements included.  Allocation-free by construction: the counting walk is the
+/// render walk with the writes removed.
+fn lossy_steps(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    let mut steps = 0;
+    while i < bytes.len() {
+        i += match decode_one(bytes, i) {
+            Some((len, _)) => len,
+            None => malformed_run(bytes, i),
+        };
+        steps += 1;
+    }
+
+    steps
+}
+
+impl fmt::Display for PString {
+    /// Lossy rendering per §2.7.8.  An unflagged string is one code point per byte, widened on the way out, and never
+    /// produces a replacement; flagged content Rust can represent is written through unchanged; an unrepresentable code
+    /// point or a rejected sequence is one `U+FFFD` each.  Width, precision, and fill are honored with `pad`'s
+    /// semantics — the cached character count supplies the length, and only the malformed terminal pays a counting walk
+    /// first.
+    ///
+    /// Total per §2.7.8: allocates nothing, consults no magic, runs no user code, so there is no `try_` twin — the only
+    /// `Err` out of here is the sink's own (§2.7.1's bargain is not needed).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut scratch = [0u8; DECODE_MAX];
+        if !self.is_utf8() {
+            // One code point per byte: the character count is the byte length, and truncation is a byte slice.
+            let bytes = self.as_bytes(&mut scratch);
+            let (effective, left, right) = pad_plan(f, bytes.len());
+            write_fill(f, left)?;
+
+            cow_buffer::widen_latin1::<fmt::Error>(&bytes[..effective], |chunk| {
+                // SAFETY: every chunk is a maximal ASCII run of the source or whole two-byte encodings the widen just
+                // built — valid UTF-8 on its own, per `widen_latin1`'s contract.
+                f.write_str(unsafe { str::from_utf8_unchecked(chunk) })
+            })?;
+
+            write_fill(f, right)
+        } else {
+            // `char_len` classifies and narrows on demand, so the state read below is post-narrowing knowledge; `None`
+            // is the malformed terminal, whose rendered count is the counting walk's.
+            let counted = self.char_len();
+            let bytes = self.as_bytes(&mut scratch);
+            let count = match counted {
+                Some(n) => n,
+                None => lossy_steps(bytes),
+            };
+
+            let (effective, left, right) = pad_plan(f, count);
+            write_fill(f, left)?;
+
+            if scan::is_rust_valid(self.scan_state()) {
+                // SAFETY: the state asserts the bytes are valid UTF-8 (§2.2.4).
+                let s = unsafe { str::from_utf8_unchecked(bytes) };
+                if effective == count {
+                    f.write_str(s)?;
+                } else {
+                    match s.char_indices().nth(effective) {
+                        Some((cut, _)) => f.write_str(&s[..cut])?,
+                        None => f.write_str(s)?, // unreachable: effective < count means a cut index exists
+                    }
+                }
+            } else {
+                fmt_flagged_lossy(bytes, effective, f)?;
+            }
+
+            write_fill(f, right)
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests/string_tests.rs"]
