@@ -1361,8 +1361,7 @@ pub(crate) struct Adopted {
 /// What an `Adopted` keeps alive.  Arms own their object outright and release it by falling out of scope in the
 /// struct's drop; the one arm that retains rather than owns — `Parent` — is the one `Drop` matches for.
 ///
-/// Future doors, recorded in §2.2.15 and deliberately absent until a caller exists: `HeapBuf` retaining a native
-/// buffer for oversized native views (Stage 3 of the surgery, which also decides its tier transport), `Mmap`, and
+/// Future doors, recorded in §2.2.15 and deliberately absent until a caller exists: `Mmap` and
 /// `Foreign { ptr, len, drop_fn }`.
 // The payload fields are drop-only by design — "matched exactly once, in Drop" — and reads go through the resolved
 // base, so the never-read warning would fire forever on what the design intends.
@@ -1378,6 +1377,15 @@ pub(crate) enum Holder {
 
     /// An oversized view of an adoptee: retains the parent, whose refcount this arm's drop releases.
     Parent(NonNull<Adopted>),
+
+    /// An oversized view of a native buffer (§2.2.15's LargeSlice case): retains the buffer's own header refcount,
+    /// released in the drop arm under the tier's rules — the capacity riding here for the tiers whose release demands
+    /// one, zero for the header-described tiers, which never read it.
+    HeapBuf {
+        ptr: NonNull<u8>,
+        tier: Tier,
+        cap: u32,
+    },
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1464,6 +1472,51 @@ impl Adopted {
             Err(e) => {
                 // SAFETY: undoing the retain just taken; the parent is still live.
                 unsafe { Adopted::release(parent) };
+                Err(e)
+            }
+        }
+    }
+
+    /// Mint the oversized native view's child (§2.2.15's LargeSlice case): an `Adopted` whose holder retains the
+    /// buffer's own header refcount and whose `base` is pre-resolved to the buffer's data plus the offset, so reads
+    /// stay two loads.  The retain is taken here and surrendered by the drop arm; on allocation failure nothing stays
+    /// retained.
+    ///
+    /// # Safety
+    /// `ptr` must be a live allocation of `tier` with at least `offset + len` initialized bytes, and `cap` its capacity
+    /// where the tier's release demands one.
+    pub(crate) unsafe fn adopt_heap_buf(
+        ptr: NonNull<u8>,
+        tier: Tier,
+        cap: u32,
+        offset: usize,
+        len: usize,
+        scan: ScanState,
+    ) -> Result<NonNull<Adopted>, AllocError> {
+        // SAFETY: live per the contract; the retain pairs with the HeapBuf arm's release in Drop.
+        let base = unsafe {
+            match tier {
+                Tier::Heap8 => heap8::retain(ptr),
+                Tier::Heap16 => heap16::retain(ptr),
+                Tier::Heap32 => heap32::retain(ptr),
+                Tier::Heap => heap::retain(ptr),
+            }
+            ptr.as_ptr().cast_const().add(offset)
+        };
+
+        match Self::mint(base, len, scan, Holder::HeapBuf { ptr, tier, cap }) {
+            Ok(child) => Ok(child),
+
+            Err(e) => {
+                // SAFETY: undoing the retain just taken; the buffer is still live.
+                unsafe {
+                    match tier {
+                        Tier::Heap8 => heap8::release(ptr, cap as u8),
+                        Tier::Heap16 => heap16::release(ptr, cap as u16),
+                        Tier::Heap32 => heap32::release(ptr),
+                        Tier::Heap => heap::release(ptr),
+                    }
+                }
                 Err(e)
             }
         }
@@ -1556,10 +1609,22 @@ impl Adopted {
 impl Drop for Adopted {
     fn drop(&mut self) {
         // The holder is matched exactly once, here.  Owning arms release by falling out of scope when the fields drop
-        // after this body; the retaining arm surrenders what it retained.
-        if let Holder::Parent(parent) = self.holder {
+        // after this body; the retaining arms surrender what they retained.
+        match self.holder {
             // SAFETY: the Parent arm holds the retain taken at adopt_span_of.
-            unsafe { Adopted::release(parent) };
+            Holder::Parent(parent) => unsafe { Adopted::release(parent) },
+
+            // SAFETY: the HeapBuf arm holds the retain taken at adopt_heap_buf, surrendered under the tier the capacity
+            // accompanies.
+            Holder::HeapBuf { ptr, tier, cap } => unsafe {
+                match tier {
+                    Tier::Heap8 => heap8::release(ptr, cap as u8),
+                    Tier::Heap16 => heap16::release(ptr, cap as u16),
+                    Tier::Heap32 => heap32::release(ptr),
+                    Tier::Heap => heap::release(ptr),
+                }
+            },
+            _ => {}
         }
     }
 }
