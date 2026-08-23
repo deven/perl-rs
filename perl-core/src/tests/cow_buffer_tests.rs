@@ -316,3 +316,50 @@ fn buffers_allocate_inside_the_jemalloc_instance() {
     assert!(counter.get() >= before + 100_000, "the buffer lives in the instance the counter reads");
     drop(parts);
 }
+
+// ── widen_latin1 (§2.7.8) ─────────────────────────────────────
+#[test]
+fn widen_latin1_streams_the_same_bytes_upgraded_bytes_builds() {
+    // The streaming form and the copying form are one implementation now, but the equivalence stays pinned against the
+    // reference expansion in case they ever part ways again.
+    let cases: [&[u8]; 6] = [b"", b"plain ascii", &[0xE9], &[0xFF, 0x00, 0x80], b"mid\xE9dle then a long ascii tail after the variant", &[0xE9; 200]];
+    for bytes in cases {
+        let mut reference = Vec::new();
+        for &b in bytes {
+            if b < 0x80 {
+                reference.push(b);
+            } else {
+                reference.extend_from_slice(&[0xC0 | (b >> 6), 0x80 | (b & 0x3F)]);
+            }
+        }
+
+        assert_eq!(upgraded_bytes(bytes).unwrap(), reference, "for {bytes:02X?}");
+
+        let mut streamed = Vec::new();
+        let Ok(()) = widen_latin1::<std::convert::Infallible>(bytes, |chunk| {
+            // Every chunk must be valid UTF-8 on its own: that is the contract the Display sink asserts.
+            assert!(std::str::from_utf8(chunk).is_ok(), "chunk {chunk:02X?} is not self-contained UTF-8");
+            streamed.extend_from_slice(chunk);
+            Ok(())
+        });
+
+        assert_eq!(streamed, reference, "for {bytes:02X?}");
+    }
+}
+
+#[test]
+fn widen_latin1_borrows_ascii_runs_from_the_source() {
+    // The zero-copy claim, pinned: chunks covering pure-ASCII spans are subslices of the input, not staged copies.
+    let bytes = b"a long ascii prefix\xE9and a long ascii suffix after it";
+    let range = bytes.as_ptr() as usize..bytes.as_ptr() as usize + bytes.len();
+    let mut borrowed = 0;
+    let Ok(()) = widen_latin1::<std::convert::Infallible>(bytes, |chunk| {
+        if range.contains(&(chunk.as_ptr() as usize)) {
+            borrowed += chunk.len();
+        }
+
+        Ok(())
+    });
+
+    assert_eq!(borrowed, bytes.len() - 1, "every byte but the variant should pass through borrowed");
+}

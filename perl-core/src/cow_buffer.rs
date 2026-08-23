@@ -1203,20 +1203,58 @@ pub(crate) fn upgraded_bytes(bytes: &[u8]) -> Result<Vec<u8>, AllocError> {
 
     let mut out = Vec::new();
     out.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
-    out.extend_from_slice(&bytes[..first]);
 
-    for &byte in &bytes[first..] {
-        if byte < 0x80 {
-            out.push(byte);
-        } else {
-            out.push(0xC0 | (byte >> 6));
-            out.push(0x80 | (byte & 0x3F));
-        }
-    }
+    // The sink cannot fail: capacity is exact and reserved above, so the monomorphized error arm compiles away.
+    let Ok(()) = widen_latin1::<std::convert::Infallible>(bytes, |chunk| {
+        out.extend_from_slice(chunk);
+        Ok(())
+    });
 
     debug_assert_eq!(out.len(), total, "the counted expansion must fill the buffer exactly");
 
     Ok(out)
+}
+
+/// Stream the Latin-1 -> UTF-8 widening of `bytes` into `sink` as borrowed chunks: each maximal ASCII run is handed
+/// through as a subslice of the source, costing one copy into the output and nothing else, and each high byte becomes
+/// its two-byte encoding, batched in a small stack buffer so the sink sees whole sequences rather than one call per
+/// byte.  Every chunk is therefore valid UTF-8 on its own, and a formatter sink may assert so.
+///
+/// Generic over the sink's error: an infallible consumer instantiates `E = Infallible` and carries no error path at
+/// all, while a formatter sink instantiates `fmt::Error`.  This is the widening transform's streaming form; the
+/// in-place form (`expand_latin1_in_place`) stays separate because it runs backwards to avoid overwriting bytes it has
+/// not yet read, which is not a sink shape.
+pub(crate) fn widen_latin1<E>(bytes: &[u8], mut sink: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+    let mut i = 0;
+    while i < bytes.len() {
+        // The maximal ASCII run, borrowed straight from the source.
+        let run = bytes[i..].iter().position(|&b| b >= 0x80).unwrap_or(bytes.len() - i);
+        if run > 0 {
+            sink(&bytes[i..i + run])?;
+            i += run;
+        }
+
+        // The following high bytes, widened into staged pairs and flushed in batches of whole sequences.
+        let mut staged = [0u8; 64];
+        let mut fill = 0;
+        while i < bytes.len() && bytes[i] >= 0x80 {
+            if fill == staged.len() {
+                sink(&staged)?;
+                fill = 0;
+            }
+
+            staged[fill] = 0xC0 | (bytes[i] >> 6);
+            staged[fill + 1] = 0x80 | (bytes[i] & 0x3F);
+            fill += 2;
+            i += 1;
+        }
+
+        if fill > 0 {
+            sink(&staged[..fill])?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Count the two-byte sequences in `bytes`, or `None` when any byte is not part of a Latin-1-range encoding — exactly
