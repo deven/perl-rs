@@ -136,7 +136,17 @@ unsafe fn small_backing_release(ptr: std::ptr::NonNull<u8>, cap: usize) {
 ///
 /// So this is correct by construction rather than by measuring the cases, and it is a constraint on what may be added
 /// later: a non-heap encoding compressing more than 2:1 would overflow every scratch buffer in the crate.
+///
+/// Read from the producer side, the same number is the **envelope representability ceiling**: the maximum logical
+/// byte length any envelope-resident form can possibly represent, and so the bound past which the envelope ladder
+/// is not worth attempting.  Representability inside the ceiling stays conditional — only lengths up to
+/// `INLINE_MAX` are unconditional, and longer content needs a compressed form to admit it — so the constant bounds
+/// where the ladder may succeed, never what it yields.
 pub const DECODE_MAX: usize = INLINE_MAX * 2;
+
+// The packed ceiling is an independent design quantity that happens to coincide; if an alphabet ever reached
+// further, the scratch buffers and the ceiling would both have to grow, and this assert forces the revisit.
+const _: () = assert!(DECODE_MAX == MAX_PACKED_LEN);
 
 /// The heap scan lattice (§2.2.4): terminal states live typed in the small tiers' envelopes, and the large tiers keep
 /// an atomic byte in the allocation header.  Zero is `UNKNOWN`, the lattice top — the natural zero-initialized state
@@ -1790,6 +1800,27 @@ macro_rules! define_perl_string {
                 }
             }
 
+            /// A view's backing and absolute coordinates, borrowed for re-slice composition: no reference is
+            /// taken, and the adopted whole-object sentinel resolves to real coordinates here.
+            fn view_parts(&self) -> Option<(ViewBacking, std::ptr::NonNull<u8>, usize, usize)> {
+                match &self.0 {
+                    $( Repr::$slice { ptr, offset, len, .. } => Some((ViewBacking::Heap32Medium, ptr.as_ptr(), u24(*offset), u24(*len))), )*
+                    $( Repr::$far_slice { ptr, offset, len, .. } => Some((ViewBacking::Heap32Far, ptr.as_ptr(), u32v(*offset), u16v(*len))), )*
+                    $( Repr::$small_slice { ptr, offset, len, cap, .. } => Some((ViewBacking::Small { cap: u16v(*cap) }, ptr.as_ptr(), u16v(*offset), u16v(*len))), )*
+                    $( Repr::$adopted { ptr, offset, len, .. } => Some({
+                        // SAFETY: the handle holds a reference on the live struct.
+                        let (off, n) = if u24(*offset) == SPAN as usize && u24(*len) == SPAN as usize {
+                            (0, unsafe { ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref() }.total_len())
+                        } else {
+                            (u24(*offset), u24(*len))
+                        };
+                        (ViewBacking::Adopted, ptr.as_ptr(), off, n)
+                    }), )*
+                    $( Repr::$far_adopted { ptr, offset, len, .. } => Some((ViewBacking::AdoptedFar, ptr.as_ptr(), u32v(*offset), u16v(*len))), )*
+                    _ => None,
+                }
+            }
+
             /// Rebuild a view with the given tag dimensions (backing reference preserved): the backing selects the
             /// family, and each family stores the fields at its own width, already proven under its bound.
             fn build_view(backing: ViewBacking, utf8: bool, tainted: bool, ptr: Owned, offset: usize, len: usize, scan: scan::ScanState) -> PString {
@@ -2324,6 +2355,9 @@ impl PString {
     /// spirit: compressed inline, verbatim inline, packed, heap, in the ruled order (§2.2.9).  Internal: public
     /// construction fixes the flags.
     fn tiered(bytes: &[u8], utf8: bool, tainted: bool) -> Result<PString, AllocError> {
+        // The envelope ladder is only worth attempting within the ceiling; longer content takes the classified
+        // heap constructor directly, and `pack`'s own band precondition backstops this in debug builds.
+        debug_assert!(bytes.len() <= DECODE_MAX, "the envelope ladder serves lengths the envelope can possibly represent");
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
             return Ok(PString::build_inline(class, utf8, tainted, stored, aux, buf));
         }
@@ -2683,6 +2717,137 @@ impl PString {
         }
     }
 
+    /// The sharing verb (§2.2.15): a zero-copy view of `offset..offset + len`, except content representable in an
+    /// inline or packed form returns that form instead — a copy costing zero allocation, zero refcount traffic, and
+    /// zero pin dominates a view on every axis, which is form selection, not policy.  Sources with no shareable
+    /// backing answer in kind: envelope-resident content materializes owned, and an immortal image yields another
+    /// immortal envelope over the same image.  The range clamps as perl's own rvalue `substr` clamps — an offset
+    /// past the end is the empty string, a length past the end truncates — with warnings the ops layer's business.
+    /// Core carries no thresholds: the copy-versus-pin judgment belongs to callers who can see what this crate
+    /// cannot (§2.7.7), with `substr` and `unshare` as the other two verbs.
+    pub fn slice(&self, offset: usize, len: usize) -> Result<PString, AllocError> {
+        let (utf8, tainted) = (self.is_utf8(), self.is_tainted());
+        let total = self.len();
+        let offset = offset.min(total);
+        let len = len.min(total - offset);
+
+        // Representability first: the dominant copy (§2.2.15).
+        {
+            let mut scratch = [0u8; DECODE_MAX];
+            if len <= DECODE_MAX {
+                let bytes = &self.as_bytes(&mut scratch)[offset..offset + len];
+                if len <= INLINE_MAX
+                    && let Some((class, s, aux, buf)) = classify_inline(bytes)
+                {
+                    return Ok(PString::build_inline(class, utf8, tainted, s, aux, buf));
+                }
+
+                if let Some(packed) = pack(bytes) {
+                    return Ok(PString::build_packed(packed, utf8, tainted));
+                }
+            }
+        }
+
+        let mut scratch = [0u8; DECODE_MAX];
+        match self.raw_parts() {
+            // Re-slice composition: the same backing, absolute coordinates, the birth table against the view's own
+            // bytes and envelope state.
+            RawParts::View { bytes, .. } => {
+                let Some((backing, raw, base, _)) = self.view_parts() else {
+                    // Unreachable by construction — the View arm and view_parts cover the same families — but a
+                    // defensive copy is total where a panic is forbidden.
+                    return Ok(PString::build_heap(utf8, tainted, heap_parts_classified(&bytes[offset..offset + len])?));
+                };
+
+                let scan = view_birth_state(self.scan_state(), bytes, offset, len);
+
+                // SAFETY (each arm): the handle's reference proves the backing live, and the coordinates were
+                // clamped within the view, which lies within the backing.
+                match backing {
+                    ViewBacking::Heap32Medium | ViewBacking::Heap32Far => unsafe { heap32_view(raw, base + offset, len, scan, utf8, tainted) },
+                    ViewBacking::Small { cap } => {
+                        let ptr = unsafe {
+                            small_backing_retain(raw, cap);
+                            Owned::from_raw(raw)
+                        };
+
+                        Ok(PString::build_view(ViewBacking::Small { cap }, utf8, tainted, ptr, base + offset, len, scan))
+                    }
+                    ViewBacking::Adopted | ViewBacking::AdoptedFar => unsafe { adopted_view(raw.cast(), base + offset, len, scan, utf8, tainted) },
+                }
+            }
+            RawParts::Heap(cb) => {
+                let scan = view_birth_state(cb.scan(), cb.as_slice(), offset, len);
+
+                // SAFETY (each arm): `cb` proves a live allocation of its tier with the clamped range initialized.
+                match cb.tier() {
+                    Tier::Heap8 | Tier::Heap16 => {
+                        let cap = cb.capacity();
+                        let ptr = unsafe {
+                            small_backing_retain(cb.raw(), cap);
+                            Owned::from_raw(cb.raw())
+                        };
+
+                        Ok(PString::build_view(ViewBacking::Small { cap }, utf8, tainted, ptr, offset, len, scan))
+                    }
+                    Tier::Heap32 => unsafe { heap32_view(cb.raw(), offset, len, scan, utf8, tainted) },
+
+                    // The word tier lies past every compact reach: always the LargeSlice case.
+                    Tier::Heap => {
+                        let child = unsafe { cow_buffer::Adopted::adopt_heap_buf(cb.raw(), Tier::Heap, 0, offset, len, scan) }?;
+                        Ok(PString::adopted_whole(child, utf8, tainted))
+                    }
+                }
+            }
+            RawParts::Borrowed { bytes, .. } => {
+                let sub = &bytes[offset..offset + len];
+                if len <= SPAN as usize {
+                    let (st, chars) = classify_full(sub);
+                    if let Some(term) = st.widen().terminal() {
+                        // SAFETY: a subslice of a live image is nonnull.
+                        let ptr = unsafe { std::ptr::NonNull::new_unchecked(sub.as_ptr().cast_mut()) };
+                        let immortal = matches!(self.storage_type(), StorageType::Immortal | StorageType::LargeImmortal);
+
+                        return Ok(if immortal {
+                            PString::build_immortal(utf8, tainted, ptr, len, chars, term)
+                        } else {
+                            PString::build_static(utf8, tainted, ptr, len, chars, term)
+                        });
+                    }
+                }
+
+                // Past the compact image reach (a large image's sub-range over 16 MiB), or a defensively
+                // non-terminal classification: the owned copy is total.
+                Ok(PString::build_heap(utf8, tainted, heap_parts_classified(sub)?))
+            }
+
+            // Envelope-resident sources past representability: no buffer to share (§2.2.15).
+            RawParts::Inline { .. } | RawParts::Packed(_) => {
+                let bytes = &self.as_bytes(&mut scratch)[offset..offset + len];
+                Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
+            }
+        }
+    }
+
+    /// The copying verb (§2.2.15): an unshared, uniquely-owned copy of `offset..offset + len` — content within the
+    /// envelope ceiling runs the envelope ladder, representability staying conditional inside it, and everything
+    /// past the ceiling takes the classified heap constructor — perl's own rvalue `substr` semantics under perl's
+    /// own name, clamping as `slice` clamps.  Lvalue `substr` remains the reserved borrowed-view type `Str`.
+    pub fn substr(&self, offset: usize, len: usize) -> Result<PString, AllocError> {
+        let (utf8, tainted) = (self.is_utf8(), self.is_tainted());
+        let total = self.len();
+        let offset = offset.min(total);
+        let len = len.min(total - offset);
+
+        let mut scratch = [0u8; DECODE_MAX];
+        let bytes = &self.as_bytes(&mut scratch)[offset..offset + len];
+        if len <= DECODE_MAX {
+            return PString::tiered(bytes, utf8, tainted);
+        }
+
+        Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
+    }
+
     /// Break any sharing: after this call, the value's bytes live in storage this handle exclusively owns, retaining
     /// nothing external.  This exists for lifetime control — a handle that must not pin an allocation other holders
     /// keep alive — not for mutation, which makes its own arrangements.  Unique and envelope-owned storage is
@@ -2920,7 +3085,7 @@ impl PString {
                     return Ok(None); // A character past U+00FF, or no character at all.
                 };
 
-                if out.len() <= MAX_PACKED_LEN {
+                if out.len() <= DECODE_MAX {
                     return Ok(Some(PString::tiered(&out, false, t)?));
                 }
 
@@ -2933,7 +3098,7 @@ impl PString {
                     return Ok(None); // A character past U+00FF, or no character at all.
                 };
 
-                if out.len() <= MAX_PACKED_LEN {
+                if out.len() <= DECODE_MAX {
                     return Ok(Some(PString::tiered(&out, false, t)?));
                 }
 
@@ -3085,8 +3250,8 @@ impl PString {
             };
             let total = ilen + bytes.len();
 
-            if total <= MAX_PACKED_LEN {
-                let mut combined = [0u8; MAX_PACKED_LEN];
+            if total <= DECODE_MAX {
+                let mut combined = [0u8; DECODE_MAX];
                 combined[..ilen].copy_from_slice(&internal[..ilen]);
                 combined[ilen..total].copy_from_slice(bytes);
 
@@ -4634,6 +4799,70 @@ impl Packed {
     }
 }
 
+// ─── The slicing mints (§2.2.15) ─────────────────────────────────────────────────────────────────────────────────────
+
+/// Mint a view of a Heap32 buffer under the ruled selection: far while the length fits u16, medium for the band only it
+/// serves, and past both the LargeSlice case — an `Adopted` child holding the buffer, worn as a whole-object envelope.
+///
+/// # Safety
+/// `raw` must be a live Heap32 allocation with at least `offset + len` initialized bytes.
+unsafe fn heap32_view(raw: std::ptr::NonNull<u8>, offset: usize, len: usize, scan: scan::ScanState, utf8: bool, tainted: bool) -> Result<PString, AllocError> {
+    if len <= u16::MAX as usize && offset <= u32::MAX as usize {
+        // SAFETY: live per the contract; the envelope owns the reference this retain adds.
+        let ptr = unsafe {
+            cow_buffer::heap32::retain(raw);
+            Owned::from_raw(raw)
+        };
+
+        return Ok(PString::build_view(ViewBacking::Heap32Far, utf8, tainted, ptr, offset, len, scan));
+    }
+
+    if offset < SPAN as usize && len < SPAN as usize {
+        // SAFETY: as above.
+        let ptr = unsafe {
+            cow_buffer::heap32::retain(raw);
+            Owned::from_raw(raw)
+        };
+
+        return Ok(PString::build_view(ViewBacking::Heap32Medium, utf8, tainted, ptr, offset, len, scan));
+    }
+
+    // SAFETY: live per the contract; the child takes its own retain and the envelope owns the child.
+    let child = unsafe { cow_buffer::Adopted::adopt_heap_buf(raw, Tier::Heap32, 0, offset, len, scan) }?;
+
+    Ok(PString::adopted_whole(child, utf8, tainted))
+}
+
+/// Mint a view of an adopted object under the same selection, the LargeAdopted case being a `Parent` child.
+///
+/// # Safety
+/// `backing` must be a live `Adopted` with `offset + len` within its object.
+unsafe fn adopted_view(
+    backing: std::ptr::NonNull<cow_buffer::Adopted>,
+    offset: usize,
+    len: usize,
+    scan: scan::ScanState,
+    utf8: bool,
+    tainted: bool,
+) -> Result<PString, AllocError> {
+    let far = len <= u16::MAX as usize && offset <= u32::MAX as usize;
+    if far || (offset < SPAN as usize && len < SPAN as usize) {
+        // SAFETY: live per the contract; the envelope owns the reference this retain adds.
+        let ptr = unsafe {
+            cow_buffer::Adopted::retain(backing);
+            Owned::from_raw(backing.cast())
+        };
+
+        let kind = if far { ViewBacking::AdoptedFar } else { ViewBacking::Adopted };
+        return Ok(PString::build_view(kind, utf8, tainted, ptr, offset, len, scan));
+    }
+
+    // SAFETY: live per the contract; the child retains the parent and the envelope owns the child.
+    let child = unsafe { cow_buffer::Adopted::adopt_span_of(backing, offset, len, scan) }?;
+
+    Ok(PString::adopted_whole(child, utf8, tainted))
+}
+
 // ─── View births (§2.2.15) ───────────────────────────────────────────────────────────────────────────────────────────
 
 /// Whether the cut at `offset..offset + len` of `parent` splits no sequence: two O(1) continuation-byte tests, valid
@@ -4644,6 +4873,7 @@ fn cut_is_clean(parent: &[u8], offset: usize, len: usize) -> bool {
     let start_clean = offset == 0 || offset >= parent.len() || (parent[offset] & 0xC0) != 0x80;
     let end = offset + len;
     let end_clean = end >= parent.len() || (parent[end] & 0xC0) != 0x80;
+
     start_clean && end_clean
 }
 

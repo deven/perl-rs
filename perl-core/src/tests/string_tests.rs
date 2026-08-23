@@ -5458,3 +5458,130 @@ fn far_adopted_carries_offsets_past_u24_reach() {
     drop(clone);
     assert_eq!(std::sync::Arc::strong_count(&big), 1, "the last far view released the struct, which released the Arc");
 }
+
+// ── The verbs (§2.2.15, Stage 3) ──────────────────────────────
+#[test]
+fn slice_returns_representable_content_in_the_envelope_forms() {
+    let parent = heap32_parent(100_000);
+    let mut sa = [0u8; DECODE_MAX];
+    let mut sb = [0u8; DECODE_MAX];
+
+    // At or under fifteen bytes: always inline, whatever the source.
+    let tiny = parent.slice(3, 10).unwrap();
+    assert!(matches!(tiny.storage_type(), StorageType::InlineAscii | StorageType::InlineAsciiFull));
+    assert_eq!(tiny.as_bytes(&mut sa), &parent.as_bytes(&mut sb)[3..13]);
+
+    // Packable content past fifteen: the packed form.
+    let stamp = PString::from_bytes(*b"xx2026-08-23T09:41:07Zyy").unwrap();
+    let packed = stamp.slice(2, 20).unwrap();
+    assert!(format!("{:?}", packed.storage_type()).starts_with("Packed"), "{:?}", packed.storage_type());
+
+    // Unrepresentable twenty bytes of a heap source: shared, not copied.
+    let mixed = parent.slice(49_990, 25).unwrap();
+    assert_eq!(mixed.storage_type(), StorageType::FarSlice, "an unrepresentable sub-range of a shareable backing is a view");
+
+    // The one reachable envelope-resident leftover: a dirty byte-cut of the Latin-1 inline class — seventeen
+    // bytes splitting a sequence are the Bytes class past the inline ceiling and no alphabet — owned, there being
+    // no buffer to share.
+    let inline_src = PString::from_bytes([0xC3, 0xA9].repeat(15)).unwrap();
+    assert!(format!("{:?}", inline_src.storage_type()).starts_with("InlineLatin1"), "{:?}", inline_src.storage_type());
+    let owned = inline_src.slice(0, 17).unwrap();
+    assert_eq!(owned.len(), 17);
+    assert!(!matches!(
+        owned.storage_type(),
+        StorageType::SmallSlice | StorageType::MediumSlice | StorageType::FarSlice | StorageType::Adopted | StorageType::FarAdopted
+    ));
+}
+
+#[test]
+fn slice_clamps_as_perl_clamps() {
+    let parent = heap32_parent(70_000);
+    assert!(parent.slice(1_000_000, 10).unwrap().is_empty(), "an offset past the end is the empty string");
+    assert_eq!(parent.slice(69_990, 1_000).unwrap().len(), 10, "a length past the end truncates");
+    assert_eq!(parent.substr(69_990, 1_000).unwrap().len(), 10);
+}
+
+#[test]
+fn oversized_native_views_take_the_large_slice_case() {
+    let parent = heap32_parent(21 * 1024 * 1024);
+    let big = parent.slice(100, 20 * 1024 * 1024).unwrap();
+    assert_eq!(big.storage_type(), StorageType::Adopted, "the LargeSlice case wears a whole-object adopted envelope");
+    assert_eq!(big.len(), 20 * 1024 * 1024);
+
+    let mut sa = [0u8; DECODE_MAX];
+    let mut sb = [0u8; DECODE_MAX];
+    assert_eq!(big.as_bytes(&mut sa)[..64], parent.as_bytes(&mut sb)[100..164]);
+
+    // The child's retain holds the buffer past the parent handle.
+    drop(parent);
+    assert_eq!(big.as_bytes(&mut sa).len(), 20 * 1024 * 1024);
+}
+
+#[test]
+fn oversized_adopted_views_take_the_parent_child() {
+    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(&vec![b'.'; 20 * 1024 * 1024][..]);
+    let a = cow_buffer::Adopted::adopt_arc_bytes(arc.clone(), scan::Ascii).unwrap();
+    let whole = PString::adopted_whole(a, false, false);
+
+    let big = whole.slice(100, 18 * 1024 * 1024).unwrap();
+    assert_eq!(big.storage_type(), StorageType::Adopted, "the LargeAdopted case is a Parent child worn whole");
+    assert_eq!(big.len(), 18 * 1024 * 1024);
+
+    drop(whole);
+    assert_eq!(std::sync::Arc::strong_count(&arc), 2, "the chain still holds the Arc");
+    drop(big);
+    assert_eq!(std::sync::Arc::strong_count(&arc), 1, "releasing the child released the parent released the Arc");
+}
+
+#[test]
+fn reslicing_composes_absolute_offsets() {
+    let parent = heap32_parent(200_000);
+    let view = parent.slice(1_000, 100_000).unwrap();
+    let sub = view.slice(500, 40_000).unwrap();
+    assert_eq!(sub.storage_type(), StorageType::FarSlice);
+
+    let direct = parent.substr(1_500, 40_000).unwrap();
+    assert_eq!(sub, direct, "composition reads the same bytes the direct copy does");
+
+    // Small-tier composition, past representability.
+    let small_parent = PString::from_bytes(vec![b's'; 5_000]).unwrap();
+    let small_view = small_parent.slice(10, 3_000).unwrap();
+    assert_eq!(small_view.storage_type(), StorageType::SmallSlice);
+    let small_sub = small_view.slice(500, 2_000).unwrap();
+    assert_eq!(small_sub.storage_type(), StorageType::SmallSlice);
+    assert_eq!(small_sub, small_parent.substr(510, 2_000).unwrap());
+
+    // Adopted composition selects far and medium by the same rule.
+    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(&vec![b'a'; 18 * 1024 * 1024][..]);
+    let whole = PString::adopted_whole(cow_buffer::Adopted::adopt_arc_bytes(arc, scan::Ascii).unwrap(), false, false);
+    assert_eq!(whole.slice(16_900_000, 100).unwrap().storage_type(), StorageType::FarAdopted);
+    assert_eq!(whole.slice(100, 200_000).unwrap().storage_type(), StorageType::Adopted);
+}
+
+#[test]
+fn slicing_a_static_image_yields_another_static_envelope() {
+    let s = PString::from_static_bytes(b"a static image with some length to it, well past the packed band for certain").unwrap();
+    assert_eq!(s.storage_type(), StorageType::Static);
+
+    let sub = s.slice(2, 40).unwrap();
+    assert_eq!(sub.storage_type(), StorageType::Static, "the image outlives every handle; the sub-envelope is free");
+    assert_eq!(sub, s.substr(2, 40).unwrap());
+}
+
+#[test]
+fn substr_is_always_uniquely_owned_and_flags_ride_both_verbs() {
+    let mut parent = heap32_parent(70_000);
+    parent.taint();
+
+    let copy = parent.substr(10, 40_000).unwrap();
+    assert!(!matches!(
+        copy.storage_type(),
+        StorageType::SmallSlice | StorageType::MediumSlice | StorageType::FarSlice | StorageType::Adopted | StorageType::FarAdopted
+    ));
+    assert!(!copy.is_shared());
+    assert!(copy.is_tainted(), "taint rides the copy");
+
+    let view = parent.slice(10, 40_000).unwrap();
+    assert!(view.is_tainted(), "taint rides the view");
+    assert_eq!(view, copy);
+}
