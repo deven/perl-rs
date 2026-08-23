@@ -56,6 +56,60 @@ const fn to_u24(value: usize) -> [u8; 3] {
     [b[0], b[1], b[2]]
 }
 
+/// The 16-bit view fields of the small-tier form (§2.2.15): little-endian in two bytes.
+#[inline]
+const fn u16v(bytes: [u8; 2]) -> usize {
+    u16::from_le_bytes(bytes) as usize
+}
+
+/// The inverse, for values already proven under the bound.
+#[inline]
+const fn to_u16(value: usize) -> [u8; 2] {
+    debug_assert!(value <= u16::MAX as usize);
+    (value as u16).to_le_bytes()
+}
+
+/// Which backing a view in flight owes its release to (§2.2.15): the small form carries the capacity its tiers' release
+/// demands, and the capacity is also the dispatch — the allocation ladder is strict, so Heap8 capacities sit at or
+/// below 255 and Heap16's above, with no overlap.
+#[derive(Clone, Copy)]
+enum ViewBacking {
+    Heap32,
+    Small { cap: usize },
+    Adopted,
+}
+
+/// # Safety
+/// `ptr` must own a live small-tier allocation of the tier the strict ladder assigns `cap`.
+#[inline]
+unsafe fn small_backing_retain(ptr: std::ptr::NonNull<u8>, cap: usize) {
+    debug_assert!(cap <= cow_buffer::heap16::MAX_CAPACITY, "the small form serves the small tiers only");
+
+    // SAFETY: the caller vouches for a live allocation; the ladder's strictness makes cap the tier.
+    unsafe {
+        if cap <= cow_buffer::heap8::MAX_CAPACITY {
+            cow_buffer::heap8::retain(ptr);
+        } else {
+            cow_buffer::heap16::retain(ptr);
+        }
+    }
+}
+
+/// # Safety
+/// As `small_backing_retain`, and the caller surrenders one reference.
+#[inline]
+unsafe fn small_backing_release(ptr: std::ptr::NonNull<u8>, cap: usize) {
+    // SAFETY: the caller vouches; the ladder's strictness makes cap the tier, and each release takes the capacity at
+    // its own width.
+    unsafe {
+        if cap <= cow_buffer::heap8::MAX_CAPACITY {
+            cow_buffer::heap8::release(ptr, cap as u8);
+        } else {
+            cow_buffer::heap16::release(ptr, cap as u16);
+        }
+    }
+}
+
 /// The widest byte sequence any non-heap form decodes to, and so the size of the scratch buffer the borrowed-view
 /// accessors take.
 ///
@@ -75,15 +129,15 @@ pub const DECODE_MAX: usize = INLINE_MAX * 2;
 pub mod scan {
     /// The scan lattice as a closed type, and the numbering's single home: the variants carry the discriminants, the
     /// related enums source theirs symbolically from the variant names, and a private projection module derives
-    /// pattern-position constants — no numeric fact is stated twice (§2.2.4).  Every value a scan byte can legally
-    /// hold is a variant, so "the byte is a valid state" stops being a convention the writers maintain and becomes a
-    /// fact the loader establishes once: [`ScanState::from_u8`] is the single place a raw byte re-enters the type,
-    /// and it is of the bomb's family.  The variants are re-exported, so `scan::Unknown` is the working vocabulary —
-    /// true variant paths, not aliases.
+    /// pattern-position constants — no numeric fact is stated twice (§2.2.4).  Every value a scan byte can legally hold
+    /// is a variant, so "the byte is a valid state" stops being a convention the writers maintain and becomes a fact
+    /// the loader establishes once: [`ScanState::from_u8`] is the single place a raw byte re-enters the type, and it is
+    /// of the bomb's family.  The variants are re-exported, so `scan::Unknown` is the working vocabulary — true variant
+    /// paths, not aliases.
     ///
     /// Each state is an assertion set (§2.2.4).  The two `Maybe` states — the strong assertion minus the witness a
-    /// subrange may exclude — and `PerlValidNonAscii` are currently unreachable, seated by ruling: slicing is
-    /// certain to come, their births arrive with it, and the meet is total only with all twelve seated.
+    /// subrange may exclude — and `PerlValidNonAscii` are currently unreachable, seated by ruling: slicing is certain
+    /// to come, their births arrive with it, and the meet is total only with all twelve seated.
     #[repr(u8)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum ScanState {
@@ -107,9 +161,9 @@ pub mod scan {
         /// here from `ValidUtf8` without paying the full-range lead-byte pass (§2.2.4).
         Utf8NonAscii = 5,
 
-        /// Perl-decodable, Rust-invalid: contains a code point Rust rejects (a surrogate or ≥ U+110000, each
-        /// ≥ U+0100 — so the beyond-Latin-1 range fact is derivable, and the range predicates lean on it).
-        /// Terminal.  Cannot equal an unflagged string.
+        /// Perl-decodable, Rust-invalid: contains a code point Rust rejects (a surrogate or ≥ U+110000, each ≥ U+0100 —
+        /// so the beyond-Latin-1 range fact is derivable, and the range predicates lean on it).  Terminal.  Cannot
+        /// equal an unflagged string.
         ExtendedUtf8 = 6,
 
         /// Violates the encoding patterns; invalid for Rust and perl both (§2.2.4).  Terminal.  Cannot equal an
@@ -128,19 +182,19 @@ pub mod scan {
         /// falsify the assertion, and debug builds treat the contradiction as the bomb family does.
         MaybeExtendedUtf8 = 10,
 
-        /// Perl-decodable with a high-bit byte present — under perl validity that byte's sequence decodes at or
-        /// above U+0080, so this is `Utf8NonAscii`'s perl-layer analog, with Rust validity and range unasserted.
-        /// The meet's home for a probe's byte fact landing on `MaybeExtendedUtf8` content, seated so that no union
-        /// of true certifications forfeits anything; a full classification can land on any perl-valid non-`Ascii`
-        /// terminal, with `MalformedUtf8` and `Ascii` both falsifying and bomb-family in debug.
+        /// Perl-decodable with a high-bit byte present — under perl validity that byte's sequence decodes at or above
+        /// U+0080, so this is `Utf8NonAscii`'s perl-layer analog, with Rust validity and range unasserted.  The meet's
+        /// home for a probe's byte fact landing on `MaybeExtendedUtf8` content, seated so that no union of true
+        /// certifications forfeits anything; a full classification can land on any perl-valid non-`Ascii` terminal,
+        /// with `MalformedUtf8` and `Ascii` both falsifying and bomb-family in debug.
         PerlValidNonAscii = 11,
     }
 
     pub use ScanState::*;
 
-    /// Pattern-position projections of the variants: a cast is not a pattern, and a `u8` scrutinee cannot match an
-    /// enum path, so these one-line derivations exist solely for `match` arms over raw bytes.  The variants remain
-    /// the numbering's only home — nothing here states a number.
+    /// Pattern-position projections of the variants: a cast is not a pattern, and a `u8` scrutinee cannot match an enum
+    /// path, so these one-line derivations exist solely for `match` arms over raw bytes.  The variants remain the
+    /// numbering's only home — nothing here states a number.
     mod raw {
         use super::ScanState;
 
@@ -165,9 +219,9 @@ pub mod scan {
             self as u8
         }
 
-        /// The single seam where a storage byte re-enters the type.  Only this crate writes scan bytes and only
-        /// through [`ScanState::as_u8`], so anything else is corruption; of the bomb's family, this reports at the
-        /// site rather than laundering a garbage byte into a legal-looking state.
+        /// The single seam where a storage byte re-enters the type.  Only this crate writes scan bytes and only through
+        /// [`ScanState::as_u8`], so anything else is corruption; of the bomb's family, this reports at the site rather
+        /// than laundering a garbage byte into a legal-looking state.
         pub fn from_u8(byte: u8) -> ScanState {
             match byte {
                 raw::UNKNOWN => Unknown,
@@ -186,8 +240,8 @@ pub mod scan {
             }
         }
 
-        /// The terminal subset, where this state is in it.  The non-terminal arms are named rather than wildcarded:
-        /// a state added to the lattice must land here by decision, not by omission.
+        /// The terminal subset, where this state is in it.  The non-terminal arms are named rather than wildcarded: a
+        /// state added to the lattice must land here by decision, not by omission.
         #[inline]
         pub const fn terminal(self) -> Option<Terminal> {
             match self {
@@ -235,10 +289,10 @@ pub mod scan {
     ///
     /// The small tiers' envelopes hold this type rather than the raw `u8`, and that is the enforcement of §2.2.3's
     /// eager rule: with no allocation slot to record a later discovery, a small tier holding an indeterminate state
-    /// would re-derive on every read forever, so the states that need narrowing are not merely rejected below 64 KiB
-    /// — they are unrepresentable there.  Writing `Unknown` into a small envelope is a type error, which is how the
-    /// defect this type answers was written twice (the in-place downgrade, and the raw-byte append transition)
-    /// before the compiler was given the means to refuse it.
+    /// would re-derive on every read forever, so the states that need narrowing are not merely rejected below 64 KiB —
+    /// they are unrepresentable there.  Writing `Unknown` into a small envelope is a type error, which is how the
+    /// defect this type answers was written twice (the in-place downgrade, and the raw-byte append transition) before
+    /// the compiler was given the means to refuse it.
     ///
     /// Discriminants are sourced from the lattice's variants, so projection is a cast.
     #[repr(u8)]
@@ -287,8 +341,8 @@ pub mod scan {
         matches!(state, Ascii | Utf8Latin1 | MaybeUtf8Latin1 | Utf8NonLatin1 | ValidUtf8 | Utf8NonAscii | ExtendedUtf8 | MaybeExtendedUtf8 | PerlValidNonAscii)
     }
 
-    /// Known entirely ≤ U+00FF (downgradable).  `MaybeUtf8Latin1` qualifies: the range bound is asserted even where
-    /// the non-Ascii witness is not.
+    /// Known entirely ≤ U+00FF (downgradable).  `MaybeUtf8Latin1` qualifies: the range bound is asserted even where the
+    /// non-Ascii witness is not.
     #[inline]
     pub const fn is_known_latin1_range(state: ScanState) -> bool {
         matches!(state, Ascii | Utf8Latin1 | MaybeUtf8Latin1)
@@ -371,8 +425,8 @@ pub mod scan {
     pub(crate) fn meet(a: ScanState, b: ScanState) -> ScanState {
         let mut f = facts(a) | facts(b);
 
-        // Derivations: under Rust validity a high-bit byte is a code point at or above U+0080, and the stronger
-        // witness implies the weaker.
+        // Derivations: under Rust validity a high-bit byte is a code point at or above U+0080, and the stronger witness
+        // implies the weaker.
         if f & RUST_VALID != 0 && f & HIGH_BIT != 0 {
             f |= CONTAINS_GE_0080;
         }
@@ -905,8 +959,7 @@ pub enum StorageType {
     /// Heap, content through 64 KiB: the same shape at `u16` widths.
     Heap16,
 
-    /// Heap, content through 4 GiB: metadata in the allocation, since at this size it is filled lazily and
-    /// shared.
+    /// Heap, content through 4 GiB: metadata in the allocation, since at this size it is filled lazily and shared.
     Heap32,
 
     /// Heap, content beyond 4 GiB.  Unreachable where pointers are 32 bits, and compiled there anyway so that
@@ -927,8 +980,12 @@ pub enum StorageType {
     /// A `'static` image past the compact ceiling (§2.2.3).
     LargeStatic,
 
-    /// A native view (§2.2.15): a sub-range of a word-tier heap buffer, sharing its header refcount.
+    /// A native view (§2.2.15): a sub-range of a Heap32 buffer, sharing its header refcount.
     Slice,
+
+    /// A small-tier view (§2.2.15): a sub-range of a Heap8 or Heap16 buffer, the envelope carrying the capacity their
+    /// release demands, which is also the release dispatch under the strict ladder.
+    SmallSlice,
 
     /// An adopted view (§2.2.15): a range of an `Adopted` object — a foreign buffer, or an oversized view's child.
     Adopted,
@@ -976,6 +1033,7 @@ macro_rules! define_perl_string {
         large_immortal: [ $( $large_immortal:ident = ($large_immortal_utf8:literal, $large_immortal_tainted:literal) ),* $(,)? ],
         large_statics:  [ $( $large_static:ident  = ($large_static_utf8:literal,  $large_static_tainted:literal)  ),* $(,)? ],
         slices:   [ $( $slice:ident   = ($slice_utf8:literal,   $slice_tainted:literal)   ),* $(,)? ],
+        small_slices: [ $( $small_slice:ident = ($small_slice_utf8:literal, $small_slice_tainted:literal) ),* $(,)? ],
         adopteds: [ $( $adopted:ident = ($adopted_utf8:literal, $adopted_tainted:literal) ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
@@ -1012,6 +1070,7 @@ macro_rules! define_perl_string {
             $( $large_immortal { head: &'static ImmortalHead }, )*
             $( $large_static { head: &'static ImmortalHead }, )*
             $( $slice { ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState }, )*
+            $( $small_slice { ptr: Owned, offset: [u8; 2], len: [u8; 2], cap: [u8; 2], scan: scan::ScanState }, )*
             $( $adopted { ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState }, )*
         }
 
@@ -1062,6 +1121,10 @@ macro_rules! define_perl_string {
                         ptr: unsafe { cow_buffer::heap32::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                         offset: *offset, len: *len, scan: *scan,
                     }, )*
+                    $( Repr::$small_slice { ptr, offset, len, cap, scan } => Repr::$small_slice {
+                        ptr: unsafe { small_backing_retain(ptr.as_ptr(), u16v(*cap)); Owned::from_raw(ptr.as_ptr()) },
+                        offset: *offset, len: *len, cap: *cap, scan: *scan,
+                    }, )*
                     $( Repr::$adopted { ptr, offset, len, scan } => Repr::$adopted {
                         ptr: unsafe { cow_buffer::Adopted::retain(ptr.as_ptr().cast()); Owned::from_raw(ptr.as_ptr()) },
                         offset: *offset, len: *len, scan: *scan,
@@ -1094,6 +1157,7 @@ macro_rules! define_perl_string {
                     // SAFETY (both view arms): the variant owns exactly one reference on its live backing, consumed
                     // here; the adopted pointer round-trips through the untyped Owned it rode in.
                     $( Repr::$slice { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
+                    $( Repr::$small_slice { ptr, cap, .. } => unsafe { small_backing_release(ptr.claim(), u16v(*cap)) }, )*
                     $( Repr::$adopted { ptr, .. } => unsafe { cow_buffer::Adopted::release(ptr.claim().cast()) }, )*
                 }
             }
@@ -1116,6 +1180,7 @@ macro_rules! define_perl_string {
                     $( Repr::$large_immortal { .. } => StorageType::LargeImmortal, )*
                     $( Repr::$large_static { .. } => StorageType::LargeStatic, )*
                     $( Repr::$slice { .. } => StorageType::Slice, )*
+                    $( Repr::$small_slice { .. } => StorageType::SmallSlice, )*
                     $( Repr::$adopted { .. } => StorageType::Adopted, )*
                 }
             }
@@ -1136,6 +1201,7 @@ macro_rules! define_perl_string {
                     $( Repr::$large_immortal { .. } => $large_immortal_utf8, )*
                     $( Repr::$large_static { .. } => $large_static_utf8, )*
                     $( Repr::$slice { .. } => $slice_utf8, )*
+                    $( Repr::$small_slice { .. } => $small_slice_utf8, )*
                     $( Repr::$adopted { .. } => $adopted_utf8, )*
                 }
             }
@@ -1156,6 +1222,7 @@ macro_rules! define_perl_string {
                     $( Repr::$large_immortal { .. } => $large_immortal_tainted, )*
                     $( Repr::$large_static { .. } => $large_static_tainted, )*
                     $( Repr::$slice { .. } => $slice_tainted, )*
+                    $( Repr::$small_slice { .. } => $small_slice_tainted, )*
                     $( Repr::$adopted { .. } => $adopted_tainted, )*
                 }
             }
@@ -1171,6 +1238,7 @@ macro_rules! define_perl_string {
                     $( Repr::$large_static { .. } => None, )*
                     $( Repr::$heap8a { .. } => None, )*
                     $( Repr::$slice { .. } => None, )*
+                    $( Repr::$small_slice { .. } => None, )*
                     $( Repr::$adopted { .. } => None, )*
                     $( Repr::$heap16a { .. } => None, )*
 
@@ -1273,6 +1341,10 @@ macro_rules! define_perl_string {
                         bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u24(*offset)), u24(*len)) },
                         scan: *scan,
                     }, )*
+                    $( Repr::$small_slice { ptr, offset, len, scan, .. } => RawParts::View {
+                        bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u16v(*offset)), u16v(*len)) },
+                        scan: *scan,
+                    }, )*
                     $( Repr::$adopted { ptr, offset, len, scan } => RawParts::View {
                         bytes: unsafe {
                             let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
@@ -1301,6 +1373,7 @@ macro_rules! define_perl_string {
                     $( Repr::$heap32 { .. } => None, )*
                     $( Repr::$heap { .. } => None, )*
                     $( Repr::$slice { .. } => None, )*
+                    $( Repr::$small_slice { .. } => None, )*
                     $( Repr::$adopted { .. } => None, )*
                 }
             }
@@ -1547,6 +1620,7 @@ macro_rules! define_perl_string {
                     $( Repr::$heap32 { .. } => Some(Tier::Heap32), )*
                     $( Repr::$heap { .. } => Some(Tier::Heap), )*
                     $( Repr::$slice { .. } => None, )*
+                    $( Repr::$small_slice { .. } => None, )*
                     $( Repr::$adopted { .. } => None, )*
                 }
             }
@@ -1636,21 +1710,29 @@ macro_rules! define_perl_string {
                     // returned transport, which carries which release it owes through `native`.
                     $( Repr::$slice { ptr, offset, len, scan } => RawOwned::View {
                         ptr: unsafe { std::ptr::read(ptr) },
-                        native: true, offset: *offset, len: *len, scan: *scan,
+                        backing: ViewBacking::Heap32, offset: u24(*offset), len: u24(*len), scan: *scan,
+                    }, )*
+                    $( Repr::$small_slice { ptr, offset, len, cap, scan } => RawOwned::View {
+                        ptr: unsafe { std::ptr::read(ptr) },
+                        backing: ViewBacking::Small { cap: u16v(*cap) }, offset: u16v(*offset), len: u16v(*len), scan: *scan,
                     }, )*
                     $( Repr::$adopted { ptr, offset, len, scan } => RawOwned::View {
                         ptr: unsafe { std::ptr::read(ptr) },
-                        native: false, offset: *offset, len: *len, scan: *scan,
+                        backing: ViewBacking::Adopted, offset: u24(*offset), len: u24(*len), scan: *scan,
                     }, )*
                 }
             }
 
-            /// Rebuild a view with the given tag dimensions (backing reference preserved): `native` selects the family,
-            /// and the envelope fields ride unchanged.
-            fn build_view(native: bool, utf8: bool, tainted: bool, ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState) -> PString {
-                match (native, utf8, tainted) {
-                    $( (true, $slice_utf8, $slice_tainted) => PString(Repr::$slice { ptr, offset, len, scan }), )*
-                    $( (false, $adopted_utf8, $adopted_tainted) => PString(Repr::$adopted { ptr, offset, len, scan }), )*
+            /// Rebuild a view with the given tag dimensions (backing reference preserved): the backing selects the
+            /// family, and each family stores the fields at its own width, already proven under its bound.
+            fn build_view(backing: ViewBacking, utf8: bool, tainted: bool, ptr: Owned, offset: usize, len: usize, scan: scan::ScanState) -> PString {
+                match (backing, utf8, tainted) {
+                    $( (ViewBacking::Heap32, $slice_utf8, $slice_tainted) =>
+                        PString(Repr::$slice { ptr, offset: to_u24(offset), len: to_u24(len), scan }), )*
+                    $( (ViewBacking::Small { cap }, $small_slice_utf8, $small_slice_tainted) =>
+                        PString(Repr::$small_slice { ptr, offset: to_u16(offset), len: to_u16(len), cap: to_u16(cap), scan }), )*
+                    $( (ViewBacking::Adopted, $adopted_utf8, $adopted_tainted) =>
+                        PString(Repr::$adopted { ptr, offset: to_u24(offset), len: to_u24(len), scan }), )*
                 }
             }
 
@@ -1741,144 +1823,150 @@ macro_rules! define_perl_string {
 
 define_perl_string! {
     inline: [
-        InlineAscii                                  = (Ascii, InlineAscii, false, false, false),
-        InlineAsciiFlagged                           = (Ascii, InlineAscii, false, true, false),
-        InlineAsciiTainted                           = (Ascii, InlineAscii, false, false, true),
-        InlineAsciiFlaggedTainted                    = (Ascii, InlineAscii, false, true, true),
-        InlineAsciiFull                              = (Ascii, InlineAsciiFull, true, false, false),
-        InlineAsciiFullFlagged                       = (Ascii, InlineAsciiFull, true, true, false),
-        InlineAsciiFullTainted                       = (Ascii, InlineAsciiFull, true, false, true),
-        InlineAsciiFullFlaggedTainted                = (Ascii, InlineAsciiFull, true, true, true),
-        InlineLatin1                                 = (Latin1, InlineLatin1, false, false, false),
-        InlineLatin1Flagged                          = (Latin1, InlineLatin1, false, true, false),
-        InlineLatin1Tainted                          = (Latin1, InlineLatin1, false, false, true),
-        InlineLatin1FlaggedTainted                   = (Latin1, InlineLatin1, false, true, true),
-        InlineLatin1Full                             = (Latin1, InlineLatin1Full, true, false, false),
-        InlineLatin1FullFlagged                      = (Latin1, InlineLatin1Full, true, true, false),
-        InlineLatin1FullTainted                      = (Latin1, InlineLatin1Full, true, false, true),
-        InlineLatin1FullFlaggedTainted               = (Latin1, InlineLatin1Full, true, true, true),
-        InlineNonLatin1                              = (NonLatin1, InlineNonLatin1, false, false, false),
-        InlineNonLatin1Flagged                       = (NonLatin1, InlineNonLatin1, false, true, false),
-        InlineNonLatin1Tainted                       = (NonLatin1, InlineNonLatin1, false, false, true),
-        InlineNonLatin1FlaggedTainted                = (NonLatin1, InlineNonLatin1, false, true, true),
-        InlineNonLatin1Full                          = (NonLatin1, InlineNonLatin1Full, true, false, false),
-        InlineNonLatin1FullFlagged                   = (NonLatin1, InlineNonLatin1Full, true, true, false),
-        InlineNonLatin1FullTainted                   = (NonLatin1, InlineNonLatin1Full, true, false, true),
-        InlineNonLatin1FullFlaggedTainted            = (NonLatin1, InlineNonLatin1Full, true, true, true),
-        InlineExtended                               = (Extended, InlineExtended, false, false, false),
-        InlineExtendedFlagged                        = (Extended, InlineExtended, false, true, false),
-        InlineExtendedTainted                        = (Extended, InlineExtended, false, false, true),
-        InlineExtendedFlaggedTainted                 = (Extended, InlineExtended, false, true, true),
-        InlineExtendedFull                           = (Extended, InlineExtendedFull, true, false, false),
-        InlineExtendedFullFlagged                    = (Extended, InlineExtendedFull, true, true, false),
-        InlineExtendedFullTainted                    = (Extended, InlineExtendedFull, true, false, true),
-        InlineExtendedFullFlaggedTainted             = (Extended, InlineExtendedFull, true, true, true),
-        InlineBytes                              = (Bytes, InlineBytes, false, false, false),
-        InlineBytesFlagged                       = (Bytes, InlineBytes, false, true, false),
-        InlineBytesTainted                       = (Bytes, InlineBytes, false, false, true),
-        InlineBytesFlaggedTainted                = (Bytes, InlineBytes, false, true, true),
-        InlineBytesFull                          = (Bytes, InlineBytesFull, true, false, false),
-        InlineBytesFullFlagged                   = (Bytes, InlineBytesFull, true, true, false),
-        InlineBytesFullTainted                   = (Bytes, InlineBytesFull, true, false, true),
-        InlineBytesFullFlaggedTainted            = (Bytes, InlineBytesFull, true, true, true),
+        InlineAscii                       = (Ascii,        InlineAscii,            false, false, false),
+        InlineAsciiFlagged                = (Ascii,        InlineAscii,            false, true,  false),
+        InlineAsciiTainted                = (Ascii,        InlineAscii,            false, false, true),
+        InlineAsciiFlaggedTainted         = (Ascii,        InlineAscii,            false, true,  true),
+        InlineAsciiFull                   = (Ascii,        InlineAsciiFull,        true,  false, false),
+        InlineAsciiFullFlagged            = (Ascii,        InlineAsciiFull,        true,  true,  false),
+        InlineAsciiFullTainted            = (Ascii,        InlineAsciiFull,        true,  false, true),
+        InlineAsciiFullFlaggedTainted     = (Ascii,        InlineAsciiFull,        true,  true,  true),
+        InlineLatin1                      = (Latin1,       InlineLatin1,           false, false, false),
+        InlineLatin1Flagged               = (Latin1,       InlineLatin1,           false, true,  false),
+        InlineLatin1Tainted               = (Latin1,       InlineLatin1,           false, false, true),
+        InlineLatin1FlaggedTainted        = (Latin1,       InlineLatin1,           false, true,  true),
+        InlineLatin1Full                  = (Latin1,       InlineLatin1Full,       true,  false, false),
+        InlineLatin1FullFlagged           = (Latin1,       InlineLatin1Full,       true,  true,  false),
+        InlineLatin1FullTainted           = (Latin1,       InlineLatin1Full,       true,  false, true),
+        InlineLatin1FullFlaggedTainted    = (Latin1,       InlineLatin1Full,       true,  true,  true),
+        InlineNonLatin1                   = (NonLatin1,    InlineNonLatin1,        false, false, false),
+        InlineNonLatin1Flagged            = (NonLatin1,    InlineNonLatin1,        false, true,  false),
+        InlineNonLatin1Tainted            = (NonLatin1,    InlineNonLatin1,        false, false, true),
+        InlineNonLatin1FlaggedTainted     = (NonLatin1,    InlineNonLatin1,        false, true,  true),
+        InlineNonLatin1Full               = (NonLatin1,    InlineNonLatin1Full,    true,  false, false),
+        InlineNonLatin1FullFlagged        = (NonLatin1,    InlineNonLatin1Full,    true,  true,  false),
+        InlineNonLatin1FullTainted        = (NonLatin1,    InlineNonLatin1Full,    true,  false, true),
+        InlineNonLatin1FullFlaggedTainted = (NonLatin1,    InlineNonLatin1Full,    true,  true,  true),
+        InlineExtended                    = (Extended,     InlineExtended,         false, false, false),
+        InlineExtendedFlagged             = (Extended,     InlineExtended,         false, true,  false),
+        InlineExtendedTainted             = (Extended,     InlineExtended,         false, false, true),
+        InlineExtendedFlaggedTainted      = (Extended,     InlineExtended,         false, true,  true),
+        InlineExtendedFull                = (Extended,     InlineExtendedFull,     true,  false, false),
+        InlineExtendedFullFlagged         = (Extended,     InlineExtendedFull,     true,  true,  false),
+        InlineExtendedFullTainted         = (Extended,     InlineExtendedFull,     true,  false, true),
+        InlineExtendedFullFlaggedTainted  = (Extended,     InlineExtendedFull,     true,  true,  true),
+        InlineBytes                       = (Bytes,        InlineBytes,            false, false, false),
+        InlineBytesFlagged                = (Bytes,        InlineBytes,            false, true,  false),
+        InlineBytesTainted                = (Bytes,        InlineBytes,            false, false, true),
+        InlineBytesFlaggedTainted         = (Bytes,        InlineBytes,            false, true,  true),
+        InlineBytesFull                   = (Bytes,        InlineBytesFull,        true,  false, false),
+        InlineBytesFullFlagged            = (Bytes,        InlineBytesFull,        true,  true,  false),
+        InlineBytesFullTainted            = (Bytes,        InlineBytesFull,        true,  false, true),
+        InlineBytesFullFlaggedTainted     = (Bytes,        InlineBytesFull,        true,  true,  true),
     ],
     packed: [
-        PackedNum                                    = (Numeric, PackedNumeric, false, false, false),
-        PackedNumFlagged                             = (Numeric, PackedNumeric, false, true, false),
-        PackedNumTainted                             = (Numeric, PackedNumeric, false, false, true),
-        PackedNumFlaggedTainted                      = (Numeric, PackedNumeric, false, true, true),
-        PackedNumFull                                = (Numeric, PackedNumericFull, true, false, false),
-        PackedNumFullFlagged                         = (Numeric, PackedNumericFull, true, true, false),
-        PackedNumFullTainted                         = (Numeric, PackedNumericFull, true, false, true),
-        PackedNumFullFlaggedTainted                  = (Numeric, PackedNumericFull, true, true, true),
-        PackedPlus                                   = (DateTimePlus, PackedDateTimePlus, false, false, false),
-        PackedPlusFlagged                            = (DateTimePlus, PackedDateTimePlus, false, true, false),
-        PackedPlusTainted                            = (DateTimePlus, PackedDateTimePlus, false, false, true),
-        PackedPlusFlaggedTainted                     = (DateTimePlus, PackedDateTimePlus, false, true, true),
-        PackedPlusFull                               = (DateTimePlus, PackedDateTimePlusFull, true, false, false),
-        PackedPlusFullFlagged                        = (DateTimePlus, PackedDateTimePlusFull, true, true, false),
-        PackedPlusFullTainted                        = (DateTimePlus, PackedDateTimePlusFull, true, false, true),
-        PackedPlusFullFlaggedTainted                 = (DateTimePlus, PackedDateTimePlusFull, true, true, true),
-        PackedZulu                                   = (DateTimeZulu, PackedDateTimeZulu, false, false, false),
-        PackedZuluFlagged                            = (DateTimeZulu, PackedDateTimeZulu, false, true, false),
-        PackedZuluTainted                            = (DateTimeZulu, PackedDateTimeZulu, false, false, true),
-        PackedZuluFlaggedTainted                     = (DateTimeZulu, PackedDateTimeZulu, false, true, true),
-        PackedZuluFull                               = (DateTimeZulu, PackedDateTimeZuluFull, true, false, false),
-        PackedZuluFullFlagged                        = (DateTimeZulu, PackedDateTimeZuluFull, true, true, false),
-        PackedZuluFullTainted                        = (DateTimeZulu, PackedDateTimeZuluFull, true, false, true),
-        PackedZuluFullFlaggedTainted                 = (DateTimeZulu, PackedDateTimeZuluFull, true, true, true),
+        PackedNum                         = (Numeric,      PackedNumeric,          false, false, false),
+        PackedNumFlagged                  = (Numeric,      PackedNumeric,          false, true,  false),
+        PackedNumTainted                  = (Numeric,      PackedNumeric,          false, false, true),
+        PackedNumFlaggedTainted           = (Numeric,      PackedNumeric,          false, true,  true),
+        PackedNumFull                     = (Numeric,      PackedNumericFull,      true,  false, false),
+        PackedNumFullFlagged              = (Numeric,      PackedNumericFull,      true,  true,  false),
+        PackedNumFullTainted              = (Numeric,      PackedNumericFull,      true,  false, true),
+        PackedNumFullFlaggedTainted       = (Numeric,      PackedNumericFull,      true,  true,  true),
+        PackedPlus                        = (DateTimePlus, PackedDateTimePlus,     false, false, false),
+        PackedPlusFlagged                 = (DateTimePlus, PackedDateTimePlus,     false, true,  false),
+        PackedPlusTainted                 = (DateTimePlus, PackedDateTimePlus,     false, false, true),
+        PackedPlusFlaggedTainted          = (DateTimePlus, PackedDateTimePlus,     false, true,  true),
+        PackedPlusFull                    = (DateTimePlus, PackedDateTimePlusFull, true,  false, false),
+        PackedPlusFullFlagged             = (DateTimePlus, PackedDateTimePlusFull, true,  true,  false),
+        PackedPlusFullTainted             = (DateTimePlus, PackedDateTimePlusFull, true,  false, true),
+        PackedPlusFullFlaggedTainted      = (DateTimePlus, PackedDateTimePlusFull, true,  true,  true),
+        PackedZulu                        = (DateTimeZulu, PackedDateTimeZulu,     false, false, false),
+        PackedZuluFlagged                 = (DateTimeZulu, PackedDateTimeZulu,     false, true,  false),
+        PackedZuluTainted                 = (DateTimeZulu, PackedDateTimeZulu,     false, false, true),
+        PackedZuluFlaggedTainted          = (DateTimeZulu, PackedDateTimeZulu,     false, true,  true),
+        PackedZuluFull                    = (DateTimeZulu, PackedDateTimeZuluFull, true,  false, false),
+        PackedZuluFullFlagged             = (DateTimeZulu, PackedDateTimeZuluFull, true,  true,  false),
+        PackedZuluFullTainted             = (DateTimeZulu, PackedDateTimeZuluFull, true,  false, true),
+        PackedZuluFullFlaggedTainted      = (DateTimeZulu, PackedDateTimeZuluFull, true,  true,  true),
     ],
     heap8: [
-        Heap8                     = (false, false),
-        Heap8Flagged              = (true, false),
-        Heap8Tainted              = (false, true),
-        Heap8FlaggedTainted       = (true, true),
+        Heap8                             = (false, false),
+        Heap8Flagged                      = (true,  false),
+        Heap8Tainted                      = (false, true),
+        Heap8FlaggedTainted               = (true,  true),
     ],
     heap8_ascii: [
-        Heap8Ascii                     = (false, false),
-        Heap8AsciiFlagged              = (true, false),
-        Heap8AsciiTainted              = (false, true),
-        Heap8AsciiFlaggedTainted       = (true, true),
+        Heap8Ascii                        = (false, false),
+        Heap8AsciiFlagged                 = (true,  false),
+        Heap8AsciiTainted                 = (false, true),
+        Heap8AsciiFlaggedTainted          = (true,  true),
     ],
     heap16: [
-        Heap16                     = (false, false),
-        Heap16Flagged              = (true, false),
-        Heap16Tainted              = (false, true),
-        Heap16FlaggedTainted       = (true, true),
+        Heap16                            = (false, false),
+        Heap16Flagged                     = (true,  false),
+        Heap16Tainted                     = (false, true),
+        Heap16FlaggedTainted              = (true,  true),
     ],
     heap16_ascii: [
-        Heap16Ascii                     = (false, false),
-        Heap16AsciiFlagged              = (true, false),
-        Heap16AsciiTainted              = (false, true),
-        Heap16AsciiFlaggedTainted      = (true, true),
+        Heap16Ascii                       = (false, false),
+        Heap16AsciiFlagged                = (true,  false),
+        Heap16AsciiTainted                = (false, true),
+        Heap16AsciiFlaggedTainted         = (true,  true),
     ],
     heap32: [
-        Heap32                     = (false, false),
-        Heap32Flagged              = (true, false),
-        Heap32Tainted              = (false, true),
-        Heap32FlaggedTainted       = (true, true),
+        Heap32                            = (false, false),
+        Heap32Flagged                     = (true,  false),
+        Heap32Tainted                     = (false, true),
+        Heap32FlaggedTainted              = (true,  true),
     ],
     heap: [
-        Heap                     = (false, false),
-        HeapFlagged              = (true, false),
-        HeapTainted              = (false, true),
-        HeapFlaggedTainted       = (true, true),
+        Heap                              = (false, false),
+        HeapFlagged                       = (true,  false),
+        HeapTainted                       = (false, true),
+        HeapFlaggedTainted                = (true,  true),
     ],
     immortal: [
-        Immortal                 = (false, false),
-        ImmortalFlagged          = (true, false),
-        ImmortalTainted          = (false, true),
-        ImmortalFlaggedTainted   = (true, true),
+        Immortal                          = (false, false),
+        ImmortalFlagged                   = (true,  false),
+        ImmortalTainted                   = (false, true),
+        ImmortalFlaggedTainted            = (true,  true),
     ],
     statics: [
-        Static                   = (false, false),
-        StaticFlagged            = (true, false),
-        StaticTainted            = (false, true),
-        StaticFlaggedTainted     = (true, true),
+        Static                            = (false, false),
+        StaticFlagged                     = (true,  false),
+        StaticTainted                     = (false, true),
+        StaticFlaggedTainted              = (true,  true),
     ],
     large_immortal: [
-        LargeImmortal                 = (false, false),
-        LargeImmortalFlagged          = (true, false),
-        LargeImmortalTainted          = (false, true),
-        LargeImmortalFlaggedTainted   = (true, true),
+        LargeImmortal                     = (false, false),
+        LargeImmortalFlagged              = (true,  false),
+        LargeImmortalTainted              = (false, true),
+        LargeImmortalFlaggedTainted       = (true,  true),
     ],
     large_statics: [
-        LargeStatic                   = (false, false),
-        LargeStaticFlagged            = (true, false),
-        LargeStaticTainted            = (false, true),
-        LargeStaticFlaggedTainted     = (true, true),
+        LargeStatic                       = (false, false),
+        LargeStaticFlagged                = (true,  false),
+        LargeStaticTainted                = (false, true),
+        LargeStaticFlaggedTainted         = (true,  true),
     ],
     slices: [
-        Slice                    = (false, false),
-        SliceFlagged             = (true, false),
-        SliceTainted             = (false, true),
-        SliceFlaggedTainted      = (true, true),
+        Slice                             = (false, false),
+        SliceFlagged                      = (true,  false),
+        SliceTainted                      = (false, true),
+        SliceFlaggedTainted               = (true,  true),
+    ],
+    small_slices: [
+        SmallSlice                        = (false, false),
+        SmallSliceFlagged                 = (true,  false),
+        SmallSliceTainted                 = (false, true),
+        SmallSliceFlaggedTainted          = (true,  true),
     ],
     adopteds: [
-        AdoptedView              = (false, false),
-        AdoptedViewFlagged       = (true, false),
-        AdoptedViewTainted       = (false, true),
-        AdoptedViewFlaggedTainted = (true, true),
+        AdoptedView                       = (false, false),
+        AdoptedViewFlagged                = (true,  false),
+        AdoptedViewTainted                = (false, true),
+        AdoptedViewFlaggedTainted         = (true,  true),
     ]
 }
 
@@ -2445,13 +2533,13 @@ impl PString {
     pub(crate) fn adopted_whole(adopted: std::ptr::NonNull<cow_buffer::Adopted>, utf8: bool, tainted: bool) -> PString {
         // SAFETY: the caller's reference keeps the struct live for this read and transfers into the envelope below.
         let (scan, ptr) = unsafe { (adopted.as_ref().scan(), Owned::from_raw(adopted.cast())) };
-        PString::build_view(false, utf8, tainted, ptr, to_u24(SPAN as usize), to_u24(SPAN as usize), scan)
+        PString::build_view(ViewBacking::Adopted, utf8, tainted, ptr, SPAN as usize, SPAN as usize, scan)
     }
 
-    /// A zero-copy sub-view of this value where the representation admits one (§2.2.15): the Heap32 tier — the tier
-    /// whose release is header-described — birthing the native form.  `None` where the storage has no native view form,
-    /// the range escapes the value, or a field would overflow `u24`: every fallback (smaller and larger tiers through
-    /// `Adopted`, re-slicing views, the copy forms and floors) is the verbs stage's, which owns the policy-free
+    /// A zero-copy sub-view of this value where the representation admits one (§2.2.15): the Heap32 tier birthing the
+    /// native form, the small tiers birthing the capacity-carrying small form.  `None` where the storage has no compact
+    /// view form, the range escapes the value, or a field would overflow its width: every fallback (the word tier
+    /// through `Adopted`, re-slicing views, the copy forms and floors) is the verbs stage's, which owns the policy-free
     /// `slice`/`substr` surface.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn view_range(&self, offset: usize, len: usize) -> Option<PString> {
@@ -2472,7 +2560,30 @@ impl PString {
                     Owned::from_raw(cb.raw())
                 };
 
-                Some(PString::build_view(true, utf8, tainted, ptr, to_u24(offset), to_u24(len), scan))
+                Some(PString::build_view(ViewBacking::Heap32, utf8, tainted, ptr, offset, len, scan))
+            }
+            RawParts::Heap(cb) if matches!(cb.tier(), Tier::Heap8 | Tier::Heap16) => {
+                let bytes = cb.as_slice();
+                if offset.checked_add(len)? > bytes.len() {
+                    return None;
+                }
+
+                // The tier's ceilings prove the u16 fields; the strict ladder makes the capacity the release dispatch
+                // (§2.2.15).
+                let cap = cb.capacity();
+                debug_assert!(bytes.len() <= cow_buffer::heap16::MAX_CAPACITY && cap <= cow_buffer::heap16::MAX_CAPACITY);
+                debug_assert!((cap <= cow_buffer::heap8::MAX_CAPACITY) == (cb.tier() == Tier::Heap8), "the ladder's strictness is the dispatch");
+
+                let scan = view_birth_state(cb.scan(), bytes, offset, len);
+
+                // SAFETY: `cb` proves a live small-tier allocation whose tier the capacity names; the envelope owns the
+                // reference this retain adds and releases it under the same dispatch in Drop.
+                let ptr = unsafe {
+                    small_backing_retain(cb.raw(), cap);
+                    Owned::from_raw(cb.raw())
+                };
+
+                Some(PString::build_view(ViewBacking::Small { cap }, utf8, tainted, ptr, offset, len, scan))
             }
             _ => None,
         }
@@ -2805,7 +2916,7 @@ impl PString {
             RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PString::build_static(u2, t2, ptr, len, count, scan),
             RawOwned::BorrowedLarge { form: BorrowedForm::Immortal, head } => PString::build_large_immortal(u2, t2, head),
             RawOwned::BorrowedLarge { form: BorrowedForm::Static, head } => PString::build_large_static(u2, t2, head),
-            RawOwned::View { ptr, native, offset, len, scan } => PString::build_view(native, u2, t2, ptr, offset, len, scan),
+            RawOwned::View { ptr, backing, offset, len, scan } => PString::build_view(backing, u2, t2, ptr, offset, len, scan),
         };
     }
 
@@ -2963,17 +3074,18 @@ impl PString {
                 let state = append_transition_heap(head.scan.widen(), kind);
                 PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
             }
-            RawOwned::View { mut ptr, native, offset, len, scan } => {
+            RawOwned::View { mut ptr, backing, offset, len, scan } => {
                 // Copy-out on write (§2.2.15): a view is a read-only carrier, so an append is a rebuild seeded by the
                 // envelope's state — the images' path, plus a reference to surrender.
                 // SAFETY: the transport owns one reference on the live backing, released below after the copy.
                 let old_bytes = unsafe {
-                    if native {
-                        std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u24(offset)), u24(len))
-                    } else {
-                        let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
-                        let (off, n) = if u24(offset) == SPAN as usize && u24(len) == SPAN as usize { (0, a.total_len()) } else { (u24(offset), u24(len)) };
-                        &a.as_slice()[off..off + n]
+                    match backing {
+                        ViewBacking::Heap32 | ViewBacking::Small { .. } => std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(offset), len),
+                        ViewBacking::Adopted => {
+                            let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
+                            let (off, n) = if offset == SPAN as usize && len == SPAN as usize { (0, a.total_len()) } else { (offset, len) };
+                            &a.as_slice()[off..off + n]
+                        }
                     }
                 };
 
@@ -2986,12 +3098,12 @@ impl PString {
                 }
 
                 // The reference is surrendered on every path: the copy above is complete or abandoned.
-                // SAFETY: the transport's one reference, consumed exactly once.
+                // SAFETY: the transport's one reference, consumed exactly once, under the backing's own release.
                 unsafe {
-                    if native {
-                        cow_buffer::heap32::release(ptr.claim());
-                    } else {
-                        cow_buffer::Adopted::release(ptr.claim().cast());
+                    match backing {
+                        ViewBacking::Heap32 => cow_buffer::heap32::release(ptr.claim()),
+                        ViewBacking::Small { cap } => small_backing_release(ptr.claim(), cap),
+                        ViewBacking::Adopted => cow_buffer::Adopted::release(ptr.claim().cast()),
                     }
                 }
 
@@ -3161,14 +3273,14 @@ enum RawOwned {
         tier: Tier,
     },
 
-    /// A view's owned backing reference in flight (§2.2.15): `native` says which release it owes — the word tier's or
-    /// the `Adopted` struct's — and the envelope fields ride unchanged, because a tag transition preserves the view
-    /// while a content transition must materialize away from it first.
+    /// A view's owned backing reference in flight (§2.2.15): the backing says which release it owes, the fields ride at
+    /// full width, and a tag transition preserves the view while a content transition must materialize away from it
+    /// first.
     View {
         ptr: Owned,
-        native: bool,
-        offset: [u8; 3],
-        len: [u8; 3],
+        backing: ViewBacking,
+        offset: usize,
+        len: usize,
         scan: scan::ScanState,
     },
 

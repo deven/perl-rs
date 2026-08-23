@@ -5334,3 +5334,55 @@ fn a_dirty_cut_births_proven_malformed_and_a_small_clean_cut_classifies_eagerly(
     assert_eq!(small.scan_state(), scan::Ascii);
     assert!(small.is_ascii());
 }
+
+// ── SmallSlice (§2.2.15) ──────────────────────────────────────
+#[test]
+fn small_tier_views_read_share_and_release_under_the_capacity_dispatch() {
+    // One backing per small tier: ~100 bytes lands in Heap8, ~40 KiB in Heap16.
+    for (len, tier) in [(100usize, StorageType::Heap8), (40_000, StorageType::Heap16)] {
+        let mut v = vec![b'x'; len];
+        v[len / 2] = 0xC3;
+        v[len / 2 + 1] = 0xA9;
+        let parent = PString::from_bytes(v).unwrap();
+        assert_eq!(parent.storage_type(), tier, "fixture for {tier:?}");
+
+        let view = parent.view_range(1, len - 2).unwrap();
+        assert_eq!(view.storage_type(), StorageType::SmallSlice);
+        assert_eq!(view.len(), len - 2);
+
+        let mut sa = [0u8; DECODE_MAX];
+        let mut sb = [0u8; DECODE_MAX];
+        assert_eq!(view.as_bytes(&mut sa), &parent.as_bytes(&mut sb)[1..len - 1]);
+
+        // The buffer outlives the parent handle through the view's retain, and clones balance.
+        let clone = view.clone();
+        drop(parent);
+        drop(view);
+        assert_eq!(clone.as_bytes(&mut sa).len(), len - 2);
+    }
+}
+
+#[test]
+fn small_views_take_tag_transitions_in_place_and_materialize_on_write() {
+    let parent = PString::from_bytes(vec![b'q'; 5_000]).unwrap();
+    assert_eq!(parent.storage_type(), StorageType::Heap16Ascii, "pure ASCII takes the specialized family");
+    let mut view = parent.view_range(10, 3_000).unwrap();
+
+    view.taint();
+    assert_eq!(view.storage_type(), StorageType::SmallSlice, "taint is a tag transition, not a copy");
+    assert!(view.is_tainted());
+
+    view.push_bytes(b"...").unwrap();
+    assert_ne!(view.storage_type(), StorageType::SmallSlice);
+    assert_eq!(view.len(), 3_003);
+    assert!(view.is_tainted(), "materialization keeps the tag");
+}
+
+#[test]
+fn a_small_view_of_ascii_content_is_born_ascii_and_answers_without_probing() {
+    let parent = PString::from_bytes(vec![b'z'; 300]).unwrap();
+    let view = parent.view_range(50, 200).unwrap();
+    assert_eq!(view.scan_state(), scan::Ascii, "Ascii cuts clean by nature and survives exactly");
+    assert!(view.is_ascii());
+    assert_eq!(view.char_len(), Some(200));
+}
