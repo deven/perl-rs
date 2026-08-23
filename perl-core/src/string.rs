@@ -69,14 +69,29 @@ const fn to_u16(value: usize) -> [u8; 2] {
     (value as u16).to_le_bytes()
 }
 
+/// The 32-bit offset of the far forms (§2.2.15): little-endian in four bytes.
+#[inline]
+const fn u32v(bytes: [u8; 4]) -> usize {
+    u32::from_le_bytes(bytes) as usize
+}
+
+/// The inverse, for values already proven under the bound.
+#[inline]
+const fn to_u32(value: usize) -> [u8; 4] {
+    debug_assert!(value <= u32::MAX as usize);
+    (value as u32).to_le_bytes()
+}
+
 /// Which backing a view in flight owes its release to (§2.2.15): the small form carries the capacity its tiers' release
 /// demands, and the capacity is also the dispatch — the allocation ladder is strict, so Heap8 capacities sit at or
 /// below 255 and Heap16's above, with no overlap.
 #[derive(Clone, Copy)]
 enum ViewBacking {
-    Heap32,
+    Heap32Medium,
+    Heap32Far,
     Small { cap: usize },
     Adopted,
+    AdoptedFar,
 }
 
 /// # Safety
@@ -981,11 +996,18 @@ pub enum StorageType {
     LargeStatic,
 
     /// A native view (§2.2.15): a sub-range of a Heap32 buffer, sharing its header refcount.
-    Slice,
+    MediumSlice,
 
     /// A small-tier view (§2.2.15): a sub-range of a Heap8 or Heap16 buffer, the envelope carrying the capacity their
     /// release demands, which is also the release dispatch under the strict ladder.
     SmallSlice,
+
+    /// A far native view (§2.2.15): u32 offset with u16 length — short views at any offset of a full-size Heap32
+    /// backing, where the u24 pair reaches only the first 16 MiB.
+    FarSlice,
+
+    /// A far adopted view (§2.2.15): the far geometry over an `Adopted` object.
+    FarAdopted,
 
     /// An adopted view (§2.2.15): a range of an `Adopted` object — a foreign buffer, or an oversized view's child.
     Adopted,
@@ -1034,6 +1056,8 @@ macro_rules! define_perl_string {
         large_statics:  [ $( $large_static:ident  = ($large_static_utf8:literal,  $large_static_tainted:literal)  ),* $(,)? ],
         slices:   [ $( $slice:ident   = ($slice_utf8:literal,   $slice_tainted:literal)   ),* $(,)? ],
         small_slices: [ $( $small_slice:ident = ($small_slice_utf8:literal, $small_slice_tainted:literal) ),* $(,)? ],
+        far_slices:   [ $( $far_slice:ident   = ($far_slice_utf8:literal,   $far_slice_tainted:literal)   ),* $(,)? ],
+        far_adopteds: [ $( $far_adopted:ident = ($far_adopted_utf8:literal, $far_adopted_tainted:literal) ),* $(,)? ],
         adopteds: [ $( $adopted:ident = ($adopted_utf8:literal, $adopted_tainted:literal) ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
@@ -1071,6 +1095,8 @@ macro_rules! define_perl_string {
             $( $large_static { head: &'static ImmortalHead }, )*
             $( $slice { ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState }, )*
             $( $small_slice { ptr: Owned, offset: [u8; 2], len: [u8; 2], cap: [u8; 2], scan: scan::ScanState }, )*
+            $( $far_slice { ptr: Owned, offset: [u8; 4], len: [u8; 2], scan: scan::ScanState }, )*
+            $( $far_adopted { ptr: Owned, offset: [u8; 4], len: [u8; 2], scan: scan::ScanState }, )*
             $( $adopted { ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState }, )*
         }
 
@@ -1125,6 +1151,14 @@ macro_rules! define_perl_string {
                         ptr: unsafe { small_backing_retain(ptr.as_ptr(), u16v(*cap)); Owned::from_raw(ptr.as_ptr()) },
                         offset: *offset, len: *len, cap: *cap, scan: *scan,
                     }, )*
+                    $( Repr::$far_slice { ptr, offset, len, scan } => Repr::$far_slice {
+                        ptr: unsafe { cow_buffer::heap32::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                        offset: *offset, len: *len, scan: *scan,
+                    }, )*
+                    $( Repr::$far_adopted { ptr, offset, len, scan } => Repr::$far_adopted {
+                        ptr: unsafe { cow_buffer::Adopted::retain(ptr.as_ptr().cast()); Owned::from_raw(ptr.as_ptr()) },
+                        offset: *offset, len: *len, scan: *scan,
+                    }, )*
                     $( Repr::$adopted { ptr, offset, len, scan } => Repr::$adopted {
                         ptr: unsafe { cow_buffer::Adopted::retain(ptr.as_ptr().cast()); Owned::from_raw(ptr.as_ptr()) },
                         offset: *offset, len: *len, scan: *scan,
@@ -1158,6 +1192,8 @@ macro_rules! define_perl_string {
                     // here; the adopted pointer round-trips through the untyped Owned it rode in.
                     $( Repr::$slice { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
                     $( Repr::$small_slice { ptr, cap, .. } => unsafe { small_backing_release(ptr.claim(), u16v(*cap)) }, )*
+                    $( Repr::$far_slice { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
+                    $( Repr::$far_adopted { ptr, .. } => unsafe { cow_buffer::Adopted::release(ptr.claim().cast()) }, )*
                     $( Repr::$adopted { ptr, .. } => unsafe { cow_buffer::Adopted::release(ptr.claim().cast()) }, )*
                 }
             }
@@ -1179,8 +1215,10 @@ macro_rules! define_perl_string {
                     $( Repr::$static { .. } => StorageType::Static, )*
                     $( Repr::$large_immortal { .. } => StorageType::LargeImmortal, )*
                     $( Repr::$large_static { .. } => StorageType::LargeStatic, )*
-                    $( Repr::$slice { .. } => StorageType::Slice, )*
+                    $( Repr::$slice { .. } => StorageType::MediumSlice, )*
                     $( Repr::$small_slice { .. } => StorageType::SmallSlice, )*
+                    $( Repr::$far_slice { .. } => StorageType::FarSlice, )*
+                    $( Repr::$far_adopted { .. } => StorageType::FarAdopted, )*
                     $( Repr::$adopted { .. } => StorageType::Adopted, )*
                 }
             }
@@ -1202,6 +1240,8 @@ macro_rules! define_perl_string {
                     $( Repr::$large_static { .. } => $large_static_utf8, )*
                     $( Repr::$slice { .. } => $slice_utf8, )*
                     $( Repr::$small_slice { .. } => $small_slice_utf8, )*
+                    $( Repr::$far_slice { .. } => $far_slice_utf8, )*
+                    $( Repr::$far_adopted { .. } => $far_adopted_utf8, )*
                     $( Repr::$adopted { .. } => $adopted_utf8, )*
                 }
             }
@@ -1223,6 +1263,8 @@ macro_rules! define_perl_string {
                     $( Repr::$large_static { .. } => $large_static_tainted, )*
                     $( Repr::$slice { .. } => $slice_tainted, )*
                     $( Repr::$small_slice { .. } => $small_slice_tainted, )*
+                    $( Repr::$far_slice { .. } => $far_slice_tainted, )*
+                    $( Repr::$far_adopted { .. } => $far_adopted_tainted, )*
                     $( Repr::$adopted { .. } => $adopted_tainted, )*
                 }
             }
@@ -1239,6 +1281,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap8a { .. } => None, )*
                     $( Repr::$slice { .. } => None, )*
                     $( Repr::$small_slice { .. } => None, )*
+                    $( Repr::$far_slice { .. } => None, )*
+                    $( Repr::$far_adopted { .. } => None, )*
                     $( Repr::$adopted { .. } => None, )*
                     $( Repr::$heap16a { .. } => None, )*
 
@@ -1345,6 +1389,17 @@ macro_rules! define_perl_string {
                         bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u16v(*offset)), u16v(*len)) },
                         scan: *scan,
                     }, )*
+                    $( Repr::$far_slice { ptr, offset, len, scan } => RawParts::View {
+                        bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u32v(*offset)), u16v(*len)) },
+                        scan: *scan,
+                    }, )*
+                    $( Repr::$far_adopted { ptr, offset, len, scan } => RawParts::View {
+                        bytes: unsafe {
+                            let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
+                            &a.as_slice()[u32v(*offset)..u32v(*offset) + u16v(*len)]
+                        },
+                        scan: *scan,
+                    }, )*
                     $( Repr::$adopted { ptr, offset, len, scan } => RawParts::View {
                         bytes: unsafe {
                             let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
@@ -1374,6 +1429,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { .. } => None, )*
                     $( Repr::$slice { .. } => None, )*
                     $( Repr::$small_slice { .. } => None, )*
+                    $( Repr::$far_slice { .. } => None, )*
+                    $( Repr::$far_adopted { .. } => None, )*
                     $( Repr::$adopted { .. } => None, )*
                 }
             }
@@ -1621,6 +1678,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap { .. } => Some(Tier::Heap), )*
                     $( Repr::$slice { .. } => None, )*
                     $( Repr::$small_slice { .. } => None, )*
+                    $( Repr::$far_slice { .. } => None, )*
+                    $( Repr::$far_adopted { .. } => None, )*
                     $( Repr::$adopted { .. } => None, )*
                 }
             }
@@ -1710,11 +1769,19 @@ macro_rules! define_perl_string {
                     // returned transport, which carries which release it owes through `native`.
                     $( Repr::$slice { ptr, offset, len, scan } => RawOwned::View {
                         ptr: unsafe { std::ptr::read(ptr) },
-                        backing: ViewBacking::Heap32, offset: u24(*offset), len: u24(*len), scan: *scan,
+                        backing: ViewBacking::Heap32Medium, offset: u24(*offset), len: u24(*len), scan: *scan,
                     }, )*
                     $( Repr::$small_slice { ptr, offset, len, cap, scan } => RawOwned::View {
                         ptr: unsafe { std::ptr::read(ptr) },
                         backing: ViewBacking::Small { cap: u16v(*cap) }, offset: u16v(*offset), len: u16v(*len), scan: *scan,
+                    }, )*
+                    $( Repr::$far_slice { ptr, offset, len, scan } => RawOwned::View {
+                        ptr: unsafe { std::ptr::read(ptr) },
+                        backing: ViewBacking::Heap32Far, offset: u32v(*offset), len: u16v(*len), scan: *scan,
+                    }, )*
+                    $( Repr::$far_adopted { ptr, offset, len, scan } => RawOwned::View {
+                        ptr: unsafe { std::ptr::read(ptr) },
+                        backing: ViewBacking::AdoptedFar, offset: u32v(*offset), len: u16v(*len), scan: *scan,
                     }, )*
                     $( Repr::$adopted { ptr, offset, len, scan } => RawOwned::View {
                         ptr: unsafe { std::ptr::read(ptr) },
@@ -1727,12 +1794,16 @@ macro_rules! define_perl_string {
             /// family, and each family stores the fields at its own width, already proven under its bound.
             fn build_view(backing: ViewBacking, utf8: bool, tainted: bool, ptr: Owned, offset: usize, len: usize, scan: scan::ScanState) -> PString {
                 match (backing, utf8, tainted) {
-                    $( (ViewBacking::Heap32, $slice_utf8, $slice_tainted) =>
+                    $( (ViewBacking::Heap32Medium, $slice_utf8, $slice_tainted) =>
                         PString(Repr::$slice { ptr, offset: to_u24(offset), len: to_u24(len), scan }), )*
                     $( (ViewBacking::Small { cap }, $small_slice_utf8, $small_slice_tainted) =>
                         PString(Repr::$small_slice { ptr, offset: to_u16(offset), len: to_u16(len), cap: to_u16(cap), scan }), )*
                     $( (ViewBacking::Adopted, $adopted_utf8, $adopted_tainted) =>
                         PString(Repr::$adopted { ptr, offset: to_u24(offset), len: to_u24(len), scan }), )*
+                    $( (ViewBacking::Heap32Far, $far_slice_utf8, $far_slice_tainted) =>
+                        PString(Repr::$far_slice { ptr, offset: to_u32(offset), len: to_u16(len), scan }), )*
+                    $( (ViewBacking::AdoptedFar, $far_adopted_utf8, $far_adopted_tainted) =>
+                        PString(Repr::$far_adopted { ptr, offset: to_u32(offset), len: to_u16(len), scan }), )*
                 }
             }
 
@@ -1951,16 +2022,28 @@ define_perl_string! {
         LargeStaticFlaggedTainted         = (true,  true),
     ],
     slices: [
-        Slice                             = (false, false),
-        SliceFlagged                      = (true,  false),
-        SliceTainted                      = (false, true),
-        SliceFlaggedTainted               = (true,  true),
+        MediumSlice                       = (false, false),
+        MediumSliceFlagged                = (true,  false),
+        MediumSliceTainted                = (false, true),
+        MediumSliceFlaggedTainted         = (true,  true),
     ],
     small_slices: [
         SmallSlice                        = (false, false),
         SmallSliceFlagged                 = (true,  false),
         SmallSliceTainted                 = (false, true),
         SmallSliceFlaggedTainted          = (true,  true),
+    ],
+    far_slices: [
+        FarSlice                          = (false, false),
+        FarSliceFlagged                   = (true,  false),
+        FarSliceTainted                   = (false, true),
+        FarSliceFlaggedTainted            = (true,  true),
+    ],
+    far_adopteds: [
+        FarAdopted                        = (false, false),
+        FarAdoptedFlagged                 = (true,  false),
+        FarAdoptedTainted                 = (false, true),
+        FarAdoptedFlaggedTainted          = (true,  true),
     ],
     adopteds: [
         AdoptedView                       = (false, false),
@@ -2547,9 +2630,20 @@ impl PString {
         match self.raw_parts() {
             RawParts::Heap(cb) if cb.tier() == Tier::Heap32 => {
                 let bytes = cb.as_slice();
-                if offset.checked_add(len)? > bytes.len() || offset >= SPAN as usize || len >= SPAN as usize {
+                if offset.checked_add(len)? > bytes.len() {
                     return None;
                 }
+
+                // The ruled selection (§2.2.15): the far form whenever the length fits u16 — its fields are native
+                // widths, one load each, where u24 has none — and the medium form for the band only it serves, lengths
+                // past 64 KiB within u24 reach.  The large forms, the verbs stage's, lie past both.
+                let backing = if len <= u16::MAX as usize {
+                    ViewBacking::Heap32Far
+                } else if offset < SPAN as usize && len < SPAN as usize {
+                    ViewBacking::Heap32Medium
+                } else {
+                    return None;
+                };
 
                 let scan = view_birth_state(cb.scan(), bytes, offset, len);
 
@@ -2560,7 +2654,7 @@ impl PString {
                     Owned::from_raw(cb.raw())
                 };
 
-                Some(PString::build_view(ViewBacking::Heap32, utf8, tainted, ptr, offset, len, scan))
+                Some(PString::build_view(backing, utf8, tainted, ptr, offset, len, scan))
             }
             RawParts::Heap(cb) if matches!(cb.tier(), Tier::Heap8 | Tier::Heap16) => {
                 let bytes = cb.as_slice();
@@ -3080,11 +3174,17 @@ impl PString {
                 // SAFETY: the transport owns one reference on the live backing, released below after the copy.
                 let old_bytes = unsafe {
                     match backing {
-                        ViewBacking::Heap32 | ViewBacking::Small { .. } => std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(offset), len),
+                        ViewBacking::Heap32Medium | ViewBacking::Heap32Far | ViewBacking::Small { .. } => {
+                            std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(offset), len)
+                        }
                         ViewBacking::Adopted => {
                             let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
                             let (off, n) = if offset == SPAN as usize && len == SPAN as usize { (0, a.total_len()) } else { (offset, len) };
                             &a.as_slice()[off..off + n]
+                        }
+                        ViewBacking::AdoptedFar => {
+                            let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
+                            &a.as_slice()[offset..offset + len]
                         }
                     }
                 };
@@ -3101,9 +3201,9 @@ impl PString {
                 // SAFETY: the transport's one reference, consumed exactly once, under the backing's own release.
                 unsafe {
                     match backing {
-                        ViewBacking::Heap32 => cow_buffer::heap32::release(ptr.claim()),
+                        ViewBacking::Heap32Medium | ViewBacking::Heap32Far => cow_buffer::heap32::release(ptr.claim()),
                         ViewBacking::Small { cap } => small_backing_release(ptr.claim(), cap),
-                        ViewBacking::Adopted => cow_buffer::Adopted::release(ptr.claim().cast()),
+                        ViewBacking::Adopted | ViewBacking::AdoptedFar => cow_buffer::Adopted::release(ptr.claim().cast()),
                     }
                 }
 

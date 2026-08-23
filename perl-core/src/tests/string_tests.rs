@@ -5182,7 +5182,7 @@ fn a_native_view_reads_the_subrange_without_copying() {
     let mut scratch_b = [0u8; DECODE_MAX];
 
     let view = parent.view_range(10, 50_000).unwrap();
-    assert_eq!(view.storage_type(), StorageType::Slice);
+    assert_eq!(view.storage_type(), StorageType::FarSlice, "under 64 KiB the far form is preferred");
     assert_eq!(view.len(), 50_000);
     assert_eq!(view.as_bytes(&mut scratch_a), &parent.as_bytes(&mut scratch_b)[10..50_010]);
 
@@ -5245,11 +5245,11 @@ fn tag_transitions_preserve_the_view() {
     let mut view = parent.view_range(0, 60_000).unwrap();
 
     view.taint();
-    assert_eq!(view.storage_type(), StorageType::Slice, "taint is a tag transition, not a copy");
+    assert_eq!(view.storage_type(), StorageType::FarSlice, "taint is a tag transition, not a copy");
     assert!(view.is_tainted());
 
     view.untaint_for_sanctioned_path();
-    assert_eq!(view.storage_type(), StorageType::Slice);
+    assert_eq!(view.storage_type(), StorageType::FarSlice);
     assert!(!view.is_tainted());
 }
 
@@ -5259,7 +5259,7 @@ fn appending_to_a_view_materializes_away_from_it() {
     let mut view = parent.view_range(0, 100).unwrap();
 
     view.push_bytes(b"!tail").unwrap();
-    assert_ne!(view.storage_type(), StorageType::Slice, "a view is a read-only carrier");
+    assert_ne!(view.storage_type(), StorageType::MediumSlice, "a view is a read-only carrier");
     assert_eq!(view.len(), 105);
 
     let mut scratch = [0u8; DECODE_MAX];
@@ -5273,7 +5273,10 @@ fn unshare_dissolves_the_pin() {
     assert!(view.is_shared(), "a view shares its backing by construction");
 
     view.unshare().unwrap();
-    assert!(!matches!(view.storage_type(), StorageType::Slice | StorageType::Adopted));
+    assert!(!matches!(
+        view.storage_type(),
+        StorageType::SmallSlice | StorageType::MediumSlice | StorageType::FarSlice | StorageType::Adopted | StorageType::FarAdopted
+    ));
     assert_eq!(view.len(), 200);
 }
 
@@ -5385,4 +5388,73 @@ fn a_small_view_of_ascii_content_is_born_ascii_and_answers_without_probing() {
     assert_eq!(view.scan_state(), scan::Ascii, "Ascii cuts clean by nature and survives exactly");
     assert!(view.is_ascii());
     assert_eq!(view.char_len(), Some(200));
+}
+
+// ── FarSlice and FarAdopted (§2.2.15) ─────────────────────────
+#[test]
+fn selection_prefers_far_and_keeps_medium_for_its_band() {
+    // A parent past the u24 offset reach: 17 MiB.
+    let parent = heap32_parent(17 * 1024 * 1024);
+
+    // Short view, small offset: far wins on width even where medium fits.
+    let short = parent.view_range(10, 1_000).unwrap();
+    assert_eq!(short.storage_type(), StorageType::FarSlice);
+
+    // Short view past the u24 reach: only far can carry it.
+    let far = parent.view_range(16_900_000, 60_000).unwrap();
+    assert_eq!(far.storage_type(), StorageType::FarSlice);
+    let mut sa = [0u8; DECODE_MAX];
+    let mut sb = [0u8; DECODE_MAX];
+    assert_eq!(far.as_bytes(&mut sa), &parent.as_bytes(&mut sb)[16_900_000..16_960_000]);
+
+    // Long view within u24 reach: the band only medium serves.
+    let medium = parent.view_range(100, 200_000).unwrap();
+    assert_eq!(medium.storage_type(), StorageType::MediumSlice);
+
+    // Long view past u24 reach: the large forms' territory, not yet built.
+    assert!(parent.view_range(16_900_000, 200_000).is_none());
+}
+
+#[test]
+fn far_views_share_read_transition_and_materialize_like_their_kin() {
+    let parent = heap32_parent(17 * 1024 * 1024);
+    let mut view = parent.view_range(16_900_000, 500).unwrap();
+    assert_eq!(view.storage_type(), StorageType::FarSlice);
+
+    let clone = view.clone();
+    view.taint();
+    assert_eq!(view.storage_type(), StorageType::FarSlice, "taint is a tag transition");
+    assert!(view.is_tainted() && !clone.is_tainted());
+
+    view.push_bytes(b"++").unwrap();
+    assert_ne!(view.storage_type(), StorageType::FarSlice);
+    assert_eq!(view.len(), 502);
+
+    drop(parent);
+    let mut scratch = [0u8; DECODE_MAX];
+    assert_eq!(clone.as_bytes(&mut scratch).len(), 500, "the clone's retain outlives the parent handle");
+}
+
+#[test]
+fn far_adopted_carries_offsets_past_u24_reach() {
+    let big: std::sync::Arc<[u8]> = {
+        let mut v = vec![b'.'; 17 * 1024 * 1024];
+        v[16_900_000] = b'X';
+        std::sync::Arc::from(&v[..])
+    };
+    let a = cow_buffer::Adopted::adopt_arc_bytes(big.clone(), scan::Ascii).unwrap();
+
+    // A far sub-view of the adoptee, built directly: the constructor surface is the verbs stage's.
+    let view = PString::build_view(ViewBacking::AdoptedFar, false, false, unsafe { Owned::from_raw(a.cast()) }, 16_900_000, 100, scan::Ascii);
+    assert_eq!(view.storage_type(), StorageType::FarAdopted);
+    let mut scratch = [0u8; DECODE_MAX];
+    assert_eq!(view.as_bytes(&mut scratch)[0], b'X');
+
+    let mut clone = view.clone();
+    clone.taint();
+    assert_eq!(clone.storage_type(), StorageType::FarAdopted);
+
+    drop(view);
+    drop(clone);
+    assert_eq!(std::sync::Arc::strong_count(&big), 1, "the last far view released the struct, which released the Arc");
 }
