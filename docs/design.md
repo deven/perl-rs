@@ -4893,28 +4893,37 @@ image, as the Latin-1 inline class stores the downgraded one.
 Pointer-backed tiers omit `bytes:`; their content is behind the
 pointer and `string:` already carries it losslessly.
 
-**The content rendering [DECISION].**  A flagged string renders
-as `"…"`, UTF-8 assumed; an unflagged string renders as `b"…"`, a
-byte string — redundant with the `utf8:` field beside it, and
-deliberately so.  Printables appear verbatim (printable ASCII
+**The content rendering [DECISION].**  The `b"…"` byte-string
+form appears only where it says something: an unflagged string
+with at least one high byte.  Pure-ASCII content renders as
+`"…"` whatever the flag — ASCII is the shared subset over which
+the flag is value-invisible, and the `utf8:` field beside it
+carries the flag regardless.  Flagged strings render as `"…"`
+with UTF-8 assumed.  Printables appear verbatim (printable ASCII
 only on the byte side), `\n`, `\t`, and `\r` take their short
-forms, the backslash and the quote escape themselves, control and
-unrepresentable code points render as `\x{…}` with at least four
-lowercase hex digits zero-padded to four, and each byte of a
-rejected sequence renders as `\x{nn}` with exactly two.  Two
-digits always means one raw byte, four or more always means one
-code point, and three are never emitted — so the same flagged
-string can hold well-formed `U+0080` as `\x{0080}` beside a
-rejected `0x80` as `\x{80}` and the reader tells them apart by
-width alone.
+forms, and the backslash and the quote escape themselves.
+Escapes divide by width: a seven-bit character takes exactly two
+lowercase hex digits in every string kind — `\x{01}`, one byte
+being one code point below `U+0080` — a code point at `U+0080`
+or above takes at least four digits zero-padded to four, and
+each byte of a rejected sequence takes exactly two.  Three are
+never emitted.  Inside `"…"`, two digits at `0x80` or above can
+only be a rejected byte, so well-formed `U+0085` renders
+`\x{0085}` beside a rejected `0x85`'s `\x{85}` and width alone
+tells them apart.
 
-**Losslessness is mechanical, not aspirational.**  The prefix
-recovers the flag, the escape width sorts bytes from code points,
-verbatim characters re-encode by Rust's own minimal UTF-8, and
-escaped code points re-encode uniquely because the decoder admits
-only minimal forms — so a small parser inverts the rendering to
-the exact flag-and-bytes identity, malformed content included,
-and a parser-backed round-trip test pins it.  Every rendering
+**Losslessness is mechanical, not aspirational.**  The escape
+width sorts bytes from code points, verbatim characters re-encode
+by Rust's own minimal UTF-8, and escaped code points re-encode
+uniquely because the decoder admits only minimal forms — so a
+small parser inverts the rendering to the exact bytes, malformed
+content included.  The flag inverts from the rendering wherever
+it matters: `b"…"` says unflagged, and any high verbatim
+character, any four-plus-digit escape, or any two-digit escape at
+`0x80` or above inside `"…"` says flagged.  Pure-ASCII content is
+the one case `"…"` serves both, deliberately, the flag being
+value-invisible there; the `utf8:` field beside it completes the
+identity, and a parser-backed round-trip test pins the whole.  Every rendering
 also pastes into perl source, with one corner: reconstructing a
 flagged-malformed string requires `Encode::_utf8_on`, pure perl
 having no way to set the flag on arbitrary bytes.
