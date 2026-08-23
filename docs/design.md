@@ -1684,7 +1684,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   carrying its length implicitly beside a shorter family storing
   it in the byte the last character would have used.  The inline
   forms split into the two length families, and the tag
-  arithmetic is §2.2.3's: 152 of 256 (136 before the §2.2.15 view
+  arithmetic is §2.2.3's: 160 of 256 (136 before the §2.2.15 view
   forms).  NUL then stops being a special case anywhere: content
   carrying one is stored inline like any other, which removes the
   rejection from both constructors, the check from the append
@@ -1723,7 +1723,7 @@ heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PString`'s own tag, which uses 152 of its
+occupies the niche in `PString`'s own tag, which uses 160 of its
 256 values (136 before the §2.2.15 view forms).  Rust's
 niche-filling requires every other variant's data to avoid that
 byte, and it lays a variant out as a self-contained struct
@@ -2369,6 +2369,22 @@ itself — whose length reads from `total_len` on the cache line
 the first load already fetched, so adoption is not capped by the
 24-bit fields; those describe only genuine sub-views.
 
+**The small tiers take a third compact form.**  `SmallSlice
+{ heap: 8, offset: u16, len: u16, cap: u16, scan: u8 }` — fifteen
+bytes again, the `u24` pair narrowed to `u16` (sufficient by
+construction: Heap16 content tops out at 65535) to make room for
+the one thing those tiers' release demands, the backing's
+capacity, which their allocations do not record.  The release
+dispatches on the capacity itself: the allocation ladder is
+strict — a tier is chosen only when the length exceeds the
+previous tier's ceiling, and the capacity is the size class above
+that length — so Heap8 capacities live at or below 255 and
+Heap16's above, with no overlap, and the envelope needs no tier
+bit it has no room for.  With this form every heap tier's views
+are zero-allocation except the word tier past 4 GiB, whose `u24`
+reach would cover only its first sixteen megabytes anyway; it
+routes through `Adopted` with the `HeapBuf` holder.
+
 **The large cases are holders, not new machinery.**  `u24` caps a
 compact view's length *and position* at 16 MiB: a 1 KB slice at
 offset 5 GiB overflows the offset field even though the slice is
@@ -2378,10 +2394,10 @@ with its own `base` pre-resolved to the parent's base plus the
 large offset at creation — envelope to child `base` to bytes, two
 loads, never three — and whose drop arm releases what it retains.
 The design prose names these cases `LargeSlice` and
-`LargeAdopted`; the `Repr` carries only the two compact forms,
+`LargeAdopted`; the `Repr` carries only the three compact forms,
 and the slicing paths choose the form silently.  Discriminant
-cost: two storage types times the three flag bits, sixteen fused
-variants, moving the string tag from 136 to 152 of 256.
+cost: three storage types times the three flag bits, twenty-four
+fused variants, moving the string tag from 136 to 160 of 256.
 
 **Birth state and narrowing.**  A view's envelope scan byte is
 born from the slice-birth table of §2.2.3 — clean cuts preserve
