@@ -4880,17 +4880,44 @@ therefore available only where doubled backslashes are already
 expected, which is `Debug`, and `Display` takes the replacement
 character instead.  Anyone diagnosing content reaches for `{:?}`.
 
-**Open: the `Debug` escape format.**  Lossless is ruled; the syntax
-is not.  Two constraints bound it.  The escape character escapes
-itself, since that is what lossless required above.  And at the
-malformed terminal the format must show the UTF-8 flag: those
-bytes decode to no characters, so `Debug` falls back to byte
-escapes there, and flagged and unflagged content with identical
-bytes would otherwise render identically — the one place the flag
-cannot be read off the rendered characters.  Perl's own diagnostic
-surface separates the cases the same way, rendering an unflagged
-high byte as `"\351"` and a flagged code point as `"\x{4e2d}"`
-(`Data::Dumper` under `Useqq`, verified).
+**`Debug` is one struct carrying both natures [DECISION].**  The
+representation fields — the tier, the length, the per-value tag
+bits — and the lossless content rendering under `string:`, in one
+`PString { … }`.  The envelope-resident tiers add `bytes:`, the
+exact stored array in bare lowercase hex with padding and
+auxiliary nibbles visible, because for those tiers the array *is*
+the representation and cleared padding is an invariant worth
+seeing — and it shows physical storage, which legitimately
+differs from the logical bytes where a tier stores a transformed
+image, as the Latin-1 inline class stores the downgraded one.
+Pointer-backed tiers omit `bytes:`; their content is behind the
+pointer and `string:` already carries it losslessly.
+
+**The content rendering [DECISION].**  A flagged string renders
+as `"…"`, UTF-8 assumed; an unflagged string renders as `b"…"`, a
+byte string — redundant with the `utf8:` field beside it, and
+deliberately so.  Printables appear verbatim (printable ASCII
+only on the byte side), `\n`, `\t`, and `\r` take their short
+forms, the backslash and the quote escape themselves, control and
+unrepresentable code points render as `\x{…}` with at least four
+lowercase hex digits zero-padded to four, and each byte of a
+rejected sequence renders as `\x{nn}` with exactly two.  Two
+digits always means one raw byte, four or more always means one
+code point, and three are never emitted — so the same flagged
+string can hold well-formed `U+0080` as `\x{0080}` beside a
+rejected `0x80` as `\x{80}` and the reader tells them apart by
+width alone.
+
+**Losslessness is mechanical, not aspirational.**  The prefix
+recovers the flag, the escape width sorts bytes from code points,
+verbatim characters re-encode by Rust's own minimal UTF-8, and
+escaped code points re-encode uniquely because the decoder admits
+only minimal forms — so a small parser inverts the rendering to
+the exact flag-and-bytes identity, malformed content included,
+and a parser-backed round-trip test pins it.  Every rendering
+also pastes into perl source, with one corner: reconstructing a
+flagged-malformed string requires `Encode::_utf8_on`, pure perl
+having no way to set the flag on arbitrary bytes.
 
 **One replacement per decode step [DECISION].**  The unit is the
 step the decoder takes, not the bytes it takes it over:
