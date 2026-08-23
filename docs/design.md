@@ -1039,7 +1039,7 @@ opportunistically (flagged → `Ascii`/`Utf8Latin1`; unflagged →
 
 **Substring sharing.**  Rvalue `substr` and regex captures
 against large strings are where perl plays COW games; the view
-design — the compact `Slice` and `Adopted` envelope forms, the
+design — the compact `MediumSlice` and `Adopted` envelope forms, the
 `Adopted` side struct and its holders, the large cases, and the
 policy-free `slice`/`substr`/`unshare` verbs — is §2.2.15.  The
 name `Str` stays reserved for a borrowed-view type (lvalue
@@ -1684,7 +1684,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   carrying its length implicitly beside a shorter family storing
   it in the byte the last character would have used.  The inline
   forms split into the two length families, and the tag
-  arithmetic is §2.2.3's: 160 of 256 (136 before the §2.2.15 view
+  arithmetic is §2.2.3's: 176 of 256 (136 before the §2.2.15 view
   forms).  NUL then stops being a special case anywhere: content
   carrying one is stored inline like any other, which removes the
   rejection from both constructors, the check from the append
@@ -1723,7 +1723,7 @@ heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PString`'s own tag, which uses 160 of its
+occupies the niche in `PString`'s own tag, which uses 176 of its
 256 values (136 before the §2.2.15 view forms).  Rust's
 niche-filling requires every other variant's data to avoid that
 byte, and it lays a variant out as a self-contained struct
@@ -2288,7 +2288,7 @@ the flag is set once, at declaration, by the front end — no pad-
 side mark to inherit later, and no path by which a shared
 variable is ever observed unpromoted.
 
-#### 2.2.15 Views: `Slice` and `Adopted`:
+#### 2.2.15 Views: the slice forms and `Adopted`:
 
 A view is a `PString` whose bytes live in someone else's
 allocation: a sub-range of a native heap buffer, or of a foreign
@@ -2300,7 +2300,7 @@ every backing that is not a native buffer.  A view's marginal
 memory is the envelope the value would occupy anyway: no
 allocation per slice, no allocation per clone.
 
-**The native form.**  `Slice { heap: 8, offset: u24, len: u24,
+**The native form.**  `MediumSlice { heap: 8, offset: u24, len: u24,
 scan: u8 }` — fifteen bytes.  The pointer is the backing buffer's
 own allocation; birth bumps the refcount its header already
 carries, drop decrements it, and the data address is arithmetic —
@@ -2309,7 +2309,7 @@ dependent load, the byte itself.  The backing's header is already
 everything a side struct would hold (refcount, the shared
 narrowing scan slot, count, length), paid once when the buffer
 was born; a native view therefore mints nothing.  A whole-buffer
-handle is simply the existing heap repr, so `Slice` always
+handle is simply the existing heap repr, so `MediumSlice` always
 denotes a proper sub-range and needs no whole-object sentinel.
 Because a view holds the refcount above one, every in-place
 transform on the buffer routes through the COW extraction
@@ -2385,6 +2385,27 @@ are zero-allocation except the word tier past 4 GiB, whose `u24`
 reach would cover only its first sixteen megabytes anyway; it
 routes through `Adopted` with the `HeapBuf` holder.
 
+**The far pair completes the compact geometries.**  `FarSlice`
+and `FarAdopted` — `{ptr: 8, offset: u32, len: u16, scan: u8}`,
+the only other packing that fits fifteen bytes — trade length
+reach for offset reach.  A view's offset is distributed over its
+backing while its length is short-tailed (captures, fields,
+`substr` results), so against a backing past 16 MiB the `u24`
+pair fails on the common axis — it addresses only the first
+16 MiB — where the far pair fails only on the rare one, views
+longer than 64 KiB.  Both stay [DECISION]: the `u24` pair keeps
+every slice of a backing at or under 16 MiB allocation-free
+whatever its shape, and the far pair carries short views at any
+offset of a full-size backing.  Selection is silent in the
+slicing paths, and prefers the far form whenever the length fits
+`u16` [DECISION]: its fields are native widths, one load each,
+where `u24` decodes by shift-and-or — so the medium form serves
+exactly the band only it can, lengths past 64 KiB within `u24`
+reach, and the large forms lie past both.  The
+whole-object sentinel stays the `u24` adopted family's `SPAN`,
+which serves adoptees of unbounded size already; the far forms
+carry none.
+
 **The large cases are holders, not new machinery.**  `u24` caps a
 compact view's length *and position* at 16 MiB: a 1 KB slice at
 offset 5 GiB overflows the offset field even though the slice is
@@ -2394,10 +2415,10 @@ with its own `base` pre-resolved to the parent's base plus the
 large offset at creation — envelope to child `base` to bytes, two
 loads, never three — and whose drop arm releases what it retains.
 The design prose names these cases `LargeSlice` and
-`LargeAdopted`; the `Repr` carries only the three compact forms,
+`LargeAdopted`; the `Repr` carries only the five compact forms,
 and the slicing paths choose the form silently.  Discriminant
-cost: three storage types times the three flag bits, twenty-four
-fused variants, moving the string tag from 136 to 160 of 256.
+cost: five storage types times the three flag bits, forty fused
+variants, moving the string tag from 136 to 176 of 256.
 
 **Birth state and narrowing.**  A view's envelope scan byte is
 born from the slice-birth table of §2.2.3 — clean cuts preserve
@@ -2443,7 +2464,7 @@ neutral: perl copies rvalue `substr`, and capture COW against
 huge strings is a documented footgun its users manage by copying
 through a scalar.  An earlier ruling fixed a uniform copy-below
 floor of 256 bytes; it was priced when every tier-sourced slice
-minted a side struct, a cost the native `Slice` form removed, and
+minted a side struct, a cost the native slice forms removed, and
 what remained of the floor was policy, which this section
 relocates.  256 stands recorded as the candidate default should
 the ops layer rule a floor at all.  Pinning is observable before
