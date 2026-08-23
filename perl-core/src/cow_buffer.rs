@@ -479,6 +479,13 @@ impl<'a> HeapView<'a> {
 
     /// Which tier owns the allocation this view borrows.
     #[allow(dead_code)]
+    /// The data pointer, for callers minting an additional reference on the allocation (§2.2.15's native views); the
+    /// retain is theirs to take under the tier's own rules.
+    pub(crate) fn raw(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn tier(&self) -> Tier {
         self.tier
     }

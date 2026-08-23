@@ -36,6 +36,26 @@ use std::str::{self, FromStr};
 /// Maximum inline payload: chosen so every numeric stringification stays allocation-free (§2.2.3).
 pub const INLINE_MAX: usize = 15;
 
+/// The u24 whole-object sentinel (§2.2.15): both fields at this value mark an adopted whole-object handle, whose length
+/// reads from the `Adopted` struct's cache line instead — so adoption is never capped by the 24-bit fields, which
+/// describe only genuine sub-views.
+pub(crate) const SPAN: u32 = 0xFF_FFFF;
+
+/// The 24-bit view fields (§2.2.15): little-endian in three bytes, the immortal envelope's geometry.
+#[inline]
+const fn u24(bytes: [u8; 3]) -> usize {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) as usize
+}
+
+/// The inverse, for values already proven under the bound.
+#[inline]
+#[cfg_attr(not(test), allow(dead_code))]
+const fn to_u24(value: usize) -> [u8; 3] {
+    debug_assert!(value <= SPAN as usize);
+    let b = (value as u32).to_le_bytes();
+    [b[0], b[1], b[2]]
+}
+
 /// The widest byte sequence any non-heap form decodes to, and so the size of the scratch buffer the borrowed-view
 /// accessors take.
 ///
@@ -906,6 +926,12 @@ pub enum StorageType {
 
     /// A `'static` image past the compact ceiling (§2.2.3).
     LargeStatic,
+
+    /// A native view (§2.2.15): a sub-range of a word-tier heap buffer, sharing its header refcount.
+    Slice,
+
+    /// An adopted view (§2.2.15): a range of an `Adopted` object — a foreign buffer, or an oversized view's child.
+    Adopted,
 }
 
 impl StorageType {
@@ -948,7 +974,9 @@ macro_rules! define_perl_string {
         immortal: [ $( $immortal:ident = ($immortal_utf8:literal, $immortal_tainted:literal) ),* $(,)? ],
         statics:  [ $( $static:ident  = ($static_utf8:literal,  $static_tainted:literal)  ),* $(,)? ],
         large_immortal: [ $( $large_immortal:ident = ($large_immortal_utf8:literal, $large_immortal_tainted:literal) ),* $(,)? ],
-        large_statics:  [ $( $large_static:ident  = ($large_static_utf8:literal,  $large_static_tainted:literal)  ),* $(,)? ]
+        large_statics:  [ $( $large_static:ident  = ($large_static_utf8:literal,  $large_static_tainted:literal)  ),* $(,)? ],
+        slices:   [ $( $slice:ident   = ($slice_utf8:literal,   $slice_tainted:literal)   ),* $(,)? ],
+        adopteds: [ $( $adopted:ident = ($adopted_utf8:literal, $adopted_tainted:literal) ),* $(,)? ]
     ) => {
         /// A Perl string.  See the module documentation.  The representation — the folded tag (§2.2.3) — is sealed
         /// behind this newtype: no variant is nameable outside the crate, so no payload can be forged or mutated around
@@ -966,9 +994,9 @@ macro_rules! define_perl_string {
         /// wrapper inherits the alignment.
         ///
         /// `Clone` and `Drop` are hand-written rather than derived, and must be: a heap variant holds an [`Owned`]
-        /// pointer whose duplication requires the tier's `retain`, and whose release requires — for the small tiers
-        /// — the capacity stored beside it in this very variant.  Only code that sees both can do either, which is
-        /// why the obligation lives here rather than in a handle type (§2.2.3).
+        /// pointer whose duplication requires the tier's `retain`, and whose release requires — for the small tiers —
+        /// the capacity stored beside it in this very variant.  Only code that sees both can do either, which is why
+        /// the obligation lives here rather than in a handle type (§2.2.3).
         #[repr(align(8))]
         enum Repr {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
@@ -983,6 +1011,8 @@ macro_rules! define_perl_string {
             $( $static { ptr: Image, len: [u8; 3], count: [u8; 3], scan: scan::Terminal }, )*
             $( $large_immortal { head: &'static ImmortalHead }, )*
             $( $large_static { head: &'static ImmortalHead }, )*
+            $( $slice { ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState }, )*
+            $( $adopted { ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState }, )*
         }
 
         impl Clone for Repr {
@@ -991,8 +1021,8 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { buf } => Repr::$inline { buf: *buf }, )*
                     $( Repr::$packed { nibbles } => Repr::$packed { nibbles: *nibbles }, )*
 
-                    // SAFETY (each heap arm): the variant owns a live allocation of its tier, and the new handle
-                    // takes the reference this `retain` adds.
+                    // SAFETY (each heap arm): the variant owns a live allocation of its tier, and the new handle takes
+                    // the reference this `retain` adds.
                     $( Repr::$heap8 { ptr, len, cap, count, scan } => Repr::$heap8 {
                         ptr: unsafe { cow_buffer::heap8::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
                         len: *len, cap: *cap, count: *count, scan: *scan,
@@ -1025,6 +1055,17 @@ macro_rules! define_perl_string {
                         Repr::$static { ptr: *ptr, len: *len, count: *count, scan: *scan }, )*
                     $( Repr::$large_immortal { head } => Repr::$large_immortal { head }, )*
                     $( Repr::$large_static { head } => Repr::$large_static { head }, )*
+
+                    // SAFETY (both view arms): the variant holds one reference on its live backing — the Heap32 buffer
+                    // or the Adopted struct — and the new handle takes the reference this retain adds.
+                    $( Repr::$slice { ptr, offset, len, scan } => Repr::$slice {
+                        ptr: unsafe { cow_buffer::heap32::retain(ptr.as_ptr()); Owned::from_raw(ptr.as_ptr()) },
+                        offset: *offset, len: *len, scan: *scan,
+                    }, )*
+                    $( Repr::$adopted { ptr, offset, len, scan } => Repr::$adopted {
+                        ptr: unsafe { cow_buffer::Adopted::retain(ptr.as_ptr().cast()); Owned::from_raw(ptr.as_ptr()) },
+                        offset: *offset, len: *len, scan: *scan,
+                    }, )*
                 }
             }
         }
@@ -1049,6 +1090,11 @@ macro_rules! define_perl_string {
                     $( Repr::$static { .. } => {}, )*
                     $( Repr::$large_immortal { .. } => {}, )*
                     $( Repr::$large_static { .. } => {}, )*
+
+                    // SAFETY (both view arms): the variant owns exactly one reference on its live backing, consumed
+                    // here; the adopted pointer round-trips through the untyped Owned it rode in.
+                    $( Repr::$slice { ptr, .. } => unsafe { cow_buffer::heap32::release(ptr.claim()) }, )*
+                    $( Repr::$adopted { ptr, .. } => unsafe { cow_buffer::Adopted::release(ptr.claim().cast()) }, )*
                 }
             }
         }
@@ -1069,6 +1115,8 @@ macro_rules! define_perl_string {
                     $( Repr::$static { .. } => StorageType::Static, )*
                     $( Repr::$large_immortal { .. } => StorageType::LargeImmortal, )*
                     $( Repr::$large_static { .. } => StorageType::LargeStatic, )*
+                    $( Repr::$slice { .. } => StorageType::Slice, )*
+                    $( Repr::$adopted { .. } => StorageType::Adopted, )*
                 }
             }
 
@@ -1087,6 +1135,8 @@ macro_rules! define_perl_string {
                     $( Repr::$static { .. } => $static_utf8, )*
                     $( Repr::$large_immortal { .. } => $large_immortal_utf8, )*
                     $( Repr::$large_static { .. } => $large_static_utf8, )*
+                    $( Repr::$slice { .. } => $slice_utf8, )*
+                    $( Repr::$adopted { .. } => $adopted_utf8, )*
                 }
             }
 
@@ -1105,6 +1155,8 @@ macro_rules! define_perl_string {
                     $( Repr::$static { .. } => $static_tainted, )*
                     $( Repr::$large_immortal { .. } => $large_immortal_tainted, )*
                     $( Repr::$large_static { .. } => $large_static_tainted, )*
+                    $( Repr::$slice { .. } => $slice_tainted, )*
+                    $( Repr::$adopted { .. } => $adopted_tainted, )*
                 }
             }
 
@@ -1118,6 +1170,8 @@ macro_rules! define_perl_string {
                     $( Repr::$large_immortal { .. } => None, )*
                     $( Repr::$large_static { .. } => None, )*
                     $( Repr::$heap8a { .. } => None, )*
+                    $( Repr::$slice { .. } => None, )*
+                    $( Repr::$adopted { .. } => None, )*
                     $( Repr::$heap16a { .. } => None, )*
 
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
@@ -1179,12 +1233,13 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16 { ptr, len, cap, count, scan } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap16)), )*
 
-                    // The Ascii twins' omitted fields are derivable (§2.2.3): every byte is a character, and the
-                    // class is the variant.
+                    // The Ascii twins' omitted fields are derivable (§2.2.3): every byte is a character, and the class
+                    // is the variant.
                     $( Repr::$heap8a { ptr, len, cap } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *len as usize, scan::Ascii, Tier::Heap8)), )*
                     $( Repr::$heap16a { ptr, len, cap } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *len as usize, scan::Ascii, Tier::Heap16)), )*
+
                     // SAFETY: a live allocation of this tier, whose header carries the metadata.
                     $( Repr::$heap32 { ptr, len } => RawParts::Heap(unsafe { HeapView::heap32(ptr, *len as usize) }), )*
                     $( Repr::$heap { ptr } => RawParts::Heap(unsafe { HeapView::large(ptr, Tier::Heap) }), )*
@@ -1211,6 +1266,21 @@ macro_rules! define_perl_string {
                         count: head.count,
                         scan: head.scan,
                     }, )*
+
+                    // SAFETY (both view arms): the variant holds a reference on its live backing, which pins the bytes;
+                    // the range was bounds-checked at birth.
+                    $( Repr::$slice { ptr, offset, len, scan } => RawParts::View {
+                        bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u24(*offset)), u24(*len)) },
+                        scan: *scan,
+                    }, )*
+                    $( Repr::$adopted { ptr, offset, len, scan } => RawParts::View {
+                        bytes: unsafe {
+                            let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
+                            let (off, n) = if u24(*offset) == SPAN as usize && u24(*len) == SPAN as usize { (0, a.total_len()) } else { (u24(*offset), u24(*len)) };
+                            &a.as_slice()[off..off + n]
+                        },
+                        scan: *scan,
+                    }, )*
                 }
             }
 
@@ -1230,16 +1300,18 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16a { .. } => None, )*
                     $( Repr::$heap32 { .. } => None, )*
                     $( Repr::$heap { .. } => None, )*
+                    $( Repr::$slice { .. } => None, )*
+                    $( Repr::$adopted { .. } => None, )*
                 }
             }
 
             /// Rewrite a heap buffer as the UTF-8 upgrade of its Latin-1 content, where that is possible without
             /// leaving the allocation.  `None` means the caller must take the copying form.
             ///
-            /// Two conditions, and both are refusals rather than problems to solve: a shared buffer cannot be
-            /// written at all, and one whose expansion exceeds its spare capacity would have to reallocate — at
-            /// which point copying *is* the operation, and it picks the right tier on the way (§2.2.3).  So there
-            /// is no growth here and no tier change: either it fits where it stands, or it moves.
+            /// Two conditions, and both are refusals rather than problems to solve: a shared buffer cannot be written
+            /// at all, and one whose expansion exceeds its spare capacity would have to reallocate — at which point
+            /// copying *is* the operation, and it picks the right tier on the way (§2.2.3).  So there is no growth here
+            /// and no tier change: either it fits where it stands, or it moves.
             fn upgrade_heap_in_place(&mut self) -> Option<usize> {
                 let (first, expansion, old_len) = match self.raw_parts() {
                     RawParts::Heap(view) => {
@@ -1258,9 +1330,9 @@ macro_rules! define_perl_string {
                 };
                 let new_len = old_len + expansion;
 
-                // SAFETY (each arm): unique and within capacity, both checked above; the loop rewrites only bytes
-                // this handle owns.  Every old byte becomes exactly one character, so the count is the old length,
-                // and the result is Latin-1 range by construction.
+                // SAFETY (each arm): unique and within capacity, both checked above; the loop rewrites only bytes this
+                // handle owns.  Every old byte becomes exactly one character, so the count is the old length, and the
+                // result is Latin-1 range by construction.
                 match &mut self.0 {
                     $( Repr::$heap8 { ptr, len, count, scan, .. } => {
                         unsafe { cow_buffer::expand_latin1_in_place(ptr.as_ptr(), first, old_len, new_len) };
@@ -1293,13 +1365,12 @@ macro_rules! define_perl_string {
                 Some(new_len)
             }
 
-            /// Rewrite a heap buffer as the Latin-1 contraction of its UTF-8 content.  `Some(false)` means a
-            /// character past U+00FF made the contraction impossible; `None` means the buffer is shared and the
-            /// caller must copy.
+            /// Rewrite a heap buffer as the Latin-1 contraction of its UTF-8 content.  `Some(false)` means a character
+            /// past U+00FF made the contraction impossible; `None` means the buffer is shared and the caller must copy.
             ///
-            /// Contraction only shrinks, so unlike the upgrade it can never want room it lacks, never reallocate
-            /// and never change tier.  It leaves spare capacity behind; whether that should be trimmed is a
-            /// question about trimming in general, deliberately left open.
+            /// Contraction only shrinks, so unlike the upgrade it can never want room it lacks, never reallocate and
+            /// never change tier.  It leaves spare capacity behind; whether that should be trimmed is a question about
+            /// trimming in general, deliberately left open.
             fn downgrade_heap_in_place(&mut self) -> Option<bool> {
                 let (first, contractions, old_len) = match self.raw_parts() {
                     RawParts::Heap(view) => {
@@ -1475,6 +1546,8 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16 { .. } => Some(Tier::Heap16), )*
                     $( Repr::$heap32 { .. } => Some(Tier::Heap32), )*
                     $( Repr::$heap { .. } => Some(Tier::Heap), )*
+                    $( Repr::$slice { .. } => None, )*
+                    $( Repr::$adopted { .. } => None, )*
                 }
             }
 
@@ -1558,6 +1631,26 @@ macro_rules! define_perl_string {
                     }, )*
                     $( Repr::$large_immortal { head } => RawOwned::BorrowedLarge { form: BorrowedForm::Immortal, head }, )*
                     $( Repr::$large_static { head } => RawOwned::BorrowedLarge { form: BorrowedForm::Static, head }, )*
+
+                    // SAFETY (both view arms): `this` is never dropped, so the backing reference transfers to the
+                    // returned transport, which carries which release it owes through `native`.
+                    $( Repr::$slice { ptr, offset, len, scan } => RawOwned::View {
+                        ptr: unsafe { std::ptr::read(ptr) },
+                        native: true, offset: *offset, len: *len, scan: *scan,
+                    }, )*
+                    $( Repr::$adopted { ptr, offset, len, scan } => RawOwned::View {
+                        ptr: unsafe { std::ptr::read(ptr) },
+                        native: false, offset: *offset, len: *len, scan: *scan,
+                    }, )*
+                }
+            }
+
+            /// Rebuild a view with the given tag dimensions (backing reference preserved): `native` selects the family,
+            /// and the envelope fields ride unchanged.
+            fn build_view(native: bool, utf8: bool, tainted: bool, ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState) -> PString {
+                match (native, utf8, tainted) {
+                    $( (true, $slice_utf8, $slice_tainted) => PString(Repr::$slice { ptr, offset, len, scan }), )*
+                    $( (false, $adopted_utf8, $adopted_tainted) => PString(Repr::$adopted { ptr, offset, len, scan }), )*
                 }
             }
 
@@ -1774,6 +1867,18 @@ define_perl_string! {
         LargeStaticFlagged            = (true, false),
         LargeStaticTainted            = (false, true),
         LargeStaticFlaggedTainted     = (true, true),
+    ],
+    slices: [
+        Slice                    = (false, false),
+        SliceFlagged             = (true, false),
+        SliceTainted             = (false, true),
+        SliceFlaggedTainted      = (true, true),
+    ],
+    adopteds: [
+        AdoptedView              = (false, false),
+        AdoptedViewFlagged       = (true, false),
+        AdoptedViewTainted       = (false, true),
+        AdoptedViewFlaggedTainted = (true, true),
     ]
 }
 
@@ -2113,7 +2218,7 @@ impl PString {
             RawParts::Inline { class, full, buf } => inline_internal_len(class, full, buf),
             RawParts::Packed(p) => p.len(),
             RawParts::Heap(cb) => cb.len(),
-            RawParts::Borrowed { bytes, .. } => bytes.len(),
+            RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => bytes.len(),
         }
     }
 
@@ -2169,7 +2274,7 @@ impl PString {
                 &scratch[..len]
             }
             RawParts::Heap(cb) => cb.as_slice(),
-            RawParts::Borrowed { bytes, .. } => bytes,
+            RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => bytes,
         }
     }
 
@@ -2209,6 +2314,20 @@ impl PString {
                 st if scan::is_rust_valid(st) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
                 _ => None, // ExtendedUtf8 or MalformedUtf8: the only terminal states outside the Rust-valid set.
             },
+            RawParts::View { bytes, scan } => match scan {
+                // SAFETY: the envelope byte certifies the view's own bytes (born from the slice-birth table, only ever
+                // narrowed per handle).
+                st if scan::is_rust_valid(st) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
+                scan::MalformedUtf8 | scan::ExtendedUtf8 | scan::PerlValidNonAscii => None,
+                _ => {
+                    // Undecided envelope: classify, answer, and leave narrowing to the paths that hold `&mut` — a
+                    // shared backing slot for views arrives with the verbs stage.
+                    let (st, _) = classify_full(bytes);
+
+                    // SAFETY: the classification just certified these exact bytes.
+                    if scan::is_rust_valid(st.widen()) { Some(unsafe { str::from_utf8_unchecked(bytes) }) } else { None }
+                }
+            },
             RawParts::Heap(cb) => {
                 let bytes = cb.as_slice();
                 match cb.scan() {
@@ -2246,6 +2365,17 @@ impl PString {
             // Every symbol of every packed alphabet is ASCII, so this is a constant rather than a question about
             // content — unlike the inline forms, whose bytes are whatever they are.
             RawParts::Packed(_) => true,
+            RawParts::View { bytes, scan } => match scan {
+                scan::Ascii => true,
+                st if scan::is_known_non_ascii(st) => false,
+
+                // Undecided envelope: probe without narrowing — the byte cannot move through `&self`, and a shared
+                // backing slot for views arrives with the verbs stage.
+                _ => {
+                    count_probe_byte();
+                    bytes.iter().all(u8::is_ascii)
+                }
+            },
             RawParts::Heap(cb) => match cb.scan() {
                 scan::Ascii => true,
                 scan::Utf8Latin1 | scan::Utf8NonLatin1 | scan::Utf8NonAscii | scan::MalformedUtf8 | scan::NonAscii | scan::ExtendedUtf8 => false,
@@ -2288,6 +2418,7 @@ impl PString {
             RawParts::Packed(_) => scan::Ascii,
             RawParts::Heap(cb) => cb.scan(),
             RawParts::Borrowed { scan, .. } => scan.widen(),
+            RawParts::View { scan, .. } => scan,
         }
     }
 
@@ -2301,6 +2432,49 @@ impl PString {
             // Bitwise clones do share the image, but with the owner that outlives them all (§2.2.3), not with each
             // other in any sense `unshare` could dissolve: copying frees nothing that would otherwise be freed.
             RawParts::Borrowed { .. } => false,
+
+            // Sharing the backing is a view's purpose: even a sole handle pins bytes it does not own, which is exactly
+            // what `unshare` exists to dissolve.
+            RawParts::View { .. } => true,
+        }
+    }
+
+    /// A whole-object view of an adopted backing (§2.2.15): `SPAN` in both fields, the struct's shared slot as the
+    /// birth state.  Takes ownership of one reference the caller holds on `adopted` — the one `mint` returns with.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn adopted_whole(adopted: std::ptr::NonNull<cow_buffer::Adopted>, utf8: bool, tainted: bool) -> PString {
+        // SAFETY: the caller's reference keeps the struct live for this read and transfers into the envelope below.
+        let (scan, ptr) = unsafe { (adopted.as_ref().scan(), Owned::from_raw(adopted.cast())) };
+        PString::build_view(false, utf8, tainted, ptr, to_u24(SPAN as usize), to_u24(SPAN as usize), scan)
+    }
+
+    /// A zero-copy sub-view of this value where the representation admits one (§2.2.15): the Heap32 tier — the tier
+    /// whose release is header-described — birthing the native form.  `None` where the storage has no native view form,
+    /// the range escapes the value, or a field would overflow `u24`: every fallback (smaller and larger tiers through
+    /// `Adopted`, re-slicing views, the copy forms and floors) is the verbs stage's, which owns the policy-free
+    /// `slice`/`substr` surface.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn view_range(&self, offset: usize, len: usize) -> Option<PString> {
+        let (utf8, tainted) = (self.is_utf8(), self.is_tainted());
+        match self.raw_parts() {
+            RawParts::Heap(cb) if cb.tier() == Tier::Heap32 => {
+                let bytes = cb.as_slice();
+                if offset.checked_add(len)? > bytes.len() || offset >= SPAN as usize || len >= SPAN as usize {
+                    return None;
+                }
+
+                let scan = view_birth_state(cb.scan(), bytes, offset, len);
+
+                // SAFETY: `cb` proves a live Heap32 allocation; the envelope built below owns the reference this retain
+                // adds and releases it under the same tier in Drop.
+                let ptr = unsafe {
+                    cow_buffer::heap32::retain(cb.raw());
+                    Owned::from_raw(cb.raw())
+                };
+
+                Some(PString::build_view(true, utf8, tainted, ptr, to_u24(offset), to_u24(len), scan))
+            }
+            _ => None,
         }
     }
 
@@ -2313,6 +2487,10 @@ impl PString {
     pub fn unshare(&mut self) -> Result<(), AllocError> {
         let parts = match self.raw_parts() {
             RawParts::Heap(view) if !view.is_unique() => heap_parts_transitioned(view.as_slice(), view.scan(), view.char_count())?,
+
+            // A view carries no count of its own (§2.2.15): zero is the unfilled sentinel, and classification rides the
+            // copy as it does for the shared-heap arm above.
+            RawParts::View { bytes, scan } => heap_parts_transitioned(bytes, scan, 0)?,
             RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Borrowed { .. } => return Ok(()),
         };
         *self = PString::build_heap(self.is_utf8(), self.is_tainted(), parts);
@@ -2326,6 +2504,13 @@ impl PString {
             RawParts::Inline { .. } => !matches!(self.inline_class(), Some(InlineClass::Bytes)),
             RawParts::Packed(_) => true, // ASCII is valid under every reading.
             RawParts::Borrowed { scan, .. } => scan::is_perl_decodable(scan.widen()),
+            RawParts::View { bytes, scan } => match scan {
+                st if scan::is_perl_decodable(st) => true,
+                scan::MalformedUtf8 => false,
+
+                // Undecided envelope: classify and answer; narrowing waits for the verbs stage's shared slot.
+                _ => scan::is_perl_decodable(classify_full(bytes).0.widen()),
+            },
             RawParts::Heap(cb) => match cb.scan() {
                 st if scan::is_perl_decodable(st) => true,
                 scan::MalformedUtf8 => false,
@@ -2365,6 +2550,17 @@ impl PString {
                     InlineClass::NonLatin1 | InlineClass::Extended => Some(if full { classify_full(&buf[..stored]).1 } else { inline_aux(buf) }),
                 }
             }
+
+            // A view carries no count (§2.2.15): the envelope answers where it can, and the rest derives on demand.
+            RawParts::View { bytes, scan } => match scan {
+                _ if bytes.is_empty() => Some(0),
+                scan::Ascii => Some(bytes.len()),
+                scan::MalformedUtf8 => None,
+                _ => {
+                    let (st, chars) = classify_full(bytes);
+                    if st.widen() == scan::MalformedUtf8 { None } else { Some(chars) }
+                }
+            },
 
             // Settled at construction: the count is always true, and only the malformed terminal has none.
             RawParts::Borrowed { count, scan, .. } => {
@@ -2513,7 +2709,7 @@ impl PString {
 
                 Ok(Some(s))
             }
-            RawParts::Borrowed { bytes, .. } => {
+            RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => {
                 // The image is readonly, so the downgrade is a copy-out by nature: walk it like heap content.
                 let Some(out) = cow_buffer::downgraded_bytes(bytes)? else {
                     return Ok(None); // A character past U+00FF, or no character at all.
@@ -2609,6 +2805,7 @@ impl PString {
             RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PString::build_static(u2, t2, ptr, len, count, scan),
             RawOwned::BorrowedLarge { form: BorrowedForm::Immortal, head } => PString::build_large_immortal(u2, t2, head),
             RawOwned::BorrowedLarge { form: BorrowedForm::Static, head } => PString::build_large_static(u2, t2, head),
+            RawOwned::View { ptr, native, offset, len, scan } => PString::build_view(native, u2, t2, ptr, offset, len, scan),
         };
     }
 
@@ -2766,6 +2963,45 @@ impl PString {
                 let state = append_transition_heap(head.scan.widen(), kind);
                 PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
             }
+            RawOwned::View { mut ptr, native, offset, len, scan } => {
+                // Copy-out on write (§2.2.15): a view is a read-only carrier, so an append is a rebuild seeded by the
+                // envelope's state — the images' path, plus a reference to surrender.
+                // SAFETY: the transport owns one reference on the live backing, released below after the copy.
+                let old_bytes = unsafe {
+                    if native {
+                        std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u24(offset)), u24(len))
+                    } else {
+                        let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
+                        let (off, n) = if u24(offset) == SPAN as usize && u24(len) == SPAN as usize { (0, a.total_len()) } else { (u24(offset), u24(len)) };
+                        &a.as_slice()[off..off + n]
+                    }
+                };
+
+                let new_len = old_bytes.len() + bytes.len();
+                let mut joined = Vec::new();
+                let reserved = joined.try_reserve_exact(new_len);
+                if reserved.is_ok() {
+                    joined.extend_from_slice(old_bytes);
+                    joined.extend_from_slice(bytes);
+                }
+
+                // The reference is surrendered on every path: the copy above is complete or abandoned.
+                // SAFETY: the transport's one reference, consumed exactly once.
+                unsafe {
+                    if native {
+                        cow_buffer::heap32::release(ptr.claim());
+                    } else {
+                        cow_buffer::Adopted::release(ptr.claim().cast());
+                    }
+                }
+
+                if reserved.is_err() {
+                    return Err(AllocError { requested: new_len });
+                }
+
+                let state = append_transition_heap(scan, kind);
+                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+            }
             RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
                 // Reached only past the in-place fast path — shared, or over capacity — so the buffer is rebuilt:
                 // growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what `HeapParts::from_slice`
@@ -2875,6 +3111,14 @@ fn u24_get(bytes: &[u8; 3]) -> usize {
 }
 
 enum RawParts<'a> {
+    /// A view's bytes (§2.2.15), resolved by `raw_parts` itself — offset applied, `SPAN` decoded — so every consumer
+    /// reads one shape.  The scan is the envelope's per-handle byte, born from the slice-birth table and possibly
+    /// non-terminal; views carry no character count, deriving on demand (§2.2.15).
+    View {
+        bytes: &'a [u8],
+        scan: scan::ScanState,
+    },
+
     Inline {
         class: InlineClass,
         full: bool,
@@ -2915,6 +3159,17 @@ enum RawOwned {
         count: usize,
         scan: scan::ScanState,
         tier: Tier,
+    },
+
+    /// A view's owned backing reference in flight (§2.2.15): `native` says which release it owes — the word tier's or
+    /// the `Adopted` struct's — and the envelope fields ride unchanged, because a tag transition preserves the view
+    /// while a content transition must materialize away from it first.
+    View {
+        ptr: Owned,
+        native: bool,
+        offset: [u8; 3],
+        len: [u8; 3],
+        scan: scan::ScanState,
     },
 
     /// An immortal image's envelope fields: nothing is owned, so nothing transfers but the facts.
@@ -2979,8 +3234,8 @@ fn append_transition_heap(prior: scan::ScanState, kind: AppendKind) -> scan::Sca
 
             // The ambiguous twins (§2.2.4): appended Latin-1-class content supplies exactly the witness
             // `MaybeUtf8Latin1` lacks, completing it; NonLatin1-class content proves the stronger terminal outright.
-            // `MaybeExtendedUtf8` stays — appended Rust-valid content resolves nothing about the extended code
-            // points that may already be present.
+            // `MaybeExtendedUtf8` stays — appended Rust-valid content resolves nothing about the extended code points
+            // that may already be present.
             ScanState::MaybeUtf8Latin1 if class == ValidRange::NonLatin1 => ScanState::Utf8NonLatin1,
             ScanState::MaybeUtf8Latin1 => ScanState::Utf8Latin1,
             ScanState::MaybeExtendedUtf8 => ScanState::MaybeExtendedUtf8,
@@ -4165,6 +4420,68 @@ impl Packed {
 
         len.cmp(&other.len())
     }
+}
+
+// ─── View births (§2.2.15) ───────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether the cut at `offset..offset + len` of `parent` splits no sequence: two O(1) continuation-byte tests, valid
+/// for the perl-extended forms too, since every continuation byte is `0x80..=0xBF` under both readings (§2.2.3).  The
+/// empty view and the whole-object cut are clean by construction.
+#[cfg_attr(not(test), allow(dead_code))]
+fn cut_is_clean(parent: &[u8], offset: usize, len: usize) -> bool {
+    let start_clean = offset == 0 || offset >= parent.len() || (parent[offset] & 0xC0) != 0x80;
+    let end = offset + len;
+    let end_clean = end >= parent.len() || (parent[end] & 0xC0) != 0x80;
+    start_clean && end_clean
+}
+
+/// The slice-birth state (§2.2.3): nothing is scanned, so the birth state is what clean cuts provably preserve —
+/// witnesses may be excluded by the cut, range and validity bounds survive — and a dirty cut of any validity-asserting
+/// source is *proven* malformed by the cut, terminal and free.
+#[cfg_attr(not(test), allow(dead_code))]
+fn slice_birth(parent: scan::ScanState, clean: bool) -> scan::ScanState {
+    use scan::ScanState::*;
+
+    if !clean {
+        return match parent {
+            // A dirty cut through content these states certify decodable severs a sequence: the view provably holds an
+            // incomplete form.
+            Utf8Latin1 | MaybeUtf8Latin1 | Utf8NonLatin1 | Utf8NonAscii | ValidUtf8 | ExtendedUtf8 | MaybeExtendedUtf8 | PerlValidNonAscii => MalformedUtf8,
+
+            // Ascii cannot cut dirty (no continuation bytes exist to split); the rest asserted no validity for the cut
+            // to disprove.
+            Ascii => Ascii,
+            Unknown | NonAscii | MalformedUtf8 => Unknown,
+        };
+    }
+
+    match parent {
+        Unknown => Unknown,
+        Ascii => Ascii,
+        Utf8Latin1 | MaybeUtf8Latin1 => MaybeUtf8Latin1,
+        Utf8NonLatin1 | Utf8NonAscii | ValidUtf8 => ValidUtf8,
+        ExtendedUtf8 | MaybeExtendedUtf8 | PerlValidNonAscii => MaybeExtendedUtf8,
+
+        // The witness may be excluded; nothing else was asserted.
+        MalformedUtf8 | NonAscii => Unknown,
+    }
+}
+
+/// The slice-eager floor (§2.2.3, 4 KiB [DECISION]): below it a view classifies at birth — one cheap pass beats a scan
+/// per descendant, since view envelopes cannot propagate narrowing.
+#[cfg_attr(not(test), allow(dead_code))]
+const SLICE_EAGER_FLOOR: usize = 4 * 1024;
+
+/// The birth state a view of `parent_bytes[offset..offset + len]` carries in its envelope: the table's answer, improved
+/// to a full classification below the eager floor.
+#[cfg_attr(not(test), allow(dead_code))]
+fn view_birth_state(parent: scan::ScanState, parent_bytes: &[u8], offset: usize, len: usize) -> scan::ScanState {
+    let table = slice_birth(parent, cut_is_clean(parent_bytes, offset, len));
+    if len < SLICE_EAGER_FLOOR && !matches!(table, scan::Ascii | scan::MalformedUtf8) {
+        return classify_full(&parent_bytes[offset..offset + len]).0.widen();
+    }
+
+    table
 }
 
 // ─── Display (§2.7.8) ────────────────────────────────────────────────────────────────────────────────────────────────

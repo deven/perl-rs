@@ -5163,3 +5163,174 @@ fn debug_shows_the_envelope_for_resident_tiers_and_omits_it_for_pointers() {
     assert!(heap.contains("string: \"xxx"), "{heap}");
     assert!(!heap.contains("bytes:"), "pointer tiers omit the envelope field: {heap}");
 }
+
+// ── Views (§2.2.15, Stage 2) ──────────────────────────────────
+/// A Heap32 parent: past the Heap16 band, mixed content unless stated.
+fn heap32_parent(len: usize) -> PString {
+    let mut v = vec![b'a'; len];
+    v[len / 2] = 0xC3;
+    v[len / 2 + 1] = 0xA9;
+    let s = PString::from_bytes(v).unwrap();
+    assert_eq!(s.storage_type(), StorageType::Heap32, "the fixture must land in the native view tier");
+    s
+}
+
+#[test]
+fn a_native_view_reads_the_subrange_without_copying() {
+    let parent = heap32_parent(100_000);
+    let mut scratch_a = [0u8; DECODE_MAX];
+    let mut scratch_b = [0u8; DECODE_MAX];
+
+    let view = parent.view_range(10, 50_000).unwrap();
+    assert_eq!(view.storage_type(), StorageType::Slice);
+    assert_eq!(view.len(), 50_000);
+    assert_eq!(view.as_bytes(&mut scratch_a), &parent.as_bytes(&mut scratch_b)[10..50_010]);
+
+    // The view is the same value as the copy, under the same flag.
+    let copy = PString::from_bytes(&parent.as_bytes(&mut scratch_b)[10..50_010]).unwrap();
+    assert_eq!(view, copy);
+}
+
+#[test]
+fn a_native_view_keeps_the_buffer_alive_past_the_parent() {
+    let view = {
+        let parent = heap32_parent(70_000);
+        parent.view_range(0, 65_000).unwrap()
+    };
+
+    // The parent handle is gone; the view's retain holds the allocation.
+    let mut scratch = [0u8; DECODE_MAX];
+    assert_eq!(view.as_bytes(&mut scratch)[0], b'a');
+    assert_eq!(view.len(), 65_000);
+}
+
+#[test]
+fn view_clones_retain_and_release_in_balance() {
+    let parent = heap32_parent(70_000);
+    let view = parent.view_range(5, 60_000).unwrap();
+    let (a, b) = (view.clone(), view.clone());
+    assert_eq!(a, b);
+    drop(view);
+    drop(a);
+
+    let mut scratch = [0u8; DECODE_MAX];
+    assert_eq!(b.as_bytes(&mut scratch).len(), 60_000);
+}
+
+#[test]
+fn an_adopted_whole_view_reads_through_span() {
+    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"the adopted content"[..]);
+    let a = cow_buffer::Adopted::adopt_arc_bytes(arc.clone(), scan::Ascii).unwrap();
+    let view = PString::adopted_whole(a, false, false);
+
+    assert_eq!(view.storage_type(), StorageType::Adopted);
+    assert_eq!(view.len(), 19);
+
+    let mut scratch = [0u8; DECODE_MAX];
+    assert_eq!(view.as_bytes(&mut scratch), b"the adopted content");
+    assert!(view.is_ascii());
+
+    let clone = view.clone();
+
+    drop(view);
+    assert_eq!(std::sync::Arc::strong_count(&arc), 2, "the Adopted struct still shares the Arc");
+
+    drop(clone);
+    assert_eq!(std::sync::Arc::strong_count(&arc), 1, "the last view released the struct, which released the Arc");
+}
+
+#[test]
+fn tag_transitions_preserve_the_view() {
+    let parent = heap32_parent(70_000);
+    let mut view = parent.view_range(0, 60_000).unwrap();
+
+    view.taint();
+    assert_eq!(view.storage_type(), StorageType::Slice, "taint is a tag transition, not a copy");
+    assert!(view.is_tainted());
+
+    view.untaint_for_sanctioned_path();
+    assert_eq!(view.storage_type(), StorageType::Slice);
+    assert!(!view.is_tainted());
+}
+
+#[test]
+fn appending_to_a_view_materializes_away_from_it() {
+    let parent = heap32_parent(70_000);
+    let mut view = parent.view_range(0, 100).unwrap();
+
+    view.push_bytes(b"!tail").unwrap();
+    assert_ne!(view.storage_type(), StorageType::Slice, "a view is a read-only carrier");
+    assert_eq!(view.len(), 105);
+
+    let mut scratch = [0u8; DECODE_MAX];
+    assert_eq!(&view.as_bytes(&mut scratch)[100..], b"!tail");
+}
+
+#[test]
+fn unshare_dissolves_the_pin() {
+    let parent = heap32_parent(70_000);
+    let mut view = parent.view_range(3, 200).unwrap();
+    assert!(view.is_shared(), "a view shares its backing by construction");
+
+    view.unshare().unwrap();
+    assert!(!matches!(view.storage_type(), StorageType::Slice | StorageType::Adopted));
+    assert_eq!(view.len(), 200);
+}
+
+#[test]
+fn the_birth_table_is_the_ruled_mapping() {
+    use scan::ScanState::*;
+    let clean: [(scan::ScanState, scan::ScanState); 11] = [
+        (Unknown, Unknown),
+        (Ascii, Ascii),
+        (Utf8Latin1, MaybeUtf8Latin1),
+        (MaybeUtf8Latin1, MaybeUtf8Latin1),
+        (Utf8NonLatin1, ValidUtf8),
+        (Utf8NonAscii, ValidUtf8),
+        (ValidUtf8, ValidUtf8),
+        (ExtendedUtf8, MaybeExtendedUtf8),
+        (MaybeExtendedUtf8, MaybeExtendedUtf8),
+        (PerlValidNonAscii, MaybeExtendedUtf8),
+        (MalformedUtf8, Unknown),
+    ];
+    for (parent, born) in clean {
+        assert_eq!(slice_birth(parent, true), born, "clean cut of {parent:?}");
+    }
+
+    assert_eq!(slice_birth(NonAscii, true), Unknown);
+
+    // A dirty cut of any validity-asserting source is proven malformed by the cut, terminal and free.
+    for parent in [Utf8Latin1, MaybeUtf8Latin1, Utf8NonLatin1, Utf8NonAscii, ValidUtf8, ExtendedUtf8, MaybeExtendedUtf8, PerlValidNonAscii] {
+        assert_eq!(slice_birth(parent, false), MalformedUtf8, "dirty cut of {parent:?}");
+    }
+
+    for parent in [Unknown, NonAscii, MalformedUtf8] {
+        assert_eq!(slice_birth(parent, false), Unknown, "dirty cut of {parent:?} asserted nothing to disprove");
+    }
+}
+
+#[test]
+fn cut_cleanliness_is_the_two_boundary_tests() {
+    let bytes = b"ab\xC3\xA9cd";
+    assert!(cut_is_clean(bytes, 0, 2));
+    assert!(cut_is_clean(bytes, 2, 2), "the whole sequence is clean on both edges");
+    assert!(!cut_is_clean(bytes, 3, 2), "starting on a continuation byte is dirty");
+    assert!(!cut_is_clean(bytes, 0, 3), "ending mid-sequence is dirty");
+    assert!(cut_is_clean(bytes, 0, 6), "the whole object is clean");
+    assert!(cut_is_clean(bytes, 6, 0), "the empty tail is clean");
+}
+
+#[test]
+fn a_dirty_cut_births_proven_malformed_and_a_small_clean_cut_classifies_eagerly() {
+    // Above the eager floor, the table's word stands: a dirty cut of a valid parent is malformed with no scan.
+    let parent = heap32_parent(70_000);
+    let dirty = parent.view_range(35_001, 5_000).unwrap();
+    assert_eq!(dirty.scan_state(), scan::MalformedUtf8);
+    assert_eq!(dirty.char_len(), None);
+
+    // Below the floor, birth classifies: a pure-ASCII subrange of a non-ASCII parent is born Ascii, tighter than the
+    // table's answer.
+    let small = parent.view_range(0, 100).unwrap();
+    assert_eq!(small.scan_state(), scan::Ascii);
+    assert!(small.is_ascii());
+}
