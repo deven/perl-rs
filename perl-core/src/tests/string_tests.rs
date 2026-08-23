@@ -1618,19 +1618,19 @@ fn interpretation_agrees_across_storage_forms() {
 }
 
 #[test]
-fn debug_shows_the_representation_with_readable_bytes() {
+fn debug_shows_the_representation_with_readable_content() {
     let packed: PString = "2026-07-28T14:33:07Z".parse().unwrap();
     let shown = format!("{packed:?}");
     assert!(shown.contains("storage: Packed"), "the tier is the first thing a developer wants: {shown}");
-    assert!(shown.contains(r#"bytes: b"2026-07-28T14:33:07Z""#), "byte-string syntax, not integers: {shown}");
+    assert!(shown.contains(r#"string: "2026-07-28T14:33:07Z""#), "the content, losslessly rendered: {shown}");
 
     // Bytes that are not text render escaped rather than lossily, since a perl string's content need not be UTF-8.
     let raw = PString::from_bytes([0xFF, 0xFE, b'h', b'i']).unwrap();
-    assert!(format!("{raw:?}").contains(r#"b"\xFF\xFEhi""#));
+    assert!(format!("{raw:?}").contains(r#"string: b"\x{ff}\x{fe}hi""#));
 
     // The usual escapes, so a newline does not break the line.
     let escaped: PString = "a\tb\nc".parse().unwrap();
-    assert!(format!("{escaped:?}").contains(r#"b"a\tb\nc""#));
+    assert!(format!("{escaped:?}").contains(r#"string: "a\tb\nc""#));
 }
 
 #[test]
@@ -4769,54 +4769,54 @@ fn well_formed_content_reports_nothing_and_still_carries_its_facts() {
     assert_eq!(facts.chars, 1);
 }
 
+/// Deterministic splitmix64, so a failure names its input and reproduces exactly.
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Encode `v` in its minimal perl-extended form — the exact inverse of `decode_one`, which rejects non-minimal forms,
+/// so every decoded value re-encodes to the bytes it came from.
+fn encode_extended(v: u64, out: &mut Vec<u8>) {
+    let len: usize = match v {
+        0..=0x7F => 1,
+        0x80..=0x7FF => 2,
+        0x800..=0xFFFF => 3,
+        0x1_0000..=0x1F_FFFF => 4,
+        0x20_0000..=0x3FF_FFFF => 5,
+        0x400_0000..=0x7FFF_FFFF => 6,
+        0x8000_0000..=0xF_FFFF_FFFF => 7,
+        _ => 13,
+    };
+    if len == 1 {
+        out.push(v as u8);
+        return;
+    }
+
+    let cont = len - 1;
+    out.push(match len {
+        2 => 0xC0 | (v >> 6) as u8,
+        3 => 0xE0 | (v >> 12) as u8,
+        4 => 0xF0 | (v >> 18) as u8,
+        5 => 0xF8 | (v >> 24) as u8,
+        6 => 0xFC | (v >> 30) as u8,
+        7 => 0xFE,
+        _ => 0xFF,
+    });
+    for k in (0..cont).rev() {
+        // The FF form's twelve continuations span 72 bits; every accepted value fits u64, so the groups above bit 63
+        // are zero and must not be reached by a real shift.
+        let group = if 6 * k < 64 { (v >> (6 * k)) & 0x3F } else { 0 };
+        out.push(0x80 | group as u8);
+    }
+}
+
 #[test]
 fn random_content_round_trips_through_the_reporting_decoder() {
     use std::cell::RefCell;
-
-    /// Deterministic splitmix64, so a failure names its input and reproduces exactly.
-    fn next(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Encode `v` in its minimal perl-extended form — the exact inverse of `decode_one`, which rejects non-minimal
-    /// forms, so every decoded value re-encodes to the bytes it came from.
-    fn encode_extended(v: u64, out: &mut Vec<u8>) {
-        let len: usize = match v {
-            0..=0x7F => 1,
-            0x80..=0x7FF => 2,
-            0x800..=0xFFFF => 3,
-            0x1_0000..=0x1F_FFFF => 4,
-            0x20_0000..=0x3FF_FFFF => 5,
-            0x400_0000..=0x7FFF_FFFF => 6,
-            0x8000_0000..=0xF_FFFF_FFFF => 7,
-            _ => 13,
-        };
-        if len == 1 {
-            out.push(v as u8);
-            return;
-        }
-
-        let cont = len - 1;
-        out.push(match len {
-            2 => 0xC0 | (v >> 6) as u8,
-            3 => 0xE0 | (v >> 12) as u8,
-            4 => 0xF0 | (v >> 18) as u8,
-            5 => 0xF8 | (v >> 24) as u8,
-            6 => 0xFC | (v >> 30) as u8,
-            7 => 0xFE,
-            _ => 0xFF,
-        });
-        for k in (0..cont).rev() {
-            // The FF form's twelve continuations span 72 bits; every accepted value fits u64, so the groups above bit
-            // 63 are zero and must not be reached by a real shift.
-            let group = if 6 * k < 64 { (v >> (6 * k)) & 0x3F } else { 0 };
-            out.push(0x80 | group as u8);
-        }
-    }
 
     enum Ev {
         Point(u64),
@@ -4829,45 +4829,45 @@ fn random_content_round_trips_through_the_reporting_decoder() {
         // from every form length (surrogates and supra-Unicode included — well formed under perl), raw bytes, stray
         // continuations, truncated sequences, overlong leads, and an FF form past IV_MAX.
         let mut bytes = Vec::new();
-        for _ in 0..=(next(&mut seed) % 8) {
-            match next(&mut seed) % 8 {
+        for _ in 0..=(splitmix(&mut seed) % 8) {
+            match splitmix(&mut seed) % 8 {
                 0 => {
-                    for _ in 0..(next(&mut seed) % 6) {
-                        bytes.push((next(&mut seed) % 0x80) as u8);
+                    for _ in 0..(splitmix(&mut seed) % 6) {
+                        bytes.push((splitmix(&mut seed) % 0x80) as u8);
                     }
                 }
                 1 | 2 => {
-                    let v = match next(&mut seed) % 8 {
-                        0 => next(&mut seed) % 0x80,
-                        1 => 0x80 + next(&mut seed) % 0x780,
-                        2 => 0x800 + next(&mut seed) % 0xF800,
-                        3 => 0x1_0000 + next(&mut seed) % 0x1F_0000,
-                        4 => 0xD800 + next(&mut seed) % 0x800,
-                        5 => 0x20_0000 + next(&mut seed) % 0x100_0000,
-                        6 => 0x8000_0000 + next(&mut seed) % 0x1_0000_0000,
-                        _ => 0x10_0000_0000 + next(&mut seed) % 0x1000_0000_0000,
+                    let v = match splitmix(&mut seed) % 8 {
+                        0 => splitmix(&mut seed) % 0x80,
+                        1 => 0x80 + splitmix(&mut seed) % 0x780,
+                        2 => 0x800 + splitmix(&mut seed) % 0xF800,
+                        3 => 0x1_0000 + splitmix(&mut seed) % 0x1F_0000,
+                        4 => 0xD800 + splitmix(&mut seed) % 0x800,
+                        5 => 0x20_0000 + splitmix(&mut seed) % 0x100_0000,
+                        6 => 0x8000_0000 + splitmix(&mut seed) % 0x1_0000_0000,
+                        _ => 0x10_0000_0000 + splitmix(&mut seed) % 0x1000_0000_0000,
                     };
                     encode_extended(v, &mut bytes);
                 }
                 3 => {
-                    for _ in 0..=(next(&mut seed) % 4) {
-                        bytes.push((next(&mut seed) & 0xFF) as u8);
+                    for _ in 0..=(splitmix(&mut seed) % 4) {
+                        bytes.push((splitmix(&mut seed) & 0xFF) as u8);
                     }
                 }
                 4 => {
-                    for _ in 0..=(next(&mut seed) % 4) {
-                        bytes.push(0x80 | (next(&mut seed) % 0x40) as u8);
+                    for _ in 0..=(splitmix(&mut seed) % 4) {
+                        bytes.push(0x80 | (splitmix(&mut seed) % 0x40) as u8);
                     }
                 }
                 5 => {
                     let mut t = Vec::new();
-                    encode_extended(0x800 + next(&mut seed) % 0xF800, &mut t);
-                    t.truncate(1 + (next(&mut seed) as usize % (t.len() - 1)));
+                    encode_extended(0x800 + splitmix(&mut seed) % 0xF800, &mut t);
+                    t.truncate(1 + (splitmix(&mut seed) as usize % (t.len() - 1)));
                     bytes.extend_from_slice(&t);
                 }
                 6 => {
-                    bytes.push(if next(&mut seed).is_multiple_of(2) { 0xC0 } else { 0xC1 });
-                    bytes.push(0x80 | (next(&mut seed) % 0x40) as u8);
+                    bytes.push(if splitmix(&mut seed).is_multiple_of(2) { 0xC0 } else { 0xC1 });
+                    bytes.push(0x80 | (splitmix(&mut seed) % 0x40) as u8);
                 }
                 _ => {
                     bytes.push(0xFF);
@@ -5030,4 +5030,136 @@ fn precision_cuts_flagged_valid_content_on_character_boundaries() {
     assert_eq!(format!("{:.1}", s), "a");
     assert_eq!(format!("{:.2}", s), "aé");
     assert_eq!(format!("{:.3}", s), "aé中");
+}
+
+// ── Debug (§2.7.8) ────────────────────────────────────────────
+#[test]
+fn content_debug_renders_the_ruled_escape_format() {
+    // Two digits is always a raw byte, four or more is always a code point, and the string kind is the quote prefix:
+    // bare quotes are UTF-8 assumed, b-prefixed is a byte string.
+    let table: [(&[u8], bool, &str); 17] = [
+        (b"h\xC3\xA9llo", false, r#"b"h\x{c3}\x{a9}llo""#),
+        (b"h\xC3\xA9llo", true, "\"h\u{e9}llo\""),
+        (&[0xF4, 0x90, 0x80, 0x80], true, r#""\x{110000}""#),
+        (&[0xED, 0xA0, 0x80], true, r#""\x{d800}""#),
+        (&[0xC2, 0x80], true, r#""\x{0080}""#),
+        (&[0x80], true, r#""\x{80}""#),
+        (&[0xE4, 0xB8], true, r#""\x{e4}\x{b8}""#),
+        (&[0xC2, 0x80, 0x80], true, r#""\x{0080}\x{80}""#),
+        (&[0x07], true, r#""\x{07}""#),
+        (&[0x07], false, r#""\x{07}""#),
+        (b"a\"b\\c", true, r#""a\"b\\c""#),
+        (b"a\nb\tc\r", false, r#""a\nb\tc\r""#),
+        (b"hi", true, r#""hi""#),
+        (&[0xC2, 0x85], true, r#""\x{0085}""#),
+        (&[0x85], true, r#""\x{85}""#),
+        (b"\xF0\x9F\x98\x80", true, "\"\u{1F600}\""),
+        (&[0xFF, 0x80, 0x87, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF], true, r#""\x{7fffffffffffffff}""#),
+    ];
+    for (bytes, utf8, expected) in table {
+        let mut s = PString::from_bytes(bytes).unwrap();
+        if utf8 {
+            s.set_utf8_for_test();
+        }
+
+        assert_eq!(format!("{:?}", ContentDebug(&s)), expected, "for {bytes:02X?} utf8={utf8}");
+    }
+}
+
+/// Invert the content rendering back to (flag evidence, bytes) — the mechanical parser the format promises.  The
+/// evidence is `None` exactly for pure-ASCII `"…"` content, where the rendering deliberately serves both flags and the
+/// struct's `utf8:` field completes the identity.
+fn parse_content_debug(text: &str) -> (Option<bool>, Vec<u8>) {
+    let (mut utf8, body) = match text.strip_prefix("b\"") {
+        Some(rest) => (Some(false), rest),
+        None => (None, text.strip_prefix('\"').unwrap()),
+    };
+    let body = body.strip_suffix('\"').unwrap();
+
+    let mut out = Vec::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            if u32::from(c) >= 0x80 {
+                utf8 = Some(true);
+            }
+
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+
+        match chars.next().unwrap() {
+            'n' => out.push(b'\n'),
+            'r' => out.push(b'\r'),
+            't' => out.push(b'\t'),
+            '\"' => out.push(b'\"'),
+            '\\' => out.push(b'\\'),
+            'x' => {
+                assert_eq!(chars.next(), Some('{'));
+                let digits: String = chars.by_ref().take_while(|&d| d != '}').collect();
+                match digits.len() {
+                    2 => {
+                        let b = u8::from_str_radix(&digits, 16).unwrap();
+                        if b >= 0x80 && utf8.is_none() {
+                            // Inside "…" a two-digit escape at 0x80 or above can only be a rejected byte.
+                            utf8 = Some(true);
+                        }
+
+                        out.push(b);
+                    }
+                    n if n >= 4 => {
+                        utf8 = Some(true);
+                        encode_extended(u64::from_str_radix(&digits, 16).unwrap(), &mut out);
+                    }
+                    n => panic!("a {n}-digit escape is never emitted: {digits}"),
+                }
+            }
+            other => panic!("unknown escape \\{other}"),
+        }
+    }
+
+    (utf8, out)
+}
+
+#[test]
+fn content_debug_round_trips_arbitrary_flag_and_bytes() {
+    // Losslessness, mechanically: parse the rendering back and require the exact (flag, bytes) identity.  Malformed
+    // content round-trips because rejected bytes are spelled as bytes, and decoded code points invert uniquely because
+    // the decoder admits only minimal forms.
+    let mut seed = 0xDEB0_65C4_9E5Fu64;
+    for iteration in 0..1500u32 {
+        let n = (splitmix(&mut seed) % 24) as usize;
+        let bytes: Vec<u8> = (0..n).map(|_| (splitmix(&mut seed) & 0xFF) as u8).collect();
+        let utf8 = splitmix(&mut seed).is_multiple_of(2);
+
+        let mut s = PString::from_bytes(&bytes).unwrap();
+        if utf8 {
+            s.set_utf8_for_test();
+        }
+
+        let rendered = format!("{:?}", ContentDebug(&s));
+        let (evidence, back) = parse_content_debug(&rendered);
+
+        assert_eq!(back, bytes, "[{iteration}] via {rendered}");
+        match evidence {
+            Some(flag) => assert_eq!(flag, utf8, "[{iteration}] via {rendered}"),
+            None => assert!(bytes.iter().all(u8::is_ascii), "[{iteration}] ambiguity is reserved for pure ASCII: {rendered}"),
+        }
+    }
+}
+
+#[test]
+fn debug_shows_the_envelope_for_resident_tiers_and_omits_it_for_pointers() {
+    let inline = format!("{:?}", PString::from_bytes(b"h\xC3\xA9llo").unwrap());
+    assert!(inline.contains("string: b\"h\\x{c3}\\x{a9}llo\""), "{inline}");
+    assert!(inline.contains("bytes: 68 e9 6c 6c 6f 00"), "the envelope hex shows physical storage: {inline}");
+
+    let packed = format!("{:?}", PString::from_bytes(b"2026-08-22T17:49:00").unwrap());
+    assert!(packed.contains("storage: Packed"), "{packed}");
+    assert!(packed.contains("bytes: "), "{packed}");
+
+    let heap = format!("{:?}", PString::from_bytes([b'x'; 40]).unwrap());
+    assert!(heap.contains("string: \"xxx"), "{heap}");
+    assert!(!heap.contains("bytes:"), "pointer tiers omit the envelope field: {heap}");
 }

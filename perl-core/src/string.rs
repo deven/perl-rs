@@ -3644,23 +3644,69 @@ impl PString {
     }
 }
 
-/// Byte-string syntax for the content: printable ASCII as itself, everything else escaped.  `Debug` for a byte slice
-/// renders integers, which makes a timestamp thirty numbers; a perl string's bytes are frequently not UTF-8, so lossy
-/// text would misrepresent them instead.
-struct ByteLiteral<'a>(&'a [u8]);
+/// The `string:` field of `PString`'s `Debug`: the lossless content rendering (§2.7.8).  The `b"…"` byte-string form
+/// appears only for an unflagged string holding at least one high byte; pure-ASCII content renders as `"…"` whatever
+/// the flag, and flagged strings render as `"…"` with UTF-8 assumed.  Printables verbatim, `\n`/`\t`/`\r` short forms,
+/// self-escaping backslash and quote.  Escapes divide by width: a seven-bit character takes exactly two lowercase hex
+/// digits in every string kind (one byte being one code point below `U+0080`), a code point at `U+0080` or above takes
+/// at least four zero-padded to four, each rejected byte takes exactly two, and three are never emitted — so inside
+/// `"…"` a two-digit escape at `0x80` or above can only be a rejected byte.  Nothing here allocates.
+struct ContentDebug<'a>(&'a PString);
 
-impl fmt::Debug for ByteLiteral<'_> {
+impl fmt::Debug for ContentDebug<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("b\"")?;
-        for &b in self.0 {
-            match b {
-                b'"' => f.write_str("\\\"")?,
-                b'\\' => f.write_str("\\\\")?,
-                b'\n' => f.write_str("\\n")?,
-                b'\r' => f.write_str("\\r")?,
-                b'\t' => f.write_str("\\t")?,
-                0x20..=0x7E => f.write_char(b as char)?,
-                _ => write!(f, "\\x{b:02X}")?,
+        let mut scratch = [0u8; DECODE_MAX];
+        let bytes = self.0.as_bytes(&mut scratch);
+        if !self.0.is_utf8() {
+            // The byte-string prefix only where it says something: pure-ASCII content renders as "…" whatever the flag,
+            // ASCII being the subset over which the flag is value-invisible.  `is_ascii` consults the scan byte and
+            // probes only when the lattice is genuinely undecided, narrowing it with the answer.
+            if !self.0.is_ascii() {
+                f.write_str("b")?;
+            }
+
+            f.write_str("\"")?;
+            for &b in bytes {
+                match b {
+                    b'"' => f.write_str("\\\"")?,
+                    b'\\' => f.write_str("\\\\")?,
+                    b'\n' => f.write_str("\\n")?,
+                    b'\r' => f.write_str("\\r")?,
+                    b'\t' => f.write_str("\\t")?,
+                    0x20..=0x7E => f.write_char(b as char)?,
+                    _ => write!(f, "\\x{{{b:02x}}}")?,
+                }
+            }
+        } else {
+            f.write_str("\"")?;
+            let mut i = 0;
+            while i < bytes.len() {
+                match decode_one(bytes, i) {
+                    Some((len, v)) => {
+                        match u32::try_from(v).ok().and_then(char::from_u32) {
+                            Some('"') => f.write_str("\\\"")?,
+                            Some('\\') => f.write_str("\\\\")?,
+                            Some('\n') => f.write_str("\\n")?,
+                            Some('\r') => f.write_str("\\r")?,
+                            Some('\t') => f.write_str("\\t")?,
+                            Some(c) if c.is_control() && v < 0x80 => write!(f, "\\x{{{v:02x}}}")?,
+                            Some(c) if c.is_control() => write!(f, "\\x{{{:04x}}}", v)?,
+                            Some(c) => f.write_char(c)?,
+
+                            // A code point Rust cannot hold — supra-Unicode or a surrogate — well formed under perl.
+                            None => write!(f, "\\x{{{:04x}}}", v)?,
+                        }
+
+                        i += len;
+                    }
+                    None => {
+                        // Every byte of the rejected sequence, spelled as the raw byte it is.
+                        for &b in &bytes[i..i + malformed_run(bytes, i)] {
+                            write!(f, "\\x{{{b:02x}}}")?;
+                            i += 1;
+                        }
+                    }
+                }
             }
         }
 
@@ -3668,19 +3714,49 @@ impl fmt::Debug for ByteLiteral<'_> {
     }
 }
 
-impl fmt::Debug for PString {
-    /// The representation, not the value: which tier holds the content, its length, the three per-value tag bits, and
-    /// the bytes.  A developer printing one of these is nearly always asking where it landed, and this type's identity
-    /// *is* its representation — how the content should render as text is a question for whatever layer knows the
-    /// output encoding.
+/// The `bytes:` field of `PString`'s `Debug` for the envelope-resident tiers: the exact stored array in bare lowercase
+/// hex, padding and auxiliary nibbles visible, because for those tiers the array *is* the representation and cleared
+/// padding is an invariant worth seeing.
+struct EnvelopeHex<'a>(&'a [u8]);
+
+impl fmt::Debug for EnvelopeHex<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PString")
-            .field("storage", &self.storage_type())
+        for (n, b) in self.0.iter().enumerate() {
+            if n > 0 {
+                f.write_str(" ")?;
+            }
+
+            write!(f, "{b:02x}")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PString {
+    /// The representation and the value, one struct (§2.7.8): the tier, the length, the per-value tag bits, the
+    /// lossless content rendering under `string:`, and — for the envelope-resident tiers only — the exact envelope
+    /// array under `bytes:`.  Pointer-backed tiers omit `bytes:`; their content is behind the pointer and `string:`
+    /// already carries it losslessly.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("PString");
+        d.field("storage", &self.storage_type())
             .field("len", &self.len())
             .field("utf8", &self.is_utf8())
             .field("tainted", &self.is_tainted())
-            .field("bytes", &ByteLiteral(self.as_bytes(&mut [0u8; DECODE_MAX])))
-            .finish()
+            .field("string", &ContentDebug(self));
+
+        match self.raw_parts() {
+            RawParts::Inline { buf, .. } => {
+                d.field("bytes", &EnvelopeHex(buf));
+            }
+            RawParts::Packed(ref p) => {
+                d.field("bytes", &EnvelopeHex(&p.nibbles));
+            }
+            _ => {}
+        }
+
+        d.finish()
     }
 }
 
