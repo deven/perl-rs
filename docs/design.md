@@ -2344,6 +2344,14 @@ enum Holder {
 }
 ```
 
+The struct is 64 bytes: the 32-byte prefix above the holder, and
+no owning arm pushing the holder past 32 — jemalloc's 64-byte
+class.  The `bytes` arm is four words, widening the holder to 40
+for 72 declared and the 80-byte class.  Below roughly sixty
+shared bytes the struct outweighs the content it shares, which is
+part of why the copy-versus-view judgment lives above this crate
+rather than in it.
+
 The struct is allocated through `alloc_backend`, visible to the
 live counters and the leak bomb — discipline a bare `Arc` could
 not join.  Reads never inspect the holder: `base` and `total_len`
