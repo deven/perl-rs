@@ -1037,24 +1037,13 @@ tracked ASCII-ness for one bit of extra cost, so both sides narrow
 opportunistically (flagged → `Ascii`/`Utf8Latin1`; unflagged →
 `Ascii`/`NonAscii`); a short-circuited walk narrows nothing.
 
-**Substring sharing.**  Rvalue `substr` and regex captures against
-large strings are where perl plays COW games.  A third storage kind
-over the same allocation family is additive if the regex-engine
-section (§11) needs it: the header refcount already supports views,
-and a compact `SharedSlice { base: NonNull<u8>, offset: u32,
-len: u32 }` (16 bytes) cannot fit beside a discriminant in the
-envelope (§2.2.9); capture views are therefore boxed
-behind a thin pointer — one small view allocation per materialized
-capture, with the buffer bytes themselves still shared zero-copy.  Because taint is
-per-value (tag) rather than per-buffer, a capture can be a
-zero-copy view into a *tainted* source's buffer while carrying a
-clean tag — the sanctioned untaint path (§2.6.2) costs no copy, a
-third dividend of the per-value/per-buffer criterion.  A full-`usize` slice form
-(24 bytes of payload) would not fit; slices at offsets past 4GB fall
-back to a copy — an acceptable bound for a view optimization.  The
-name
-`Str` is reserved for a borrowed-view type (lvalue `substr` returns,
-capture views) to be designed with lvalues.
+**Substring sharing.**  Rvalue `substr` and regex captures
+against large strings are where perl plays COW games; the view
+design — the compact `Slice` and `Adopted` envelope forms, the
+`Adopted` side struct and its holders, the large cases, and the
+policy-free `slice`/`substr`/`unshare` verbs — is §2.2.15.  The
+name `Str` stays reserved for a borrowed-view type (lvalue
+`substr` returns) to be designed with lvalues.
 
 #### 2.2.4 String content scan states:
 
@@ -1535,15 +1524,15 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   container-verified: `chop` removes one byte, leaving a
   dangling lead byte that is no longer valid UTF-8 — so mutation
   re-runs canonical selection on the result, and a split lands in
-  a verbatim class; decoded
-  storage is a read optimization the string can fall out of,
-  never a constraint on what the bytes may become.  The
-  reinterpretation APIs are representation transforms, total
-  because decoded storage re-expands through the unique canonical
-  encoding: `Encode::_utf8_off` on compressed flag-on content
-  re-expands (container-verified: an upgraded `é` becomes the
-  flag-off two-character `C3.A9`), and `_utf8_on` on raw octets
-  reclassifies (a lone `E9` stays bytes-class, now flagged).
+  a verbatim class; decoded storage is a read optimization the
+  string can fall out of, never a constraint on what the bytes
+  may become.  The reinterpretation APIs are representation
+  transforms, total because decoded storage re-expands through
+  the unique canonical encoding: `Encode::_utf8_off` on
+  compressed flag-on content re-expands (container-verified: an
+  upgraded `é` becomes the flag-off two-character `C3.A9`), and
+  `_utf8_on` on raw octets reclassifies (a lone `E9` stays
+  bytes-class, now flagged).
 
   **The storage types are the normative vocabulary.**  The
   twenty-three base variants — `InlineAscii`, `InlineLatin1`,
@@ -1682,33 +1671,32 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   byte `0x00`, the character U+0000 — is stored like any other.
   It was heap-only while the inline forms were NUL-terminated,
   the terminator being what bought the fifteenth payload byte,
-  and the reversal is explicit-length inline
-  variants — adopted, on evidence that
-  arrived from an unexpected direction.  The fallback was recorded
-  against the corpus tripwire showing short NUL-bearing strings
-  mattering; what settled it instead was the cost of termination
-  itself.  Finding the terminator is a scan where a length is a
-  byte read, and every append must additionally reject NUL-bearing
-  content, so the inline forms measured 2.4x slower at appending
-  and 2.2x slower at reading a length than the same forms with an
-  explicit length.  The packed tier's length families are the
-  template: a full-capacity family carrying its length implicitly
-  beside a shorter family storing it in the byte the last
-  character would have used.  The inline forms split into
-  the two length families, and the tag arithmetic is §2.2.3's:
-  136 of 256.  NUL then stops being a
-  special case anywhere: content carrying one is stored inline
-  like any other, which removes the rejection from both
-  constructors, the check from the append path, and the hazard
-  that a string need not *end* in a NUL to *pass through* one —
-  the same shape as the trailing-space problem the packed families
-  already solved.  Packing is
-  an **encoding, never a canonicalization**: exact byte
-  round-trip is the invariant, and a packed string is
-  observationally identical to its raw form in every operation —
-  length, index, substr, regex, numification and its warnings —
-  a stated test-battery obligation.  Every `%.15g` output
-  and every `i64` stringification fits the numeric alphabet.
+  and the reversal is explicit-length inline variants — adopted,
+  on evidence that arrived from an unexpected direction.  The
+  fallback was recorded against the corpus tripwire showing short
+  NUL-bearing strings mattering; what settled it instead was the
+  cost of termination itself.  Finding the terminator is a scan
+  where a length is a byte read, and every append must
+  additionally reject NUL-bearing content, so the inline forms
+  measured 2.4x slower at appending and 2.2x slower at reading a
+  length than the same forms with an explicit length.  The packed
+  tier's length families are the template: a full-capacity family
+  carrying its length implicitly beside a shorter family storing
+  it in the byte the last character would have used.  The inline
+  forms split into the two length families, and the tag
+  arithmetic is §2.2.3's: 152 of 256 (136 before the §2.2.15 view
+  forms).  NUL then stops being a special case anywhere: content
+  carrying one is stored inline like any other, which removes the
+  rejection from both constructors, the check from the append
+  path, and the hazard that a string need not *end* in a NUL to
+  *pass through* one — the same shape as the trailing-space
+  problem the packed families already solved.  Packing is an
+  **encoding, never a canonicalization**: exact byte round-trip
+  is the invariant, and a packed string is observationally
+  identical to its raw form in every operation — length, index,
+  substr, regex, numification and its warnings — a stated
+  test-battery obligation.  Every `%.15g` output and every `i64`
+  stringification fits the numeric alphabet.
 - **Heap, thin pointer** to the string node; the §2.2.3-§2.2.6
   buffer architecture (single-fetch, scan header, COW) carries
   forward unchanged.
@@ -1735,14 +1723,15 @@ heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PString`'s own tag, which uses 136 of its
-256 values.  Rust's niche-filling requires every other variant's
-data to avoid that byte, and it lays a variant out as a
-self-contained struct *before* placing it — so a field wanting
-eight-byte alignment lands at offset 8 and fills the payload,
-leaving nowhere for a cache.  Adding one cache byte beside a bare
-`i64` therefore costs eight, for the same reason a taint byte did
-before taint became a discriminant twin.  Measured:
+occupies the niche in `PString`'s own tag, which uses 152 of its
+256 values (136 before the §2.2.15 view forms).  Rust's
+niche-filling requires every other variant's data to avoid that
+byte, and it lays a variant out as a self-contained struct
+*before* placing it — so a field wanting eight-byte alignment
+lands at offset 8 and fills the payload, leaving nowhere for a
+cache.  Adding one cache byte beside a bare `i64` therefore costs
+eight, for the same reason a taint byte did before taint became a
+discriminant twin.  Measured:
 
 | arrangement                              |  size  |
 |------------------------------------------|--------|
@@ -1770,9 +1759,8 @@ digits is nibble unpacking.  `Float` carries 10 significant
 digits plus a decimal exponent and a count; `Integer` carries 12,
 spending no byte on an exponent and so holding two more in the same
 seven.  Neither stores a sign — the datum carries it, which buys a
-digit.  The
-cached digits are always perl's `%.15g` output digits — never
-shortest-round-trip — so the cache cannot leak a formatting
+digit.  The cached digits are always perl's `%.15g` output digits —
+never shortest-round-trip — so the cache cannot leak a formatting
 divergence.  Coverage is the point: `%.15g` trims trailing zeros,
 making the digit-count distribution bimodal (container-measured:
 parse-born and money-shaped values at 1-8 digits, arithmetic
@@ -2299,6 +2287,150 @@ provide.  Promotion happens where the attribute is applied, so
 the flag is set once, at declaration, by the front end — no pad-
 side mark to inherit later, and no path by which a shared
 variable is ever observed unpromoted.
+
+#### 2.2.15 Views: `Slice` and `Adopted`:
+
+A view is a `PString` whose bytes live in someone else's
+allocation: a sub-range of a native heap buffer, or of a foreign
+object taken in whole.  Two compact envelope forms carry every
+view, both in the immortal envelope's 24-bit geometry — because
+all three are "no header precedes the data at the pointer" forms
+and the constraint is identical — and one side struct serves
+every backing that is not a native buffer.  A view's marginal
+memory is the envelope the value would occupy anyway: no
+allocation per slice, no allocation per clone.
+
+**The native form.**  `Slice { heap: 8, offset: u24, len: u24,
+scan: u8 }` — fifteen bytes.  The pointer is the backing buffer's
+own allocation; birth bumps the refcount its header already
+carries, drop decrements it, and the data address is arithmetic —
+buffer pointer plus header size plus offset — so a read costs one
+dependent load, the byte itself.  The backing's header is already
+everything a side struct would hold (refcount, the shared
+narrowing scan slot, count, length), paid once when the buffer
+was born; a native view therefore mints nothing.  A whole-buffer
+handle is simply the existing heap repr, so `Slice` always
+denotes a proper sub-range and needs no whole-object sentinel.
+Because a view holds the refcount above one, every in-place
+transform on the buffer routes through the COW extraction
+discipline unchanged: views are read-only carriers by
+construction, and mutation of a view extracts to owned first.
+
+**The adopted form.**  `Adopted { adopted: 8, offset: u24,
+len: u24, scan: u8 }` — fifteen bytes, pointing at one `Adopted`
+struct per adopted object:
+
+```rust
+#[repr(C)]
+struct Adopted {
+    refcount: AtomicU32,     // count over views
+    scan: AtomicU8,          // shared narrowing slot, as a tier
+    _flags: [u8; 3],         //   header's — see birth rules below
+    char_count: AtomicUsize, // whole-object count cache; 0 unfilled
+    base: *const u8,         // resolved data pointer: THE read field
+    total_len: usize,
+    holder: Holder,          // matched exactly once, in Drop
+}
+
+enum Holder {
+    VecBuf(Vec<u8>),
+    StrBuf(String),
+    Bytes(bytes::Bytes),        // behind the `bytes` crate feature
+    ArcBytes(Arc<[u8]>),
+    ArcStr(Arc<str>),
+    HeapBuf(/* native buffer */),  // retains the header refcount
+    Parent(NonNull<Adopted>),      // oversized view of an adoptee
+    // future doors: Mmap(..), Foreign { ptr, len, drop_fn }
+}
+```
+
+The struct is allocated through `alloc_backend`, visible to the
+live counters and the leak bomb — discipline a bare `Arc` could
+not join.  Reads never inspect the holder: `base` and `total_len`
+are resolved at adoption, so every read is two dependent loads —
+the struct's fixed-offset `base`, then the byte — for every
+holder alike.  The holder's legality is the readonly rule:
+adopted content is never mutated while held, so `Vec`'s buffer,
+`Bytes`' view pointer, and `Arc`'s inner slice are stable for the
+`Adopted`'s life.  The `Bytes` arm and the dependency it drags
+sit behind a `perl-core` feature named `bytes`; the parser's own
+direct dependency carries no weight in this crate's surface.  The
+offset/length sentinel `SPAN` (`0xFF_FFFF` in both fields) marks
+a whole-object handle — the overwhelming case, minted by adoption
+itself — whose length reads from `total_len` on the cache line
+the first load already fetched, so adoption is not capped by the
+24-bit fields; those describe only genuine sub-views.
+
+**The large cases are holders, not new machinery.**  `u24` caps a
+compact view's length *and position* at 16 MiB: a 1 KB slice at
+offset 5 GiB overflows the offset field even though the slice is
+small.  An oversized view is an `Adopted` whose holder is
+`Parent` (over an adoptee) or `HeapBuf` (over a native buffer),
+with its own `base` pre-resolved to the parent's base plus the
+large offset at creation — envelope to child `base` to bytes, two
+loads, never three — and whose drop arm releases what it retains.
+The design prose names these cases `LargeSlice` and
+`LargeAdopted`; the `Repr` carries only the two compact forms,
+and the slicing paths choose the form silently.  Discriminant
+cost: two storage types times the three flag bits, sixteen fused
+variants, moving the string tag from 136 to 152 of 256.
+
+**Birth state and narrowing.**  A view's envelope scan byte is
+born from the slice-birth table of §2.2.3 — clean cuts preserve
+what survives cutting, dirty cuts of validity-asserting sources
+are born proven `MalformedUtf8` — and views below the slice-eager
+floor (4 KiB) classify at birth instead, per the same section.
+The backing's shared slot (a tier header's, or the `Adopted`'s)
+keeps narrowing under §2.2.3's monotonic meet, so slices taken
+after a backing narrows are born tighter; the per-view byte then
+narrows per handle, as the immortal envelopes do.  Views carry no
+character count; `SPAN` handles read the struct's cache, and
+sub-views derive on demand.
+
+**The API is mechanism; policy lives above.**  `perl-core` does
+not decide whether pinning a backing matters — it cannot see the
+facts that answer it (how long the backing lives, how many
+siblings share it, what the caller does next), and §2.7.7's
+layering sends judgment to the layer that can.  Core therefore
+exposes verbs, no thresholds:
+
+- `slice()` shares: it returns the compact or large view form —
+  except content *representable* in an inline or packed form is
+  returned in that form instead, because a copy costing zero
+  allocation, zero refcount traffic, and zero pin dominates a
+  view on every axis at once.  That is form selection, not
+  policy; only lengths ≤ 15 are unconditionally representable,
+  and longer content packs only when the packed families admit
+  it, so the rule is stated over representability, never over a
+  byte count.
+- `substr()` copies: an unshared, uniquely-owned result in the
+  owned tiers — which is perl's own rvalue `substr` semantics
+  under perl's own name.  Lvalue `substr` remains the reserved
+  borrowed-view type `Str`, to be designed with lvalues.
+- `unshare()` unpins after the fact: the explicit break-sharing
+  call, free when the refcount is already one — for the caller
+  who learns *later* that the backing matters.
+
+Between the three verbs every pinning stance is expressible at
+the moment someone actually holds the relevant knowledge.  The
+ops layer inherits the policy question per operation — captures,
+`split` fields, rvalue `substr` — where perl itself is not
+neutral: perl copies rvalue `substr`, and capture COW against
+huge strings is a documented footgun its users manage by copying
+through a scalar.  An earlier ruling fixed a uniform copy-below
+floor of 256 bytes; it was priced when every tier-sourced slice
+minted a side struct, a cost the native `Slice` form removed, and
+what remained of the floor was policy, which this section
+relocates.  256 stands recorded as the candidate default should
+the ops layer rule a floor at all.  Pinning is observable before
+it is governed: backings are our allocations, so bytes held by
+views are a measurable number in the live counters, not a silent
+leak.
+
+Because taint is per-value (tag) rather than per-buffer, a view
+into a *tainted* source's buffer can carry a clean tag: the
+sanctioned untaint path (§2.6.2) costs no copy — a dividend of
+the per-value/per-buffer criterion that both view forms inherit.
 
 ### 2.3 Promoted Scalars
 
