@@ -2367,7 +2367,13 @@ offset/length sentinel `SPAN` (`0xFF_FFFF` in both fields) marks
 a whole-object handle — the overwhelming case, minted by adoption
 itself — whose length reads from `total_len` on the cache line
 the first load already fetched, so adoption is not capped by the
-24-bit fields; those describe only genuine sub-views.
+24-bit fields; those describe only genuine sub-views.  All-ones
+rather than zero, on the house polarity: zero is the additive
+identity that offset arithmetic naturally produces and that
+zeroed memory accidentally contains, so it must stay literal —
+an empty view, loud on misuse — where the top coordinate is
+unreachable by computation, bounds-checked away before encoding,
+and the least missed literal value in the range.
 
 **The small tiers take a third compact form.**  `SmallSlice
 { heap: 8, offset: u16, len: u16, cap: u16, scan: u8 }` — fifteen
@@ -2447,7 +2453,12 @@ exposes verbs, no thresholds:
   policy; only lengths ≤ 15 are unconditionally representable,
   and longer content packs only when the packed families admit
   it, so the rule is stated over representability, never over a
-  byte count.
+  byte count.  Sources with no shareable backing answer in kind:
+  a slice of an envelope-resident value (inline, packed) that is
+  not itself representable materializes owned — there is no
+  buffer to share — and a slice of an immortal image is another
+  immortal envelope over the same image, classification deriving
+  the settled facts the compact form carries.
 - `substr()` copies: an unshared, uniquely-owned result in the
   owned tiers — which is perl's own rvalue `substr` semantics
   under perl's own name.  Lvalue `substr` remains the reserved
