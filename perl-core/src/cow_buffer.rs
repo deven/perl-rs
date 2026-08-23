@@ -33,9 +33,12 @@
 //! concurrency tests.  (Miri is unavailable under the container's apt toolchain — noted as an outstanding verification
 //! obligation for an environment that has it.)
 
+use crate::alloc_backend;
 use crate::string::scan::ScanState;
+use std::alloc::Layout;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering, fence};
 
 /// Allocation failure (or capacity arithmetic overflow, which is the same condition seen earlier).  Surfaces as a
 /// `Result` so the runtime can eventually map it to perl's trappable `Out of memory!` die rather than aborting the
@@ -1312,3 +1315,252 @@ pub(crate) fn downgraded_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, AllocErr
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests/cow_buffer_tests.rs"]
 mod tests;
+
+// ── `Adopted`: the side struct behind non-native views (§2.2.15) ─────────────────────────────────────────────────────
+
+/// One `Adopted` per adopted object: the readonly facts a view needs — resolved data pointer, total length, the shared
+/// narrowing scan slot, a whole-object character-count cache — with the owning `Holder` last, matched exactly once, in
+/// `Drop`.  Reads never inspect the holder: `base` and `total_len` are resolved at adoption, so every read is two
+/// dependent loads — the struct's fixed-offset `base`, then the byte — for every holder alike.
+///
+/// Allocated through `alloc_backend`, so it is visible to the live counters — discipline a bare `Arc` could not join.
+/// The holder's legality is the readonly rule: adopted content is never mutated while held, so `Vec`'s buffer, `Arc`'s
+/// inner slice, and (behind the `bytes` feature) `Bytes`' view pointer are stable for the `Adopted`'s life.
+// Consumed by the tests until the §2.2.15 envelope forms land (Stage 2 of the surgery), which bring the crate-internal
+// callers.
+#[cfg_attr(not(test), allow(dead_code))]
+#[repr(C)]
+pub(crate) struct Adopted {
+    /// Count over views.  A new `Adopted` is born with one holder-side reference — the view that minted it.
+    refcount: AtomicU32,
+
+    /// The shared narrowing slot, as a tier header's: certifications of the same immutable bytes, only ever narrowed,
+    /// under the §2.2.4 meet.
+    scan: AtomicU8,
+
+    _flags: [u8; 3],
+
+    /// Whole-object character-count cache; zero means unfilled, the house sentinel (§2.2.3).
+    char_count: AtomicUsize,
+
+    /// The resolved data pointer: THE read field.
+    base: *const u8,
+    total_len: usize,
+
+    /// Matched exactly once, in `Drop`.
+    holder: Holder,
+}
+
+/// What an `Adopted` keeps alive.  Arms own their object outright and release it by falling out of scope in the
+/// struct's drop; the one arm that retains rather than owns — `Parent` — is the one `Drop` matches for.
+///
+/// Future doors, recorded in §2.2.15 and deliberately absent until a caller exists: `HeapBuf` retaining a native
+/// buffer for oversized native views (Stage 3 of the surgery, which also decides its tier transport), `Mmap`, and
+/// `Foreign { ptr, len, drop_fn }`.
+// The payload fields are drop-only by design — "matched exactly once, in Drop" — and reads go through the resolved
+// base, so the never-read warning would fire forever on what the design intends.
+#[allow(dead_code)]
+pub(crate) enum Holder {
+    VecBuf(Vec<u8>),
+    StrBuf(String),
+    ArcBytes(std::sync::Arc<[u8]>),
+    ArcStr(std::sync::Arc<str>),
+
+    #[cfg(feature = "bytes")]
+    Bytes(bytes::Bytes),
+
+    /// An oversized view of an adoptee: retains the parent, whose refcount this arm's drop releases.
+    Parent(NonNull<Adopted>),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Adopted {
+    /// Allocate and initialize one `Adopted`.  `base` and `total_len` must describe bytes the holder keeps alive and
+    /// unmoved for the struct's life; every public adoption constructor resolves them from the holder itself before
+    /// moving it in.
+    fn mint(base: *const u8, total_len: usize, scan: ScanState, holder: Holder) -> Result<NonNull<Adopted>, AllocError> {
+        let layout = Layout::new::<Adopted>();
+        let Some(raw) = alloc_backend::allocate(layout) else {
+            return Err(AllocError { requested: layout.size() });
+        };
+
+        #[cfg(test)]
+        live::allocated();
+
+        let ptr = raw.cast::<Adopted>();
+
+        // SAFETY: a fresh allocation of exactly this layout, written once before any reader exists.
+        unsafe {
+            ptr.as_ptr().write(Adopted {
+                refcount: AtomicU32::new(1),
+                scan: AtomicU8::new(scan.as_u8()),
+                _flags: [0; 3],
+                char_count: AtomicUsize::new(0),
+                base,
+                total_len,
+                holder,
+            });
+        }
+
+        Ok(ptr)
+    }
+
+    /// Adopt a `Vec`'s buffer whole.
+    pub(crate) fn adopt_vec(v: Vec<u8>, scan: ScanState) -> Result<NonNull<Adopted>, AllocError> {
+        let (base, len) = (v.as_ptr(), v.len());
+        Self::mint(base, len, scan, Holder::VecBuf(v))
+    }
+
+    /// Adopt a `String`'s buffer whole.  The content is valid UTF-8 by the type's own contract, which the caller's
+    /// `scan` should already assert.
+    pub(crate) fn adopt_string(s: String, scan: ScanState) -> Result<NonNull<Adopted>, AllocError> {
+        let (base, len) = (s.as_ptr(), s.len());
+        Self::mint(base, len, scan, Holder::StrBuf(s))
+    }
+
+    /// Adopt a shared byte slice, joining its existing sharing.
+    pub(crate) fn adopt_arc_bytes(a: std::sync::Arc<[u8]>, scan: ScanState) -> Result<NonNull<Adopted>, AllocError> {
+        let (base, len) = (a.as_ptr(), a.len());
+        Self::mint(base, len, scan, Holder::ArcBytes(a))
+    }
+
+    /// Adopt a shared string slice, joining its existing sharing.
+    pub(crate) fn adopt_arc_str(a: std::sync::Arc<str>, scan: ScanState) -> Result<NonNull<Adopted>, AllocError> {
+        let (base, len) = (a.as_ptr(), a.len());
+        Self::mint(base, len, scan, Holder::ArcStr(a))
+    }
+
+    /// Adopt a `Bytes` view, joining its refcounted sharing.
+    #[cfg(feature = "bytes")]
+    pub(crate) fn adopt_bytes(b: bytes::Bytes, scan: ScanState) -> Result<NonNull<Adopted>, AllocError> {
+        let (base, len) = (b.as_ptr(), b.len());
+        Self::mint(base, len, scan, Holder::Bytes(b))
+    }
+
+    /// Mint the oversized-view child (§2.2.15): an `Adopted` whose holder retains `parent` and whose `base` is
+    /// pre-resolved to the parent's base plus the large offset, so reads stay two loads — envelope to child `base` to
+    /// bytes, never three.
+    ///
+    /// # Safety
+    /// `parent` must be a live `Adopted`, and `offset..offset + len` must lie within its object.
+    pub(crate) unsafe fn adopt_span_of(parent: NonNull<Adopted>, offset: usize, len: usize, scan: ScanState) -> Result<NonNull<Adopted>, AllocError> {
+        // SAFETY: live per the contract; the retain pairs with the Parent arm's release in Drop.
+        let base = unsafe {
+            debug_assert!(offset.checked_add(len).is_some_and(|end| end <= parent.as_ref().total_len), "the span must lie within the parent");
+            Adopted::retain(parent);
+            parent.as_ref().base.add(offset)
+        };
+
+        match Self::mint(base, len, scan, Holder::Parent(parent)) {
+            Ok(child) => Ok(child),
+
+            Err(e) => {
+                // SAFETY: undoing the retain just taken; the parent is still live.
+                unsafe { Adopted::release(parent) };
+                Err(e)
+            }
+        }
+    }
+
+    /// # Safety
+    /// `ptr` must be a live `Adopted` minted by this module.
+    #[inline]
+    pub(crate) unsafe fn retain(ptr: NonNull<Adopted>) {
+        // SAFETY: the caller vouches for a live struct.
+        unsafe { ptr.as_ref() }.refcount.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// # Safety
+    /// `ptr` must be a live `Adopted` minted by this module, and the caller surrenders its reference.
+    pub(crate) unsafe fn release(ptr: NonNull<Adopted>) {
+        // SAFETY: the caller vouches for a live struct.
+        if unsafe { ptr.as_ref() }.refcount.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+
+        fence(Ordering::Acquire);
+
+        #[cfg(test)]
+        live::released();
+
+        // SAFETY: last reference; drops the holder (releasing a Parent's retain through Drop below), then frees the
+        // allocation under exactly the layout it was made with.
+        unsafe {
+            ptr.as_ptr().drop_in_place();
+            alloc_backend::release(ptr.cast(), Layout::new::<Adopted>());
+        }
+    }
+
+    /// The adopted bytes.
+    ///
+    /// # Safety
+    /// `self` must be reached through a live reference-holding handle.
+    #[inline]
+    pub(crate) unsafe fn as_slice(&self) -> &[u8] {
+        // SAFETY: the holder pins base for the struct's life, and the handle the caller vouches for pins the struct.
+        unsafe { std::slice::from_raw_parts(self.base, self.total_len) }
+    }
+
+    #[inline]
+    pub(crate) fn total_len(&self) -> usize {
+        self.total_len
+    }
+
+    #[inline]
+    pub(crate) fn scan(&self) -> ScanState {
+        ScanState::from_u8(self.scan.load(Ordering::Acquire))
+    }
+
+    /// The §2.2.4 monotonic meet on the shared slot, as `narrow_scan` performs it on a tier header: two certifications
+    /// of the same immutable bytes union their facts, so the loop only ever narrows and terminates.
+    pub(crate) fn narrow_scan(&self, state: ScanState) {
+        let mut current = self.scan.load(Ordering::Acquire);
+        loop {
+            let merged = crate::string::scan::meet(ScanState::from_u8(current), state).as_u8();
+            if merged == current {
+                break;
+            }
+
+            match self.scan.compare_exchange(current, merged, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    /// The whole-object character-count cache: zero is the unfilled sentinel, and any filled value is the one true
+    /// count of immutable bytes, so racing fillers agree and relaxed ordering suffices.
+    #[inline]
+    pub(crate) fn char_count(&self) -> usize {
+        self.char_count.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn set_char_count(&self, count: usize) {
+        self.char_count.store(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn refcount(&self) -> u32 {
+        self.refcount.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Adopted {
+    fn drop(&mut self) {
+        // The holder is matched exactly once, here.  Owning arms release by falling out of scope when the fields drop
+        // after this body; the retaining arm surrenders what it retained.
+        if let Holder::Parent(parent) = self.holder {
+            // SAFETY: the Parent arm holds the retain taken at adopt_span_of.
+            unsafe { Adopted::release(parent) };
+        }
+    }
+}
+
+// The §2.2.15 accounting, pinned: 64 bytes bare, and the `bytes` arm — four words — widens the holder to 40 for 72
+// declared.
+#[cfg(not(feature = "bytes"))]
+const _: () = assert!(size_of::<Adopted>() == 64);
+
+#[cfg(feature = "bytes")]
+const _: () = assert!(size_of::<Adopted>() == 72);

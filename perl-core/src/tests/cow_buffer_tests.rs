@@ -363,3 +363,111 @@ fn widen_latin1_borrows_ascii_runs_from_the_source() {
 
     assert_eq!(borrowed, bytes.len() - 1, "every byte but the variant should pass through borrowed");
 }
+
+// ── Adopted (§2.2.15, Stage 1) ────────────────────────────────
+#[test]
+fn adoption_joins_and_release_leaves_the_holders_sharing() {
+    let before = live::count();
+    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"shared content"[..]);
+    let a = Adopted::adopt_arc_bytes(arc.clone(), ScanState::Ascii).unwrap();
+
+    // SAFETY: `a` is live until the release below, and this handle pins it.
+    unsafe {
+        assert_eq!(a.as_ref().as_slice(), b"shared content");
+        assert_eq!(a.as_ref().total_len(), 14);
+        assert_eq!(std::sync::Arc::strong_count(&arc), 2, "adoption joins the Arc's sharing");
+        assert_eq!(a.as_ref().refcount(), 1);
+
+        Adopted::release(a);
+    }
+
+    assert_eq!(std::sync::Arc::strong_count(&arc), 1, "the last release surrenders the holder");
+    assert_eq!(live::count(), before, "the struct's allocation is balanced");
+}
+
+#[test]
+fn a_span_child_retains_its_parent_and_releases_it_last() {
+    let before = live::count();
+    let v: Vec<u8> = (0u8..100).collect();
+    let parent = Adopted::adopt_vec(v, ScanState::Unknown).unwrap();
+
+    // SAFETY: parent is live; the child's span lies within it; handles pin what they read.
+    unsafe {
+        let child = Adopted::adopt_span_of(parent, 40, 10, ScanState::Unknown).unwrap();
+        assert_eq!(parent.as_ref().refcount(), 2, "the child retains the parent");
+        assert_eq!(child.as_ref().as_slice(), &(40u8..50).collect::<Vec<u8>>()[..], "base is pre-resolved to the large offset");
+
+        Adopted::release(parent);
+        assert_eq!(child.as_ref().as_slice()[0], 40, "the parent lives while the child holds it");
+
+        Adopted::release(child);
+    }
+
+    assert_eq!(live::count(), before, "both structs and the Vec are balanced");
+}
+
+#[test]
+fn the_shared_slot_narrows_and_never_widens() {
+    let a = Adopted::adopt_vec(b"abc".to_vec(), ScanState::Unknown).unwrap();
+
+    // SAFETY: live until the release below.
+    unsafe {
+        a.as_ref().narrow_scan(ScanState::Ascii);
+        assert_eq!(a.as_ref().scan(), ScanState::Ascii);
+
+        a.as_ref().narrow_scan(ScanState::Unknown);
+        assert_eq!(a.as_ref().scan(), ScanState::Ascii, "the meet keeps the finer certification");
+
+        assert_eq!(a.as_ref().char_count(), 0, "zero is the unfilled sentinel");
+        a.as_ref().set_char_count(3);
+        assert_eq!(a.as_ref().char_count(), 3);
+
+        Adopted::release(a);
+    }
+}
+
+#[test]
+fn the_adopted_struct_lands_in_the_recorded_size_class() {
+    // The §2.2.15 accounting: 64 bare and 72 with the bytes arm land in jemalloc's 64 and 80 classes.
+    #[cfg(not(feature = "bytes"))]
+    assert_eq!(alloc_backend::size_class(Layout::new::<Adopted>()), 64);
+    #[cfg(feature = "bytes")]
+    assert_eq!(alloc_backend::size_class(Layout::new::<Adopted>()), 80);
+}
+
+#[cfg(feature = "bytes")]
+#[test]
+fn bytes_adoption_joins_the_view_and_balances() {
+    let before = live::count();
+    let b = bytes::Bytes::from_static(b"a static image");
+    let a = Adopted::adopt_bytes(b.slice(2..8), ScanState::Ascii).unwrap();
+
+    // SAFETY: live until the release below.
+    unsafe {
+        assert_eq!(a.as_ref().as_slice(), b"static");
+        Adopted::release(a);
+    }
+
+    assert_eq!(live::count(), before);
+}
+
+#[test]
+fn string_and_arc_str_adoption_carry_their_holders_to_the_last_release() {
+    let before = live::count();
+    let s = Adopted::adopt_string(String::from("owned héllo"), ScanState::ValidUtf8).unwrap();
+    let arc: std::sync::Arc<str> = std::sync::Arc::from("shared text");
+    let a = Adopted::adopt_arc_str(arc.clone(), ScanState::Ascii).unwrap();
+
+    // SAFETY: both are live until the releases below.
+    unsafe {
+        assert_eq!(s.as_ref().as_slice(), "owned héllo".as_bytes());
+        assert_eq!(a.as_ref().as_slice(), b"shared text");
+        assert_eq!(std::sync::Arc::strong_count(&arc), 2);
+
+        Adopted::release(s);
+        Adopted::release(a);
+    }
+
+    assert_eq!(std::sync::Arc::strong_count(&arc), 1);
+    assert_eq!(live::count(), before);
+}

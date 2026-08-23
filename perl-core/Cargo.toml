@@ -7,12 +7,15 @@ rust-version.workspace = true
 description = "Perl core types"
 
 [features]
-# The buffer allocation backend (§2.2.3): `jemalloc` is on by default, and in its absence buffers come from the
-# system allocator — presence/absence of one additive feature, so cargo's feature unification can never conflict.
+bytes    = ["dep:bytes"]
+
+# The buffer allocation backend (§2.2.3): `jemalloc` is on by default, and in its absence buffers come from the system
+# allocator — presence/absence of one additive feature, so cargo's feature unification can never conflict.
 default  = ["jemalloc"]
 jemalloc = ["dep:tikv-jemalloc-sys"]
 
 [dependencies]
+bytes             = { workspace = true, optional = true }
 hashbrown         = { workspace = true }
 imbl              = { workspace = true, optional = true }
 indexmap          = { workspace = true, optional = true }
