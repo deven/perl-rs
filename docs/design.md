@@ -1357,8 +1357,9 @@ A compact value is promoted to the aliasing form
   and nothing to mean there (§2.2.14): sharing a scalar is two
   threads naming one storage, which is identity.
 - **First numification warning** on an unshared non-numeric string —
-  see §2.3.4; the warn-once bit is carried in the `PString` tag,
-  so this trigger applies only where the tag route is unavailable.
+  see §2.3.4; warn-once suppression rides the cached numeric face,
+  never a tag bit (§2.2.3), so a compact value with no face cache
+  promotes to record it.
 
 Multi-representation caching is *not* an upgrade trigger (it was in
 the flag-matrix design): compact values recompute conversions, which
@@ -1535,15 +1536,18 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   bytes-class, now flagged).
 
   **The storage types are the normative vocabulary.**  The
-  twenty-three base variants — `InlineAscii`, `InlineLatin1`,
+  thirty-one base variants — `InlineAscii`, `InlineLatin1`,
   `InlineNonLatin1`, `InlineExtended`, `InlineBytes`,
   `PackedNumeric`, `PackedDateTimePlus`, and
   `PackedDateTimeZulu`, each beside its `Full` family twin;
   `Heap8` and `Heap16`, each beside its Ascii twin (§2.2.3);
-  `Heap32` and `Heap`; and the immortal quartet `Immortal`,
+  `Heap32` and `Heap`; the immortal quartet `Immortal`,
   `Static`, `LargeImmortal`, and `LargeStatic` (§2.2.3),
-  constructed explicitly and never canonically selected — are
-  reified as `StorageType`: twenty-three values dense from zero,
+  constructed explicitly and never canonically selected; and the
+  view quintet `MediumSlice`, `SmallSlice`, `FarSlice`,
+  `Adopted`, and `FarAdopted` (§2.2.15), minted only by the
+  slicing verbs — are
+  reified as `StorageType`: thirty-one values dense from zero,
   which is the niche budget's requirement (§2.2.3), with every
   coarse question a projection on it.  The
   declaration order is itself the selection [DECISION]: canonical
@@ -1684,7 +1688,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   carrying its length implicitly beside a shorter family storing
   it in the byte the last character would have used.  The inline
   forms split into the two length families, and the tag
-  arithmetic is §2.2.3's: 176 of 256 (136 before the §2.2.15 view
+  arithmetic is §2.2.3's: 124 of 256 (104 before the §2.2.15 view
   forms).  NUL then stops being a special case anywhere: content
   carrying one is stored inline like any other, which removes the
   rejection from both constructors, the check from the append
@@ -1703,7 +1707,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
 
 The standalone `PString` is 16 bytes too — the tag budget
 closes in one byte, the discriminant being the storage type times
-the three flag bits (§2.2.9) — leaving 15 payload bytes: the five
+the two flag bits (§2.2.9) — leaving 15 payload bytes: the five
 inline classes and the packed tier at the fused variants'
 capacities, and the heap tiers a thin pointer plus whatever
 envelope metadata each tier's ruling assigns (§2.2.3): the small
@@ -1723,8 +1727,8 @@ heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PString`'s own tag, which uses 176 of its
-256 values (136 before the §2.2.15 view forms).  Rust's
+occupies the niche in `PString`'s own tag, which uses 124 of its
+256 values (104 before the §2.2.15 view forms).  Rust's
 niche-filling requires every other variant's data to avoid that
 byte, and it lays a variant out as a self-contained struct
 *before* placing it — so a field wanting eight-byte alignment
@@ -2423,8 +2427,8 @@ loads, never three — and whose drop arm releases what it retains.
 The design prose names these cases `LargeSlice` and
 `LargeAdopted`; the `Repr` carries only the five compact forms,
 and the slicing paths choose the form silently.  Discriminant
-cost: five storage types times the three flag bits, forty fused
-variants, moving the string tag from 136 to 176 of 256.
+cost: five storage types times the two flag bits, twenty fused
+variants, moving the string tag from 104 to 124 of 256.
 
 **Birth state and narrowing.**  A view's envelope scan byte is
 born from the slice-birth table of §2.2.3 — clean cuts preserve

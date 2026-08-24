@@ -2,11 +2,13 @@
 //!
 //! Two storage kinds and three per-value state dimensions fold into the enum discriminant:
 //!
-//! - **Storage**: `Inline` (≤ 22 bytes, no heap allocation) or `Heap` (a tiered refcounted buffer, §2.2.3).
+//! - **Storage**: an envelope-resident form (inline, packed — no heap allocation) or a pointer-backed one (the tiered
+//!   refcounted buffers, the immortal images, and the §2.2.15 views).
 //! - **The Perl utf8 flag**: a per-SV *semantic claim* ("interpret these bytes as characters"), not a validity fact.
 //!   It can be set on bytes Rust rejects (perl-extended UTF-8; verified `chr(0x110000)`); no code path may derive
 //!   `from_utf8_unchecked` from it.  Rust-level validity comes from the scan cache only.
-//! - **Warned**: the numification-warning once-bit (§2.3.4).  Monotonic: set, never cleared.
+//! - **Warned**: not a flag here — warn-once suppression rides the cached numeric face (§2.3.4), and the tag is storage
+//!   times utf8 times tainted only (§2.2.3).
 //! - **Tainted**: the per-value taint bit (§2.6.1).  Cleared only through the laundering capability (§2.6.2).
 //!
 //! Inline strings additionally fold their **scan state** into the tag — and only the five mutually exclusive *terminal*
@@ -912,10 +914,11 @@ enum InlineClass {
     Bytes,
 }
 
-/// The storage type: the twenty-three-value normative vocabulary (§2.2.9), one value per base variant of the folded
-/// tag — the discriminant is this type times the three flag bits.  Coarse questions are the projection methods.
-/// Declaration order is itself the selection (§2.2.9): canonical selection takes the first type, in this order, able
-/// to represent the content — first-fit is the ladder — which is what the derived `Ord` means.
+/// The storage type: the thirty-one-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
+/// the discriminant is this type times the two flag bits, utf8 and tainted, which is the whole tag ledger: thirty-one
+/// times four is the 124 the §2.2.3 arithmetic states, pinned by `REPR_VARIANT_COUNT`.  Coarse questions are the
+/// projection methods.  Declaration order is itself the selection (§2.2.9): canonical selection takes the first type,
+/// in this order, able to represent the content — first-fit is the ladder — which is what the derived `Ord` means.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum StorageType {
     /// Inline, ≤ [`INLINE_MAX`] payload bytes, no allocation: the five content classes, each beside its full-capacity
@@ -1108,6 +1111,27 @@ macro_rules! define_perl_string {
             $( $far_adopted { ptr: Owned, offset: [u8; 4], len: [u8; 2], scan: scan::ScanState }, )*
             $( $adopted { ptr: Owned, offset: [u8; 3], len: [u8; 3], scan: scan::ScanState }, )*
         }
+
+        /// The number of `Repr` variants this invocation declares: checked arithmetic for the tag ledger, which must
+        /// state this same number (§2.2.3, §2.2.9) — the assert beside the invocation fails any drift.
+        pub(crate) const REPR_VARIANT_COUNT: usize = 0
+            $( + { let _ = stringify!($inline); 1 } )*
+            $( + { let _ = stringify!($packed); 1 } )*
+            $( + { let _ = stringify!($heap8a); 1 } )*
+            $( + { let _ = stringify!($heap16a); 1 } )*
+            $( + { let _ = stringify!($heap8); 1 } )*
+            $( + { let _ = stringify!($heap16); 1 } )*
+            $( + { let _ = stringify!($heap32); 1 } )*
+            $( + { let _ = stringify!($heap); 1 } )*
+            $( + { let _ = stringify!($immortal); 1 } )*
+            $( + { let _ = stringify!($static); 1 } )*
+            $( + { let _ = stringify!($large_immortal); 1 } )*
+            $( + { let _ = stringify!($large_static); 1 } )*
+            $( + { let _ = stringify!($slice); 1 } )*
+            $( + { let _ = stringify!($small_slice); 1 } )*
+            $( + { let _ = stringify!($far_slice); 1 } )*
+            $( + { let _ = stringify!($far_adopted); 1 } )*
+            $( + { let _ = stringify!($adopted); 1 } )*;
 
         impl Clone for Repr {
             fn clone(&self) -> Repr {
@@ -2090,6 +2114,10 @@ define_perl_string! {
         AdoptedViewFlaggedTainted         = (true,  true),
     ]
 }
+
+// The ledger, checked: thirty-one storage types times the two flag bits (§2.2.3, §2.2.9).  Growing the list moves this
+// number and the design's ledgers in the same commit.
+const _: () = assert!(REPR_VARIANT_COUNT == 124);
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
 const _: () = assert!(size_of::<PString>() == 16);
