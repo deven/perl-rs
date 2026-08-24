@@ -1393,14 +1393,17 @@ macro_rules! define_perl_string {
                     $( Repr::$slice { ptr, offset, len, scan } => RawParts::View {
                         bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u24(*offset)), u24(*len)) },
                         scan: *scan,
+                        backing: None,
                     }, )*
                     $( Repr::$small_slice { ptr, offset, len, scan, .. } => RawParts::View {
                         bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u16v(*offset)), u16v(*len)) },
                         scan: *scan,
+                        backing: None,
                     }, )*
                     $( Repr::$far_slice { ptr, offset, len, scan } => RawParts::View {
                         bytes: unsafe { std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(u32v(*offset)), u16v(*len)) },
                         scan: *scan,
+                        backing: None,
                     }, )*
                     $( Repr::$far_adopted { ptr, offset, len, scan } => RawParts::View {
                         bytes: unsafe {
@@ -1408,14 +1411,19 @@ macro_rules! define_perl_string {
                             &a.as_slice()[u32v(*offset)..u32v(*offset) + u16v(*len)]
                         },
                         scan: *scan,
+                        backing: None,
                     }, )*
-                    $( Repr::$adopted { ptr, offset, len, scan } => RawParts::View {
-                        bytes: unsafe {
-                            let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
-                            let (off, n) = if u24(*offset) == SPAN as usize && u24(*len) == SPAN as usize { (0, a.total_len()) } else { (u24(*offset), u24(*len)) };
-                            &a.as_slice()[off..off + n]
-                        },
-                        scan: *scan,
+                    $( Repr::$adopted { ptr, offset, len, scan } => {
+                        // SAFETY: the handle holds a reference on the live struct, which pins struct and bytes both.
+                        let a: &cow_buffer::Adopted = unsafe { ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref() };
+                        let span = u24(*offset) == SPAN as usize && u24(*len) == SPAN as usize;
+                        let (off, n) = if span { (0, a.total_len()) } else { (u24(*offset), u24(*len)) };
+                        RawParts::View {
+                            // SAFETY: within the object, bounds-checked at birth; SPAN is the whole object.
+                            bytes: unsafe { &a.as_slice()[off..off + n] },
+                            scan: *scan,
+                            backing: if span { Some(a) } else { None },
+                        }
                     }, )*
                 }
             }
@@ -2518,15 +2526,19 @@ impl PString {
                 st if scan::is_rust_valid(st) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
                 _ => None, // ExtendedUtf8 or MalformedUtf8: the only terminal states outside the Rust-valid set.
             },
-            RawParts::View { bytes, scan } => match scan {
+            RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 // SAFETY: the envelope byte certifies the view's own bytes (born from the slice-birth table, only ever
-                // narrowed per handle).
+                // narrowed per handle), met with the struct's slot for a whole-object adopted view, whose facts are the
+                // object's facts.
                 st if scan::is_rust_valid(st) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
                 scan::MalformedUtf8 | scan::ExtendedUtf8 | scan::PerlValidNonAscii => None,
                 _ => {
-                    // Undecided envelope: classify, answer, and leave narrowing to the paths that hold `&mut` — a
-                    // shared backing slot for views arrives with the verbs stage.
+                    // Undecided: classify, answer, and record the certification in the shared slot where one exists —
+                    // the envelope byte itself cannot move through `&self`.
                     let (st, _) = classify_full(bytes);
+                    if let Some(a) = backing {
+                        a.narrow_scan(st.widen());
+                    }
 
                     // SAFETY: the classification just certified these exact bytes.
                     if scan::is_rust_valid(st.widen()) { Some(unsafe { str::from_utf8_unchecked(bytes) }) } else { None }
@@ -2569,15 +2581,22 @@ impl PString {
             // Every symbol of every packed alphabet is ASCII, so this is a constant rather than a question about
             // content — unlike the inline forms, whose bytes are whatever they are.
             RawParts::Packed(_) => true,
-            RawParts::View { bytes, scan } => match scan {
+            RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 scan::Ascii => true,
                 st if scan::is_known_non_ascii(st) => false,
 
-                // Undecided envelope: probe without narrowing — the byte cannot move through `&self`, and a shared
-                // backing slot for views arrives with the verbs stage.
+                // Undecided: probe, and record the answer in the shared slot where one exists — the envelope byte
+                // itself cannot move through `&self`.
                 _ => {
                     count_probe_byte();
-                    bytes.iter().all(u8::is_ascii)
+                    let ascii = bytes.iter().all(u8::is_ascii);
+                    if let Some(a) = backing
+                        && ascii
+                    {
+                        a.narrow_scan(scan::Ascii);
+                    }
+
+                    ascii
                 }
             },
             RawParts::Heap(cb) => match cb.scan() {
@@ -2859,7 +2878,7 @@ impl PString {
 
             // A view carries no count of its own (§2.2.15): zero is the unfilled sentinel, and classification rides the
             // copy as it does for the shared-heap arm above.
-            RawParts::View { bytes, scan } => heap_parts_transitioned(bytes, scan, 0)?,
+            RawParts::View { bytes, scan, .. } => heap_parts_transitioned(bytes, scan, 0)?,
             RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Borrowed { .. } => return Ok(()),
         };
         *self = PString::build_heap(self.is_utf8(), self.is_tainted(), parts);
@@ -2873,12 +2892,19 @@ impl PString {
             RawParts::Inline { .. } => !matches!(self.inline_class(), Some(InlineClass::Bytes)),
             RawParts::Packed(_) => true, // ASCII is valid under every reading.
             RawParts::Borrowed { scan, .. } => scan::is_perl_decodable(scan.widen()),
-            RawParts::View { bytes, scan } => match scan {
+            RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 st if scan::is_perl_decodable(st) => true,
                 scan::MalformedUtf8 => false,
 
-                // Undecided envelope: classify and answer; narrowing waits for the verbs stage's shared slot.
-                _ => scan::is_perl_decodable(classify_full(bytes).0.widen()),
+                // Undecided: classify and answer, recording the certification in the shared slot where one exists.
+                _ => {
+                    let st = classify_full(bytes).0.widen();
+                    if let Some(a) = backing {
+                        a.narrow_scan(st);
+                    }
+
+                    scan::is_perl_decodable(st)
+                }
             },
             RawParts::Heap(cb) => match cb.scan() {
                 st if scan::is_perl_decodable(st) => true,
@@ -2920,14 +2946,34 @@ impl PString {
                 }
             }
 
-            // A view carries no count (§2.2.15): the envelope answers where it can, and the rest derives on demand.
-            RawParts::View { bytes, scan } => match scan {
+            // A view carries no count of its own (§2.2.15): a whole-object adopted view reads and fills the struct's
+            // cache — zero the unfilled sentinel — and sub-views derive on demand.
+            RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 _ if bytes.is_empty() => Some(0),
                 scan::Ascii => Some(bytes.len()),
                 scan::MalformedUtf8 => None,
                 _ => {
+                    if let Some(a) = backing {
+                        let cached = a.char_count();
+                        if cached != 0 {
+                            return Some(cached);
+                        }
+                    }
+
                     let (st, chars) = classify_full(bytes);
-                    if st.widen() == scan::MalformedUtf8 { None } else { Some(chars) }
+                    if let Some(a) = backing {
+                        a.narrow_scan(st.widen());
+                    }
+
+                    if st.widen() == scan::MalformedUtf8 {
+                        None
+                    } else {
+                        if let Some(a) = backing {
+                            a.set_char_count(chars);
+                        }
+
+                        Some(chars)
+                    }
                 }
             },
 
@@ -3489,10 +3535,14 @@ fn u24_get(bytes: &[u8; 3]) -> usize {
 enum RawParts<'a> {
     /// A view's bytes (§2.2.15), resolved by `raw_parts` itself — offset applied, `SPAN` decoded — so every consumer
     /// reads one shape.  The scan is the envelope's per-handle byte, born from the slice-birth table and possibly
-    /// non-terminal; views carry no character count, deriving on demand (§2.2.15).
+    /// non-terminal.  `backing` is the read-through handle for whole-object adopted views only (§2.2.15): their facts
+    /// are the whole object's facts, so they read the struct's shared slot and character-count cache — riding the cache
+    /// line `base` already occupies — and record what on-demand classification learns; sub-views carry `None`, since a
+    /// sub-range's facts certify nothing about the whole and view envelopes cannot propagate narrowing.
     View {
         bytes: &'a [u8],
         scan: scan::ScanState,
+        backing: Option<&'a cow_buffer::Adopted>,
     },
 
     Inline {

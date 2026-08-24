@@ -5585,3 +5585,123 @@ fn substr_is_always_uniquely_owned_and_flags_ride_both_verbs() {
     assert!(view.is_tainted(), "taint rides the view");
     assert_eq!(view, copy);
 }
+
+// ── Stage 4: the view-equals-copy oracle (§2.2.15) ────────────
+/// Every consumer surface must be unable to tell a view from its copy: same value, same answers, same renderings.
+fn view_copy_oracle(parent: &PString, offset: usize, len: usize, tag: &str) {
+    let view = parent.slice(offset, len).unwrap();
+    let copy = parent.substr(offset, len).unwrap();
+
+    assert_eq!(view, copy, "{tag}: eq");
+    assert_eq!(copy, view, "{tag}: eq is symmetric");
+    assert_eq!(view.cmp(&copy), std::cmp::Ordering::Equal, "{tag}: cmp");
+    assert_eq!(hash_of(&view), hash_of(&copy), "{tag}: hash");
+    assert_eq!(view.len(), copy.len(), "{tag}: len");
+    assert_eq!(view.char_len(), copy.char_len(), "{tag}: char_len");
+    assert_eq!(view.is_ascii(), copy.is_ascii(), "{tag}: is_ascii");
+    assert_eq!(view.is_perl_utf8_valid(), copy.is_perl_utf8_valid(), "{tag}: is_perl_utf8_valid");
+
+    let mut sa = [0u8; DECODE_MAX];
+    let mut sb = [0u8; DECODE_MAX];
+    assert_eq!(view.as_bytes(&mut sa), copy.as_bytes(&mut sb), "{tag}: as_bytes");
+    assert_eq!(view.as_str(&mut sa).is_some(), copy.as_str(&mut sb).is_some(), "{tag}: as_str presence");
+    assert_eq!(view.as_str(&mut sa), copy.as_str(&mut sb), "{tag}: as_str");
+    assert_eq!(format!("{view}"), format!("{copy}"), "{tag}: Display");
+    assert_eq!(format!("{:?}", ContentDebug(&view)), format!("{:?}", ContentDebug(&copy)), "{tag}: Debug content");
+
+    let (dv, dc) = (view.downgraded().unwrap(), copy.downgraded().unwrap());
+    assert_eq!(dv.is_some(), dc.is_some(), "{tag}: downgrade presence");
+    if let (Some(a), Some(b)) = (dv, dc) {
+        assert_eq!(a, b, "{tag}: downgrade value");
+    }
+}
+
+/// Random content mixing ASCII runs, well-formed multibyte, and raw high bytes, so cuts land clean and dirty alike.
+fn oracle_content(seed: &mut u64, len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len + 4);
+    while v.len() < len {
+        match splitmix(seed) % 5 {
+            0 => v.extend_from_slice(&[0xC3, 0xA9]),
+            1 => v.push((splitmix(seed) % 0x80) as u8),
+            2 => v.extend_from_slice("汉".as_bytes()),
+            3 => v.push(0x80 | (splitmix(seed) & 0x3F) as u8),
+            _ => v.extend_from_slice(b"plain"),
+        }
+    }
+
+    v.truncate(len);
+    v
+}
+
+#[test]
+fn the_oracle_holds_across_the_native_families() {
+    let mut seed = 0x04AC_1E01_u64;
+    for (iterations, min, spread, label) in [(150u32, 40usize, 200usize, "heap8"), (100, 300, 50_000, "heap16"), (60, 70_000, 30_000, "heap32")] {
+        for i in 0..iterations {
+            let total = min + (splitmix(&mut seed) as usize % spread);
+            let mut parent = PString::from_bytes(oracle_content(&mut seed, total)).unwrap();
+            if splitmix(&mut seed).is_multiple_of(2) {
+                parent.set_utf8_for_test();
+            }
+
+            let offset = splitmix(&mut seed) as usize % total;
+            let len = splitmix(&mut seed) as usize % (total - offset + 1);
+            view_copy_oracle(&parent, offset, len, &format!("{label}[{i}] {offset}+{len}/{total}"));
+        }
+    }
+}
+
+#[test]
+fn the_oracle_holds_across_the_adopted_families_and_composition() {
+    let mut seed = 0xADD_04AC_1E02_u64;
+    let total = 200_000usize;
+    let whole = PString::adopted_whole(cow_buffer::Adopted::adopt_vec(oracle_content(&mut seed, total), scan::Unknown).unwrap(), false, false);
+
+    for i in 0..100u32 {
+        let offset = splitmix(&mut seed) as usize % total;
+        let len = splitmix(&mut seed) as usize % (total - offset + 1);
+        view_copy_oracle(&whole, offset, len, &format!("adopted[{i}] {offset}+{len}"));
+    }
+
+    // Composition: a random view re-sliced, oracled against the whole at composed coordinates.
+    for i in 0..40u32 {
+        let offset = splitmix(&mut seed) as usize % (total / 2);
+        let len = total / 4 + (splitmix(&mut seed) as usize % (total / 4));
+        let view = whole.slice(offset, len).unwrap();
+        let sub_off = splitmix(&mut seed) as usize % len;
+        let sub_len = splitmix(&mut seed) as usize % (len - sub_off + 1);
+        assert_eq!(view.slice(sub_off, sub_len).unwrap(), whole.substr(offset + sub_off, sub_len).unwrap(), "composed[{i}]");
+    }
+}
+
+#[test]
+fn the_oracle_holds_at_far_offsets_and_the_large_case() {
+    let mut seed = 0xFA20_u64;
+    let total = 17 * 1024 * 1024;
+    let parent = PString::from_bytes(oracle_content(&mut seed, total)).unwrap();
+    assert_eq!(parent.storage_type(), StorageType::Heap32);
+
+    for i in 0..12u32 {
+        let offset = 16_800_000 + (splitmix(&mut seed) as usize % 100_000);
+        let len = splitmix(&mut seed) as usize % 60_000;
+        view_copy_oracle(&parent, offset, len, &format!("far[{i}]"));
+    }
+
+    view_copy_oracle(&parent, 100, 16_900_000, "large slice");
+}
+
+#[test]
+fn whole_object_views_read_and_fill_the_struct_cache() {
+    let a = cow_buffer::Adopted::adopt_vec("héllo wörld, plainly mixed".into(), scan::Unknown).unwrap();
+    let raw = a;
+    let whole = PString::adopted_whole(a, true, false);
+
+    // SAFETY: `whole` holds a reference on the struct for these reads.
+    unsafe {
+        assert_eq!(raw.as_ref().char_count(), 0, "unfilled at birth");
+        assert_eq!(whole.char_len(), Some(26));
+        assert_eq!(raw.as_ref().char_count(), 26, "the derivation filled the whole-object cache");
+        assert_ne!(raw.as_ref().scan(), scan::Unknown, "the classification narrowed the shared slot");
+        assert_eq!(whole.char_len(), Some(26), "the second ask is the cache read");
+    }
+}
