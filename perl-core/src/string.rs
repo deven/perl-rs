@@ -134,19 +134,18 @@ unsafe fn small_backing_release(ptr: std::ptr::NonNull<u8>, cap: usize) {
 /// range.  The same factor, arrived at from opposite directions — one packing two units into a byte, the other refusing
 /// to let one unit take two.  Raw forms compress not at all and are trivially under the bound.
 ///
-/// So this is correct by construction rather than by measuring the cases, and it is a constraint on what may be added
-/// later: a non-heap encoding compressing more than 2:1 would overflow every scratch buffer in the crate.
+/// So today's value is correct by construction rather than by measuring the cases.  The definition below is the
+/// **maximum over the envelope families' decode ceilings** rather than a hardcoded factor, deliberately: a future
+/// family may compress beyond 2:1 — a format whose fixed punctuation is implied by position decodes more characters
+/// than it stores nibbles — and defining the maximum as a maximum means such a family raises this constant and every
+/// scratch sized by it in the same edit that adds its ceiling to the list, with no silent shortfall possible.
 ///
-/// Read from the producer side, the same number is the **envelope representability ceiling**: the maximum logical
-/// byte length any envelope-resident form can possibly represent, and so the bound past which the envelope ladder
-/// is not worth attempting.  Representability inside the ceiling stays conditional — only lengths up to
-/// `INLINE_MAX` are unconditional, and longer content needs a compressed form to admit it — so the constant bounds
-/// where the ladder may succeed, never what it yields.
-pub const DECODE_MAX: usize = INLINE_MAX * 2;
-
-// The packed ceiling is an independent design quantity that happens to coincide; if an alphabet ever reached
-// further, the scratch buffers and the ceiling would both have to grow, and this assert forces the revisit.
-const _: () = assert!(DECODE_MAX == MAX_PACKED_LEN);
+/// Read from the producer side, the same number is the **envelope representability ceiling**: the maximum logical byte
+/// length any envelope-resident form can possibly represent, and so the bound past which the envelope ladder is not
+/// worth attempting.  Representability inside the ceiling stays conditional — only lengths up to `INLINE_MAX` are
+/// unconditional, and longer content needs a compressed form to admit it — so the constant bounds where the ladder may
+/// succeed, never what it yields.
+pub const DECODE_MAX: usize = if 2 * INLINE_MAX > MAX_PACKED_LEN { 2 * INLINE_MAX } else { MAX_PACKED_LEN };
 
 /// The heap scan lattice (§2.2.4): terminal states live typed in the small tiers' envelopes, and the large tiers keep
 /// an atomic byte in the allocation header.  Zero is `UNKNOWN`, the lattice top — the natural zero-initialized state
@@ -4448,17 +4447,17 @@ impl fmt::Debug for PString {
 //   DateTimeZulu, so equal byte contents always take equal representations — the prerequisite for representation-level
 //   equality.
 
-/// The packed-tier capacity in characters: 15 nibble bytes, two characters each.
-const MAX_PACKED_LEN: usize = 30;
+/// The nibble-array width in bytes: the envelope payload itself, the same fifteen bytes every inline form spans.
+const PACKED_BYTES: usize = INLINE_MAX;
 
-/// The shortest content this tier holds.  Content of 15 characters or fewer takes an inline form instead (§2.2.9), so
-/// the packed forms hold exactly 16-30 characters.  The band is established by the tier selector, the only path that
-/// constructs strings; `pack` states it as a precondition rather than checking it.  It is also what lets the stored
-/// length occupy four bits: only the low nibble varies across 16-29.
-const MIN_PACKED_LEN: usize = 16;
+/// The packed-tier capacity in characters: two characters per nibble byte over the whole payload.
+const MAX_PACKED_LEN: usize = 2 * PACKED_BYTES;
 
-/// The nibble-array width in bytes.
-const PACKED_BYTES: usize = MAX_PACKED_LEN / 2;
+/// The shortest content this tier holds.  Content the inline forms can carry verbatim takes them instead (§2.2.9),
+/// so the packed forms hold exactly 16-30 characters.  The band is established by the tier selector, the only path
+/// that constructs strings; `pack` states it as a precondition rather than checking it.  It is also what lets the
+/// stored length occupy four bits: only the low nibble varies across 16-29.
+const MIN_PACKED_LEN: usize = INLINE_MAX + 1;
 
 /// The nibble index holding the stored length, for content shorter than the capacity.
 const LENGTH_NIBBLE: usize = MAX_PACKED_LEN - 1;
