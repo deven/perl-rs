@@ -2492,6 +2492,126 @@ into a *tainted* source's buffer can carry a clean tag: the
 sanctioned untaint path (§2.6.2) costs no copy — a dividend of
 the per-value/per-buffer criterion that both view forms inherit.
 
+#### 2.2.16 Packed identifiers: UUIDs and hex-byte strings [DECISION]
+
+Fixed-structure identifiers pack into the envelope by shaving the
+bits their structure implies rather than storing them.  Every form
+in this section is optional capacity, never semantics: a value
+that misses a family's pattern — wrong case mix, wrong punctuation,
+out-of-range field, unrecognized layout — takes ordinary storage
+exactly as it would without the family, so nothing here can change
+what a value means, only where it lives.
+
+**Packed UUIDs.**  A canonical hyphenated UUID is 36 characters:
+32 hex digits whose four hyphens sit at fixed positions and whose
+version and variant fields are constrained by RFC 9562.  The
+payload's 120 bits carry what varies; reconstruction supplies the
+hyphens, the version nibble, and the fixed variant bits.  The
+version families:
+
+Shards for the hash forms, fixed bits for the time forms — each
+the cheaper trade for its distribution: fixing bits on a hash
+forfeits three quarters of real instances, while fixing timestamp
+bits forfeits only dates past the ranges below.
+
+- **v4** (random) and **v3/v5** (namespace hash): 128 bits minus
+  the version nibble minus the variant nibble is exactly 120, and
+  the variant nibble's two data bits ride four discriminant
+  shards, giving full coverage — shards carry two bits of any
+  distribution, structure or none.
+- **v1 and v6** (Gregorian timestamp): the top two timestamp bits
+  are required zero, which holds through roughly 2496.
+- **v7** (Unix-millisecond timestamp): the top two timestamp bits
+  are required zero, which holds through roughly 4199.
+
+No `Full` twins: the length is fixed, so there is nothing for a
+length family to reclaim.  Standard fused utf8 and taint twins,
+as every packed family carries [DECISION]: spill preserves Perl
+behavior exactly either way — the flag survives on the heap — but
+twins extend the packing to flagged values, and regex captures
+from decoded text, the common source of flagged ASCII, make those
+a mainstream case rather than a corner.  `taint()` stays an
+infallible tag transition (§2.6.1).  Case is a whole-string
+property selecting the family; the initial scope is lowercase
+(60 variants: sixteen each for v4, v3, and v5; four each for v1,
+v6, and v7), with uppercase deferred until the occupancy counters
+show the legacy constituency — `Data::UUID` emits uppercase —
+actually appearing in workloads.  Full uppercase costs 60 more,
+which presses the ceiling; partial uppercase (v4 and v7, twenty)
+is the likelier shape if evidence arrives.
+
+GUIDs need nothing separate: the string form is identical, and
+the binary layout's endianness never reaches a string.  Legacy
+Microsoft-variant and NCS-variant patterns, mixed case, braces,
+`urn:uuid:` prefixes, and unhyphenated spellings all spill.
+Unhyphenated UUIDs are the recorded next candidate — the version
+and variant nibbles are present in the hex, so the same codec
+applies with a presentation family per version — evidence-gated
+on the same counters.
+
+**PackedHexBytes.**  A variable-length hex string of D digits,
+byte-separated, plain, or prefixed.  Fourteen payload bytes hold
+the ⌈D/2⌉ data bytes; the floors per spelling (separated D ≥ 12,
+plain D ≥ 16, `0x` D ≥ 14) are selection facts the first-fit
+order enforces, not encoding cases.  The fifteenth byte holds two
+nibbles:
+
+- **Length nibble**: all sixteen codes carry the digit count by
+  the formula *zero means 12, otherwise 13 plus the code* —
+  covering 12 and 14 through 28, with the single hole at 13.
+  Every format admits every count its rendering can express:
+  digits pair left to right, a separated spelling carrying a
+  trailing lone digit for an odd count.  The hole sits at 13
+  because that is where it costs least — plain and prefixed
+  thirteens are inline, and only the separated thirteen-digit
+  spellings, a rarity of a rarity, spill for it.  An odd count
+  zeroes its trailing nibble under the standing rule that every
+  envelope form zeroes its unused payload by construction.  With
+  every code meaningful, no length code is loud: validation
+  lives wholly in classification.
+- **Variation nibble**: a three-bit format code and one case bit.
+  Five codes are assigned — colon, hyphen, none, space, and a
+  `0x` prefix written once before plain digits — and three are
+  unassigned and loud, on the length nibble's polarity, until a
+  format earns one.  Recorded candidates: dotted four-digit
+  grouping, and the per-byte `0x` spellings with space or comma.
+  A prefix is a format, not an orthogonal property: each spelling
+  takes a code, and a format's admissible range is a
+  classification fact it may narrow — the per-byte spellings
+  render at 5D/2 − 1 characters, 69 at D=28, so assigning one
+  moves the decode ceiling and may warrant a narrower range.
+
+The none-separator code makes this family the hex alphabet:
+uniform-case plain hex from 16 to 28 digits, even or odd, packs
+here at the same density nibble alphabets would give, so no
+standalone hex alphabet pair is added — the residue is the 29-
+and 30-digit spellings, unreachable in twenty-eight nibble slots,
+and the separated thirteens at the hole.  The family
+sits after `PackedNumeric` and the datetime alphabets in the
+selection order, since digit strings are valid hex.  Standard
+fused utf8 and taint twins in the tag: four variants.  The
+17-character colon form is the MAC address, ubiquitous as hash
+keys in the network-management Perl this family chiefly serves.
+
+**Arithmetic.**  Hex-bytes 4, UUIDs 60 (120 with full
+uppercase): the tag moves from 124 to 188 of 256, or 248 with
+full uppercase — the pressure behind the partial-uppercase note
+above.  The
+decode ceilings — 36 for UUIDs, 41 for the N=14 colon and space
+forms — join `DECODE_MAX`'s maximum as each family lands, growing
+every scratch in the same edit.
+
+**What cannot pack**, recorded so it is not relitigated:
+arbitrary 128-bit values need all sixteen envelope bytes, leaving
+none for the tag; ULIDs carry 128 bits with no fixed bits to
+shave, and truncating their timestamp as v7 does ran out of range
+in 2004; KSUIDs are 160 bits; MD5 and every real hash digest
+(32+ hex digits) exceed both the alphabet band and, at 128 bits
+with nothing fixed, the payload; Base64 is rejected — a six-bit
+codec with padding and alphabet variants for a 16–20-character
+band, whose marquee 22-character case misses anyway.
+
+
 ### 2.3 Promoted Scalars
 
 #### 2.3.1 `Referent` — shared identity:
