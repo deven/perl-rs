@@ -6027,3 +6027,51 @@ fn hex_flags_ride_the_twins_and_appends_exit_or_complete() {
     assert_eq!(r.storage_type(), StorageType::PackedHexBytes, "the ladder recognizes the completed spelling");
     assert_eq!(r, PString::from_bytes(*s).unwrap());
 }
+
+// ── The inline-first invariant (§2.2.9's ladder) ──────────────
+#[test]
+fn nothing_representable_inline_ever_packs() {
+    // The packed families exist to hold what the payload cannot (§2.2.9): every content the inline forms can carry
+    // takes them, whatever alphabet or identifier spelling it would otherwise qualify for.
+    for src in [
+        "1234567890123456",  // PackedNumeric at sixteen
+        "2026-07-28T14:33",  // PackedDateTimePlus
+        "2026-07-28T14:33Z", // PackedDateTimeZulu
+        "1e2e3e4e5e6e7e8e",  // the exponent letters, which are the alphabets' own
+        "deadbeefdeadbeef",  // PackedHexBytes, plain
+        "00:1a:2b:33:44:55", // PackedHexBytes, separated
+        "0xdeadbeefdeadbe",  // PackedHexBytes, prefixed
+        "0123456789abcdef",  // every hex digit
+    ] {
+        for n in 0..=INLINE_MAX.min(src.len()) {
+            let head = &src.as_bytes()[..n];
+            let p = PString::from_bytes(head).unwrap();
+            let st = format!("{:?}", p.storage_type());
+            assert!(st.starts_with("Inline"), "{n} bytes of {src:?} took {st}, not an inline form");
+
+            let mut sc = [0u8; DECODE_MAX];
+            assert_eq!(p.as_bytes(&mut sc), head, "and holds its content exactly");
+        }
+    }
+
+    // The band opens exactly one byte past the payload: the same content at sixteen packs.
+    for src in ["1234567890123456", "2026-07-28T14:33", "deadbeefdeadbeef", "0xdeadbeefdeadbe"] {
+        let p = PString::from_bytes(src.as_bytes()).unwrap();
+        assert!(format!("{:?}", p.storage_type()).starts_with("Packed"), "{src} should pack at sixteen");
+    }
+}
+
+#[test]
+fn compressible_content_reaches_the_envelope_through_both_verbs() {
+    // A Latin-1 cut compresses to well under the payload, so representability — not a byte count — decides (§2.2.15).
+    // A view here would pin the whole backing for content a free envelope copy holds.
+    let source = PString::from_bytes([&[0xC3u8, 0xA9].repeat(10)[..], &b"z".repeat(40)[..]].concat()).unwrap();
+    assert!(source.storage_type().is_heap(), "a shareable backing exists to be pinned");
+
+    let sliced = source.slice(0, 20).unwrap();
+    let copied = source.substr(0, 20).unwrap();
+    assert_eq!(sliced.storage_type(), StorageType::InlineLatin1, "twenty logical bytes compress to ten stored");
+    assert_eq!(copied.storage_type(), StorageType::InlineLatin1, "and the copying verb agrees");
+    assert_eq!(sliced, copied);
+    assert!(!sliced.is_shared(), "nothing is pinned");
+}

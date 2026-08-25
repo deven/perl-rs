@@ -2988,9 +2988,11 @@ impl PString {
             let mut scratch = [0u8; DECODE_MAX];
             if len <= DECODE_MAX {
                 let bytes = &self.as_bytes(&mut scratch)[offset..offset + len];
-                if len <= INLINE_MAX
-                    && let Some((class, s, aux, buf)) = classify_inline(bytes)
-                {
+
+                // Representability, never a byte count (§2.2.15): `classify_inline` is the authority, and it holds
+                // compressible content well past the payload width — a length pre-filter here would send a twenty-byte
+                // Latin-1 cut to a view, pinning a whole buffer where a free envelope copy existed.
+                if let Some((class, s, aux, buf)) = classify_inline(bytes) {
                     return Ok(PString::build_inline(class, utf8, tainted, s, aux, buf));
                 }
 
