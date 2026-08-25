@@ -1071,15 +1071,55 @@ pub enum StorageType {
 }
 
 impl StorageType {
-    /// Any of the ten inline types.
+    /// Any of the ten inline types: content the payload carries verbatim or Latin-1-compressed.  A positive match, not
+    /// the complement of the others — the immortal images and the §2.2.15 views are none of the three, so a complement
+    /// would claim them.
     pub fn is_inline(self) -> bool {
-        !self.is_packed() && !self.is_heap()
+        use StorageType::*;
+        matches!(
+            self,
+            InlineAscii
+                | InlineAsciiFull
+                | InlineLatin1
+                | InlineLatin1Full
+                | InlineNonLatin1
+                | InlineNonLatin1Full
+                | InlineExtended
+                | InlineExtendedFull
+                | InlineBytes
+                | InlineBytesFull
+        )
     }
 
-    /// Any of the six packed types.
+    /// Any of the twenty-two packed types: the six nibble alphabets and the §2.2.16 identifier families, whose content
+    /// is encoded into the payload rather than stored there.
     pub fn is_packed(self) -> bool {
         use StorageType::*;
-        matches!(self, PackedNumeric | PackedNumericFull | PackedDateTimePlus | PackedDateTimePlusFull | PackedDateTimeZulu | PackedDateTimeZuluFull)
+        matches!(
+            self,
+            PackedNumeric
+                | PackedNumericFull
+                | PackedDateTimePlus
+                | PackedDateTimePlusFull
+                | PackedDateTimeZulu
+                | PackedDateTimeZuluFull
+                | PackedUuidV1
+                | PackedUuidV3S0
+                | PackedUuidV3S1
+                | PackedUuidV3S2
+                | PackedUuidV3S3
+                | PackedUuidV4S0
+                | PackedUuidV4S1
+                | PackedUuidV4S2
+                | PackedUuidV4S3
+                | PackedUuidV5S0
+                | PackedUuidV5S1
+                | PackedUuidV5S2
+                | PackedUuidV5S3
+                | PackedUuidV6
+                | PackedUuidV7
+                | PackedHexBytes
+        )
     }
 
     /// The heap tiers that classify eagerly, keeping their scan state in the envelope or the variant (§2.2.3).
@@ -5200,6 +5240,10 @@ impl Packed {
 /// The canonical spelling's length: the §2.2.16 UUID decode ceiling.
 pub(crate) const UUID_LEN: usize = 36;
 
+// The ladder's floor applies here too, though the length is fixed rather than gated: content the payload can carry
+// verbatim takes an inline form, and no packed family may claim it (§2.2.9).
+const _: () = assert!(UUID_LEN >= MIN_PACKED_LEN);
+
 /// The hyphen positions in the canonical spelling.
 const HYPHENS: [usize; 4] = [8, 13, 18, 23];
 
@@ -5409,10 +5453,6 @@ pub(crate) fn decode_uuid(form: UuidForm, payload: &[u8; PACKED_BYTES], out: &mu
 // 41 characters, which lie past the alphabets' thirty-character ceiling.  Classification is total over candidate bytes:
 // anything else is simply not a hex-byte string, and the value takes ordinary storage.
 
-/// The shortest rendering any format produces: sixteen characters — plain at twelve digits is inline, and the separated
-/// and prefixed floors follow the same way (§2.2.16), so the gate needs no per-format floor.
-const HEX_MIN_LEN: usize = 16;
-
 /// The longest rendering any format produces: twenty-eight digits separated is forty-one characters, the widest decode
 /// in the crate and so `DECODE_MAX`'s tallest entry.
 const HEX_MAX_LEN: usize = 41;
@@ -5468,7 +5508,10 @@ fn hex_length_code(digits: usize) -> Option<u8> {
 /// Classify a candidate as a hex-byte string of a recognized spelling, yielding the payload, or `None` for anything
 /// else — which is not a failure, merely a value the family does not serve.
 fn classify_hex_bytes(bytes: &[u8]) -> Option<[u8; PACKED_BYTES]> {
-    if !(HEX_MIN_LEN..=HEX_MAX_LEN).contains(&bytes.len()) {
+    // The floor is the ladder's, shared with the alphabets: one past what the payload carries verbatim, since hex
+    // digits are ASCII and never compress.  No per-format floor is needed on top of it — the spellings shorter than
+    // this are exactly the ones the inline forms already hold (§2.2.16).
+    if !(MIN_PACKED_LEN..=HEX_MAX_LEN).contains(&bytes.len()) {
         return None;
     }
 

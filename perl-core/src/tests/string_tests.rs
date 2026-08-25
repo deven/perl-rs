@@ -6075,3 +6075,33 @@ fn compressible_content_reaches_the_envelope_through_both_verbs() {
     assert_eq!(sliced, copied);
     assert!(!sliced.is_shared(), "nothing is pinned");
 }
+
+#[test]
+fn the_storage_projections_answer_for_every_type() {
+    // The three predicates do not partition the vocabulary: the immortal images and the §2.2.15 views belong to none of
+    // them, which is why is_inline is a positive match rather than a complement.
+    let inline = PString::from_bytes(*b"hello").unwrap();
+    assert!(inline.storage_type().is_inline());
+    assert!(!inline.storage_type().is_packed() && !inline.storage_type().is_heap());
+
+    for s in ["1234567890123456", "2026-07-28T14:33Z", "deadbeefdeadbeef", "f47ac10b-58cc-4372-a567-0e02b2c3d479"] {
+        let p = PString::from_bytes(s.as_bytes()).unwrap();
+        let st = p.storage_type();
+        assert!(st.is_packed(), "{s} is packed: {st:?}");
+        assert!(!st.is_inline(), "{s} is not inline: {st:?}");
+        assert!(!st.is_heap(), "{s} is not heap: {st:?}");
+    }
+
+    let heap = PString::from_bytes(b"z".repeat(64)).unwrap();
+    assert!(heap.storage_type().is_heap());
+    assert!(!heap.storage_type().is_inline() && !heap.storage_type().is_packed());
+
+    // An image and a view are none of the three.
+    let image = PString::from_static_bytes(b"a static image well past the inline payload width").unwrap();
+    let st = image.storage_type();
+    assert!(!st.is_inline() && !st.is_packed() && !st.is_heap(), "an image is none of the three: {st:?}");
+
+    let view = heap.slice(0, 40).unwrap();
+    let st = view.storage_type();
+    assert!(!st.is_inline() && !st.is_packed() && !st.is_heap(), "a view is none of the three: {st:?}");
+}
