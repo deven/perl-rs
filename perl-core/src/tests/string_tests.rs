@@ -5705,3 +5705,81 @@ fn whole_object_views_read_and_fill_the_struct_cache() {
         assert_eq!(whole.char_len(), Some(26), "the second ask is the cache read");
     }
 }
+
+// ── The packed-UUID codec (§2.2.16) ──────────────────────────
+fn round_trip(s: &str) -> (UuidForm, [u8; 15]) {
+    let (form, payload) = classify_uuid(s.as_bytes()).unwrap();
+    let mut out = [0u8; UUID_LEN];
+    assert_eq!(decode_uuid(form, &payload, &mut out), UUID_LEN);
+    assert_eq!(std::str::from_utf8(&out).unwrap(), s, "round trip must be exact");
+
+    (form, payload)
+}
+
+#[test]
+fn every_recognized_form_round_trips() {
+    let (f, _) = round_trip("f47ac10b-58cc-4372-a567-0e02b2c3d479");
+    assert_eq!(f, UuidForm::V4(0b10), "variant digit a is data bits 10");
+
+    let (f, _) = round_trip("017f22e2-79b0-7cc3-98c4-dc0c0c07398f");
+    assert_eq!(f, UuidForm::V7);
+
+    let (f, _) = round_trip("2f1a0e9c-5d1b-11ee-8c99-0242ac120002");
+    assert_eq!(f, UuidForm::V1);
+
+    let (f, _) = round_trip("1ee5d1b2-f1a0-6e9c-8c99-0242ac120002");
+    assert_eq!(f, UuidForm::V6);
+
+    let (f, _) = round_trip("a3bb189e-8bf9-3888-9912-ace4e6543002");
+    assert_eq!(f, UuidForm::V3(0b01));
+
+    let (f, _) = round_trip("74738ff5-5367-5958-9aee-98fffdcd1876");
+    assert_eq!(f, UuidForm::V5(0b01));
+}
+
+#[test]
+fn every_shard_and_every_variant_digit_survives() {
+    for (digit, bits) in [(b'8', 0b00u8), (b'9', 0b01), (b'a', 0b10), (b'b', 0b11)] {
+        let s = format!("f47ac10b-58cc-4372-{}567-0e02b2c3d479", digit as char);
+        let (form, payload) = classify_uuid(s.as_bytes()).unwrap();
+        assert_eq!(form, UuidForm::V4(bits));
+
+        let mut out = [0u8; UUID_LEN];
+        decode_uuid(form, &payload, &mut out);
+        assert_eq!(out[19], digit, "the variant digit is the shard's to restore");
+    }
+}
+
+#[test]
+fn the_time_ranges_gate_exactly() {
+    // v7: the top two bits of the first digit are the range.  3 = 0b0011 passes; 4 = 0b0100 spills.
+    assert!(classify_uuid(b"3fffffff-ffff-7fff-bfff-ffffffffffff").is_some());
+    assert!(classify_uuid(b"4fffffff-ffff-7fff-bfff-ffffffffffff").is_none(), "past roughly 4199: spills");
+
+    // v1: digit 13 carries the range, the timestamp running low-first.
+    assert!(classify_uuid(b"2f1a0e9c-5d1b-13ee-8c99-0242ac120002").is_some());
+    assert!(classify_uuid(b"2f1a0e9c-5d1b-14ee-8c99-0242ac120002").is_none(), "past roughly 2496: spills");
+
+    // v6 reorders most-significant-first: digit 0 carries the same range.
+    assert!(classify_uuid(b"3ee5d1b2-f1a0-6e9c-8c99-0242ac120002").is_some());
+    assert!(classify_uuid(b"4ee5d1b2-f1a0-6e9c-8c99-0242ac120002").is_none(), "the same 2496 gate, at v6's digit");
+}
+
+#[test]
+fn everything_noncanonical_spills() {
+    assert!(classify_uuid(b"F47AC10B-58CC-4372-A567-0E02B2C3D479").is_none(), "uppercase: initial scope is lowercase");
+    assert!(classify_uuid(b"f47ac10b-58cc-4372-A567-0e02b2c3d479").is_none(), "mixed case");
+    assert!(classify_uuid(b"f47ac10b_58cc_4372_a567_0e02b2c3d479").is_none(), "wrong separators");
+    assert!(classify_uuid(b"f47ac10b58cc4372a5670e02b2c3d479").is_none(), "unhyphenated: recorded candidate, not this form");
+    assert!(classify_uuid(b"{f47ac10b-58cc-4372-a567-0e02b2c3d479").is_none(), "braces");
+    assert!(classify_uuid(b"f47ac10b-58cc-2372-a567-0e02b2c3d479").is_none(), "unrecognized version");
+    assert!(classify_uuid(b"f47ac10b-58cc-4372-c567-0e02b2c3d479").is_none(), "non-RFC variant: legacy layouts spill");
+    assert!(classify_uuid(b"f47ac10b-58cc-4372-a567-0e02b2c3d47").is_none(), "wrong length");
+}
+
+#[test]
+fn payloads_of_distinct_uuids_differ_and_zero_nothing_silently() {
+    let (_, a) = classify_uuid(b"f47ac10b-58cc-4372-a567-0e02b2c3d479").unwrap();
+    let (_, b) = classify_uuid(b"f47ac10b-58cc-4372-a567-0e02b2c3d478").unwrap();
+    assert_ne!(a, b);
+}

@@ -4876,6 +4876,191 @@ impl Packed {
     }
 }
 
+// ─── The packed-UUID codec (§2.2.16) ────────────────────────────────────────────────────────────────────────────────
+//
+// Classification into a version form and a 15-byte payload, and reconstruction of the canonical 36-character spelling.
+// A canonical hyphenated UUID is 36 characters: 32 hex digits with hyphens at positions 8, 13, 18, and 23.  Of its 128
+// bits, the version nibble (digit 12) and the variant nibble's high two bits (digit 16 is `10xx`) are implied by the
+// form, and each version family fixes or shards two further bits (§2.2.16), leaving exactly 120 — the payload.  The
+// nibble layout is the spelling's own order with the implied nibbles removed:
+//
+// - v4, v3, v5 (shard forms): the 30 data nibbles in digit order, skipping digit 12 (version) and digit 16 (variant)
+//   entirely; the variant's two data bits ride the tag shard.
+// - v1, v6 (Gregorian): the top four timestamp bits sit at digit 13 for v1 — its timestamp runs low-first, the high
+//   twelve bits landing after the version — and at digit 0 for v6, which reorders the same timestamp
+//   most-significant-first.  That digit's top two bits are required zero (§2.2.16: through roughly 2496), and its two
+//   live bits fuse with the variant's two data bits into one nibble — variant bits high, timestamp bits low — standing
+//   where the digit stood; digits 12 and 16 are skipped.
+// - v7 (Unix-millisecond): digit 0 carries the top four timestamp bits, top two required zero (§2.2.16: through roughly
+//   4199), fused the same way and standing where digit 0 stood; digits 12 and 16 are skipped.
+//
+// Every form therefore stores exactly 30 nibbles in 15 bytes through the packed tier's own nibble helpers, and decoding
+// reverses the same walk.  Classification is total over candidate bytes: anything that is not a canonical lowercase
+// spelling of a recognized form is simply not a packed UUID, and the value takes ordinary storage (§2.2.16: the forms
+// are capacity, never semantics).
+
+/// The canonical spelling's length: the §2.2.16 UUID decode ceiling.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const UUID_LEN: usize = 36;
+
+/// The hyphen positions in the canonical spelling.
+const HYPHENS: [usize; 4] = [8, 13, 18, 23];
+
+/// A recognized packed-UUID form: the version family, with the variant nibble's two data bits alongside where the
+/// family shards them (§2.2.16: shards for the hash forms, fixed bits for the time forms — the time forms carry those
+/// two bits inside the payload instead).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum UuidForm {
+    V1,
+    V3(u8),
+    V4(u8),
+    V5(u8),
+    V6,
+    V7,
+}
+
+/// Classify a candidate as a canonical lowercase UUID of a recognized form, yielding the form and the 15-byte payload,
+/// or `None` for anything else — which is not a failure, merely a value the family does not serve.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_uuid(bytes: &[u8]) -> Option<(UuidForm, [u8; PACKED_BYTES])> {
+    if bytes.len() != UUID_LEN {
+        return None;
+    }
+
+    // The 32 data nibbles in digit order, hyphens checked by position.  Uppercase fails here: the initial scope is
+    // lowercase (§2.2.16), and mixed case must fail regardless.
+    let mut nibbles = [0u8; 32];
+    let mut d = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if HYPHENS.contains(&i) {
+            if b != b'-' {
+                return None;
+            }
+
+            continue;
+        }
+
+        nibbles[d] = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => return None,
+        };
+        d += 1;
+    }
+
+    // The variant nibble must be the RFC `10xx` shape; its two data bits are what the forms carry.
+    let variant = nibbles[16];
+    if variant & 0b1100 != 0b1000 {
+        return None;
+    }
+    let variant_bits = variant & 0b0011;
+
+    match nibbles[12] {
+        // Shard forms: drop digits 12 and 16; the variant bits become the shard.
+        3 => Some((UuidForm::V3(variant_bits), pack_skipping(&nibbles, None))),
+        4 => Some((UuidForm::V4(variant_bits), pack_skipping(&nibbles, None))),
+        5 => Some((UuidForm::V5(variant_bits), pack_skipping(&nibbles, None))),
+
+        // Time forms: the fused nibble stands where the range-checked digit stood.
+        1 => pack_time(&nibbles, 13, variant_bits).map(|p| (UuidForm::V1, p)),
+        6 => pack_time(&nibbles, 0, variant_bits).map(|p| (UuidForm::V6, p)),
+        7 => pack_time(&nibbles, 0, variant_bits).map(|p| (UuidForm::V7, p)),
+        _ => None,
+    }
+}
+
+/// Pack the 30 stored nibbles for a time form: the digit at `top` must have its top two bits zero (the §2.2.16 range
+/// requirement), and the fused nibble — variant bits high, the digit's live bits low — stands in its place.
+fn pack_time(nibbles: &[u8; 32], top: usize, variant_bits: u8) -> Option<[u8; PACKED_BYTES]> {
+    if nibbles[top] & 0b1100 != 0 {
+        return None;
+    }
+
+    let mut fused = *nibbles;
+    fused[top] = (variant_bits << 2) | nibbles[top];
+    Some(pack_skipping(&fused, Some(top)))
+}
+
+/// Pack digit order into 15 bytes, high nibble first, always skipping digits 12 and 16.  For the shard forms the
+/// substituted position is `None` and the walk is the plain skip; the time forms pass their fused digit through
+/// unchanged by position.
+fn pack_skipping(nibbles: &[u8; 32], _fused_at: Option<usize>) -> [u8; PACKED_BYTES] {
+    let mut payload = [0u8; PACKED_BYTES];
+    let mut out = 0;
+    for (i, &n) in nibbles.iter().enumerate() {
+        if i == 12 || i == 16 {
+            continue;
+        }
+
+        set_nibble(&mut payload, out, n);
+        out += 1;
+    }
+
+    payload
+}
+
+/// Reconstruct the canonical lowercase spelling into `out`, returning the written length (always [`UUID_LEN`]).  The
+/// inverse of [`classify_uuid`] by construction, which the round-trip tests pin.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_uuid(form: UuidForm, payload: &[u8; PACKED_BYTES], out: &mut [u8]) -> usize {
+    // Unpack the 30 stored nibbles.
+    let mut stored = [0u8; 30];
+    for (i, slot) in stored.iter_mut().enumerate() {
+        *slot = nibble_at(payload, i);
+    }
+
+    // Rebuild the 32 digit nibbles: reinsert the version at 12 and the variant at 16, and split any fused digit.
+    let (version, variant_bits, fused_at) = match form {
+        UuidForm::V1 => (1, None, Some(13)),
+        UuidForm::V3(v) => (3, Some(v), None),
+        UuidForm::V4(v) => (4, Some(v), None),
+        UuidForm::V5(v) => (5, Some(v), None),
+        UuidForm::V6 => (6, None, Some(0)),
+        UuidForm::V7 => (7, None, Some(0)),
+    };
+
+    let mut nibbles = [0u8; 32];
+    let mut src = 0;
+    for (i, slot) in nibbles.iter_mut().enumerate() {
+        if i == 12 || i == 16 {
+            continue;
+        }
+
+        *slot = stored[src];
+        src += 1;
+    }
+
+    nibbles[12] = version;
+    let variant_bits = match (variant_bits, fused_at) {
+        (Some(v), _) => v,
+        (None, Some(at)) => {
+            let fused = nibbles[at];
+            nibbles[at] = fused & 0b0011;
+            fused >> 2
+        }
+
+        // Unreachable by the form table above; zero keeps the function total.
+        (None, None) => 0,
+    };
+    nibbles[16] = 0b1000 | variant_bits;
+
+    // Render: 32 hex digits with the four hyphens by position.
+    let mut d = 0;
+    for (i, o) in out.iter_mut().take(UUID_LEN).enumerate() {
+        if HYPHENS.contains(&i) {
+            *o = b'-';
+            continue;
+        }
+
+        let n = nibbles[d];
+        *o = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+        d += 1;
+    }
+
+    UUID_LEN
+}
+
 // ─── The slicing mints (§2.2.15) ─────────────────────────────────────────────────────────────────────────────────────
 
 /// Mint a view of a Heap32 buffer under the ruled selection: far while the length fits u16, medium for the band only it
