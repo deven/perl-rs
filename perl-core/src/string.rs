@@ -3650,11 +3650,13 @@ impl PString {
         }
 
         let (u, t) = (self.is_utf8(), self.is_tainted());
-        let old = mem::take(self);
 
-        *self = match old.into_raw() {
-            RawOwned::Inline { .. } => return Ok(()), // Handled above; unreachable.
-            RawOwned::Packed(p) => {
+        // The replacement is built while `self` still owns itself, so a failure below leaves the value exactly as it
+        // was — the honest meaning of a failed append — and the old allocation is released by the assignment at the end
+        // rather than by a transport that would have to be unwound on every error path.
+        let replacement = match self.raw_parts() {
+            RawParts::Inline { .. } => return Ok(()), // Handled above; unreachable.
+            RawParts::Packed(p) => {
                 if let Some(packed) = p.push(bytes) {
                     // In place: the existing nibbles are kept, rather than the whole result being decoded and
                     // re-encoded on every append.
@@ -3663,138 +3665,39 @@ impl PString {
                     // Past the band, or no longer alphabet-conformant: decode once, on the way out of the tier.  Packed
                     // content is ASCII, so the heap state starts from there.
                     let (decoded, len) = p.unpack();
-                    let old_bytes = &decoded[..len];
-                    let new_len = len + bytes.len();
-                    let mut joined = Vec::new();
-                    joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
-                    joined.extend_from_slice(old_bytes);
-                    joined.extend_from_slice(bytes);
-                    let state = append_transition_heap(scan::Ascii, kind);
-                    PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                    PString::build_heap(u, t, joined_parts(&decoded[..len], bytes, scan::Ascii, kind, 0)?)
                 }
             }
-            RawOwned::Uuid { form, payload } => {
+            RawParts::Uuid { form, payload } => {
                 // An append leaves the canonical spelling, so the value always exits the family: decode once, on the
                 // way out, ASCII seeding the heap state as the packed tier's exit does.
                 let mut decoded = [0u8; DECODE_MAX];
-                let len = decode_uuid(form, &payload, &mut decoded);
-                let new_len = len + bytes.len();
-                let mut joined = Vec::new();
-                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
-                joined.extend_from_slice(&decoded[..len]);
-                joined.extend_from_slice(bytes);
-                let state = append_transition_heap(scan::Ascii, kind);
-                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                let len = decode_uuid(form, payload, &mut decoded);
+                PString::build_heap(u, t, joined_parts(&decoded[..len], bytes, scan::Ascii, kind, 0)?)
             }
-            RawOwned::Hex { payload } => {
+            RawParts::Hex { payload } => {
                 // An append may or may not leave a hex spelling; the combined attempt above already tried the ladder,
                 // so reaching here means it did.  Same exit as the packed tier's.
                 let mut decoded = [0u8; DECODE_MAX];
-                let len = decode_hex_bytes(&payload, &mut decoded);
-                let new_len = len + bytes.len();
-                let mut joined = Vec::new();
-                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
-                joined.extend_from_slice(&decoded[..len]);
-                joined.extend_from_slice(bytes);
-                let state = append_transition_heap(scan::Ascii, kind);
-                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                let len = decode_hex_bytes(payload, &mut decoded);
+                PString::build_heap(u, t, joined_parts(&decoded[..len], bytes, scan::Ascii, kind, 0)?)
             }
-            RawOwned::Borrowed { form: _, ptr, len, count: _, scan } => {
+            RawParts::Borrowed { bytes: old_bytes, scan, .. } => {
                 // Copy-out on write (§2.2.3): the image is readonly, so an append is a rebuild seeded by the settled
                 // state — same shape as the packed tier's exit.
-                // SAFETY: the image outlives every handle by the forms' contract.
-                let old_bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) };
-                let new_len = len + bytes.len();
-                let mut joined = Vec::new();
-                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
-                joined.extend_from_slice(old_bytes);
-                joined.extend_from_slice(bytes);
-                let state = append_transition_heap(scan.widen(), kind);
-                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                PString::build_heap(u, t, joined_parts(old_bytes, bytes, scan.widen(), kind, 0)?)
             }
-            RawOwned::BorrowedLarge { form: _, head } => {
-                // Copy-out on write, at large size: the image is readonly, so the append is a rebuild seeded by the
-                // settled state, exactly the compact forms' path.
-                let old_bytes = head.bytes();
-                let new_len = old_bytes.len() + bytes.len();
-                let mut joined = Vec::new();
-                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
-                joined.extend_from_slice(old_bytes);
-                joined.extend_from_slice(bytes);
-                let state = append_transition_heap(head.scan.widen(), kind);
-                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
-            }
-            RawOwned::View { mut ptr, backing, offset, len, scan } => {
+            RawParts::View { bytes: old_bytes, scan, .. } => {
                 // Copy-out on write (§2.2.15): a view is a read-only carrier, so an append is a rebuild seeded by the
-                // envelope's state — the images' path, plus a reference to surrender.
-                // SAFETY: the transport owns one reference on the live backing, released below after the copy.
-                let old_bytes = unsafe {
-                    match backing {
-                        ViewBacking::Heap32Medium | ViewBacking::Heap32Far | ViewBacking::Small { .. } => {
-                            std::slice::from_raw_parts(ptr.as_ptr().as_ptr().add(offset), len)
-                        }
-                        ViewBacking::Adopted => {
-                            let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
-                            let (off, n) = if offset == SPAN as usize && len == SPAN as usize { (0, a.total_len()) } else { (offset, len) };
-                            &a.as_slice()[off..off + n]
-                        }
-                        ViewBacking::AdoptedFar => {
-                            let a: &cow_buffer::Adopted = ptr.as_ptr().cast::<cow_buffer::Adopted>().as_ref();
-                            &a.as_slice()[offset..offset + len]
-                        }
-                    }
-                };
-
-                let new_len = old_bytes.len() + bytes.len();
-                let mut joined = Vec::new();
-                let reserved = joined.try_reserve_exact(new_len);
-                if reserved.is_ok() {
-                    joined.extend_from_slice(old_bytes);
-                    joined.extend_from_slice(bytes);
-                }
-
-                // The reference is surrendered on every path: the copy above is complete or abandoned.
-                // SAFETY: the transport's one reference, consumed exactly once, under the backing's own release.
-                unsafe {
-                    match backing {
-                        ViewBacking::Heap32Medium | ViewBacking::Heap32Far => cow_buffer::heap32::release(ptr.claim()),
-                        ViewBacking::Small { cap } => small_backing_release(ptr.claim(), cap),
-                        ViewBacking::Adopted | ViewBacking::AdoptedFar => cow_buffer::Adopted::release(ptr.claim().cast()),
-                    }
-                }
-
-                if reserved.is_err() {
-                    return Err(AllocError { requested: new_len });
-                }
-
-                let state = append_transition_heap(scan, kind);
-                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+                // envelope's state — the images' path.  The reference the view holds is surrendered by the assignment
+                // below, which drops the old value; nothing is released before the new one exists.
+                PString::build_heap(u, t, joined_parts(old_bytes, bytes, scan, kind, 0)?)
             }
-            RawOwned::Heap { ptr, len, cap, count, scan: prior, tier } => {
+            RawParts::Heap(view) => {
                 // Reached only past the in-place fast path — shared, or over capacity — so the buffer is rebuilt:
                 // growth crosses tiers at the ceilings (§2.2.3), and choosing the tier is what `HeapParts::from_slice`
-                // does.  Reassembling the parts first makes the old allocation owned for the whole arm: dropping `old`
-                // — at the end or through either `?` — is the release.  The first run of the leak bomb caught this arm
-                // abandoning the pointer instead.
-                let old = HeapParts { ptr, len, cap, count, scan: prior, tier };
-                let view = match tier {
-                    Tier::Heap8 | Tier::Heap16 => HeapView::small(&old.ptr, len, cap, count, prior, tier),
-
-                    // SAFETY (both large arms): a live allocation of the matching tier, owned by `old`.  The compact
-                    // tier's length is envelope-authoritative, so its view takes the length this arm already holds
-                    // (§2.2.3).
-                    Tier::Heap32 => unsafe { HeapView::heap32(&old.ptr, len) },
-                    Tier::Heap => unsafe { HeapView::large(&old.ptr, tier) },
-                };
+                // does.  The old allocation stays owned by `self` throughout, so no path can abandon it.
                 let (prior, prior_chars) = (view.scan(), view.char_count());
-
-                let old_bytes = view.as_slice();
-                let total = old_bytes.len() + bytes.len();
-                let mut joined = Vec::new();
-                joined.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
-                joined.extend_from_slice(old_bytes);
-                joined.extend_from_slice(bytes);
-
                 let state = append_transition_heap(prior, kind);
 
                 // Maintain the character count incrementally when both sides know theirs (§2.2.5): the appended
@@ -3804,12 +3707,26 @@ impl PString {
                     _ => 0,
                 };
 
-                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, chars)?)
+                PString::build_heap(u, t, joined_parts(view.as_slice(), bytes, prior, kind, chars)?)
             }
         };
 
+        *self = replacement;
+
         Ok(())
     }
+}
+
+/// Join `old` and `added` into a fresh heap allocation, seeded by the transition `prior` and `kind` imply and by a
+/// character count the caller has already established (zero where none is known).  The single fallible step every
+/// rebuilding append arm shares, kept in one place so the failure shape is one thing rather than seven.
+fn joined_parts(old: &[u8], added: &[u8], prior: scan::ScanState, kind: AppendKind, chars: usize) -> Result<HeapParts, AllocError> {
+    let total = old.len() + added.len();
+    let mut joined = Vec::new();
+    joined.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
+    joined.extend_from_slice(old);
+    joined.extend_from_slice(added);
+    heap_parts_transitioned(&joined, append_transition_heap(prior, kind), chars)
 }
 
 /// Which immortal form a borrowed payload came from, so a tag rebuild can return to it.  Nothing else dispatches on

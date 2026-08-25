@@ -6121,3 +6121,48 @@ fn every_hex_format_survives_a_round_trip_in_both_cases() {
         assert_eq!(rendered.len(), s.len(), "and its rendering width");
     }
 }
+
+#[test]
+fn a_rebuilding_append_never_takes_the_value_before_it_succeeds() {
+    // A failed append must leave the value exactly as it was, which the rebuild path now gets structurally: the
+    // replacement is built while `self` still owns itself, and only the final assignment disturbs it.  With no
+    // allocation-failure seam in the crate, what a test can hold is the success side of the same structure — every
+    // rebuilding arm producing the right content, and the old allocation released exactly once by the assignment.
+    let before = crate::cow_buffer::live::count();
+    {
+        // The view arm, where a take would have surrendered the backing before the copy: the content of a failed append
+        // there would exist nowhere.
+        let source = PString::from_bytes(b"z".repeat(4_000)).unwrap();
+        let mut view = source.slice(10, 3_000).unwrap();
+        assert_eq!(view.storage_type(), StorageType::SmallSlice);
+        view.push_bytes(b"!").unwrap();
+        assert_eq!(view.len(), 3_001);
+
+        let mut sc = [0u8; DECODE_MAX];
+        assert_eq!(&view.as_bytes(&mut sc)[..3_000], &source.substr(10, 3_000).unwrap().as_bytes(&mut [0u8; DECODE_MAX])[..3_000]);
+
+        // The identifier families, whose payloads are decoded on the way out.
+        let mut uuid = PString::from_bytes(*b"f47ac10b-58cc-4372-a567-0e02b2c3d479").unwrap();
+        uuid.push_bytes(b"x").unwrap();
+        assert_eq!(uuid.len(), 37);
+
+        let mut hex = PString::from_bytes(*b"00:1a:2b:33:44:55").unwrap();
+        hex.push_bytes(b"x").unwrap();
+        assert_eq!(hex.len(), 18);
+
+        // An image, which owns no allocation to surrender.
+        let mut image = PString::from_static_bytes(b"a static image past the inline payload width").unwrap();
+        image.push_bytes(b"!").unwrap();
+        assert_eq!(image.len(), 45, "the image plus one byte");
+
+        // And a shared heap buffer, rebuilt rather than extended.
+        let shared = PString::from_bytes(b"y".repeat(200)).unwrap();
+        let mut other = shared.clone();
+        assert!(shared.is_shared());
+        other.push_bytes(b"!").unwrap();
+        assert_eq!(other.len(), 201);
+        assert!(!shared.is_shared(), "the rebuild left the original sole owner");
+        assert_eq!(shared.len(), 200, "and untouched");
+    }
+    assert_eq!(crate::cow_buffer::live::count(), before, "every allocation the rebuilds made was released");
+}
