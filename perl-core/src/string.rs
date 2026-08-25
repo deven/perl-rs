@@ -149,7 +149,8 @@ unsafe fn small_backing_release(ptr: std::ptr::NonNull<u8>, cap: usize) {
 /// succeed, never what it yields.
 pub const DECODE_MAX: usize = {
     let nibble = if 2 * INLINE_MAX > MAX_PACKED_LEN { 2 * INLINE_MAX } else { MAX_PACKED_LEN };
-    if UUID_LEN > nibble { UUID_LEN } else { nibble }
+    let identifiers = if UUID_LEN > HEX_MAX_LEN { UUID_LEN } else { HEX_MAX_LEN };
+    if identifiers > nibble { identifiers } else { nibble }
 };
 
 /// The heap scan lattice (§2.2.4): terminal states live typed in the small tiers' envelopes, and the large tiers keep
@@ -917,11 +918,12 @@ enum InlineClass {
     Bytes,
 }
 
-/// The storage type: the forty-six-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
-/// the discriminant is this type times the two flag bits, utf8 and tainted, which is the whole tag ledger: forty-six
-/// times four is the 184 the §2.2.3 arithmetic states, pinned by `REPR_VARIANT_COUNT`.  Coarse questions are the
-/// projection methods.  Declaration order is itself the selection (§2.2.9): canonical selection takes the first type,
-/// in this order, able to represent the content — first-fit is the ladder — which is what the derived `Ord` means.
+/// The storage type: the forty-seven-value normative vocabulary (§2.2.9), one value per base variant of the folded tag
+/// — the discriminant is this type times the two flag bits, utf8 and tainted, which is the whole tag ledger:
+/// forty-seven times four is the 188 the §2.2.3 arithmetic states, pinned by `REPR_VARIANT_COUNT`.  Coarse questions
+/// are the projection methods.  Declaration order is itself the selection (§2.2.9): canonical selection takes the first
+/// type, in this order, able to represent the content — first-fit is the ladder — which is what the derived `Ord`
+/// means.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum StorageType {
     /// Inline, ≤ [`INLINE_MAX`] payload bytes, no allocation: the five content classes, each beside its full-capacity
@@ -1062,6 +1064,10 @@ pub enum StorageType {
 
     /// The packed UUID v7 form (§2.2.16): Unix-millisecond timestamp, top two bits implied zero.
     PackedUuidV7,
+
+    /// A packed hex-byte string (§2.2.16): the digits in the payload, the spelling's format and case in its fifteenth
+    /// byte beside the length.
+    PackedHexBytes,
 }
 
 impl StorageType {
@@ -1096,6 +1102,7 @@ macro_rules! define_perl_string {
         inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
         packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_tainted:literal) ),* $(,)? ],
         uuids: [ $( $uuid:ident = ($uuid_form:ident, $uuid_type:ident, $uuid_utf8:literal, $uuid_tainted:literal) ),* $(,)? ],
+        hexes: [ $( $hex:ident = ($hex_type:ident, $hex_utf8:literal, $hex_tainted:literal) ),* $(,)? ],
         heap8:  [ $( $heap8:ident  = ($heap8_utf8:literal,  $heap8_tainted:literal)  ),* $(,)? ],
         heap8_ascii:  [ $( $heap8a:ident  = ($heap8a_utf8:literal,  $heap8a_tainted:literal)  ),* $(,)? ],
         heap16: [ $( $heap16:ident = ($heap16_utf8:literal, $heap16_tainted:literal) ),* $(,)? ],
@@ -1136,6 +1143,7 @@ macro_rules! define_perl_string {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
             $( $uuid { payload: [u8; PACKED_BYTES] }, )*
+            $( $hex { payload: [u8; PACKED_BYTES] }, )*
             $( $heap8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: scan::Terminal }, )*
             $( $heap8a { ptr: Owned, len: u8,  cap: u8 }, )*
             $( $heap16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
@@ -1159,6 +1167,7 @@ macro_rules! define_perl_string {
             $( + { let _ = stringify!($inline); 1 } )*
             $( + { let _ = stringify!($packed); 1 } )*
             $( + { let _ = stringify!($uuid); 1 } )*
+            $( + { let _ = stringify!($hex); 1 } )*
             $( + { let _ = stringify!($heap8a); 1 } )*
             $( + { let _ = stringify!($heap16a); 1 } )*
             $( + { let _ = stringify!($heap8); 1 } )*
@@ -1181,6 +1190,7 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { buf } => Repr::$inline { buf: *buf }, )*
                     $( Repr::$packed { nibbles } => Repr::$packed { nibbles: *nibbles }, )*
                     $( Repr::$uuid { payload } => Repr::$uuid { payload: *payload }, )*
+                    $( Repr::$hex { payload } => Repr::$hex { payload: *payload }, )*
 
                     // SAFETY (each heap arm): the variant owns a live allocation of its tier, and the new handle takes
                     // the reference this `retain` adds.
@@ -1251,6 +1261,7 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { .. } => {}, )*
                     $( Repr::$packed { .. } => {}, )*
                     $( Repr::$uuid { .. } => {}, )*
+                    $( Repr::$hex { .. } => {}, )*
                     $( Repr::$heap8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
                     $( Repr::$heap16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
                     $( Repr::$heap8a { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
@@ -1283,6 +1294,7 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { .. } => StorageType::$inline_type, )*
                     $( Repr::$packed { .. } => StorageType::$packed_type, )*
                     $( Repr::$uuid { .. } => StorageType::$uuid_type, )*
+                    $( Repr::$hex { .. } => StorageType::$hex_type, )*
                     $( Repr::$heap8 { .. } => StorageType::Heap8, )*
                     $( Repr::$heap16 { .. } => StorageType::Heap16, )*
                     $( Repr::$heap8a { .. } => StorageType::Heap8Ascii, )*
@@ -1307,6 +1319,7 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { .. } => $inline_utf8, )*
                     $( Repr::$packed { .. } => $packed_utf8, )*
                     $( Repr::$uuid { .. } => $uuid_utf8, )*
+                    $( Repr::$hex { .. } => $hex_utf8, )*
                     $( Repr::$heap8 { .. } => $heap8_utf8, )*
                     $( Repr::$heap16 { .. } => $heap16_utf8, )*
                     $( Repr::$heap8a { .. } => $heap8a_utf8, )*
@@ -1331,6 +1344,7 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { .. } => $inline_tainted, )*
                     $( Repr::$packed { .. } => $packed_tainted, )*
                     $( Repr::$uuid { .. } => $uuid_tainted, )*
+                    $( Repr::$hex { .. } => $hex_tainted, )*
                     $( Repr::$heap8 { .. } => $heap8_tainted, )*
                     $( Repr::$heap16 { .. } => $heap16_tainted, )*
                     $( Repr::$heap8a { .. } => $heap8a_tainted, )*
@@ -1369,6 +1383,7 @@ macro_rules! define_perl_string {
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
                     $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
                     $( Repr::$uuid { .. } => Some(InlineClass::Ascii), )*
+                    $( Repr::$hex { .. } => Some(InlineClass::Ascii), )*
                     $( Repr::$heap8 { .. } => None, )*
                     $( Repr::$heap16 { .. } => None, )*
                     $( Repr::$heap32 { .. } => None, )*
@@ -1419,6 +1434,14 @@ macro_rules! define_perl_string {
                 }
             }
 
+            /// Mint a packed hex-byte string (§2.2.16): both flags select the variant, exhaustively — the format and
+            /// case ride the payload, so the tag carries nothing else.
+            fn build_hex(payload: [u8; PACKED_BYTES], utf8: bool, tainted: bool) -> PString {
+                match (utf8, tainted) {
+                    $( ($hex_utf8, $hex_tainted) => PString(Repr::$hex { payload }), )*
+                }
+            }
+
             /// The payload behind the tag, borrowed.  Generated rather than hand-written: with three storage kinds the
             /// explicit variant lists ran past a hundred names, and the per-section repetition expresses it exactly.
             fn raw_parts(&self) -> RawParts<'_> {
@@ -1430,6 +1453,7 @@ macro_rules! define_perl_string {
                         nibbles: *nibbles,
                     }), )*
                     $( Repr::$uuid { payload } => RawParts::Uuid { form: UuidForm::$uuid_form, payload }, )*
+                    $( Repr::$hex { payload } => RawParts::Hex { payload }, )*
                     $( Repr::$heap8 { ptr, len, cap, count, scan } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap8)), )*
                     $( Repr::$heap16 { ptr, len, cap, count, scan } =>
@@ -1516,6 +1540,7 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { buf } => Some(($inline_full, buf)), )*
                     $( Repr::$packed { .. } => None, )*
                     $( Repr::$uuid { .. } => None, )*
+                    $( Repr::$hex { .. } => None, )*
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
                     $( Repr::$large_immortal { .. } => None, )*
@@ -1766,6 +1791,7 @@ macro_rules! define_perl_string {
                     $( Repr::$inline { .. } => None, )*
                     $( Repr::$packed { .. } => None, )*
                     $( Repr::$uuid { .. } => None, )*
+                    $( Repr::$hex { .. } => None, )*
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
                     $( Repr::$large_immortal { .. } => None, )*
@@ -1803,6 +1829,7 @@ macro_rules! define_perl_string {
                         nibbles: *nibbles,
                     }), )*
                     $( Repr::$uuid { payload } => RawOwned::Uuid { form: UuidForm::$uuid_form, payload: *payload }, )*
+                    $( Repr::$hex { payload } => RawOwned::Hex { payload: *payload }, )*
                     $( Repr::$heap8 { ptr, len, cap, count, scan } => RawOwned::Heap {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
@@ -2145,6 +2172,12 @@ define_perl_string! {
         PackedUuidV7Tainted               = (V7   , PackedUuidV7   , false, true),
         PackedUuidV7FlaggedTainted        = (V7   , PackedUuidV7   , true,  true),
     ],
+    hexes: [
+        PackedHexBytes                    = (PackedHexBytes, false, false),
+        PackedHexBytesFlagged             = (PackedHexBytes, true,  false),
+        PackedHexBytesTainted             = (PackedHexBytes, false, true),
+        PackedHexBytesFlaggedTainted      = (PackedHexBytes, true,  true),
+    ],
     heap8: [
         Heap8                             = (false, false),
         Heap8Flagged                      = (true,  false),
@@ -2237,9 +2270,9 @@ define_perl_string! {
     ]
 }
 
-// The ledger, checked: forty-six storage types times the two flag bits (§2.2.3, §2.2.9).  Growing the list moves this
+// The ledger, checked: forty-seven storage types times the two flag bits (§2.2.3, §2.2.9).  Growing the list moves this
 // number and the design's ledgers in the same commit.
-const _: () = assert!(REPR_VARIANT_COUNT == 184);
+const _: () = assert!(REPR_VARIANT_COUNT == 188);
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
 const _: () = assert!(size_of::<PString>() == 16);
@@ -2527,6 +2560,10 @@ impl PString {
         if let Some((form, payload)) = classify_uuid(bytes) {
             return Ok(PString::build_uuid(form, payload, utf8, tainted));
         }
+
+        if let Some(payload) = classify_hex_bytes(bytes) {
+            return Ok(PString::build_hex(payload, utf8, tainted));
+        }
         Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
     }
 
@@ -2563,7 +2600,11 @@ impl PString {
 
         // The §2.2.16 identifier forms allocate nothing either.  Past every envelope reach, `None` starts meaning
         // "the heap".
-        classify_uuid(bytes).map(|(form, payload)| PString::build_uuid(form, payload, false, false))
+        if let Some((form, payload)) = classify_uuid(bytes) {
+            return Some(PString::build_uuid(form, payload, false, false));
+        }
+
+        classify_hex_bytes(bytes).map(|payload| PString::build_hex(payload, false, false))
     }
 
     /// Construct from raw bytes **without allocating**, or `None` if the content cannot be stored in the value itself.
@@ -2581,7 +2622,11 @@ impl PString {
             return Some(PString::build_packed(p, false, false));
         }
 
-        classify_uuid(bytes).map(|(form, payload)| PString::build_uuid(form, payload, false, false))
+        if let Some((form, payload)) = classify_uuid(bytes) {
+            return Some(PString::build_uuid(form, payload, false, false));
+        }
+
+        classify_hex_bytes(bytes).map(|payload| PString::build_hex(payload, false, false))
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -2591,6 +2636,7 @@ impl PString {
             RawParts::Inline { class, full, buf } => inline_internal_len(class, full, buf),
             RawParts::Packed(p) => p.len(),
             RawParts::Uuid { .. } => UUID_LEN,
+            RawParts::Hex { payload } => hex_rendered_len(payload),
             RawParts::Heap(cb) => cb.len(),
             RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => bytes.len(),
         }
@@ -2651,6 +2697,10 @@ impl PString {
                 let n = decode_uuid(form, payload, scratch);
                 &scratch[..n]
             }
+            RawParts::Hex { payload } => {
+                let n = decode_hex_bytes(payload, scratch);
+                &scratch[..n]
+            }
             RawParts::Heap(cb) => cb.as_slice(),
             RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => bytes,
         }
@@ -2663,6 +2713,13 @@ impl PString {
             RawParts::Uuid { form, payload } => {
                 // The canonical spelling is ASCII, so the decoded bytes are always valid.
                 let n = decode_uuid(form, payload, scratch);
+
+                // SAFETY: ASCII by construction.
+                Some(unsafe { str::from_utf8_unchecked(&scratch[..n]) })
+            }
+            RawParts::Hex { payload } => {
+                // Hex digits, separators, and the prefix are ASCII, so the decoded bytes are always valid.
+                let n = decode_hex_bytes(payload, scratch);
 
                 // SAFETY: ASCII by construction.
                 Some(unsafe { str::from_utf8_unchecked(&scratch[..n]) })
@@ -2755,6 +2812,7 @@ impl PString {
             // content — unlike the inline forms, whose bytes are whatever they are.
             RawParts::Packed(_) => true,
             RawParts::Uuid { .. } => true,
+            RawParts::Hex { .. } => true,
             RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 scan::Ascii => true,
                 st if scan::is_known_non_ascii(st) => false,
@@ -2814,6 +2872,7 @@ impl PString {
             },
             RawParts::Packed(_) => scan::Ascii,
             RawParts::Uuid { .. } => scan::Ascii,
+            RawParts::Hex { .. } => scan::Ascii,
             RawParts::Heap(cb) => cb.scan(),
             RawParts::Borrowed { scan, .. } => scan.widen(),
             RawParts::View { scan, .. } => scan,
@@ -2825,7 +2884,7 @@ impl PString {
     pub fn is_shared(&self) -> bool {
         match self.raw_parts() {
             RawParts::Heap(view) => !view.is_unique(),
-            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } => false,
+            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } => false,
 
             // Bitwise clones do share the image, but with the owner that outlives them all (§2.2.3), not with each
             // other in any sense `unshare` could dissolve: copying frees nothing that would otherwise be freed.
@@ -2944,6 +3003,10 @@ impl PString {
                 if let Some((form, payload)) = classify_uuid(bytes) {
                     return Ok(PString::build_uuid(form, payload, utf8, tainted));
                 }
+
+                if let Some(payload) = classify_hex_bytes(bytes) {
+                    return Ok(PString::build_hex(payload, utf8, tainted));
+                }
             }
         }
 
@@ -3021,7 +3084,7 @@ impl PString {
             }
 
             // Envelope-resident sources past representability: no buffer to share (§2.2.15).
-            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } => {
+            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } => {
                 let bytes = &self.as_bytes(&mut scratch)[offset..offset + len];
                 Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
             }
@@ -3060,7 +3123,9 @@ impl PString {
             // A view carries no count of its own (§2.2.15): zero is the unfilled sentinel, and classification rides the
             // copy as it does for the shared-heap arm above.
             RawParts::View { bytes, scan, .. } => heap_parts_transitioned(bytes, scan, 0)?,
-            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Borrowed { .. } => return Ok(()),
+            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } | RawParts::Borrowed { .. } => {
+                return Ok(());
+            }
         };
         *self = PString::build_heap(self.is_utf8(), self.is_tainted(), parts);
         Ok(())
@@ -3073,6 +3138,7 @@ impl PString {
             RawParts::Inline { .. } => !matches!(self.inline_class(), Some(InlineClass::Bytes)),
             RawParts::Packed(_) => true,   // ASCII is valid under every reading.
             RawParts::Uuid { .. } => true, // Likewise.
+            RawParts::Hex { .. } => true,  // Likewise.
             RawParts::Borrowed { scan, .. } => scan::is_perl_decodable(scan.widen()),
             RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 st if scan::is_perl_decodable(st) => true,
@@ -3115,6 +3181,7 @@ impl PString {
             // Packed alphabets are ASCII, so every character is one byte.
             RawParts::Packed(p) => Some(p.len()),
             RawParts::Uuid { .. } => Some(UUID_LEN),
+            RawParts::Hex { payload } => Some(hex_rendered_len(payload)),
             RawParts::Inline { class, full, buf } => {
                 let stored = inline_stored(full, buf);
                 match class {
@@ -3314,6 +3381,13 @@ impl PString {
 
                 Ok(Some(s))
             }
+            RawParts::Hex { .. } => {
+                // Likewise ASCII by construction.
+                let mut s = self.clone();
+                s.reinterpret_utf8(false);
+
+                Ok(Some(s))
+            }
             RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => {
                 // The image is readonly, so the downgrade is a copy-out by nature: walk it like heap content.
                 let Some(out) = cow_buffer::downgraded_bytes(bytes)? else {
@@ -3406,6 +3480,7 @@ impl PString {
             }
             RawOwned::Packed(p) => PString::build_packed(p, u2, t2),
             RawOwned::Uuid { form, payload } => PString::build_uuid(form, payload, u2, t2),
+            RawOwned::Hex { payload } => PString::build_hex(payload, u2, t2),
             RawOwned::Heap { ptr, len, cap, count, scan, tier } => PString::build_heap(u2, t2, HeapParts { ptr, len, cap, count, scan, tier }),
             RawOwned::Borrowed { form: BorrowedForm::Immortal, ptr, len, count, scan } => PString::build_immortal(u2, t2, ptr, len, count, scan),
             RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PString::build_static(u2, t2, ptr, len, count, scan),
@@ -3508,6 +3583,11 @@ impl PString {
                     return Ok(());
                 }
 
+                if let Some(payload) = classify_hex_bytes(&combined[..total]) {
+                    *self = PString::build_hex(payload, u, t);
+                    return Ok(());
+                }
+
                 // Sixteen to thirty bytes fitting neither a compressed payload nor an alphabet: the heap, below.
             }
 
@@ -3556,6 +3636,19 @@ impl PString {
                 // way out, ASCII seeding the heap state as the packed tier's exit does.
                 let mut decoded = [0u8; DECODE_MAX];
                 let len = decode_uuid(form, &payload, &mut decoded);
+                let new_len = len + bytes.len();
+                let mut joined = Vec::new();
+                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
+                joined.extend_from_slice(&decoded[..len]);
+                joined.extend_from_slice(bytes);
+                let state = append_transition_heap(scan::Ascii, kind);
+                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
+            }
+            RawOwned::Hex { payload } => {
+                // An append may or may not leave a hex spelling; the combined attempt above already tried the ladder,
+                // so reaching here means it did.  Same exit as the packed tier's.
+                let mut decoded = [0u8; DECODE_MAX];
+                let len = decode_hex_bytes(&payload, &mut decoded);
                 let new_len = len + bytes.len();
                 let mut joined = Vec::new();
                 joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
@@ -3744,6 +3837,12 @@ fn u24_get(bytes: &[u8; 3]) -> usize {
 }
 
 enum RawParts<'a> {
+    /// A packed hex-byte string (§2.2.16): the payload carries digits, length, format, and case, decoded on demand
+    /// into a caller scratch — the content is ASCII and terminal, whatever the spelling.
+    Hex {
+        payload: &'a [u8; PACKED_BYTES],
+    },
+
     /// A packed UUID (§2.2.16): the form and the 15-byte payload, decoded on demand into a caller scratch — the content
     /// is always the 36-character canonical lowercase spelling, ASCII and terminal.
     Uuid {
@@ -3793,6 +3892,9 @@ enum RawOwned {
     Packed(Packed),
     Uuid {
         form: UuidForm,
+        payload: [u8; PACKED_BYTES],
+    },
+    Hex {
         payload: [u8; PACKED_BYTES],
     },
 
@@ -5284,6 +5386,229 @@ pub(crate) fn decode_uuid(form: UuidForm, payload: &[u8; PACKED_BYTES], out: &mu
     }
 
     UUID_LEN
+}
+
+// ─── The packed hex-byte codec (§2.2.16) ────────────────────────────────────────────────────────────────────────────
+//
+// A hex string of D digits, byte-separated, plain, or `0x`-prefixed.  Fourteen payload bytes hold the digits two per
+// byte, high nibble first, and the fifteenth byte holds the metadata: nibble 28 the length code, nibble 29 the
+// variation.  The length code carries every count by the formula *zero means 12, otherwise 13 plus the code*, which
+// covers 12 and 14 through 28 with a single hole at 13 — placed where it costs least, since plain and prefixed
+// thirteens are inline and only the separated thirteen-digit spellings lose it.  The variation is a three-bit format
+// code and a case bit; five codes are assigned and three are unassigned, reachable only by corruption.
+//
+// Every format admits every count its rendering can express: digits pair left to right, and a separated spelling
+// carries a trailing lone digit for an odd count, whose unused nibble stays zero by construction.  Case is a
+// whole-string property of the digits alone: the `0x` prefix is always lowercase, so `0xABCD` packs and `0XABCD`
+// spills, and all-digit content is canonically lowercase because the two spellings render identically.
+//
+// The family sits after the nibble alphabets in the selection order (§2.2.16), so digit strings they can represent stay
+// theirs; what reaches here is content bearing `a`-`f` or `A`-`F`, and the all-digit separated spellings of 31 through
+// 41 characters, which lie past the alphabets' thirty-character ceiling.  Classification is total over candidate bytes:
+// anything else is simply not a hex-byte string, and the value takes ordinary storage.
+
+/// The shortest rendering any format produces: sixteen characters — plain at twelve digits is inline, and the separated
+/// and prefixed floors follow the same way (§2.2.16), so the gate needs no per-format floor.
+const HEX_MIN_LEN: usize = 16;
+
+/// The longest rendering any format produces: twenty-eight digits separated is forty-one characters, the widest decode
+/// in the crate and so `DECODE_MAX`'s tallest entry.
+const HEX_MAX_LEN: usize = 41;
+
+/// The digit ceiling: fourteen payload bytes at two digits each.
+const HEX_MAX_DIGITS: usize = 28;
+
+/// The metadata nibbles in the fifteenth payload byte.
+const HEX_LENGTH_NIBBLE: usize = 28;
+const HEX_VARIATION_NIBBLE: usize = 29;
+
+/// The case bit within the variation nibble; the low three bits are the format code.
+const HEX_UPPER_BIT: u8 = 0b1000;
+
+/// A recognized hex-byte spelling (§2.2.16).  The discriminants are the assigned format codes; codes five through seven
+/// are unassigned and stay loud.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HexFormat {
+    Colon = 0,
+    Hyphen = 1,
+    Plain = 2,
+    Space = 3,
+    PrefixOnce = 4,
+}
+
+impl HexFormat {
+    /// The separator standing between digit pairs, or `None` where the spelling has none.
+    fn separator(self) -> Option<u8> {
+        match self {
+            HexFormat::Colon => Some(b':'),
+            HexFormat::Hyphen => Some(b'-'),
+            HexFormat::Space => Some(b' '),
+            HexFormat::Plain | HexFormat::PrefixOnce => None,
+        }
+    }
+}
+
+/// The digit count a length code carries: zero means twelve, and every other code means thirteen plus itself.
+fn hex_digits_of(code: u8) -> usize {
+    if code == 0 { 12 } else { 13 + code as usize }
+}
+
+/// The length code for a digit count, or `None` for the counts no code carries — below twelve, above twenty-eight, and
+/// the hole at thirteen.
+fn hex_length_code(digits: usize) -> Option<u8> {
+    match digits {
+        12 => Some(0),
+        14..=28 => Some((digits - 13) as u8),
+        _ => None,
+    }
+}
+
+/// Classify a candidate as a hex-byte string of a recognized spelling, yielding the payload, or `None` for anything
+/// else — which is not a failure, merely a value the family does not serve.
+fn classify_hex_bytes(bytes: &[u8]) -> Option<[u8; PACKED_BYTES]> {
+    if !(HEX_MIN_LEN..=HEX_MAX_LEN).contains(&bytes.len()) {
+        return None;
+    }
+
+    // The format is one lookahead, never a trial of each spelling: a `0x` front is the prefixed form, a separator
+    // standing where the first one would is that separator, and anything else is plain — and is rejected below if it is
+    // not a hex digit after all.
+    let format = if bytes.starts_with(b"0x") {
+        HexFormat::PrefixOnce
+    } else {
+        match bytes[2] {
+            b':' => HexFormat::Colon,
+            b'-' => HexFormat::Hyphen,
+            b' ' => HexFormat::Space,
+            _ => HexFormat::Plain,
+        }
+    };
+
+    let tail = if format == HexFormat::PrefixOnce { &bytes[2..] } else { bytes };
+    let separator = format.separator();
+
+    let mut payload = [0u8; PACKED_BYTES];
+    let mut digits = 0usize;
+    let mut saw_lower = false;
+    let mut saw_upper = false;
+    let mut i = 0usize;
+    while i < tail.len() {
+        // Between groups stands exactly one separator, where the spelling has one.
+        if digits > 0
+            && let Some(sep) = separator
+        {
+            if tail[i] != sep {
+                return None;
+            }
+
+            i += 1;
+        }
+
+        // A group is two digits, or one where an odd count ends the string.
+        for _ in 0..2 {
+            if i >= tail.len() {
+                break;
+            }
+
+            let value = match tail[i] {
+                b @ b'0'..=b'9' => b - b'0',
+                b @ b'a'..=b'f' => {
+                    saw_lower = true;
+                    b - b'a' + 10
+                }
+                b @ b'A'..=b'F' => {
+                    saw_upper = true;
+                    b - b'A' + 10
+                }
+                _ => return None,
+            };
+
+            if digits >= HEX_MAX_DIGITS {
+                return None;
+            }
+
+            set_nibble(&mut payload, digits, value);
+            digits += 1;
+            i += 1;
+        }
+    }
+
+    // Mixed case is no spelling of ours, and all-digit content is canonically lowercase: the two render alike.
+    if saw_lower && saw_upper {
+        return None;
+    }
+
+    let code = hex_length_code(digits)?;
+    set_nibble(&mut payload, HEX_LENGTH_NIBBLE, code);
+    let variation = format as u8 | if saw_upper { HEX_UPPER_BIT } else { 0 };
+    set_nibble(&mut payload, HEX_VARIATION_NIBBLE, variation);
+    Some(payload)
+}
+
+/// The format and case a payload's variation nibble carries.
+fn hex_variation(payload: &[u8; PACKED_BYTES]) -> (HexFormat, bool) {
+    let variation = nibble_at(payload, HEX_VARIATION_NIBBLE);
+    let format = match variation & 0b0111 {
+        0 => HexFormat::Colon,
+        1 => HexFormat::Hyphen,
+        2 => HexFormat::Plain,
+        3 => HexFormat::Space,
+        4 => HexFormat::PrefixOnce,
+
+        // The unassigned codes are unreachable: classification is the only constructor and emits five (§2.2.16).  Debug
+        // builds fail here; release renders the plain spelling rather than panicking on corruption.
+        _ => {
+            debug_assert!(false, "an unassigned hex-byte format code reached the decoder");
+            HexFormat::Plain
+        }
+    };
+
+    (format, variation & HEX_UPPER_BIT != 0)
+}
+
+/// The rendered length of a payload, without decoding it: the length answer every consumer asks for.
+fn hex_rendered_len(payload: &[u8; PACKED_BYTES]) -> usize {
+    let digits = hex_digits_of(nibble_at(payload, HEX_LENGTH_NIBBLE));
+    let (format, _) = hex_variation(payload);
+    match format {
+        HexFormat::Plain => digits,
+        HexFormat::PrefixOnce => 2 + digits,
+
+        // One separator between groups: the groups are the digit pairs, the last possibly lone.
+        _ => digits + digits.div_ceil(2) - 1,
+    }
+}
+
+/// Reconstruct the spelling into `out`, returning the written length.  The inverse of [`classify_hex_bytes`] by
+/// construction, which the round-trip tests pin.
+fn decode_hex_bytes(payload: &[u8; PACKED_BYTES], out: &mut [u8]) -> usize {
+    let digits = hex_digits_of(nibble_at(payload, HEX_LENGTH_NIBBLE));
+    let (format, upper) = hex_variation(payload);
+    let separator = format.separator();
+    let alpha = if upper { b'A' } else { b'a' };
+
+    let mut n = 0;
+    if format == HexFormat::PrefixOnce {
+        out[0] = b'0';
+        out[1] = b'x';
+        n = 2;
+    }
+
+    for d in 0..digits {
+        if d > 0
+            && d.is_multiple_of(2)
+            && let Some(sep) = separator
+        {
+            out[n] = sep;
+            n += 1;
+        }
+
+        let value = nibble_at(payload, d);
+        out[n] = if value < 10 { b'0' + value } else { alpha + (value - 10) };
+        n += 1;
+    }
+
+    n
 }
 
 // ─── The slicing mints (§2.2.15) ─────────────────────────────────────────────────────────────────────────────────────

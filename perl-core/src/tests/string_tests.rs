@@ -18,10 +18,15 @@ fn the_tier_ladder_places_content_by_length_and_alphabet() {
     let inline = PString::from_str(&"a".repeat(15)).unwrap();
     assert!(inline.storage_type().is_inline());
 
-    // Letters belong to no packed alphabet, so past the inline payload they go to the heap.
-    let lettered = PString::from_str(&"a".repeat(16)).unwrap();
+    // Letters outside every alphabet — and outside the hex digits — go to the heap past the inline payload.
+    let lettered = PString::from_str(&"z".repeat(16)).unwrap();
     assert!(lettered.storage_type().is_heap());
     assert_eq!(lettered.len(), 16);
+
+    // Hex digits are a rung of their own (§2.2.16), below the alphabets and above the heap.
+    let hex = PString::from_str(&"a".repeat(16)).unwrap();
+    assert_eq!(hex.storage_type(), StorageType::PackedHexBytes);
+    assert_eq!(hex.len(), 16);
 
     // Digit-dense content of the same length does not.
     for text in ["1234567890123456", "2.2250738585072e-308", "2026-07-28T14:33:07Z", "192.168.100.200 1.2"] {
@@ -1496,8 +1501,8 @@ impl PString {
 
 #[test]
 fn inline_accepts_up_to_the_capacity_and_refuses_beyond() {
-    assert!(PString::inline("a".repeat(INLINE_MAX)).is_some());
-    assert_eq!(PString::inline("a".repeat(INLINE_MAX + 1)), None);
+    assert!(PString::inline("z".repeat(INLINE_MAX)).is_some());
+    assert_eq!(PString::inline("z".repeat(INLINE_MAX + 1)), None, "`z` is in no alphabet and is no hex digit");
     assert!(PString::inline_bytes(vec![0xFFu8; INLINE_MAX]).is_some());
     assert_eq!(PString::inline_bytes(vec![0xFFu8; INLINE_MAX + 1]), None);
 }
@@ -1532,7 +1537,7 @@ fn inline_flags_follow_the_source_type() {
 fn inline_composes_with_unwrap_or_default() {
     // The discard-the-detail path: callers who merely prefer inline storage need one combinator.
     assert_eq!(PString::inline("hi").unwrap_or_default().as_bytes(&mut [0u8; DECODE_MAX]), b"hi");
-    assert_eq!(PString::inline("a".repeat(INLINE_MAX + 1)).unwrap_or_default(), PString::empty());
+    assert_eq!(PString::inline("z".repeat(INLINE_MAX + 1)).unwrap_or_default(), PString::empty());
 }
 
 #[test]
@@ -4462,7 +4467,7 @@ fn downgrade_refuses_content_past_the_latin1_range() {
 fn raw_append_onto_a_small_tier_is_classified_not_left_unknown() {
     // A raw-byte append transitions to UNKNOWN in the lattice, and a small tier cannot hold that — the transition
     // funnel must pay the construction-grade pass instead of recording an indeterminate state (§2.2.3).
-    let mut s = PString::from_bytes(b"a".repeat(24)).unwrap();
+    let mut s = PString::from_bytes(b"z".repeat(24)).unwrap();
     assert!(s.storage_type().is_small_heap_tier());
     s.push_bytes(&[0x81, 0x82]).unwrap(); // AppendKind::Unknown: nothing known about these bytes
 
@@ -4605,7 +4610,7 @@ fn heap_append_releases_the_buffer_it_replaces() {
     // touches an `Owned`.
     let before = crate::cow_buffer::live::count();
     {
-        let mut s = PString::from_bytes(b"a".repeat(24)).unwrap();
+        let mut s = PString::from_bytes(b"z".repeat(24)).unwrap();
         assert!(s.storage_type().is_small_heap_tier());
 
         for _ in 0..8 {
@@ -5882,4 +5887,143 @@ fn uuid_slices_copy_and_appends_exit_or_complete() {
     r.push_bytes(&s[12..]).unwrap();
     assert_eq!(r.storage_type(), StorageType::PackedUuidV4S2, "the ladder recognizes the completed spelling");
     assert_eq!(r, p);
+}
+
+// ── The packed hex-byte family (§2.2.16) ──────────────────────
+#[test]
+fn hex_spellings_pack_through_every_format_code() {
+    for s in [
+        "00:1a:2b:33:44:55",                         // colon, the MAC address
+        "00-1a-2b-33-44-55",                         // hyphen
+        "00 1a 2b 33 44 55",                         // space
+        "deadbeefdeadbeef",                          // plain, sixteen digits
+        "0xdeadbeefdeadbe",                          // the prefix, written once
+        "0a:1b:2c:3d:4e:5f:60:71:82:93:a4:b5:c6:d7", // twenty-eight digits: the forty-one-character ceiling
+        "DEADBEEFDEADBEEF",                          // uppercase digits
+        "0xDEADBEEFDEADBE",                          // and under the always-lowercase prefix
+    ] {
+        let p = PString::from_bytes(s.as_bytes()).unwrap();
+        assert_eq!(p.storage_type(), StorageType::PackedHexBytes, "{s}");
+        assert_eq!(p.len(), s.len(), "{s}");
+        assert_eq!(p.char_len(), Some(s.len()), "{s}");
+        assert!(p.is_ascii());
+        assert!(p.is_perl_utf8_valid());
+
+        let mut sc = [0u8; DECODE_MAX];
+        assert_eq!(p.as_bytes(&mut sc), s.as_bytes(), "{s}");
+        assert_eq!(p.as_str(&mut sc), Some(s), "{s}");
+        assert_eq!(format!("{p}"), s, "{s}");
+    }
+
+    assert_eq!(DECODE_MAX, 41, "the separated ceiling is the crate's widest decode (§2.2.16)");
+}
+
+#[test]
+fn the_alphabets_keep_what_they_can_represent() {
+    // All-digit separated forms inside the alphabets' band stay theirs: predictability over density (§2.2.16).
+    assert_eq!(PString::from_bytes(*b"00:11:22:33:44:55").unwrap().storage_type(), StorageType::PackedDateTimePlus);
+    assert_eq!(PString::from_bytes(*b"00-11-22-33-44-55").unwrap().storage_type(), StorageType::PackedNumeric);
+    assert_eq!(PString::from_bytes(*b"1234567890123456").unwrap().storage_type(), StorageType::PackedNumeric);
+
+    // `e` and `E` belong to PackedNumeric, so they do not force the hex rung in the unseparated spellings — but the
+    // colon spelling has no `e` in its alphabet, so there every hex letter forces it.
+    assert_eq!(PString::from_bytes(*b"1e2e3e4e5e6e7e8e").unwrap().storage_type(), StorageType::PackedNumeric);
+    assert_eq!(PString::from_bytes(*b"00:1e:2e:3e:4e:5e").unwrap().storage_type(), StorageType::PackedHexBytes);
+
+    // Past the alphabets' thirty-character ceiling, the all-digit separated spellings come back to the hex rung.
+    let long = PString::from_bytes(*b"00:11:22:33:44:55:66:77:88:99:00:11:22:33").unwrap();
+    assert_eq!(long.len(), 41);
+    assert_eq!(long.storage_type(), StorageType::PackedHexBytes);
+}
+
+#[test]
+fn noncanonical_hex_spellings_spill() {
+    for s in [
+        &b"0XDEADBEEFDEADBE"[..],              // the prefix is always lowercase
+        b"DEADbeefDEADbeef",                   // mixed case
+        b"00:1a-2b:33:44:55",                  // mixed separators
+        b"00::1a:2b:33:44:5",                  // a doubled separator
+        b"001a2b3344556677889900112233445566", // thirty-four digits: past the payload
+        b"00:1a:2b:33:44:5g",                  // not a hex digit
+    ] {
+        let p = PString::from_bytes(s).unwrap();
+        assert_ne!(p.storage_type(), StorageType::PackedHexBytes, "{:?}", std::str::from_utf8(s));
+
+        let mut sc = [0u8; DECODE_MAX];
+        assert_eq!(p.as_bytes(&mut sc), s, "the spill is exact");
+    }
+}
+
+#[test]
+fn the_thirteen_digit_hole_spills_only_the_separated_spellings() {
+    // Thirteen digits: plain and prefixed are inline, so only the separated spellings pay for the hole (§2.2.16).
+    let plain = PString::from_bytes(*b"0123456789abc").unwrap();
+    assert!(plain.storage_type().is_inline(), "thirteen digits plain is inline");
+
+    let prefixed = PString::from_bytes(*b"0x0123456789abc").unwrap();
+    assert!(prefixed.storage_type().is_inline(), "fifteen characters with the prefix is inline");
+
+    let separated = PString::from_bytes(*b"01:23:45:67:89:ab:c").unwrap();
+    assert_ne!(separated.storage_type(), StorageType::PackedHexBytes, "the separated thirteen falls in the hole");
+
+    // Its neighbors on both sides do pack.
+    assert_eq!(PString::from_bytes(*b"01:23:45:67:89:ab").unwrap().storage_type(), StorageType::PackedHexBytes);
+    assert_eq!(PString::from_bytes(*b"01:23:45:67:89:ab:cd").unwrap().storage_type(), StorageType::PackedHexBytes);
+}
+
+#[test]
+fn odd_digit_counts_carry_a_lone_trailing_group() {
+    for s in ["00:1a:2b:33:44:55:66:7", "0xdeadbeefdeadbee", "deadbeefdeadbeefd"] {
+        let p = PString::from_bytes(s.as_bytes()).unwrap();
+        assert_eq!(p.storage_type(), StorageType::PackedHexBytes, "{s}");
+
+        let mut sc = [0u8; DECODE_MAX];
+        assert_eq!(p.as_bytes(&mut sc), s.as_bytes(), "{s}");
+    }
+}
+
+#[test]
+fn packed_hex_equals_its_heap_spelling_on_every_surface() {
+    let s = b"00:1a:2b:33:44:55";
+    let packed = PString::from_bytes(*s).unwrap();
+    assert_eq!(packed.storage_type(), StorageType::PackedHexBytes);
+
+    // A heap twin of the same spelling: build one character short, append the tail — heap never demotes.
+    let mut heap = PString::from_bytes(&s[..16]).unwrap();
+    heap.push_bytes(&s[16..]).unwrap();
+    assert!(heap.storage_type().is_heap(), "no demotion: {:?}", heap.storage_type());
+
+    assert_eq!(packed, heap);
+    assert_eq!(heap, packed);
+    assert_eq!(packed.cmp(&heap), std::cmp::Ordering::Equal);
+    assert_eq!(hash_of(&packed), hash_of(&heap));
+    assert_eq!(format!("{packed}"), format!("{heap}"));
+    assert_eq!(format!("{:?}", ContentDebug(&packed)), format!("{:?}", ContentDebug(&heap)));
+}
+
+#[test]
+fn hex_flags_ride_the_twins_and_appends_exit_or_complete() {
+    let s = b"00:1a:2b:33:44:55";
+    let mut p = PString::from_bytes(*s).unwrap();
+    p.taint();
+    p.set_utf8_for_test();
+    assert!(p.is_tainted() && p.is_utf8());
+    assert_eq!(p.storage_type(), StorageType::PackedHexBytes, "the twins leave the storage type");
+
+    let mut sc = [0u8; DECODE_MAX];
+    assert_eq!(p.as_bytes(&mut sc), s, "flags never touch the payload");
+
+    // An append that leaves every spelling exits to the heap with the content intact.
+    let mut q = PString::from_bytes(*s).unwrap();
+    q.push_bytes(b"!!").unwrap();
+    assert_eq!(q.len(), 19);
+    let mut sa = [0u8; DECODE_MAX];
+    assert_eq!(&q.as_bytes(&mut sa)[..17], s);
+
+    // An append that completes one packs it: the combined attempt runs the same ladder.
+    let mut r = PString::from_bytes(&s[..14]).unwrap();
+    assert!(r.storage_type().is_inline());
+    r.push_bytes(&s[14..]).unwrap();
+    assert_eq!(r.storage_type(), StorageType::PackedHexBytes, "the ladder recognizes the completed spelling");
+    assert_eq!(r, PString::from_bytes(*s).unwrap());
 }

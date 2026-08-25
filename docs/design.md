@@ -1536,7 +1536,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   bytes-class, now flagged).
 
   **The storage types are the normative vocabulary.**  The
-  forty-six base variants — `InlineAscii`, `InlineLatin1`,
+  forty-seven base variants — `InlineAscii`, `InlineLatin1`,
   `InlineNonLatin1`, `InlineExtended`, `InlineBytes`,
   `PackedNumeric`, `PackedDateTimePlus`, and
   `PackedDateTimeZulu`, each beside its `Full` family twin;
@@ -1549,7 +1549,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   slicing verbs; and the fifteen §2.2.16 UUID forms —
   `PackedUuidV1`, `V6`, and `V7`, and the four shards each of
   `V3`, `V4`, and `V5` — are
-  reified as `StorageType`: forty-six values dense from zero,
+  reified as `StorageType`: forty-seven values dense from zero,
   which is the niche budget's requirement (§2.2.3), with every
   coarse question a projection on it.  The
   declaration order is itself the selection [DECISION]: canonical
@@ -2590,9 +2590,27 @@ uniform-case plain hex from 16 to 28 digits, even or odd, packs
 here at the same density nibble alphabets would give, so no
 standalone hex alphabet pair is added — the residue is the 29-
 and 30-digit spellings, unreachable in twenty-eight nibble slots,
-and the separated thirteens at the hole.  The family
-sits after `PackedNumeric` and the datetime alphabets in the
-selection order, since digit strings are valid hex.  Standard
+and the separated thirteens at the hole.
+
+The alphabets keep whatever they can represent, and this family
+is the fallback: predictability over density, since for content
+both can hold the two representations are equally free.
+Measured, that leaves the family two territories.  `PackedNumeric`
+carries space, `+`, `-`, `.`, the digits, and `E`/`e`, and
+`PackedDateTimePlus` carries `:` and `T` in place of the
+exponents, so an all-digit separated spelling inside the
+alphabets' thirty-character band is already theirs — an all-digit
+MAC address packs as `PackedDateTimePlus` today.  What reaches
+this family is content bearing a hex letter: `a`-`d` and `f` in
+the unseparated spellings, where `e` and `E` are the alphabets'
+own, and every one of `a`-`f` in the colon spelling, whose
+alphabet has no exponent.  And past thirty characters the
+alphabets stop, so the long all-digit separated spellings return
+here.  Real MAC addresses and every hex digest bear letters, so
+the territory is the common case rather than the remainder.
+
+The family therefore sits after `PackedNumeric` and the datetime
+alphabets in the selection order.  Standard
 fused utf8 and taint twins in the tag: four variants.  The
 17-character colon form is the MAC address, ubiquitous as hash
 keys in the network-management Perl this family chiefly serves.
