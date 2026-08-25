@@ -1536,18 +1536,20 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   bytes-class, now flagged).
 
   **The storage types are the normative vocabulary.**  The
-  thirty-one base variants — `InlineAscii`, `InlineLatin1`,
+  forty-six base variants — `InlineAscii`, `InlineLatin1`,
   `InlineNonLatin1`, `InlineExtended`, `InlineBytes`,
   `PackedNumeric`, `PackedDateTimePlus`, and
   `PackedDateTimeZulu`, each beside its `Full` family twin;
   `Heap8` and `Heap16`, each beside its Ascii twin (§2.2.3);
   `Heap32` and `Heap`; the immortal quartet `Immortal`,
   `Static`, `LargeImmortal`, and `LargeStatic` (§2.2.3),
-  constructed explicitly and never canonically selected; and the
+  constructed explicitly and never canonically selected; the
   view quintet `MediumSlice`, `SmallSlice`, `FarSlice`,
   `Adopted`, and `FarAdopted` (§2.2.15), minted only by the
-  slicing verbs — are
-  reified as `StorageType`: thirty-one values dense from zero,
+  slicing verbs; and the fifteen §2.2.16 UUID forms —
+  `PackedUuidV1`, `V6`, and `V7`, and the four shards each of
+  `V3`, `V4`, and `V5` — are
+  reified as `StorageType`: forty-six values dense from zero,
   which is the niche budget's requirement (§2.2.3), with every
   coarse question a projection on it.  The
   declaration order is itself the selection [DECISION]: canonical
@@ -1688,7 +1690,8 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   carrying its length implicitly beside a shorter family storing
   it in the byte the last character would have used.  The inline
   forms split into the two length families, and the tag
-  arithmetic is §2.2.3's: 124 of 256 (104 before the §2.2.15 view
+  arithmetic is §2.2.3's: 184 of 256 (124 before the §2.2.16 UUID
+families, 104 before the §2.2.15 view
   forms).  NUL then stops being a special case anywhere: content
   carrying one is stored inline like any other, which removes the
   rejection from both constructors, the check from the append
@@ -1727,8 +1730,9 @@ heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PString`'s own tag, which uses 124 of its
-256 values (104 before the §2.2.15 view forms).  Rust's
+occupies the niche in `PString`'s own tag, which uses 184 of its
+256 values (124 before the §2.2.16 UUID families, 104 before the
+§2.2.15 view forms).  Rust's
 niche-filling requires every other variant's data to avoid that
 byte, and it lays a variant out as a self-contained struct
 *before* placing it — so a field wanting eight-byte alignment

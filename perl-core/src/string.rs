@@ -147,7 +147,10 @@ unsafe fn small_backing_release(ptr: std::ptr::NonNull<u8>, cap: usize) {
 /// worth attempting.  Representability inside the ceiling stays conditional — only lengths up to `INLINE_MAX` are
 /// unconditional, and longer content needs a compressed form to admit it — so the constant bounds where the ladder may
 /// succeed, never what it yields.
-pub const DECODE_MAX: usize = if 2 * INLINE_MAX > MAX_PACKED_LEN { 2 * INLINE_MAX } else { MAX_PACKED_LEN };
+pub const DECODE_MAX: usize = {
+    let nibble = if 2 * INLINE_MAX > MAX_PACKED_LEN { 2 * INLINE_MAX } else { MAX_PACKED_LEN };
+    if UUID_LEN > nibble { UUID_LEN } else { nibble }
+};
 
 /// The heap scan lattice (§2.2.4): terminal states live typed in the small tiers' envelopes, and the large tiers keep
 /// an atomic byte in the allocation header.  Zero is `UNKNOWN`, the lattice top — the natural zero-initialized state
@@ -914,9 +917,9 @@ enum InlineClass {
     Bytes,
 }
 
-/// The storage type: the thirty-one-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
-/// the discriminant is this type times the two flag bits, utf8 and tainted, which is the whole tag ledger: thirty-one
-/// times four is the 124 the §2.2.3 arithmetic states, pinned by `REPR_VARIANT_COUNT`.  Coarse questions are the
+/// The storage type: the forty-six-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
+/// the discriminant is this type times the two flag bits, utf8 and tainted, which is the whole tag ledger: forty-six
+/// times four is the 184 the §2.2.3 arithmetic states, pinned by `REPR_VARIANT_COUNT`.  Coarse questions are the
 /// projection methods.  Declaration order is itself the selection (§2.2.9): canonical selection takes the first type,
 /// in this order, able to represent the content — first-fit is the ladder — which is what the derived `Ord` means.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -1023,6 +1026,42 @@ pub enum StorageType {
 
     /// An adopted view (§2.2.15): a range of an `Adopted` object — a foreign buffer, or an oversized view's child.
     Adopted,
+
+    /// The packed UUID v1 form (§2.2.16): Gregorian timestamp low-first, top two timestamp bits implied zero.
+    PackedUuidV1,
+
+    /// A packed UUID v3 shard (§2.2.16): namespace-MD5, the suffix carrying the variant nibble's two data bits.
+    PackedUuidV3S0,
+    /// A packed UUID v3 shard (§2.2.16).
+    PackedUuidV3S1,
+    /// A packed UUID v3 shard (§2.2.16).
+    PackedUuidV3S2,
+    /// A packed UUID v3 shard (§2.2.16).
+    PackedUuidV3S3,
+
+    /// A packed UUID v4 shard (§2.2.16): random, the suffix carrying the variant nibble's two data bits.
+    PackedUuidV4S0,
+    /// A packed UUID v4 shard (§2.2.16).
+    PackedUuidV4S1,
+    /// A packed UUID v4 shard (§2.2.16).
+    PackedUuidV4S2,
+    /// A packed UUID v4 shard (§2.2.16).
+    PackedUuidV4S3,
+
+    /// A packed UUID v5 shard (§2.2.16): namespace-SHA-1, the suffix carrying the variant nibble's two data bits.
+    PackedUuidV5S0,
+    /// A packed UUID v5 shard (§2.2.16).
+    PackedUuidV5S1,
+    /// A packed UUID v5 shard (§2.2.16).
+    PackedUuidV5S2,
+    /// A packed UUID v5 shard (§2.2.16).
+    PackedUuidV5S3,
+
+    /// The packed UUID v6 form (§2.2.16): Gregorian timestamp most-significant-first, top two bits implied zero.
+    PackedUuidV6,
+
+    /// The packed UUID v7 form (§2.2.16): Unix-millisecond timestamp, top two bits implied zero.
+    PackedUuidV7,
 }
 
 impl StorageType {
@@ -1056,6 +1095,7 @@ macro_rules! define_perl_string {
     (
         inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
         packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_tainted:literal) ),* $(,)? ],
+        uuids: [ $( $uuid:ident = ($uuid_form:ident, $uuid_type:ident, $uuid_utf8:literal, $uuid_tainted:literal) ),* $(,)? ],
         heap8:  [ $( $heap8:ident  = ($heap8_utf8:literal,  $heap8_tainted:literal)  ),* $(,)? ],
         heap8_ascii:  [ $( $heap8a:ident  = ($heap8a_utf8:literal,  $heap8a_tainted:literal)  ),* $(,)? ],
         heap16: [ $( $heap16:ident = ($heap16_utf8:literal, $heap16_tainted:literal) ),* $(,)? ],
@@ -1095,6 +1135,7 @@ macro_rules! define_perl_string {
         enum Repr {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
+            $( $uuid { payload: [u8; PACKED_BYTES] }, )*
             $( $heap8  { ptr: Owned, len: u8,  cap: u8,  count: u8,  scan: scan::Terminal }, )*
             $( $heap8a { ptr: Owned, len: u8,  cap: u8 }, )*
             $( $heap16 { ptr: Owned, len: u16, cap: u16, count: u16, scan: scan::Terminal }, )*
@@ -1117,6 +1158,7 @@ macro_rules! define_perl_string {
         pub(crate) const REPR_VARIANT_COUNT: usize = 0
             $( + { let _ = stringify!($inline); 1 } )*
             $( + { let _ = stringify!($packed); 1 } )*
+            $( + { let _ = stringify!($uuid); 1 } )*
             $( + { let _ = stringify!($heap8a); 1 } )*
             $( + { let _ = stringify!($heap16a); 1 } )*
             $( + { let _ = stringify!($heap8); 1 } )*
@@ -1138,6 +1180,7 @@ macro_rules! define_perl_string {
                 match self {
                     $( Repr::$inline { buf } => Repr::$inline { buf: *buf }, )*
                     $( Repr::$packed { nibbles } => Repr::$packed { nibbles: *nibbles }, )*
+                    $( Repr::$uuid { payload } => Repr::$uuid { payload: *payload }, )*
 
                     // SAFETY (each heap arm): the variant owns a live allocation of its tier, and the new handle takes
                     // the reference this `retain` adds.
@@ -1207,6 +1250,7 @@ macro_rules! define_perl_string {
                 match self {
                     $( Repr::$inline { .. } => {}, )*
                     $( Repr::$packed { .. } => {}, )*
+                    $( Repr::$uuid { .. } => {}, )*
                     $( Repr::$heap8 { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
                     $( Repr::$heap16 { ptr, cap, .. } => unsafe { cow_buffer::heap16::release(ptr.claim(), *cap) }, )*
                     $( Repr::$heap8a { ptr, cap, .. } => unsafe { cow_buffer::heap8::release(ptr.claim(), *cap) }, )*
@@ -1238,6 +1282,7 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => StorageType::$inline_type, )*
                     $( Repr::$packed { .. } => StorageType::$packed_type, )*
+                    $( Repr::$uuid { .. } => StorageType::$uuid_type, )*
                     $( Repr::$heap8 { .. } => StorageType::Heap8, )*
                     $( Repr::$heap16 { .. } => StorageType::Heap16, )*
                     $( Repr::$heap8a { .. } => StorageType::Heap8Ascii, )*
@@ -1261,6 +1306,7 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_utf8, )*
                     $( Repr::$packed { .. } => $packed_utf8, )*
+                    $( Repr::$uuid { .. } => $uuid_utf8, )*
                     $( Repr::$heap8 { .. } => $heap8_utf8, )*
                     $( Repr::$heap16 { .. } => $heap16_utf8, )*
                     $( Repr::$heap8a { .. } => $heap8a_utf8, )*
@@ -1284,6 +1330,7 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_tainted, )*
                     $( Repr::$packed { .. } => $packed_tainted, )*
+                    $( Repr::$uuid { .. } => $uuid_tainted, )*
                     $( Repr::$heap8 { .. } => $heap8_tainted, )*
                     $( Repr::$heap16 { .. } => $heap16_tainted, )*
                     $( Repr::$heap8a { .. } => $heap8a_tainted, )*
@@ -1321,6 +1368,7 @@ macro_rules! define_perl_string {
 
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
                     $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
+                    $( Repr::$uuid { .. } => Some(InlineClass::Ascii), )*
                     $( Repr::$heap8 { .. } => None, )*
                     $( Repr::$heap16 { .. } => None, )*
                     $( Repr::$heap32 { .. } => None, )*
@@ -1363,6 +1411,14 @@ macro_rules! define_perl_string {
                 }
             }
 
+            /// Mint a packed UUID (§2.2.16): the form and both flags select the variant, exhaustively — fifteen forms
+            /// times four flag combinations is the sixty arms below, no fallback.
+            fn build_uuid(form: UuidForm, payload: [u8; PACKED_BYTES], utf8: bool, tainted: bool) -> PString {
+                match (form, utf8, tainted) {
+                    $( (UuidForm::$uuid_form, $uuid_utf8, $uuid_tainted) => PString(Repr::$uuid { payload }), )*
+                }
+            }
+
             /// The payload behind the tag, borrowed.  Generated rather than hand-written: with three storage kinds the
             /// explicit variant lists ran past a hundred names, and the per-section repetition expresses it exactly.
             fn raw_parts(&self) -> RawParts<'_> {
@@ -1373,6 +1429,7 @@ macro_rules! define_perl_string {
                         full: $packed_full,
                         nibbles: *nibbles,
                     }), )*
+                    $( Repr::$uuid { payload } => RawParts::Uuid { form: UuidForm::$uuid_form, payload }, )*
                     $( Repr::$heap8 { ptr, len, cap, count, scan } =>
                         RawParts::Heap(HeapView::small(ptr, *len as usize, *cap as usize, *count as usize, scan.widen(), Tier::Heap8)), )*
                     $( Repr::$heap16 { ptr, len, cap, count, scan } =>
@@ -1458,6 +1515,7 @@ macro_rules! define_perl_string {
                 match &mut self.0 {
                     $( Repr::$inline { buf } => Some(($inline_full, buf)), )*
                     $( Repr::$packed { .. } => None, )*
+                    $( Repr::$uuid { .. } => None, )*
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
                     $( Repr::$large_immortal { .. } => None, )*
@@ -1707,6 +1765,7 @@ macro_rules! define_perl_string {
                 match &self.0 {
                     $( Repr::$inline { .. } => None, )*
                     $( Repr::$packed { .. } => None, )*
+                    $( Repr::$uuid { .. } => None, )*
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
                     $( Repr::$large_immortal { .. } => None, )*
@@ -1743,6 +1802,7 @@ macro_rules! define_perl_string {
                         full: $packed_full,
                         nibbles: *nibbles,
                     }), )*
+                    $( Repr::$uuid { payload } => RawOwned::Uuid { form: UuidForm::$uuid_form, payload: *payload }, )*
                     $( Repr::$heap8 { ptr, len, cap, count, scan } => RawOwned::Heap {
                         ptr: unsafe { std::ptr::read(ptr) },
                         len: *len as usize,
@@ -2023,6 +2083,68 @@ define_perl_string! {
         PackedZuluFullTainted             = (DateTimeZulu, PackedDateTimeZuluFull, true,  false, true),
         PackedZuluFullFlaggedTainted      = (DateTimeZulu, PackedDateTimeZuluFull, true,  true,  true),
     ],
+    uuids: [
+        PackedUuidV1                      = (V1   , PackedUuidV1   , false, false),
+        PackedUuidV1Flagged               = (V1   , PackedUuidV1   , true,  false),
+        PackedUuidV1Tainted               = (V1   , PackedUuidV1   , false, true),
+        PackedUuidV1FlaggedTainted        = (V1   , PackedUuidV1   , true,  true),
+        PackedUuidV3S0                    = (V3S0 , PackedUuidV3S0 , false, false),
+        PackedUuidV3S0Flagged             = (V3S0 , PackedUuidV3S0 , true,  false),
+        PackedUuidV3S0Tainted             = (V3S0 , PackedUuidV3S0 , false, true),
+        PackedUuidV3S0FlaggedTainted      = (V3S0 , PackedUuidV3S0 , true,  true),
+        PackedUuidV3S1                    = (V3S1 , PackedUuidV3S1 , false, false),
+        PackedUuidV3S1Flagged             = (V3S1 , PackedUuidV3S1 , true,  false),
+        PackedUuidV3S1Tainted             = (V3S1 , PackedUuidV3S1 , false, true),
+        PackedUuidV3S1FlaggedTainted      = (V3S1 , PackedUuidV3S1 , true,  true),
+        PackedUuidV3S2                    = (V3S2 , PackedUuidV3S2 , false, false),
+        PackedUuidV3S2Flagged             = (V3S2 , PackedUuidV3S2 , true,  false),
+        PackedUuidV3S2Tainted             = (V3S2 , PackedUuidV3S2 , false, true),
+        PackedUuidV3S2FlaggedTainted      = (V3S2 , PackedUuidV3S2 , true,  true),
+        PackedUuidV3S3                    = (V3S3 , PackedUuidV3S3 , false, false),
+        PackedUuidV3S3Flagged             = (V3S3 , PackedUuidV3S3 , true,  false),
+        PackedUuidV3S3Tainted             = (V3S3 , PackedUuidV3S3 , false, true),
+        PackedUuidV3S3FlaggedTainted      = (V3S3 , PackedUuidV3S3 , true,  true),
+        PackedUuidV4S0                    = (V4S0 , PackedUuidV4S0 , false, false),
+        PackedUuidV4S0Flagged             = (V4S0 , PackedUuidV4S0 , true,  false),
+        PackedUuidV4S0Tainted             = (V4S0 , PackedUuidV4S0 , false, true),
+        PackedUuidV4S0FlaggedTainted      = (V4S0 , PackedUuidV4S0 , true,  true),
+        PackedUuidV4S1                    = (V4S1 , PackedUuidV4S1 , false, false),
+        PackedUuidV4S1Flagged             = (V4S1 , PackedUuidV4S1 , true,  false),
+        PackedUuidV4S1Tainted             = (V4S1 , PackedUuidV4S1 , false, true),
+        PackedUuidV4S1FlaggedTainted      = (V4S1 , PackedUuidV4S1 , true,  true),
+        PackedUuidV4S2                    = (V4S2 , PackedUuidV4S2 , false, false),
+        PackedUuidV4S2Flagged             = (V4S2 , PackedUuidV4S2 , true,  false),
+        PackedUuidV4S2Tainted             = (V4S2 , PackedUuidV4S2 , false, true),
+        PackedUuidV4S2FlaggedTainted      = (V4S2 , PackedUuidV4S2 , true,  true),
+        PackedUuidV4S3                    = (V4S3 , PackedUuidV4S3 , false, false),
+        PackedUuidV4S3Flagged             = (V4S3 , PackedUuidV4S3 , true,  false),
+        PackedUuidV4S3Tainted             = (V4S3 , PackedUuidV4S3 , false, true),
+        PackedUuidV4S3FlaggedTainted      = (V4S3 , PackedUuidV4S3 , true,  true),
+        PackedUuidV5S0                    = (V5S0 , PackedUuidV5S0 , false, false),
+        PackedUuidV5S0Flagged             = (V5S0 , PackedUuidV5S0 , true,  false),
+        PackedUuidV5S0Tainted             = (V5S0 , PackedUuidV5S0 , false, true),
+        PackedUuidV5S0FlaggedTainted      = (V5S0 , PackedUuidV5S0 , true,  true),
+        PackedUuidV5S1                    = (V5S1 , PackedUuidV5S1 , false, false),
+        PackedUuidV5S1Flagged             = (V5S1 , PackedUuidV5S1 , true,  false),
+        PackedUuidV5S1Tainted             = (V5S1 , PackedUuidV5S1 , false, true),
+        PackedUuidV5S1FlaggedTainted      = (V5S1 , PackedUuidV5S1 , true,  true),
+        PackedUuidV5S2                    = (V5S2 , PackedUuidV5S2 , false, false),
+        PackedUuidV5S2Flagged             = (V5S2 , PackedUuidV5S2 , true,  false),
+        PackedUuidV5S2Tainted             = (V5S2 , PackedUuidV5S2 , false, true),
+        PackedUuidV5S2FlaggedTainted      = (V5S2 , PackedUuidV5S2 , true,  true),
+        PackedUuidV5S3                    = (V5S3 , PackedUuidV5S3 , false, false),
+        PackedUuidV5S3Flagged             = (V5S3 , PackedUuidV5S3 , true,  false),
+        PackedUuidV5S3Tainted             = (V5S3 , PackedUuidV5S3 , false, true),
+        PackedUuidV5S3FlaggedTainted      = (V5S3 , PackedUuidV5S3 , true,  true),
+        PackedUuidV6                      = (V6   , PackedUuidV6   , false, false),
+        PackedUuidV6Flagged               = (V6   , PackedUuidV6   , true,  false),
+        PackedUuidV6Tainted               = (V6   , PackedUuidV6   , false, true),
+        PackedUuidV6FlaggedTainted        = (V6   , PackedUuidV6   , true,  true),
+        PackedUuidV7                      = (V7   , PackedUuidV7   , false, false),
+        PackedUuidV7Flagged               = (V7   , PackedUuidV7   , true,  false),
+        PackedUuidV7Tainted               = (V7   , PackedUuidV7   , false, true),
+        PackedUuidV7FlaggedTainted        = (V7   , PackedUuidV7   , true,  true),
+    ],
     heap8: [
         Heap8                             = (false, false),
         Heap8Flagged                      = (true,  false),
@@ -2115,9 +2237,9 @@ define_perl_string! {
     ]
 }
 
-// The ledger, checked: thirty-one storage types times the two flag bits (§2.2.3, §2.2.9).  Growing the list moves this
+// The ledger, checked: forty-six storage types times the two flag bits (§2.2.3, §2.2.9).  Growing the list moves this
 // number and the design's ledgers in the same commit.
-const _: () = assert!(REPR_VARIANT_COUNT == 124);
+const _: () = assert!(REPR_VARIANT_COUNT == 184);
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
 const _: () = assert!(size_of::<PString>() == 16);
@@ -2396,8 +2518,14 @@ impl PString {
         if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
             return Ok(PString::build_inline(class, utf8, tainted, stored, aux, buf));
         }
-        if let Some(p) = pack(bytes) {
+        if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
+            && let Some(p) = pack(bytes)
+        {
             return Ok(PString::build_packed(p, utf8, tainted));
+        }
+
+        if let Some((form, payload)) = classify_uuid(bytes) {
+            return Ok(PString::build_uuid(form, payload, utf8, tainted));
         }
         Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
     }
@@ -2426,13 +2554,16 @@ impl PString {
             return Some(PString::build_inline(class, class != InlineClass::Ascii, false, stored, aux, buf));
         }
 
-        // The packed band holds 16-30-character alphabet content and allocates nothing either.  Past it, `None` starts
-        // meaning "the heap".
-        if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
-            return None;
+        // The packed band holds 16-30-character alphabet content and allocates nothing either.
+        if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
+            && let Some(p) = pack(bytes)
+        {
+            return Some(PString::build_packed(p, false, false));
         }
 
-        pack(bytes).map(|p| PString::build_packed(p, false, false))
+        // The §2.2.16 identifier forms allocate nothing either.  Past every envelope reach, `None` starts meaning
+        // "the heap".
+        classify_uuid(bytes).map(|(form, payload)| PString::build_uuid(form, payload, false, false))
     }
 
     /// Construct from raw bytes **without allocating**, or `None` if the content cannot be stored in the value itself.
@@ -2444,11 +2575,13 @@ impl PString {
             return Some(PString::build_inline(class, false, false, stored, aux, buf));
         }
 
-        if !(MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len()) {
-            return None;
+        if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
+            && let Some(p) = pack(bytes)
+        {
+            return Some(PString::build_packed(p, false, false));
         }
 
-        pack(bytes).map(|p| PString::build_packed(p, false, false))
+        classify_uuid(bytes).map(|(form, payload)| PString::build_uuid(form, payload, false, false))
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -2457,6 +2590,7 @@ impl PString {
         match self.raw_parts() {
             RawParts::Inline { class, full, buf } => inline_internal_len(class, full, buf),
             RawParts::Packed(p) => p.len(),
+            RawParts::Uuid { .. } => UUID_LEN,
             RawParts::Heap(cb) => cb.len(),
             RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => bytes.len(),
         }
@@ -2513,6 +2647,10 @@ impl PString {
                 scratch[..len].copy_from_slice(&decoded[..len]);
                 &scratch[..len]
             }
+            RawParts::Uuid { form, payload } => {
+                let n = decode_uuid(form, payload, scratch);
+                &scratch[..n]
+            }
             RawParts::Heap(cb) => cb.as_slice(),
             RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => bytes,
         }
@@ -2522,6 +2660,13 @@ impl PString {
     /// heap scan lattice as a side effect (§2.2.5); sound through `&self`.
     pub fn as_str<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> Option<&'a str> {
         match self.raw_parts() {
+            RawParts::Uuid { form, payload } => {
+                // The canonical spelling is ASCII, so the decoded bytes are always valid.
+                let n = decode_uuid(form, payload, scratch);
+
+                // SAFETY: ASCII by construction.
+                Some(unsafe { str::from_utf8_unchecked(&scratch[..n]) })
+            }
             RawParts::Packed(p) => {
                 // Every packed alphabet is ASCII, so the decoded bytes are always valid.
                 let (decoded, len) = p.unpack();
@@ -2609,6 +2754,7 @@ impl PString {
             // Every symbol of every packed alphabet is ASCII, so this is a constant rather than a question about
             // content — unlike the inline forms, whose bytes are whatever they are.
             RawParts::Packed(_) => true,
+            RawParts::Uuid { .. } => true,
             RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 scan::Ascii => true,
                 st if scan::is_known_non_ascii(st) => false,
@@ -2667,6 +2813,7 @@ impl PString {
                 None => scan::Unknown, // unreachable by construction
             },
             RawParts::Packed(_) => scan::Ascii,
+            RawParts::Uuid { .. } => scan::Ascii,
             RawParts::Heap(cb) => cb.scan(),
             RawParts::Borrowed { scan, .. } => scan.widen(),
             RawParts::View { scan, .. } => scan,
@@ -2678,7 +2825,7 @@ impl PString {
     pub fn is_shared(&self) -> bool {
         match self.raw_parts() {
             RawParts::Heap(view) => !view.is_unique(),
-            RawParts::Inline { .. } | RawParts::Packed(_) => false,
+            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } => false,
 
             // Bitwise clones do share the image, but with the owner that outlives them all (§2.2.3), not with each
             // other in any sense `unshare` could dissolve: copying frees nothing that would otherwise be freed.
@@ -2788,8 +2935,14 @@ impl PString {
                     return Ok(PString::build_inline(class, utf8, tainted, s, aux, buf));
                 }
 
-                if let Some(packed) = pack(bytes) {
+                if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&len)
+                    && let Some(packed) = pack(bytes)
+                {
                     return Ok(PString::build_packed(packed, utf8, tainted));
+                }
+
+                if let Some((form, payload)) = classify_uuid(bytes) {
+                    return Ok(PString::build_uuid(form, payload, utf8, tainted));
                 }
             }
         }
@@ -2868,7 +3021,7 @@ impl PString {
             }
 
             // Envelope-resident sources past representability: no buffer to share (§2.2.15).
-            RawParts::Inline { .. } | RawParts::Packed(_) => {
+            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } => {
                 let bytes = &self.as_bytes(&mut scratch)[offset..offset + len];
                 Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
             }
@@ -2907,7 +3060,7 @@ impl PString {
             // A view carries no count of its own (§2.2.15): zero is the unfilled sentinel, and classification rides the
             // copy as it does for the shared-heap arm above.
             RawParts::View { bytes, scan, .. } => heap_parts_transitioned(bytes, scan, 0)?,
-            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Borrowed { .. } => return Ok(()),
+            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Borrowed { .. } => return Ok(()),
         };
         *self = PString::build_heap(self.is_utf8(), self.is_tainted(), parts);
         Ok(())
@@ -2918,7 +3071,8 @@ impl PString {
     pub fn is_perl_utf8_valid(&self) -> bool {
         match self.raw_parts() {
             RawParts::Inline { .. } => !matches!(self.inline_class(), Some(InlineClass::Bytes)),
-            RawParts::Packed(_) => true, // ASCII is valid under every reading.
+            RawParts::Packed(_) => true,   // ASCII is valid under every reading.
+            RawParts::Uuid { .. } => true, // Likewise.
             RawParts::Borrowed { scan, .. } => scan::is_perl_decodable(scan.widen()),
             RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
                 st if scan::is_perl_decodable(st) => true,
@@ -2960,6 +3114,7 @@ impl PString {
         match self.raw_parts() {
             // Packed alphabets are ASCII, so every character is one byte.
             RawParts::Packed(p) => Some(p.len()),
+            RawParts::Uuid { .. } => Some(UUID_LEN),
             RawParts::Inline { class, full, buf } => {
                 let stored = inline_stored(full, buf);
                 match class {
@@ -3152,6 +3307,13 @@ impl PString {
 
                 Ok(Some(s))
             }
+            RawParts::Uuid { .. } => {
+                // Likewise ASCII by construction.
+                let mut s = self.clone();
+                s.reinterpret_utf8(false);
+
+                Ok(Some(s))
+            }
             RawParts::Borrowed { bytes, .. } | RawParts::View { bytes, .. } => {
                 // The image is readonly, so the downgrade is a copy-out by nature: walk it like heap content.
                 let Some(out) = cow_buffer::downgraded_bytes(bytes)? else {
@@ -3243,6 +3405,7 @@ impl PString {
                 PString::build_inline(class, u2, t2, s, aux, buf)
             }
             RawOwned::Packed(p) => PString::build_packed(p, u2, t2),
+            RawOwned::Uuid { form, payload } => PString::build_uuid(form, payload, u2, t2),
             RawOwned::Heap { ptr, len, cap, count, scan, tier } => PString::build_heap(u2, t2, HeapParts { ptr, len, cap, count, scan, tier }),
             RawOwned::Borrowed { form: BorrowedForm::Immortal, ptr, len, count, scan } => PString::build_immortal(u2, t2, ptr, len, count, scan),
             RawOwned::Borrowed { form: BorrowedForm::Static, ptr, len, count, scan } => PString::build_static(u2, t2, ptr, len, count, scan),
@@ -3333,8 +3496,15 @@ impl PString {
                     return Ok(());
                 }
 
-                if let Some(packed) = pack(&combined[..total]) {
+                if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&total)
+                    && let Some(packed) = pack(&combined[..total])
+                {
                     *self = PString::build_packed(packed, u, t);
+                    return Ok(());
+                }
+
+                if let Some((form, payload)) = classify_uuid(&combined[..total]) {
+                    *self = PString::build_uuid(form, payload, u, t);
                     return Ok(());
                 }
 
@@ -3380,6 +3550,19 @@ impl PString {
                     let state = append_transition_heap(scan::Ascii, kind);
                     PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
                 }
+            }
+            RawOwned::Uuid { form, payload } => {
+                // An append leaves the canonical spelling, so the value always exits the family: decode once, on the
+                // way out, ASCII seeding the heap state as the packed tier's exit does.
+                let mut decoded = [0u8; DECODE_MAX];
+                let len = decode_uuid(form, &payload, &mut decoded);
+                let new_len = len + bytes.len();
+                let mut joined = Vec::new();
+                joined.try_reserve_exact(new_len).map_err(|_| AllocError { requested: new_len })?;
+                joined.extend_from_slice(&decoded[..len]);
+                joined.extend_from_slice(bytes);
+                let state = append_transition_heap(scan::Ascii, kind);
+                PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?)
             }
             RawOwned::Borrowed { form: _, ptr, len, count: _, scan } => {
                 // Copy-out on write (§2.2.3): the image is readonly, so an append is a rebuild seeded by the settled
@@ -3561,6 +3744,13 @@ fn u24_get(bytes: &[u8; 3]) -> usize {
 }
 
 enum RawParts<'a> {
+    /// A packed UUID (§2.2.16): the form and the 15-byte payload, decoded on demand into a caller scratch — the content
+    /// is always the 36-character canonical lowercase spelling, ASCII and terminal.
+    Uuid {
+        form: UuidForm,
+        payload: &'a [u8; PACKED_BYTES],
+    },
+
     /// A view's bytes (§2.2.15), resolved by `raw_parts` itself — offset applied, `SPAN` decoded — so every consumer
     /// reads one shape.  The scan is the envelope's per-handle byte, born from the slice-birth table and possibly
     /// non-terminal.  `backing` is the read-through handle for whole-object adopted views only (§2.2.15): their facts
@@ -3601,6 +3791,10 @@ enum RawOwned {
         buf: [u8; INLINE_MAX],
     },
     Packed(Packed),
+    Uuid {
+        form: UuidForm,
+        payload: [u8; PACKED_BYTES],
+    },
 
     /// The owned pointer with its tier's full metadata, wherever the tier keeps it: the small tiers' fields come from
     /// the envelope, the large tiers' from the allocation header, read at the take.  Every field is true — nothing
@@ -4900,29 +5094,54 @@ impl Packed {
 // are capacity, never semantics).
 
 /// The canonical spelling's length: the §2.2.16 UUID decode ceiling.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const UUID_LEN: usize = 36;
 
 /// The hyphen positions in the canonical spelling.
 const HYPHENS: [usize; 4] = [8, 13, 18, 23];
 
-/// A recognized packed-UUID form: the version family, with the variant nibble's two data bits alongside where the
-/// family shards them (§2.2.16: shards for the hash forms, fixed bits for the time forms — the time forms carry those
-/// two bits inside the payload instead).
+/// A recognized packed-UUID form: the version family, the hash forms carrying the variant nibble's two data bits as
+/// their shard suffix (§2.2.16: shards for the hash forms, fixed bits for the time forms — the time forms carry those
+/// two bits inside the payload instead).  Fifteen unit variants, one per storage type, so that minting can match
+/// `(UuidForm, bool, bool)` exhaustively — sixty arms, no fallback.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum UuidForm {
     V1,
-    V3(u8),
-    V4(u8),
-    V5(u8),
+    V3S0,
+    V3S1,
+    V3S2,
+    V3S3,
+    V4S0,
+    V4S1,
+    V4S2,
+    V4S3,
+    V5S0,
+    V5S1,
+    V5S2,
+    V5S3,
     V6,
     V7,
 }
 
+/// The shard variant for two data bits, per hash version.
+fn uuid_shard(version: u8, bits: u8) -> UuidForm {
+    match (version, bits & 0b11) {
+        (3, 0) => UuidForm::V3S0,
+        (3, 1) => UuidForm::V3S1,
+        (3, 2) => UuidForm::V3S2,
+        (3, 3) => UuidForm::V3S3,
+        (4, 0) => UuidForm::V4S0,
+        (4, 1) => UuidForm::V4S1,
+        (4, 2) => UuidForm::V4S2,
+        (4, 3) => UuidForm::V4S3,
+        (5, 0) => UuidForm::V5S0,
+        (5, 1) => UuidForm::V5S1,
+        (5, 2) => UuidForm::V5S2,
+        _ => UuidForm::V5S3,
+    }
+}
+
 /// Classify a candidate as a canonical lowercase UUID of a recognized form, yielding the form and the 15-byte payload,
 /// or `None` for anything else — which is not a failure, merely a value the family does not serve.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn classify_uuid(bytes: &[u8]) -> Option<(UuidForm, [u8; PACKED_BYTES])> {
     if bytes.len() != UUID_LEN {
         return None;
@@ -4958,9 +5177,7 @@ pub(crate) fn classify_uuid(bytes: &[u8]) -> Option<(UuidForm, [u8; PACKED_BYTES
 
     match nibbles[12] {
         // Shard forms: drop digits 12 and 16; the variant bits become the shard.
-        3 => Some((UuidForm::V3(variant_bits), pack_skipping(&nibbles, None))),
-        4 => Some((UuidForm::V4(variant_bits), pack_skipping(&nibbles, None))),
-        5 => Some((UuidForm::V5(variant_bits), pack_skipping(&nibbles, None))),
+        v @ 3..=5 => Some((uuid_shard(v, variant_bits), pack_skipping(&nibbles, None))),
 
         // Time forms: the fused nibble stands where the range-checked digit stood.
         1 => pack_time(&nibbles, 13, variant_bits).map(|p| (UuidForm::V1, p)),
@@ -5002,7 +5219,6 @@ fn pack_skipping(nibbles: &[u8; 32], _fused_at: Option<usize>) -> [u8; PACKED_BY
 
 /// Reconstruct the canonical lowercase spelling into `out`, returning the written length (always [`UUID_LEN`]).  The
 /// inverse of [`classify_uuid`] by construction, which the round-trip tests pin.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_uuid(form: UuidForm, payload: &[u8; PACKED_BYTES], out: &mut [u8]) -> usize {
     // Unpack the 30 stored nibbles.
     let mut stored = [0u8; 30];
@@ -5013,9 +5229,18 @@ pub(crate) fn decode_uuid(form: UuidForm, payload: &[u8; PACKED_BYTES], out: &mu
     // Rebuild the 32 digit nibbles: reinsert the version at 12 and the variant at 16, and split any fused digit.
     let (version, variant_bits, fused_at) = match form {
         UuidForm::V1 => (1, None, Some(13)),
-        UuidForm::V3(v) => (3, Some(v), None),
-        UuidForm::V4(v) => (4, Some(v), None),
-        UuidForm::V5(v) => (5, Some(v), None),
+        UuidForm::V3S0 => (3, Some(0), None),
+        UuidForm::V3S1 => (3, Some(1), None),
+        UuidForm::V3S2 => (3, Some(2), None),
+        UuidForm::V3S3 => (3, Some(3), None),
+        UuidForm::V4S0 => (4, Some(0), None),
+        UuidForm::V4S1 => (4, Some(1), None),
+        UuidForm::V4S2 => (4, Some(2), None),
+        UuidForm::V4S3 => (4, Some(3), None),
+        UuidForm::V5S0 => (5, Some(0), None),
+        UuidForm::V5S1 => (5, Some(1), None),
+        UuidForm::V5S2 => (5, Some(2), None),
+        UuidForm::V5S3 => (5, Some(3), None),
         UuidForm::V6 => (6, None, Some(0)),
         UuidForm::V7 => (7, None, Some(0)),
     };

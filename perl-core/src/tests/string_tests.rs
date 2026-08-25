@@ -5719,7 +5719,7 @@ fn round_trip(s: &str) -> (UuidForm, [u8; 15]) {
 #[test]
 fn every_recognized_form_round_trips() {
     let (f, _) = round_trip("f47ac10b-58cc-4372-a567-0e02b2c3d479");
-    assert_eq!(f, UuidForm::V4(0b10), "variant digit a is data bits 10");
+    assert_eq!(f, UuidForm::V4S2, "variant digit a is data bits 10");
 
     let (f, _) = round_trip("017f22e2-79b0-7cc3-98c4-dc0c0c07398f");
     assert_eq!(f, UuidForm::V7);
@@ -5731,18 +5731,18 @@ fn every_recognized_form_round_trips() {
     assert_eq!(f, UuidForm::V6);
 
     let (f, _) = round_trip("a3bb189e-8bf9-3888-9912-ace4e6543002");
-    assert_eq!(f, UuidForm::V3(0b01));
+    assert_eq!(f, UuidForm::V3S1);
 
     let (f, _) = round_trip("74738ff5-5367-5958-9aee-98fffdcd1876");
-    assert_eq!(f, UuidForm::V5(0b01));
+    assert_eq!(f, UuidForm::V5S1);
 }
 
 #[test]
 fn every_shard_and_every_variant_digit_survives() {
-    for (digit, bits) in [(b'8', 0b00u8), (b'9', 0b01), (b'a', 0b10), (b'b', 0b11)] {
+    for (digit, shard) in [(b'8', UuidForm::V4S0), (b'9', UuidForm::V4S1), (b'a', UuidForm::V4S2), (b'b', UuidForm::V4S3)] {
         let s = format!("f47ac10b-58cc-4372-{}567-0e02b2c3d479", digit as char);
         let (form, payload) = classify_uuid(s.as_bytes()).unwrap();
-        assert_eq!(form, UuidForm::V4(bits));
+        assert_eq!(form, shard);
 
         let mut out = [0u8; UUID_LEN];
         decode_uuid(form, &payload, &mut out);
@@ -5782,4 +5782,104 @@ fn payloads_of_distinct_uuids_differ_and_zero_nothing_silently() {
     let (_, a) = classify_uuid(b"f47ac10b-58cc-4372-a567-0e02b2c3d479").unwrap();
     let (_, b) = classify_uuid(b"f47ac10b-58cc-4372-a567-0e02b2c3d478").unwrap();
     assert_ne!(a, b);
+}
+
+// ── The packed-UUID family (§2.2.16) ──────────────────────────
+#[test]
+fn uuid_spellings_pack_through_the_selector() {
+    for (s, ty) in [
+        ("f47ac10b-58cc-4372-a567-0e02b2c3d479", StorageType::PackedUuidV4S2),
+        ("017f22e2-79b0-7cc3-98c4-dc0c0c07398f", StorageType::PackedUuidV7),
+        ("2f1a0e9c-5d1b-11ee-8c99-0242ac120002", StorageType::PackedUuidV1),
+        ("3ee5d1b2-f1a0-6e9c-8c99-0242ac120002", StorageType::PackedUuidV6),
+        ("a3bb189e-8bf9-3888-9912-ace4e6543002", StorageType::PackedUuidV3S1),
+        ("74738ff5-5367-5958-9aee-98fffdcd1876", StorageType::PackedUuidV5S1),
+    ] {
+        let p = PString::from_bytes(s.as_bytes()).unwrap();
+        assert_eq!(p.storage_type(), ty, "{s}");
+        assert_eq!(p.len(), 36);
+        assert_eq!(p.char_len(), Some(36));
+        assert!(p.is_ascii());
+        assert!(p.is_perl_utf8_valid());
+        assert!(!p.is_shared());
+
+        let mut sc = [0u8; DECODE_MAX];
+        assert_eq!(p.as_bytes(&mut sc), s.as_bytes());
+        assert_eq!(p.as_str(&mut sc), Some(s));
+        assert_eq!(format!("{p}"), s);
+    }
+
+    // A spelling outside every pattern takes ordinary storage: capacity, never semantics.
+    let spilled = PString::from_bytes(*b"F47AC10B-58CC-4372-A567-0E02B2C3D479").unwrap();
+    assert_eq!(spilled.storage_type(), StorageType::Heap8Ascii, "uppercase spills until evidence rules it in");
+}
+
+#[test]
+fn packed_uuids_equal_their_heap_spelling_on_every_surface() {
+    let s = b"f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    let packed = PString::from_bytes(*s).unwrap();
+    assert_eq!(packed.storage_type(), StorageType::PackedUuidV4S2);
+
+    // A heap twin of the same spelling: build past the band, append the tail — heap never demotes.
+    let mut heap = PString::from_bytes(&s[..35]).unwrap();
+    assert_eq!(heap.storage_type(), StorageType::Heap8Ascii);
+    heap.push_bytes(&s[35..]).unwrap();
+    assert!(matches!(heap.storage_type(), StorageType::Heap8 | StorageType::Heap8Ascii), "no demotion");
+
+    assert_eq!(packed, heap);
+    assert_eq!(heap, packed);
+    assert_eq!(packed.cmp(&heap), std::cmp::Ordering::Equal);
+    assert_eq!(hash_of(&packed), hash_of(&heap));
+    assert_eq!(format!("{packed}"), format!("{heap}"));
+    assert_eq!(format!("{:?}", ContentDebug(&packed)), format!("{:?}", ContentDebug(&heap)));
+}
+
+#[test]
+fn uuid_flags_ride_the_twins_and_the_payload_stays() {
+    let s = b"017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
+    let mut p = PString::from_bytes(*s).unwrap();
+    p.taint();
+    assert!(p.is_tainted());
+    assert_eq!(p.storage_type(), StorageType::PackedUuidV7, "the twin switch leaves the storage type");
+
+    p.set_utf8_for_test();
+    assert!(p.is_utf8());
+    assert_eq!(p.storage_type(), StorageType::PackedUuidV7);
+
+    let mut sc = [0u8; DECODE_MAX];
+    assert_eq!(p.as_bytes(&mut sc), s, "flags never touch the payload");
+
+    let down = p.downgraded().unwrap().unwrap();
+    assert!(!down.is_utf8());
+    assert!(down.is_tainted(), "the downgrade drops the flag and keeps the taint");
+    assert_eq!(down, p);
+}
+
+#[test]
+fn uuid_slices_copy_and_appends_exit_or_complete() {
+    let s = b"f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    let p = PString::from_bytes(*s).unwrap();
+
+    let head = p.slice(0, 8).unwrap();
+    assert_eq!(head, p.substr(0, 8).unwrap());
+    let mid = p.slice(9, 20).unwrap();
+    assert!(
+        !matches!(mid.storage_type(), StorageType::SmallSlice | StorageType::MediumSlice | StorageType::FarSlice),
+        "an envelope-resident source has no buffer to share"
+    );
+    assert_eq!(mid, p.substr(9, 20).unwrap());
+
+    // An append leaves the spelling: the value exits to the heap with the joined content.
+    let mut q = p.clone();
+    q.push_bytes(b"!").unwrap();
+    assert_eq!(q.len(), 37);
+    let mut sa = [0u8; DECODE_MAX];
+    assert_eq!(&q.as_bytes(&mut sa)[..36], s);
+
+    // And an append that completes a spelling packs it: the combined attempt runs the same ladder.
+    let mut r = PString::from_bytes(&s[..12]).unwrap();
+    assert!(format!("{:?}", r.storage_type()).starts_with("Inline"));
+    r.push_bytes(&s[12..]).unwrap();
+    assert_eq!(r.storage_type(), StorageType::PackedUuidV4S2, "the ladder recognizes the completed spelling");
+    assert_eq!(r, p);
 }
