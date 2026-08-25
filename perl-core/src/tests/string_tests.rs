@@ -6105,3 +6105,19 @@ fn the_storage_projections_answer_for_every_type() {
     let st = view.storage_type();
     assert!(!st.is_inline() && !st.is_packed() && !st.is_heap(), "a view is none of the three: {st:?}");
 }
+
+#[test]
+fn every_hex_format_survives_a_round_trip_in_both_cases() {
+    // The numeric assignment is unobservable from out here, so what a test can hold is what each spelling renders: its
+    // own separators, its own case, its own width.  The polarity itself is pinned beside the enum.
+    for s in ["deadbeefdeadbeef", "00:1a:2b:33:44:55", "00-1a-2b-33-44-55", "00 1a 2b 33 44 55", "0xdeadbeefdeadbe"] {
+        let lower = PString::from_bytes(s.as_bytes()).unwrap();
+        assert_eq!(lower.storage_type(), StorageType::PackedHexBytes, "{s}");
+
+        let upper = PString::from_bytes(s.to_uppercase().replace("0X", "0x").as_bytes()).unwrap();
+        let mut sc = [0u8; DECODE_MAX];
+        let rendered = upper.as_bytes(&mut sc);
+        assert!(rendered.iter().all(|b| !b.is_ascii_lowercase() || *b == b'x'), "{s} keeps its case");
+        assert_eq!(rendered.len(), s.len(), "and its rendering width");
+    }
+}

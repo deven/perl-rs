@@ -2574,10 +2574,14 @@ nibbles:
   every code meaningful, no length code is loud: validation
   lives wholly in classification.
 - **Variation nibble**: a three-bit format code and one case bit.
-  Five codes are assigned — colon, hyphen, none, space, and a
-  `0x` prefix written once before plain digits — and three are
-  unassigned and loud, on the length nibble's polarity, until a
-  format earns one.  Recorded candidates: dotted four-digit
+  Five codes are assigned — none at zero, then colon, hyphen,
+  space, and a `0x` prefix written once before plain digits — and
+  three are unassigned until a format earns one.  The undecorated
+  spelling takes zero on the house polarity, so a zeroed nibble
+  reads as the least a spelling can carry rather than as a
+  decoration nothing asked for, and the unassigned codes read as
+  it too: the decoder stays total over the whole field with no
+  branch that can fail.  Recorded candidates: dotted four-digit
   grouping, and the per-byte `0x` spellings with space or comma.
   A prefix is a format, not an orthogonal property: each spelling
   takes a code, and a format's admissible range is a

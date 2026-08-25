@@ -5467,16 +5467,21 @@ const HEX_VARIATION_NIBBLE: usize = 29;
 /// The case bit within the variation nibble; the low three bits are the format code.
 const HEX_UPPER_BIT: u8 = 0b1000;
 
-/// A recognized hex-byte spelling (§2.2.16).  The discriminants are the assigned format codes; codes five through seven
-/// are unassigned and stay loud.
+/// A recognized hex-byte spelling (§2.2.16).  The discriminants are the assigned format codes, and the plain spelling
+/// takes zero on the house polarity: the undecorated reading is what a zeroed nibble should mean, not some decoration
+/// nothing asked for.  Codes five through seven are unassigned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HexFormat {
-    Colon = 0,
-    Hyphen = 1,
-    Plain = 2,
+    Plain = 0,
+    Colon = 1,
+    Hyphen = 2,
     Space = 3,
     PrefixOnce = 4,
 }
+
+// The polarity, pinned: moving the plain spelling off zero would make a zeroed variation nibble decode as a separated
+// one.
+const _: () = assert!(HexFormat::Plain as u8 == 0);
 
 impl HexFormat {
     /// The separator standing between digit pairs, or `None` where the spelling has none.
@@ -5590,22 +5595,20 @@ fn classify_hex_bytes(bytes: &[u8]) -> Option<[u8; PACKED_BYTES]> {
     Some(payload)
 }
 
-/// The format and case a payload's variation nibble carries.
+/// The format and case a payload's variation nibble carries.  Total over the three-bit field by construction, so no
+/// branch here can fail: the plain spelling answers for zero, which is its own code, and for the three unassigned ones,
+/// which classification never emits.  Assigning a code gives it an arm above, and the round-trip tests fail at once if
+/// a spelling is added on the classifying side alone.
 fn hex_variation(payload: &[u8; PACKED_BYTES]) -> (HexFormat, bool) {
     let variation = nibble_at(payload, HEX_VARIATION_NIBBLE);
     let format = match variation & 0b0111 {
-        0 => HexFormat::Colon,
-        1 => HexFormat::Hyphen,
-        2 => HexFormat::Plain,
+        1 => HexFormat::Colon,
+        2 => HexFormat::Hyphen,
         3 => HexFormat::Space,
         4 => HexFormat::PrefixOnce,
 
-        // The unassigned codes are unreachable: classification is the only constructor and emits five (§2.2.16).  Debug
-        // builds fail here; release renders the plain spelling rather than panicking on corruption.
-        _ => {
-            debug_assert!(false, "an unassigned hex-byte format code reached the decoder");
-            HexFormat::Plain
-        }
+        // Zero is the plain spelling; the three unassigned codes read as it too.
+        _ => HexFormat::Plain,
     };
 
     (format, variation & HEX_UPPER_BIT != 0)
@@ -5627,6 +5630,8 @@ fn hex_rendered_len(payload: &[u8; PACKED_BYTES]) -> usize {
 /// Reconstruct the spelling into `out`, returning the written length.  The inverse of [`classify_hex_bytes`] by
 /// construction, which the round-trip tests pin.
 fn decode_hex_bytes(payload: &[u8; PACKED_BYTES], out: &mut [u8]) -> usize {
+    // Every spelling fits the scratch every caller supplies: the widest is the separated one at `HEX_MAX_LEN`, which
+    // `DECODE_MAX` is defined to cover, so the writes below need no bound of their own.
     let digits = hex_digits_of(nibble_at(payload, HEX_LENGTH_NIBBLE));
     let (format, upper) = hex_variation(payload);
     let separator = format.separator();
