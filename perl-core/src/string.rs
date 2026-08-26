@@ -897,33 +897,11 @@ unsafe fn classify_known_valid_into(dst: *mut u8, src: &[u8]) -> (scan::ValidRan
     (range, chars)
 }
 
-/// The inline content class (§2.2.9), eagerly established at construction.  One vocabulary with the §2.2.4 heap
-/// lattice: the same classification, eager and in the tag here, lazy and in the buffer header there.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum InlineClass {
-    /// Entirely U+0000–U+007F.
-    Ascii,
-
-    /// Rust-valid, entirely U+0000–U+00FF, non-ASCII.
-    Latin1,
-
-    /// Rust-valid, contains a character ≥ U+0100.
-    NonLatin1,
-
-    /// Perl-decodable, Rust-invalid (§2.2.4): contains a Rust-rejected code point, hence ≥ U+0100.
-    Extended,
-
-    /// Bytes neither reader decodes — malformed as UTF-8 to both perl and Rust, and perfectly well-formed Latin-1 to
-    /// perl when the flag is off: every octet a character.
-    Bytes,
-}
-
-/// The storage type: the forty-seven-value normative vocabulary (§2.2.9), one value per base variant of the folded tag
-/// — the discriminant is this type times the two flag bits, utf8 and tainted, which is the whole tag ledger:
-/// forty-seven times four is the 188 the §2.2.3 arithmetic states, pinned by `REPR_VARIANT_COUNT`.  Coarse questions
-/// are the projection methods.  Declaration order is itself the selection (§2.2.9): canonical selection takes the first
-/// type, in this order, able to represent the content — first-fit is the ladder — which is what the derived `Ord`
-/// means.
+/// The storage type: the forty-nine-value normative vocabulary (§2.2.9), one value per base variant of the folded tag —
+/// the discriminant is this type times the two flag bits, utf8 and tainted, which is the whole tag ledger: forty-nine
+/// times four is the 196 the §2.2.3 arithmetic states, pinned by `REPR_VARIANT_COUNT`.  Coarse questions are the
+/// projection methods.  Declaration order is itself the selection (§2.2.9): canonical selection takes the first type,
+/// in this order, able to represent the content — first-fit is the ladder — which is what the derived `Ord` means.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum StorageType {
     /// Inline, ≤ [`INLINE_MAX`] payload bytes, no allocation: the five content classes, each beside its full-capacity
@@ -1068,6 +1046,14 @@ pub enum StorageType {
     /// A packed hex-byte string (§2.2.16): the digits in the payload, the spelling's format and case in its fifteenth
     /// byte beside the length.
     PackedHexBytes,
+
+    /// Latin-1-range content compressed into the payload (§2.2.9): one octet per code point, reaching thirty input
+    /// bytes where the verbatim classes reach fifteen.  Packed, not inline — the payload holds a transcoding of the
+    /// value's bytes rather than the bytes themselves.
+    PackedLatin1,
+
+    /// The full-capacity twin of [`StorageType::PackedLatin1`].
+    PackedLatin1Full,
 }
 
 impl StorageType {
@@ -1119,6 +1105,8 @@ impl StorageType {
                 | PackedUuidV6
                 | PackedUuidV7
                 | PackedHexBytes
+                | PackedLatin1
+                | PackedLatin1Full
         )
     }
 
@@ -1139,7 +1127,8 @@ impl StorageType {
 /// synthesized by identifier concatenation) so a grep for any variant finds this defining invocation.
 macro_rules! define_perl_string {
     (
-        inline: [ $( $inline:ident = ($inline_class:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
+        inline: [ $( $inline:ident = ($inline_terminal:ident, $inline_type:ident, $inline_full:literal, $inline_utf8:literal, $inline_tainted:literal) ),* $(,)? ],
+        latin1: [ $( $latin1:ident = ($latin1_type:ident, $latin1_full:literal, $latin1_utf8:literal, $latin1_tainted:literal) ),* $(,)? ],
         packed: [ $( $packed:ident = ($packed_alphabet:ident, $packed_type:ident, $packed_full:literal, $packed_utf8:literal, $packed_tainted:literal) ),* $(,)? ],
         uuids: [ $( $uuid:ident = ($uuid_form:ident, $uuid_type:ident, $uuid_utf8:literal, $uuid_tainted:literal) ),* $(,)? ],
         hexes: [ $( $hex:ident = ($hex_type:ident, $hex_utf8:literal, $hex_tainted:literal) ),* $(,)? ],
@@ -1181,6 +1170,7 @@ macro_rules! define_perl_string {
         #[repr(align(8))]
         enum Repr {
             $( $inline { buf: [u8; INLINE_MAX] }, )*
+            $( $latin1 { buf: [u8; INLINE_MAX] }, )*
             $( $packed { nibbles: [u8; PACKED_BYTES] }, )*
             $( $uuid { payload: [u8; PACKED_BYTES] }, )*
             $( $hex { payload: [u8; PACKED_BYTES] }, )*
@@ -1205,6 +1195,7 @@ macro_rules! define_perl_string {
         /// state this same number (§2.2.3, §2.2.9) — the assert beside the invocation fails any drift.
         pub(crate) const REPR_VARIANT_COUNT: usize = 0
             $( + { let _ = stringify!($inline); 1 } )*
+            $( + { let _ = stringify!($latin1); 1 } )*
             $( + { let _ = stringify!($packed); 1 } )*
             $( + { let _ = stringify!($uuid); 1 } )*
             $( + { let _ = stringify!($hex); 1 } )*
@@ -1228,6 +1219,7 @@ macro_rules! define_perl_string {
             fn clone(&self) -> Repr {
                 match self {
                     $( Repr::$inline { buf } => Repr::$inline { buf: *buf }, )*
+                    $( Repr::$latin1 { buf } => Repr::$latin1 { buf: *buf }, )*
                     $( Repr::$packed { nibbles } => Repr::$packed { nibbles: *nibbles }, )*
                     $( Repr::$uuid { payload } => Repr::$uuid { payload: *payload }, )*
                     $( Repr::$hex { payload } => Repr::$hex { payload: *payload }, )*
@@ -1299,6 +1291,7 @@ macro_rules! define_perl_string {
                 // consumed here; the small tiers pass the capacity their allocation does not record.
                 match self {
                     $( Repr::$inline { .. } => {}, )*
+                    $( Repr::$latin1 { .. } => {}, )*
                     $( Repr::$packed { .. } => {}, )*
                     $( Repr::$uuid { .. } => {}, )*
                     $( Repr::$hex { .. } => {}, )*
@@ -1332,6 +1325,7 @@ macro_rules! define_perl_string {
             pub fn storage_type(&self) -> StorageType {
                 match &self.0 {
                     $( Repr::$inline { .. } => StorageType::$inline_type, )*
+                    $( Repr::$latin1 { .. } => StorageType::$latin1_type, )*
                     $( Repr::$packed { .. } => StorageType::$packed_type, )*
                     $( Repr::$uuid { .. } => StorageType::$uuid_type, )*
                     $( Repr::$hex { .. } => StorageType::$hex_type, )*
@@ -1357,6 +1351,7 @@ macro_rules! define_perl_string {
             pub fn is_utf8(&self) -> bool {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_utf8, )*
+                    $( Repr::$latin1 { .. } => $latin1_utf8, )*
                     $( Repr::$packed { .. } => $packed_utf8, )*
                     $( Repr::$uuid { .. } => $uuid_utf8, )*
                     $( Repr::$hex { .. } => $hex_utf8, )*
@@ -1382,6 +1377,7 @@ macro_rules! define_perl_string {
             pub fn is_tainted(&self) -> bool {
                 match &self.0 {
                     $( Repr::$inline { .. } => $inline_tainted, )*
+                    $( Repr::$latin1 { .. } => $latin1_tainted, )*
                     $( Repr::$packed { .. } => $packed_tainted, )*
                     $( Repr::$uuid { .. } => $uuid_tainted, )*
                     $( Repr::$hex { .. } => $hex_tainted, )*
@@ -1403,11 +1399,13 @@ macro_rules! define_perl_string {
                 }
             }
 
-            /// The inline content class, or `None` for heap storage.  Internal: the public vocabulary is
-            /// [`StorageType`], of which this is the class projection.
-            fn inline_class(&self) -> Option<InlineClass> {
+            /// The settled content state of an envelope-resident value, or `None` where the bytes live behind a pointer
+            /// and the state belongs to the buffer or the view envelope instead (§2.2.4).  Internal: the public
+            /// vocabulary is [`StorageType`].
+            fn envelope_terminal(&self) -> Option<scan::Terminal> {
                 match &self.0 {
-                    $( Repr::$inline { .. } => Some(InlineClass::$inline_class), )*
+                    $( Repr::$inline { .. } => Some(scan::Terminal::$inline_terminal), )*
+                    $( Repr::$latin1 { .. } => Some(scan::Terminal::Utf8Latin1), )*
                     $( Repr::$immortal { .. } => None, )*
                     $( Repr::$static { .. } => None, )*
                     $( Repr::$large_immortal { .. } => None, )*
@@ -1421,9 +1419,9 @@ macro_rules! define_perl_string {
                     $( Repr::$heap16a { .. } => None, )*
 
                     // Packed alphabets are ASCII by construction, so the scan state is fixed.
-                    $( Repr::$packed { .. } => Some(InlineClass::Ascii), )*
-                    $( Repr::$uuid { .. } => Some(InlineClass::Ascii), )*
-                    $( Repr::$hex { .. } => Some(InlineClass::Ascii), )*
+                    $( Repr::$packed { .. } => Some(scan::Terminal::Ascii), )*
+                    $( Repr::$uuid { .. } => Some(scan::Terminal::Ascii), )*
+                    $( Repr::$hex { .. } => Some(scan::Terminal::Ascii), )*
                     $( Repr::$heap8 { .. } => None, )*
                     $( Repr::$heap16 { .. } => None, )*
                     $( Repr::$heap32 { .. } => None, )*
@@ -1436,15 +1434,16 @@ macro_rules! define_perl_string {
             /// compressed classes, the decoded character count for the verbatim valid classes, zero for Ascii and
             /// Bytes — stored beside `s` in the short family, implied and derived at full capacity.  Internal: tag
             /// transitions go through the public monotonic/setter methods.
-            fn build_inline(class: InlineClass, utf8: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PString {
+            fn build_inline(terminal: scan::Terminal, utf8: bool, tainted: bool, s: usize, aux: usize, buf: [u8; INLINE_MAX]) -> PString {
                 debug_assert!(s <= INLINE_MAX);
                 debug_assert!(
-                    match class {
-                        InlineClass::Ascii | InlineClass::Bytes => aux == 0,
-                        InlineClass::Latin1 => (1..=s).contains(&aux),
-                        InlineClass::NonLatin1 | InlineClass::Extended => (1..s).contains(&aux),
+                    match terminal {
+                        // A character count is worth storing only where it can differ from the byte count, which is
+                        // where a character can span more than one byte (§2.2.9).
+                        scan::Terminal::Ascii | scan::Terminal::MalformedUtf8 => aux == 0,
+                        _ => (1..s).contains(&aux),
                     },
-                    "the aux nibble is per-class (§2.2.9): {class:?} with s {s}, aux {aux}"
+                    "the aux nibble is per-state (§2.2.9): {terminal:?} with s {s}, aux {aux}"
                 );
                 let mut buf = buf;
                 if s < INLINE_MAX {
@@ -1454,8 +1453,25 @@ macro_rules! define_perl_string {
                     buf[LENGTH_BYTE] = ((aux as u8) << 4) | s as u8;
                 }
 
-                match (class, s == INLINE_MAX, utf8, tainted) {
-                    $( (InlineClass::$inline_class, $inline_full, $inline_utf8, $inline_tainted) => PString(Repr::$inline { buf }), )*
+                match (terminal, s == INLINE_MAX, utf8, tainted) {
+                    $( (scan::Terminal::$inline_terminal, $inline_full, $inline_utf8, $inline_tainted) => PString(Repr::$inline { buf }), )*
+                }
+            }
+
+            /// Build a compressed Latin-1 value (§2.2.9): the payload is the transcoding, `s` its stored count and `h`
+            /// the count of octets that expand to two bytes, packed into the length byte's nibbles.
+            fn build_latin1(utf8: bool, tainted: bool, s: usize, h: usize, buf: [u8; INLINE_MAX]) -> PString {
+                debug_assert!((1..=s).contains(&h), "every compressed payload carries a high octet: s {s}, h {h}");
+                debug_assert!(s + h > INLINE_MAX, "content the verbatim payload holds must not compress (§2.2.9)");
+
+                let mut buf = buf;
+                if s < INLINE_MAX {
+                    buf[s..].fill(0);
+                    buf[LENGTH_BYTE] = ((h as u8) << 4) | s as u8;
+                }
+
+                match (s == INLINE_MAX, utf8, tainted) {
+                    $( ($latin1_full, $latin1_utf8, $latin1_tainted) => PString(Repr::$latin1 { buf }), )*
                 }
             }
 
@@ -1486,7 +1502,8 @@ macro_rules! define_perl_string {
             /// explicit variant lists ran past a hundred names, and the per-section repetition expresses it exactly.
             fn raw_parts(&self) -> RawParts<'_> {
                 match &self.0 {
-                    $( Repr::$inline { buf } => RawParts::Inline { class: InlineClass::$inline_class, full: $inline_full, buf }, )*
+                    $( Repr::$inline { buf } => RawParts::Inline { terminal: scan::Terminal::$inline_terminal, full: $inline_full, buf }, )*
+                    $( Repr::$latin1 { buf } => RawParts::Latin1 { full: $latin1_full, buf }, )*
                     $( Repr::$packed { nibbles } => RawParts::Packed(Packed {
                         alphabet: PackedAlphabet::$packed_alphabet,
                         full: $packed_full,
@@ -1578,6 +1595,9 @@ macro_rules! define_perl_string {
             fn inline_buf_mut(&mut self) -> Option<(bool, &mut [u8; INLINE_MAX])> {
                 match &mut self.0 {
                     $( Repr::$inline { buf } => Some(($inline_full, buf)), )*
+
+                    // The compressed payload is a transcoding, so a byte append cannot write through it (§2.2.9).
+                    $( Repr::$latin1 { .. } => None, )*
                     $( Repr::$packed { .. } => None, )*
                     $( Repr::$uuid { .. } => None, )*
                     $( Repr::$hex { .. } => None, )*
@@ -1829,6 +1849,7 @@ macro_rules! define_perl_string {
             fn heap_tier(&self) -> Option<Tier> {
                 match &self.0 {
                     $( Repr::$inline { .. } => None, )*
+                    $( Repr::$latin1 { .. } => None, )*
                     $( Repr::$packed { .. } => None, )*
                     $( Repr::$uuid { .. } => None, )*
                     $( Repr::$hex { .. } => None, )*
@@ -1862,7 +1883,8 @@ macro_rules! define_perl_string {
                 // SAFETY (each heap arm): `this` is never dropped, so the pointer is read out exactly once and the
                 // reference it carries transfers to the returned `RawOwned`.
                 match &this.0 {
-                    $( Repr::$inline { buf } => RawOwned::Inline { class: InlineClass::$inline_class, full: $inline_full, buf: *buf }, )*
+                    $( Repr::$inline { buf } => RawOwned::Inline { terminal: scan::Terminal::$inline_terminal, full: $inline_full, buf: *buf }, )*
+                    $( Repr::$latin1 { buf } => RawOwned::Latin1 { full: $latin1_full, buf: *buf }, )*
                     $( Repr::$packed { nibbles } => RawOwned::Packed(Packed {
                         alphabet: PackedAlphabet::$packed_alphabet,
                         full: $packed_full,
@@ -2083,46 +2105,56 @@ macro_rules! define_perl_string {
 
 define_perl_string! {
     inline: [
-        InlineAscii                       = (Ascii,        InlineAscii,            false, false, false),
-        InlineAsciiFlagged                = (Ascii,        InlineAscii,            false, true,  false),
-        InlineAsciiTainted                = (Ascii,        InlineAscii,            false, false, true),
-        InlineAsciiFlaggedTainted         = (Ascii,        InlineAscii,            false, true,  true),
-        InlineAsciiFull                   = (Ascii,        InlineAsciiFull,        true,  false, false),
-        InlineAsciiFullFlagged            = (Ascii,        InlineAsciiFull,        true,  true,  false),
-        InlineAsciiFullTainted            = (Ascii,        InlineAsciiFull,        true,  false, true),
-        InlineAsciiFullFlaggedTainted     = (Ascii,        InlineAsciiFull,        true,  true,  true),
-        InlineLatin1                      = (Latin1,       InlineLatin1,           false, false, false),
-        InlineLatin1Flagged               = (Latin1,       InlineLatin1,           false, true,  false),
-        InlineLatin1Tainted               = (Latin1,       InlineLatin1,           false, false, true),
-        InlineLatin1FlaggedTainted        = (Latin1,       InlineLatin1,           false, true,  true),
-        InlineLatin1Full                  = (Latin1,       InlineLatin1Full,       true,  false, false),
-        InlineLatin1FullFlagged           = (Latin1,       InlineLatin1Full,       true,  true,  false),
-        InlineLatin1FullTainted           = (Latin1,       InlineLatin1Full,       true,  false, true),
-        InlineLatin1FullFlaggedTainted    = (Latin1,       InlineLatin1Full,       true,  true,  true),
-        InlineNonLatin1                   = (NonLatin1,    InlineNonLatin1,        false, false, false),
-        InlineNonLatin1Flagged            = (NonLatin1,    InlineNonLatin1,        false, true,  false),
-        InlineNonLatin1Tainted            = (NonLatin1,    InlineNonLatin1,        false, false, true),
-        InlineNonLatin1FlaggedTainted     = (NonLatin1,    InlineNonLatin1,        false, true,  true),
-        InlineNonLatin1Full               = (NonLatin1,    InlineNonLatin1Full,    true,  false, false),
-        InlineNonLatin1FullFlagged        = (NonLatin1,    InlineNonLatin1Full,    true,  true,  false),
-        InlineNonLatin1FullTainted        = (NonLatin1,    InlineNonLatin1Full,    true,  false, true),
-        InlineNonLatin1FullFlaggedTainted = (NonLatin1,    InlineNonLatin1Full,    true,  true,  true),
-        InlineExtended                    = (Extended,     InlineExtended,         false, false, false),
-        InlineExtendedFlagged             = (Extended,     InlineExtended,         false, true,  false),
-        InlineExtendedTainted             = (Extended,     InlineExtended,         false, false, true),
-        InlineExtendedFlaggedTainted      = (Extended,     InlineExtended,         false, true,  true),
-        InlineExtendedFull                = (Extended,     InlineExtendedFull,     true,  false, false),
-        InlineExtendedFullFlagged         = (Extended,     InlineExtendedFull,     true,  true,  false),
-        InlineExtendedFullTainted         = (Extended,     InlineExtendedFull,     true,  false, true),
-        InlineExtendedFullFlaggedTainted  = (Extended,     InlineExtendedFull,     true,  true,  true),
-        InlineBytes                       = (Bytes,        InlineBytes,            false, false, false),
-        InlineBytesFlagged                = (Bytes,        InlineBytes,            false, true,  false),
-        InlineBytesTainted                = (Bytes,        InlineBytes,            false, false, true),
-        InlineBytesFlaggedTainted         = (Bytes,        InlineBytes,            false, true,  true),
-        InlineBytesFull                   = (Bytes,        InlineBytesFull,        true,  false, false),
-        InlineBytesFullFlagged            = (Bytes,        InlineBytesFull,        true,  true,  false),
-        InlineBytesFullTainted            = (Bytes,        InlineBytesFull,        true,  false, true),
-        InlineBytesFullFlaggedTainted     = (Bytes,        InlineBytesFull,        true,  true,  true),
+        InlineAscii                       = (Ascii,         InlineAscii,            false, false, false),
+        InlineAsciiFlagged                = (Ascii,         InlineAscii,            false, true,  false),
+        InlineAsciiTainted                = (Ascii,         InlineAscii,            false, false, true),
+        InlineAsciiFlaggedTainted         = (Ascii,         InlineAscii,            false, true,  true),
+        InlineAsciiFull                   = (Ascii,         InlineAsciiFull,        true,  false, false),
+        InlineAsciiFullFlagged            = (Ascii,         InlineAsciiFull,        true,  true,  false),
+        InlineAsciiFullTainted            = (Ascii,         InlineAsciiFull,        true,  false, true),
+        InlineAsciiFullFlaggedTainted     = (Ascii,         InlineAsciiFull,        true,  true,  true),
+        InlineLatin1                      = (Utf8Latin1,    InlineLatin1,           false, false, false),
+        InlineLatin1Flagged               = (Utf8Latin1,    InlineLatin1,           false, true,  false),
+        InlineLatin1Tainted               = (Utf8Latin1,    InlineLatin1,           false, false, true),
+        InlineLatin1FlaggedTainted        = (Utf8Latin1,    InlineLatin1,           false, true,  true),
+        InlineLatin1Full                  = (Utf8Latin1,    InlineLatin1Full,       true,  false, false),
+        InlineLatin1FullFlagged           = (Utf8Latin1,    InlineLatin1Full,       true,  true,  false),
+        InlineLatin1FullTainted           = (Utf8Latin1,    InlineLatin1Full,       true,  false, true),
+        InlineLatin1FullFlaggedTainted    = (Utf8Latin1,    InlineLatin1Full,       true,  true,  true),
+        InlineNonLatin1                   = (Utf8NonLatin1, InlineNonLatin1,        false, false, false),
+        InlineNonLatin1Flagged            = (Utf8NonLatin1, InlineNonLatin1,        false, true,  false),
+        InlineNonLatin1Tainted            = (Utf8NonLatin1, InlineNonLatin1,        false, false, true),
+        InlineNonLatin1FlaggedTainted     = (Utf8NonLatin1, InlineNonLatin1,        false, true,  true),
+        InlineNonLatin1Full               = (Utf8NonLatin1, InlineNonLatin1Full,    true,  false, false),
+        InlineNonLatin1FullFlagged        = (Utf8NonLatin1, InlineNonLatin1Full,    true,  true,  false),
+        InlineNonLatin1FullTainted        = (Utf8NonLatin1, InlineNonLatin1Full,    true,  false, true),
+        InlineNonLatin1FullFlaggedTainted = (Utf8NonLatin1, InlineNonLatin1Full,    true,  true,  true),
+        InlineExtended                    = (ExtendedUtf8,  InlineExtended,         false, false, false),
+        InlineExtendedFlagged             = (ExtendedUtf8,  InlineExtended,         false, true,  false),
+        InlineExtendedTainted             = (ExtendedUtf8,  InlineExtended,         false, false, true),
+        InlineExtendedFlaggedTainted      = (ExtendedUtf8,  InlineExtended,         false, true,  true),
+        InlineExtendedFull                = (ExtendedUtf8,  InlineExtendedFull,     true,  false, false),
+        InlineExtendedFullFlagged         = (ExtendedUtf8,  InlineExtendedFull,     true,  true,  false),
+        InlineExtendedFullTainted         = (ExtendedUtf8,  InlineExtendedFull,     true,  false, true),
+        InlineExtendedFullFlaggedTainted  = (ExtendedUtf8,  InlineExtendedFull,     true,  true,  true),
+        InlineBytes                       = (MalformedUtf8, InlineBytes,            false, false, false),
+        InlineBytesFlagged                = (MalformedUtf8, InlineBytes,            false, true,  false),
+        InlineBytesTainted                = (MalformedUtf8, InlineBytes,            false, false, true),
+        InlineBytesFlaggedTainted         = (MalformedUtf8, InlineBytes,            false, true,  true),
+        InlineBytesFull                   = (MalformedUtf8, InlineBytesFull,        true,  false, false),
+        InlineBytesFullFlagged            = (MalformedUtf8, InlineBytesFull,        true,  true,  false),
+        InlineBytesFullTainted            = (MalformedUtf8, InlineBytesFull,        true,  false, true),
+        InlineBytesFullFlaggedTainted     = (MalformedUtf8, InlineBytesFull,        true,  true,  true),
+    ],
+    latin1: [
+        PackedLatin1                      = (PackedLatin1,     false, false, false),
+        PackedLatin1Flagged               = (PackedLatin1,     false, true,  false),
+        PackedLatin1Tainted               = (PackedLatin1,     false, false, true),
+        PackedLatin1FlaggedTainted        = (PackedLatin1,     false, true,  true),
+        PackedLatin1Full                  = (PackedLatin1Full, true,  false, false),
+        PackedLatin1FullFlagged           = (PackedLatin1Full, true,  true,  false),
+        PackedLatin1FullTainted           = (PackedLatin1Full, true,  false, true),
+        PackedLatin1FullFlaggedTainted    = (PackedLatin1Full, true,  true,  true),
     ],
     packed: [
         PackedNum                         = (Numeric,      PackedNumeric,          false, false, false),
@@ -2310,9 +2342,9 @@ define_perl_string! {
     ]
 }
 
-// The ledger, checked: forty-seven storage types times the two flag bits (§2.2.3, §2.2.9).  Growing the list moves this
+// The ledger, checked: forty-nine storage types times the two flag bits (§2.2.3, §2.2.9).  Growing the list moves this
 // number and the design's ledgers in the same commit.
-const _: () = assert!(REPR_VARIANT_COUNT == 188);
+const _: () = assert!(REPR_VARIANT_COUNT == 196);
 
 // ── Layout law (§2.3.6) ───────────────────────────────────────────
 const _: () = assert!(size_of::<PString>() == 16);
@@ -2345,26 +2377,24 @@ fn high_count(cps: &[u8]) -> usize {
     cps.iter().filter(|&&c| c >= 0x80).count()
 }
 
-/// The internal byte length of an inline value: `s + h` for the Latin-1 class, whose stored bytes each expand back to
-/// one or two internal bytes, and `s` for everything else — Ascii's `h` is zero by tag, and the verbatim classes store
-/// the internal bytes themselves (§2.2.9).
-fn inline_internal_len(class: InlineClass, full: bool, buf: &[u8; INLINE_MAX]) -> usize {
+/// The stored count and the expansion length of a compressed Latin-1 payload (§2.2.9): every stored octet expands to
+/// one or two internal bytes, so the expansion is `s + h` — read from the aux nibble, or recounted for the full family,
+/// which has no nibble to spare.
+fn latin1_extent(full: bool, buf: &[u8; INLINE_MAX]) -> (usize, usize) {
     let s = inline_stored(full, buf);
-    match class {
-        InlineClass::Latin1 => s + if full { high_count(buf) } else { inline_aux(buf) },
-        _ => s,
-    }
+    let h = if full { high_count(buf) } else { inline_aux(buf) };
+    (s, s + h)
 }
 
 /// The aux nibble, stored or derived: the short family reads it; the full family recomputes it (§2.2.9).
-fn inline_derived_aux(class: InlineClass, full: bool, buf: &[u8; INLINE_MAX]) -> usize {
+fn inline_derived_aux(terminal: scan::Terminal, full: bool, buf: &[u8; INLINE_MAX]) -> usize {
     if !full {
         return inline_aux(buf);
     }
-    match class {
-        InlineClass::Ascii | InlineClass::Bytes => 0,
-        InlineClass::Latin1 => high_count(buf),
-        InlineClass::NonLatin1 | InlineClass::Extended => classify_full(buf).1,
+
+    match terminal {
+        scan::Terminal::Ascii | scan::Terminal::MalformedUtf8 => 0,
+        _ => classify_full(buf).1,
     }
 }
 
@@ -2454,29 +2484,34 @@ fn heap_parts_classified(bytes: &[u8]) -> Result<HeapParts, AllocError> {
 }
 
 /// Classify content into its canonical inline form: the class, the two nibbles, and the payload — `None` when no inline
-/// form holds it, packed and heap lying past (§2.2.9's ladder, inline rungs).  Determinism is disjointness: valid
-/// Latin-1-range UTF-8 always compresses — up to thirty input bytes — and the verbatim classes hold exactly the
-/// fifteen-byte-or-shorter content failing that test, the Bytes class by default when the tag rules out every other.
-/// The flag is never consulted: the class is a fact about the bytes.
-fn classify_inline(bytes: &[u8]) -> Option<(InlineClass, usize, usize, [u8; INLINE_MAX])> {
-    if let Some((cp, s, h)) = decode_latin1_range(bytes) {
-        let class = if h == 0 { InlineClass::Ascii } else { InlineClass::Latin1 };
-        return Some((class, s, h, cp));
-    }
-
+/// form holds it, packed and heap lying past (§2.2.9's ladder, inline rungs).  Determinism is disjointness by length:
+/// content whose own bytes fit the payload is stored verbatim, whatever it contains, and compression is tried only past
+/// that — which is what compression is for.  That the verbatim rungs happen to hold Latin-1-range content is nothing
+/// about Latin-1; it is a UTF-8 string that fits fifteen bytes, and so are the others.  The Bytes class is the default
+/// when the tag rules out every other.  The flag is never consulted: the class is a fact about the bytes.
+fn classify_inline(bytes: &[u8]) -> Option<(scan::Terminal, usize, usize, [u8; INLINE_MAX])> {
     if bytes.len() > INLINE_MAX {
         return None;
     }
 
-    let (class, aux) = match classify_full(bytes) {
-        (scan::Terminal::Utf8NonLatin1, chars) => (InlineClass::NonLatin1, chars),
-        (scan::Terminal::ExtendedUtf8, chars) => (InlineClass::Extended, chars),
-
-        // ASCII and Latin-1-range content took the compressed branch above; what remains is the Bytes residual.
-        _ => (InlineClass::Bytes, 0),
+    let (terminal, chars) = classify_full(bytes);
+    let aux = match terminal {
+        scan::Terminal::Ascii | scan::Terminal::MalformedUtf8 => 0,
+        _ => chars,
     };
 
-    Some((class, bytes.len(), aux, inline_payload(bytes)))
+    Some((terminal, bytes.len(), aux, inline_payload(bytes)))
+}
+
+/// Classify content into the compressed Latin-1 form (§2.2.9): the payload and its two nibbles, or `None` where the
+/// transcoding does not fit — which includes everything the verbatim payload already holds, since the ladder tries this
+/// only past that.
+fn classify_packed_latin1(bytes: &[u8]) -> Option<(usize, usize, [u8; INLINE_MAX])> {
+    if bytes.len() <= INLINE_MAX {
+        return None;
+    }
+
+    decode_latin1_range(bytes).map(|(cp, s, h)| (s, h, cp))
 }
 
 /// Whether content can be stored inline.  Length alone: an explicit length admits NUL-bearing content that a terminator
@@ -2588,9 +2623,14 @@ impl PString {
         // The envelope ladder is only worth attempting within the ceiling; longer content takes the classified
         // heap constructor directly, and `pack`'s own band precondition backstops this in debug builds.
         debug_assert!(bytes.len() <= DECODE_MAX, "the envelope ladder serves lengths the envelope can possibly represent");
-        if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
-            return Ok(PString::build_inline(class, utf8, tainted, stored, aux, buf));
+        if let Some((terminal, stored, aux, buf)) = classify_inline(bytes) {
+            return Ok(PString::build_inline(terminal, utf8, tainted, stored, aux, buf));
         }
+
+        if let Some((sc, h, buf)) = classify_packed_latin1(bytes) {
+            return Ok(PString::build_latin1(utf8, tainted, sc, h, buf));
+        }
+
         if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
             && let Some(p) = pack(bytes)
         {
@@ -2610,7 +2650,7 @@ impl PString {
     /// The empty string: inline, unflagged, trivially ASCII.  Infallible, unlike the other constructors — an empty
     /// payload needs no allocation — which is also what lets `Default` exist.
     pub fn empty() -> PString {
-        PString::build_inline(InlineClass::Ascii, false, false, 0, 0, [0u8; INLINE_MAX])
+        PString::build_inline(scan::Terminal::Ascii, false, false, 0, 0, [0u8; INLINE_MAX])
     }
 
     /// Construct from a Rust `&str` **without allocating**, or `None` if the content cannot be stored in the value
@@ -2623,12 +2663,16 @@ impl PString {
     pub fn inline(s: impl AsRef<str>) -> Option<PString> {
         let bytes = s.as_ref().as_bytes();
 
-        // The inline rungs come first (§2.2.9's ladder), and they now reach 16-30-byte Latin-1-compressible content:
-        // the accepted set has widened, exactly as the guarantee-not-a-count contract promises.
-        if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
+        // The verbatim rungs come first (§2.2.9's ladder): content whose own bytes fit the payload is stored as itself,
+        // and only what does not fit is offered to compression.
+        if let Some((terminal, stored, aux, buf)) = classify_inline(bytes) {
             // Ascii stores unflagged, non-ASCII flagged, following `FromStr`.  Bytes/Extended are impossible from a
             // `&str`, whose bytes are Rust-valid.
-            return Some(PString::build_inline(class, class != InlineClass::Ascii, false, stored, aux, buf));
+            return Some(PString::build_inline(terminal, terminal != scan::Terminal::Ascii, false, stored, aux, buf));
+        }
+
+        if let Some((sc, h, buf)) = classify_packed_latin1(bytes) {
+            return Some(PString::build_latin1(true, false, sc, h, buf));
         }
 
         // The packed band holds 16-30-character alphabet content and allocates nothing either.
@@ -2652,8 +2696,12 @@ impl PString {
     pub fn inline_bytes(bytes: impl AsRef<[u8]>) -> Option<PString> {
         let bytes = bytes.as_ref();
 
-        if let Some((class, stored, aux, buf)) = classify_inline(bytes) {
-            return Some(PString::build_inline(class, false, false, stored, aux, buf));
+        if let Some((terminal, stored, aux, buf)) = classify_inline(bytes) {
+            return Some(PString::build_inline(terminal, false, false, stored, aux, buf));
+        }
+
+        if let Some((sc, h, buf)) = classify_packed_latin1(bytes) {
+            return Some(PString::build_latin1(false, false, sc, h, buf));
         }
 
         if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&bytes.len())
@@ -2673,7 +2721,8 @@ impl PString {
     /// Length in bytes.  No dereference for inline; handle mirror for heap.
     pub fn len(&self) -> usize {
         match self.raw_parts() {
-            RawParts::Inline { class, full, buf } => inline_internal_len(class, full, buf),
+            RawParts::Inline { full, buf, .. } => inline_stored(full, buf),
+            RawParts::Latin1 { full, buf } => latin1_extent(full, buf).1,
             RawParts::Packed(p) => p.len(),
             RawParts::Uuid { .. } => UUID_LEN,
             RawParts::Hex { payload } => hex_rendered_len(payload),
@@ -2715,18 +2764,16 @@ impl PString {
 
     fn as_bytes_inner<'a>(&'a self, scratch: &'a mut [u8; DECODE_MAX]) -> &'a [u8] {
         match self.raw_parts() {
-            RawParts::Inline { class, full, buf } => {
-                let stored = inline_stored(full, buf);
-                if class == InlineClass::Latin1 {
-                    // The compressed payload is the Latin-1 transcoding; the value's bytes are its expansion (§2.2.9).
-                    let mut n = 0;
-                    for &c in &buf[..stored] {
-                        n += expand_latin1(c, &mut scratch[n..]);
-                    }
-
-                    return &scratch[..n];
+            RawParts::Inline { full, buf, .. } => &buf[..inline_stored(full, buf)],
+            RawParts::Latin1 { full, buf } => {
+                // The compressed payload is the Latin-1 transcoding; the value's bytes are its expansion (§2.2.9).
+                let (stored, _) = latin1_extent(full, buf);
+                let mut n = 0;
+                for &c in &buf[..stored] {
+                    n += expand_latin1(c, &mut scratch[n..]);
                 }
-                &buf[..stored]
+
+                &scratch[..n]
             }
             RawParts::Packed(p) => {
                 let (decoded, len) = p.unpack();
@@ -2770,24 +2817,25 @@ impl PString {
                 scratch[..len].copy_from_slice(&decoded[..len]);
                 str::from_utf8(&scratch[..len]).ok()
             }
-            RawParts::Inline { class, full, buf } => {
+            RawParts::Latin1 { full, buf } => {
+                let (stored, _) = latin1_extent(full, buf);
+                let mut n = 0;
+                for &c in &buf[..stored] {
+                    n += expand_latin1(c, &mut scratch[n..]);
+                }
+
+                // SAFETY: the expansion emits canonical one- and two-byte encodings only — valid by construction.
+                Some(unsafe { str::from_utf8_unchecked(&scratch[..n]) })
+            }
+            RawParts::Inline { terminal, full, buf } => {
                 let stored = inline_stored(full, buf);
-                match class {
-                    InlineClass::Latin1 => {
-                        let mut n = 0;
-                        for &c in &buf[..stored] {
-                            n += expand_latin1(c, &mut scratch[n..]);
-                        }
-
-                        // SAFETY: the expansion emits canonical one- and two-byte encodings only — valid by
-                        // construction.
-                        Some(unsafe { str::from_utf8_unchecked(&scratch[..n]) })
+                match terminal {
+                    // SAFETY: these states certify Rust-valid UTF-8, established by a full scan at construction and
+                    // stored verbatim; inline mutation reclassifies.
+                    scan::Terminal::Ascii | scan::Terminal::Utf8Latin1 | scan::Terminal::Utf8NonLatin1 => {
+                        Some(unsafe { str::from_utf8_unchecked(&buf[..stored]) })
                     }
-
-                    // SAFETY: the Ascii class certifies seven-bit content and NonLatin1 certifies Rust-valid UTF-8,
-                    // both established by a full scan at construction; inline mutation reclassifies.
-                    InlineClass::Ascii | InlineClass::NonLatin1 => Some(unsafe { str::from_utf8_unchecked(&buf[..stored]) }),
-                    InlineClass::Extended | InlineClass::Bytes => None,
+                    scan::Terminal::ExtendedUtf8 | scan::Terminal::MalformedUtf8 => None,
                 }
             }
             RawParts::Borrowed { bytes, scan, .. } => match scan.widen() {
@@ -2846,7 +2894,11 @@ impl PString {
     /// Whether the content is pure 7-bit ASCII.  Narrows the heap lattice (§2.2.5).
     pub fn is_ascii(&self) -> bool {
         match self.raw_parts() {
-            RawParts::Inline { .. } => self.inline_class() == Some(InlineClass::Ascii),
+            RawParts::Inline { .. } => self.envelope_terminal() == Some(scan::Terminal::Ascii),
+
+            // Reaching the compressed form requires the transcoding to be shorter than the encoding, so at least one
+            // octet is high: never ASCII (§2.2.9).
+            RawParts::Latin1 { .. } => false,
 
             // Every symbol of every packed alphabet is ASCII, so this is a constant rather than a question about
             // content — unlike the inline forms, whose bytes are whatever they are.
@@ -2906,8 +2958,9 @@ impl PString {
     /// only; performs no scan.
     fn scan_state(&self) -> scan::ScanState {
         match self.raw_parts() {
-            RawParts::Inline { .. } => match self.inline_class() {
-                Some(st) => inline_scan_to_heap(st),
+            RawParts::Latin1 { .. } => scan::Utf8Latin1,
+            RawParts::Inline { .. } => match self.envelope_terminal() {
+                Some(st) => st.widen(),
                 None => scan::Unknown, // unreachable by construction
             },
             RawParts::Packed(_) => scan::Ascii,
@@ -2924,7 +2977,7 @@ impl PString {
     pub fn is_shared(&self) -> bool {
         match self.raw_parts() {
             RawParts::Heap(view) => !view.is_unique(),
-            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } => false,
+            RawParts::Inline { .. } | RawParts::Latin1 { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } => false,
 
             // Bitwise clones do share the image, but with the owner that outlives them all (§2.2.3), not with each
             // other in any sense `unshare` could dissolve: copying frees nothing that would otherwise be freed.
@@ -3032,8 +3085,12 @@ impl PString {
                 // Representability, never a byte count (§2.2.15): `classify_inline` is the authority, and it holds
                 // compressible content well past the payload width — a length pre-filter here would send a twenty-byte
                 // Latin-1 cut to a view, pinning a whole buffer where a free envelope copy existed.
-                if let Some((class, s, aux, buf)) = classify_inline(bytes) {
-                    return Ok(PString::build_inline(class, utf8, tainted, s, aux, buf));
+                if let Some((terminal, s, aux, buf)) = classify_inline(bytes) {
+                    return Ok(PString::build_inline(terminal, utf8, tainted, s, aux, buf));
+                }
+
+                if let Some((sc, h, buf)) = classify_packed_latin1(bytes) {
+                    return Ok(PString::build_latin1(utf8, tainted, sc, h, buf));
                 }
 
                 if (MIN_PACKED_LEN..=MAX_PACKED_LEN).contains(&len)
@@ -3126,7 +3183,7 @@ impl PString {
             }
 
             // Envelope-resident sources past representability: no buffer to share (§2.2.15).
-            RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } => {
+            RawParts::Inline { .. } | RawParts::Latin1 { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } => {
                 let bytes = &self.as_bytes(&mut scratch)[offset..offset + len];
                 Ok(PString::build_heap(utf8, tainted, heap_parts_classified(bytes)?))
             }
@@ -3165,7 +3222,13 @@ impl PString {
             // A view carries no count of its own (§2.2.15): zero is the unfilled sentinel, and classification rides the
             // copy as it does for the shared-heap arm above.
             RawParts::View { bytes, scan, .. } => heap_parts_transitioned(bytes, scan, 0)?,
-            RawParts::Heap(_) | RawParts::Inline { .. } | RawParts::Packed(_) | RawParts::Uuid { .. } | RawParts::Hex { .. } | RawParts::Borrowed { .. } => {
+            RawParts::Heap(_)
+            | RawParts::Inline { .. }
+            | RawParts::Latin1 { .. }
+            | RawParts::Packed(_)
+            | RawParts::Uuid { .. }
+            | RawParts::Hex { .. }
+            | RawParts::Borrowed { .. } => {
                 return Ok(());
             }
         };
@@ -3177,7 +3240,10 @@ impl PString {
     /// operations on flagged strings use.  Narrows the heap lattice.
     pub fn is_perl_utf8_valid(&self) -> bool {
         match self.raw_parts() {
-            RawParts::Inline { .. } => !matches!(self.inline_class(), Some(InlineClass::Bytes)),
+            RawParts::Inline { .. } => !matches!(self.envelope_terminal(), Some(scan::Terminal::MalformedUtf8)),
+
+            // A compressed payload is Latin-1-range by construction, hence decodable under both readings.
+            RawParts::Latin1 { .. } => true,
             RawParts::Packed(_) => true,   // ASCII is valid under every reading.
             RawParts::Uuid { .. } => true, // Likewise.
             RawParts::Hex { .. } => true,  // Likewise.
@@ -3224,19 +3290,20 @@ impl PString {
             RawParts::Packed(p) => Some(p.len()),
             RawParts::Uuid { .. } => Some(UUID_LEN),
             RawParts::Hex { payload } => Some(hex_rendered_len(payload)),
-            RawParts::Inline { class, full, buf } => {
+            RawParts::Inline { terminal, full, buf } => {
                 let stored = inline_stored(full, buf);
-                match class {
-                    // Under perl's flagged semantics — this method's question — the transcoded units are the
-                    // characters, so the count is the stored count: O(1) for all Latin-1-range content, where the
-                    // raw-byte tier could only shortcut ASCII.
-                    InlineClass::Ascii | InlineClass::Latin1 => Some(stored),
-                    InlineClass::Bytes => None,
+                match terminal {
+                    scan::Terminal::Ascii => Some(stored),
+                    scan::Terminal::MalformedUtf8 => None,
 
-                    // The verbatim valid classes carry their count in the aux nibble; the full family derives it.
-                    InlineClass::NonLatin1 | InlineClass::Extended => Some(if full { classify_full(&buf[..stored]).1 } else { inline_aux(buf) }),
+                    // The valid states carry their character count in the aux nibble; the full family derives it.
+                    _ => Some(if full { classify_full(&buf[..stored]).1 } else { inline_aux(buf) }),
                 }
             }
+
+            // Under perl's flagged semantics — this method's question — the transcoded octets are the characters, so
+            // the count is the stored count: O(1), no decode (§2.2.9).
+            RawParts::Latin1 { full, buf } => Some(latin1_extent(full, buf).0),
 
             // A view carries no count of its own (§2.2.15): a whole-object adopted view reads and fills the struct's
             // cache — zero the unfilled sentinel — and sub-views derive on demand.
@@ -3342,7 +3409,19 @@ impl PString {
             buf[..internal.len()].copy_from_slice(internal);
             let h = high_count(internal);
             debug_assert!(h > 0, "all-ASCII content took the flip above");
-            return Ok(PString::build_inline(InlineClass::Latin1, true, t, internal.len(), h, buf));
+            // The bytes upgraded are already the Latin-1 transcoding, and the value's own bytes are their expansion:
+            // verbatim when that fits the payload, compressed when it does not (§2.2.9).
+            if internal.len() + h <= INLINE_MAX {
+                let mut wide = [0u8; INLINE_MAX];
+                let mut n = 0;
+                for &c in internal {
+                    n += expand_latin1(c, &mut wide[n..]);
+                }
+
+                return Ok(PString::build_inline(scan::Terminal::Utf8Latin1, true, t, n, internal.len(), wide));
+            }
+
+            return Ok(PString::build_latin1(true, t, internal.len(), h, buf));
         }
 
         // Sixteen or more non-ASCII characters: heap.  The buffer owns the expansion — appending byte by byte would pay
@@ -3402,10 +3481,21 @@ impl PString {
 
         let t = self.is_tainted();
         match self.raw_parts() {
-            RawParts::Inline { class: InlineClass::Latin1, full, buf } => {
-                let stored = inline_stored(full, buf);
+            RawParts::Latin1 { full, buf } => {
+                // The stored octets are already the characters, so the downgrade is a re-tag: zero byte work.
+                let (stored, _) = latin1_extent(full, buf);
 
                 Ok(Some(PString::tiered(&buf[..stored], false, t)?))
+            }
+            RawParts::Inline { terminal: scan::Terminal::Utf8Latin1, full, buf } => {
+                // The verbatim form holds the encoding, so its characters are that encoding's contraction —
+                // allocation-free at this width.  Refusing where the contraction fails is the safe answer, and the
+                // state certifies it cannot.
+                let stored = inline_stored(full, buf);
+                match decode_latin1_range(&buf[..stored]) {
+                    Some((cps, s, _)) => Ok(Some(PString::tiered(&cps[..s], false, t)?)),
+                    None => Ok(None),
+                }
             }
             RawParts::Inline { .. } => Ok(None),
             RawParts::Packed(_) => {
@@ -3516,9 +3606,13 @@ impl PString {
         let old = mem::take(self);
 
         *self = match old.into_raw() {
-            RawOwned::Inline { class, full, buf } => {
-                let (s, aux) = (inline_stored(full, &buf), inline_derived_aux(class, full, &buf));
-                PString::build_inline(class, u2, t2, s, aux, buf)
+            RawOwned::Inline { terminal, full, buf } => {
+                let (s, aux) = (inline_stored(full, &buf), inline_derived_aux(terminal, full, &buf));
+                PString::build_inline(terminal, u2, t2, s, aux, buf)
+            }
+            RawOwned::Latin1 { full, buf } => {
+                let (s, expanded) = latin1_extent(full, &buf);
+                PString::build_latin1(u2, t2, s, expanded - s, buf)
             }
             RawOwned::Packed(p) => PString::build_packed(p, u2, t2),
             RawOwned::Uuid { form, payload } => PString::build_uuid(form, payload, u2, t2),
@@ -3565,7 +3659,7 @@ impl PString {
         // that still fits short extends the existing variant bit-identically to the raw-byte tier, the length byte
         // updated in place.  Every other class, and any append reaching full capacity (which changes the family),
         // rebuilds through canonical selection below — append is byte mutation (§2.2.9).
-        if self.inline_class() == Some(InlineClass::Ascii)
+        if self.envelope_terminal() == Some(scan::Terminal::Ascii)
             && matches!(kind, AppendKind::Valid { class: scan::ValidRange::Ascii, .. })
             && let Some((full, dst)) = self.inline_buf_mut()
             && !full
@@ -3582,16 +3676,17 @@ impl PString {
         // Otherwise the payload has to move.  For inline content that is still only a materialization of at most thirty
         // bytes and one rebuild: append is byte mutation, so the result re-runs canonical selection (§2.2.9) over the
         // value's internal bytes — the compressed classes expand first, exactly as `as_bytes` would.
-        let inline = match self.raw_parts() {
-            RawParts::Inline { class, full, buf } => Some((class, inline_stored(full, buf), *buf)),
+        let envelope = match self.raw_parts() {
+            RawParts::Inline { full, buf, .. } => Some((false, inline_stored(full, buf), *buf)),
+            RawParts::Latin1 { full, buf } => Some((true, latin1_extent(full, buf).0, *buf)),
             _ => None,
         };
 
-        if let Some((class, stored, buf)) = inline {
+        if let Some((compressed, stored, buf)) = envelope {
             let (u, t) = (self.is_utf8(), self.is_tainted());
 
             let mut internal = [0u8; DECODE_MAX];
-            let ilen = if class == InlineClass::Latin1 {
+            let ilen = if compressed {
                 let mut n = 0;
                 for &c in &buf[..stored] {
                     n += expand_latin1(c, &mut internal[n..]);
@@ -3608,8 +3703,13 @@ impl PString {
                 combined[..ilen].copy_from_slice(&internal[..ilen]);
                 combined[ilen..total].copy_from_slice(bytes);
 
-                if let Some((nc, ns, naux, nbuf)) = classify_inline(&combined[..total]) {
-                    *self = PString::build_inline(nc, u, t, ns, naux, nbuf);
+                if let Some((nt, ns, naux, nbuf)) = classify_inline(&combined[..total]) {
+                    *self = PString::build_inline(nt, u, t, ns, naux, nbuf);
+                    return Ok(());
+                }
+
+                if let Some((ns, nh, nbuf)) = classify_packed_latin1(&combined[..total]) {
+                    *self = PString::build_latin1(u, t, ns, nh, nbuf);
                     return Ok(());
                 }
 
@@ -3637,7 +3737,8 @@ impl PString {
             joined.try_reserve_exact(total).map_err(|_| AllocError { requested: total })?;
             joined.extend_from_slice(&internal[..ilen]);
             joined.extend_from_slice(bytes);
-            let state = append_transition_heap(inline_scan_to_heap(class), kind);
+            let seed = if compressed { scan::Utf8Latin1 } else { classify_full(&internal[..ilen]).0.widen() };
+            let state = append_transition_heap(seed, kind);
             *self = PString::build_heap(u, t, heap_parts_transitioned(&joined, state, 0)?);
 
             return Ok(());
@@ -3655,7 +3756,7 @@ impl PString {
         // was — the honest meaning of a failed append — and the old allocation is released by the assignment at the end
         // rather than by a transport that would have to be unwound on every error path.
         let replacement = match self.raw_parts() {
-            RawParts::Inline { .. } => return Ok(()), // Handled above; unreachable.
+            RawParts::Inline { .. } | RawParts::Latin1 { .. } => return Ok(()), // Handled above; unreachable.
             RawParts::Packed(p) => {
                 if let Some(packed) = p.push(bytes) {
                     // In place: the existing nibbles are kept, rather than the whole result being decoded and
@@ -3822,7 +3923,14 @@ enum RawParts<'a> {
     },
 
     Inline {
-        class: InlineClass,
+        terminal: scan::Terminal,
+        full: bool,
+        buf: &'a [u8; INLINE_MAX],
+    },
+
+    /// Latin-1-range content compressed into the payload (§2.2.9): the stored octets are the characters, and the
+    /// value's bytes are their expansion, so this form decodes where the verbatim ones borrow.
+    Latin1 {
         full: bool,
         buf: &'a [u8; INLINE_MAX],
     },
@@ -3844,7 +3952,11 @@ enum RawParts<'a> {
 
 enum RawOwned {
     Inline {
-        class: InlineClass,
+        terminal: scan::Terminal,
+        full: bool,
+        buf: [u8; INLINE_MAX],
+    },
+    Latin1 {
         full: bool,
         buf: [u8; INLINE_MAX],
     },
@@ -3908,16 +4020,6 @@ enum AppendKind {
 
     /// Nothing known.
     Unknown,
-}
-
-fn inline_scan_to_heap(s: InlineClass) -> scan::ScanState {
-    match s {
-        InlineClass::Ascii => scan::Ascii,
-        InlineClass::Latin1 => scan::Utf8Latin1,
-        InlineClass::NonLatin1 => scan::Utf8NonLatin1,
-        InlineClass::Extended => scan::ExtendedUtf8,
-        InlineClass::Bytes => scan::MalformedUtf8,
-    }
 }
 
 /// §2.2.5 append transitions for a heap result, from the buffer's prior state and the appended content's kind.
@@ -4266,11 +4368,17 @@ impl PartialEq for PString {
             // Same flag, both inline: representation equality is exact — canonical selection guarantees equal content
             // takes equal class, family, and payload bytes (§2.2.9), and the padding is canonical.  One discriminant
             // compare and one fifteen-byte memcmp, where expanding both sides costs decode work.
-            if let (RawParts::Inline { class: ca, full: fa, buf: ba }, RawParts::Inline { class: cb, full: fb, buf: bb }) =
+            if let (RawParts::Inline { terminal: ta, full: fa, buf: ba }, RawParts::Inline { terminal: tb, full: fb, buf: bb }) =
                 (self.raw_parts(), other.raw_parts())
             {
                 grid_hit!();
-                return ca == cb && fa == fb && ba == bb;
+                return ta == tb && fa == fb && ba == bb;
+            }
+
+            // Likewise for two compressed payloads, whose transcoding is canonical for the same reason.
+            if let (RawParts::Latin1 { full: fa, buf: ba }, RawParts::Latin1 { full: fb, buf: bb }) = (self.raw_parts(), other.raw_parts()) {
+                grid_hit!();
+                return fa == fb && ba == bb;
             }
 
             // Same interpretation: byte equality is character equality (length check is memcmp's first move).

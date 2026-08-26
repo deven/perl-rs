@@ -46,7 +46,7 @@ fn the_tier_ladder_places_content_by_length_and_alphabet() {
 fn ascii_from_str_is_unflagged_canonical() {
     let s = PString::from_str("hello").unwrap();
     assert!(!s.is_utf8(), "ASCII stores in canonical downgraded form");
-    assert_eq!(s.inline_class(), Some(InlineClass::Ascii));
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::Ascii));
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("hello"));
 }
 
@@ -54,14 +54,14 @@ fn ascii_from_str_is_unflagged_canonical() {
 fn non_ascii_from_str_is_flagged() {
     let s = PString::from_str("héllo").unwrap();
     assert!(s.is_utf8());
-    assert_eq!(s.inline_class(), Some(InlineClass::Latin1)); // é is U+00E9: Latin-1 range
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::Utf8Latin1)); // é is U+00E9: Latin-1 range
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("héllo"));
 }
 
 #[test]
 fn invalid_bytes_inline_scan_terminal() {
     let s = PString::from_bytes([0xFF, 0xFE]).unwrap();
-    assert_eq!(s.inline_class(), Some(InlineClass::Bytes));
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::MalformedUtf8));
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), None);
     assert!(!s.is_ascii());
     assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), &[0xFF, 0xFE]);
@@ -143,7 +143,7 @@ fn taint_round_trip_via_sanctioned_path() {
 fn ascii_append_preserves_state() {
     let mut s = PString::from_str("abc").unwrap();
     s.push_str("def").unwrap();
-    assert_eq!(s.inline_class(), Some(InlineClass::Ascii));
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::Ascii));
     assert_eq!(s.as_bytes(&mut [0u8; DECODE_MAX]), b"abcdef");
 }
 
@@ -151,7 +151,7 @@ fn ascii_append_preserves_state() {
 fn valid_utf8_append_to_ascii_goes_non_ascii() {
     let mut s = PString::from_str("abc").unwrap();
     s.push_str("é").unwrap();
-    assert_eq!(s.inline_class(), Some(InlineClass::Latin1)); // ASCII + é joins to Latin-1 range
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::Utf8Latin1)); // ASCII + é joins to Latin-1 range
     assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), Some("abcé"));
 }
 
@@ -183,7 +183,7 @@ fn heap_append_transitions() {
 fn flag_and_bits_survive_promotion() {
     let mut s = PString::from_str(&"é".repeat(15)).unwrap(); // Fifteen stored bytes: full-capacity inline, flagged.
     s.taint();
-    assert!(s.storage_type().is_inline(), "thirty encoded bytes compress to a full payload (§2.2.9)");
+    assert_eq!(s.storage_type(), StorageType::PackedLatin1Full, "thirty encoded bytes compress to a full payload (§2.2.9)");
     s.push_str("é").unwrap(); // A sixteenth character: past every non-heap form — non-ASCII cannot pack.
     assert!(s.storage_type().is_heap());
     assert!(s.is_utf8());
@@ -197,7 +197,7 @@ fn extended_taxonomy_inline() {
     // Perl-decodable, Rust-invalid: surrogate, supra-Unicode, minimal FE form.
     for bytes in [&[0xED, 0xA0, 0x80][..], &[0xF4, 0x90, 0x80, 0x80], &[0xFE, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80]] {
         let s = PString::from_bytes(bytes).unwrap();
-        assert_eq!(s.inline_class(), Some(InlineClass::Extended), "{bytes:02X?}");
+        assert_eq!(s.envelope_terminal(), Some(scan::Terminal::ExtendedUtf8), "{bytes:02X?}");
         assert_eq!(s.as_str(&mut [0u8; DECODE_MAX]), None, "Rust view must reject extended");
         assert!(s.is_perl_utf8_valid(), "perl view must accept extended");
         assert!(!s.is_ascii());
@@ -207,7 +207,7 @@ fn extended_taxonomy_inline() {
     let overlong_ff: Vec<u8> = std::iter::once(0xFFu8).chain(std::iter::repeat_n(0x80u8, 12)).collect();
     for bytes in [&[0xC0, 0x80][..], &[0x80], &[0xC3], &overlong_ff] {
         let s = PString::from_bytes(bytes).unwrap();
-        assert_eq!(s.inline_class(), Some(InlineClass::Bytes), "{bytes:02X?}");
+        assert_eq!(s.envelope_terminal(), Some(scan::Terminal::MalformedUtf8), "{bytes:02X?}");
         assert!(!s.is_perl_utf8_valid());
     }
 }
@@ -244,7 +244,7 @@ fn ff_form_boundary() {
     let mut seq = vec![0xFFu8];
     seq.extend_from_slice(&conts);
     let s = PString::from_bytes(&seq).unwrap();
-    assert_eq!(s.inline_class(), Some(InlineClass::Extended), "minimal FF form is perl-valid");
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::ExtendedUtf8), "minimal FF form is perl-valid");
 
     // One less than the boundary is overlong for FF.
     let mut v2: u64 = (1 << 36) - 1;
@@ -257,14 +257,14 @@ fn ff_form_boundary() {
     let mut seq2 = vec![0xFFu8];
     seq2.extend_from_slice(&c2);
     let t = PString::from_bytes(&seq2).unwrap();
-    assert_eq!(t.inline_class(), Some(InlineClass::Bytes), "FF encoding a FE-range value is overlong");
+    assert_eq!(t.envelope_terminal(), Some(scan::Terminal::MalformedUtf8), "FF encoding a FE-range value is overlong");
 }
 
 #[test]
 fn extended_append_transitions() {
     let mut s = PString::from_bytes([0xF4, 0x90, 0x80, 0x80]).unwrap();
     s.push_str("abc").unwrap();
-    assert_eq!(s.inline_class(), Some(InlineClass::Extended), "valid append preserves extended");
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::ExtendedUtf8), "valid append preserves extended");
     assert!(s.is_perl_utf8_valid());
 }
 
@@ -285,11 +285,11 @@ fn extended_eq_and_hash_behavior() {
 #[test]
 fn latin1_vs_non_latin1_terminals() {
     let e = PString::from_str("é").unwrap(); // U+00E9
-    assert_eq!(e.inline_class(), Some(InlineClass::Latin1));
+    assert_eq!(e.envelope_terminal(), Some(scan::Terminal::Utf8Latin1));
     let cjk = PString::from_str("字").unwrap(); // U+5B57
-    assert_eq!(cjk.inline_class(), Some(InlineClass::NonLatin1));
+    assert_eq!(cjk.envelope_terminal(), Some(scan::Terminal::Utf8NonLatin1));
     let mixed = PString::from_str("é字").unwrap();
-    assert_eq!(mixed.inline_class(), Some(InlineClass::NonLatin1), "range joins upward");
+    assert_eq!(mixed.envelope_terminal(), Some(scan::Terminal::Utf8NonLatin1), "range joins upward");
 }
 
 #[test]
@@ -401,7 +401,7 @@ fn eq_grid_flagged_malformed_vs_unflagged_is_false() {
 fn eq_reverse_malformed_orientation_can_match() {
     // Unflagged MALFORMED-classified bytes are just bytes: \x80 as a character equals flagged C2 80.
     let plain = PString::from_bytes([0x80]).unwrap();
-    assert_eq!(plain.inline_class(), Some(InlineClass::Bytes));
+    assert_eq!(plain.envelope_terminal(), Some(scan::Terminal::MalformedUtf8));
     let mut flagged = PString::from_bytes([0xC2, 0x80]).unwrap();
     flagged.set_utf8_for_test();
     assert_eq!(flagged, plain, "the grid must not shortcut this orientation");
@@ -467,9 +467,9 @@ fn eq_fast_negative_for_beyond_latin1() {
 fn append_range_join_semantics() {
     let mut s = PString::from_str("abc").unwrap(); // Ascii
     s.push_str("é").unwrap();
-    assert_eq!(s.inline_class(), Some(InlineClass::Latin1));
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::Utf8Latin1));
     s.push_str("字").unwrap();
-    assert_eq!(s.inline_class(), Some(InlineClass::NonLatin1));
+    assert_eq!(s.envelope_terminal(), Some(scan::Terminal::Utf8NonLatin1));
 
     // This append carries the content past the inline payload, and non-ASCII bytes belong to no packed alphabet, so the
     // string lands on the heap — where the same join rule holds, read through the heap lattice.
@@ -1085,7 +1085,7 @@ fn char_len_semantics_and_caching() {
     // Latin-1 inline: the transcoded units are the flagged-side characters, so the count is the stored nibble — no scan
     // at all, where the raw-byte tier paid a recount.
     let li = PString::from_bytes([0xC3, 0xA9].repeat(12)).unwrap();
-    assert!(li.storage_type().is_inline(), "24 compressible bytes live inline now (§2.2.9)");
+    assert_eq!(li.storage_type(), StorageType::PackedLatin1, "24 bytes are past the verbatim payload, so they compress");
     eq_probe::reset();
     assert_eq!(li.char_len(), Some(12));
     assert_eq!(eq_probe::scans().0, 0, "the count is the stored nibble: no pass at all");
@@ -1116,7 +1116,7 @@ fn char_len_semantics_and_caching() {
     // length(chr 0xD800) == 1; a CESU-style pair decodes to TWO characters (D800, DC00), length 2, distinct from the
     // one-character astral U+10000.
     let lone = PString::from_bytes([0xED, 0xA0, 0x80]).unwrap();
-    assert_eq!(lone.inline_class(), Some(InlineClass::Extended));
+    assert_eq!(lone.envelope_terminal(), Some(scan::Terminal::ExtendedUtf8));
     assert_eq!(lone.char_len(), Some(1));
     let cesu_pair = PString::from_bytes([0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80]).unwrap();
     assert_eq!(cesu_pair.char_len(), Some(2), "pairs are two characters, never merged");
@@ -1825,29 +1825,42 @@ fn equal_content_has_equal_bytes_whatever_its_history() {
 fn compressed_payloads_and_the_nibble_scheme() {
     // The Latin-1 class stores the Latin-1 transcoding of the internal bytes — each one- or two-byte UTF-8 sequence as
     // its single-byte equivalent — with the length byte split into the two nibbles (§2.2.9): low `s`, high `h`.  The E9
-    // monster's two strings at the representation level.
-    let two_char = PString::from_bytes([0xC3, 0xA9]).unwrap(); // The octet string C3.A9.
-    assert_eq!(two_char.storage_type(), StorageType::InlineLatin1);
-    match two_char.raw_parts() {
-        RawParts::Inline { buf, .. } => {
-            assert_eq!(buf[0], 0xE9, "the payload is the Latin-1 equivalent, not the encoding");
-            assert_eq!(buf[LENGTH_BYTE], 0x11, "one stored, one high: nibbles 1/1");
-        }
+    // monster's two strings at the representation level.  Two bytes fit the payload as they are, so they are stored as
+    // they are: compression is for what does not fit.
+    let short = PString::from_bytes([0xC3, 0xA9]).unwrap();
+    assert_eq!(short.storage_type(), StorageType::InlineLatin1);
+    match short.raw_parts() {
+        RawParts::Inline { buf, .. } => assert_eq!(&buf[..2], &[0xC3, 0xA9], "the verbatim class stores the encoding itself"),
         _ => panic!("expected inline storage"),
     }
-    assert_eq!(two_char.len(), 2, "the internal length is s + h");
-    assert_eq!(two_char.char_len(), Some(1));
-    assert_eq!(two_char.as_bytes(&mut [0u8; DECODE_MAX]), [0xC3, 0xA9], "as_bytes expands the compression");
 
+    // Sixteen encoded bytes do not fit, so they compress: eight stored octets, all eight high.
+    let two_char = PString::from_bytes([0xC3, 0xA9].repeat(8)).unwrap();
+    assert_eq!(two_char.storage_type(), StorageType::PackedLatin1);
+    match two_char.raw_parts() {
+        RawParts::Latin1 { buf, .. } => {
+            assert_eq!(buf[0], 0xE9, "the payload is the Latin-1 equivalent, not the encoding");
+            assert_eq!(buf[LENGTH_BYTE], 0x88, "eight stored, eight high: nibbles 8/8");
+        }
+        _ => panic!("expected the compressed form"),
+    }
+    assert_eq!(two_char.len(), 16, "the internal length is s + h");
+    assert_eq!(two_char.char_len(), Some(8));
+    assert_eq!(two_char.as_bytes(&mut [0u8; DECODE_MAX]), [0xC3, 0xA9].repeat(8), "as_bytes expands the compression");
+
+    // The E9 monster's two strings at the representation level, both now verbatim at this width: the same octet means
+    // one character flagged and two unflagged, and the class axis is what tells them apart.
+    let encoded = PString::from_bytes([0xC3, 0xA9]).unwrap();
     let one_char = PString::from_bytes([0xE9]).unwrap(); // The one-octet string é: the Bytes residual.
     assert_eq!(one_char.storage_type(), StorageType::InlineBytes);
     assert_eq!(one_char.len(), 1);
-    assert_ne!(two_char, one_char, "different strings, distinguished by the class axis alone");
+    assert_ne!(encoded, one_char, "different strings, distinguished by the class axis alone");
 
-    // Sixteen to thirty compressible bytes are the new inline intake: fifteen stored high bytes span thirty internal
-    // bytes, report length 30 (container-verified: ord returns the lead C3), and fill the payload — the full family.
+    // Sixteen to thirty compressible bytes are the compressed class's intake: fifteen stored high bytes span thirty
+    // internal bytes, report length 30 (container-verified: ord returns the lead C3), and fill the payload — the full
+    // family.
     let wide = PString::from_bytes([0xC3, 0xA9].repeat(15)).unwrap();
-    assert_eq!(wide.storage_type(), StorageType::InlineLatin1Full);
+    assert_eq!(wide.storage_type(), StorageType::PackedLatin1Full);
     assert_eq!(wide.len(), 30, "length is the expansion sum, never the payload count");
     assert_eq!(wide.char_len(), Some(15));
     assert_eq!(wide.as_bytes(&mut [0u8; DECODE_MAX]), [0xC3, 0xA9].repeat(15));
@@ -1885,7 +1898,7 @@ fn rebuilding_zeroes_everything_past_the_content() {
     // and representation would stop standing in for content.
     let mut dirty = [0xEEu8; INLINE_MAX];
     dirty[..4].copy_from_slice(b"abcd");
-    let s = PString::build_inline(InlineClass::Ascii, false, false, 4, 0, dirty);
+    let s = PString::build_inline(scan::Terminal::Ascii, false, false, 4, 0, dirty);
 
     match s.raw_parts() {
         RawParts::Inline { full, buf, .. } => {
@@ -5158,7 +5171,7 @@ fn content_debug_round_trips_arbitrary_flag_and_bytes() {
 fn debug_shows_the_envelope_for_resident_tiers_and_omits_it_for_pointers() {
     let inline = format!("{:?}", PString::from_bytes(b"h\xC3\xA9llo").unwrap());
     assert!(inline.contains("string: b\"h\\x{c3}\\x{a9}llo\""), "{inline}");
-    assert!(inline.contains("bytes: 68 e9 6c 6c 6f 00"), "the envelope hex shows physical storage: {inline}");
+    assert!(inline.contains("bytes: 68 c3 a9 6c 6c 6f"), "the envelope hex shows physical storage: {inline}");
 
     let packed = format!("{:?}", PString::from_bytes(b"2026-08-22T17:49:00").unwrap());
     assert!(packed.contains("storage: Packed"), "{packed}");
@@ -5489,7 +5502,7 @@ fn slice_returns_representable_content_in_the_envelope_forms() {
     // bytes splitting a sequence are the Bytes class past the inline ceiling and no alphabet — owned, there being
     // no buffer to share.
     let inline_src = PString::from_bytes([0xC3, 0xA9].repeat(15)).unwrap();
-    assert!(format!("{:?}", inline_src.storage_type()).starts_with("InlineLatin1"), "{:?}", inline_src.storage_type());
+    assert_eq!(inline_src.storage_type(), StorageType::PackedLatin1Full, "{:?}", inline_src.storage_type());
     let owned = inline_src.slice(0, 17).unwrap();
     assert_eq!(owned.len(), 17);
     assert!(!matches!(
@@ -6070,8 +6083,8 @@ fn compressible_content_reaches_the_envelope_through_both_verbs() {
 
     let sliced = source.slice(0, 20).unwrap();
     let copied = source.substr(0, 20).unwrap();
-    assert_eq!(sliced.storage_type(), StorageType::InlineLatin1, "twenty logical bytes compress to ten stored");
-    assert_eq!(copied.storage_type(), StorageType::InlineLatin1, "and the copying verb agrees");
+    assert_eq!(sliced.storage_type(), StorageType::PackedLatin1, "twenty logical bytes compress to ten stored");
+    assert_eq!(copied.storage_type(), StorageType::PackedLatin1, "and the copying verb agrees");
     assert_eq!(sliced, copied);
     assert!(!sliced.is_shared(), "nothing is pinned");
 }
@@ -6165,4 +6178,61 @@ fn a_rebuilding_append_never_takes_the_value_before_it_succeeds() {
         assert_eq!(shared.len(), 200, "and untouched");
     }
     assert_eq!(crate::cow_buffer::live::count(), before, "every allocation the rebuilds made was released");
+}
+
+// ── The verbatim/compressed split (§2.2.9) ────────────────────
+#[test]
+fn content_whose_bytes_fit_the_payload_is_stored_as_itself() {
+    // The rule is length, not content: a UTF-8 string of fifteen bytes or fewer takes a verbatim class whatever it
+    // holds, and compression exists only to reach what does not fit.
+    for (text, ty) in [
+        ("hello", StorageType::InlineAscii),
+        ("é", StorageType::InlineLatin1),
+        ("ééééééé", StorageType::InlineLatin1),            // fourteen bytes, seven characters
+        ("aaaaaaaaaaaaaé", StorageType::InlineLatin1Full), // fifteen bytes fills the payload: the full family
+        ("€€", StorageType::InlineNonLatin1),
+    ] {
+        let p = PString::from_str(text).unwrap();
+        assert_eq!(p.storage_type(), ty, "{text:?}");
+        assert!(p.storage_type().is_inline() && !p.storage_type().is_packed(), "{text:?} is stored, not encoded");
+
+        // A verbatim class holds the value's own bytes, so the payload is the encoding.
+        if let RawParts::Inline { buf, full, .. } = p.raw_parts() {
+            assert_eq!(&buf[..inline_stored(full, buf)], text.as_bytes(), "{text:?}");
+        }
+    }
+
+    // One byte past the payload is where compression starts earning its keep.
+    let compressed = PString::from_str("éééééééé").unwrap(); // sixteen bytes, eight characters
+    assert_eq!(compressed.storage_type(), StorageType::PackedLatin1);
+    assert!(compressed.storage_type().is_packed() && !compressed.storage_type().is_inline());
+    assert_eq!(compressed.len(), 16);
+    assert_eq!(compressed.char_len(), Some(8));
+    assert_eq!(compressed.as_bytes(&mut [0u8; DECODE_MAX]), "éééééééé".as_bytes());
+}
+
+#[test]
+fn the_split_preserves_value_across_the_boundary() {
+    // The two classes are representations of the same thing, so nothing observable may turn on which one a value took —
+    // including at the boundary, where a character's width decides.
+    for n in 1..=15usize {
+        let text = "é".repeat(n);
+        let p = PString::from_str(&text).unwrap();
+        let expected = if text.len() <= INLINE_MAX { StorageType::InlineLatin1 } else { StorageType::PackedLatin1 };
+        let expected = if text.len() > INLINE_MAX && n == 15 { StorageType::PackedLatin1Full } else { expected };
+        assert_eq!(p.storage_type(), expected, "{n} characters, {} bytes", text.len());
+
+        assert_eq!(p.len(), text.len());
+        assert_eq!(p.char_len(), Some(n));
+        assert_eq!(p.as_str(&mut [0u8; DECODE_MAX]), Some(text.as_str()));
+        assert_eq!(format!("{p}"), text);
+        assert!(!p.is_ascii());
+        assert!(p.is_perl_utf8_valid());
+
+        // Both classes downgrade to the same octets, and upgrade back.
+        let down = p.downgraded().unwrap().expect("Latin-1 range downgrades");
+        assert_eq!(down.len(), n, "one octet per character");
+        assert!(!down.is_utf8());
+        assert_eq!(down.upgraded().unwrap(), p, "the round trip is the identity");
+    }
 }

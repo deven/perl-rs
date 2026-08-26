@@ -1506,21 +1506,40 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   on later additions: a non-heap encoding compressing more than
   2:1 would overflow every borrowed-view buffer.
 
-  The class/flag independence is load-bearing, with a pinned
-  monster: payload `E9` flag-off means the one-octet string `é`
-  stored verbatim under the *bytes* class and the two-octet
-  string `C3 A9` stored compressed under the *Latin-1* class —
-  different strings (container-verified: flag-off they compare
-  unequal at lengths one and two; decode the second and they
-  compare equal) — distinguished by the class axis alone.
-  Canonical selection is a determinism obligation, since equal
-  perl strings must take equal representations for
-  representation-level equality and hashing to be sound: content
-  is classified by its bytes deterministically, so a flag-off
-  octet sequence that is valid Latin-1-range UTF-8 always takes
-  the compressed representation, never verbatim storage, and the
-  verbatim classes hold exactly the content failing that test;
-  the full tier selection is normative, tabled below.
+  The state/flag independence is load-bearing, with a pinned
+  monster: a payload of eight `E9` octets flag-off means the
+  eight-octet string of `é` repeated, stored verbatim in the
+  *malformed* state, and also the sixteen-octet `C3 A9` repeated,
+  stored compressed — different strings (container-verified:
+  flag-off they compare unequal at lengths eight and sixteen;
+  decode the second and they compare equal) — distinguished by
+  the storage group and the auxiliary nibble, never by the
+  payload alone.  Canonical selection is a determinism
+  obligation, since equal perl strings must take equal
+  representations for representation-level equality and hashing
+  to be sound: content is classified by its bytes
+  deterministically, and the rule is **length**.  Content whose
+  own bytes fit the payload is stored verbatim, whatever it
+  contains, and compression is attempted only past that — which
+  is what compression is for, since it buys back a payload byte
+  per non-ASCII character and so reaches thirty input bytes where
+  the verbatim forms reach fifteen.  That the verbatim forms hold
+  Latin-1-range content says nothing about Latin-1: such a value
+  is a UTF-8 string that fits fifteen bytes, exactly as an ASCII
+  or a non-Latin-1 one is.
+
+  Verbatim and compressed are therefore **separate storage
+  groups**, not two spellings of one class.  A verbatim form
+  carries the value's own bytes, so every reader borrows them and
+  its content state is exactly the §2.2.4 terminal — the five
+  verbatim forms are the five terminal states, one for one, and
+  need no vocabulary of their own.  The compressed form is a
+  transcoding that must be expanded to be read, its length the
+  expansion rather than the stored count, which is what every
+  other packed family also is and where it is grouped: it answers
+  `is_packed`, not `is_inline`, and the boundary is visible in
+  the storage type rather than implied by a length nobody can
+  see.  The full tier selection is normative, tabled below.
   Byte-level *mutation* can split an encoded character —
   container-verified: `chop` removes one byte, leaving a
   dangling lead byte that is no longer valid UTF-8 — so mutation
@@ -1536,7 +1555,7 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   bytes-class, now flagged).
 
   **The storage types are the normative vocabulary.**  The
-  forty-seven base variants — `InlineAscii`, `InlineLatin1`,
+  forty-nine base variants — `InlineAscii`, `InlineLatin1`,
   `InlineNonLatin1`, `InlineExtended`, `InlineBytes`,
   `PackedNumeric`, `PackedDateTimePlus`, and
   `PackedDateTimeZulu`, each beside its `Full` family twin;
@@ -1548,8 +1567,11 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   `Adopted`, and `FarAdopted` (§2.2.15), minted only by the
   slicing verbs; and the fifteen §2.2.16 UUID forms —
   `PackedUuidV1`, `V6`, and `V7`, and the four shards each of
-  `V3`, `V4`, and `V5` — are
-  reified as `StorageType`: forty-seven values dense from zero,
+  `V3`, `V4`, and `V5`; `PackedHexBytes` (§2.2.16), whose
+  spelling and case ride its payload rather than the tag; and
+  `PackedLatin1` beside its `Full` twin (§2.2.9), the compressed
+  companion to the verbatim `InlineLatin1` — are
+  reified as `StorageType`: forty-nine values dense from zero,
   which is the niche budget's requirement (§2.2.3), with every
   coarse question a projection on it.  The
   declaration order is itself the selection [DECISION]: canonical
@@ -1571,11 +1593,14 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   packed at 16-30 where it fits an alphabet — tried in the fixed
   order `Numeric`, `DateTimePlus`, `DateTimeZulu`, digits
   fitting more than one — and heap otherwise; Latin-1-range
-  content with a high code point takes `InlineLatin1` at 0-15
-  stored bytes (up to 30 internal bytes) and heap past that, the
-  packed rungs unreachable for it since the alphabets are
-  ASCII-only; non-Latin-1, extended, and bytes content takes its
-  inline type at 0-15 octets and heap past that.  The growth
+  content with a high code point takes `InlineLatin1` while its
+  encoding fits the payload — 0-15 octets, like every other
+  verbatim form — then `PackedLatin1` to 15 stored bytes (up to
+  30 internal bytes), and heap past that, the alphabet rungs
+  unreachable for it since those are ASCII-only; non-Latin-1,
+  extended, and bytes content takes its inline type at 0-15
+  octets and heap past that, having no compression to reach
+  further with.  The growth
   consequence: only alphabet-compatible ASCII leaves inline
   capacity without spilling to heap.  The ladder consults bytes
   alone, never the flag (class/flag independence above).
@@ -1690,7 +1715,8 @@ inner tag would cost a word — the §2.3.6 nesting lesson):
   carrying its length implicitly beside a shorter family storing
   it in the byte the last character would have used.  The inline
   forms split into the two length families, and the tag
-  arithmetic is §2.2.3's: 184 of 256 (124 before the §2.2.16 UUID
+  arithmetic is §2.2.3's: 196 of 256 (188 before the §2.2.9
+verbatim/compressed split, 124 before the §2.2.16 identifier
 families, 104 before the §2.2.15 view
   forms).  NUL then stops being a special case anywhere: content
   carrying one is stored inline like any other, which removes the
@@ -1711,8 +1737,8 @@ families, 104 before the §2.2.15 view
 The standalone `PString` is 16 bytes too — the tag budget
 closes in one byte, the discriminant being the storage type times
 the two flag bits (§2.2.9) — leaving 15 payload bytes: the five
-inline classes and the packed tier at the fused variants'
-capacities, and the heap tiers a thin pointer plus whatever
+verbatim inline forms and the packed families at the fused
+variants' capacities, and the heap tiers a thin pointer plus whatever
 envelope metadata each tier's ruling assigns (§2.2.3): the small
 tiers' full length/capacity/count/state, `Heap32`'s authoritative
 `u32` length, the word tier the bare pointer.  The `Value`↔key
@@ -1730,9 +1756,10 @@ heap cost is per-distinct-key-per-hash, not per-operation.
 
 **Where the cache bytes live, and why the obvious placements
 fail.**  The discriminant is not a byte the layout sets aside: it
-occupies the niche in `PString`'s own tag, which uses 184 of its
-256 values (124 before the §2.2.16 UUID families, 104 before the
-§2.2.15 view forms).  Rust's
+occupies the niche in `PString`'s own tag, which uses 196 of its
+256 values (188 before the §2.2.9 verbatim/compressed split, 124
+before the §2.2.16 identifier families, 104 before the §2.2.15
+view forms).  Rust's
 niche-filling requires every other variant's data to avoid that
 byte, and it lays a variant out as a self-contained struct
 *before* placing it — so a field wanting eight-byte alignment
@@ -5094,8 +5121,8 @@ exact stored array in bare lowercase hex with padding and
 auxiliary nibbles visible, because for those tiers the array *is*
 the representation and cleared padding is an invariant worth
 seeing — and it shows physical storage, which legitimately
-differs from the logical bytes where a tier stores a transformed
-image, as the Latin-1 inline class stores the downgraded one.
+differs from the logical bytes where a form stores a transformed
+image, as the compressed Latin-1 form stores the downgraded one.
 Pointer-backed tiers omit `bytes:`; their content is behind the
 pointer and `string:` already carries it losslessly.
 
