@@ -430,9 +430,9 @@ fn the_shared_slot_narrows_and_never_widens() {
 fn the_adopted_struct_lands_in_the_recorded_size_class() {
     // The §2.2.15 accounting: 64 bare and 72 with the bytes arm land in jemalloc's 64 and 80 classes.
     #[cfg(not(feature = "bytes"))]
-    assert_eq!(alloc_backend::size_class(Layout::new::<Adopted>()), 64);
+    assert_eq!(alloc_backend::size_class(Layout::new::<Adopted>()), Some(64));
     #[cfg(feature = "bytes")]
-    assert_eq!(alloc_backend::size_class(Layout::new::<Adopted>()), 80);
+    assert_eq!(alloc_backend::size_class(Layout::new::<Adopted>()), Some(80));
 }
 
 #[cfg(feature = "bytes")]
@@ -470,4 +470,46 @@ fn string_and_arc_str_adoption_carry_their_holders_to_the_last_release() {
 
     assert_eq!(std::sync::Arc::strong_count(&arc), 1);
     assert_eq!(live::count(), before);
+}
+
+#[test]
+fn a_declined_size_class_falls_back_rather_than_wrapping() {
+    // The allocator reports a class it cannot serve as zero; subtracting a header from that would wrap into an enormous
+    // bogus capacity.  The refusal takes the same road a bad layout does — capacity is the request itself, and the
+    // allocation that follows reports the real failure.  A request at the top of the addressable range is a valid
+    // Layout that no allocator can serve.
+    let len = (isize::MAX as usize) - 4096;
+    let huge = Layout::from_size_align(len, 1).expect("a valid layout, just an unservable one");
+    if alloc_backend::size_class(huge).is_none() {
+        // The derivation answers with the request rather than subtracting a header from a refusal, which used to
+        // overflow — a debug panic, and in release a capacity bounded only by the tier ceiling.
+        assert_eq!(heap32::class_capacity(len), len, "an unnameable class yields the request itself");
+        assert_eq!(heap::class_capacity(len), len);
+    }
+
+    // Whatever the backend answers, a named class covers what was asked and the derivation stays inside its tier.
+    for size in [1usize, 64, 1 << 20, 1 << 40, len] {
+        let Ok(layout) = Layout::from_size_align(size, 1) else { continue };
+        if let Some(class) = alloc_backend::size_class(layout) {
+            assert!(class >= size, "a named class covers the request: {size:#x} -> {class:#x}");
+        }
+
+        assert!(heap32::class_capacity(size) <= heap32::MAX_CAPACITY.max(size));
+        assert!(heap8::class_capacity(size) <= heap8::MAX_CAPACITY.max(size));
+    }
+}
+
+#[test]
+fn a_panicking_classifier_releases_the_buffer_it_was_handed() {
+    // The classifying birth hands a raw pointer to a caller's closure between the allocation and its installation.  The
+    // obligation is live across that call, so unwinding through it releases rather than strands.
+    for len in [16usize, 300, 70_000] {
+        let before = live::count();
+        let bytes = vec![b'z'; len];
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| HeapParts::from_slice_classifying(&bytes, |_, _| panic!("classifier failed mid-copy"))));
+
+        assert!(outcome.is_err(), "the panic propagates");
+        assert_eq!(live::count(), before, "and the allocation it was handed is gone: len {len}");
+    }
 }

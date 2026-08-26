@@ -2905,24 +2905,31 @@ impl PString {
             RawParts::Packed(_) => true,
             RawParts::Uuid { .. } => true,
             RawParts::Hex { .. } => true,
-            RawParts::View { bytes, scan, backing } => match backing.map_or(scan, |a| scan::meet(scan, a.scan())) {
-                scan::Ascii => true,
-                st if scan::is_known_non_ascii(st) => false,
+            RawParts::View { bytes, scan, backing } => {
+                let met = backing.map_or(scan, |a| scan::meet(scan, a.scan()));
+                match met {
+                    scan::Ascii => true,
+                    st if scan::is_known_non_ascii(st) => false,
 
-                // Undecided: probe, and record the answer in the shared slot where one exists — the envelope byte
-                // itself cannot move through `&self`.
-                _ => {
-                    count_probe_byte();
-                    let ascii = bytes.iter().all(u8::is_ascii);
-                    if let Some(a) = backing
-                        && ascii
-                    {
-                        a.narrow_scan(scan::Ascii);
+                    // Undecided: probe, and record the answer in the shared slot where one exists — the envelope byte
+                    // itself cannot move through `&self`.  Both answers are knowledge, and a failed probe is the more
+                    // valuable one: the CAS-meet completes a `Maybe` state from it (§2.2.4), where discarding it would
+                    // leave every later reader to walk the bytes again.  Validity survives where the met state had it.
+                    _ => {
+                        count_probe_byte();
+                        let ascii = bytes.iter().all(u8::is_ascii);
+                        if let Some(a) = backing {
+                            a.narrow_scan(match (ascii, met) {
+                                (true, _) => scan::Ascii,
+                                (false, scan::ValidUtf8) => scan::Utf8NonAscii,
+                                (false, _) => scan::NonAscii,
+                            });
+                        }
+
+                        ascii
                     }
-
-                    ascii
                 }
-            },
+            }
             RawParts::Heap(cb) => match cb.scan() {
                 scan::Ascii => true,
                 scan::Utf8Latin1 | scan::Utf8NonLatin1 | scan::Utf8NonAscii | scan::MalformedUtf8 | scan::NonAscii | scan::ExtendedUtf8 => false,

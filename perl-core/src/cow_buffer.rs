@@ -283,7 +283,45 @@ impl HeapParts {
         // SAFETY: the allocation above carries exactly one reference, which this `Owned` now owes.
         Ok(HeapParts { ptr: unsafe { Owned::from_raw(ptr) }, len, cap, count, scan, tier })
     }
+}
 
+/// A fresh tier allocation whose release obligation is live from the moment it exists, so that a caller's closure
+/// unwinding between the allocation and its installation cannot strand the buffer.  [`Owned`] cannot serve here: it
+/// detects an abandoned obligation rather than discharging one, so establishing it early would turn a leak into an
+/// abort during unwind.  [`FreshBuffer::claim`] disarms once the buffer is safely owned.
+struct FreshBuffer {
+    ptr: NonNull<u8>,
+    tier: Tier,
+    cap: usize,
+}
+
+impl FreshBuffer {
+    /// Take the pointer, discharging the obligation to the caller.
+    #[inline]
+    fn claim(self) -> NonNull<u8> {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+
+        ptr
+    }
+}
+
+impl Drop for FreshBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from this tier's `allocate` and nothing has released it — reaching this drop is
+        // exactly the case where nobody claimed it.
+        unsafe {
+            match self.tier {
+                Tier::Heap8 => heap8::release(self.ptr, self.cap as u8),
+                Tier::Heap16 => heap16::release(self.ptr, self.cap as u16),
+                Tier::Heap32 => heap32::release(self.ptr),
+                Tier::Heap => heap::release(self.ptr),
+            }
+        }
+    }
+}
+
+impl HeapParts {
     /// The classifying birth: allocate at the class, and determine the terminal state and character count during the
     /// copy itself (§2.2.3) — `classify_into` is one traversal that does both, so the buffer is born settled at every
     /// size without a pass the copy was not already paying for.  The closure seam keeps the walker where it lives
@@ -301,31 +339,31 @@ impl HeapParts {
             match tier {
                 Tier::Heap8 => {
                     let cap = heap8::class_capacity(len);
-                    let p = heap8::allocate(cap as u8)?;
-                    let (scan, count) = classify_into(p.as_ptr(), bytes);
-                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                    let held = FreshBuffer { ptr: heap8::allocate(cap as u8)?, tier, cap };
+                    let (scan, count) = classify_into(held.ptr.as_ptr(), bytes);
+                    Ok(HeapParts { ptr: Owned::from_raw(held.claim()), len, cap, count, scan, tier })
                 }
                 Tier::Heap16 => {
                     let cap = heap16::class_capacity(len);
-                    let p = heap16::allocate(cap as u16)?;
-                    let (scan, count) = classify_into(p.as_ptr(), bytes);
-                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                    let held = FreshBuffer { ptr: heap16::allocate(cap as u16)?, tier, cap };
+                    let (scan, count) = classify_into(held.ptr.as_ptr(), bytes);
+                    Ok(HeapParts { ptr: Owned::from_raw(held.claim()), len, cap, count, scan, tier })
                 }
                 Tier::Heap32 => {
                     let cap = heap32::class_capacity(len);
-                    let p = heap32::allocate(cap as u32, ScanState::Unknown.as_u8(), 0)?;
-                    let (scan, count) = classify_into(p.as_ptr(), bytes);
-                    heap32::set_scan(p, scan.as_u8());
-                    heap32::set_char_count(p, count as u32);
-                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                    let held = FreshBuffer { ptr: heap32::allocate(cap as u32, ScanState::Unknown.as_u8(), 0)?, tier, cap };
+                    let (scan, count) = classify_into(held.ptr.as_ptr(), bytes);
+                    heap32::set_scan(held.ptr, scan.as_u8());
+                    heap32::set_char_count(held.ptr, count as u32);
+                    Ok(HeapParts { ptr: Owned::from_raw(held.claim()), len, cap, count, scan, tier })
                 }
                 Tier::Heap => {
                     let cap = heap::class_capacity(len);
-                    let p = heap::allocate(cap, len, ScanState::Unknown.as_u8(), 0)?;
-                    let (scan, count) = classify_into(p.as_ptr(), bytes);
-                    heap::set_scan(p, scan.as_u8());
-                    heap::set_char_count(p, count);
-                    Ok(HeapParts { ptr: Owned::from_raw(p), len, cap, count, scan, tier })
+                    let held = FreshBuffer { ptr: heap::allocate(cap, len, ScanState::Unknown.as_u8(), 0)?, tier, cap };
+                    let (scan, count) = classify_into(held.ptr.as_ptr(), bytes);
+                    heap::set_scan(held.ptr, scan.as_u8());
+                    heap::set_char_count(held.ptr, count);
+                    Ok(HeapParts { ptr: Owned::from_raw(held.claim()), len, cap, count, scan, tier })
                 }
             }
         }
@@ -646,7 +684,14 @@ macro_rules! heap_tier {
                 let Ok(layout) = Layout::from_size_align(total, align_of::<Head>()) else {
                     return len;
                 };
-                (crate::alloc_backend::size_class(layout) - HEADER).min(MAX_CAPACITY)
+
+                // A class the allocator declines to name is one it cannot serve: ask for exactly what is needed and let
+                // the allocation itself report the failure, rather than harvesting headroom from a refusal.
+                let Some(room) = crate::alloc_backend::size_class(layout).and_then(|c| c.checked_sub(HEADER)) else {
+                    return len;
+                };
+
+                room.min(MAX_CAPACITY)
             }
 
             /// # Safety
@@ -787,7 +832,14 @@ macro_rules! heap_tier {
                 let Ok(layout) = Layout::from_size_align(total, align_of::<Head>()) else {
                     return len;
                 };
-                (crate::alloc_backend::size_class(layout) - HEADER).min(MAX_CAPACITY)
+
+                // A class the allocator declines to name is one it cannot serve: ask for exactly what is needed and let
+                // the allocation itself report the failure, rather than harvesting headroom from a refusal.
+                let Some(room) = crate::alloc_backend::size_class(layout).and_then(|c| c.checked_sub(HEADER)) else {
+                    return len;
+                };
+
+                room.min(MAX_CAPACITY)
             }
 
             /// # Safety
@@ -1009,7 +1061,14 @@ macro_rules! heap_tier {
                 let Ok(layout) = Layout::from_size_align(total, align_of::<Head>()) else {
                     return len;
                 };
-                (crate::alloc_backend::size_class(layout) - HEADER).min(MAX_CAPACITY)
+
+                // A class the allocator declines to name is one it cannot serve: ask for exactly what is needed and let
+                // the allocation itself report the failure, rather than harvesting headroom from a refusal.
+                let Some(room) = crate::alloc_backend::size_class(layout).and_then(|c| c.checked_sub(HEADER)) else {
+                    return len;
+                };
+
+                room.min(MAX_CAPACITY)
             }
 
             /// # Safety

@@ -113,7 +113,10 @@ impl Geometry {
     fn allocate_slots(at_least: usize) -> Result<(NonNull<ArraySlot>, usize), AllocError> {
         let fail = || AllocError { requested: at_least * size_of::<ArraySlot>() };
         let layout = Layout::array::<ArraySlot>(at_least).map_err(|_| fail())?;
-        let granted = alloc_backend::size_class(layout) / size_of::<ArraySlot>();
+
+        // A class the allocator declines to name is one it cannot serve: fall back to the request itself and let the
+        // allocation below report the failure, rather than harvesting slack from a refusal.
+        let granted = alloc_backend::size_class(layout).map_or(at_least, |class| class / size_of::<ArraySlot>());
         let full = Layout::array::<ArraySlot>(granted).map_err(|_| fail())?;
         let raw = alloc_backend::allocate(full).ok_or_else(fail)?.cast::<ArraySlot>();
 

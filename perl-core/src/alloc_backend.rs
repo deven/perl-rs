@@ -27,10 +27,16 @@ mod backend {
     /// The size class a request of `layout` would occupy: allocating this many bytes costs exactly what allocating
     /// `layout.size()` costs, so the difference is free capacity.  Zero-sized requests are the caller's to avoid, as
     /// with the raw allocator APIs.
+    ///
+    /// `None` where the allocator declines to name a class, which it reports as zero for a request it cannot serve.
+    /// That is not a capacity of nothing — it is the absence of an answer, and a caller that subtracted a header from
+    /// it would wrap into an enormous bogus capacity.
     #[inline]
-    pub(crate) fn size_class(layout: Layout) -> usize {
+    pub(crate) fn size_class(layout: Layout) -> Option<usize> {
         // SAFETY: `nallocx` computes without allocating; a `Layout` guarantees a power-of-two alignment.
-        unsafe { je::nallocx(layout.size(), flags(layout)) }
+        let class = unsafe { je::nallocx(layout.size(), flags(layout)) };
+
+        (class != 0).then_some(class)
     }
 
     /// Allocate `layout` from the buffer instance.  Returns `None` on exhaustion; the caller maps that to its own
@@ -62,9 +68,12 @@ mod backend {
 
     /// The size class for `layout`: its size rounded up to the 16-byte quantum.  Conservative by design — a family with
     /// coarser classes wastes nothing on a 16-shaped request, and no family is finer.
+    ///
+    /// `None` where the rounding itself would overflow, matching the other backend's shape so callers need only one
+    /// road for a class that cannot be named.
     #[inline]
-    pub(crate) fn size_class(layout: Layout) -> usize {
-        (layout.size() + 15) & !15
+    pub(crate) fn size_class(layout: Layout) -> Option<usize> {
+        layout.size().checked_add(15).map(|rounded| rounded & !15)
     }
 
     /// Allocate `layout` from the system allocator.
