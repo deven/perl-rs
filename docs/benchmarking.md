@@ -160,6 +160,140 @@ suspect assumption — a different pattern, the previous version's output, the
 emitted assembly, the file on disk — because a check built from the same
 premise as the work will agree with it.
 
+## Synchronization primitives
+
+Measured on the session container (Xeon 2.8 GHz, single vCPU), uncontended,
+one run of the complete surface:
+
+| primitive                          | ns/op |
+| ---------------------------------- | ----: |
+| unsynchronized read (floor)        |  0.99 |
+| seqlock read (per-word atomics)    |  1.31 |
+| hand-rolled spinlock               |  8.83 |
+| `HeapArc` clone + drop (two RMW)   | 13.05 |
+| `std::sync::Mutex`                 | 13.36 |
+| `parking_lot::Mutex`               | 13.73 |
+| `parking_lot::RwLock` write        | 13.74 |
+| `std::sync::RwLock` write          | 15.23 |
+| `std::sync::RwLock` read           | 18.19 |
+| `parking_lot::RwLock` read         | 19.28 |
+
+Four conclusions, in ascending order of how much they should change.
+
+**Switching lock libraries is not a lever.**  `std` and `parking_lot` land
+within about 6% of each other, with `std`'s `RwLock` read marginally the
+faster of the two; the futex rewrite closed the gap that once justified the
+dependency.  What `parking_lot` still buys is a smaller lock word, no
+poisoning in the API, and different fairness under contention — none of which
+this benchmark can see, because contention is exactly what a single vCPU
+cannot produce.
+
+**A read lock costs more than a write lock**, in both implementations.
+Releasing a write lock is a store; releasing a read lock is a
+read-modify-write on the shared counter, so a reader pays two RMWs to a
+writer's one.  The "cheap read path" intuition is inverted here.
+
+**A refcount is a peer of the lock, not a rounding error.**  Cloning and
+dropping a `HeapArc` costs 13 ns, against ~19 ns for the read lock it sits
+inside.  Any API returning an owned pointer-bearing value pays both.
+
+**`RwLock`'s benefit is parallel readers, not cheaper reads**, and the
+capability is one this crate's critical sections are too short to use.  A
+hash lookup is ~17 ns, an array index ~2 ns, a scalar read ~1 ns — all
+shorter than the 19 ns lock around them.  Worse, `RwLock` readers *write* to
+the shared counter, so every reader on every core must take that line
+exclusive: N logically parallel readers serialize on cache-line ownership.
+Reader parallelism only repays that coherence traffic when the critical
+section is long enough to amortize it, which is why the kernel has per-CPU
+reader locks and why RCU exists.  For sections shorter than the lock, a
+naive `RwLock` can scale *worse* than a mutex.
+
+A seqlock inverts that: its readers issue no writes at all, the line stays
+shared across every core, and readers genuinely scale.  Hence 1.31 ns,
+essentially at the unsynchronized floor — 14x cheaper than any lock here, and
+that figure is for the per-word-atomic version, which is sound under a
+concurrent writer rather than the technically-UB direct read, and costs the
+same in codegen.
+
+The payload measured owns nothing, which is also the case that needs no
+synchronization at the read at all: a `Value` living entirely in the
+sixteen-byte envelope has nothing to keep alive.  Whether the figure extends
+to a payload that owns pointers is a question for a concrete design, not one
+this measurement answers.
+
+Two lifetime facts belong beside that figure, because it invites lock-free
+reasoning and the first one is easy to get backwards.
+
+**`clone` racing `drop` is unconditionally sound**, with no reclamation
+machinery of any kind.  `clone` takes `&self`, so the caller holds a live
+borrow of an owned handle, and that handle's own contribution to the count
+cannot be removed underneath it.  A concurrent drop implies a second handle,
+hence a count of at least two, hence a floor of one — never zero during a
+clone.  That is the entire point of atomic refcounting.  It is stated here
+affirmatively because the opposite is the obvious guess, and an argument that
+some read path is unsound *because clone races drop* has gone wrong earlier
+than it looks.
+
+**Monotonic publication is free.**  A pointer that goes null to non-null once
+and never changes again has no lifetime hazard at all: nothing is ever
+released, so there is nothing for a reader to outlive.  Publish with a release
+CAS, read with an acquire load; a racing initializer that loses frees only its
+own candidate, which no other thread ever observed.  Write-once faces and
+`narrow_scan`'s CAS-meet are both in this class and need no lock.  What is
+*not* in it is a cache that resets: `FullScalar::invalidate_caches` takes
+`&mut self` and uses `get_mut`/`take`, so its exclusivity comes from the cell's
+write lock rather than from the atomics, which serve the read side only.
+
+### Sequence counter width
+
+Use 64 bits.  The reasoning is worth recording because two shorter widths look
+defensible and are not.
+
+The reader's window is not its execution time — it is bounded by *scheduling*.
+A userspace reader can be preempted between taking the sequence and
+re-checking it, and a descheduled thread is off-CPU for milliseconds.  With a
+write costing 2.34 ns, a full cycle takes 300 ns at one byte and 77 µs at
+two, so a single scheduling quantum overruns both by orders of magnitude.
+
+Wraparound only creates the *opportunity*; failure requires observing the
+identical value.  For a preemption long enough to cycle the counter, the
+value at resume is effectively uniform, so the probability is 1/2^(W−1) per
+exposure: 1 in 128 for one byte, 1 in 32,768 for two, 1 in 2.1 billion for
+four.  One in 32,768 is a corruption every few seconds under load.  Four
+bytes is a rate rather than an impossibility, and the consequence is a
+dereferenced garbage pointer — an unreproducible crash, the worst class of
+defect to ship.
+
+The kernel is comfortable at four bytes because its readers often run with
+preemption disabled and its structures are replicated by the million.
+Neither holds here.
+
+And eight bytes is free in this layout.  `u32 seq + 16-byte payload` and
+`u64 seq + 16-byte payload` both measure 24 bytes, the `u32` spending its
+saving on alignment padding, and both read within noise of the floor (1.34
+versus 1.64 ns).  Taking the wide counter converts a probabilistic argument
+into a structural one and retires the question.  Put the writer-in-progress
+flag in the low bit, as the kernel does, so it stays one word.
+
+Where the counter lives, if a seqlock is ever built: not inside the payload.
+A scalar slot is `rc_state` (8 bytes) plus a 16-byte payload in a 32-byte
+stride, so eight bytes are already unclaimed there — but *unclaimed is not
+free*, and spending them should be a recorded decision, since the design
+moved `class_id` to a per-page array specifically to avoid per-slot bytes.
+For containers the counter replaces the `RwLock` word rather than joining
+it, and the identity allocation class holds — unless a reader-fallback hybrid
+keeps both, in which case it is eight bytes on top.
+
+### The measurement that is still owed
+
+Everything above is uncontended, on one vCPU.  The choice between `RwLock`,
+a mutex, and a seqlock-with-writer-mutex turns on concurrent readers across
+cores at realistic critical-section lengths, which this container cannot
+measure: any "contention" benchmark here measures timesharing, not coherence
+traffic, and would flatter whichever primitive the harness favored.  That
+experiment needs a multi-core machine and should settle the question rather
+than argument settling it.
+
 ## Checklist
 
 1. Does the reference row read exactly 1.00?
@@ -176,3 +310,5 @@ premise as the work will agree with it.
 10. Is the verification independent of the work — a different pattern, an
     earlier version, the artifact on disk — or does it share the assumption
     being tested?
+11. For a synchronization result: is it uncontended on one core, and is the
+    question actually about contention?
