@@ -244,6 +244,14 @@ own candidate, which no other thread ever observed.  Write-once faces and
 `&mut self` and uses `get_mut`/`take`, so its exclusivity comes from the cell's
 write lock rather than from the atomics, which serve the read side only.
 
+Which mechanism such a face should use is an occupancy question rather than an
+argument, and it is easy to settle the wrong way from the empty case alone.  A
+null `AtomicPtr` is eight bytes against `OnceLock`'s twenty-four, but a filled
+one is eight *plus* a separate allocation, and a sixteen-byte payload lands in
+a 32-byte class — so the two cross near fifty percent occupancy, and boxing an
+otherwise-inline value purely to obtain a pointer can erase the saving
+entirely.  Measure the fill rate first.
+
 ### Sequence counter width
 
 Use 64 bits.  The reasoning is worth recording because two shorter widths look
@@ -289,7 +297,11 @@ keeps both, in which case it is eight bytes on top.
 Everything above is uncontended, on one vCPU.  The choice between `RwLock`,
 a mutex, and a seqlock-with-writer-mutex turns on concurrent readers across
 cores at realistic critical-section lengths, which this container cannot
-measure: any "contention" benchmark here measures timesharing, not coherence
+measure.  The same run should show what a descheduled writer costs: the stall
+is no worse than a preempted lock holder's, since both are one scheduling
+latency, but seqlock readers retry where lock waiters sleep, so it appears as
+burnt CPU rather than as blocked threads.  This container cannot see that
+either: any "contention" benchmark here measures timesharing, not coherence
 traffic, and would flatter whichever primitive the harness favored.  That
 experiment needs a multi-core machine and should settle the question rather
 than argument settling it.
