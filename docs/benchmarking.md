@@ -292,6 +292,94 @@ For containers the counter replaces the `RwLock` word rather than joining
 it, and the identity allocation class holds — unless a reader-fallback hybrid
 keeps both, in which case it is eight bytes on top.
 
+### Waiting: what each escalation costs
+
+Measured on the same machine (Xeon 2.10 GHz, one vCPU, virtualized — the
+`hypervisor` flag is set), for a writer or reader that finds the cell busy:
+
+| step                                        |   ns |
+| ------------------------------------------- | ---: |
+| bare relaxed load, retry loop               | 0.37 |
+| `std::hint::spin_loop()` — one `PAUSE`      | 17.7 |
+| `std::thread::yield_now()` — `sched_yield`  |  195 |
+
+And the section being waited on, so the escalations have something to be
+measured against:
+
+| operation                                   |   ns |
+| ------------------------------------------- | ---: |
+| single relaxed 8-byte store                 | 0.70 |
+| seqlock section, 8-byte payload             | 1.26 |
+| seqlock section, 16-byte payload            | 1.90 |
+| full write including the acquiring CAS      | 10.1 |
+
+**The acquisition dominates the write**, at 8.2 of the 10.1 ns — more than
+four times the section it guards.  A read-modify-write on a shared line is
+expensive whether it belongs to a mutex or to a seqlock, so the seqlock's
+writer-side saving over a 13.7 ns mutex is about a quarter, not an order of
+magnitude.  Its value is on the read path, 19 ns to 1.31, which is what the
+primitive table already said.
+
+**A retry costs almost nothing; the hint costs everything.**  A bare relaxed
+load with a test and an untaken branch is 0.37 ns, so five or six of them
+outlast the whole 1.90 ns section.  One `PAUSE` is forty-eight times that — 37
+cycles here, matching Intel's post-Skylake lengthening of the instruction, and
+`std::hint::spin_loop()` does emit exactly one `pause` per call with no loop
+around it.  Conventional spin ladders open with the hint because they assume
+sections of hundreds of nanoseconds; ours is seven cycles, so opening with the
+hint means waiting eight sections to avoid re-reading once.
+
+That inverts the usual ordering.  Spin bare while the wait might be short,
+because the section is shorter than a single hint; escalate to the hint only
+after concluding the holder is not running, where its cost stops mattering and
+its benefits — not saturating a hyperthread sibling, and being visible to the
+hypervisor — begin to.  A ladder calibrated from the three numbers above
+spends roughly one operation of each tier before escalating: about 48 bare
+loads to one `PAUSE`, about 10 pauses to one yield, and about 195 ns total
+before the first syscall, which is one yield's worth of patience before paying
+for a yield.
+
+**In a guest, `PAUSE` is the only signal that reaches the layer that can
+help.**  VMX PAUSE-Loop Exiting counts pauses within a window and forces a VM
+exit so the hypervisor can reschedule the vCPU that likely holds the lock —
+the exact pathology, since a spinning guest is usually waiting on a *vCPU*
+that is not running rather than a thread.  `ple_window` defaults near 4096
+cycles, so detection needs on the order of a hundred consecutive pauses; a
+short pause run delivers neither backoff nor the signal.  It is also
+host-configured and invisible from inside the guest, so this is a reason to
+size the pause phase generously, not a measurement.
+
+Two cautions on the constants.  0.37 ns is about 0.78 cycles, which means the
+benchmark had several loads in flight; a real spin loop must *observe* the
+change, so budget one to two cycles per iteration and re-derive the count from
+a dependent-load loop before treating it as calibrated.  And all three numbers
+are per-target: `PAUSE` is ~37 cycles here, ~10 on pre-Skylake parts, and on
+AArch64 `spin_loop` maps to `yield` at a couple of cycles — so the same
+iteration count spans two orders of magnitude across machines.  Express a
+budget in bare loads, whose cost is roughly uniform, rather than in hints.
+
+### The corpus cannot answer the contention question
+
+The obvious way to size any of this is to ask how often real Perl programs
+contend on a shared scalar, and the answer is that they essentially never do —
+which proves nothing.  Perl programs are not concurrent because `ithreads`
+made concurrency unusable: every variable copied per interpreter, sharing
+opt-in and expensive, so people reached for `fork` or an event loop instead.
+Sampling that corpus measures the road nobody can drive.
+
+PerlOxide's shared-by-default model is meant to make a different kind of
+program possible, so the cost of shared access is not responding to a demand —
+it is setting a ceiling on what demand can exist.  A 19 ns shared read teaches
+new code to route around shared state, after which the corpus would show low
+contention and appear to vindicate the choice that caused it.
+
+So the benchmark has to be **built rather than sampled**, shaped like the
+concurrency the design intends to enable: N threads on one shared scalar, N
+threads on disjoint scalars, and a read-mostly mix, at realistic
+critical-section lengths.  That is writable today and runnable on the
+multi-core machine the contention measurement already needs.  It would settle
+the primitive choice and the spin constants in one run.
+
 ### The measurement that is still owed
 
 Everything above is uncontended, on one vCPU.  The choice between `RwLock`,
@@ -303,8 +391,8 @@ latency, but seqlock readers retry where lock waiters sleep, so it appears as
 burnt CPU rather than as blocked threads.  This container cannot see that
 either: any "contention" benchmark here measures timesharing, not coherence
 traffic, and would flatter whichever primitive the harness favored.  That
-experiment needs a multi-core machine and should settle the question rather
-than argument settling it.
+experiment needs a multi-core machine, and the workload it runs has to be the
+built one described above rather than anything sampled from existing code.
 
 ## Checklist
 
@@ -324,3 +412,5 @@ than argument settling it.
     being tested?
 11. For a synchronization result: is it uncontended on one core, and is the
     question actually about contention?
+12. Is the corpus being sampled one the current implementation made
+    impossible — measuring demand for a road nobody can drive?
