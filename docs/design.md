@@ -3420,12 +3420,249 @@ constant).
 Open items awaiting rulings or container work, marked here rather
 than scattered: the perl-extended-UTF-8 representation subsection
 (§2.2.3); which 5.42 constant-declaration surfaces map to `Const`
-construction.  (Closed since first marked: the would-warn predicate
+construction; and the slot-model questions collected in §2.3.8.  (Closed since first marked: the would-warn predicate
 table is container-mapped in §2.3.4; the cache-fill mechanism is
 ruled in §2.3.2 — atomics for the numeric slots, `OnceLock` for the
 string slot.)  (The
 buffer ruling is settled: custom `CowBuffer`, no new required
 dependencies; `memchr` optional for scan acceleration.)
+
+#### 2.3.8 The slot model: rulings and open questions [DECISION]
+
+This subsection records the outcome of the slot-model design pass
+so the rulings survive independently of the sessions that produced
+them.  Rulings are stated as design; questions still open are
+listed as open, with what each turns on.  It is the prerequisite
+for §21.1 step 6 and for §2.3.9.
+
+**Locations leave `Value`.**  `AliasMut` and `AliasConst` are
+location variants — a slot naming a promoted cell — and as members
+of `Value` they make `Clone` ambiguous: deriving it bumps the `Arc`,
+which creates a second *name* rather than a copy, and nothing in the
+type says which a given `Value` is.  They move to `Slot`.  `Value`
+is then purely an rvalue: `Clone` copies, and every read is the
+value it holds.  `Slot` is deliberately not `Clone`; copying a
+location is meaningless, and `load` (copy the value out) and `alias`
+(make a second name) stay separate verbs.
+
+**`Slot` is the name.**  §21.1 already calls this the slot model.
+`Lvalue` is reserved for the syntactic category — lvalue `substr`,
+lvalue subs, the reserved borrowed-view type of §2.2.15 — which will
+need the word; spending it on storage now means renaming later.
+`Place` survives as the evaluator's navigation descriptor (nested
+access through `$h{k}[3]`, autovivification, tied and magical
+routing), because `&mut Slot` cannot express those without holding
+container guards across the caller's operation.
+
+**Layering, not a shared representation.**  `Slot` is a real enum
+layered on `Value` — `Value(Value)` plus the alias arms — exactly as
+`Value` layers on `PString`.  Measured: 16 bytes, and `Option<Slot>`
+16, because niche filling composes.  The invariant this buys: **a
+cell contains a `Value` and never a `Slot`**, so an alias chain is
+unrepresentable rather than merely forbidden, and
+`Slot::Value(Value::ScalarRef(r))` (holds a reference) is a
+different shape from `Slot::Cell(r)` (aliases the referent) by
+construction.
+
+**Aliasing is a standalone-library capability**, not an ops-layer
+one.  Correct aliasing — `foreach` and `@_` semantics, `\$a[0]` —
+must work from `perl-core` alone; the verbs are public on `Slot`.
+
+**The slot→cell edge is monotonic.**  Un-promoting would invalidate
+every outstanding reference, so a slot that names a cell names it
+until the slot dies; taking a reference is an initialization-only
+operation.  This is perl's `sv_upgrade` address stability from the
+other side.  Consequence: once a reader holds the cell pointer it is
+valid for as long as the slot holds it — that edge needs no
+reclamation protocol of any kind.  Freeing a cell whose count reaches
+zero is ordinary `Arc` semantics and is unaffected (the slot's own
+reference has already been released).
+
+**Identity does not copy; therefore identity lives in the cell.**
+Container-verified on 5.44: a readonly scalar assigned to another
+variable yields a *mutable* copy; a tied scalar assigned yields a
+plain copy of its fetched value.  Readonly, magic, and blessedness
+are per-location facts, never per-value — so they can live neither
+in `Value` nor in an unpromoted `Slot`, only in the cell.  This is
+what forces the three-type split rather than one type with flags.
+
+**Demotion and claim-free reads are mutually exclusive.**  Collapsing
+a live cell back into its slot when the count drops to one is
+implementable (`Arc::try_unwrap`), but it means a reader may not use
+a cell pointer it read from a slot without holding a refcount or a
+lock for the duration.  If demotion never happens, readers deref the
+pointer with nothing held.  The price of the other choice is
+measured: a `HeapArc` clone-and-drop pair is 13 ns against the 19 ns
+lock it would be replacing (`benchmarking.md`).  Ruled: no demotion;
+reads through a slot's cell pointer hold no claim.
+
+**The tag budget, corrected.**  Niche filling is per-type, so the
+layers form a *chain*, not a sum: `PString` spends 196 of 256;
+`Value` inherits those and adds its own; `Slot` and `Scalar` are
+parallel branches above `Value` and do not compete with each other.
+Measured room above `Value`: between 32 and 39 unit variants before
+it leaves 16 bytes.  Earlier prose quoting 60 was counting
+`PString`'s spare without subtracting `Value`'s claim on it.  Every
+future packed-string family is subtracted from every chain at once.
+
+What remains open, each with what decides it:
+
+1. **How the slot names a cell.**  Flattened alias arms measure 16
+   bytes today.  `Cell(ScalarRef)` with a two-word handle measures
+   24 — eight bytes on every element — and reaches 16 only when
+   `ScalarRef` is one word, which the typed slab at §21.1 step 11
+   provides.  A tagged pointer gets 16 now at the cost of hand-rolled
+   bit-stuffing in the identity type.  Same destination, three
+   routes through the interval; this decides whether step 6 lands at
+   16 or 24 bytes per element.
+2. **What an unpromoted slot holds** — a `Value`, or a `Scalar`.
+   Holding a `Scalar` lets an element be readonly or magical without
+   being shared (one `Box`, no lock, no refcount traffic).  Today no
+   such path exists: `upgrade_to_full` is a method on `Scalar`, which
+   exists only inside the shared cell, so `my $x = "abc"; $x + 0;`
+   must become a shared cell merely to cache a numeric face.
+3. **Whether `Scalar`'s `Plain`/`Full` split survives.**  Measured: a
+   plain promoted cell is 40 bytes, a born-fat one 104; the split
+   buys those 64 bytes and costs the in-place upgrade machinery.
+   Collapsing it deletes a type and makes the identity guarantee
+   vacuous.  The deciding number — how often a promoted cell stays
+   plain — has not been measured; reference-taking and aliasing say
+   often, the §2.3.4 numification cache says less often.
+4. **A `Box` tier** for unshared-but-fat, only if question 3 keeps
+   a fat form.
+5. **Frozen faces, eager or lazy.**  Eager precomputation is the sole
+   reason `ConstScalar` carries a warn record (24 of its 72 bytes):
+   precomputing the face destroys the cache-as-once-bit signal perl
+   uses, so it must be reconstructed explicitly.  Lazy filling makes
+   warn-once fall out of §2.3.4's rule and shrinks the cell toward
+   40; the cost is that const numification becomes fallible, as
+   mutable-cell numification already is.  Perl's own behavior,
+   container-verified: constants warn once per SV on first
+   numification, readonly does not suppress the cache, and
+   suppression rides copies — no special case anywhere.
+6. **The scalar API shape**: `snapshot()`/`update()` rather than
+   `read()`/`write()` guards.  No prerequisites; keeps the §2.3.9
+   backend private so the eventual choice touches no caller, and
+   retires the standalone-API finding about `parking_lot` guard
+   types on the public surface.
+
+**A from-scratch candidate**, recorded because it dissolves
+questions 3, 4, and 5 rather than answering them, and because the
+comparison is cheap to keep:
+
+```text
+Value   16 bytes   a value; Clone copies; no identity
+Slot    16 bytes   a location: Value inline, or a handle to a Cell
+Cell    40 bytes   rc_state | seq | Value | face — identity, slab slot
+```
+
+The move is putting the numeric face in the cell's own spare word
+rather than a boxed side struct.  Then there is no thin/fat
+distinction to upgrade between; the face-valid bit in `rc_state` is
+the warn-once bit; and the same field serves both disciplines — a
+mutable cell clears it on assignment inside the section it already
+holds, a frozen cell fills it once and never resets.  A cell is 40
+bytes always, against today's 40 plain / 120 fat.  `FullScalar`'s
+caches become the face; readonly, has-magic, and frozen become
+`rc_state` bits; magic and stash go to a side table reached only
+when the bit is set.  What it gives up: frozen immutability becomes
+a bit the write path checks rather than a type with no lock to hand
+out (reads stay lock-free — check the bit, read directly); and a
+blessed *scalar* pays a side-table lookup, which is assumed rare
+since blessed containers carry their stash in their own headers.
+Not ruled; it is the shape that the open questions converge on if
+each is answered toward simplicity.
+
+#### 2.3.9 Synchronizing the cell payload [candidate protocol]
+
+The measurements this rests on are in `benchmarking.md`
+("Synchronization primitives" and following).  The protocol is
+ruled in shape and pending the multi-core measurement recorded
+there as owed; the API of question 6 above keeps it replaceable.
+
+**Four cases, three of them free.**  A bare `Value` in a slot is
+unshared by definition (§2.2.14) — no writer exists, so a read is a
+plain load, and nothing here applies.  A frozen cell's payload never
+changes, so its read is a plain `&self` access pinned by the `Arc`,
+whatever the payload holds; pointer-bearing changes nothing.  A
+mutable cell holding an envelope-resident payload has a real writer,
+so a read can tear and needs the sequence check, but nothing is
+owned so nothing can be freed underneath it: this is where the
+seqlock applies, soundly, with no reclamation question.  A mutable
+cell holding an owning payload is the one quadrant where the lock
+does work only a lock can do: a replaced pointer can be freed under
+a claimless reader, and — separately — an unreplaced buffer can be
+*rewritten* under one, which no sequence over the envelope can see.
+The lock stays there.
+
+**The protocol.**  One 64-bit sequence word per cell, outside the
+envelope (the unclaimed eight bytes of the scalar slot's stride, or
+for containers the word the `RwLock` occupies; never inside
+`rc_state`, whose sixteen spare bits are far below the safe width,
+and never sharing a line that refcount traffic writes).  Writers
+acquire by `compare_exchange(even, even+1, Acquire, Relaxed)`; the
+odd value is both the writer's mutual exclusion and the readers'
+in-flight marker.  Inside the section the writer is the sole
+mutator and needs no read protocol of its own: read the tag, decide
+the operation, store the halves relaxed, then `store(even+2,
+Release)` — a plain store, since the writer owns the word.  Readers
+load the sequence with `Acquire`, read the halves relaxed, fence,
+re-read; odd or changed means retry.  The `Acquire`/`Release` pair
+on the sequence is what lets every payload access be `Relaxed`, so
+the pair cannot be weakened on either end.
+
+**Writers always serialize.**  A write confined to one aligned
+eight-byte half cannot tear against a *reader*, and same-type
+numeric assignment, short inline strings, and tainting are each such
+a write (measured by byte pattern: the discriminant is in byte 0
+and an eight-byte payload occupies the high half alone).  But two
+writers each touching one half assemble a mismatched pair — a tag
+asserting one type over another type's payload — with neither
+having written a torn value.  So the half-count never licenses
+skipping acquisition; it decides only how much work happens inside a
+section the writer already owns.  The unshared fast path is the
+cheap one: a `Relaxed` store at the floor, no counter, because there
+is no second writer to serialize against.
+
+**Nothing inside the section may block, fail, or run code we do not
+control.**  Allocate, construct, and fail *before* acquiring; store
+already-built values inside; take the old payload out and drop it
+*after* releasing, since a destructor can cascade a whole graph.  A
+tied `STORE` or any magic runs before acquisition and its result is
+what gets stored — this sharpens §13.11.1's pattern for the
+sequence-guarded case, where "release lock → execute callback →
+acquire lock → write result" becomes "run the callback → build the
+replacement → acquire → store → release."  With nothing fallible
+inside, there is no unwind path through an odd sequence and no
+poison state to model.
+
+**Waiting.**  A blocked writer polls the sequence with plain loads
+and attempts the CAS only when it reads even (test-and-test-and-set;
+a failed CAS is a read-modify-write that takes the line exclusive
+from the holder it is waiting on).  The ladder, calibrated from the
+measured costs — bare load 0.37 ns, `PAUSE` 17.7 ns, `sched_yield`
+195 ns, against a 1.90 ns section: **64 bare loads, then 10
+`PAUSE`, then yield, then 128 `PAUSE` between further yields.**
+Each phase spends about one operation of the next tier before
+escalating, and the total before the first syscall is one yield's
+cost.  Bare loads come first because the section is shorter than a
+single hint; the hint comes after the threshold because that is when
+its benefits — not saturating a hyperthread sibling, and being
+visible to a hypervisor's PAUSE-Loop Exiting, whose detection needs
+on the order of a hundred consecutive pauses — begin.  The constants
+are per-target (`PAUSE` spans two orders of magnitude across
+machines) and the 0.37 was measured with loads in flight that a
+dependent spin loop cannot have; express budgets in bare loads and
+re-derive before carving anything in.  A reader's loop is the same
+shape but distinguishes odd (wait it out) from even-but-changed
+(re-read immediately; nothing is in flight).
+
+**Not a licence to extend lock-free reads to owning payloads.**  A
+sequence in the buffer header could cover in-place edits, but no
+sequence keeps an allocation alive, and the read-path saving was
+measured on a sixteen-byte payload read with no indirection.  The
+boundary is exact: the lock-free read is sound when the reader needs
+nothing beyond the sixteen bytes it snapshotted.
 
 ### 2.4 Reference Counting, Cycles, and the Heap
 
@@ -10320,6 +10557,10 @@ internal operation that might trigger user code is:
 - Value writes: acquire lock → write data → release lock.
 - Magic/tie/overload: acquire lock → read callback ref → release
   lock → execute callback → acquire lock → write result → release.
+  Where the guard is a sequence rather than a lock (§2.3.9), the
+  callback also runs *before* acquisition and its result is what
+  is stored: nothing that can block, fail, or run user code may
+  execute while the sequence is odd.
 - DESTROY: never called while any internal lock is held.
 - `eval STRING`: compilation never occurs while an internal lock is
   held.
@@ -13279,7 +13520,8 @@ internal ordering follows the dependency structure of §2:
 6. Containers — `Array`/`Hash` with their handle types
    (the ordered-map ruling is recorded in §2.2.11, and the
    scanning kernels `char_len` needs in §2.2.10),
-   exists/delete semantics against the slot model.
+   exists/delete semantics against the slot model.  Gated on
+   §2.3.8's open questions 1 and 2, which decide the element type.
 
 7. Iterative teardown — the runtime-owned mechanical release
    worklist (§2.4.9), fixing the measured drop-glue stack overflow
